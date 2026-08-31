@@ -9,7 +9,8 @@ import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type S
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_NODE_HOST_CALL_BYTES, DEFAULT_MAX_NODE_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { createCustodyAllowance, type CustodyAllowance } from "./realm-queue.js";
 import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
@@ -43,6 +44,8 @@ export type RealmFactory = (opts: {
     /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
      *  factory's own default (`DEFAULT_GUEST_DEADLINE_MS` on both targets). */
     deadlineMs?: number;
+    /** Parent node allowance shared by sibling realms. */
+    custodyAllowance?: CustodyAllowance;
 }) => Promise<SafeRealm>;
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
@@ -183,8 +186,13 @@ export function createRealmTimers(
     fire: (payload: Uint8Array) => void,
     max = DEFAULT_MAX_LIVE_TIMERS,
     maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
+    parent?: CustodyAllowance,
 ): RealmTimers {
-    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; payloadBytes: number }>();
+    const live = new Map<number, {
+        timer: ReturnType<typeof setTimeout>;
+        payloadBytes: number;
+        releaseParent?: () => void;
+    }>();
     let payloadBytes = 0;
     const clear = (id: number) => {
         const entry = live.get(id);
@@ -192,6 +200,7 @@ export function createRealmTimers(
             clearTimeout(entry.timer);
             live.delete(id);
             payloadBytes -= entry.payloadBytes;
+            entry.releaseParent?.();
         }
     };
     return {
@@ -206,7 +215,10 @@ export function createRealmTimers(
                 throw new Error(`guest: live timer payloads exceed byte cap ${maxPayloadBytes}`);
             // Copy only after both checks pass. The guest-call request buffer can then be
             // collected, and the table retains exactly the bytes it accounts for.
-            const body = payload.slice();
+            const releaseParent = parent?.reserve(1, payload.byteLength);
+            let body: Uint8Array;
+            try { body = payload.slice(); }
+            catch (err) { releaseParent?.(); throw err; }
             clear(id);
             // Dropped from the table BEFORE the realm is re-entered, so a guest that
             // re-arms the same id from inside its own `timer` entrypoint arms the new
@@ -216,14 +228,18 @@ export function createRealmTimers(
                 if (!entry || entry.timer !== timer) return;
                 live.delete(id);
                 payloadBytes -= entry.payloadBytes;
+                entry.releaseParent?.();
                 fire(body);
             }, ms);
-            live.set(id, { timer, payloadBytes: body.byteLength });
+            live.set(id, { timer, payloadBytes: body.byteLength, releaseParent });
             payloadBytes += body.byteLength;
         },
         clear,
         clearAll() {
-            for (const { timer } of live.values()) clearTimeout(timer);
+            for (const { timer, releaseParent } of live.values()) {
+                clearTimeout(timer);
+                releaseParent?.();
+            }
             live.clear();
             payloadBytes = 0;
         },
@@ -366,6 +382,10 @@ export interface BootResult {
  *  path — a second way to a Shell would be one that skipped the pin. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const sodium = opts.sodium;
+    const nodeCustody = createCustodyAllowance(
+        DEFAULT_MAX_NODE_HOST_CALLS,
+        DEFAULT_MAX_NODE_HOST_CALL_BYTES,
+    );
     // The defaults are imported lazily: they are JS-target parts (a worker-backed module
     // builder, the QuickJS realm engine), and the one target that never takes them (the
     // native loader, which supplies Go-backed equivalents) must not pay for them.
@@ -466,7 +486,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             void slot.realm?.call(concatBytes([HOST_CALLER_ID, payload])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
-        });
+        }, undefined, undefined, nodeCustody);
         const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
         const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
@@ -506,11 +526,23 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
         // already refused any non-object).
         const appConfig = b.manifest.guest.config ?? {};
+        // The third preamble: not what the author signed (`APP`) nor what the operator set
+        // for this app (`LOCAL`), but what the HOST will admit — the budgets a guest is
+        // measured against, told to it rather than discovered by being refused. A guest
+        // pacing its own fan-out to these turns a hard rejection into a window; the
+        // ceilings still enforce, for a guest that does not bother. Anything that changes
+        // what the realm actually admits must change what is advertised here with it.
+        const hostBudgets: JsonObject = {
+            maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+            maxOutstandingHostCallBytes: DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+        };
         slot.realm = await createRealm({
-            source: jsonPreamble("APP", appConfig) + jsonPreamble("LOCAL", localConfig) + b.guestSource,
+            source: jsonPreamble("HOST", hostBudgets) + jsonPreamble("APP", appConfig)
+                + jsonPreamble("LOCAL", localConfig) + b.guestSource,
             hostCall: seamFor(slot),
             memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
+            custodyAllowance: nodeCustody,
         });
     };
     /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),

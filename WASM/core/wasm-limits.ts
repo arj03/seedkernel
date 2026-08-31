@@ -1,6 +1,8 @@
 // Module memory bounds, read off the bytes before instantiation (§4.3). An imported
 // or shared memory is refused. Compute is bounded at each target's engine.
 
+import { MAX_INBOUND_HOLD_BYTES, MAX_NODE_OUTBOUND_QUEUE_BYTES } from "./net-limits.js";
+
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
 
@@ -41,11 +43,49 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
  *  memory. Applies to every host call, not only networking. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
+/** Parent allowance across all realms in one node (`nodeCustody`, shell-core.ts). ONE pool
+ *  for the per-realm bounds that would otherwise multiply by realm count: active host calls
+ *  and timer payloads by bytes and count, realm-entry invocations by count alone — which is
+ *  why the total below counts this pair once rather than each of them.
+ *
+ *  It bounds the PROCESS, not realms from each other: with no per-realm floor, siblings can
+ *  starve one another once the pool is spent. Stated as a multiple of the per-realm ceilings
+ *  so the two cannot drift — four realms' worth, matching what net-limits.ts's
+ *  `MAX_NODE_OUTBOUND_QUEUE_BYTES` allows on the outbound side. */
+export const DEFAULT_MAX_NODE_HOST_CALLS = 4 * DEFAULT_MAX_OUTSTANDING_HOST_CALLS;
+export const DEFAULT_MAX_NODE_HOST_CALL_BYTES = 4 * DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES;
+
+/** How deep one realm's entry queue may get. A DEPTH bound with no byte companion, on
+ *  purpose: a waiting invocation's bytes are already owned for a longer period by whoever
+ *  handed them over — an inbound read by its link, a guest call by the calling realm's
+ *  active-call registry. See `serializeCalls` (host/realm-queue.ts). */
+export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
+
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling
  *  (`PureModuleLoader.maxModuleMemoryBytes`) — so a host may hold its isolates to less and
  *  none can be looser about what a bundle may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
+
+/** The default in-memory `Fs` backend's whole quota (host/fs-memory.ts `MemoryFs`), so a
+ *  successful put cannot turn bounded in-flight calls into unbounded permanent process RAM.
+ *  Declared here rather than in fs-memory.ts so the total below can name it without core
+ *  importing a host file; fs-memory.ts re-exports it. */
+export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
+
+// Every owner above is finite, but only their SUM is checkable against real machine RAM.
+// Adding a node-scoped owner of admitted host memory means adding its term here, not just
+// declaring its own constant. A FLOOR, not a worst case: the last two terms are counted once
+// each, and nothing bounds how many realms a shell installs or how many modules a bundle
+// ships, so a node running N apps multiplies them.
+export const DERIVED_NODE_MEMORY_CEILING_BYTES =
+    DEFAULT_MAX_NODE_HOST_CALL_BYTES // active host calls and timer payloads, one shared pool
+  + MAX_NODE_OUTBOUND_QUEUE_BYTES    // §12.6 — outbound socket queues, aggregated over every link
+  + MAX_INBOUND_HOLD_BYTES           // §12.6 — inbound reads held above an unpausable adapter
+  + DEFAULT_MEMORY_FS_MAX_BYTES      // the in-memory fs backend's whole quota
+  + DEFAULT_REALM_MEMORY_BYTES       // §12.3 — ONE realm's heap cap — see the floor note above
+  + DEFAULT_MAX_MODULE_MEMORY_BYTES; // §4.3 — ONE module's declared memory — see the floor note above
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether

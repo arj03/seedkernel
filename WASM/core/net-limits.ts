@@ -29,6 +29,11 @@ export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_FRAME_BYTES;
  *  queue nodes inside the byte window while spending much more host memory in metadata. */
 export const MAX_OUTBOUND_QUEUE_SLICES = 4096;
 
+/** Parent allowance shared by every link in one network driver. Per-link ceilings alone
+ * multiply by `DEFAULT_MAX_RAW_LINKS`; this bounds the process-facing aggregate instead. */
+export const MAX_NODE_OUTBOUND_QUEUE_BYTES = 4 * MAX_OUTBOUND_QUEUE_BYTES;
+export const MAX_NODE_OUTBOUND_QUEUE_SLICES = 4 * MAX_OUTBOUND_QUEUE_SLICES;
+
 /** Live raw sockets one host holds at once. The native accept path also receives this
  *  value so it can refuse before allocating a channel's goroutines and read buffer. */
 export const DEFAULT_MAX_RAW_LINKS = 4096;

@@ -43,6 +43,7 @@ const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
+const { createActiveHostCallRegistry, createCustodyAllowance, serializeCalls } = await imp("build/host/realm-queue.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
@@ -137,6 +138,21 @@ console.log("\n§12.2 — fs is scoped per app key");
   // The real backends reject anything outside that charset, so an unsafe scope must
   // fail at construction rather than on the first write.
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
+
+  const bounded = new MemoryFs(4, 2);
+  await bounded.put("a", Uint8Array.of(1, 2, 3));
+  await rejects(bounded.put("b", Uint8Array.of(4, 5)),
+    "an in-memory backend refuses cumulative bytes beyond its quota");
+  ok((await bounded.get("a")).join() === "1,2,3",
+    "a refused put leaves existing stored state intact");
+  await bounded.put("a", Uint8Array.of(9));
+  await bounded.put("b", Uint8Array.of(8, 7, 6));
+  await rejects(bounded.put("c", new Uint8Array()),
+    "the storage owner also bounds retained entry objects");
+  await bounded.delete("a");
+  await bounded.put("c", Uint8Array.of(5));
+  ok((await bounded.stat()).used === 4 && (await bounded.stat()).available === 0,
+    "replacement and deletion transactionally release storage custody");
 }
 
 console.log("\n§12.4 — every app is a guest, modules are its library");
@@ -296,11 +312,28 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "settled host calls release their per-realm accounting");
   boundedCalls.dispose();
 
-  // Count alone still allows 256 maximum-sized inputs to sit outside the confined heap.
+  const duplicateHeld = [];
+  const duplicateIds = await createSafeRealm({
+    source: `function handle(a) {
+      __host_call("first", 77, new ArrayBuffer(1));
+      if (a[0]) __host_call("second", 77, new ArrayBuffer(1));
+      return new Uint8Array();
+    }`,
+    hostCall: () => new Promise((resolve) => duplicateHeld.push(resolve)),
+    deadlineMs: 1000,
+  });
+  await rejects(duplicateIds.call(Uint8Array.of(1)), "a duplicate live host-call id is rejected");
+  ok(duplicateHeld.length === 1, "duplicate-id rejection occurs before a second host copy");
+  duplicateHeld.shift()(new Uint8Array());
+  await sleep(20);
+  const reused = duplicateIds.call(Uint8Array.of(0));
+  await sleep(0);
+  duplicateHeld.shift()(new Uint8Array());
+  ok((await reused).length === 0, "a settled id can be admitted again");
+  duplicateIds.dispose();
+
   // Reach the byte boundary with only eight calls, then prove the ninth is rejected before
-  // the host seam receives another copied payload. Only "link/deliver" meters bytes
-  // (domains.ts isByteMetered) — an ordinary awaited call's outstanding bytes are bounded
-  // by the caller's own fan-out window instead (seedstore's `netSendMany`, for one).
+  // the host seam receives another copied payload.
   const hostCallChunk = 2 * 1024 * 1024;
   const callsAtByteCap = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES / hostCallChunk;
   const byteHeld = [];
@@ -328,9 +361,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "settled host calls release their per-realm byte accounting");
   byteBoundedCalls.dispose();
 
-  // An ordinary call name (anything but "link/deliver") is bounded by COUNT alone: a
-  // caller-windowed fan-out (seedstore's netSendMany, windowed by its own fanoutWindow)
-  // must not trip the byte cap meant only for un-windowed inbound delivery.
+  // Changing only the operation name cannot buy an accounting exemption.
   const ordinaryHeld = [];
   const ordinaryCalls = await createSafeRealm({
     source: `function handle() {
@@ -341,12 +372,124 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     hostCall: () => new Promise((resolve) => ordinaryHeld.push(resolve)),
     deadlineMs: 1000,
   });
-  void ordinaryCalls.call(new Uint8Array());
-  await sleep(20);
-  ok(ordinaryHeld.length === callsAtByteCap + 1,
-    "an ordinary call name is unmetered by bytes, past what the link/deliver cap allows");
+  await rejects(ordinaryCalls.call(new Uint8Array()),
+    "an ordinary call name is subject to the same byte cap");
+  ok(ordinaryHeld.length === callsAtByteCap,
+    "the owner of the resource admits, and no name relaxes what it admits");
   for (const resolve of ordinaryHeld) resolve(new Uint8Array());
   ordinaryCalls.dispose();
+}
+
+console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
+{
+  const active = createActiveHostCallRegistry(2, 8);
+  const first = active.admit(1, 5);
+  throws(() => active.admit(1, 0), "a registry refuses a duplicate live id");
+  first.reserve(3);
+  throws(() => active.admit(2, 1), "responses awaiting delivery remain charged");
+  first.release();
+  active.admit(2, 8).release();
+  ok(true, "terminal settlement releases request, response, id, and count together");
+
+  const parent = createCustodyAllowance(4, 6);
+  const siblingA = createActiveHostCallRegistry(4, 6, parent);
+  const siblingB = createActiveHostCallRegistry(4, 6, parent);
+  const child = siblingA.admit(1, 4);
+  throws(() => siblingB.admit(1, 3),
+    "a parent allowance prevents sibling realms multiplying their local byte caps");
+  child.release();
+  siblingB.admit(1, 3).release();
+
+  const teardownParent = createCustodyAllowance(2, 1);
+  let settleOrphan;
+  await rejects(createSafeRealm({
+    source: 'host.call("hold", Uint8Array.of(1)); throw new Error("init failed");',
+    hostCall: () => new Promise((resolve) => { settleOrphan = resolve; }),
+    custodyAllowance: teardownParent,
+  }), "failed realm construction reports its source error");
+  const afterFailure = await createSafeRealm({
+    source: 'async function handle() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
+    hostCall: () => new Uint8Array(),
+    custodyAllowance: teardownParent,
+  });
+  await rejects(afterFailure.call(new Uint8Array()),
+    "teardown does not launder a non-cancellable call's retained bytes");
+  settleOrphan(new Uint8Array());
+  await sleep(20);
+  ok((await afterFailure.call(new Uint8Array()))[0] === 7,
+    "a retired owner releases its parent only when backend work actually settles");
+  afterFailure.dispose();
+
+  let closed = false;
+  const gates = [];
+  const seen = [];
+  const queued = serializeCalls((payload) => {
+    seen.push([...payload]);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    gates.push(release);
+    return { result: gate.then(() => payload), released: gate };
+  }, () => closed ? new Error("closed") : null, 1);
+  const one = Uint8Array.of(1);
+  const firstInvocation = queued(one);
+  one[0] = 9;
+  await sleep(0);
+  const two = Uint8Array.of(2, 3, 4, 5);
+  const secondInvocation = queued(two);
+  two.fill(9);
+  await rejects(queued(Uint8Array.of(6)), "a queued invocation count is bounded");
+  gates.shift()();
+  await firstInvocation;
+  await sleep(0);
+  ok(seen[0][0] === 1 && seen[1].join() === "2,3,4,5",
+    "the realm-entry owner snapshots payloads before queueing");
+  gates.shift()();
+  await secondInvocation;
+  // Depth, not bytes: a payload far past any byte ceiling this queue could have had is
+  // admitted, because its bytes are already owned by whoever handed them over — a second
+  // counter here would reject work the real owner had admitted (realm-queue.ts).
+  const large = queued(new Uint8Array(32 * 1024 * 1024));
+  await sleep(0);
+  gates.shift()();
+  ok((await large).length === 32 * 1024 * 1024,
+    "the entry queue bounds how many invocations wait, never how many bytes they carry");
+  closed = true;
+  await rejects(queued(new Uint8Array()), "a closed realm stops admitting immediately");
+
+  // A realm may DEFER its answer to an arbitrary later turn (`__deferred`), with no
+  // wall-clock bound at all — so only dispose() can ever end the wait for one that never
+  // comes. Two realms sharing one parent allowance model the real shape: realm A defers
+  // forever, realm B's own host.call awaits A's answer (transport-host.ts `deliver`
+  // awaiting a slot's `realm.call`), so B's active host call stays charged to the shared
+  // parent for as long as A's invocation is unsettled. Cap 2, not 1: `waiting.call` itself
+  // transiently reserves one queued-invocation slot for the length of its own synchronous
+  // segment (serializeCalls), which OVERLAPS the active-host-call admission taken inside
+  // that same segment before releasing — 1 would make that ordinary overlap indistinguishable
+  // from the leak under test.
+  const sharedParent = createCustodyAllowance(2, 1024);
+  const deferring = await createSafeRealm({
+    source: 'function handle() { globalThis.__deferred = true; return new Promise(() => {}); }',
+    hostCall: () => new Uint8Array(),
+  });
+  const waiting = await createSafeRealm({
+    source: 'function handle() { return host.call("ask", new Uint8Array()); }',
+    hostCall: () => deferring.call(new Uint8Array(1)),
+    custodyAllowance: sharedParent,
+  });
+  const hung = waiting.call(new Uint8Array()).catch(() => "failed");
+  await sleep(20);
+  // The transient queued-invocation reservation has released by now; the active-host-call
+  // admission has not, because nothing has settled `deferring.call(...)`'s promise. Exactly
+  // one of the parent's two slots remains free.
+  throws(() => sharedParent.reserve(2, 1),
+    "one slot of the shared parent stays spent while A's deferred answer is outstanding");
+  sharedParent.reserve(1, 1)(); // the one remaining slot — reserve then immediately release
+  deferring.dispose();
+  ok(await hung === "failed",
+    "disposing the deferred realm settles the invocation the other realm was awaiting, not hanging forever");
+  sharedParent.reserve(2, 1)(); // dispose released the charge — the full allowance is free again
+  ok(true, "dispose released the deferred invocation's charge against the parent allowance");
+  waiting.dispose();
 }
 
 console.log("\n§12.3 — timer count and copied payload bytes are bounded per realm");
@@ -371,6 +514,16 @@ console.log("\n§12.3 — timer count and copied payload bytes are bounded per r
   byteBound.arm(4, 60_000, new Uint8Array(8));
   byteBound.clearAll();
   ok(true, "clear, fire, and disposal release timer payload accounting");
+
+  const timerParent = createCustodyAllowance(1, 16);
+  const siblingTimersA = createRealmTimers(() => {}, 2, 16, timerParent);
+  const siblingTimersB = createRealmTimers(() => {}, 2, 16, timerParent);
+  siblingTimersA.arm(1, 60_000, new Uint8Array(1));
+  throws(() => siblingTimersB.arm(1, 60_000, new Uint8Array(1)),
+    "sibling timer tables draw from their node parent allowance");
+  siblingTimersA.clearAll();
+  siblingTimersB.arm(1, 60_000, new Uint8Array(1));
+  siblingTimersB.clearAll();
 }
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
@@ -414,10 +567,11 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
   ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
 
-  // APP and LOCAL are two provenance-preserving values, not one host-side merge. Evaluate
-  // only the two generated preamble lines (the guest body is self-contained).
+  // HOST, APP and LOCAL are three provenance-preserving values, not one host-side merge:
+  // what the runtime admits, what the author signed, what the operator set for this load.
+  // Evaluate only the three generated preamble lines (the guest body is self-contained).
   const valuesFrom = (source) => Function(
-    source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+    source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL, HOST];",
   )();
   const [app, local] = valuesFrom(seen[0].source);
   ok(app.mode === "signed" && !("localOnly" in app), "LOCAL never overwrites or extends signed APP");
@@ -489,6 +643,14 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   await bareProbe.invoke(new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
+  // The budgets a guest is measured against are TOLD to it (the `HOST` preamble), so an app
+  // can window its own fan-out to them instead of discovering them by being refused.
+  const advertised = Function(
+    seen2.source.split("\n").slice(0, 3).join("\n") + "\nreturn HOST;",
+  )();
+  ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
+    && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+    "the realm's host-call budget is advertised to the guest, not only enforced against it");
   bare.close();
 }
 
@@ -496,6 +658,23 @@ console.log("\n§12.6 — host socket send queues are bounded");
 {
   const { MessageChannel } = await imp("build/host/net-channel.js");
   const { NodeChannelFactory } = await imp("build/host/net-node.js");
+  const { TransportHost } = await imp("build/host/transport-host.js");
+  const ownedChannel = (channel, limits = {}) => {
+    const channels = {
+      connect: () => channel,
+      listen: async () => ({ port: 0, wsPort: 0 }),
+      close() {},
+    };
+    const driver = new TransportHost({ channels, ...limits }, {});
+    driver.activate(() => Promise.resolve(new Uint8Array()));
+    const raw = driver.rawNet();
+    const { linkId } = raw.open("test");
+    return {
+      send: (bytes) => raw.send(linkId, bytes),
+      buffered: () => raw.buffered(linkId),
+      close: () => driver.close(),
+    };
+  };
   // A transport that never becomes writable — the state an unfinished connect leaves a
   // channel in. Until `open` fires, everything written is HOST memory spent by a peer that
   // has proved nothing, so the queue a handshake frame or two needs must not be a place an
@@ -509,17 +688,19 @@ console.log("\n§12.6 — host socket send queues are bounded");
     addEventListener: () => { },
   };
   const ch = new MessageChannel(stuck);
+  const owned = ownedChannel(ch);
   let died = false;
   ch.onClose(() => { died = true; });
   const frame = new Uint8Array(64 * 1024);
-  for (let i = 0; i < 16; i++) ch.send(frame); // 1 MiB exactly — the last byte still inside
+  for (let i = 0; i < 256; i++) owned.send(frame);
   ok(!died && sent.length === 0, "a channel that has not opened buffers rather than writes");
-  ok(ch.buffered() === 1024 * 1024, `the queue reports its own bytes (got ${ch.buffered()})`);
-  ch.send(frame); // …and the frame that crosses it
+  ok(owned.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
+    `the link owner reports pre-open bytes (got ${owned.buffered()})`);
+  owned.send(frame);
   // Failed, not silently trimmed: dropping a frame off an ordered stream leaves the far end
   // waiting on a gap forever, where a dead channel is one the occupant is told about.
-  ok(died && closed, "crossing the ceiling fails the channel instead of growing the queue");
-  ok(ch.buffered() === 0, "a failed channel releases its queue rather than holding it to be collected");
+  ok(!died && closed, "crossing the ceiling closes the adapter instead of growing the queue");
+  ok(owned.buffered() === 0, "a failed link releases its queue rather than holding it to be collected");
 
   const openedChannel = () => {
     const listeners = new Map();
@@ -533,7 +714,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
     let failed = false;
     channel.onClose(() => { failed = true; });
     listeners.get("open")();
-    return { channel, transport, failed: () => failed };
+    return { channel: ownedChannel(channel), transport, failed: () => failed };
   };
 
   // Once open, the platform's own queue is host memory too. Exactly the byte window is
@@ -546,8 +727,8 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(!byBytes.failed() && byBytes.channel.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
     "the exact outbound byte ceiling remains writable");
   byBytes.channel.send(Uint8Array.of(1));
-  ok(byBytes.failed() && byBytes.transport.closed,
-    "crossing the outbound byte ceiling fails the channel");
+  ok(byBytes.channel.buffered() === 0 && byBytes.transport.closed,
+    "crossing the outbound byte ceiling closes and releases the link");
 
   // A byte cap alone admits millions of one-byte message objects. The independent count
   // ceiling bites while the byte total is still tiny.
@@ -556,17 +737,47 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(!byCount.failed() && byCount.channel.buffered() < MAX_OUTBOUND_QUEUE_BYTES,
     "tiny writes reach the exact outbound slice ceiling below the byte ceiling");
   byCount.channel.send(Uint8Array.of(1));
-  ok(byCount.failed() && byCount.transport.closed,
-    "crossing the outbound slice ceiling fails the channel");
+  ok(byCount.channel.buffered() === 0 && byCount.transport.closed,
+    "crossing the outbound slice ceiling closes and releases the link");
 
-  // Node's adapter is a separate queue owner. A connect has no chance to progress while
+  const parentLinks = [0, 1].map(() => {
+    const listeners = new Map();
+    return {
+      held: 0, closed: false,
+      send(bytes) { this.held += bytes.length; },
+      buffered() { return this.held; },
+      close() { this.closed = true; },
+      onData(cb) { listeners.set("data", cb); },
+      onClose(cb) { listeners.set("close", cb); },
+    };
+  });
+  let parentNext = 0;
+  const parentDriver = new TransportHost({
+    channels: {
+      connect: () => parentLinks[parentNext++],
+      listen: async () => ({ port: 0, wsPort: 0 }),
+      close() {},
+    },
+    maxOutboundBytes: 6,
+  }, {});
+  parentDriver.activate(() => Promise.resolve(new Uint8Array()));
+  const parentRaw = parentDriver.rawNet();
+  const firstLink = parentRaw.open("a").linkId;
+  const secondLink = parentRaw.open("b").linkId;
+  parentRaw.send(firstLink, new Uint8Array(4));
+  parentRaw.send(secondLink, new Uint8Array(3));
+  ok(!parentLinks[0].closed && parentLinks[1].closed,
+    "the node allowance prevents individually legal links multiplying retained bytes");
+  parentDriver.close();
+
+  // Node reports its platform backlog to the same link owner. A connect cannot progress while
   // this synchronous loop runs, which makes both exact boundaries deterministic without
   // depending on a peer or on kernel socket-buffer sizes.
   const nodeLink = () => {
     const link = new NodeChannelFactory().connect("tcp://127.0.0.1:1");
     if (!link) throw new Error("node test link was not created");
     link.onClose(() => {}); // consume the expected destroy/connect-error events
-    return link;
+    return ownedChannel(link);
   };
   const nodeBytes = nodeLink();
   for (let n = block.length; n <= MAX_OUTBOUND_QUEUE_BYTES; n += block.length) {
@@ -574,18 +785,45 @@ console.log("\n§12.6 — host socket send queues are bounded");
   }
   ok(nodeBytes.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
     "Node accepts exactly the outbound byte ceiling before connect");
-  let nodeByteError = "";
-  try { nodeBytes.send(Uint8Array.of(1)); } catch (e) { nodeByteError = String(e); }
-  ok(nodeByteError.includes("outbound queue limit"),
-    "Node destroys a socket before accepting bytes past the ceiling");
+  nodeBytes.send(Uint8Array.of(1));
+  ok(nodeBytes.buffered() === 0,
+    "the link owner destroys Node's socket before accepting bytes past the ceiling");
 
   const nodeCount = nodeLink();
   const one = Uint8Array.of(1);
   for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) nodeCount.send(one);
-  let nodeCountError = "";
-  try { nodeCount.send(one); } catch (e) { nodeCountError = String(e); }
-  ok(nodeCountError.includes("outbound queue limit"),
-    "Node destroys a socket before accepting a write past the count ceiling");
+  nodeCount.send(one);
+  ok(nodeCount.buffered() === 0,
+    "the link owner destroys Node's socket before accepting a write past the count ceiling");
+
+  // `RawLink.buffered` is a required member of the contract (socket-seam.ts). An adapter
+  // reporting 0 ASSERTS it retains nothing; one whose call throws — or, since a JS double
+  // is not type-checked, is missing entirely — asserts nothing at all, and the two must not
+  // read alike. Reading "cannot say" as 0 would release this link's charge and the node's
+  // while the platform still holds the bytes, which is the uncharged interval this owner
+  // exists to rule out; freezing the accounting instead would strangle a healthy link at
+  // its cumulative ceiling. The link fails on the write instead, and only that teardown
+  // releases — a destroyed socket really has dropped what it held.
+  let silentClosed = false, silentWrote = 0;
+  const silent = ownedChannel({
+    stream: true, send: () => { silentWrote++; }, onData: () => {}, onClose: () => {},
+    close: () => { silentClosed = true; },
+    // No `buffered` at all: an adapter declaring it retains nothing past send.
+  });
+  for (let i = 0; i < 4 * MAX_OUTBOUND_QUEUE_SLICES; i++) silent.send(Uint8Array.of(1));
+  ok(!silentClosed && silentWrote === 4 * MAX_OUTBOUND_QUEUE_SLICES && silent.buffered() === 0,
+    "an adapter that declares no backlog keeps writing, its custody released at each send");
+
+  let brokenClosed = false, brokenWrote = 0;
+  const broken = ownedChannel({
+    stream: true, send: () => { brokenWrote++; }, onData: () => {}, onClose: () => {},
+    close: () => { brokenClosed = true; },
+    buffered: () => { throw new Error("cannot say"); },
+  });
+  for (let i = 0; i < 4 * MAX_OUTBOUND_QUEUE_SLICES; i++) broken.send(Uint8Array.of(1));
+  ok(brokenClosed && brokenWrote === 0,
+    "a buffered() that cannot answer fails the link on its first write rather than writing uncharged");
+  ok(broken.buffered() === 0, "and leaves nothing charged to the link its teardown released");
 }
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");

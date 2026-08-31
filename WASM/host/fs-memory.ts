@@ -4,7 +4,13 @@
 // key rule (core/fs.ts), with the wrappers that apply them in shell-core.ts — those decide
 // what an app can reach. Which medium the bytes land in decides nothing.
 
-import { FS_AVAILABLE_UNKNOWN, type Fs, type FsStat } from "../core/fs.js";
+import { type Fs, type FsStat } from "../core/fs.js";
+// The quota constants live in core/wasm-limits.ts, not here: they are one term of that
+// file's derived node-memory ceiling (DERIVED_NODE_MEMORY_CEILING_BYTES), which needs them
+// without core importing this host-layer file. Re-exported so an existing import of them
+// from this module keeps working.
+import { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
+export { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
 
 /** In-RAM Fs. Stores copies so callers can reuse their buffers.
  *
@@ -13,12 +19,37 @@ import { FS_AVAILABLE_UNKNOWN, type Fs, type FsStat } from "../core/fs.js";
  *  work by accident on this one and fail on the backend it ships against. */
 export class MemoryFs implements Fs {
   private readonly map = new Map<string, Uint8Array>();
+  private used = 0;
+
+  constructor(
+    private readonly maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES,
+    private readonly maxEntries = DEFAULT_MEMORY_FS_MAX_ENTRIES,
+  ) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0
+      || !Number.isSafeInteger(maxEntries) || maxEntries < 0) {
+      throw new Error("memory-fs: invalid quota");
+    }
+  }
 
   async get(key: string): Promise<Uint8Array | null> {
     const v = this.map.get(key);
     return v ? v.slice() : null;
   }
-  async put(key: string, bytes: Uint8Array): Promise<void> { this.map.set(key, bytes.slice()); }
+  async put(key: string, bytes: Uint8Array): Promise<void> {
+    const previous = this.map.get(key);
+    if (!previous && this.map.size >= this.maxEntries) {
+      throw new Error(`memory-fs: entry quota exceeded (cap ${this.maxEntries})`);
+    }
+    const nextUsed = this.used - (previous?.length ?? 0) + bytes.length;
+    if (nextUsed > this.maxBytes) {
+      throw new Error(`memory-fs: byte quota exceeded (cap ${this.maxBytes})`);
+    }
+    // Quota is checked before copying, and the old value remains intact if allocation
+    // fails. Commit of map entry and accounting follows the successful copy.
+    const stored = bytes.slice();
+    this.map.set(key, stored);
+    this.used = nextUsed;
+  }
   async size(key: string): Promise<number> {
     const v = this.map.get(key);
     return v ? v.length : -1;
@@ -28,10 +59,14 @@ export class MemoryFs implements Fs {
     for (const k of this.map.keys()) if (!prefix || k.startsWith(prefix)) out.push(k);
     return out;
   }
-  async delete(key: string): Promise<boolean> { return this.map.delete(key); }
+  async delete(key: string): Promise<boolean> {
+    const previous = this.map.get(key);
+    if (!previous) return false;
+    this.map.delete(key);
+    this.used -= previous.length;
+    return true;
+  }
   async stat(): Promise<FsStat> {
-    let used = 0;
-    for (const v of this.map.values()) used += v.length;
-    return { used, available: FS_AVAILABLE_UNKNOWN };
+    return { used: this.used, available: this.maxBytes - this.used };
   }
 }

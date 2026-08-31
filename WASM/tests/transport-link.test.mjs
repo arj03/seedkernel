@@ -21,7 +21,7 @@ import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/core/n
 // what the guest asked. Delivery is deferred a microtask (like a real socket); `hold`/
 // `flush` model a byte stream's several whole messages arriving in ONE read — the held
 // writes are handed to the far end as a single `onData`.
-function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, stream = false } = {}) {
+function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, stream = false, trackBacklog = false } = {}) {
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
     sent: [], closeArgs: [], dead: false, inFlight: 0,
@@ -45,12 +45,18 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       return parts.length;
     },
     // The stall clock's progress signal (core/socket-seam.ts `RawLink.buffered`):
-    // bytes written but not yet on the wire. A test drives it directly to model a
-    // backpressured socket — draining, or stuck.
+    // bytes written but not yet on the wire. Plain writes never bump this — a test drives
+    // it directly to model a backpressured socket, draining or stuck — UNLESS
+    // `trackBacklog` is set, in which case `send` grows it by exactly what it was handed:
+    // the host's own outbound owner (transport-host.ts `LinkOutboundOwner`) reconciles its
+    // retained bytes against the DELTA of this report, so a value invented independent of
+    // what was actually written is drained away as a phantom on the very next reconcile —
+    // a test simulating a slow real backlog needs a real write behind it.
     backlog: 0,
     buffered() { return this.backlog; },
     send(bytes) {
       if (this.dead) return;
+      if (trackBacklog) this.backlog += bytes.length;
       this.sent.push(Buffer.from(bytes).toString("hex"));
       const out = tamper ? tamper(bytes, this.name) : bytes;
       if (out === null) return; // dropped in flight
@@ -221,16 +227,21 @@ await test("the deadline is a STALL clock: a request still draining out is not l
   // A clock armed when the request is QUEUED times our own upload and blames the holder
   // for our backlog: a 50 MB PUT queued ~42 MB behind its sockets would cancel every
   // request in the window at its 5 s deadline while the wire moves perfectly.
-  const chans = wirePair();
+  //
+  // `trackBacklog` makes `chans[0].backlog` grow by exactly what a write puts there,
+  // matching how the host's own outbound owner reconciles retained bytes against the
+  // DELTA of this report (host/transport-host.ts `LinkOutboundOwner`): a backlog set
+  // independent of a real write is a phantom the very next reconcile drains away, so the
+  // 40 KB below has to be a real request payload, not an invented number.
+  const chans = wirePair({ trackBacklog: true });
   const st = keep(await linked(chans, {}, { mode: "hang" }));
   const proto = PROTO;
-  // A backpressured socket holding 40 KB of this request, draining 4 KB at a time —
-  // slower than the 100 ms deadline, so a queue-time clock would fire ~9 times over.
-  chans[0].backlog = 40_000;
+  // Draining 4 KB at a time — slower than the 100 ms deadline, so a queue-time clock
+  // would fire ~9 times over.
   const drain = setInterval(() => { chans[0].backlog = Math.max(0, chans[0].backlog - 4_000); }, 40);
 
   const t0 = Date.now();
-  const settled = st.A.request(st.B.peerId, proto, Uint8Array.from([1]), 100)
+  const settled = st.A.request(st.B.peerId, proto, new Uint8Array(40_000), 100)
     .then(() => "resolved", () => Date.now() - t0);
 
   // While it drains, the request must survive well past its own deadline.
@@ -252,13 +263,13 @@ await test("the deadline is a STALL clock: a request still draining out is not l
 await test("a stalled link still settles on the deadline", async (keep) => {
   // The other half: a backlog that never moves is a stuck wire, and no amount of
   // "bytes are queued" may excuse it. Same 100 ms, same never-answering peer, but
-  // nothing drains.
-  const chans = wirePair();
+  // nothing drains — `trackBacklog` grows `chans[0].backlog` from the request's own
+  // 40 KB write (see the sibling test above) and nothing here ever counts it back down.
+  const chans = wirePair({ trackBacklog: true });
   const st = keep(await linked(chans, {}, { mode: "hang" }));
   const proto = PROTO;
-  chans[0].backlog = 40_000;                            // frozen: no drain interval
   const t0 = Date.now();
-  const ms = await st.A.request(st.B.peerId, proto, Uint8Array.from([1]), 100)
+  const ms = await st.A.request(st.B.peerId, proto, new Uint8Array(40_000), 100)
     .then(() => "resolved", () => Date.now() - t0);
   assert(typeof ms === "number", "a stalled request must reject");
   assert(ms < 1500, `a frozen backlog must settle on the deadline, not wait forever (took ${ms}ms)`);

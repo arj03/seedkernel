@@ -287,7 +287,13 @@ func shutdown() {
 	for _, g := range realms {
 		g.discard() // guest runtime only — the host realm it borrowed values from dies below
 	}
+	for _, g := range retiredRealms {
+		g.discard()
+	}
 	realms = map[int64]*guestRealm{}
+	retiredRealms = map[int64]*guestRealm{}
+	nodeHostCalls, nodeHostBytes = 0, 0
+	maxNodeHostCalls, maxNodeHostBytes = 0, 0
 	if qrt != nil {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil

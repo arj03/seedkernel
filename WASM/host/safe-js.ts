@@ -14,7 +14,6 @@ import {
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
 // ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isByteMetered } from "../core/domains.js";
 import { errMessage } from "../core/util.js";
 // The in-repo quickjs-ng build (quickjs/): the same v0.16.1 the native loader compiles,
 // emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
@@ -28,7 +27,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
-import { createOutstandingHostCallBudget, serializeCalls, type Invocation } from "./realm-queue.js";
+import { createActiveHostCallRegistry, createInvocationSettler, serializeCalls, type CustodyAllowance, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
@@ -45,6 +44,8 @@ export interface SafeRealmOptions {
   /** Guest execution budget per entrypoint, in ms. Running time, not wall clock.
    *  `Infinity` disables; omit for default. */
   deadlineMs?: number;
+  /** Shared node allowance for this realm's active host calls. */
+  custodyAllowance?: CustodyAllowance;
 }
 
 export interface SafeRealm {
@@ -191,7 +192,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
-  const outstandingHostCalls = createOutstandingHostCallBudget();
+  const activeHostCalls = createActiveHostCallRegistry(undefined, undefined, opts.custodyAllowance);
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -227,18 +228,13 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // Rejectors for calls currently awaiting a guest promise (§12.3). A guest promise is
-  // settled from *inside* the realm, so anything that stops the realm mid-flight — a budget
-  // interrupt during a continuation, or dispose() while a call is parked — leaves it
-  // permanently pending. A bound that turns a runaway guest into a hung host is not much of
-  // a bound, so the realm fails them explicitly.
-  const pending = new Set<(err: Error) => void>();
-  const failPending = (err: Error): void => {
-    for (const reject of [...pending]) {
-      pending.delete(reject);
-      reject(err);
-    }
-  };
+  // Rejectors for calls currently awaiting a guest promise (§12.3) — a DEFERRED entrypoint
+  // included, whose answer has no wall-clock bound at all (realm-queue.ts). A guest promise
+  // is settled from *inside* the realm, so anything that stops the realm mid-flight — a
+  // budget interrupt during a continuation, or dispose() while a call is parked or deferred
+  // — leaves it permanently pending. A bound that turns a runaway or silent guest into a
+  // hung host is not much of a bound, so the realm fails them explicitly.
+  const invocationSettler = createInvocationSettler();
 
   // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
   // preamble's half of the contract), then pump so the awaiting continuation runs.
@@ -257,7 +253,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     } catch (err) {
       // The guest was interrupted while resuming, so nothing inside the realm will ever
       // settle the caller's promise: fail it here, or `call()` hangs forever.
-      failPending(err instanceof Error ? err : new Error(String(err)));
+      invocationSettler.failAll(err instanceof Error ? err : new Error(String(err)));
     } finally {
       clock.end();
       id.dispose();
@@ -280,12 +276,12 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
     // Inspect the borrowed view first, reserve both count and bytes, and only then copy.
     // `getArrayBuffer` owns a lifetime but not another payload-sized allocation.
-    const [payload, releaseHostCall] = (() => {
+    const [payload, activeCall] = (() => {
       const borrowed = ctx.getArrayBuffer(payloadHandle);
       try {
-        const release = outstandingHostCalls.acquire(borrowed.value.byteLength, isByteMetered(name));
-        try { return [borrowed.value.slice(), release] as const; }
-        catch (err) { release(); throw err; }
+        const call = activeHostCalls.admit(callId, borrowed.value.byteLength);
+        try { return [borrowed.value.slice(), call] as const; }
+        catch (err) { call.release(); throw err; }
       } finally {
         borrowed.dispose();
       }
@@ -294,19 +290,33 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     try {
       answer = opts.hostCall(name, payload, budget);
     } catch (err) {
-      releaseHostCall();
+      activeCall.release();
       throw err;
     }
     void Promise.resolve(answer).then(
       (bytes) => {
-        releaseHostCall();
-        if (disposed || !ctx.alive) return;
-        settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));
+        try {
+          if (disposed || !ctx.alive) return;
+          // Request and response coexist while copying the result into the guest. Reserve
+          // that overlap and keep the call live through guest-side settlement.
+          activeCall.reserve(bytes.byteLength);
+          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));
+        } catch (err) {
+          if (!disposed && ctx.alive) {
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)));
+          }
+        } finally {
+          activeCall.release();
+        }
       },
       (err) => {
-        releaseHostCall();
-        if (disposed || !ctx.alive) return;
-        settleNet("__netReject", callId, ctx.newString(errMessage(err)));
+        try {
+          if (!disposed && ctx.alive) {
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)));
+          }
+        } finally {
+          activeCall.release();
+        }
       },
     );
     return ctx.null;
@@ -389,15 +399,15 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     const result = (async () => {
       let rejectThis!: (err: Error) => void;
       const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
-      pending.add(rejectThis);
+      const untrack = invocationSettler.track(rejectThis);
       let consumed = false;
       try {
         const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
         consumed = true;
         return takeBytes(ctx, ctx.unwrapResult(settled as never));
       } finally {
-        pending.delete(rejectThis);
-        // An invocation that lost the race to failPending has no consumer for the settled
+        untrack();
+        // An invocation that lost the race to failAll has no consumer for the settled
         // result, so if the guest promise still settles afterwards its dup'd handle would be
         // orphaned and abort the module at runtime free. Release it when it lands.
         if (!consumed) {
@@ -411,16 +421,21 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
 
   return {
-    call: serializeCalls(invoke, () =>
-      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null),
+    call: serializeCalls(
+      invoke,
+      () => (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
+      undefined,
+      opts.custodyAllowance,
+    ),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
       // promises can only be settled from inside the realm, so disposing first would
-      // strand every parked caller.
-      failPending(new Error("guest realm disposed"));
+      // strand every parked caller — a DEFERRED one included, whose answer would
+      // otherwise never come (realm-queue.ts's time-bound invariant).
+      invocationSettler.failAll(new Error("guest realm disposed"));
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
-      // continuation runs as a microtask after failPending, and a handle released after its
+      // continuation runs as a microtask after failAll, and a handle released after its
       // context died would abort the whole wasm module. See `newRuntime` for the ordering
       // this deferral buys.
       const timer = setTimeout(() => {

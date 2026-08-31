@@ -10,7 +10,14 @@ export interface RawLink {
   onClose(cb: () => void): void;
   /** `graceful` permits flushing queued writes. */
   close(graceful?: boolean): void;
-  /** Bytes awaiting transmission, used for stall detection. */
+  /** Bytes awaiting transmission — the stall clock's progress signal, and the ONLY thing
+   *  `LinkOutboundOwner.reconcile` (transport-host.ts) has to release custody as writes
+   *  actually leave this adapter. Omit it ONLY when this adapter retains nothing past
+   *  `send` (an in-process fabric handing the buffer straight over); omitting it while
+   *  really buffering leaves that owner no release signal, so the link's charge grows until
+   *  it hits the cumulative ceiling with an empty socket buffer. Implement it and it must
+   *  answer: one that throws asserts nothing, and fails its link on the next write rather
+   *  than being read as "holding nothing". */
   buffered?(): number;
   /** Unauthenticated key for per-source limits; never a peer identity. */
   readonly remoteAddr?: string;

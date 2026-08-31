@@ -18,17 +18,13 @@ import (
 )
 
 const testCloseGrace = time.Second
-const testMaxQueuedBytes = 16 << 20
-const testMaxQueuedSlices = 4096
 
 func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	return newInboundChannel(conn, onMsg, onClose, testCloseGrace,
-		testMaxQueuedBytes, testMaxQueuedSlices)
+	return newInboundChannel(conn, onMsg, onClose, testCloseGrace)
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, onMsg, onClose, testCloseGrace,
-		testMaxQueuedBytes, testMaxQueuedSlices)
+	return newDialChannel(addr, onMsg, onClose, testCloseGrace)
 }
 
 func waitOn(t *testing.T, ch <-chan struct{}, what string) {
@@ -178,8 +174,7 @@ func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 // transport's stall clock. No writer is started, so every byte remains deterministically
 // queued until a non-graceful close drops it.
 func TestSockChannelBufferedReportsQueue(t *testing.T) {
-	c := &sockChannel{wake: make(chan struct{}, 1),
-		maxQueuedBytes: testMaxQueuedBytes, maxQueuedSlices: testMaxQueuedSlices}
+	c := &sockChannel{wake: make(chan struct{}, 1)}
 	c.send([]byte("first"))
 	c.send([]byte("second"))
 	if got := c.buffered(); got != len("firstsecond") {
@@ -188,47 +183,6 @@ func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	c.close(false)
 	if got := c.buffered(); got != 0 {
 		t.Fatalf("buffered after non-graceful close = %d, want 0", got)
-	}
-}
-
-// TestSockChannelOutboundQueueBounds pins both dimensions of the native writer bound. A
-// byte-only ceiling still admits millions of one-byte slice headers; a count-only ceiling
-// still admits a handful of frame-sized allocations. Crossing either fails the channel and
-// releases what it had queued instead of dropping one write out of the ordered stream.
-func TestSockChannelOutboundQueueBounds(t *testing.T) {
-	tests := []struct {
-		name      string
-		maxBytes  int
-		maxSlices int
-		writes    [][]byte
-	}{
-		{name: "bytes", maxBytes: 4, maxSlices: 10,
-			writes: [][]byte{[]byte("aa"), []byte("bb"), []byte("c")}},
-		{name: "slices", maxBytes: 100, maxSlices: 2,
-			writes: [][]byte{[]byte("a"), []byte("b"), []byte("c")}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			closed := make(chan struct{}, 1)
-			c := &sockChannel{
-				onMsg: func([]byte) {}, onClose: func() { closed <- struct{}{} },
-				wake: make(chan struct{}, 1), readGate: newReadGate(),
-				maxQueuedBytes: tt.maxBytes, maxQueuedSlices: tt.maxSlices,
-			}
-			for i, b := range tt.writes {
-				accepted := c.send(b)
-				if i < len(tt.writes)-1 && !accepted {
-					t.Fatalf("write %d was refused below the ceiling", i)
-				}
-				if i == len(tt.writes)-1 && accepted {
-					t.Fatal("write crossing the ceiling was accepted")
-				}
-			}
-			waitOn(t, closed, "outbound queue overflow to fail the channel")
-			if got := c.buffered(); got != 0 {
-				t.Fatalf("overflow retained %d queued bytes", got)
-			}
-		})
 	}
 }
 

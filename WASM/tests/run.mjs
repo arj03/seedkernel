@@ -2832,7 +2832,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     try { await shell.loadBundleBlob(blob, { localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
     const [, candidateLocal] = Function(
-      candidates[0].source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+      candidates[0].source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
     )();
     assert(candidateLocal.custom === "kept",
       "a link slot keeps the load's ordinary installation-local config");

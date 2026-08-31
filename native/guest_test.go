@@ -66,9 +66,6 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	}
 }
 
-// Only "link/deliver" (seedkernel WASM/core/domains.ts isByteMetered) meters bytes: it is
-// fired by the link occupant once per inbound frame with no caller-side window, unlike an
-// ordinary awaited call whose outstanding bytes a caller's own fan-out already bounds.
 func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
@@ -96,11 +93,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 	}
 }
 
-// A caller-windowed op (any name other than "link/deliver") is bounded by COUNT alone: a
-// realm may hold far more than 16 MiB of an ordinary op's payloads outstanding, matching a
-// bounded application fan-out (e.g. seedstore's netSendMany, windowed by its own
-// fanoutWindow) that must not trip the byte cap meant for un-windowed inbound delivery.
-func TestGuestRealmOrdinaryHostCallBytesUnmetered(t *testing.T) {
+func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__heldHostCalls = 0;
@@ -119,11 +112,66 @@ func TestGuestRealmOrdinaryHostCallBytesUnmetered(t *testing.T) {
 		}
 	`, 1000)
 	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
-	if _, err := realmCall("ordinary flood", nil); err != nil {
-		t.Fatalf("an ordinary call name was refused by the byte cap meant only for link/deliver: %v", err)
+	if _, err := realmCall("ordinary flood", nil); err == nil {
+		t.Fatal("an ordinary call name bypassed the universal host-call byte cap")
 	}
-	if got := evalString(t, "String(__heldHostCalls)"); got != "9" {
-		t.Fatalf("host received %s payloads, want all 9 (18 MiB, over the 16 MiB byte cap) uncapped by bytes", got)
+	if got := evalString(t, "String(__heldHostCalls)"); got != "8" {
+		t.Fatalf("host received %s payloads, want exactly 8 before name-blind admission refused the ninth", got)
+	}
+}
+
+func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__heldHostCalls = 0;
+		globalThis.__guestSeam = () => {
+		  __heldHostCalls++;
+		  return new Promise(() => {});
+		};
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() {
+		  __host_call("first", 7, new ArrayBuffer(1));
+		  __host_call("second", 7, new ArrayBuffer(1));
+		  return new Uint8Array();
+		}
+	`, 1000)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	if _, err := realmCall("duplicate", nil); err == nil {
+		t.Fatal("a duplicate live host-call id was accepted")
+	}
+	if got := evalString(t, "String(__heldHostCalls)"); got != "1" {
+		t.Fatalf("host received %s payloads, want one before duplicate-id rejection", got)
+	}
+}
+
+// TestGuestRealmNodeAllowanceIsProcessScoped drives bridge.createRealm directly (not
+// through native-shim.ts's RealmFactory, which always restates the same shared defaults —
+// so a mismatch never arises through the production call path) with two DIFFERENT declared
+// node-host-call ceilings, standing in for two legitimate shells sharing one process.
+// Before the fix this errored on the second call ("node host-call limits changed after
+// initialization"); the ceiling is process-scoped by design (see the var block above
+// guestRealm), so a later caller's numbers must simply replace the earlier ones, never be
+// refused for disagreeing with them.
+func TestGuestRealmNodeAllowanceIsProcessScoped(t *testing.T) {
+	bootRealm(t)
+	mk := func(id, nodeCalls, nodeBytes int64) error {
+		src := fmt.Sprintf(
+			`bridge.createRealm(%d, "function handle(){ return new Uint8Array(); }", () => {}, %d, 1000, 10, 1048576, %d, %d)`,
+			id, 64<<20, nodeCalls, nodeBytes)
+		_, err := qc.Eval("mk.js", qjs.Code(src))
+		return err
+	}
+	if err := mk(1, 5, 4096); err != nil {
+		t.Fatalf("first realm declaring its own node ceiling: %v", err)
+	}
+	if err := mk(2, 9, 8192); err != nil {
+		t.Fatalf("a second realm declaring a DIFFERENT node ceiling must not be refused: %v", err)
+	}
+	if maxNodeHostCalls != 9 || maxNodeHostBytes != 8192 {
+		t.Fatalf("the process-scoped ceiling should track the latest caller, got %d/%d", maxNodeHostCalls, maxNodeHostBytes)
 	}
 }
 
@@ -178,7 +226,10 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	`)
 	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
 
-	g := realms[realmSeq]
+	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which stands the host realm up
+	// fresh (host-shell.gen.js re-evaluates, resetting native-shim.ts's own realm-id
+	// counter), and newTestRealm above is the first createRealm this test makes.
+	g := realms[1]
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
 	}

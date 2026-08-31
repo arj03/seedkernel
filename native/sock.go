@@ -36,8 +36,6 @@ type netHost struct {
 	// Policy values installed by host/native-shim.ts before any socket is opened.
 	maxLiveChannels int
 	closeGrace      time.Duration
-	maxQueuedBytes  int
-	maxQueuedSlices int
 
 	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
@@ -53,25 +51,21 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 4 {
+		if len(t.Args()) < 2 {
 			return nil, errors.New("net: no socket limits supplied")
 		}
 		maxLive := int(t.Args()[0].Int64())
 		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
-		maxQueuedBytes := int(t.Args()[2].Int64())
-		maxQueuedSlices := int(t.Args()[3].Int64())
-		if maxLive <= 0 || grace <= 0 || maxQueuedBytes <= 0 || maxQueuedSlices <= 0 {
+		if maxLive <= 0 || grace <= 0 {
 			return nil, errors.New("net: invalid socket limits")
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.maxLiveChannels != 0 || n.closeGrace != 0 || n.maxQueuedBytes != 0 || n.maxQueuedSlices != 0 {
+		if n.maxLiveChannels != 0 || n.closeGrace != 0 {
 			return nil, errors.New("net: socket limits already installed")
 		}
 		n.maxLiveChannels = maxLive
 		n.closeGrace = grace
-		n.maxQueuedBytes = maxQueuedBytes
-		n.maxQueuedSlices = maxQueuedSlices
 		return t.Context().NewUndefined(), nil
 	}))
 
@@ -198,8 +192,7 @@ func (n *netHost) allocInbound() (int64, bool) {
 // pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately.
 func (n *netHost) dial(addr string) int64 {
 	id := n.alloc()
-	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace,
-		n.maxQueuedBytes, n.maxQueuedSlices)
+	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
 	n.mu.Lock()
 	n.chans[id] = ch
 	n.mu.Unlock()
@@ -271,8 +264,7 @@ func (n *netHost) closeListeners() {
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
 func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
-	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace,
-		n.maxQueuedBytes, n.maxQueuedSlices)
+	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return c, func() { go c.readLoop() }
 }
 
