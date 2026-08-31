@@ -67,6 +67,10 @@ export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
  *  none can be looser about what a bundle may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
+/** Metadata bound for one signed bundle. The memory sum below normally binds first, but
+ *  zero-memory declarations must not turn admission into an unbounded module-array walk. */
+export const DEFAULT_MAX_BUNDLE_MODULES = 256;
+
 /** The default in-memory `Fs` backend's whole quota (host/fs-memory.ts `MemoryFs`), so a
  *  successful put cannot turn bounded in-flight calls into unbounded permanent process RAM.
  *  Declared here rather than in fs-memory.ts so the total below can name it without core
@@ -77,15 +81,15 @@ export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 // Every owner above is finite, but only their SUM is checkable against real machine RAM.
 // Adding a node-scoped owner of admitted host memory means adding its term here, not just
 // declaring its own constant. A FLOOR, not a worst case: the last two terms are counted once
-// each, and nothing bounds how many realms a shell installs or how many modules a bundle
-// ships, so a node running N apps multiplies them.
+// each, and nothing bounds how many realms/bundles a shell installs, so a node running N
+// apps multiplies them.
 export const DERIVED_NODE_MEMORY_CEILING_BYTES =
     DEFAULT_MAX_NODE_HOST_CALL_BYTES // active host calls and timer payloads, one shared pool
   + MAX_NODE_OUTBOUND_QUEUE_BYTES    // §12.6 — outbound socket queues, aggregated over every link
   + MAX_INBOUND_HOLD_BYTES           // §12.6 — inbound reads held above an unpausable adapter
   + DEFAULT_MEMORY_FS_MAX_BYTES      // the in-memory fs backend's whole quota
   + DEFAULT_REALM_MEMORY_BYTES       // §12.3 — ONE realm's heap cap — see the floor note above
-  + DEFAULT_MAX_MODULE_MEMORY_BYTES; // §4.3 — ONE module's declared memory — see the floor note above
+  + DEFAULT_MAX_MODULE_MEMORY_BYTES; // §4.3 — ONE bundle's aggregate module memory
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether

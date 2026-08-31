@@ -408,6 +408,30 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
   assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
 });
 
+await test("PRE-AUTH QUEUE: tiny frames are bounded by count", async (keep) => {
+  let msg1 = null;
+  let holdHandshake = true;
+  const chans = wirePair({
+    tamper: (bytes, from) => {
+      if (from === "A" && holdHandshake) { msg1 = Uint8Array.from(bytes); return null; }
+      return bytes;
+    },
+  });
+  const st = keep(await linked(chans, { transportConfig: { maxPreAuthQueueSlices: 8 } }));
+  await until(() => msg1 !== null, 4000, "the held msg1");
+  for (let i = 0; i < 12; i++) {
+    await st.A.sendNoReply(st.B.peerId, PROTO, Uint8Array.of(i));
+  }
+
+  holdHandshake = false;
+  chans[1].msg(msg1);
+  await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake after queueing");
+  await until(async () => (await st.B.seen()).length === 8, 4000, "the bounded queue to flush");
+  const seen = await st.B.seen();
+  assert(seen.every((payload, i) => payload[0] === i + 4),
+    `the queue must retain only its newest 8 frames (got ${seen.map((p) => p[0]).join(",")})`);
+});
+
 await test("REASSEMBLY: a frame dribbled one byte at a time is still one message", async (keep) => {
   // A dribbled full-size frame is where both naive assemblers get it wrong — quadratic
   // copying if every slice is joined onto one buffer, ~50x the cap in pinned chunks if
@@ -1376,6 +1400,8 @@ await test("default caps are sane", async () => {
     "verified cap should be a real bound");
   assert(defaults.maxHalfOpenPerSource > 0 && defaults.maxHalfOpenPerSource < defaults.maxHalfOpenUnverified,
     "the per-source cap must bound one source well below the whole budget");
+  assert(defaults.maxPreAuthQueueSlices > 0 && defaults.maxPreAuthQueueSlices <= 4096,
+    "the pre-auth queue needs a finite object-count bound");
   // The three signed numbers this rework moved out of per-link options and into the
   // node-level, signed transport config.
   assert(defaults.handshakeTimeoutMs > 0, "the dialer's whole-handshake deadline must be a real bound");

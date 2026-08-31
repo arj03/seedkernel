@@ -136,7 +136,7 @@ func (c *sockChannel) send(bytes []byte) bool {
 }
 
 // buffered is the transport-owned stall clock's view of this socket: bytes accepted from
-// the guest but not yet handed to conn.Write. The bundle decides how much queued progress
+// the guest whose conn.Write has not completed. The bundle decides how much queued progress
 // is acceptable; this primitive only reports the fact.
 func (c *sockChannel) buffered() int {
 	c.mu.Lock()
@@ -198,12 +198,18 @@ func (c *sockChannel) writeLoop() {
 		if len(c.queue) == 0 {
 			c.queue = nil // drained: free the backing array instead of pinning its high-water cap
 		}
-		c.queued -= len(b)
 		c.mu.Unlock()
 		// If a close()-initiated flush hits a write error, fail() is a no-op (dead is set)
 		// and the remaining writes error instantly on the closed conn — the loop still
 		// terminates, it just drains fast.
 		c.writeMsg(b)
+		c.mu.Lock()
+		// Keep the slice visible to buffered() while conn.Write owns it. A concurrent
+		// hard close/fail may already have released the whole allowance.
+		if c.queued >= len(b) {
+			c.queued -= len(b)
+		}
+		c.mu.Unlock()
 	}
 }
 

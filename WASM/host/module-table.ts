@@ -12,7 +12,7 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 // ─── module routing ─────────────────────────────────────────────────────
 
 export interface ModuleTableOptions {
-  /** Ceiling on a module's declared initial *and* maximum linear memory, in bytes.
+  /** Ceiling on each module and on the bundle's aggregate declared maximum memory.
    *  A module above it — or one declaring no maximum at all — is refused at load
    *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
    *  this table to something tighter than a bundle may land.

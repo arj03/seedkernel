@@ -186,6 +186,46 @@ func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	}
 }
 
+// TestSockChannelBufferedIncludesBlockedWrite pins the handoff edge: popping a slice from
+// the Go queue does not release its driver-visible bytes while conn.Write still retains it.
+func TestSockChannelBufferedIncludesBlockedWrite(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	c := newTestInboundChannel(c1, func([]byte) {}, func() {})
+	payload := []byte("blocked")
+	c.send(payload)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		popped := len(c.queue) == 0
+		c.mu.Unlock()
+		if popped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer never popped the queued slice")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := c.buffered(); got != len(payload) {
+		t.Fatalf("buffered during blocked Write = %d, want %d", got, len(payload))
+	}
+
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(c2, buf); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for c.buffered() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("completed Write did not release buffered bytes")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.close(false)
+}
+
 // TestSockChannelDialFailureFiresOnClose covers the dial-error path: a background
 // dial that cannot connect fails the channel, and onClose is how the owner learns.
 func TestSockChannelDialFailureFiresOnClose(t *testing.T) {

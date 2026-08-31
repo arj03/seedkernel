@@ -18,7 +18,7 @@ const sodium = _sodium;
 
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES }
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES }
   = await imp("build/core/wasm-limits.js");
 const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES }
   = await imp("build/core/net-limits.js");
@@ -91,6 +91,17 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   // 128 MiB declared against a loader that would allow 1 GiB: the shared ceiling still wins.
   await rejects(loadBundleModules(stub(1 << 30), bundleOf(memModule(1, 2048))),
     "a loader's LOOSER ceiling cannot raise what a bundle may land");
+  await rejects(loadBundleModules(stub(undefined), {
+    modules: [
+      { mod: { name: "a" }, wasm: memModule(1, 600) },
+      { mod: { name: "b" }, wasm: memModule(1, 600) },
+    ],
+  }), "module maxima are bounded in aggregate across one bundle");
+  await rejects(loadBundleModules(stub(undefined), {
+    modules: Array.from({ length: DEFAULT_MAX_BUNDLE_MODULES + 1 }, (_, i) => ({
+      mod: { name: `m${i}` }, wasm: memModule(0, 0),
+    })),
+  }), "a bundle cannot evade memory accounting with unbounded zero-memory modules");
 
   const host = new ModuleTable();
   const loaded = await host.build([{ name: "ok", wasm: withMax }]);
@@ -166,9 +177,12 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
   ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", requires: [] } }) !== null,
-    "a guest may declare no modules at all — zero-to-many, no count rule");
+    "a guest may declare no modules at all");
   ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", requires: [] } }) !== null,
-    "a guest may declare many modules — the guest dispatches them");
+    "a guest may declare multiple modules within the admission cap");
+  const tooMany = Array.from({ length: DEFAULT_MAX_BUNDLE_MODULES + 1 }, (_, i) => ({ name: `m${i}`, hash: "aa" }));
+  ok(refusal({ app: "x", version: 1, modules: tooMany, guest: { hash: "aa", requires: [] } }).includes("malformed manifest"),
+    "the manifest module-count cap is enforced before file extraction");
   for (const version of [-1, Number.MAX_SAFE_INTEGER + 1]) {
     ok(refusal({ app: "x", version, modules: [], guest: { hash: "aa", requires: [] } }).includes("malformed manifest"),
       `version ${version} is refused before it can poison freshness state`);

@@ -105,7 +105,7 @@ class LengthFramer {
     const out = new Uint8Array(4 + msg.length);
     writeU32BE(out, 0, msg.length);
     out.set(msg, 4);
-    this.put(out);
+    return this.put(out);
   }
 
   raiseCap() { this.cap = maxFrameBytes; }
@@ -156,8 +156,8 @@ class WsFramer {
     this.client = weDialed;
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
     this.parts = new ByteParts();      // inbound: handshake head, then frames
-    this.queue = [];                   // outbound, until the upgrade completes
     this.open = false;
+    this.opened = new Promise((resolve) => { this.resolveOpen = resolve; });
     this.fragOpcode = -1;
     this.frags = [];
     this.fragBytes = 0;
@@ -205,28 +205,21 @@ class WsFramer {
   }
 
   /** Append one write to the wire chain: frame the message, then put it — in order,
-   *  when its module call answers. A failure drops the frame: the link is dying (or
-   *  dead) anyway, and the peer's read side or the idle clock notices. */
+   *  when its module call answers. */
   enqueue(opcode, payload) {
-    this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => { this.put(f); }).catch(() => {});
+    return this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => this.put(f));
   }
 
-  send(msg) {
-    // The transport emits its HELLO before the upgrade finishes, so frames queue until
-    // the channel opens.
-    if (!this.open) { this.queue.push(msg); return; }
-    this.enqueue(WS_OP_BINARY, msg);
+  async send(msg) {
+    await this.opened;
+    await this.enqueue(WS_OP_BINARY, msg);
   }
 
   /** The close frame rides the same byte stream after the end-of-stream record just
    *  written, so it cannot overtake it — the ordering that record depends on. */
   goodbye() {
-    if (this.open) this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL);
+    return this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL);
   }
-
-  /** Wait for every pending write; used so the EOS record and the close frame land on
-   *  the wire before the host channel closes. */
-  flush() { return this.writes; }
 
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
    *  that keeps two parses from running at once, which matters twice: `frames()` takes a
@@ -247,8 +240,7 @@ class WsFramer {
       if (consumed < 0) return this.parts.length <= MAX_WS_HANDSHAKE;
       this.parts.take(consumed);
       this.open = true;
-      for (const m of this.queue) this.enqueue(WS_OP_BINARY, m);
-      this.queue = [];
+      this.resolveOpen();
     }
     try { return await this.frames(deliver); } catch { return false; }
   }
@@ -327,7 +319,7 @@ class WsFramer {
 
   async dispatch(opcode, payload, deliver) {
     if (opcode === WS_OP_BINARY) deliver(payload);
-    else if (opcode === WS_OP_PING) this.enqueue(WS_OP_PONG, payload);
+    else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
     return true;
   }
