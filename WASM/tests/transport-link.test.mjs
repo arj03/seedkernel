@@ -472,6 +472,46 @@ await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied",
   assert(!st.a.closed && !st.b.closed, "a refused send must not disturb the link");
 });
 
+await test("OUTBOUND QUEUE: authenticated encryption work is bounded", async (keep) => {
+  // Hold A's first post-auth seal below the guest realm. Every later send can return to
+  // its app but must remain on Link's ordered work chain, exactly the queue a peer that
+  // refuses to read can otherwise grow without reaching a socket-side limit.
+  let stallSeals = false;
+  let releaseSeal = null;
+  const slowSodium = Object.create(sodium);
+  Object.defineProperty(slowSodium, "crypto_aead_chacha20poly1305_ietf_encrypt", {
+    value: (...args) => {
+      const seal = () => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(...args);
+      if (!stallSeals) return seal();
+      return new Promise((resolve) => { releaseSeal = () => resolve(seal()); });
+    },
+  });
+
+  // A 512-byte frame cap makes the matching eight-frame work window 4096 bytes, small
+  // enough to cross without allocating the production 16 MiB in this regression test.
+  const cfg = { maxFrameBytes: 512 };
+  const st = keep(await upPair(undefined,
+    { sodium: slowSodium, transportConfig: cfg },
+    { transportConfig: cfg }));
+  stallSeals = true;
+  const payload = new Uint8Array(400); // wire plaintext frame: 6 + PROTO.length + 400
+  await st.A.sendNoReply(st.B.peerId, PROTO, payload);
+  await until(() => releaseSeal !== null, 3000, "the first authenticated seal to stall");
+
+  // Nine such frames fit (3744 bytes); the tenth would take the queued plaintext to
+  // 4160 and must abort the link. No partial ordered record is silently discarded.
+  for (let i = 1; i < 10; i++) await st.A.sendNoReply(st.B.peerId, PROTO, payload);
+  // abort() deliberately tears down behind the active crypto step so it cannot zero a key
+  // under that step. Release only that first seal: if the ceiling did not latch `closed`,
+  // the next queued seal stalls and this assertion times out.
+  const releaseFirstSeal = releaseSeal;
+  releaseSeal = null;
+  releaseFirstSeal();
+  await until(() => st.a.closed, 3000, "the outbound encryption queue to close its link");
+  assert(st.a.reason === CLOSE_REASON.LOCAL,
+    `an outbound queue overflow must be a local abort, got reason ${st.a.reason}`);
+});
+
 await test("IDLE: an authenticated link carrying no traffic is retired", async (keep) => {
   // The handshake deadlines stop applying the moment a link authenticates, so without an
   // idle clock a quiet link is held forever with its framer, session keys, timers and
@@ -1123,7 +1163,7 @@ await test("DRIVER BACKPRESSURE: a peer outrunning the realm loses its link", as
   await settle(0);
 
   const SLICE = 1 << 20; // 1 MiB, well under the per-delivery frame cap
-  const over = Math.floor(MAX_INBOUND_HOLD_BYTES / SLICE) + 2; // one dispatched, the rest held
+  const over = Math.floor(MAX_INBOUND_HOLD_BYTES / SLICE) + 2; // aggregate includes the dispatched read
   for (let i = 0; i < over && channel.closes === 0; i++) channel.emit(new Uint8Array(SLICE));
   assert(channel.closes === 1, "a peer past the hold bound must have its link closed");
   assert(h.reads.length === 1, `only the dispatched read may reach the realm, got ${h.reads.length}`);
@@ -1139,12 +1179,55 @@ await test("DRIVER BACKPRESSURE: tiny messages cannot outrun the hold by count",
   await settle(0);
 
   const one = Uint8Array.of(9);
-  const over = MAX_INBOUND_HOLD_SLICES + 2; // one dispatched, MAX held, one past the bound
+  const over = MAX_INBOUND_HOLD_SLICES + 2; // aggregate includes the dispatched read
   let sent = 0;
   for (; sent < over && channel.closes === 0; sent++) channel.emit(one);
   assert(channel.closes === 1, "a peer past the slice bound must have its link closed");
   assert(sent * one.length < MAX_INBOUND_HOLD_BYTES,
     "the count bound must bite long before the byte bound it backs up");
+});
+
+await test("DRIVER BACKPRESSURE: the inbound slice budget is shared by every link", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const first = new UnpausableChannel();
+  const second = new UnpausableChannel();
+  h.factory.give(first);
+  h.factory.give(second);
+  await settle(0);
+
+  // Two dispatched reads already occupy two reservations. Fill the remaining allowance
+  // behind only the first link; one more slice on the otherwise-empty second link must be
+  // refused by the DRIVER total, not admitted under a fresh per-link allowance.
+  first.emit(Uint8Array.of(1));
+  second.emit(Uint8Array.of(2));
+  for (let i = 2; i < MAX_INBOUND_HOLD_SLICES; i++) first.emit(Uint8Array.of(3));
+  assert(first.closes === 0 && second.closes === 0,
+    "the exact aggregate slice ceiling must remain admitted");
+  second.emit(Uint8Array.of(4));
+  assert(second.closes === 1 && first.closes === 0,
+    "the link crossing the shared slice ceiling must fail without closing its neighbour");
+  assert(h.reads.length === 2, `both dispatched reads count while stalled (got ${h.reads.length})`);
+});
+
+await test("DRIVER BACKPRESSURE: the inbound byte budget is shared by every link", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const first = new UnpausableChannel();
+  const second = new UnpausableChannel();
+  h.factory.give(first);
+  h.factory.give(second);
+  await settle(0);
+
+  const frame = new Uint8Array(MAX_INBOUND_HOLD_BYTES / 8);
+  first.emit(frame);
+  second.emit(frame);
+  for (let i = 2; i < 8; i++) first.emit(frame);
+  assert(first.closes === 0 && second.closes === 0,
+    "the exact aggregate byte ceiling must remain admitted");
+  second.emit(Uint8Array.of(5));
+  assert(second.closes === 1 && first.closes === 0,
+    "the link crossing the shared byte ceiling must fail without closing its neighbour");
 });
 
 // A read the transport answers with "no route" is over before it began, so a full hold

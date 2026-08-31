@@ -13,7 +13,8 @@ import {
 } from "quickjs-emscripten-core";
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
 // ceiling and the same budget whether its realm is this one or the native target's.
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { isByteMetered } from "../core/domains.js";
 import { errMessage } from "../core/util.js";
 // The in-repo quickjs-ng build (quickjs/): the same v0.16.1 the native loader compiles,
 // emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
@@ -27,7 +28,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
-import { serializeCalls, type Invocation } from "./realm-queue.js";
+import { createOutstandingHostCallBudget, serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
@@ -121,14 +122,6 @@ function stageArg(ctx: QuickJSContext, payload: Uint8Array): void {
   argHandle.dispose();
 }
 
-/** Copy an op payload out of WASM memory (the buffer may move under us). */
-function copyPayload(ctx: QuickJSContext, payloadHandle: QuickJSHandle): Uint8Array {
-  const lt = ctx.getArrayBuffer(payloadHandle);
-  const payload = lt.value.slice();
-  lt.dispose();
-  return payload;
-}
-
 /** Take ownership of a result handle and copy its bytes out (copy boundary). The handle
  *  must go back even when the value is not an ArrayBuffer: an orphaned handle keeps its
  *  object on the runtime's GC list, which aborts the module at runtime free. */
@@ -198,7 +191,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
-  let outstandingHostCalls = 0;
+  const outstandingHostCalls = createOutstandingHostCallBudget();
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -279,31 +272,39 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // `Promise.resolve` flattens an inline answer too, so no continuation ever re-enters
   // the realm inside the frame that issued the call.
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
-    if (outstandingHostCalls >= DEFAULT_MAX_OUTSTANDING_HOST_CALLS) {
-      throw new Error(`guest: too many outstanding host calls (cap ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS})`);
-    }
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
     // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment is
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
+    // Inspect the borrowed view first, reserve both count and bytes, and only then copy.
+    // `getArrayBuffer` owns a lifetime but not another payload-sized allocation.
+    const [payload, releaseHostCall] = (() => {
+      const borrowed = ctx.getArrayBuffer(payloadHandle);
+      try {
+        const release = outstandingHostCalls.acquire(borrowed.value.byteLength, isByteMetered(name));
+        try { return [borrowed.value.slice(), release] as const; }
+        catch (err) { release(); throw err; }
+      } finally {
+        borrowed.dispose();
+      }
+    })();
     let answer: Promise<Uint8Array> | Uint8Array;
-    outstandingHostCalls++;
     try {
-      answer = opts.hostCall(name, copyPayload(ctx, payloadHandle), budget);
+      answer = opts.hostCall(name, payload, budget);
     } catch (err) {
-      outstandingHostCalls--;
+      releaseHostCall();
       throw err;
     }
     void Promise.resolve(answer).then(
       (bytes) => {
-        if (outstandingHostCalls > 0) outstandingHostCalls--;
+        releaseHostCall();
         if (disposed || !ctx.alive) return;
         settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));
       },
       (err) => {
-        if (outstandingHostCalls > 0) outstandingHostCalls--;
+        releaseHostCall();
         if (disposed || !ctx.alive) return;
         settleNet("__netReject", callId, ctx.newString(errMessage(err)));
       },
@@ -327,7 +328,6 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // A candidate that cannot initialize never reaches the returned dispose seam. Free it
     // here, or repeated rejected installs turn a bounded guest into an unbounded host leak.
     disposed = true;
-    outstandingHostCalls = 0;
     disposePhantoms();
     try {
       if (ctx.alive) ctx.dispose();
@@ -415,7 +415,6 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       (disposed || !ctx.alive) ? new Error("guest realm disposed") : null),
     dispose(): void {
       disposed = true;
-      outstandingHostCalls = 0;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller.

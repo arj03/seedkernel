@@ -11,7 +11,10 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const rtc = await imp("build/host/net-rtc.js");
-const { RtcChannel, RtcNetwork, RTC_CHUNK_BYTES } = rtc;
+const {
+  RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
+  MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES, UNESTABLISHED_PEER_TTL_MS,
+} = rtc;
 import { testkit } from "./testkit.mjs";
 
 const { test, assert, summary } = testkit();
@@ -20,8 +23,22 @@ const { test, assert, summary } = testkit();
 // peer connection ESTABLISHES — DTLS/ICE completes (`PeerEntry.established`) — not once the
 // transport link above it authenticates, so a genuine fleet is unconstrained; only NEW
 // speculative entries are.
-const MAX_UNESTABLISHED_PEERS = 256;
 const peerId = (n) => String(n).padStart(64, "0");
+
+function stubPeerConnection() {
+  const listeners = new Map();
+  const pc = {
+    signalingState: "stable", connectionState: "new", remoteDescription: null,
+    closed: false,
+    addEventListener(type, cb) { listeners.set(type, cb); },
+    createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
+    async setRemoteDescription(sdp) { this.remoteDescription = sdp; },
+    async setLocalDescription() {},
+    async addIceCandidate() {},
+    close() { this.closed = true; },
+  };
+  return { pc, listeners };
+}
 
 console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.6.1)\n");
 
@@ -174,6 +191,95 @@ await test("offers cannot force more than MAX_UNESTABLISHED_PEERS peer entries",
   assert(pcs.n === MAX_UNESTABLISHED_PEERS, "and no further connections may have been opened");
 
   net.close();
+});
+
+await test("pending ICE is normalized and bounded by candidate count", async () => {
+  let receive = () => {};
+  const made = [];
+  const net = new RtcNetwork({
+    peerId: peerId(0),
+    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
+    peerConnectionFactory: () => {
+      const madePc = stubPeerConnection();
+      made.push(madePc);
+      return madePc.pc;
+    },
+  });
+  const remote = peerId(1);
+  await receive({ type: "hello", from: remote, to: peerId(0) });
+  const original = {
+    candidate: "candidate:1", sdpMid: "0", sdpMLineIndex: 0,
+    usernameFragment: "u", extra: { retained: new Uint8Array(1024) },
+  };
+  await receive({ type: "ice", from: remote, to: peerId(0), candidate: original });
+  const entry = net.peers.get(remote);
+  assert(entry.pendingIce.length === 1, "a valid early candidate must be queued");
+  assert(entry.pendingIce[0] !== original && !("extra" in entry.pendingIce[0]),
+    "the pending queue must retain a normalized candidate, never the signaling object");
+
+  for (let i = 1; i < MAX_PENDING_ICE_CANDIDATES; i++) {
+    await receive({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: `candidate:${i}` } });
+  }
+  assert(entry.pendingIce.length === MAX_PENDING_ICE_CANDIDATES && !made[0].pc.closed,
+    "the exact pending-candidate count ceiling must remain admitted");
+  await receive({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: "one-too-many" } });
+  assert(!net.peers.has(remote) && made[0].pc.closed,
+    "crossing the pending-candidate count ceiling must release the speculative peer");
+  net.close();
+});
+
+await test("pending ICE is bounded by aggregate string bytes", async () => {
+  let receive = () => {};
+  const made = stubPeerConnection();
+  const ownId = peerId(0);
+  const remote = peerId(1);
+  const net = new RtcNetwork({
+    peerId: ownId,
+    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
+    peerConnectionFactory: () => made.pc,
+  });
+  await receive({ type: "hello", from: remote, to: ownId });
+  // Candidate accounting uses the worst-case two bytes per JS string code unit.
+  const full = "x".repeat(MAX_PENDING_ICE_BYTES / 2);
+  await receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: full } });
+  assert(net.peers.get(remote).pendingIceBytes === MAX_PENDING_ICE_BYTES,
+    "the exact pending ICE byte ceiling must remain admitted");
+  await receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "x" } });
+  assert(!net.peers.has(remote) && made.pc.closed,
+    "crossing the pending ICE byte ceiling must release the speculative peer");
+  net.close();
+});
+
+await test("an unestablished peer expires on a host-owned deadline", async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => {
+    const timer = { fn, ms, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = (timer) => { timer.cleared = true; };
+  let net;
+  try {
+    const made = stubPeerConnection();
+    net = new RtcNetwork({
+      peerId: peerId(0),
+      signaling: { send() {}, onMessage() {}, close() {} },
+      peerConnectionFactory: () => made.pc,
+    });
+    const remote = peerId(1);
+    await net.onSignal({ type: "hello", from: remote, to: peerId(0) });
+    assert(timers.length === 1 && timers[0].ms === UNESTABLISHED_PEER_TTL_MS,
+      "creating a speculative peer must arm the documented establishment deadline");
+    timers[0].fn();
+    assert(!net.peers.has(remote) && made.pc.closed,
+      "the establishment deadline must close and forget a zombie peer");
+  } finally {
+    net?.close();
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
 });
 
 summary("net-rtc signaling boundary and speculative-entry cap");

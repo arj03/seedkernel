@@ -87,6 +87,16 @@ const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs
 export function isIrreversible(name: string): boolean {
     return IRREVERSIBLE.has(name);
 }
+/** Calls whose outstanding COUNT a caller's own logic already bounds (an app awaits its
+ *  own fan-out, windowed by its own concurrency policy) but whose outstanding BYTES it
+ *  does not: `link/deliver` is fired by the link occupant once per inbound frame it
+ *  decodes, with no caller-side window between one peer's request and the next — so it
+ *  is the one host.call a realm's own byte budget (realm-queue.ts) must meter. Every
+ *  host.call still counts against that realm's COUNT budget regardless. */
+const BYTE_METERED: ReadonlySet<string> = new Set<CapabilityName>(["link/deliver"]);
+export function isByteMetered(name: string): boolean {
+    return BYTE_METERED.has(name);
+}
 // Manifest suite: first byte of the envelope, covered by the signature. Channel suite
 // lives in the transport bundle (ake.js), not here — §14.1.
 /** Hybrid Ed25519 + ML-DSA-65, both must verify. `0x01` retired, `0x03` next. */

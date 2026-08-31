@@ -246,6 +246,18 @@ func (v *Value) toByteArray() []byte {
 	return out
 }
 
+// byteArrayLength reads an ArrayBuffer's live size without copying its contents. As with
+// toByteArray, QJS_GetArrayBuffer's packed cell is the only allocation this owns.
+func (v *Value) byteArrayLength() (int64, error) {
+	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
+	if packed == 0 {
+		return 0, errors.New("qjs: value is not a byte array")
+	}
+	_, size := v.c.rt.unpackPtr(packed)
+	v.c.rt.freeAt(packed)
+	return int64(size), nil
+}
+
 // toByteArrayWindow copies just the [offset, offset+length) window, with the same
 // ownership story as toByteArray. The window is validated against the buffer size QuickJS
 // itself reports — never the caller's numbers alone — so a forged byteOffset/byteLength
@@ -416,4 +428,34 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	offset := input.GetPropertyStr("byteOffset").Int64()
 	length := input.GetPropertyStr("byteLength").Int64()
 	return buffer.toByteArrayWindow(offset, length)
+}
+
+// JsTypedArrayByteLength validates the same TypedArray/DataView/ArrayBuffer shapes as
+// JsTypedArrayToGo and returns the view width without making the payload-sized Go copy.
+// Resource gates use it before crossing that copy boundary.
+func JsTypedArrayByteLength(input *Value) (int64, error) {
+	if input == nil || !input.IsObject() {
+		return 0, errors.New("qjs: expected a typed array or ArrayBuffer")
+	}
+	if input.isByteArray() {
+		return input.byteArrayLength()
+	}
+	buffer := input.GetPropertyStr("buffer")
+	defer buffer.Free()
+	if buffer.IsUndefined() || buffer.IsNull() {
+		return 0, errors.New("qjs: value has no ArrayBuffer backing")
+	}
+	if !buffer.isByteArray() {
+		return 0, errors.New("qjs: value is not a byte array")
+	}
+	offset := input.GetPropertyStr("byteOffset").Int64()
+	length := input.GetPropertyStr("byteLength").Int64()
+	bufferLength, err := buffer.byteArrayLength()
+	if err != nil {
+		return 0, err
+	}
+	if offset < 0 || length < 0 || offset > bufferLength || length > bufferLength-offset {
+		return 0, errors.New("qjs: typed array view out of range")
+	}
+	return length, nil
 }

@@ -10,14 +10,26 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { serializeCalls } from "./realm-queue.js";
+import { createOutstandingHostCallBudget, serializeCalls } from "./realm-queue.js";
+import { isByteMetered } from "../core/domains.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
-import { DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS } from "../core/net-limits.js";
+import {
+  DEFAULT_MAX_RAW_LINKS,
+  MAX_OUTBOUND_QUEUE_BYTES,
+  MAX_OUTBOUND_QUEUE_SLICES,
+  TCP_LINGER_MS,
+} from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKey } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
+import {
+  DEFAULT_GUEST_DEADLINE_MS,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  DEFAULT_REALM_MEMORY_BYTES,
+  DEFAULT_SCRATCH_SIZE,
+} from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
 // program that is the node's network (§12.6).
@@ -53,7 +65,8 @@ declare const bridge: {
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
-  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
+  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
+              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
   realmCall(realm: number, payload: Uint8Array,
@@ -170,14 +183,14 @@ export const fs: Fs = {
 /** Go's raw byte-stream primitives (§12.1). */
 declare const __net: {
   /** Install host-owned socket limits before any channel can be opened. */
-  install(maxLiveChannels: number, closeGraceMs: number): void;
+  install(maxLiveChannels: number, closeGraceMs: number, maxQueuedBytes: number, maxQueuedSlices: number): void;
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
   /** Bind a listener; returns the bound port, or -1 on failure. */
   listen(host: string, port: number): number;
   /** Queue bytes for the writer goroutine (never blocks the loop goroutine). */
-  send(id: number, bytes: Uint8Array): void;
+  send(id: number, bytes: Uint8Array): boolean;
   /** Bytes queued for the writer goroutine but not yet handed to the socket. */
   buffered(id: number): number;
   /** Release the next socket read after one serialized transport-realm invocation. */
@@ -189,7 +202,8 @@ declare const __net: {
 
 // Policy values live in shared TypeScript and cross once when the primitive is installed;
 // Go retains the mechanisms that must act before JS can observe an accepted socket.
-__net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS);
+__net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS,
+  MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES);
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //
@@ -212,7 +226,9 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
   return {
     stream: true,
     remoteAddr,
-    send: (bytes) => __net.send(id, bytes),
+    send: (bytes) => {
+      if (!__net.send(id, bytes)) throw new Error("socket: outbound queue limit exceeded");
+    },
     buffered: () => __net.buffered(id),
     // Go consumes a one-read token before invoking us, so the false edge is already
     // applied at the socket; the true edge returns the token after the realm turn.
@@ -382,37 +398,37 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
     // second charge when guest-seam's common module path settles.
-    let outstandingHostCalls = 0;
+    const outstandingHostCalls = createOutstandingHostCallBudget();
     const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
-        if (outstandingHostCalls >= DEFAULT_MAX_OUTSTANDING_HOST_CALLS) {
-            throw new Error(`guest: too many outstanding host calls (cap ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS})`);
-        }
+        // The bridge has already made the cross-realm ArrayBuffer; reserve it before
+        // exposing a view to hostCall, which may retain that view until its promise settles.
+        const releaseHostCall = outstandingHostCalls.acquire(payload.byteLength, isByteMetered(name));
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
         };
         let answer: Promise<Uint8Array> | Uint8Array;
-        outstandingHostCalls++;
         try {
             answer = hostCall(name, new Uint8Array(payload), budget);
         } catch (e) {
-            outstandingHostCalls--;
+            releaseHostCall();
             throw e;
         }
         void Promise.resolve(answer).then(
             (bytes: Uint8Array) => {
-                if (outstandingHostCalls > 0) outstandingHostCalls--;
+                releaseHostCall();
                 bridge.realmSettle(realm, callId, bytes, null);
             },
             (e: unknown) => {
-                if (outstandingHostCalls > 0) outstandingHostCalls--;
+                releaseHostCall();
                 bridge.realmSettle(realm, callId, null, errMessage(e));
             },
         );
         return null;
     };
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
+        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
+        DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
     let disposed = false;
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm

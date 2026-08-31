@@ -37,6 +37,10 @@ export interface PeerEntry {
   polite: boolean;
   makingOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
+  /** Worst-case UTF-16 storage retained by `pendingIce` string fields. */
+  pendingIceBytes: number;
+  /** Speculative entries must establish before this host-owned deadline. */
+  establishmentTimer: ReturnType<typeof setTimeout> | null;
 }
 
 
@@ -74,14 +78,31 @@ function isSessionDescription(value: unknown): value is SdpSignal["sdp"] {
         && typeof value.sdp === "string";
 }
 
-function isIceCandidate(value: unknown): value is RTCIceCandidateInit {
-    if (!isRecord(value) || typeof value.candidate !== "string") return false;
-    return (value.sdpMid === undefined || value.sdpMid === null || typeof value.sdpMid === "string")
+function iceCandidate(value: unknown): RTCIceCandidateInit | undefined {
+    if (!isRecord(value) || typeof value.candidate !== "string") return undefined;
+    if (!((value.sdpMid === undefined || value.sdpMid === null || typeof value.sdpMid === "string")
         && (value.sdpMLineIndex === undefined || value.sdpMLineIndex === null
             || (typeof value.sdpMLineIndex === "number" && Number.isInteger(value.sdpMLineIndex)
                 && value.sdpMLineIndex >= 0 && value.sdpMLineIndex <= 0xffff))
         && (value.usernameFragment === undefined || value.usernameFragment === null
-            || typeof value.usernameFragment === "string");
+            || typeof value.usernameFragment === "string"))) return undefined;
+    // Retain only the standard scalar fields. In particular, never queue the signaling
+    // adapter's original object or attacker-chosen extra properties.
+    const candidate: RTCIceCandidateInit = { candidate: value.candidate };
+    if (value.sdpMid !== undefined) candidate.sdpMid = value.sdpMid;
+    if (value.sdpMLineIndex !== undefined) candidate.sdpMLineIndex = value.sdpMLineIndex;
+    if (value.usernameFragment !== undefined) candidate.usernameFragment = value.usernameFragment;
+    return candidate;
+}
+
+/** Conservative retained storage for candidate strings. JS engines may store strings as
+ *  UTF-16, so charging two bytes per code unit avoids allocating an encoding just to
+ *  measure untrusted signaling input and never understates its host-memory cost. */
+function iceCandidateBytes(candidate: RTCIceCandidateInit): number {
+    const stringBytes = (value: string | null | undefined) => value === undefined || value === null ? 0 : value.length * 2;
+    return stringBytes(candidate.candidate)
+        + stringBytes(candidate.sdpMid)
+        + stringBytes(candidate.usernameFragment);
 }
 
 /** Decode the kernel's private negotiation protocol at the untrusted signaling boundary. */
@@ -96,8 +117,13 @@ function signalMsg(value: unknown): SignalMsg | undefined {
     if (value.type === "hello") return { type: "hello", ...base };
     if (value.type === "sdp" && isSessionDescription(value.sdp))
         return { type: "sdp", ...base, sdp: value.sdp };
-    if (value.type === "ice" && isIceCandidate(value.candidate))
-        return { type: "ice", ...base, candidate: value.candidate };
+    if (value.type === "ice") {
+        const candidate = iceCandidate(value.candidate);
+        // This also caps a candidate delivered after remoteDescription, where no pending
+        // queue exists but handing an arbitrary-size string to the WebRTC stack is unsafe.
+        if (candidate && iceCandidateBytes(candidate) <= MAX_PENDING_ICE_BYTES)
+            return { type: "ice", ...base, candidate };
+    }
     return undefined;
 }
 
@@ -142,7 +168,12 @@ export class RtcChannel extends MessageChannel {
 // that line bounded is `bindLink`'s channel watch: an entry that establishes but never
 // carries an authenticated link loses its data channel to the transport's own deadline,
 // and the entry with it.
-const MAX_UNESTABLISHED_PEERS = 256;
+export const MAX_UNESTABLISHED_PEERS = 256;
+/** Count and byte bounds for candidates retained before a remote description lands. */
+export const MAX_PENDING_ICE_CANDIDATES = 256;
+export const MAX_PENDING_ICE_BYTES = 256 * 1024;
+/** A relayed hello/offer that never completes ICE/DTLS cannot retain a peer forever. */
+export const UNESTABLISHED_PEER_TTL_MS = 30_000;
 export class RtcNetwork implements ChannelFactory {
     opts;
     private readonly ownId: string;
@@ -177,13 +208,7 @@ export class RtcNetwork implements ChannelFactory {
     /** Tear down every connection and the signaling channel. The transport's links
      *  die with their channels. */
     close(): void {
-        for (const e of this.peers.values()) {
-            try {
-                e.pc.close();
-            }
-            catch { /* ignore */ }
-        }
-        this.peers.clear();
+        for (const peerId of [...this.peers.keys()]) this.forget(peerId);
         this.opts.signaling.close();
     }
     // ── per-peer connection (perfect negotiation) ───────────────────────────────────
@@ -200,8 +225,17 @@ export class RtcNetwork implements ChannelFactory {
         if (existing)
             return existing;
         const pc = this.makePc(this.opts.rtcConfig);
-        const e: PeerEntry = { pc, linked: false, established: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] };
+        const e: PeerEntry = {
+            pc, linked: false, established: false, polite: this.ownId > peerId,
+            makingOffer: false, pendingIce: [], pendingIceBytes: 0, establishmentTimer: null,
+        };
         this.peers.set(peerId, e);
+        e.establishmentTimer = setTimeout(() => {
+            if (this.peers.get(peerId) === e && !e.established) this.forget(peerId);
+        }, UNESTABLISHED_PEER_TTL_MS);
+        // A speculative browser connection should expire, but the deadline alone must not
+        // keep a Node console process alive.
+        (e.establishmentTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
         pc.addEventListener("icecandidate", (ev) => {
             if (ev.candidate)
                 this.sendSignal({ type: "ice", from: this.ownId, to: peerId, candidate: ev.candidate.toJSON() });
@@ -231,6 +265,10 @@ export class RtcNetwork implements ChannelFactory {
                 // authenticates is that guest's business from here — this file's watch
                 // ends at the peer connection.
                 e.established = true;
+                if (e.establishmentTimer !== null) {
+                    clearTimeout(e.establishmentTimer);
+                    e.establishmentTimer = null;
+                }
             }
             else if (s === "disconnected") {
                 // A transient path failure (network blip, NAT rebind): restartIce()
@@ -289,6 +327,12 @@ export class RtcNetwork implements ChannelFactory {
         const e = this.peers.get(peerId);
         if (!e)
             return;
+        if (e.establishmentTimer !== null) {
+            clearTimeout(e.establishmentTimer);
+            e.establishmentTimer = null;
+        }
+        e.pendingIce.length = 0;
+        e.pendingIceBytes = 0;
         try {
             e.pc.close();
         }
@@ -349,7 +393,9 @@ export class RtcNetwork implements ChannelFactory {
         if (!e.polite && collision)
             return;
         await e.pc.setRemoteDescription(msg.sdp);
-        for (const c of e.pendingIce.splice(0)) {
+        const pendingIce = e.pendingIce.splice(0);
+        e.pendingIceBytes = 0;
+        for (const c of pendingIce) {
             try {
                 await e.pc.addIceCandidate(c);
             }
@@ -374,7 +420,17 @@ export class RtcNetwork implements ChannelFactory {
             }
             catch { /* ignore */ }
         }
-        else
+        else {
+            const candidateBytes = iceCandidateBytes(msg.candidate);
+            if (e.pendingIce.length >= MAX_PENDING_ICE_CANDIDATES
+                || candidateBytes > MAX_PENDING_ICE_BYTES - e.pendingIceBytes) {
+                // The sender has made this speculative negotiation unusable; tear it down
+                // now instead of retaining a full queue until the establishment deadline.
+                this.forget(msg.from);
+                return;
+            }
             e.pendingIce.push(msg.candidate);
+            e.pendingIceBytes += candidateBytes;
+        }
     }
 }

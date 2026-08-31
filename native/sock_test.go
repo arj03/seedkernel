@@ -3,7 +3,7 @@ package main
 // sock_test.go — the direct tests for sockChannel (net.go/sock.go): the queue
 // limit, the close-vs-fail split, and the dial lifecycle. Until these existed the
 // channel was only exercised end-to-end through the transport tests, which can't
-// reach a 4 MiB unacked queue, a deliberate close mid-flush, or the dial races.
+// reach the outbound queue ceilings, a deliberate close mid-flush, or the dial races.
 //
 // net.Pipe gives each test a real net.Conn with deadlines but no ports: a channel
 // wraps one end and the test plays the peer on the other.
@@ -18,6 +18,18 @@ import (
 )
 
 const testCloseGrace = time.Second
+const testMaxQueuedBytes = 16 << 20
+const testMaxQueuedSlices = 4096
+
+func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
+	return newInboundChannel(conn, onMsg, onClose, testCloseGrace,
+		testMaxQueuedBytes, testMaxQueuedSlices)
+}
+
+func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
+	return newDialChannel(addr, onMsg, onClose, testCloseGrace,
+		testMaxQueuedBytes, testMaxQueuedSlices)
+}
 
 func waitOn(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
@@ -35,7 +47,7 @@ func TestSockChannelRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	in := make(chan []byte, 1)
-	c := newInboundChannel(c1, func(b []byte) { in <- b }, func() {}, testCloseGrace)
+	c := newTestInboundChannel(c1, func(b []byte) { in <- b }, func() {})
 	go c.readLoop()
 
 	if _, err := c2.Write([]byte("inbound")); err != nil {
@@ -71,7 +83,7 @@ func TestSockChannelReadBackpressure(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	in := make(chan string, 2)
-	c := newInboundChannel(c1, func(b []byte) { in <- string(b) }, func() {}, testCloseGrace)
+	c := newTestInboundChannel(c1, func(b []byte) { in <- string(b) }, func() {})
 	go c.readLoop()
 
 	if _, err := c2.Write([]byte("first")); err != nil {
@@ -114,7 +126,7 @@ func TestSockChannelReadBackpressure(t *testing.T) {
 func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
 	c.send([]byte("first"))
 	c.send([]byte("second"))
 	c.close(true)
@@ -147,7 +159,7 @@ func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
 	c.send([]byte("must-not-flush"))
 	c.close(false)
 
@@ -166,7 +178,8 @@ func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 // transport's stall clock. No writer is started, so every byte remains deterministically
 // queued until a non-graceful close drops it.
 func TestSockChannelBufferedReportsQueue(t *testing.T) {
-	c := &sockChannel{wake: make(chan struct{}, 1)}
+	c := &sockChannel{wake: make(chan struct{}, 1),
+		maxQueuedBytes: testMaxQueuedBytes, maxQueuedSlices: testMaxQueuedSlices}
 	c.send([]byte("first"))
 	c.send([]byte("second"))
 	if got := c.buffered(); got != len("firstsecond") {
@@ -175,6 +188,47 @@ func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	c.close(false)
 	if got := c.buffered(); got != 0 {
 		t.Fatalf("buffered after non-graceful close = %d, want 0", got)
+	}
+}
+
+// TestSockChannelOutboundQueueBounds pins both dimensions of the native writer bound. A
+// byte-only ceiling still admits millions of one-byte slice headers; a count-only ceiling
+// still admits a handful of frame-sized allocations. Crossing either fails the channel and
+// releases what it had queued instead of dropping one write out of the ordered stream.
+func TestSockChannelOutboundQueueBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		maxBytes  int
+		maxSlices int
+		writes    [][]byte
+	}{
+		{name: "bytes", maxBytes: 4, maxSlices: 10,
+			writes: [][]byte{[]byte("aa"), []byte("bb"), []byte("c")}},
+		{name: "slices", maxBytes: 100, maxSlices: 2,
+			writes: [][]byte{[]byte("a"), []byte("b"), []byte("c")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			closed := make(chan struct{}, 1)
+			c := &sockChannel{
+				onMsg: func([]byte) {}, onClose: func() { closed <- struct{}{} },
+				wake: make(chan struct{}, 1), readGate: newReadGate(),
+				maxQueuedBytes: tt.maxBytes, maxQueuedSlices: tt.maxSlices,
+			}
+			for i, b := range tt.writes {
+				accepted := c.send(b)
+				if i < len(tt.writes)-1 && !accepted {
+					t.Fatalf("write %d was refused below the ceiling", i)
+				}
+				if i == len(tt.writes)-1 && accepted {
+					t.Fatal("write crossing the ceiling was accepted")
+				}
+			}
+			waitOn(t, closed, "outbound queue overflow to fail the channel")
+			if got := c.buffered(); got != 0 {
+				t.Fatalf("overflow retained %d queued bytes", got)
+			}
+		})
 	}
 }
 
@@ -189,7 +243,7 @@ func TestSockChannelDialFailureFiresOnClose(t *testing.T) {
 	ln.Close() // now nothing listens: the dial must fail
 
 	onClosed := make(chan struct{}, 1)
-	c := newDialChannel(addr, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
+	c := newTestDialChannel(addr, func([]byte) {}, func() { onClosed <- struct{}{} })
 	waitOn(t, onClosed, "a failed dial must fire onClose")
 	c.send([]byte("x")) // dead: dropped without a panic
 }
@@ -205,7 +259,7 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 	defer ln.Close()
 
 	var onClosed atomic.Int32
-	c := newDialChannel(ln.Addr().String(), func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
+	c := newTestDialChannel(ln.Addr().String(), func([]byte) {}, func() { onClosed.Add(1) })
 	c.send([]byte("queued")) // buffers pre-connect; the non-graceful close drops it
 	c.close(false)
 
@@ -233,7 +287,7 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	c1, c2 := net.Pipe()
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
 	go c.readLoop()
 	c2.Close() // the peer tears down
 	waitOn(t, onClosed, "a peer close must fire onClose")
@@ -254,7 +308,7 @@ func TestSockChannelSilentPeerTimesOut(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
 	go c.readLoop()
 	waitOn(t, onClosed, "a connection that never spoke must be reclaimed")
 }
@@ -271,7 +325,7 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 	defer c2.Close()
 	in := make(chan struct{}, 1)
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} })
 	go c.readLoop()
 
 	if _, err := c2.Write([]byte("hello")); err != nil {
@@ -319,7 +373,7 @@ func TestNetHostAcceptCeiling(t *testing.T) {
 func TestSockChannelCloseFailRace(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
+	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
 	go c.readLoop()
 
 	var wg sync.WaitGroup

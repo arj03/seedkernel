@@ -31,8 +31,15 @@ export const DEFAULT_MAX_TIMER_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
 /** Unresolved `host.call`s one realm may hold at once. Every call crosses a copy boundary
  *  and retains host-side promise state, so fire-and-forget calls need their own count bound
- *  independent of the guest heap. */
+ *  independent of the guest heap. Paired with the byte ceiling below: neither bound is a
+ *  substitute for the other. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
+
+/** Aggregate copied input bytes retained by unresolved `host.call`s in one realm. Eight
+ *  maximum-sized network frames leave useful concurrency for ordinary calls while keeping
+ *  a stalled destination from turning the caller's confined heap into unbounded host
+ *  memory. Applies to every host call, not only networking. */
+export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling

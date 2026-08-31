@@ -76,6 +76,11 @@ export class TransportHost {
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
   private closed = false;
+  // One transport realm sits behind every link in this driver, so its inbound allowance
+  // is aggregate too. Both the invocation currently dispatched per link and any slices
+  // held above unpausable adapters remain charged until released or dropped.
+  private inboundReadSlices = 0;
+  private inboundReadBytes = 0;
 
   constructor(
     opts: Omit<TransportHostOptions, "networkKey">,
@@ -105,6 +110,19 @@ export class TransportHost {
   /** Host-owned transport config (§12.10). */
   initialConfig(): JsonObject {
     return { networkKey: toHex(this.nodeFacts.networkKey ?? ZERO32) };
+  }
+
+  private reserveInboundRead(length: number): boolean {
+    if (this.inboundReadSlices >= MAX_INBOUND_HOLD_SLICES
+      || length > MAX_INBOUND_HOLD_BYTES - this.inboundReadBytes) return false;
+    this.inboundReadSlices++;
+    this.inboundReadBytes += length;
+    return true;
+  }
+
+  private releaseInboundRead(length: number): void {
+    this.inboundReadSlices--;
+    this.inboundReadBytes -= length;
   }
 
   /** Release link state owned by a departing link-capable slot, retaining the listeners for
@@ -236,13 +254,22 @@ export class TransportHost {
     this.channels.set(linkId, channel);
     // Admit one read per link into the serialized realm at a time. An adapter that can be
     // paused is paused at the socket, where the peer's own transport pushes back; one that
-    // cannot is held HERE, bounded by MAX_INBOUND_HOLD_BYTES, past which the peer is
-    // outrunning the realm and the link fails instead of the queue growing.
+    // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
+    // so thousands of links cannot multiply a per-link allowance behind one realm.
     let readActive = false;
+    let activeBytes = 0;
     const held: Uint8Array[] = [];
-    let heldBytes = 0;
 
-    const dropHeld = () => { held.length = 0; heldBytes = 0; };
+    const dropHeld = () => {
+      for (const bytes of held) this.releaseInboundRead(bytes.length);
+      held.length = 0;
+    };
+    const releaseActive = () => {
+      if (!readActive) return;
+      readActive = false;
+      this.releaseInboundRead(activeBytes);
+      activeBytes = 0;
+    };
     const failReadSide = () => {
       dropHeld();
       try { channel.close(false); } catch { /* already gone */ }
@@ -253,14 +280,14 @@ export class TransportHost {
      *  binding answers every read synchronously, and recursing there would put the whole
      *  held queue on the stack. */
     const releaseRead = () => {
+      releaseActive();
       for (;;) {
         if (this.channels.get(linkId) !== channel) { dropHeld(); return; }
         const next = held.shift();
         if (!next) break;
-        heldBytes -= next.length;
         if (!dispatchRead(next)) return; // in flight: its settle re-enters here
+        releaseActive(); // vacant binding or synchronous failure
       }
-      readActive = false;
       try { channel.setReadable?.(true); }
       catch { failReadSide(); }
     };
@@ -269,8 +296,9 @@ export class TransportHost {
      *  binding and nothing else. */
     const dispatchRead = (bytes: Uint8Array): boolean => {
       readActive = true;
+      activeBytes = bytes.length;
       try { channel.setReadable?.(false); }
-      catch { failReadSide(); return false; }
+      catch { releaseActive(); failReadSide(); return false; }
       let result: Promise<Uint8Array> | null;
       try { result = this.toTransport(ev("linkBytes").u32(linkId).blob(bytes)); }
       catch (err) { this.reportOpError("linkBytes", err); return true; }
@@ -287,15 +315,17 @@ export class TransportHost {
       // hard host cap. Refuse the oversized delivery before OpArgs copies it into a realm
       // invocation; stream backends naturally deliver much smaller slices.
       if (bytes.length > MAX_FRAME_BYTES) { failReadSide(); return; }
+      if (!this.reserveInboundRead(bytes.length)) { failReadSide(); return; }
       if (!readActive) {
         if (dispatchRead(bytes)) releaseRead(); // over before it began: go back to draining
         return;
       }
-      if (held.length >= MAX_INBOUND_HOLD_SLICES
-        || heldBytes + bytes.length > MAX_INBOUND_HOLD_BYTES) { failReadSide(); return; }
       // A custom RawLink may reuse its callback buffer, so what we hold owns its bytes.
-      held.push(bytes.slice());
-      heldBytes += bytes.length;
+      try { held.push(bytes.slice()); }
+      catch {
+        this.releaseInboundRead(bytes.length);
+        failReadSide();
+      }
     });
     channel.onClose(() => { dropHeld(); this.channelClosed(linkId, channel); });
     return linkId;

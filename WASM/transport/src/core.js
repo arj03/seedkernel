@@ -67,6 +67,10 @@ const connected = new Set();
 // These policies and their defaults belong to this signed program. LOCAL is the
 // installation's general override path; APP is the author's signed fallback.
 const maxFrameBytes = policy("maxFrameBytes");
+// Work waiting to be sealed has not reached a socket adapter yet, so its socket-side cap
+// cannot see it. Give it the same eight-frame byte window and tiny-write count ceiling.
+const maxOutboundQueueBytes = 8 * maxFrameBytes;
+const maxOutboundQueueSlices = 4096;
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");
 const maxVerified = policy("maxHalfOpenVerified");

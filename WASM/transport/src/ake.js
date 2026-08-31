@@ -310,6 +310,8 @@ class Link {
     this.kemSecret = null;
     this.queue = [];
     this.queuedBytes = 0;
+    this.outboundQueuedBytes = 0;
+    this.outboundQueuedSlices = 0;
     this.peerEph = null;
     this.closed = false;
     this.stalled = false;
@@ -444,11 +446,25 @@ class Link {
     if (frame.length === 0) return;
     if (this.authed) {
       if (this.sendEpoch >= REJECT_AFTER_EPOCHS) { this.close(); return; }
+      if (this.outboundQueuedSlices >= maxOutboundQueueSlices
+          || frame.length > maxOutboundQueueBytes - this.outboundQueuedBytes) {
+        // Dropping one record would desynchronise the ordered stream. Fail the link and let
+        // every already-queued send observe `closed` instead of doing more crypto work.
+        this.abort();
+        return;
+      }
       this.sawTraffic = true;
       // Sealed and wired through the one work chain, so records leave in send order.
+      this.outboundQueuedSlices++;
+      this.outboundQueuedBytes += frame.length;
       void this.enqueue(async () => {
-        if (this.closed) return;
-        this.wire(await this.seal(frame));
+        try {
+          if (this.closed) return;
+          this.wire(await this.seal(frame));
+        } finally {
+          this.outboundQueuedSlices--;
+          this.outboundQueuedBytes -= frame.length;
+        }
       });
       return;
     }

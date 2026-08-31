@@ -2,25 +2,32 @@
 /** Hard cap on one link frame, checked against the declared length before buffering. */
 export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
 
-/** Inbound bytes the driver will HOLD for one link whose adapter cannot be paused at the
- *  platform — a browser WebSocket and an RTCDataChannel both deliver whatever arrives, so
- *  "paused" can only mean held above the socket. It is the peer's in-flight window while
- *  one read occupies the serialized realm: eight more frames behind the one being worked
- *  on. Past it the peer is outrunning the realm, and the link fails rather than the driver
- *  growing a queue on its behalf. A socket that CAN be paused holds nothing here.
+/** Aggregate inbound bytes one driver admits across dispatched and held reads. A browser
+ *  WebSocket and an RTCDataChannel cannot be paused, while a pausable socket still owns one
+ *  dispatched read until the serialized realm releases it; both therefore reserve from the
+ *  same driver-wide window before a read crosses into the realm. Past it, the arriving
+ *  link fails instead of multiplying this host-memory allowance by the raw-link ceiling.
  *
  *  The window is what a pipelining peer really runs at, not a guess: seedstore's holder
  *  ingest bench (1 MiB batched STOREs against a zero-latency fabric, the hardest case there
  *  is — no wire to pace the sender) peaks at ~6 MiB of hold, so this leaves ~2.5× headroom.
- *  Only a link with no platform pushback holds anything at all, which in practice means a
- *  browser edge's handful of peers rather than a node's whole link table. */
+ *  The value is eight maximum-sized frames, shared by the entire transport realm. */
 export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_FRAME_BYTES;
 
-/** The same hold, as a COUNT. A byte bound alone lets a peer sending one-byte messages
- *  turn that window into millions of held slices, which cost far more than their bytes —
- *  so the two bounds meet at roughly a kilobyte per slice, and a peer below that is
- *  bounded by this one. A stream adapter's slices are orders of magnitude larger. */
+/** Driver-wide count companion to `MAX_INBOUND_HOLD_BYTES`. A byte bound alone lets peers
+ *  sending one-byte messages turn that window into millions of queued realm invocations
+ *  and held slices, which cost far more than their bytes. */
 export const MAX_INBOUND_HOLD_SLICES = 4096;
+
+/** Bytes one socket adapter may retain for writes that have not reached the wire. The
+ *  transport may have many authenticated producers (local requests and peer responses),
+ *  so observing backlog for stall clocks is not enough: the adapter that owns the queue
+ *  fails the link before accepting a write past this ceiling. */
+export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_FRAME_BYTES;
+
+/** Count companion to `MAX_OUTBOUND_QUEUE_BYTES`. Tiny writes otherwise fit millions of
+ *  queue nodes inside the byte window while spending much more host memory in metadata. */
+export const MAX_OUTBOUND_QUEUE_SLICES = 4096;
 
 /** Live raw sockets one host holds at once. The native accept path also receives this
  *  value so it can refuse before allocating a channel's goroutines and read buffer. */

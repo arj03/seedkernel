@@ -15,6 +15,48 @@
 // the queue against the only event that could settle it — which is why such a guest calls
 // `defer()` (guest-seam.ts) instead of awaiting.
 
+import {
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+} from "../core/wasm-limits.js";
+
+/** Per-realm leases for copied inputs and promise state retained by unresolved host calls.
+ *  Shared by both realm implementations so the native and JS targets cannot drift on the
+ *  boundary or on exactly when settlement returns capacity.
+ *
+ *  COUNT is charged for every call — an ordinary awaited call still costs a promise slot.
+ *  BYTES are charged only when the caller passes `chargeBytes: true` (domains.ts
+ *  `isByteMetered`): a caller-windowed fan-out (e.g. seedstore's `netSendMany`, bounded by
+ *  its own `fanoutWindow`) can legitimately hold far more than one call's worth of payload
+ *  outstanding, so only the calls with no such caller-side window (`link/deliver`) meter
+ *  bytes here. */
+export function createOutstandingHostCallBudget(
+  maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+): { acquire(payloadBytes: number, chargeBytes: boolean): () => void } {
+  let calls = 0;
+  let bytes = 0;
+  return {
+    acquire(payloadBytes: number, chargeBytes: boolean): () => void {
+      if (calls >= maxCalls) {
+        throw new Error(`guest: too many outstanding host calls (cap ${maxCalls})`);
+      }
+      if (chargeBytes && payloadBytes > maxBytes - bytes) {
+        throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
+      }
+      calls++;
+      if (chargeBytes) bytes += payloadBytes;
+      let live = true;
+      return () => {
+        if (!live) return;
+        live = false;
+        calls--;
+        if (chargeBytes) bytes -= payloadBytes;
+      };
+    },
+  };
+}
+
 /** One entrypoint invocation, in the two moments that are not always the same. */
 export interface Invocation {
   /** The entrypoint's answer, which is what the caller of `call` receives. */

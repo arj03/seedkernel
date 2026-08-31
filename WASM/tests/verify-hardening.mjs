@@ -17,8 +17,11 @@ await _sodium.ready;
 const sodium = _sodium;
 
 const { ModuleTable } = await imp("build/host/module-table.js");
-const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS }
+const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES }
   = await imp("build/core/wasm-limits.js");
+const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES }
+  = await imp("build/core/net-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, verifyManifest, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
@@ -292,6 +295,58 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok((await boundedCalls.call(new Uint8Array([0])))[0] === 7,
     "settled host calls release their per-realm accounting");
   boundedCalls.dispose();
+
+  // Count alone still allows 256 maximum-sized inputs to sit outside the confined heap.
+  // Reach the byte boundary with only eight calls, then prove the ninth is rejected before
+  // the host seam receives another copied payload. Only "link/deliver" meters bytes
+  // (domains.ts isByteMetered) — an ordinary awaited call's outstanding bytes are bounded
+  // by the caller's own fan-out window instead (seedstore's `netSendMany`, for one).
+  const hostCallChunk = 2 * 1024 * 1024;
+  const callsAtByteCap = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES / hostCallChunk;
+  const byteHeld = [];
+  let holdBytes = true;
+  const byteBoundedCalls = await createSafeRealm({
+    source: `function handle(a) {
+      if (a[0]) {
+        const payload = new Uint8Array(${hostCallChunk});
+        for (let i = 0; i <= ${callsAtByteCap}; i++) host.call("link/deliver", payload);
+        return new Uint8Array();
+      }
+      return host.call("link/deliver", new Uint8Array());
+    }`,
+    hostCall: () => holdBytes ? new Promise((resolve) => byteHeld.push(resolve)) : new Uint8Array([8]),
+    deadlineMs: 1000,
+  });
+  await rejects(byteBoundedCalls.call(new Uint8Array([1])),
+    "a realm cannot retain unbounded copied host-call payload bytes");
+  ok(byteHeld.length === callsAtByteCap,
+    `the byte refusal happens before copy ${callsAtByteCap + 1}`);
+  holdBytes = false;
+  for (const resolve of byteHeld) resolve(new Uint8Array());
+  await sleep(20);
+  ok((await byteBoundedCalls.call(new Uint8Array([0])))[0] === 8,
+    "settled host calls release their per-realm byte accounting");
+  byteBoundedCalls.dispose();
+
+  // An ordinary call name (anything but "link/deliver") is bounded by COUNT alone: a
+  // caller-windowed fan-out (seedstore's netSendMany, windowed by its own fanoutWindow)
+  // must not trip the byte cap meant only for un-windowed inbound delivery.
+  const ordinaryHeld = [];
+  const ordinaryCalls = await createSafeRealm({
+    source: `function handle() {
+      const payload = new Uint8Array(${hostCallChunk});
+      for (let i = 0; i < ${callsAtByteCap + 1}; i++) host.call("send", payload);
+      return new Uint8Array();
+    }`,
+    hostCall: () => new Promise((resolve) => ordinaryHeld.push(resolve)),
+    deadlineMs: 1000,
+  });
+  void ordinaryCalls.call(new Uint8Array());
+  await sleep(20);
+  ok(ordinaryHeld.length === callsAtByteCap + 1,
+    "an ordinary call name is unmetered by bytes, past what the link/deliver cap allows");
+  for (const resolve of ordinaryHeld) resolve(new Uint8Array());
+  ordinaryCalls.dispose();
 }
 
 console.log("\n§12.3 — timer count and copied payload bytes are bounded per realm");
@@ -437,9 +492,10 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   bare.close();
 }
 
-console.log("\n§12.6 — the host's pre-open send queue is bounded");
+console.log("\n§12.6 — host socket send queues are bounded");
 {
   const { MessageChannel } = await imp("build/host/net-channel.js");
+  const { NodeChannelFactory } = await imp("build/host/net-node.js");
   // A transport that never becomes writable — the state an unfinished connect leaves a
   // channel in. Until `open` fires, everything written is HOST memory spent by a peer that
   // has proved nothing, so the queue a handshake frame or two needs must not be a place an
@@ -464,6 +520,72 @@ console.log("\n§12.6 — the host's pre-open send queue is bounded");
   // waiting on a gap forever, where a dead channel is one the occupant is told about.
   ok(died && closed, "crossing the ceiling fails the channel instead of growing the queue");
   ok(ch.buffered() === 0, "a failed channel releases its queue rather than holding it to be collected");
+
+  const openedChannel = () => {
+    const listeners = new Map();
+    const transport = {
+      binaryType: "", bufferedAmount: 0, closed: false,
+      send(bytes) { this.bufferedAmount += bytes.length; },
+      close() { this.closed = true; },
+      addEventListener(type, cb) { listeners.set(type, cb); },
+    };
+    const channel = new MessageChannel(transport);
+    let failed = false;
+    channel.onClose(() => { failed = true; });
+    listeners.get("open")();
+    return { channel, transport, failed: () => failed };
+  };
+
+  // Once open, the platform's own queue is host memory too. Exactly the byte window is
+  // accepted; the next whole ordered message fails the link rather than being dropped.
+  const byBytes = openedChannel();
+  const block = new Uint8Array(1 << 20);
+  for (let n = block.length; n <= MAX_OUTBOUND_QUEUE_BYTES; n += block.length) {
+    byBytes.channel.send(block);
+  }
+  ok(!byBytes.failed() && byBytes.channel.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
+    "the exact outbound byte ceiling remains writable");
+  byBytes.channel.send(Uint8Array.of(1));
+  ok(byBytes.failed() && byBytes.transport.closed,
+    "crossing the outbound byte ceiling fails the channel");
+
+  // A byte cap alone admits millions of one-byte message objects. The independent count
+  // ceiling bites while the byte total is still tiny.
+  const byCount = openedChannel();
+  for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) byCount.channel.send(Uint8Array.of(i));
+  ok(!byCount.failed() && byCount.channel.buffered() < MAX_OUTBOUND_QUEUE_BYTES,
+    "tiny writes reach the exact outbound slice ceiling below the byte ceiling");
+  byCount.channel.send(Uint8Array.of(1));
+  ok(byCount.failed() && byCount.transport.closed,
+    "crossing the outbound slice ceiling fails the channel");
+
+  // Node's adapter is a separate queue owner. A connect has no chance to progress while
+  // this synchronous loop runs, which makes both exact boundaries deterministic without
+  // depending on a peer or on kernel socket-buffer sizes.
+  const nodeLink = () => {
+    const link = new NodeChannelFactory().connect("tcp://127.0.0.1:1");
+    if (!link) throw new Error("node test link was not created");
+    link.onClose(() => {}); // consume the expected destroy/connect-error events
+    return link;
+  };
+  const nodeBytes = nodeLink();
+  for (let n = block.length; n <= MAX_OUTBOUND_QUEUE_BYTES; n += block.length) {
+    nodeBytes.send(block);
+  }
+  ok(nodeBytes.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
+    "Node accepts exactly the outbound byte ceiling before connect");
+  let nodeByteError = "";
+  try { nodeBytes.send(Uint8Array.of(1)); } catch (e) { nodeByteError = String(e); }
+  ok(nodeByteError.includes("outbound queue limit"),
+    "Node destroys a socket before accepting bytes past the ceiling");
+
+  const nodeCount = nodeLink();
+  const one = Uint8Array.of(1);
+  for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) nodeCount.send(one);
+  let nodeCountError = "";
+  try { nodeCount.send(one); } catch (e) { nodeCountError = String(e); }
+  ok(nodeCountError.includes("outbound queue limit"),
+    "Node destroys a socket before accepting a write past the count ceiling");
 }
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");

@@ -45,7 +45,7 @@ func dialTCP(addr string) (net.Conn, error) {
 // and one writer goroutine. send only queues — safe from any goroutine — and takes
 // ownership of its slice; onMsg likewise hands the callee a fresh slice it owns.
 type rawChannel interface {
-	send(bytes []byte)
+	send(bytes []byte) bool
 	buffered() int
 	resume()
 	close(graceful bool)
@@ -63,12 +63,14 @@ type sockChannel struct {
 	onMsg   func([]byte)
 	onClose func()
 
-	mu         sync.Mutex
-	conn       net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
-	queue      [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
-	queued     int      // bytes held in queue, reported to the transport's stall clock
-	dead       bool
-	closeGrace time.Duration // installed from the shared TypeScript network policy
+	mu              sync.Mutex
+	conn            net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
+	queue           [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
+	queued          int      // bytes held in queue, reported to the transport's stall clock
+	dead            bool
+	closeGrace      time.Duration // installed from the shared TypeScript network policy
+	maxQueuedBytes  int
+	maxQueuedSlices int
 
 	wake     chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
 	readGate chan struct{} // one token permits one socket read / serialized realm turn
@@ -82,8 +84,10 @@ func newReadGate() chan struct{} {
 
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
-func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration,
+	maxQueuedBytes, maxQueuedSlices int) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
+		maxQueuedBytes: maxQueuedBytes, maxQueuedSlices: maxQueuedSlices,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
 		conn, err := dialTCP(addr)
@@ -107,8 +111,10 @@ func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace 
 
 // newInboundChannel wraps an already-open accepted socket: its writer starts immediately,
 // while the caller starts readLoop once the JS channel is registered (netHost.wrapInbound).
-func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration,
+	maxQueuedBytes, maxQueuedSlices int) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
+		maxQueuedBytes: maxQueuedBytes, maxQueuedSlices: maxQueuedSlices,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go c.writeLoop()
 	return c
@@ -118,11 +124,16 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeG
 // socket. It takes ownership of bytes (sock.go hands over a fresh JsTypedArrayToGo copy),
 // so nothing is copied here. A send on a dead channel is dropped silently, like a
 // node:net write after destroy.
-func (c *sockChannel) send(bytes []byte) {
+func (c *sockChannel) send(bytes []byte) bool {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
-		return
+		return true
+	}
+	if len(c.queue) >= c.maxQueuedSlices || len(bytes) > c.maxQueuedBytes-c.queued {
+		c.mu.Unlock()
+		c.fail()
+		return false
 	}
 	c.queue = append(c.queue, bytes)
 	c.queued += len(bytes)
@@ -132,6 +143,7 @@ func (c *sockChannel) send(bytes []byte) {
 	// the frame hits the wire now, overlapping the sender's JS turn — ~10% round-trip
 	// latency on the Net benches. A hint only: correctness never depends on it.
 	runtime.Gosched()
+	return true
 }
 
 // buffered is the transport-owned stall clock's view of this socket: bytes accepted from

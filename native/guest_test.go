@@ -66,6 +66,67 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	}
 }
 
+// Only "link/deliver" (seedkernel WASM/core/domains.ts isByteMetered) meters bytes: it is
+// fired by the link occupant once per inbound frame with no caller-side window, unlike an
+// ordinary awaited call whose outstanding bytes a caller's own fan-out already bounds.
+func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__heldHostCalls = 0;
+		globalThis.__guestSeam = () => {
+		  __heldHostCalls++;
+		  return new Promise(() => {});
+		};
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() {
+		  const payload = new Uint8Array(2 * 1024 * 1024);
+		  for (let i = 0; i < 9; i++) host.call("link/deliver", payload);
+		  return new Uint8Array();
+		}
+	`, 1000)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	if _, err := realmCall("byte flood", nil); err == nil {
+		t.Fatal("a guest accumulated unbounded unresolved host-call payload bytes")
+	}
+	if got := evalString(t, "String(__heldHostCalls)"); got != "8" {
+		t.Fatalf("host received %s payloads, want exactly 8 before the 16 MiB byte cap", got)
+	}
+}
+
+// A caller-windowed op (any name other than "link/deliver") is bounded by COUNT alone: a
+// realm may hold far more than 16 MiB of an ordinary op's payloads outstanding, matching a
+// bounded application fan-out (e.g. seedstore's netSendMany, windowed by its own
+// fanoutWindow) that must not trip the byte cap meant for un-windowed inbound delivery.
+func TestGuestRealmOrdinaryHostCallBytesUnmetered(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__heldHostCalls = 0;
+		globalThis.__guestSeam = () => {
+		  __heldHostCalls++;
+		  return new Promise(() => {});
+		};
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() {
+		  const payload = new Uint8Array(2 * 1024 * 1024);
+		  for (let i = 0; i < 9; i++) host.call("send", payload);
+		  return new Uint8Array();
+		}
+	`, 1000)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	if _, err := realmCall("ordinary flood", nil); err != nil {
+		t.Fatalf("an ordinary call name was refused by the byte cap meant only for link/deliver: %v", err)
+	}
+	if got := evalString(t, "String(__heldHostCalls)"); got != "9" {
+		t.Fatalf("host received %s payloads, want all 9 (18 MiB, over the 16 MiB byte cap) uncapped by bytes", got)
+	}
+}
+
 // TestGuestRealmCarriesModuleDeadline pins the native-only half of CallBudget: guest.go
 // owns the live execution segment, so it must carry that remainder into the shared seam.
 // The seam then hands exactly that value to this slot's private module call.

@@ -8,18 +8,34 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { LISTENER, type Arrival, type RawLink } from "../core/socket-seam.js";
-import { TCP_LINGER_MS } from "../core/net-limits.js";
+import {
+    MAX_OUTBOUND_QUEUE_BYTES,
+    MAX_OUTBOUND_QUEUE_SLICES,
+    TCP_LINGER_MS,
+} from "../core/net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
 // node:net buffers pre-connect writes, so the link is immediately writable.
 function nodeRawStream(socket: Socket): RawLink {
+    // `writableLength` supplies bytes, while write callbacks supply the missing count.
+    // Both describe writes Node still owns; crossing either bound destroys the ordered
+    // stream before another buffer is admitted.
+    let pendingWrites = 0;
     return {
         stream: true,
         // The peer's IP, for the per-source half-open cap only (§12.6.1) — unauthenticated
         // and never an identity. Captured now because `socket.remoteAddress` reads undefined
         // once destroyed, and the limiter must release the bucket it took.
         remoteAddr: socket.remoteAddress ?? undefined,
-        send: (bytes: Uint8Array) => { socket.write(bytes); },
+        send: (bytes: Uint8Array) => {
+            if (pendingWrites >= MAX_OUTBOUND_QUEUE_SLICES
+                || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - socket.writableLength) {
+                socket.destroy();
+                throw new Error("socket: outbound queue limit exceeded");
+            }
+            pendingWrites++;
+            socket.write(bytes, () => { if (pendingWrites > 0) pendingWrites--; });
+        },
         onData: (cb: (chunk: Uint8Array) => void) => { socket.on("data", (chunk: Uint8Array) => cb(new Uint8Array(chunk))); },
         setReadable: (enabled) => { if (enabled) socket.resume(); else socket.pause(); },
         // error and close both mean "gone"; the caller's teardown is idempotent.
