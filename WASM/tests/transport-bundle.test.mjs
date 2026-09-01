@@ -122,7 +122,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     })),
   });
   const [appConfig, localConfig] = Function(
-    source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+    source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
   )();
   assert(appConfig.requestDeadlineMs === TRANSPORT_APP_CONFIG.requestDeadlineMs,
     "transport defaults arrive from signed APP config");

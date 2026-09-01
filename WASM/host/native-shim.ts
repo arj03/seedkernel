@@ -10,14 +10,13 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { createOutstandingHostCallBudget, serializeCalls } from "./realm-queue.js";
-import { isByteMetered } from "../core/domains.js";
+import { serializeCalls } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
-  MAX_OUTBOUND_QUEUE_BYTES,
-  MAX_OUTBOUND_QUEUE_SLICES,
+  MAX_INBOUND_HOLD_BYTES,
+  MAX_INBOUND_HOLD_SLICES,
   TCP_LINGER_MS,
 } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -183,14 +182,17 @@ export const fs: Fs = {
 /** Go's raw byte-stream primitives (§12.1). */
 declare const __net: {
   /** Install host-owned socket limits before any channel can be opened. */
-  install(maxLiveChannels: number, closeGraceMs: number, maxQueuedBytes: number, maxQueuedSlices: number): void;
+  install(maxLiveChannels: number, closeGraceMs: number,
+          maxInboundReadBytes: number, maxInboundReadSlices: number): void;
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
   /** Bind a listener; returns the bound port, or -1 on failure. */
   listen(host: string, port: number): number;
-  /** Queue bytes for the writer goroutine (never blocks the loop goroutine). */
-  send(id: number, bytes: Uint8Array): boolean;
+  /** Queue bytes for the writer goroutine (never blocks the loop goroutine). Answers
+   *  nothing: admission happened at the driver's per-link owner, which charged these bytes
+   *  against `buffered()` below before calling. */
+  send(id: number, bytes: Uint8Array): void;
   /** Bytes queued for the writer goroutine but not yet handed to the socket. */
   buffered(id: number): number;
   /** Release the next socket read after one serialized transport-realm invocation. */
@@ -203,7 +205,7 @@ declare const __net: {
 // Policy values live in shared TypeScript and cross once when the primitive is installed;
 // Go retains the mechanisms that must act before JS can observe an accepted socket.
 __net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS,
-  MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES);
+              MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //
@@ -226,9 +228,7 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
   return {
     stream: true,
     remoteAddr,
-    send: (bytes) => {
-      if (!__net.send(id, bytes)) throw new Error("socket: outbound queue limit exceeded");
-    },
+    send: (bytes) => { __net.send(id, bytes); },
     buffered: () => __net.buffered(id),
     // Go consumes a one-read token before invoking us, so the false edge is already
     // applied at the socket; the true edge returns the token after the realm turn.
@@ -391,36 +391,30 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-    // Go does not pump this guest queue during evaluation, so settlement cannot precede
-    // assignment (§12.3).
-    let realm: number;
+    // Go mints the handle, but createRealm runs the guest's top-level code before returning
+    // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
+    // because settling is a HOST-realm microtask and Go pumps only between turns, never
+    // inside a bridge call, so no settlement can precede the assignment below (§12.3).
+    let realm = 0;
     // Go supplies the live segment remainder because it owns this realm's execution
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
     // second charge when guest-seam's common module path settles.
-    const outstandingHostCalls = createOutstandingHostCallBudget();
     const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
-        // The bridge has already made the cross-realm ArrayBuffer; reserve it before
-        // exposing a view to hostCall, which may retain that view until its promise settles.
-        const releaseHostCall = outstandingHostCalls.acquire(payload.byteLength, isByteMetered(name));
+        // Go admitted this call before making the cross-realm copy. This adapter only
+        // routes and settles; post-copy accounting here would be a second policy authority.
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
         };
-        let answer: Promise<Uint8Array> | Uint8Array;
-        try {
-            answer = hostCall(name, new Uint8Array(payload), budget);
-        } catch (e) {
-            releaseHostCall();
-            throw e;
-        }
+        // A synchronous throw is a refused NAME, which fails at the guest's call site
+        // (guest-seam.ts); guest.go releases the call it had already admitted.
+        const answer = hostCall(name, new Uint8Array(payload), budget);
         void Promise.resolve(answer).then(
             (bytes: Uint8Array) => {
-                releaseHostCall();
                 bridge.realmSettle(realm, callId, bytes, null);
             },
             (e: unknown) => {
-                releaseHostCall();
                 bridge.realmSettle(realm, callId, null, errMessage(e));
             },
         );
@@ -440,13 +434,21 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                 // the time the return statement reads it.
                 let deferred = false;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    deferred = bridge.realmCall(realm, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg))) === 1;
+                    deferred = bridge.realmCall(realm, payload,
+                        (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
+                        (msg: string) => reject(new Error(msg))) === 1;
                 });
                 return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
             },
             () => (disposed ? new Error("guest realm disposed") : null),
         ),
-        dispose: () => { disposed = true; bridge.realmDispose(realm); },
+        dispose: () => {
+            disposed = true;
+            // guest.go's close() runs settleAll before it frees anything, so every callback
+            // it still owns is rejected synchronously here — safe-js.ts needs its own
+            // registry for this, and this target does not (§12.3).
+            bridge.realmDispose(realm);
+        },
     };
 };
 /** Everything that crosses back to Go crosses as BYTES — the currency of this seam, and

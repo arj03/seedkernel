@@ -221,10 +221,8 @@ async function netLinkOpen(dest) {
   // Destination selects the codec (§12.1).
   return { linkId: readU32BE(r, 0), stream: r[4] === 1 };
 }
-/** Fire-and-forget wire ops: a link/send cannot answer anything worth having (the
- *  channel drops silently when the link is gone either way), so their rejections are
- *  swallowed here rather than left to surface as unhandled rejections. */
-function netLinkSend(linkId, bytes) { void host.call(N_LINK_SEND, args([linkId], [], bytes)).catch(() => {}); }
+/** Answer once the raw-link owner has accepted the bytes. */
+function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)).then(() => {}); }
 function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {}); }
 /** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
  *  or a channel that cannot say — both read as "nothing queued", which leaves the
@@ -357,6 +355,8 @@ class Link {
     // boot chain's rejection arm — same deferred teardown the refused slot takes: the
     // slot first and on its own, then the timer table, then the notify-on-later-turn.
     const networkKeyBytes = spec.networkKey || networkKey;
+    // RECOVERED, like every later link in the chain: a raw rejecting `work` would silently
+    // skip whatever `enqueue` put behind it, and the deadline's own abort is exactly that.
     this.work = (async () => {
       this.root = await hash(DOMAIN_CHANNEL, networkKeyBytes);
       if (this.weDialed) {
@@ -366,8 +366,7 @@ class Link {
       } else {
         this.armDeadline(unverifiedTimeoutMs);
       }
-    })();
-    this.work.catch(() => {
+    })().catch(() => {
       this.releaseSlot();
       try { this.teardown(); } catch { /* the host has evidently lost the timer anyway */ }
       this.deferTeardown();
@@ -460,7 +459,7 @@ class Link {
       void this.enqueue(async () => {
         try {
           if (this.closed) return;
-          this.wire(await this.seal(frame));
+          await this.wireRecord(frame);
         } finally {
           this.outboundQueuedSlices--;
           this.outboundQueuedBytes -= frame.length;
@@ -470,7 +469,8 @@ class Link {
     }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
-    while (this.queuedBytes > MAX_QUEUE_BYTES && this.queue.length > 1) {
+    while ((this.queuedBytes > MAX_QUEUE_BYTES || this.queue.length > maxPreAuthQueueSlices)
+        && this.queue.length > 1) {
       this.queuedBytes -= this.queue.shift().length;
     }
   }
@@ -479,24 +479,23 @@ class Link {
     if (this.closed) return;
     this.closed = true;
     this.closedLocally = true;
+    this.severWire();
     // The goodbye rides the same work chain as everything else, so it cannot overtake
     // a record still being sealed and cannot race teardown's key-zeroing.
     void this.enqueue(async () => {
       let saidGoodbye = false;
       if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
         try {
-          this.wire(await this.seal(new Uint8Array(0)));
+          await this.wire(await this.seal(new Uint8Array(0)));
           // A codec with its own end-of-stream signal says it too, on the same byte
           // stream after our record, so the peer reads one clean shutdown.
-          if (this.framer && this.framer.goodbye) this.framer.goodbye();
+          if (this.framer && this.framer.goodbye) await this.framer.goodbye();
           saidGoodbye = true;
         } catch { /* the channel is already gone */ }
       }
       this.teardown();
-      // The goodbye record is QUEUED, not yet on the wire; only closing once the framer's
-      // last write has landed lets the peer read a clean shutdown, not a truncation.
-      const flushed = (this.framer && this.framer.flush ? this.framer.flush() : Promise.resolve()).catch(() => {});
-      await flushed;
+      // Both writes above reached the raw-link owner before teardown, so a graceful
+      // channel close flushes a complete farewell rather than truncating its record.
       netLinkClose(this.linkId, saidGoodbye);
       this.finish();
     });
@@ -509,6 +508,7 @@ class Link {
     this.closed = true;
     this.closedLocally = true;
     if (defensive) this.aborted = true;
+    this.severWire();
     // Behind the chain like close(), so an in-flight step finishes before its keys are
     // zeroed under it.
     void this.enqueue(async () => {
@@ -539,8 +539,19 @@ class Link {
   /** Put one link message on the wire, framing it first where the platform gave us
    *  no boundaries of its own. */
   wire(msg) {
-    if (this.framer) this.framer.send(msg);
-    else netLinkSend(this.linkId, msg);
+    return this.framer ? this.framer.send(msg) : netLinkSend(this.linkId, msg);
+  }
+
+  /** Seal one record and put it on the wire, failing the link if it does not land (§12.6).
+   *  Catches on purpose: the refusal may come from the driver OR from this realm's own
+   *  host-call budget, which `host.call` raises synchronously and the chain would swallow.
+   *  `close()`'s goodbye is the deliberate exception — netLinkClose still has to run. */
+  async wireRecord(frame) {
+    try {
+      await this.wire(await this.seal(frame));
+    } catch {
+      this.abort();
+    }
   }
 
   /** Inbound bytes. Over-cap is a defensive abort. Every step rides the link's one work
@@ -628,7 +639,7 @@ class Link {
     const flush = this.queue;
     this.queue = [];
     this.queuedBytes = 0;
-    for (const f of flush) this.wire(await this.seal(f));
+    for (const f of flush) await this.wireRecord(f);
   }
 
   // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
@@ -692,7 +703,7 @@ class Link {
     const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
       await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), this.myNonce)]);
     this.th = await this.h(this.root, w1);
-    this.wire(w1);
+    await this.wire(w1);
   }
 
   async onMsg1(w1) {
@@ -723,7 +734,7 @@ class Link {
       await this.sealZero(await this.kdf([this.ee, this.kemSecret], h1, LABEL_M2), this.myNonce),
     ]);
     this.th = await this.h(h1, w2);
-    this.wire(w2);
+    await this.wire(w2);
   }
 
   async onMsg2(w2) {
@@ -745,7 +756,7 @@ class Link {
     if (!si) return;
     const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([si.id, si.sig]));
     this.th = await this.h(h2, w3);
-    this.wire(w3);
+    await this.wire(w3);
   }
 
   async onMsg3(w3) {
@@ -765,7 +776,7 @@ class Link {
     const w4 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h3, LABEL_M4), concatBytes([si.id, si.sig]));
     this.th = await this.h(h3, w4);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
-    this.wire(w4);
+    await this.wire(w4);
     await this.becomeAuthed();
   }
 
@@ -869,7 +880,17 @@ class Link {
 
   // ── teardown ────────────────────────────────────────────────────────────────
 
+  /** End the wire NOW, off the work chain — the one part of a teardown that cannot wait
+   *  its turn, because a step already parked ON the wire would hold the chain against the
+   *  very event meant to end it (§12.6). Idempotent; a no-op for a codec with nothing to
+   *  park (LengthFramer) or a link already past its upgrade. */
+  severWire() {
+    try { if (this.framer && this.framer.abort) this.framer.abort(); }
+    catch { /* already gone */ }
+  }
+
   teardown() {
+    this.severWire();
     this.clearDeadline();
     this.clearIdle();
     this.releaseSlot();

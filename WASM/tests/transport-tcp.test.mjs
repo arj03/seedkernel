@@ -33,7 +33,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
 
 const HOST = "127.0.0.1";
 
-async function makeNode(ws = false) {
+async function makeNode(ws = false, extraConfig = {}) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, appAuthorHex],
@@ -46,7 +46,7 @@ async function makeNode(ws = false) {
     load: false,
     bundle: transportBlob,
   };
-  const transportConfig = { requestDeadlineMs: 2000 };
+  const transportConfig = { requestDeadlineMs: 2000, ...extraConfig };
   // bootShell owns the adapter but leaves the load and listeners to this test, which
   // starts them by hand below.
   const { shell, transport } = await bootShell({
@@ -156,5 +156,37 @@ assert(burstIntact, "12 concurrent requests each got their OWN answer back, in o
 
 await cNet.close();
 await dNet.close();
+
+// ── a WS upgrade that never lands must still meet its deadline ────────────────
+// The codec parks every write until the upgrade completes, and a teardown queued behind
+// that park would never run: no close, and the slot and raw link held until the socket
+// happened to die on its own. So the peer here does the one thing that defeats every
+// other clock — it accepts, says just enough to look alive (which clears the host's own
+// pre-speech read deadline), and then stops. Only the guest's handshake deadline is left.
+console.log("\nTest: a WS peer that accepts, half-speaks and stalls still meets the deadline");
+
+const { createServer } = await import("node:net");
+let stalledClosed = false;
+const stalling = createServer((sock) => {
+  sock.on("close", () => { stalledClosed = true; });
+  sock.on("error", () => { /* the node hangs up on us; that is the point */ });
+  sock.resume(); // a paused socket never reads, so it would never see the hang-up either
+  // A partial head: never a complete HTTP response, so `upgrade()` keeps returning -1.
+  sock.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n");
+});
+await new Promise((resolve) => stalling.listen(0, HOST, resolve));
+
+const e = await makeNode(false, { handshakeTimeoutMs: 500 });
+await e.transport.start();
+await addr(e, "00".repeat(32), `ws://${HOST}:${stalling.address().port}`);
+// Any send is enough to make the address book dial.
+appRequest(e.app, "00".repeat(32), new Uint8Array([1])).catch(() => {});
+
+const deadline = Date.now() + 6000;
+while (!stalledClosed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+assert(stalledClosed, "the handshake deadline closed a link parked on an upgrade that never came");
+
+await e.transport.close();
+await new Promise((resolve) => stalling.close(resolve));
 
 summary("transport TCP smoke");

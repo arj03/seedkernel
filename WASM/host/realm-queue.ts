@@ -1,96 +1,142 @@
-// The per-realm serialization queue — one implementation, shared by both realm factories
-// (safe-js.ts on the JS platform, native-shim.ts over Go's quickjs-ng).
+// The per-realm boundary owners shared by both realm factories (safe-js.ts on the JS
+// platform, native-shim.ts over Go's quickjs-ng): active guest-to-host calls, and the
+// serialized entry of payloads into the guest.
 //
-// An invocation does not begin until the previous one has settled, so no two guest frames
-// are ever in flight in one realm. Both roles a realm serves can yield — an initiator awaits
-// the network, a holder awaits `fs` — so ordering does not fall out of the host's call stack;
-// without the queue, a holder invoked while an initiator is parked would resume interleaved
-// with it at every `await`. The cost is head-of-line blocking, and an app that wants both at
-// once wants two realms.
-//
-// A frame is in flight while the guest is parked mid-frame, which for an ordinary guest
-// coincides with "the invocation has not settled". It does not for a guest whose answer
-// arrives through its own realm: the transport replies to a send by reading bytes off a
-// link, and reading them is another invocation of this same realm, so waiting would hold
-// the queue against the only event that could settle it — which is why such a guest calls
-// `defer()` (guest-seam.ts) instead of awaiting.
+// Every owner here is scoped to ONE realm and none is shared between realms. The node's
+// total is what these admit times `DEFAULT_MAX_APP_SLOTS` (core/wasm-limits.ts), which is
+// the same bound a pool held in common would give — without the pool's standing channel
+// for a busy app to refuse a quiet one's calls.
 
 import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  DEFAULT_MAX_QUEUED_REALM_INVOCATIONS,
 } from "../core/wasm-limits.js";
 
-/** Per-realm leases for copied inputs and promise state retained by unresolved host calls.
- *  Shared by both realm implementations so the native and JS targets cannot drift on the
- *  boundary or on exactly when settlement returns capacity.
+function checkedBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new Error("guest: payload width is not a non-negative safe integer");
+  }
+  return bytes;
+}
+
+/** One active call's custody, held from admission through settlement. Further host copies
+ * are reserved before they are made, and everything reserved stays owned until the response
+ * has been delivered or the call has terminally failed.
  *
- *  COUNT is charged for every call — an ordinary awaited call still costs a promise slot.
- *  BYTES are charged only when the caller passes `chargeBytes: true` (domains.ts
- *  `isByteMetered`): a caller-windowed fan-out (e.g. seedstore's `netSendMany`, bounded by
- *  its own `fanoutWindow`) can legitimately hold far more than one call's worth of payload
- *  outstanding, so only the calls with no such caller-side window (`link/deliver`) meter
- *  bytes here. */
-export function createOutstandingHostCallBudget(
+ * Bounded in TIME as well as size (§12.3): the host's answer releases it, and disposal
+ * releases whatever never answered — the guest that would have consumed it is gone, so what
+ * a still-pending backend holds is the host's own memory, not this realm's. Without that
+ * second path one unanswering backend pins the realm's allowance for good. */
+export interface ActiveHostCall {
+  reserve(bytes: number): void;
+  release(): void;
+}
+
+/** Own every guest-to-host copy and promise slot from admission through settlement (§12.3).
+ * Id, count slot and actual source width are admitted atomically. The id is the guest's own,
+ * so it is checked here rather than trusted: guest.go must key its parked calls by it to
+ * route settlements, and a target that admitted a duplicate where the other refuses one
+ * would be the two engines disagreeing about the guest's ABI. No operation name reaches here
+ * either: policy elsewhere is legitimately name-keyed (`MemoryFs`'s quota, `isIrreversible`),
+ * but a name may only TIGHTEN what an owner admits, and this owner has no exemption to
+ * give — the resource's owner decides, never the dispatcher that routed the call. */
+export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-): { acquire(payloadBytes: number, chargeBytes: boolean): () => void } {
-  let calls = 0;
+): {
+  admit(callId: number, payloadBytes: number): ActiveHostCall;
+  releaseAll(): void;
+} {
+  const active = new Map<number, ActiveHostCall>();
   let bytes = 0;
   return {
-    acquire(payloadBytes: number, chargeBytes: boolean): () => void {
-      if (calls >= maxCalls) {
+    releaseAll(): void {
+      for (const call of [...active.values()]) call.release();
+    },
+    admit(callId: number, payloadBytes: number): ActiveHostCall {
+      if (!Number.isSafeInteger(callId)) throw new Error("guest: invalid host call id");
+      if (active.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
+      checkedBytes(payloadBytes);
+      if (active.size >= maxCalls) {
         throw new Error(`guest: too many outstanding host calls (cap ${maxCalls})`);
       }
-      if (chargeBytes && payloadBytes > maxBytes - bytes) {
+      if (payloadBytes > maxBytes - bytes) {
         throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
       }
-      calls++;
-      if (chargeBytes) bytes += payloadBytes;
+      bytes += payloadBytes;
+      let owned = payloadBytes;
       let live = true;
-      return () => {
-        if (!live) return;
-        live = false;
-        calls--;
-        if (chargeBytes) bytes -= payloadBytes;
+      const call: ActiveHostCall = {
+        reserve(additionalBytes: number): void {
+          if (!live) throw new Error("guest: host call is no longer active");
+          checkedBytes(additionalBytes);
+          if (additionalBytes > maxBytes - bytes) {
+            throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
+          }
+          bytes += additionalBytes;
+          owned += additionalBytes;
+        },
+        release(): void {
+          if (!live) return;
+          live = false;
+          active.delete(callId);
+          bytes -= owned;
+        },
       };
+      active.set(callId, call);
+      return call;
+
     },
   };
 }
 
 /** One entrypoint invocation, in the two moments that are not always the same. */
 export interface Invocation {
-  /** The entrypoint's answer, which is what the caller of `call` receives. */
+  /** The entrypoint's answer, which is what the caller of `call` receives. A deferred
+   *  entrypoint (`__deferred`) hands it to an arbitrary later turn under no wall-clock
+   *  bound, so only the realm's own dispose can guarantee it settles (safe-js.ts,
+   *  native-shim.ts). */
   result: Promise<Uint8Array>;
-  /** Settles when this realm is free for the next invocation: with `result` for an
-   *  ordinary entrypoint, and as soon as the synchronous segment ends for a deferred
-   *  one. Its VALUE is never read and its rejection is swallowed here — the caller holds
-   *  `result` and with it the real error. */
+  /** Settles when this realm is free for the next invocation. */
   released: Promise<unknown>;
 }
 
-/** Wrap a per-invocation function so calls run one at a time, in acceptance order.
+/** Serialize realm entry, bounding the DEPTH of what waits on the Promise chain.
  *
- *  `notReady` is consulted at the moment an invocation reaches the front of the queue,
- *  never when it is accepted: a call queued behind others can be overtaken by a
- *  `dispose`, and entering a torn-down realm is what aborts the whole wasm module. It
- *  returns the error to fail with, or `null` to proceed. */
+ * Depth only, and the payload is BORROWED, not copied — both follow from the same fact:
+ * every payload reaching here is already owned for a period that contains this one (§12.3),
+ * by the link that read it, by the calling realm's `ActiveHostCall`, or by the host caller
+ * that allocated it. Counting or copying those bytes again would double the memory the
+ * ownership rule exists to bound. Depth is this queue's own: waiting invocations are
+ * objects on a chain nobody else counts. */
 export function serializeCalls(
   invoke: (payload: Uint8Array) => Invocation,
   notReady: () => Error | null,
+  maxQueuedCalls = DEFAULT_MAX_QUEUED_REALM_INVOCATIONS,
 ): (payload: Uint8Array) => Promise<Uint8Array> {
-  // The tail of the chain accepted so far. A new call attaches to it and becomes the
-  // new tail.
   let tail: Promise<unknown> = Promise.resolve();
+  let queued = 0;
   return (payload) => {
+    // Closed owners stop admission immediately. Already accepted work checks again when it
+    // reaches the front because teardown can overtake it while it waits.
+    const admissionError = notReady();
+    if (admissionError) return Promise.reject(admissionError);
+    if (queued >= maxQueuedCalls) {
+      return Promise.reject(new Error(`guest: too many queued realm invocations (cap ${maxQueuedCalls})`));
+    }
+    queued++;
     const started = tail.then(() => {
-      const err = notReady();
-      if (err) throw err;
-      return invoke(payload);
+      try {
+        const err = notReady();
+        if (err) throw err;
+        return invoke(payload);
+      } finally {
+        queued--;
+      }
     });
-    // Both outcomes swallowed, load-bearing twice: a failed invocation must not poison
-    // every later one, and an unhandled rejection on this internal chain would be reported
-    // against the host rather than the caller, who holds the real error. The rejected arm is
-    // an invocation that never started, which releases the realm at once.
+    // A failed invocation must not poison later work. The caller owns the real rejection;
+    // this internal tail consumes both outcomes.
     tail = started.then((inv) => inv.released, () => {}).then(() => {}, () => {});
     return started.then((inv) => inv.result);
   };

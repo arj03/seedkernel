@@ -34,10 +34,16 @@ type netHost struct {
 	listeners []net.Listener // bound listeners, closed on network teardown
 
 	// Policy values installed by host/native-shim.ts before any socket is opened.
-	maxLiveChannels int
-	closeGrace      time.Duration
-	maxQueuedBytes  int
-	maxQueuedSlices int
+	maxLiveChannels      int
+	closeGrace           time.Duration
+	maxInboundReadBytes  int
+	maxInboundReadSlices int
+
+	// Native staging custody: copied socket reads posted toward QuickJS but not yet
+	// synchronously handed to TransportHost's existing driver-wide allowance.
+	inboundReadBytes  int
+	inboundReadSlices int
+	readSpace         *sync.Cond // signalled as staging custody is released
 
 	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
@@ -58,20 +64,21 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		maxLive := int(t.Args()[0].Int64())
 		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
-		maxQueuedBytes := int(t.Args()[2].Int64())
-		maxQueuedSlices := int(t.Args()[3].Int64())
-		if maxLive <= 0 || grace <= 0 || maxQueuedBytes <= 0 || maxQueuedSlices <= 0 {
+		maxInboundBytes := int(t.Args()[2].Int64())
+		maxInboundSlices := int(t.Args()[3].Int64())
+		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
 			return nil, errors.New("net: invalid socket limits")
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.maxLiveChannels != 0 || n.closeGrace != 0 || n.maxQueuedBytes != 0 || n.maxQueuedSlices != 0 {
+		if n.maxLiveChannels != 0 || n.closeGrace != 0 ||
+			n.maxInboundReadBytes != 0 || n.maxInboundReadSlices != 0 {
 			return nil, errors.New("net: socket limits already installed")
 		}
 		n.maxLiveChannels = maxLive
 		n.closeGrace = grace
-		n.maxQueuedBytes = maxQueuedBytes
-		n.maxQueuedSlices = maxQueuedSlices
+		n.maxInboundReadBytes = maxInboundBytes
+		n.maxInboundReadSlices = maxInboundSlices
 		return t.Context().NewUndefined(), nil
 	}))
 
@@ -94,19 +101,21 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return t.Context().NewInt32(int32(bound)), nil
 	}))
+	// No answer: admission is the driver's per-link owner (host/transport-host.ts), which
+	// has already charged these bytes against this socket's `buffered()`. A send for a
+	// channel that is gone is dropped, exactly as one on a dead channel is.
 	o.SetPropertyStr("send", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
-			return t.Context().NewBool(false), nil
+			return nil, nil
 		}
-		id := t.Args()[0].Int64()
-		if ch := n.get(id); ch != nil {
+		if ch := n.get(t.Args()[0].Int64()); ch != nil {
 			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without another. It
 			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
 			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
-				return t.Context().NewBool(ch.send(b)), nil
+				ch.send(b)
 			}
 		}
-		return t.Context().NewBool(true), nil
+		return nil, nil
 	}))
 	o.SetPropertyStr("buffered", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 1 {
@@ -181,6 +190,41 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
+// waitSpace is lazily built so a zero-value netHost still works; always called under mu.
+func (n *netHost) waitSpace() *sync.Cond {
+	if n.readSpace == nil {
+		n.readSpace = sync.NewCond(&n.mu)
+	}
+	return n.readSpace
+}
+
+// reserveInboundRead charges a socket read before the reader makes the retained copy that
+// crosses into el.post — the driver-wide staging allowance of §12.6. A full window WAITS,
+// parking this reader goroutine so the socket's own receive window carries the pressure to
+// the peer; only a read that can never fit is refused, since waiting would park forever.
+func (n *netHost) reserveInboundRead(length int) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if length < 0 || length > n.maxInboundReadBytes || n.maxInboundReadSlices <= 0 {
+		return false
+	}
+	for n.inboundReadSlices >= n.maxInboundReadSlices ||
+		length > n.maxInboundReadBytes-n.inboundReadBytes {
+		n.waitSpace().Wait()
+	}
+	n.inboundReadSlices++
+	n.inboundReadBytes += length
+	return true
+}
+
+func (n *netHost) releaseInboundRead(length int) {
+	n.mu.Lock()
+	n.inboundReadSlices--
+	n.inboundReadBytes -= length
+	n.waitSpace().Broadcast()
+	n.mu.Unlock()
+}
+
 // allocInbound is alloc for a socket nobody asked for: it refuses once the host holds
 // maxLiveChannels. The count is read under the same lock that hands out the id, so the
 // only slack is at most one connection per accept goroutine.
@@ -198,8 +242,7 @@ func (n *netHost) allocInbound() (int64, bool) {
 // pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately.
 func (n *netHost) dial(addr string) int64 {
 	id := n.alloc()
-	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace,
-		n.maxQueuedBytes, n.maxQueuedSlices)
+	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
 	n.mu.Lock()
 	n.chans[id] = ch
 	n.mu.Unlock()
@@ -271,18 +314,28 @@ func (n *netHost) closeListeners() {
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
 func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
-	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace,
-		n.maxQueuedBytes, n.maxQueuedSlices)
+	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return c, func() { go c.readLoop() }
 }
 
 // onMsg/onClose run on a socket reader goroutine; they hand the work to the loop
 // goroutine, which owns all QuickJS access.
-func (n *netHost) onMsg(id int64) func([]byte) {
-	return func(b []byte) {
-		// b is freshly allocated and ours (the rawChannel onMsg contract), so capture it
-		// directly — one fewer full pass over every inbound byte.
-		n.el.post(func() { n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b)) })
+func (n *netHost) onMsg(id int64) func([]byte) bool {
+	return func(b []byte) bool {
+		// The readLoop's buffer is borrowed and reused. Reserve BEFORE copying it, and on
+		// a read that can never fit leave nothing allocated and nothing posted.
+		if !n.reserveInboundRead(len(b)) {
+			return false
+		}
+		owned := append([]byte(nil), b...)
+		n.el.post(func() {
+			// NewArrayBuffer copies into QuickJS, whose synchronous __netDeliver then enters
+			// TransportHost's existing allowance. Release native staging custody only after
+			// that handoff returns, including when the JS dispatcher rejects or throws.
+			defer n.releaseInboundRead(len(owned))
+			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(owned))
+		})
+		return true
 	}
 }
 

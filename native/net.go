@@ -43,9 +43,10 @@ func dialTCP(addr string) (net.Conn, error) {
 // an arbitrary slice of the stream and implies no boundary, which the transport bundle's
 // framer imposes on the far side of __net. A channel owns one socket, one read goroutine
 // and one writer goroutine. send only queues — safe from any goroutine — and takes
-// ownership of its slice; onMsg likewise hands the callee a fresh slice it owns.
+// ownership of its slice. onMsg borrows the read buffer only for the call; the native
+// host reserves its shared staging allowance before making any retained copy.
 type rawChannel interface {
-	send(bytes []byte) bool
+	send(bytes []byte)
 	buffered() int
 	resume()
 	close(graceful bool)
@@ -60,17 +61,15 @@ type rawChannel interface {
 // doubles as the pre-connect buffer, and one writer draining one FIFO keeps later
 // messages from overtaking earlier ones (PeerLink's HELLO, a WS upgrade request).
 type sockChannel struct {
-	onMsg   func([]byte)
+	onMsg   func([]byte) bool // false means the native driver-wide read allowance refused it
 	onClose func()
 
-	mu              sync.Mutex
-	conn            net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
-	queue           [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
-	queued          int      // bytes held in queue, reported to the transport's stall clock
-	dead            bool
-	closeGrace      time.Duration // installed from the shared TypeScript network policy
-	maxQueuedBytes  int
-	maxQueuedSlices int
+	mu         sync.Mutex
+	conn       net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
+	queue      [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
+	queued     int      // bytes held in queue, reported to the transport's stall clock
+	dead       bool
+	closeGrace time.Duration // installed from the shared TypeScript network policy
 
 	wake     chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
 	readGate chan struct{} // one token permits one socket read / serialized realm turn
@@ -84,10 +83,8 @@ func newReadGate() chan struct{} {
 
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
-func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration,
-	maxQueuedBytes, maxQueuedSlices int) *sockChannel {
+func newDialChannel(addr string, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
-		maxQueuedBytes: maxQueuedBytes, maxQueuedSlices: maxQueuedSlices,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
 		conn, err := dialTCP(addr)
@@ -111,10 +108,8 @@ func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace 
 
 // newInboundChannel wraps an already-open accepted socket: its writer starts immediately,
 // while the caller starts readLoop once the JS channel is registered (netHost.wrapInbound).
-func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration,
-	maxQueuedBytes, maxQueuedSlices int) *sockChannel {
+func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
-		maxQueuedBytes: maxQueuedBytes, maxQueuedSlices: maxQueuedSlices,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go c.writeLoop()
 	return c
@@ -123,17 +118,15 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeG
 // send queues bytes for the writer goroutine and returns immediately, never touching the
 // socket. It takes ownership of bytes (sock.go hands over a fresh JsTypedArrayToGo copy),
 // so nothing is copied here. A send on a dead channel is dropped silently, like a
-// node:net write after destroy.
-func (c *sockChannel) send(bytes []byte) bool {
+// node:net write after destroy. It answers nothing: what one link may hold is the driver's
+// per-link owner (host/transport-host.ts `LinkOutboundOwner`), which charges every write
+// against this socket's `buffered()` BEFORE it reaches here. A refusal from this primitive
+// would be a second gate on the same bytes, with no owner behind it.
+func (c *sockChannel) send(bytes []byte) {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
-		return true
-	}
-	if len(c.queue) >= c.maxQueuedSlices || len(bytes) > c.maxQueuedBytes-c.queued {
-		c.mu.Unlock()
-		c.fail()
-		return false
+		return
 	}
 	c.queue = append(c.queue, bytes)
 	c.queued += len(bytes)
@@ -143,11 +136,10 @@ func (c *sockChannel) send(bytes []byte) bool {
 	// the frame hits the wire now, overlapping the sender's JS turn — ~10% round-trip
 	// latency on the Net benches. A hint only: correctness never depends on it.
 	runtime.Gosched()
-	return true
 }
 
 // buffered is the transport-owned stall clock's view of this socket: bytes accepted from
-// the guest but not yet handed to conn.Write. The bundle decides how much queued progress
+// the guest whose conn.Write has not completed. The bundle decides how much queued progress
 // is acceptable; this primitive only reports the fact.
 func (c *sockChannel) buffered() int {
 	c.mu.Lock()
@@ -209,12 +201,18 @@ func (c *sockChannel) writeLoop() {
 		if len(c.queue) == 0 {
 			c.queue = nil // drained: free the backing array instead of pinning its high-water cap
 		}
-		c.queued -= len(b)
 		c.mu.Unlock()
 		// If a close()-initiated flush hits a write error, fail() is a no-op (dead is set)
 		// and the remaining writes error instantly on the closed conn — the loop still
 		// terminates, it just drains fast.
 		c.writeMsg(b)
+		c.mu.Lock()
+		// Keep the slice visible to buffered() while conn.Write owns it. A concurrent
+		// hard close/fail may already have released the whole allowance.
+		if c.queued >= len(b) {
+			c.queued -= len(b)
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -294,7 +292,14 @@ func (c *sockChannel) readLoop() {
 				spoke = true
 				conn.SetReadDeadline(time.Time{}) // said something: the guest's link deadlines own it now
 			}
-			c.onMsg(append([]byte(nil), chunk[:n]...))
+			// onMsg charges the §12.6 staging allowance before copying this borrowed
+			// scratch slice, stalling here when the window is full. It answers false only
+			// for a read that can never fit; leaving that socket open would just let the
+			// peer retry outside the meter.
+			if !c.onMsg(chunk[:n]) {
+				c.fail()
+				return
+			}
 		} else if err == nil {
 			// A zero-byte, nil-error read made no realm turn to return the token.
 			c.resume()

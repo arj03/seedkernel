@@ -12,7 +12,7 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 // ─── module routing ─────────────────────────────────────────────────────
 
 export interface ModuleTableOptions {
-  /** Ceiling on a module's declared initial *and* maximum linear memory, in bytes.
+  /** Ceiling on each module and on the bundle's aggregate declared maximum memory.
    *  A module above it — or one declaring no maximum at all — is refused at load
    *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
    *  this table to something tighter than a bundle may land.
@@ -358,8 +358,9 @@ export class ModuleTable implements PureModuleLoader {
     if (!w) return { bytes: null, ms: 0 };
     if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
     const bound = deadlineMs ?? this.deadlineMs;
-    // One in-flight call per module: the next call starts only when the previous one
-    // settled, so a spinning module burns one core for one bound, not one per caller.
+    // Bytes are not this table's to account for: the enclosing `host.call`'s
+    // `ActiveHostCall` owns `payload` until the module settles (§12.3). Execution IS —
+    // one in-flight call per module, so a spinner burns one core for one bound.
     const started = w.tail.then(() => this.call(w, payload, bound));
     w.tail = started.catch(() => {});
     return started;

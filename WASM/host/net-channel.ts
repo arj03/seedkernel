@@ -1,11 +1,6 @@
-import {
-    MAX_OUTBOUND_QUEUE_BYTES,
-    MAX_OUTBOUND_QUEUE_SLICES,
-} from "../core/net-limits.js";
 
-/** Pre-open send queue ceiling. Overflow fails the channel rather than dropping
- *  bytes (§16.1). */
-const MAX_PREOPEN_QUEUE_BYTES = 1024 * 1024; // 1 MiB
+/** Platform adapter with a natural pre-open buffer. Admission belongs to the enclosing
+ * link owner (`TransportHost`); this class retains accepted bytes and reports them. */
 
 export abstract class BufferedChannel {
     protected onMsg: ((bytes: Uint8Array) => void) | null = null;
@@ -25,7 +20,7 @@ export abstract class BufferedChannel {
     buffered(): number { return this.pendingBytes + this.backlog(); }
     send(bytes: Uint8Array): void {
         if (this.dead)
-            return;
+            throw new Error("socket: link is closed");
         if (this.opened) {
             try {
                 this.write(bytes);
@@ -36,9 +31,6 @@ export abstract class BufferedChannel {
                 this.fail();
             }
         }
-        else if (this.pending.length >= MAX_OUTBOUND_QUEUE_SLICES
-            || this.pendingBytes + bytes.length > MAX_PREOPEN_QUEUE_BYTES)
-            this.fail();
         else {
             this.pending.push(bytes);
             this.pendingBytes += bytes.length;
@@ -124,12 +116,6 @@ export interface MessageTransport {
  *  multiplex renegotiation signaling over the same channel); only binary frames are
  *  transport messages. */
 export class MessageChannel extends BufferedChannel {
-    /** Application messages still represented by `bufferedAmount`, oldest first. The
-     *  platform exposes only a byte total, so reconcile that total at each write to retire
-     *  completed messages without polling a quiet socket. */
-    private readonly outbound: number[] = [];
-    private observedBuffered = 0;
-
     constructor(private readonly t: MessageTransport) {
         super();
         t.binaryType = "arraybuffer";
@@ -141,44 +127,14 @@ export class MessageChannel extends BufferedChannel {
         t.addEventListener("close", () => this.fail());
         t.addEventListener("error", () => this.fail());
     }
-    private reconcileOutbound(): number {
-        const now = this.backlog();
-        if (now === 0) {
-            this.outbound.length = 0;
-            this.observedBuffered = 0;
-            return 0;
-        }
-        let drained = Math.max(0, this.observedBuffered - now);
-        while (drained > 0 && this.outbound.length > 0) {
-            if (drained < this.outbound[0]) {
-                this.outbound[0] -= drained;
-                drained = 0;
-            } else {
-                drained -= this.outbound.shift() as number;
-            }
-        }
-        this.observedBuffered = now;
-        return now;
-    }
     protected write(bytes: Uint8Array): void {
-        const queued = this.reconcileOutbound();
-        if (this.outbound.length >= MAX_OUTBOUND_QUEUE_SLICES
-            || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - queued) {
-            throw new Error("socket: outbound queue limit exceeded");
-        }
         this.t.send(bytes);
-        this.outbound.push(bytes.length);
-        this.observedBuffered = this.backlog();
-        // A transport that accepted the write straight onto the wire retained nothing.
-        if (this.observedBuffered === 0) this.outbound.length = 0;
     }
     /** The transport's own send backlog. */
     protected backlog(): number { return this.t.bufferedAmount ?? 0; }
     // Both real transports drain their queued frames before going away, so a
     // graceful stop needs nothing extra here.
     protected stop(_graceful: boolean): void {
-        this.outbound.length = 0;
-        this.observedBuffered = 0;
         this.t.close();
     }
 }

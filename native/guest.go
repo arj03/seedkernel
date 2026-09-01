@@ -23,7 +23,8 @@ import (
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. Each has
 	// its own guest seam, which is why net-settle routing is per realm rather than one
-	// global hook.
+	// global hook. The map mints the handles too, so a caller has no id to reuse or forge
+	// and one realm can never quietly displace another.
 	realms   = map[int64]*guestRealm{}
 	realmSeq int64
 )
@@ -58,9 +59,8 @@ type guestRealm struct {
 	// realm, and later calls are refused rather than panicking on a freed handle.
 	dead bool
 
-	// Host-side calls parked for this realm. Shared TypeScript owns the authoritative lease;
-	// these mirrored values arrive from it and let this bridge refuse before making the
-	// guest→Go payload copy. The map also rejects duplicate/stray settlements.
+	// Host-side calls parked for this realm. This is the authoritative native registry: it
+	// rejects before the guest-to-Go payload copy and retains custody through delivery.
 	hostCalls        map[int64]int64 // guest-minted id → copied input bytes
 	hostCallBytes    int64
 	maxHostCalls     int
@@ -89,14 +89,15 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if maxHostCalls <= 0 || maxHostCallBytes <= 0 {
 			return nil, errors.New("createRealm: no outstanding host-call limits supplied")
 		}
+		realmSeq++
+		id := realmSeq
 		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget,
 			maxHostCalls, maxHostCallBytes)
 		if err != nil {
 			return nil, err
 		}
-		realmSeq++
-		realms[realmSeq] = g
-		return t.Context().NewInt64(realmSeq), nil
+		realms[id] = g
+		return t.Context().NewInt64(id), nil
 	}))
 	b.SetPropertyStr("realmCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]
@@ -121,8 +122,20 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 			return nil, nil
 		}
 		callID := t.Args()[1].Int64()
+		if _, live := g.hostCalls[callID]; !live {
+			return nil, nil
+		}
 		if t.Args()[2].IsNull() || t.Args()[2].IsUndefined() {
 			g.settleNet(callID, nil, t.Args()[3].String())
+			return nil, nil
+		}
+		resultBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
+		if err != nil {
+			g.settleNet(callID, nil, "net result not bytes")
+			return nil, nil
+		}
+		if err := g.reserveHostCall(callID, resultBytes); err != nil {
+			g.settleNet(callID, nil, err.Error())
 			return nil, nil
 		}
 		bytes, err := qjs.JsTypedArrayToGo(t.Args()[2])
@@ -186,41 +199,38 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	// fourth host argument is this segment's live module deadline; -1 means unbounded.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		name := t.Args()[0].String()
-		// Only a call with no caller-side window (link/deliver, fired by the link occupant
-		// once per inbound frame it decodes) meters the BYTE budget: an ordinary awaited
-		// call's outstanding bytes are already bounded by the caller's own fan-out policy
-		// (domains.ts isByteMetered). COUNT is still charged for every call below.
-		chargeBytes := name == "link/deliver"
+		callID := t.Args()[1].Int64()
+		if _, duplicate := g.hostCalls[callID]; duplicate {
+			return nil, fmt.Errorf("guest: duplicate live host call id %d", callID)
+		}
 		if len(g.hostCalls) >= g.maxHostCalls {
 			return nil, fmt.Errorf("guest: too many outstanding host calls (cap %d)", g.maxHostCalls)
 		}
-		if chargeBytes {
-			payloadBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
-			if err != nil {
-				return nil, err
-			}
-			if payloadBytes > g.maxHostCallBytes-g.hostCallBytes {
-				return nil, fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
-			}
-		}
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
+		payloadBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
 		if err != nil {
 			return nil, err
 		}
-		// The no-copy width check and copy are synchronous in one realm turn. Charge the
-		// actual copy length as a defensive invariant if a custom view changed its getters.
-		payloadBytes := int64(0)
-		if chargeBytes {
-			payloadBytes = int64(len(payload))
-			if payloadBytes > g.maxHostCallBytes-g.hostCallBytes {
-				return nil, fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
-			}
+		if payloadBytes > g.maxHostCallBytes-g.hostCallBytes {
+			return nil, fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
 		}
+		// Admit id, count and source width together before the guest-to-Go copy.
+		g.hostCalls[callID] = payloadBytes
+		g.hostCallBytes += payloadBytes
+		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
+		if err != nil {
+			g.releaseHostCall(callID)
+			return nil, err
+		}
+		if int64(len(payload)) != payloadBytes {
+			g.releaseHostCall(callID)
+			return nil, errors.New("guest: host-call payload width changed while copying")
+		}
+		// The admitted custody follows the payload through the synchronous Go-to-host-realm
+		// handoff. It stays charged to this call after the shuttle slice leaves scope.
 		// nv and pv are the refcounted args (callID is an immediate) and Invoke only
 		// borrows them, so both are freed once the call returns.
 		nv := hostQc.NewString(name)
 		pv := hostQc.NewArrayBuffer(payload)
-		callID := t.Args()[1].Int64()
 		deadlineMs := int64(-1)
 		if !g.segmentDeadline.IsZero() {
 			deadlineMs = time.Until(g.segmentDeadline).Milliseconds()
@@ -228,15 +238,12 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 				deadlineMs = 0
 			}
 		}
-		g.hostCalls[callID] = payloadBytes // 0 when this call does not meter bytes
-		g.hostCallBytes += payloadBytes
 		res, err := hostQc.Invoke(g.hostCall, hostQc.NewUndefined(),
 			nv, pv, hostQc.NewInt64(callID), hostQc.NewInt64(deadlineMs))
 		pv.Free()
 		nv.Free()
 		if err != nil {
-			delete(g.hostCalls, callID)
-			g.hostCallBytes -= payloadBytes
+			g.releaseHostCall(callID)
 			return nil, err
 		}
 		res.Free() // always the JS_NULL immediate: the call parked
@@ -449,21 +456,39 @@ func (g *guestRealm) checkAlive() error {
 // There is no nested-budget case: the shim's per-realm queue leaves exactly one budget
 // window open at a time, so resetting `consumed` per call is the whole of the accounting.
 
+func (g *guestRealm) reserveHostCall(callID, bytes int64) error {
+	owned, live := g.hostCalls[callID]
+	if !live {
+		return errors.New("guest: host call is no longer active")
+	}
+	if bytes < 0 || bytes > g.maxHostCallBytes-g.hostCallBytes {
+		return fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
+	}
+	g.hostCalls[callID] = owned + bytes
+	g.hostCallBytes += bytes
+	return nil
+}
+
+func (g *guestRealm) releaseHostCall(callID int64) {
+	owned, live := g.hostCalls[callID]
+	if !live {
+		return
+	}
+	delete(g.hostCalls, callID)
+	g.hostCallBytes -= owned
+}
+
 // settleNet resolves or rejects the guest Promise parked under callID when the host
 // realm's Transport promise settles (`bytes` fulfils, `msg` rejects); the loop's next
 // pump runs the awaiting continuation.
 func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
+	if _, parked := g.hostCalls[callID]; !parked {
+		return
+	}
+	defer g.releaseHostCall(callID)
 	if g.checkAlive() != nil {
 		return // the realm the continuation belonged to no longer exists
 	}
-	// Look up the parked call first. A duplicate or stray settlement must not consume a
-	// different live call or run a guest continuation twice.
-	payloadBytes, parked := g.hostCalls[callID]
-	if !parked {
-		return
-	}
-	delete(g.hostCalls, callID)
-	g.hostCallBytes -= payloadBytes
 	var res *qjs.Value
 	var err error
 	if bytes != nil {
@@ -537,8 +562,13 @@ func (g *guestRealm) close() {
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 	g.settleAll("guest realm closed")
-	clear(g.hostCalls)
-	g.hostCallBytes = 0
+	// The custody these hold ends here: the guest that would have consumed the answers is
+	// gone, so what a still-pending backend holds is the host's own allocation, not this
+	// realm's (§12.3). Keeping the charge would pin this realm's allowance on any backend
+	// that never answers, with nothing left alive to release it.
+	for callID := range g.hostCalls {
+		g.releaseHostCall(callID)
+	}
 	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil

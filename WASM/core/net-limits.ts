@@ -5,8 +5,10 @@ export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
 /** Aggregate inbound bytes one driver admits across dispatched and held reads. A browser
  *  WebSocket and an RTCDataChannel cannot be paused, while a pausable socket still owns one
  *  dispatched read until the serialized realm releases it; both therefore reserve from the
- *  same driver-wide window before a read crosses into the realm. Past it, the arriving
- *  link fails instead of multiplying this host-memory allowance by the raw-link ceiling.
+ *  same driver-wide window before a read crosses into the realm, instead of multiplying
+ *  host memory by the raw-link ceiling. Native applies the window a SECOND time to reads
+ *  staged toward QuickJS, so the two overlap and that target's real bound is 2× (§12.6);
+ *  there a full window stalls the reader goroutine, here it fails the arriving link.
  *
  *  The window is what a pipelining peer really runs at, not a guess: seedstore's holder
  *  ingest bench (1 MiB batched STOREs against a zero-latency fabric, the hardest case there
@@ -28,6 +30,11 @@ export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_FRAME_BYTES;
 /** Count companion to `MAX_OUTBOUND_QUEUE_BYTES`. Tiny writes otherwise fit millions of
  *  queue nodes inside the byte window while spending much more host memory in metadata. */
 export const MAX_OUTBOUND_QUEUE_SLICES = 4096;
+
+/** Parent allowance shared by every link in one network driver. Per-link ceilings alone
+ * multiply by `DEFAULT_MAX_RAW_LINKS`; this bounds the process-facing aggregate instead. */
+export const MAX_NODE_OUTBOUND_QUEUE_BYTES = 4 * MAX_OUTBOUND_QUEUE_BYTES;
+export const MAX_NODE_OUTBOUND_QUEUE_SLICES = 4 * MAX_OUTBOUND_QUEUE_SLICES;
 
 /** Live raw sockets one host holds at once. The native accept path also receives this
  *  value so it can refuse before allocating a channel's goroutines and read buffer. */

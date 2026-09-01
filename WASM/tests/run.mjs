@@ -453,6 +453,30 @@ async function testManifestClaimIsTheRouting() {
     assert(shell.resolve("seedstore/v2") === null, "uninstall drops the app's claims");
     assertEqual(shell.routes().length, 0, "…leaving no route behind");
 
+    // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so the
+    // install list is counted: without this bound each of those ceilings is a floor. A
+    // REPLACEMENT is never refused — it takes the slot its own key already holds — and an
+    // uninstall gives one back.
+    const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
+    for (let i = 0; i < DEFAULT_MAX_APP_SLOTS; i++) {
+      await shell.loadBundleBlob(blob(author, `filler${i}`, 1, [`filler/${i}`]));
+    }
+    let overfull = "";
+    try { await shell.loadBundleBlob(blob(author, "one-too-many", 1, ["filler/x"])); }
+    catch (e) { overfull = String(e); }
+    assert(overfull.includes("app slots"), `a full node refuses another app, got: ${overfull || "no error"}`);
+    assert(shell.resolve("filler/x") === null, "…and the refused candidate claimed nothing");
+    await shell.loadBundleBlob(blob(author, "filler0", 2, ["filler/0"]));
+    assertEqual(shell.resolve("filler/0"), appKey(author.id, "filler0"),
+      "a replacement takes the slot its own key already holds");
+    shell.uninstall(appKey(author.id, "filler0"));
+    await shell.loadBundleBlob(blob(author, "one-too-many", 1, ["filler/x"]));
+    assertEqual(shell.resolve("filler/x"), appKey(author.id, "one-too-many"),
+      "uninstalling gives the slot back");
+    shell.uninstall(appKey(author.id, "one-too-many"));
+    for (let i = 1; i < DEFAULT_MAX_APP_SLOTS; i++) shell.uninstall(appKey(author.id, `filler${i}`));
+    assertEqual(shell.routes().length, 0, "the node is empty again");
+
     // The format's half of the rule: an id that is not routable is a manifest its author
     // got wrong, refused whole at verify rather than dropped quietly.
     for (const bad of [["bad id"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
@@ -2832,7 +2856,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     try { await shell.loadBundleBlob(blob, { localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
     const [, candidateLocal] = Function(
-      candidates[0].source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+      candidates[0].source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
     )();
     assert(candidateLocal.custom === "kept",
       "a link slot keeps the load's ordinary installation-local config");

@@ -18,17 +18,19 @@ import (
 )
 
 const testCloseGrace = time.Second
-const testMaxQueuedBytes = 16 << 20
-const testMaxQueuedSlices = 4096
 
 func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	return newInboundChannel(conn, onMsg, onClose, testCloseGrace,
-		testMaxQueuedBytes, testMaxQueuedSlices)
+	return newInboundChannel(conn, func(b []byte) bool {
+		onMsg(append([]byte(nil), b...))
+		return true
+	}, onClose, testCloseGrace)
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, onMsg, onClose, testCloseGrace,
-		testMaxQueuedBytes, testMaxQueuedSlices)
+	return newDialChannel(addr, func(b []byte) bool {
+		onMsg(append([]byte(nil), b...))
+		return true
+	}, onClose, testCloseGrace)
 }
 
 func waitOn(t *testing.T, ch <-chan struct{}, what string) {
@@ -178,8 +180,7 @@ func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 // transport's stall clock. No writer is started, so every byte remains deterministically
 // queued until a non-graceful close drops it.
 func TestSockChannelBufferedReportsQueue(t *testing.T) {
-	c := &sockChannel{wake: make(chan struct{}, 1),
-		maxQueuedBytes: testMaxQueuedBytes, maxQueuedSlices: testMaxQueuedSlices}
+	c := &sockChannel{wake: make(chan struct{}, 1)}
 	c.send([]byte("first"))
 	c.send([]byte("second"))
 	if got := c.buffered(); got != len("firstsecond") {
@@ -191,45 +192,44 @@ func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	}
 }
 
-// TestSockChannelOutboundQueueBounds pins both dimensions of the native writer bound. A
-// byte-only ceiling still admits millions of one-byte slice headers; a count-only ceiling
-// still admits a handful of frame-sized allocations. Crossing either fails the channel and
-// releases what it had queued instead of dropping one write out of the ordered stream.
-func TestSockChannelOutboundQueueBounds(t *testing.T) {
-	tests := []struct {
-		name      string
-		maxBytes  int
-		maxSlices int
-		writes    [][]byte
-	}{
-		{name: "bytes", maxBytes: 4, maxSlices: 10,
-			writes: [][]byte{[]byte("aa"), []byte("bb"), []byte("c")}},
-		{name: "slices", maxBytes: 100, maxSlices: 2,
-			writes: [][]byte{[]byte("a"), []byte("b"), []byte("c")}},
+// TestSockChannelBufferedIncludesBlockedWrite pins the handoff edge: popping a slice from
+// the Go queue does not release its driver-visible bytes while conn.Write still retains it.
+func TestSockChannelBufferedIncludesBlockedWrite(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	c := newTestInboundChannel(c1, func([]byte) {}, func() {})
+	payload := []byte("blocked")
+	c.send(payload)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		popped := len(c.queue) == 0
+		c.mu.Unlock()
+		if popped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer never popped the queued slice")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			closed := make(chan struct{}, 1)
-			c := &sockChannel{
-				onMsg: func([]byte) {}, onClose: func() { closed <- struct{}{} },
-				wake: make(chan struct{}, 1), readGate: newReadGate(),
-				maxQueuedBytes: tt.maxBytes, maxQueuedSlices: tt.maxSlices,
-			}
-			for i, b := range tt.writes {
-				accepted := c.send(b)
-				if i < len(tt.writes)-1 && !accepted {
-					t.Fatalf("write %d was refused below the ceiling", i)
-				}
-				if i == len(tt.writes)-1 && accepted {
-					t.Fatal("write crossing the ceiling was accepted")
-				}
-			}
-			waitOn(t, closed, "outbound queue overflow to fail the channel")
-			if got := c.buffered(); got != 0 {
-				t.Fatalf("overflow retained %d queued bytes", got)
-			}
-		})
+	if got := c.buffered(); got != len(payload) {
+		t.Fatalf("buffered during blocked Write = %d, want %d", got, len(payload))
 	}
+
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(c2, buf); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for c.buffered() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("completed Write did not release buffered bytes")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.close(false)
 }
 
 // TestSockChannelDialFailureFiresOnClose covers the dial-error path: a background
@@ -364,6 +364,106 @@ func TestNetHostAcceptCeiling(t *testing.T) {
 	}
 	if _, ok := n.allocInbound(); !ok {
 		t.Fatal("the ceiling did not release as channels drained")
+	}
+}
+
+// TestNetHostInboundReadAllowance pins the native side of the driver-wide inbound meter:
+// shared across links (not one allowance per sockChannel), admitted up to the exact byte
+// and slice ceilings, and fully returned after delivery.
+func TestNetHostInboundReadAllowance(t *testing.T) {
+	n := &netHost{maxInboundReadBytes: 8, maxInboundReadSlices: 2}
+	if !n.reserveInboundRead(5) || !n.reserveInboundRead(3) {
+		t.Fatal("reads at the exact aggregate byte/slice ceilings must be admitted")
+	}
+	if n.reserveInboundRead(9) {
+		t.Fatal("a read larger than the whole window must be refused, never waited on")
+	}
+	if got := n.inboundReadBytes; got != 8 {
+		t.Fatalf("refusal changed staged bytes: got %d, want 8", got)
+	}
+	n.releaseInboundRead(5)
+	n.releaseInboundRead(3)
+	if n.inboundReadBytes != 0 || n.inboundReadSlices != 0 {
+		t.Fatalf("native staging custody leaked: %d bytes, %d slices",
+			n.inboundReadBytes, n.inboundReadSlices)
+	}
+}
+
+// TestNetHostInboundReadWaitsForSpace is the backpressure half: a full window parks the
+// reader goroutine — where stalling is free and the socket's receive window carries it to
+// the peer — instead of failing an honest link well below MAX_RAW_LINKS.
+func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
+	n := &netHost{maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	if !n.reserveInboundRead(4) {
+		t.Fatal("failed to occupy the test allowance")
+	}
+	admitted := make(chan struct{})
+	go func() {
+		n.reserveInboundRead(2)
+		close(admitted)
+	}()
+	select {
+	case <-admitted:
+		t.Fatal("a read was admitted while the staging window was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	n.releaseInboundRead(4)
+	select {
+	case <-admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("released staging capacity did not wake the waiting reader")
+	}
+	n.releaseInboundRead(2)
+	if n.inboundReadBytes != 0 || n.inboundReadSlices != 0 {
+		t.Fatalf("native staging custody leaked: %d bytes, %d slices",
+			n.inboundReadBytes, n.inboundReadSlices)
+	}
+}
+
+// TestNetHostOnMsgChargesBeforePost covers the exact pre-meter edge: the copy into the
+// event-loop queue happens only after custody is charged. A nil QuickJS context is
+// intentional — touching the delivery path would panic the test.
+func TestNetHostOnMsgChargesBeforePost(t *testing.T) {
+	el := &eventLoop{tasks: make(chan func(), 1)}
+	n := &netHost{el: el, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	if n.onMsg(1)([]byte("toolong")) {
+		t.Fatal("onMsg admitted a read larger than the whole staging window")
+	}
+	if len(el.tasks) != 0 || n.inboundReadSlices != 0 {
+		t.Fatal("a refused read was charged or posted toward QuickJS")
+	}
+	if !n.onMsg(1)([]byte("ok")) {
+		t.Fatal("onMsg refused a read the staging window had room for")
+	}
+	if n.inboundReadBytes != 2 || n.inboundReadSlices != 1 || len(el.tasks) != 1 {
+		t.Fatalf("accepted read was not charged before post: %d bytes, %d slices, %d tasks",
+			n.inboundReadBytes, n.inboundReadSlices, len(el.tasks))
+	}
+	// Do not execute the task against this test's intentionally nil QuickJS context.
+	// Discard its retained closure and mirror the defer it would run after delivery.
+	<-el.tasks
+	n.releaseInboundRead(2)
+}
+
+// TestSockChannelReadAdmissionRefusalIsTerminal ensures a peer cannot keep retrying a read
+// the staging meter can never admit: it closes the socket and reports the link down once.
+func TestSockChannelReadAdmissionRefusalIsTerminal(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	closed := make(chan struct{}, 1)
+	var attempts atomic.Int32
+	c := newInboundChannel(c1, func([]byte) bool {
+		attempts.Add(1)
+		return false
+	}, func() { closed <- struct{}{} }, testCloseGrace)
+	go c.readLoop()
+
+	if _, err := c2.Write([]byte("refused")); err != nil {
+		t.Fatal(err)
+	}
+	waitOn(t, closed, "an over-budget native read must fail its link")
+	if attempts.Load() != 1 {
+		t.Fatalf("read admission attempted %d times, want exactly once", attempts.Load())
 	}
 }
 

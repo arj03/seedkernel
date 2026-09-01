@@ -33,6 +33,8 @@ class LoopbackChannel {
     const p = this.peer;
     queueMicrotask(() => { if (p && !p.dead) p.msg?.(bytes); });
   }
+  // Honest: delivery is a microtask handoff, so nothing is retained past send().
+  buffered() { return 0; }
   onData(cb) { this.msg = cb; }
   onClose(cb) { this.cls = cb; }
   close() {

@@ -15,6 +15,7 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   maxHalfOpenVerified: 256,
   maxAuthedLinks: 256,
   maxFrameBytes: MAX_FRAME_BYTES,
+  maxPreAuthQueueSlices: 4096,
   requestDeadlineMs: 10_000,
   linkIdleTimeoutMs: 300_000,
   admitPeers: Object.freeze([]),

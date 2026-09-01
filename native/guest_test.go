@@ -60,15 +60,12 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host calls")
 	}
 }
 
-// Only "link/deliver" (seedkernel WASM/core/domains.ts isByteMetered) meters bytes: it is
-// fired by the link occupant once per inbound frame with no caller-side window, unlike an
-// ordinary awaited call whose outstanding bytes a caller's own fan-out already bounds.
 func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
@@ -87,7 +84,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("byte flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host-call payload bytes")
 	}
@@ -96,11 +93,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 	}
 }
 
-// A caller-windowed op (any name other than "link/deliver") is bounded by COUNT alone: a
-// realm may hold far more than 16 MiB of an ordinary op's payloads outstanding, matching a
-// bounded application fan-out (e.g. seedstore's netSendMany, windowed by its own
-// fanoutWindow) that must not trip the byte cap meant for un-windowed inbound delivery.
-func TestGuestRealmOrdinaryHostCallBytesUnmetered(t *testing.T) {
+func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__heldHostCalls = 0;
@@ -118,12 +111,53 @@ func TestGuestRealmOrdinaryHostCallBytesUnmetered(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
-	if _, err := realmCall("ordinary flood", nil); err != nil {
-		t.Fatalf("an ordinary call name was refused by the byte cap meant only for link/deliver: %v", err)
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	if _, err := realmCall("ordinary flood", nil); err == nil {
+		t.Fatal("an ordinary call name bypassed the universal host-call byte cap")
 	}
-	if got := evalString(t, "String(__heldHostCalls)"); got != "9" {
-		t.Fatalf("host received %s payloads, want all 9 (18 MiB, over the 16 MiB byte cap) uncapped by bytes", got)
+	if got := evalString(t, "String(__heldHostCalls)"); got != "8" {
+		t.Fatalf("host received %s payloads, want exactly 8 before name-blind admission refused the ninth", got)
+	}
+}
+
+func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__heldHostCalls = 0;
+		globalThis.__guestSeam = () => {
+		  __heldHostCalls++;
+		  return new Promise(() => {});
+		};
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() {
+		  __host_call("first", 7, new ArrayBuffer(1));
+		  __host_call("second", 7, new ArrayBuffer(1));
+		  return new Uint8Array();
+		}
+	`, 1000)
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	if _, err := realmCall("duplicate", nil); err == nil {
+		t.Fatal("a duplicate live host-call id was accepted")
+	}
+	if got := evalString(t, "String(__heldHostCalls)"); got != "1" {
+		t.Fatalf("host received %s payloads, want one before duplicate-id rejection", got)
+	}
+}
+
+// TestGuestRealmIDsAreMintedByTheirOwner pins the bridge's handle contract at the Go side:
+// the map that owns realms also mints their opaque ids, so callers have no id to reuse or
+// forge and successive realms can never quietly displace one another.
+func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
+	bootRealm(t)
+	const mk = `bridge.createRealm("function handle(){ return new Uint8Array(); }", () => {}, 67108864, 1000, 10, 1048576)`
+	if _, err := qc.Eval("mk.js", qjs.Code(`globalThis.__realmIds = [`+mk+`, `+mk+`];`)); err != nil {
+		t.Fatalf("create realms: %v", err)
+	}
+	if got := evalString(t, "String(__realmIds[0] > 0 && __realmIds[1] > __realmIds[0])"); got != "true" {
+		t.Fatalf("realm ids are not positive and strictly increasing: %s", got)
 	}
 }
 
@@ -152,7 +186,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	newTestRealmBudget(t, "{}", `
 		function handle() { return host.call("probe", new Uint8Array()); }
 	`, 250)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if got, err := realmCall("probe", nil); err != nil || !bytes.Equal(got, []byte{9}) {
 		t.Fatalf("module probe = %v, err = %v", got, err)
 	}
@@ -176,9 +210,12 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 
-	g := realms[realmSeq]
+	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which stands the host realm up
+	// fresh (host-shell.gen.js re-evaluates, resetting native-shim.ts's own realm-id
+	// counter), and newTestRealm above is the first createRealm this test makes.
+	g := realms[1]
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
 	}
@@ -197,6 +234,38 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	g.settleNet(liveID, []byte{}, "")
 	if len(g.hostCalls) != 0 {
 		t.Fatalf("live settlement left parked call count at %d", len(g.hostCalls))
+	}
+}
+
+// TestGuestRealmCloseReleasesParkedCalls: closing a realm ends the custody of whatever it
+// still had parked. The guest that would have consumed those answers is gone, so what a
+// pending backend holds is the host's own memory — keeping the charge would pin the
+// process-wide pool on any backend that never answers, with nothing left to release it.
+func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("park-close-seam.js", qjs.Code(`
+		globalThis.__guestSeam = () => new Promise(() => {});
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealm(t, "{}", `
+		function handle() {
+		  host.call("hold", new Uint8Array([1, 2, 3]));
+		  return new Uint8Array();
+		}
+	`)
+	g := realms[1]
+	if _, err := realmCall("park", nil); err != nil {
+		t.Fatal("park host call:", err)
+	}
+	if len(g.hostCalls) != 1 || g.hostCallBytes != 3 {
+		t.Fatalf("parked call not charged: %d calls, %d bytes", len(g.hostCalls), g.hostCallBytes)
+	}
+	if _, err := qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)); err != nil {
+		t.Fatal("dispose:", err)
+	}
+	if len(g.hostCalls) != 0 || g.hostCallBytes != 0 {
+		t.Fatalf("close left %d parked calls and %d bytes charged", len(g.hostCalls), g.hostCallBytes)
 	}
 }
 

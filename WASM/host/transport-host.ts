@@ -8,6 +8,10 @@ import {
   MAX_FRAME_BYTES,
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
+  MAX_NODE_OUTBOUND_QUEUE_BYTES,
+  MAX_NODE_OUTBOUND_QUEUE_SLICES,
+  MAX_OUTBOUND_QUEUE_BYTES,
+  MAX_OUTBOUND_QUEUE_SLICES,
 } from "../core/net-limits.js";
 import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
@@ -42,6 +46,9 @@ export interface TransportHostOptions {
  *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
  *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
+  /** Aggregate write custody across every link in this driver. */
+  maxOutboundBytes?: number;
+  maxOutboundSlices?: number;
   /** The socket seam: dialing and listening live here, and so does every judgement about
  *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
  *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
@@ -58,6 +65,89 @@ export interface TransportHostOptions {
   onLinkClosed?: (linkId: number, reason: number) => void;
 }
 
+/** One link's continuous outbound custody (§12.6), spanning adapter pre-open buffering and
+ * the platform socket backlog. What the adapter still holds IS the charge; the sizes queue
+ * is only what turns its one byte total back into the slices that make it up. */
+class LinkOutboundOwner {
+  /** Admitted write sizes in send order, so a drained PREFIX can be retired without
+   *  waiting for the whole backlog to empty — the node-wide slice count is shared, and one
+   *  busy link that never reaches an idle moment would otherwise hold it to the ceiling. */
+  private readonly queued: number[] = [];
+  private charged = 0; // === sum(queued)
+  private closed = false;
+
+  constructor(
+    private readonly channel: RawLink,
+    private readonly reserveParent: (bytes: number) => boolean,
+    private readonly releaseParent: (bytes: number, slices: number) => void,
+  ) {}
+
+  /** The adapter's own report, or null when it claims to know and cannot answer. No
+   *  `buffered` at all is a static declaration that nothing is retained past `send`, and a
+   *  `buffered()` answering 0 says the same dynamically — both release. One that throws or
+   *  answers nonsense asserts nothing, and reading THAT as 0 would drop the charge while
+   *  the platform still holds the bytes, so it never releases and its next `send` fails
+   *  the link (§12.6). */
+  private report(): number | null {
+    if (!this.channel.buffered) return 0;
+    try {
+      const n = this.channel.buffered();
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Hand back what the platform has drained since the last look. Growth is never taken on
+   *  trust — only writes admitted here are ever charged. Every transport behind this seam is
+   *  ORDERED, so the report is a suffix of what was admitted: a slice is gone once the bytes
+   *  behind it already cover the report, and a partly drained head stays charged in full. */
+  private settle(now: number | null): void {
+    if (now === null) return;
+    let n = 0, bytes = 0;
+    while (n < this.queued.length && this.charged - bytes - this.queued[n] >= now) {
+      bytes += this.queued[n++];
+    }
+    if (n === 0) return;
+    this.queued.splice(0, n);
+    this.charged -= bytes;
+    this.releaseParent(bytes, n);
+  }
+
+  send(bytes: Uint8Array): void {
+    if (this.closed) throw new Error("socket: link is closed");
+    const now = this.report();
+    if (now === null) throw new Error("socket: adapter cannot report its outbound backlog");
+    this.settle(now);
+    if (this.queued.length >= MAX_OUTBOUND_QUEUE_SLICES
+      || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.charged
+      || !this.reserveParent(bytes.length)) {
+      throw new Error("socket: outbound queue limit exceeded");
+    }
+    this.charged += bytes.length;
+    this.queued.push(bytes.length);
+    try { this.channel.send(bytes); }
+    catch (err) { this.releaseAll(); throw err; }
+    this.settle(this.report());
+  }
+
+  /** The occupant's stall clock wants the platform's live number, not the slice-rounded
+   *  charge: an adapter that answers is exact, and only a mute one falls back (§12.6). */
+  buffered(): number {
+    const now = this.report();
+    this.settle(now);
+    return now ?? this.charged;
+  }
+
+  releaseAll(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.releaseParent(this.charged, this.queued.length);
+    this.queued.length = 0;
+    this.charged = 0;
+  }
+}
+
 /** The host side of the node's network: sockets and listeners. Nothing on this object is
  *  reached by an app.
  *
@@ -72,6 +162,7 @@ export class TransportHost {
   private readonly opts: Omit<TransportHostOptions, "networkKey">;
   private readonly nodeFacts: Pick<TransportHostOptions, "networkKey">;
   private readonly channels = new Map<number, RawLink>;
+  private readonly outbound = new Map<number, LinkOutboundOwner>;
   private nextLinkId = 1;
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
@@ -81,6 +172,8 @@ export class TransportHost {
   // held above unpausable adapters remain charged until released or dropped.
   private inboundReadSlices = 0;
   private inboundReadBytes = 0;
+  private outboundSlices = 0;
+  private outboundBytes = 0;
 
   constructor(
     opts: Omit<TransportHostOptions, "networkKey">,
@@ -123,6 +216,21 @@ export class TransportHost {
   private releaseInboundRead(length: number): void {
     this.inboundReadSlices--;
     this.inboundReadBytes -= length;
+  }
+
+  private reserveOutbound(length: number): boolean {
+    if (this.outboundSlices >= (this.opts.maxOutboundSlices ?? MAX_NODE_OUTBOUND_QUEUE_SLICES)
+      || length > (this.opts.maxOutboundBytes ?? MAX_NODE_OUTBOUND_QUEUE_BYTES) - this.outboundBytes) {
+      return false;
+    }
+    this.outboundSlices++;
+    this.outboundBytes += length;
+    return true;
+  }
+
+  private releaseOutbound(bytes: number, slices: number): void {
+    this.outboundBytes -= bytes;
+    this.outboundSlices -= slices;
   }
 
   /** Release link state owned by a departing link-capable slot, retaining the listeners for
@@ -198,7 +306,7 @@ export class TransportHost {
         if (!bound()) return;
         const channel = this.channels.get(linkId);
         if (!channel) return;
-        try { channel.send(bytes); }
+        try { this.outbound.get(linkId)?.send(bytes); }
         catch {
           // A throwing backend may already have emitted a prefix (notably an RTC write
           // split into SCTP-sized chunks). Continuing would desynchronize LENGTH framing.
@@ -220,7 +328,7 @@ export class TransportHost {
       // the occupant's stall clock sees no progress and lets the deadline decide.
       buffered: (linkId) => {
         if (!bound()) return 0;
-        try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
+        try { return this.outbound.get(linkId)?.buffered() ?? 0; } catch { return 0; }
       },
       // Inbound attributed delivery (§12.10): one request the occupant decoded, routed
       // through the shell's claim table and answered back to the occupant, which frames it
@@ -252,6 +360,11 @@ export class TransportHost {
     }
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
+    this.outbound.set(linkId, new LinkOutboundOwner(
+      channel,
+      (bytes) => this.reserveOutbound(bytes),
+      (bytes, slices) => this.releaseOutbound(bytes, slices),
+    ));
     // Admit one read per link into the serialized realm at a time. An adapter that can be
     // paused is paused at the socket, where the peer's own transport pushes back; one that
     // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
@@ -341,6 +454,8 @@ export class TransportHost {
   private channelClosed(linkId: number, channel: RawLink): void {
     if (this.channels.get(linkId) !== channel) return;
     this.channels.delete(linkId);
+    this.outbound.get(linkId)?.releaseAll();
+    this.outbound.delete(linkId);
     const report = (reason: number) => {
       try { this.opts.onLinkClosed?.(linkId, reason); }
       catch { /* a platform callback cannot corrupt this driver's link table */ }

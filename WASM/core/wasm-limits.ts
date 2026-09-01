@@ -41,11 +41,38 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
  *  memory. Applies to every host call, not only networking. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
+/** How deep one realm's entry queue may get. A DEPTH bound with no byte companion, on
+ *  purpose: a waiting invocation's bytes are already owned for a longer period by whoever
+ *  handed them over — an inbound read by its link, a guest call by the calling realm's
+ *  active-call registry. See `serializeCalls` (host/realm-queue.ts). */
+export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
+
+/** Confined realms one node may hold at once (`slots`, shell-core.ts). The MULTIPLICAND:
+ *  every per-realm ceiling here is one of these times this number, which is what makes the
+ *  node total a ceiling rather than a floor — that sum is added up and measured against a
+ *  real machine in tests/verify-hardening.mjs (§12.3). Bounding the count is also
+ *  why nothing here is pooled BETWEEN realms: an allowance apps draw on in common is one
+ *  app's standing way to refuse another's calls by being busy, while a quota per tenant
+ *  times a bounded tenant count reaches the same total with no such channel. Slots are the
+ *  operator's own admin path (§12.4), so this bounds an install list, never a peer's reach. */
+export const DEFAULT_MAX_APP_SLOTS = 8;
+
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling
  *  (`PureModuleLoader.maxModuleMemoryBytes`) — so a host may hold its isolates to less and
  *  none can be looser about what a bundle may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
+
+/** Metadata bound for one signed bundle. Aggregate module memory normally binds first, but
+ *  zero-memory declarations must not turn admission into an unbounded module-array walk. */
+export const DEFAULT_MAX_BUNDLE_MODULES = 256;
+
+/** The default in-memory `Fs` backend's whole quota (host/fs-memory.ts `MemoryFs`), so a
+ *  successful put cannot turn bounded in-flight calls into unbounded permanent process RAM.
+ *  Declared here rather than in fs-memory.ts so one file holds every node-scoped ceiling
+ *  the §12.3 sum adds up; fs-memory.ts re-exports it. */
+export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether

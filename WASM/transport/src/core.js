@@ -71,6 +71,7 @@ const maxFrameBytes = policy("maxFrameBytes");
 // cannot see it. Give it the same eight-frame byte window and tiny-write count ceiling.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
 const maxOutboundQueueSlices = 4096;
+const maxPreAuthQueueSlices = Math.max(1, policy("maxPreAuthQueueSlices"));
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");
 const maxVerified = policy("maxHalfOpenVerified");
