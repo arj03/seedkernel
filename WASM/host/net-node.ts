@@ -15,7 +15,7 @@ import { parseDest } from "./peer-addr.js";
 function nodeRawStream(socket: Socket): RawLink {
     return {
         stream: true,
-        // The peer's IP, for the per-source half-open cap only (§12.6.1) — unauthenticated
+        // The peer's IP, for the per-source half-open cap only (§12.6.2) — unauthenticated
         // and never an identity. Captured now because `socket.remoteAddress` reads undefined
         // once destroyed, and the limiter must release the bucket it took.
         remoteAddr: socket.remoteAddress ?? undefined,

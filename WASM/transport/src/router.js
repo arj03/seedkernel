@@ -91,8 +91,7 @@ class Router {
  *  `send` op measures a caller's arguments against the frame cap before copying them. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
 
-// Stall clock (§16.1): re-arms while this request's bytes still drain
-// (`flushed < owed`); baseline on first expiry, not at send.
+// Stall clock, §16.1.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
@@ -130,13 +129,10 @@ class ReqRes {
     return (this.sent.get(to) || 0) - buffered;
   }
 
-  /** Arm one request's stall clock. `owed` is `sent` including this request's own
-   *  frame — the point at which it has finished being asked.
-   *
-   *  The baseline is taken on the first expiry, not here: a frame handed over while the
-   *  peer is still being dialled routes through the pre-auth pool, where there is no link
-   *  to read a backlog from, so a baseline taken now would be an over-estimate no later
-   *  reading could correct. The cost is one deadline of grace to find the link. */
+  /** Arm one request's stall clock (§16.1 `REQUEST_DEADLINE_MS`). `owed` is `sent`
+   *  including this request's own frame — the point at which it has finished being
+   *  asked. Baseline taken on first expiry, not here, at the cost of one deadline of
+   *  grace: see §16.1 for why. */
   armStall(corr, to, deadlineMs, owed) {
     let mark = null;
     const tick = async () => {

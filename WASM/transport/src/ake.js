@@ -30,15 +30,14 @@ const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
 
 // The X25519 base point: `dh(sk, BASEPOINT)` IS the public-key derivation, so the
-// the residual host transform needs no keygen entry while the secret comes from node/random.
+// residual host transform needs no keygen entry while the secret comes from node/random.
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-// Why a link went down, returned from the driver's `linkClosed` event. The event already
-// names the link, so the return carries no link id and cannot speak about another socket.
-// This is the ONE thing the host cannot work out for itself: it sees a descriptor close,
-// while whether that was a farewell, a defensive abort or a cut stream is a fact only the
-// end holding the session keys ever had.
+// Why a link went down, returned from the driver's `linkClosed` event (no link id needed —
+// the event already names the link). The ONE thing the host cannot work out for itself:
+// it sees a descriptor close, while farewell vs. defensive abort vs. cut stream is a fact
+// only the end holding the session keys ever had.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
       REASON_LOCAL = 4, REASON_TRUNCATED = 5;
 
@@ -60,11 +59,8 @@ const M2_LEN = EPH_LEN + KEM_CT_LEN + NONCE_LEN + TAG_LEN;             // 1168
 const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 
-// The one suite this transport speaks, and the bundle's own number: a channel suite is
-// read by the AKE, which is entirely this program, so it lives here rather than in the
-// host's core (§14.1). Not negotiated: it makes the wire self-describing, and because it
-// sits inside every signed transcript half, an in-path attacker who flips it only makes
-// the two ends sign different bytes (§12.6).
+// The one suite this transport speaks. Lives here, not in the host's core, since a
+// channel suite is read entirely by this AKE (§14.1); not negotiated (§12.6).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
 const ZERO_NPUB = new Uint8Array(NPUB_LEN);

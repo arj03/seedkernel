@@ -170,7 +170,7 @@ interface AppSlot {
 }
 
 /** Per-realm timer table. Cap live count and retained bytes; `clearAll` before realm
- *  disposal (§2.1). */
+ *  disposal (§12.3). */
 interface RealmTimers extends HostTimers {
   /** Cancel every live deadline. Called only from `disposeSlot`, before the realm goes. */
   clearAll(): void;
@@ -456,7 +456,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // The tail of every host-initiated call into a realm. close() defers realm disposal onto
     // this, so a call parked mid-await (a repair pass on an unreachable peer, an operator
     // waiting for a cohort) is never resumed into a freed realm — a QuickJS
-    // use-after-free (§2.1).
+    // use-after-free (§12.3).
     let inFlight = Promise.resolve();
     const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
     /** Each signed list paired with the map it claims in, so every caller iterating a
@@ -629,7 +629,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         ? slot.realm.call(input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
     /** Chain a host-initiated call onto `inFlight`, so `close()` waits for it rather than
-     *  freeing the realm out from under it (§2.1). */
+     *  freeing the realm out from under it (§12.3). */
     const track = (call: Promise<Uint8Array>): Promise<Uint8Array> => {
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
