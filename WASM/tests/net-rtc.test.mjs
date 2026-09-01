@@ -163,7 +163,7 @@ await test("inbound signaling handlers run in arrival order", async () => {
   net.close();
 });
 
-await test("post-description ICE uses one drain under direct concurrency", async () => {
+await test("post-description ICE candidates drain one at a time", async () => {
   let firstStartedResolve, secondStartedResolve, releaseFirst;
   const firstStarted = new Promise((resolve) => { firstStartedResolve = resolve; });
   const secondStarted = new Promise((resolve) => { secondStartedResolve = resolve; });
@@ -184,18 +184,20 @@ await test("post-description ICE uses one drain under direct concurrency", async
   };
   const ownId = peerId(0);
   const remote = peerId(1);
+  let receive = () => {};
   const net = new RtcNetwork({
     peerId: ownId,
-    signaling: { send() {}, onMessage() {}, close() {} },
+    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
     peerConnectionFactory: () => made.pc,
   });
   const entry = net.ensurePeer(remote);
   entry.pc.remoteDescription = { type: "offer", sdp: "ready" };
 
-  // Call the handler directly to prove the per-entry drain owns this invariant rather
-  // than getting it only incidentally from the inbound signaling lane above.
-  const first = net.onSignal({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } });
-  const second = net.onSignal({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } });
+  // Through the inbound boundary, the only way a candidate arrives: one signaling lane
+  // serializes every handler, so a drain cannot start while another is mid-candidate and
+  // there is no second per-entry lane to keep in step with this one.
+  const first = receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } });
+  const second = receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } });
   await firstStarted;
   assert(calls === 1 && maxActive === 1,
     "a later candidate must wait while the preceding addIceCandidate is in flight");

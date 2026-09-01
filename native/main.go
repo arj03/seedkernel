@@ -289,8 +289,6 @@ func shutdown() {
 	}
 	realms = map[int64]*guestRealm{}
 	lastRealmID = 0
-	nodeHostCalls, nodeHostBytes = 0, 0
-	maxNodeHostCalls, maxNodeHostBytes = 0, 0
 	if qrt != nil {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil

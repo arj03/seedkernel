@@ -9,8 +9,7 @@ import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type S
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_NODE_HOST_CALL_BYTES, DEFAULT_MAX_NODE_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { createCustodyAllowance, type CustodyAllowance } from "./realm-queue.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
@@ -44,8 +43,6 @@ export type RealmFactory = (opts: {
     /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
      *  factory's own default (`DEFAULT_GUEST_DEADLINE_MS` on both targets). */
     deadlineMs?: number;
-    /** Parent node allowance shared by sibling realms. */
-    custodyAllowance?: CustodyAllowance;
 }) => Promise<SafeRealm>;
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
@@ -186,13 +183,8 @@ export function createRealmTimers(
     fire: (payload: Uint8Array) => void,
     max = DEFAULT_MAX_LIVE_TIMERS,
     maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
-    parent?: CustodyAllowance,
 ): RealmTimers {
-    const live = new Map<number, {
-        timer: ReturnType<typeof setTimeout>;
-        payloadBytes: number;
-        releaseParent?: () => void;
-    }>();
+    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; payloadBytes: number }>();
     let payloadBytes = 0;
     const clear = (id: number) => {
         const entry = live.get(id);
@@ -200,7 +192,6 @@ export function createRealmTimers(
             clearTimeout(entry.timer);
             live.delete(id);
             payloadBytes -= entry.payloadBytes;
-            entry.releaseParent?.();
         }
     };
     return {
@@ -215,10 +206,7 @@ export function createRealmTimers(
                 throw new Error(`guest: live timer payloads exceed byte cap ${maxPayloadBytes}`);
             // Copy only after both checks pass. The guest-call request buffer can then be
             // collected, and the table retains exactly the bytes it accounts for.
-            const releaseParent = parent?.reserve(1, payload.byteLength);
-            let body: Uint8Array;
-            try { body = payload.slice(); }
-            catch (err) { releaseParent?.(); throw err; }
+            const body = payload.slice();
             clear(id);
             // Dropped from the table BEFORE the realm is re-entered, so a guest that
             // re-arms the same id from inside its own `timer` entrypoint arms the new
@@ -228,18 +216,14 @@ export function createRealmTimers(
                 if (!entry || entry.timer !== timer) return;
                 live.delete(id);
                 payloadBytes -= entry.payloadBytes;
-                entry.releaseParent?.();
                 fire(body);
             }, ms);
-            live.set(id, { timer, payloadBytes: body.byteLength, releaseParent });
+            live.set(id, { timer, payloadBytes: body.byteLength });
             payloadBytes += body.byteLength;
         },
         clear,
         clearAll() {
-            for (const { timer, releaseParent } of live.values()) {
-                clearTimeout(timer);
-                releaseParent?.();
-            }
+            for (const { timer } of live.values()) clearTimeout(timer);
             live.clear();
             payloadBytes = 0;
         },
@@ -382,10 +366,6 @@ export interface BootResult {
  *  path — a second way to a Shell would be one that skipped the pin. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const sodium = opts.sodium;
-    const nodeCustody = createCustodyAllowance(
-        DEFAULT_MAX_NODE_HOST_CALLS,
-        DEFAULT_MAX_NODE_HOST_CALL_BYTES,
-    );
     // The defaults are imported lazily: they are JS-target parts (a worker-backed module
     // builder, the QuickJS realm engine), and the one target that never takes them (the
     // native loader, which supplies Go-backed equivalents) must not pay for them.
@@ -486,7 +466,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             void slot.realm?.call(concatBytes([HOST_CALLER_ID, payload])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
-        }, undefined, undefined, nodeCustody);
+        });
         const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
         const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
@@ -540,7 +520,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             hostCall: seamFor(slot),
             memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
-            custodyAllowance: nodeCustody,
         });
     };
     /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
@@ -640,6 +619,15 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  holds (§12.10). Asked before candidate code runs, then again in the commit window.
      *  Per MAP: the same name under `protocols` and `services` is two claims, not a
      *  contest. */
+    /** Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
+     *  install list nobody counts would leave each of those ceilings a floor rather than a
+     *  bound. A replacement takes the slot it already holds and is never refused here.
+     *  Checked twice like the contest below, and for the same reason: this is the cheap
+     *  early refusal, and the commit window re-checks what another load may have taken. */
+    const refuseOverfull = (key: string) => {
+        if (slots.length >= DEFAULT_MAX_APP_SLOTS && !slots.some((installed) => keyOf(installed) === key))
+            throw new Error(`shell: this node already holds its ${DEFAULT_MAX_APP_SLOTS} app slots — uninstall one before installing another`);
+    };
     const refuseContested = (loaded: LoadedBundle, key: string) => {
         for (const [book, names, audience] of booksOf(loaded.manifest)) {
             for (const claim of names) {
@@ -749,6 +737,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             // synchronous commit window remains necessary, since another load may take a
             // free claim while this candidate is built.
             refuseContested(loaded, key);
+            refuseOverfull(key);
             const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules, loadOpts.onInbound);
             // Stand the guest, before anything already standing is replaced. Every app is a
@@ -761,6 +750,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
                 refuseContested(loaded, key);
+                refuseOverfull(key);
                 // A mark that cannot be persisted throws, and the store has already rolled
                 // itself back; the catch below disposes the candidate, so the running slot
                 // is untouched.

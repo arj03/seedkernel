@@ -49,22 +49,14 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
  *  active-call registry. See `serializeCalls` (host/realm-queue.ts). */
 export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
 
-/** Everything ONE realm may hold against the node pool at once — the multiplicand below.
- *  A SUM, never one of its terms: sized off the host-call ceiling alone the object pool
- *  came out equal to `DEFAULT_MAX_LIVE_TIMERS`, and a per-realm ceiling the pool cannot
- *  cover is a starvation schedule, not a ceiling (§12.3). */
-const REALM_NODE_OBJECTS =
-    DEFAULT_MAX_OUTSTANDING_HOST_CALLS   // active host calls (realm-queue.ts)
-  + DEFAULT_MAX_LIVE_TIMERS              // armed deadlines (shell-core.ts createRealmTimers)
-  + DEFAULT_MAX_QUEUED_REALM_INVOCATIONS; // invocations waiting to enter the realm
-const REALM_NODE_BYTES =
-    DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES // copied host-call inputs and their answers
-  + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;        // copied timer bodies
-
-/** Parent allowance across all realms in one node (`nodeCustody`, shell-core.ts) — §12.3.
- *  Four realms' worth, matching what `MAX_NODE_OUTBOUND_QUEUE_BYTES` allows outbound. */
-export const DEFAULT_MAX_NODE_HOST_CALLS = 4 * REALM_NODE_OBJECTS;
-export const DEFAULT_MAX_NODE_HOST_CALL_BYTES = 4 * REALM_NODE_BYTES;
+/** Confined realms one node may hold at once (`slots`, shell-core.ts). The MULTIPLICAND:
+ *  every per-realm ceiling here is one of these times this number, which is what makes the
+ *  total at the end of this file a ceiling rather than a floor. Bounding the count is also
+ *  why nothing here is pooled BETWEEN realms: an allowance apps draw on in common is one
+ *  app's standing way to refuse another's calls by being busy, while a quota per tenant
+ *  times a bounded tenant count reaches the same total with no such channel. Slots are the
+ *  operator's own admin path (§12.4), so this bounds an install list, never a peer's reach. */
+export const DEFAULT_MAX_APP_SLOTS = 8;
 
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling
@@ -85,17 +77,18 @@ export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 
 // Every owner above is finite, but only their SUM is checkable against real machine RAM.
 // Adding a node-scoped owner of admitted host memory means adding its term here, not just
-// declaring its own constant. A FLOOR, not a worst case: the last two terms are counted once
-// each, and nothing bounds how many realms/bundles a shell installs, so a node running N
-// apps multiplies them.
+// declaring its own constant. A worst case rather than a floor: what one realm may hold is
+// multiplied by the bound on realms, which is what that bound is for.
 export const DERIVED_NODE_MEMORY_CEILING_BYTES =
-    DEFAULT_MAX_NODE_HOST_CALL_BYTES // active host calls and timer payloads, one shared pool
-  + MAX_NODE_OUTBOUND_QUEUE_BYTES    // §12.6 — outbound socket queues, aggregated over every link
-  + 2 * MAX_INBOUND_HOLD_BYTES       // §12.6 — inbound reads: native staging and the driver window
-                                     // hold the same read at once, by design (sock.go)
-  + DEFAULT_MEMORY_FS_MAX_BYTES      // the in-memory fs backend's whole quota
-  + DEFAULT_REALM_MEMORY_BYTES       // §12.3 — ONE realm's heap cap — see the floor note above
-  + DEFAULT_MAX_MODULE_MEMORY_BYTES; // §4.3 — ONE bundle's aggregate module memory
+    DEFAULT_MAX_APP_SLOTS * (
+      DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES // copied host-call inputs and their answers
+    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES         // copied timer bodies
+    + DEFAULT_REALM_MEMORY_BYTES              // §12.3 — one confined guest heap
+    + DEFAULT_MAX_MODULE_MEMORY_BYTES)        // §4.3 — one bundle's aggregate module memory
+  + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, aggregated over every link
+  + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — inbound reads: native staging and the driver window
+                                  // hold the same read at once, by design (sock.go)
+  + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether

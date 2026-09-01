@@ -147,31 +147,26 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 	}
 }
 
-// TestGuestRealmNodeAllowanceIsProcessScoped drives bridge.createRealm directly (not
-// through native-shim.ts's RealmFactory, which always restates the same shared defaults —
-// so a mismatch never arises through the production call path) with two DIFFERENT declared
-// node-host-call ceilings, standing in for two legitimate shells sharing one process.
-// Before the fix this errored on the second call ("node host-call limits changed after
-// initialization"); the ceiling is process-scoped by design (see the var block above
-// guestRealm), so a later caller's numbers must simply replace the earlier ones, never be
-// refused for disagreeing with them.
-func TestGuestRealmNodeAllowanceIsProcessScoped(t *testing.T) {
+// TestGuestRealmReusedRealmIDIsRefused pins the shim's id contract at the Go side: ids are
+// minted as one strictly increasing sequence, so anything at or below the high-water mark
+// is a bug or a forgery and never a second realm quietly displacing the first.
+func TestGuestRealmReusedRealmIDIsRefused(t *testing.T) {
 	bootRealm(t)
-	mk := func(id, nodeCalls, nodeBytes int64) error {
+	mk := func(id int64) error {
 		src := fmt.Sprintf(
-			`bridge.createRealm(%d, "function handle(){ return new Uint8Array(); }", () => {}, %d, 1000, 10, 1048576, %d, %d)`,
-			id, 64<<20, nodeCalls, nodeBytes)
+			`bridge.createRealm(%d, "function handle(){ return new Uint8Array(); }", () => {}, %d, 1000, 10, 1048576)`,
+			id, 64<<20)
 		_, err := qc.Eval("mk.js", qjs.Code(src))
 		return err
 	}
-	if err := mk(1, 5, 4096); err != nil {
-		t.Fatalf("first realm declaring its own node ceiling: %v", err)
+	if err := mk(1); err != nil {
+		t.Fatalf("first realm: %v", err)
 	}
-	if err := mk(2, 9, 8192); err != nil {
-		t.Fatalf("a second realm declaring a DIFFERENT node ceiling must not be refused: %v", err)
+	if err := mk(1); err == nil {
+		t.Fatal("a reused realm id was accepted")
 	}
-	if maxNodeHostCalls != 9 || maxNodeHostBytes != 8192 {
-		t.Fatalf("the process-scoped ceiling should track the latest caller, got %d/%d", maxNodeHostCalls, maxNodeHostBytes)
+	if err := mk(2); err != nil {
+		t.Fatalf("the next id in sequence: %v", err)
 	}
 }
 
@@ -269,23 +264,17 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 		}
 	`)
 	g := realms[1]
-	before, beforeBytes := nodeHostCalls, nodeHostBytes
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
 	}
-	if len(g.hostCalls) != 1 || nodeHostCalls != before+1 || nodeHostBytes != beforeBytes+3 {
-		t.Fatalf("parked call not charged: %d local, node %d/%d",
-			len(g.hostCalls), nodeHostCalls, nodeHostBytes)
+	if len(g.hostCalls) != 1 || g.hostCallBytes != 3 {
+		t.Fatalf("parked call not charged: %d calls, %d bytes", len(g.hostCalls), g.hostCallBytes)
 	}
 	if _, err := qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)); err != nil {
 		t.Fatal("dispose:", err)
 	}
-	if len(g.hostCalls) != 0 {
-		t.Fatalf("close left %d parked calls charged", len(g.hostCalls))
-	}
-	if nodeHostCalls != before || nodeHostBytes != beforeBytes {
-		t.Fatalf("close leaked the node pool: %d/%d, want %d/%d",
-			nodeHostCalls, nodeHostBytes, before, beforeBytes)
+	if len(g.hostCalls) != 0 || g.hostCallBytes != 0 {
+		t.Fatalf("close left %d parked calls and %d bytes charged", len(g.hostCalls), g.hostCallBytes)
 	}
 }
 

@@ -1,5 +1,11 @@
-// The two per-realm boundary owners shared by the JS and native realm factories:
-// active guest-to-host calls, and serialized payloads waiting to enter the guest.
+// The per-realm boundary owners shared by both realm factories (safe-js.ts on the JS
+// platform, native-shim.ts over Go's quickjs-ng): active guest-to-host calls, and the
+// serialized entry of payloads into the guest.
+//
+// Every owner here is scoped to ONE realm and none is shared between realms. The node's
+// total is what these admit times `DEFAULT_MAX_APP_SLOTS` (core/wasm-limits.ts), which is
+// the same bound a pool held in common would give — without the pool's standing channel
+// for a busy app to refuse a quiet one's calls.
 
 import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
@@ -14,57 +20,30 @@ function checkedBytes(bytes: number): number {
   return bytes;
 }
 
-/** One active call's custody. Further host copies are reserved before creation and all
- * capacity remains owned until response delivery or terminal failure has completed.
+/** One active call's custody, held from admission through settlement. Further host copies
+ * are reserved before they are made, and everything reserved stays owned until the response
+ * has been delivered or the call has terminally failed.
  *
  * Bounded in TIME as well as size (§12.3): the host's answer releases it, and disposal
- * releases whatever never answered — the guest that would have consumed it is gone, so
- * what a still-pending backend holds is the host's own memory, not this realm's. Without
- * that second path one unanswering backend pins the node pool for good. */
+ * releases whatever never answered — the guest that would have consumed it is gone, so what
+ * a still-pending backend holds is the host's own memory, not this realm's. Without that
+ * second path one unanswering backend pins the realm's allowance for good. */
 export interface ActiveHostCall {
   reserve(bytes: number): void;
   release(): void;
 }
 
-/** A parent owner used to compose finite child allowances without exposing counters. */
-export interface CustodyAllowance {
-  reserve(objects: number, bytes: number): () => void;
-}
-
-export function createCustodyAllowance(maxObjects: number, maxBytes: number): CustodyAllowance {
-  let objects = 0;
-  let bytes = 0;
-  return {
-    reserve(additionalObjects: number, additionalBytes: number): () => void {
-      if (!Number.isSafeInteger(additionalObjects) || additionalObjects < 0) {
-        throw new Error("guest: invalid custody object count");
-      }
-      checkedBytes(additionalBytes);
-      if (additionalObjects > maxObjects - objects || additionalBytes > maxBytes - bytes) {
-        throw new Error("guest: node custody allowance exceeded");
-      }
-      objects += additionalObjects;
-      bytes += additionalBytes;
-      let live = true;
-      return () => {
-        if (!live) return;
-        live = false;
-        objects -= additionalObjects;
-        bytes -= additionalBytes;
-      };
-    },
-  };
-}
-
 /** Own every guest-to-host copy and promise slot from admission through settlement (§12.3).
- * Id, count slot and actual source width are admitted atomically. No operation name reaches
- * here: policy elsewhere is legitimately name-keyed (`MemoryFs`'s quota, `isIrreversible`),
+ * Id, count slot and actual source width are admitted atomically. The id is the guest's own,
+ * so it is checked here rather than trusted: guest.go must key its parked calls by it to
+ * route settlements, and a target that admitted a duplicate where the other refuses one
+ * would be the two engines disagreeing about the guest's ABI. No operation name reaches here
+ * either: policy elsewhere is legitimately name-keyed (`MemoryFs`'s quota, `isIrreversible`),
  * but a name may only TIGHTEN what an owner admits, and this owner has no exemption to
  * give — the resource's owner decides, never the dispatcher that routed the call. */
 export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-  parent?: CustodyAllowance,
 ): {
   admit(callId: number, payloadBytes: number): ActiveHostCall;
   releaseAll(): void;
@@ -85,10 +64,8 @@ export function createActiveHostCallRegistry(
       if (payloadBytes > maxBytes - bytes) {
         throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
       }
-      const parentReleases: (() => void)[] = [];
-      if (parent) parentReleases.push(parent.reserve(1, payloadBytes));
       bytes += payloadBytes;
-      let ownedBytes = payloadBytes;
+      let owned = payloadBytes;
       let live = true;
       const call: ActiveHostCall = {
         reserve(additionalBytes: number): void {
@@ -97,20 +74,19 @@ export function createActiveHostCallRegistry(
           if (additionalBytes > maxBytes - bytes) {
             throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
           }
-          if (parent) parentReleases.push(parent.reserve(0, additionalBytes));
           bytes += additionalBytes;
-          ownedBytes += additionalBytes;
+          owned += additionalBytes;
         },
         release(): void {
           if (!live) return;
           live = false;
-          if (active.get(callId) === call) active.delete(callId);
-          bytes -= ownedBytes;
-          for (const release of parentReleases) release();
+          active.delete(callId);
+          bytes -= owned;
         },
       };
       active.set(callId, call);
       return call;
+
     },
   };
 }
@@ -141,15 +117,13 @@ export interface InvocationSettler {
 export function createInvocationSettler(): InvocationSettler {
   const live = new Set<(err: Error) => void>();
   return {
+    // Each invocation registers a rejector of its own, so untracking is idempotent by
+    // being a set deletion — nothing here needs a spent flag to guard it.
     track(reject) {
       live.add(reject);
-      let tracked = true;
-      return () => {
-        if (!tracked) return;
-        tracked = false;
-        live.delete(reject);
-      };
+      return () => live.delete(reject);
     },
+
     failAll(err) {
       for (const reject of [...live]) {
         live.delete(reject);
@@ -171,39 +145,25 @@ export function serializeCalls(
   invoke: (payload: Uint8Array) => Invocation,
   notReady: () => Error | null,
   maxQueuedCalls = DEFAULT_MAX_QUEUED_REALM_INVOCATIONS,
-  parent?: CustodyAllowance,
 ): (payload: Uint8Array) => Promise<Uint8Array> {
   let tail: Promise<unknown> = Promise.resolve();
-  let queuedCalls = 0;
+  let queued = 0;
   return (payload) => {
     // Closed owners stop admission immediately. Already accepted work checks again when it
     // reaches the front because teardown can overtake it while it waits.
     const admissionError = notReady();
     if (admissionError) return Promise.reject(admissionError);
-    if (queuedCalls >= maxQueuedCalls) {
+    if (queued >= maxQueuedCalls) {
       return Promise.reject(new Error(`guest: too many queued realm invocations (cap ${maxQueuedCalls})`));
     }
-    let releaseParent: (() => void) | undefined;
-    try {
-      releaseParent = parent?.reserve(1, 0);
-    } catch (err) {
-      return Promise.reject(err);
-    }
-    queuedCalls++;
-    let owned = true;
-    const releaseEntry = () => {
-      if (!owned) return;
-      owned = false;
-      queuedCalls--;
-      releaseParent?.();
-    };
+    queued++;
     const started = tail.then(() => {
       try {
         const err = notReady();
         if (err) throw err;
         return invoke(payload);
       } finally {
-        releaseEntry();
+        queued--;
       }
     });
     // A failed invocation must not poison later work. The caller owns the real rejection;

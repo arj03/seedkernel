@@ -66,12 +66,11 @@ export interface TransportHostOptions {
 }
 
 /** One link's continuous outbound custody, spanning adapter pre-open buffering and the
- * platform socket backlog. The adapter reports the current retained byte total; it does
- * not decide admission. */
+ * platform socket backlog. What the adapter still holds IS the charge — this owner keeps no
+ * model of the queue beside it, only the totals it has admitted against the node's. */
 class LinkOutboundOwner {
-  private readonly queue: number[] = [];
-  private bytes = 0;
-  private observed = 0;
+  private charged = 0;
+  private slices = 0;
   private closed = false;
 
   constructor(
@@ -86,7 +85,7 @@ class LinkOutboundOwner {
    *  answers nonsense asserts nothing, and reading THAT as 0 would drop the charge while
    *  the platform still holds the bytes, so it never releases and its next `send` fails
    *  the link (§12.6). */
-  private platformBuffered(): number | null {
+  private report(): number | null {
     if (!this.channel.buffered) return 0;
     try {
       const n = this.channel.buffered();
@@ -96,75 +95,44 @@ class LinkOutboundOwner {
     }
   }
 
-  private reconcile(now = this.platformBuffered()): void {
-    if (now === null) return;
-    if (now === 0 && this.queue.length > 0) {
-      const releasedBytes = this.bytes;
-      const releasedSlices = this.queue.length;
-      this.queue.length = 0;
-      this.bytes = 0;
-      this.observed = 0;
-      this.releaseParent(releasedBytes, releasedSlices);
-      return;
-    }
-    let drained = Math.max(0, this.observed - now);
-    let released = 0;
-    let slices = 0;
-    while (drained > 0 && this.queue.length > 0) {
-      const take = Math.min(drained, this.queue[0]);
-      this.queue[0] -= take;
-      drained -= take;
-      released += take;
-      if (this.queue[0] === 0) {
-        this.queue.shift();
-        slices++;
-      }
-    }
-    if (released > 0) {
-      this.bytes -= released;
-      this.releaseParent(released, slices);
-    }
-    this.observed = now;
+  /** Hand back what the platform has drained since the last look. Growth is never taken on
+   *  trust — only writes admitted here are ever charged — and the slice count retires all at
+   *  once at an empty queue, the one moment a byte total says how many writes it holds. */
+  private settle(now: number | null): void {
+    if (now === null || now >= this.charged) return;
+    this.releaseParent(this.charged - now, now === 0 ? this.slices : 0);
+    if (now === 0) this.slices = 0;
+    this.charged = now;
   }
 
   send(bytes: Uint8Array): void {
     if (this.closed) throw new Error("socket: link is closed");
-    const now = this.platformBuffered();
+    const now = this.report();
     if (now === null) throw new Error("socket: adapter cannot report its outbound backlog");
-    this.reconcile(now);
-    if (this.queue.length >= MAX_OUTBOUND_QUEUE_SLICES
-      || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.bytes
+    this.settle(now);
+    if (this.slices >= MAX_OUTBOUND_QUEUE_SLICES
+      || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.charged
       || !this.reserveParent(bytes.length)) {
       throw new Error("socket: outbound queue limit exceeded");
     }
-    this.queue.push(bytes.length);
-    this.bytes += bytes.length;
-    try {
-      this.channel.send(bytes);
-      // The prior observed backlog plus this accepted write is the no-drain expectation.
-      // Comparing the platform's new report against it retires bytes drained during send.
-      this.observed += bytes.length;
-      this.reconcile();
-    } catch (err) {
-      this.releaseAll();
-      throw err;
-    }
+    this.charged += bytes.length;
+    this.slices++;
+    try { this.channel.send(bytes); }
+    catch (err) { this.releaseAll(); throw err; }
+    this.settle(this.report());
   }
 
   buffered(): number {
-    this.reconcile();
-    return this.bytes;
+    this.settle(this.report());
+    return this.charged;
   }
 
   releaseAll(): void {
     if (this.closed) return;
     this.closed = true;
-    const slices = this.queue.length;
-    const bytes = this.bytes;
-    this.queue.length = 0;
-    this.bytes = 0;
-    this.observed = 0;
-    this.releaseParent(bytes, slices);
+    this.releaseParent(this.charged, this.slices);
+    this.charged = 0;
+    this.slices = 0;
   }
 }
 

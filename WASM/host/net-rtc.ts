@@ -39,9 +39,6 @@ export interface PeerEntry {
   pendingIce: RTCIceCandidateInit[];
   /** Worst-case UTF-16 storage retained by queued or in-flight candidate strings. */
   pendingIceBytes: number;
-  /** Tail of this entry's candidate lane: one `addIceCandidate` runs at a time, and a
-   *  later candidate waits in the bounded queue rather than overtaking it. */
-  iceDrain: Promise<void> | null;
   /** Speculative entries must establish before this host-owned deadline. */
   establishmentTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -256,8 +253,7 @@ export class RtcNetwork implements ChannelFactory {
         const pc = this.makePc(this.opts.rtcConfig);
         const e: PeerEntry = {
             pc, linked: false, established: false, polite: this.ownId > peerId,
-            makingOffer: false, pendingIce: [], pendingIceBytes: 0, iceDrain: null,
-            establishmentTimer: null,
+            makingOffer: false, pendingIce: [], pendingIceBytes: 0, establishmentTimer: null,
         };
         this.peers.set(peerId, e);
         e.establishmentTimer = setTimeout(() => {
@@ -457,7 +453,7 @@ export class RtcNetwork implements ChannelFactory {
         await e.pc.setRemoteDescription(msg.sdp);
         if (this.closed || this.peers.get(msg.from) !== e)
             return;
-        await this.flushIce(msg.from, e);
+        await this.drainIce(msg.from, e);
         if (this.closed || this.peers.get(msg.from) !== e)
             return;
         if (msg.sdp.type === "offer") {
@@ -484,18 +480,12 @@ export class RtcNetwork implements ChannelFactory {
         e.pendingIce.push(msg.candidate);
         e.pendingIceBytes += candidateBytes;
         if (e.pc.remoteDescription)
-            await this.flushIce(msg.from, e);
+            await this.drainIce(msg.from, e);
     }
-    /** Join this entry's candidate lane: one `addIceCandidate` in flight per entry. Each
-     *  caller gets a turn of its OWN rather than a drain already running, so a candidate
-     *  queued behind a finishing drain is never left with nobody to feed it. */
-    private flushIce(peerId: string, e: PeerEntry): Promise<void> {
-        const run = (e.iceDrain ?? Promise.resolve()).then(() => this.drainIce(peerId, e));
-        e.iceDrain = run.catch(() => { /* drainIce already contains the boundary */ });
-        return run;
-    }
-    /** Feed the queue to WebRTC oldest first. The candidate at index zero remains charged
-     *  while the platform owns the in-flight promise. */
+    /** Feed the queue to WebRTC oldest first, the candidate at index zero staying charged
+     *  while the platform owns the in-flight promise. No lane of its own: every caller
+     *  reaches here from `onSignal`, which the signaling lane already runs one at a time,
+     *  so a second drain cannot begin while this one is between candidates. */
     private async drainIce(peerId: string, e: PeerEntry): Promise<void> {
         while (!this.closed && this.peers.get(peerId) === e
             && e.pc.remoteDescription && e.pendingIce.length > 0) {

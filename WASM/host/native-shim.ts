@@ -24,8 +24,6 @@ import { deriveNodeKey } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import {
   DEFAULT_GUEST_DEADLINE_MS,
-  DEFAULT_MAX_NODE_HOST_CALL_BYTES,
-  DEFAULT_MAX_NODE_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_REALM_MEMORY_BYTES,
@@ -67,8 +65,7 @@ declare const bridge: {
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
   createRealm(realmId: number, source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
-              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number,
-              maxNodeHostCalls: number, maxNodeHostCallBytes: number): void;
+              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): void;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
   realmCall(realm: number, payload: Uint8Array,
@@ -394,7 +391,7 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 let nativeRealmSeq = 0;
-const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs, custodyAllowance }) => {
+const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
     // Go does not pump this guest queue during evaluation, so settlement cannot precede
     // assignment (§12.3).
     const realm = ++nativeRealmSeq;
@@ -424,8 +421,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     };
     bridge.createRealm(realm, source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
         deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
-        DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-        DEFAULT_MAX_NODE_HOST_CALLS, DEFAULT_MAX_NODE_HOST_CALL_BYTES);
+        DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
     let disposed = false;
     // The JS half of safe-js.ts's time-bound invariant (§12.3). `realmCall` hands its
     // resolve/reject straight to Go, so a deferred entrypoint's `result` would otherwise
@@ -451,8 +447,6 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                 return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
             },
             () => (disposed ? new Error("guest realm disposed") : null),
-            undefined,
-            custodyAllowance,
         ),
         dispose: () => {
             disposed = true;

@@ -27,7 +27,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
-import { createActiveHostCallRegistry, createInvocationSettler, serializeCalls, type CustodyAllowance, type Invocation } from "./realm-queue.js";
+import { createActiveHostCallRegistry, createInvocationSettler, serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
@@ -44,8 +44,6 @@ export interface SafeRealmOptions {
   /** Guest execution budget per entrypoint, in ms. Running time, not wall clock.
    *  `Infinity` disables; omit for default. */
   deadlineMs?: number;
-  /** Shared node allowance for this realm's active host calls. */
-  custodyAllowance?: CustodyAllowance;
 }
 
 export interface SafeRealm {
@@ -192,7 +190,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
-  const activeHostCalls = createActiveHostCallRegistry(undefined, undefined, opts.custodyAllowance);
+  const activeHostCalls = createActiveHostCallRegistry();
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -424,12 +422,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
 
   return {
-    call: serializeCalls(
-      invoke,
-      () => (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
-      undefined,
-      opts.custodyAllowance,
-    ),
+    call: serializeCalls(invoke, () =>
+      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
@@ -438,8 +432,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // otherwise never come (realm-queue.ts's time-bound invariant).
       invocationSettler.failAll(new Error("guest realm disposed"));
       // And end custody of every call the host never answered: nothing inside this realm
-      // will consume those answers now, so holding their charge would pin the node pool
-      // on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
+      // will consume those answers now, so holding their charge would pin this realm's
+      // allowance on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
       activeHostCalls.releaseAll();
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
       // continuation runs as a microtask after failAll, and a handle released after its

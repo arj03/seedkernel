@@ -28,14 +28,6 @@ var (
 	// The shim mints ids as one strictly increasing sequence (native-shim.ts), so refusing
 	// anything below the high-water mark is the whole reuse check.
 	lastRealmID int64
-	// The §12.3 node pool, PROCESS-scoped here where the JS host's `nodeCustody` is
-	// per-bootShell: this loader stands up exactly one shell (main.go boot()). Several
-	// would share one pool, which is why the ceilings simply restate the latest
-	// createRealm's — there is no isolation between them to reconcile.
-	nodeHostCalls    int
-	nodeHostBytes    int64
-	maxNodeHostCalls int
-	maxNodeHostBytes int64
 )
 
 type guestRealm struct {
@@ -99,14 +91,9 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		}
 		maxHostCalls := int(t.Args()[5].Int64())
 		maxHostCallBytes := t.Args()[6].Int64()
-		nodeCalls := int(t.Args()[7].Int64())
-		nodeBytes := t.Args()[8].Int64()
-		if maxHostCalls <= 0 || maxHostCallBytes <= 0 || nodeCalls <= 0 || nodeBytes <= 0 {
+		if maxHostCalls <= 0 || maxHostCallBytes <= 0 {
 			return nil, errors.New("createRealm: no outstanding host-call limits supplied")
 		}
-		// Restated rather than latched (see the var block): every caller in this process
-		// passes the same shared defaults, so this is a no-op after the first realm.
-		maxNodeHostCalls, maxNodeHostBytes = nodeCalls, nodeBytes
 		lastRealmID = id
 		g, err := newGuestRealm(el, t.Args()[1].String(), t.Args()[2], mem, budget,
 			maxHostCalls, maxHostCallBytes)
@@ -230,14 +217,9 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		if payloadBytes > g.maxHostCallBytes-g.hostCallBytes {
 			return nil, fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
 		}
-		if nodeHostCalls >= maxNodeHostCalls || payloadBytes > maxNodeHostBytes-nodeHostBytes {
-			return nil, errors.New("guest: node host-call allowance exceeded")
-		}
 		// Admit id, count and source width together before the guest-to-Go copy.
 		g.hostCalls[callID] = payloadBytes
 		g.hostCallBytes += payloadBytes
-		nodeHostCalls++
-		nodeHostBytes += payloadBytes
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
 			g.releaseHostCall(callID)
@@ -486,12 +468,8 @@ func (g *guestRealm) reserveHostCall(callID, bytes int64) error {
 	if bytes < 0 || bytes > g.maxHostCallBytes-g.hostCallBytes {
 		return fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", g.maxHostCallBytes)
 	}
-	if bytes > maxNodeHostBytes-nodeHostBytes {
-		return errors.New("guest: node host-call allowance exceeded")
-	}
 	g.hostCalls[callID] = owned + bytes
 	g.hostCallBytes += bytes
-	nodeHostBytes += bytes
 	return nil
 }
 
@@ -502,8 +480,6 @@ func (g *guestRealm) releaseHostCall(callID int64) {
 	}
 	delete(g.hostCalls, callID)
 	g.hostCallBytes -= owned
-	nodeHostCalls--
-	nodeHostBytes -= owned
 }
 
 // settleNet resolves or rejects the guest Promise parked under callID when the host
@@ -592,8 +568,8 @@ func (g *guestRealm) close() {
 	g.settleAll("guest realm closed")
 	// The custody these hold ends here: the guest that would have consumed the answers is
 	// gone, so what a still-pending backend holds is the host's own allocation, not this
-	// realm's (§12.3). Keeping the charge would pin the node pool on any backend that
-	// never answers, with nothing left alive to release it.
+	// realm's (§12.3). Keeping the charge would pin this realm's allowance on any backend
+	// that never answers, with nothing left alive to release it.
 	for callID := range g.hostCalls {
 		g.releaseHostCall(callID)
 	}

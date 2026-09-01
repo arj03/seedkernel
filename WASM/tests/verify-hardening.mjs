@@ -19,9 +19,8 @@ const sodium = _sodium;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
-  DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
-  DEFAULT_MAX_QUEUED_REALM_INVOCATIONS, DEFAULT_MAX_NODE_HOST_CALLS,
-  DEFAULT_MAX_NODE_HOST_CALL_BYTES, DERIVED_NODE_MEMORY_CEILING_BYTES }
+  DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS,
+  DEFAULT_REALM_MEMORY_BYTES, DERIVED_NODE_MEMORY_CEILING_BYTES }
   = await imp("build/core/wasm-limits.js");
 const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES }
   = await imp("build/core/net-limits.js");
@@ -46,7 +45,7 @@ const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { createActiveHostCallRegistry, createCustodyAllowance, serializeCalls } = await imp("build/host/realm-queue.js");
+const { createActiveHostCallRegistry, serializeCalls } = await imp("build/host/realm-queue.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
@@ -397,24 +396,21 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ordinaryCalls.dispose();
 }
 
-console.log("\n§12.3 — the node pool covers one realm's whole share");
+console.log("\n§12.3 — a bounded realm count is what makes the node total a ceiling");
 {
-  // The pool has to be a multiple of the SUM of the per-realm ceilings that draw on it.
-  // Sized off the host-call ceiling alone it came out equal to DEFAULT_MAX_LIVE_TIMERS, so
-  // one app arming its own legitimate timer quota spent the entire node allowance and
-  // refused every sibling's next call — a ceiling the pool cannot cover is a starvation
-  // schedule, not a ceiling.
-  const realmObjects = DEFAULT_MAX_OUTSTANDING_HOST_CALLS + DEFAULT_MAX_LIVE_TIMERS
-    + DEFAULT_MAX_QUEUED_REALM_INVOCATIONS;
-  const realmBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;
-  ok(DEFAULT_MAX_NODE_HOST_CALLS >= 2 * realmObjects,
-    "the node object pool holds more than one realm's every countable owner at once");
-  ok(DEFAULT_MAX_NODE_HOST_CALL_BYTES >= 2 * realmBytes,
-    "the node byte pool holds more than one realm's every byte owner at once");
+  // Every owner in this file is per realm and none is pooled between realms: a shared
+  // allowance is a standing way for a busy app to refuse a quiet sibling's calls, and one
+  // realm's ceiling times a bound on realms reaches the same total without one. So the
+  // multiplication has to actually appear in the sum — otherwise each per-realm number is
+  // a floor that an install list nobody counts multiplies at will.
+  const perRealm = DEFAULT_REALM_MEMORY_BYTES + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
+    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;
+  ok(DERIVED_NODE_MEMORY_CEILING_BYTES >= DEFAULT_MAX_APP_SLOTS * perRealm,
+    "the derived ceiling multiplies what one realm may hold by the bound on realms");
   // Not circular: this is the sum measured against a real machine, so growing any owner
   // has to be a deliberate choice rather than a number nobody added up.
-  ok(DERIVED_NODE_MEMORY_CEILING_BYTES <= 1024 * 1024 * 1024,
-    "the summed floor of every node-scoped owner still fits a modest machine");
+  ok(DERIVED_NODE_MEMORY_CEILING_BYTES <= 2 * 1024 * 1024 * 1024,
+    "the summed worst case of every node-scoped owner still fits a modest machine");
 }
 
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
@@ -425,34 +421,23 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   first.reserve(3);
   throws(() => active.admit(2, 1), "responses awaiting delivery remain charged");
   first.release();
+  throws(() => first.reserve(1), "a settled call cannot reserve more against its realm");
   active.admit(2, 8).release();
   ok(true, "terminal settlement releases request, response, id, and count together");
 
-  const parent = createCustodyAllowance(4, 6);
-  const siblingA = createActiveHostCallRegistry(4, 6, parent);
-  const siblingB = createActiveHostCallRegistry(4, 6, parent);
-  const child = siblingA.admit(1, 4);
-  throws(() => siblingB.admit(1, 3),
-    "a parent allowance prevents sibling realms multiplying their local byte caps");
-  child.release();
-  siblingB.admit(1, 3).release();
-
   // A realm that dies with calls still parked releases them: nothing is left to consume
   // those answers, and no handle survives that could release them later — so holding the
-  // charge would pin the node allowance on one backend that never answers. The two ways a
+  // charge would pin the realm's allowance on a backend that never answers. The two ways a
   // realm can die (construction failure, dispose) are both checked, and a backend that
   // settles afterwards must be a no-op, never a second release.
-  const teardownParent = createCustodyAllowance(2, 1);
   let settleOrphan;
   await rejects(createSafeRealm({
     source: 'host.call("hold", Uint8Array.of(1)); throw new Error("init failed");',
     hostCall: () => new Promise((resolve) => { settleOrphan = resolve; }),
-    custodyAllowance: teardownParent,
   }), "failed realm construction reports its source error");
   const afterFailure = await createSafeRealm({
     source: 'async function handle() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
     hostCall: () => new Uint8Array(),
-    custodyAllowance: teardownParent,
   });
   ok((await afterFailure.call(new Uint8Array()))[0] === 7,
     "a realm that failed to construct released what its parked call held");
@@ -465,7 +450,6 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   const disposedWithParked = await createSafeRealm({
     source: 'async function handle() { await host.call("park", Uint8Array.of(1)); return Uint8Array.of(1); }',
     hostCall: () => new Promise((resolve) => { settleAtDispose = resolve; }),
-    custodyAllowance: teardownParent,
   });
   // dispose() rejects this invocation; the caller holds the error, so consume it here.
   disposedWithParked.call(new Uint8Array()).catch(() => {});
@@ -512,15 +496,9 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
 
   // A realm may DEFER its answer to an arbitrary later turn (`__deferred`), with no
   // wall-clock bound at all — so only dispose() can ever end the wait for one that never
-  // comes. Two realms sharing one parent allowance model the real shape: realm A defers
-  // forever, realm B's own host.call awaits A's answer (transport-host.ts `deliver`
-  // awaiting a slot's `realm.call`), so B's active host call stays charged to the shared
-  // parent for as long as A's invocation is unsettled. Cap 2, not 1: `waiting.call` itself
-  // transiently reserves one queued-invocation slot for the length of its own synchronous
-  // segment (serializeCalls), which OVERLAPS the active-host-call admission taken inside
-  // that same segment before releasing — 1 would make that ordinary overlap indistinguishable
-  // from the leak under test.
-  const sharedParent = createCustodyAllowance(2, 1024);
+  // comes. Realm A defers forever while realm B's own host.call awaits A's answer
+  // (transport-host.ts `deliver` awaiting a slot's `realm.call`), which is the shape that
+  // keeps B's active host call charged for as long as A's invocation is unsettled.
   const deferring = await createSafeRealm({
     source: 'function handle() { globalThis.__deferred = true; return new Promise(() => {}); }',
     hostCall: () => new Uint8Array(),
@@ -528,21 +506,12 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   const waiting = await createSafeRealm({
     source: 'function handle() { return host.call("ask", new Uint8Array()); }',
     hostCall: () => deferring.call(new Uint8Array(1)),
-    custodyAllowance: sharedParent,
   });
   const hung = waiting.call(new Uint8Array()).catch(() => "failed");
   await sleep(20);
-  // The transient queued-invocation reservation has released by now; the active-host-call
-  // admission has not, because nothing has settled `deferring.call(...)`'s promise. Exactly
-  // one of the parent's two slots remains free.
-  throws(() => sharedParent.reserve(2, 1),
-    "one slot of the shared parent stays spent while A's deferred answer is outstanding");
-  sharedParent.reserve(1, 1)(); // the one remaining slot — reserve then immediately release
   deferring.dispose();
   ok(await hung === "failed",
     "disposing the deferred realm settles the invocation the other realm was awaiting, not hanging forever");
-  sharedParent.reserve(2, 1)(); // dispose released the charge — the full allowance is free again
-  ok(true, "dispose released the deferred invocation's charge against the parent allowance");
   waiting.dispose();
 }
 
@@ -568,16 +537,6 @@ console.log("\n§12.3 — timer count and copied payload bytes are bounded per r
   byteBound.arm(4, 60_000, new Uint8Array(8));
   byteBound.clearAll();
   ok(true, "clear, fire, and disposal release timer payload accounting");
-
-  const timerParent = createCustodyAllowance(1, 16);
-  const siblingTimersA = createRealmTimers(() => {}, 2, 16, timerParent);
-  const siblingTimersB = createRealmTimers(() => {}, 2, 16, timerParent);
-  siblingTimersA.arm(1, 60_000, new Uint8Array(1));
-  throws(() => siblingTimersB.arm(1, 60_000, new Uint8Array(1)),
-    "sibling timer tables draw from their node parent allowance");
-  siblingTimersA.clearAll();
-  siblingTimersB.arm(1, 60_000, new Uint8Array(1));
-  siblingTimersB.clearAll();
 }
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
