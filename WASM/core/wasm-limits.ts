@@ -43,23 +43,28 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
  *  memory. Applies to every host call, not only networking. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
-/** Parent allowance across all realms in one node (`nodeCustody`, shell-core.ts). ONE pool
- *  for the per-realm bounds that would otherwise multiply by realm count: active host calls
- *  and timer payloads by bytes and count, realm-entry invocations by count alone — which is
- *  why the total below counts this pair once rather than each of them.
- *
- *  It bounds the PROCESS, not realms from each other: with no per-realm floor, siblings can
- *  starve one another once the pool is spent. Stated as a multiple of the per-realm ceilings
- *  so the two cannot drift — four realms' worth, matching what net-limits.ts's
- *  `MAX_NODE_OUTBOUND_QUEUE_BYTES` allows on the outbound side. */
-export const DEFAULT_MAX_NODE_HOST_CALLS = 4 * DEFAULT_MAX_OUTSTANDING_HOST_CALLS;
-export const DEFAULT_MAX_NODE_HOST_CALL_BYTES = 4 * DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES;
-
 /** How deep one realm's entry queue may get. A DEPTH bound with no byte companion, on
  *  purpose: a waiting invocation's bytes are already owned for a longer period by whoever
  *  handed them over — an inbound read by its link, a guest call by the calling realm's
  *  active-call registry. See `serializeCalls` (host/realm-queue.ts). */
 export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
+
+/** Everything ONE realm may hold against the node pool at once — the multiplicand below.
+ *  A SUM, never one of its terms: sized off the host-call ceiling alone the object pool
+ *  came out equal to `DEFAULT_MAX_LIVE_TIMERS`, and a per-realm ceiling the pool cannot
+ *  cover is a starvation schedule, not a ceiling (§12.3). */
+const REALM_NODE_OBJECTS =
+    DEFAULT_MAX_OUTSTANDING_HOST_CALLS   // active host calls (realm-queue.ts)
+  + DEFAULT_MAX_LIVE_TIMERS              // armed deadlines (shell-core.ts createRealmTimers)
+  + DEFAULT_MAX_QUEUED_REALM_INVOCATIONS; // invocations waiting to enter the realm
+const REALM_NODE_BYTES =
+    DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES // copied host-call inputs and their answers
+  + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;        // copied timer bodies
+
+/** Parent allowance across all realms in one node (`nodeCustody`, shell-core.ts) — §12.3.
+ *  Four realms' worth, matching what `MAX_NODE_OUTBOUND_QUEUE_BYTES` allows outbound. */
+export const DEFAULT_MAX_NODE_HOST_CALLS = 4 * REALM_NODE_OBJECTS;
+export const DEFAULT_MAX_NODE_HOST_CALL_BYTES = 4 * REALM_NODE_BYTES;
 
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling
@@ -86,7 +91,8 @@ export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 export const DERIVED_NODE_MEMORY_CEILING_BYTES =
     DEFAULT_MAX_NODE_HOST_CALL_BYTES // active host calls and timer payloads, one shared pool
   + MAX_NODE_OUTBOUND_QUEUE_BYTES    // §12.6 — outbound socket queues, aggregated over every link
-  + MAX_INBOUND_HOLD_BYTES           // §12.6 — inbound reads held above an unpausable adapter
+  + 2 * MAX_INBOUND_HOLD_BYTES       // §12.6 — inbound reads: native staging and the driver window
+                                     // hold the same read at once, by design (sock.go)
   + DEFAULT_MEMORY_FS_MAX_BYTES      // the in-memory fs backend's whole quota
   + DEFAULT_REALM_MEMORY_BYTES       // §12.3 — ONE realm's heap cap — see the floor note above
   + DEFAULT_MAX_MODULE_MEMORY_BYTES; // §4.3 — ONE bundle's aggregate module memory

@@ -60,7 +60,7 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host calls")
 	}
@@ -84,7 +84,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("byte flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host-call payload bytes")
 	}
@@ -111,7 +111,7 @@ func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("ordinary flood", nil); err == nil {
 		t.Fatal("an ordinary call name bypassed the universal host-call byte cap")
 	}
@@ -138,7 +138,7 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if _, err := realmCall("duplicate", nil); err == nil {
 		t.Fatal("a duplicate live host-call id was accepted")
 	}
@@ -200,7 +200,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	newTestRealmBudget(t, "{}", `
 		function handle() { return host.call("probe", new Uint8Array()); }
 	`, 250)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 	if got, err := realmCall("probe", nil); err != nil || !bytes.Equal(got, []byte{9}) {
 		t.Fatalf("module probe = %v, err = %v", got, err)
 	}
@@ -224,7 +224,7 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`)
-	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
 
 	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which stands the host realm up
 	// fresh (host-shell.gen.js re-evaluates, resetting native-shim.ts's own realm-id
@@ -248,6 +248,44 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	g.settleNet(liveID, []byte{}, "")
 	if len(g.hostCalls) != 0 {
 		t.Fatalf("live settlement left parked call count at %d", len(g.hostCalls))
+	}
+}
+
+// TestGuestRealmCloseReleasesParkedCalls: closing a realm ends the custody of whatever it
+// still had parked. The guest that would have consumed those answers is gone, so what a
+// pending backend holds is the host's own memory — keeping the charge would pin the
+// process-wide pool on any backend that never answers, with nothing left to release it.
+func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("park-close-seam.js", qjs.Code(`
+		globalThis.__guestSeam = () => new Promise(() => {});
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealm(t, "{}", `
+		function handle() {
+		  host.call("hold", new Uint8Array([1, 2, 3]));
+		  return new Uint8Array();
+		}
+	`)
+	g := realms[1]
+	before, beforeBytes := nodeHostCalls, nodeHostBytes
+	if _, err := realmCall("park", nil); err != nil {
+		t.Fatal("park host call:", err)
+	}
+	if len(g.hostCalls) != 1 || nodeHostCalls != before+1 || nodeHostBytes != beforeBytes+3 {
+		t.Fatalf("parked call not charged: %d local, node %d/%d",
+			len(g.hostCalls), nodeHostCalls, nodeHostBytes)
+	}
+	if _, err := qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)); err != nil {
+		t.Fatal("dispose:", err)
+	}
+	if len(g.hostCalls) != 0 {
+		t.Fatalf("close left %d parked calls charged", len(g.hostCalls))
+	}
+	if nodeHostCalls != before || nodeHostBytes != beforeBytes {
+		t.Fatalf("close leaked the node pool: %d/%d, want %d/%d",
+			nodeHostCalls, nodeHostBytes, before, beforeBytes)
 	}
 }
 

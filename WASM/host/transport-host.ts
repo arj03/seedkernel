@@ -80,16 +80,12 @@ class LinkOutboundOwner {
     private readonly releaseParent: (bytes: number, slices: number) => void,
   ) {}
 
-  /** The adapter's own report, or null when it claims to know and cannot answer.
-   *
-   *  Three cases, and the middle one is the whole point. NO `buffered` at all is an adapter
-   *  declaring statically that it retains nothing past `send` — an in-process fabric that
-   *  hands the buffer straight to its peer — so it reads as 0 and releases at once. A
-   *  `buffered()` that ANSWERS 0 asserts the same thing dynamically. But one that throws or
-   *  returns something malformed asserts nothing at all, and reading that as 0 would drop
-   *  this link's charge and the node's while the platform still holds the bytes. So an
-   *  unreadable report never releases and `send` refuses the write, failing the link —
-   *  whose teardown releases honestly, because a destroyed socket really has dropped it. */
+  /** The adapter's own report, or null when it claims to know and cannot answer. No
+   *  `buffered` at all is a static declaration that nothing is retained past `send`, and a
+   *  `buffered()` answering 0 says the same dynamically — both release. One that throws or
+   *  answers nonsense asserts nothing, and reading THAT as 0 would drop the charge while
+   *  the platform still holds the bytes, so it never releases and its next `send` fails
+   *  the link (§12.6). */
   private platformBuffered(): number | null {
     if (!this.channel.buffered) return 0;
     try {

@@ -336,8 +336,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
   } catch (err) {
     // A candidate that cannot initialize never reaches the returned dispose seam. Free it
-    // here, or repeated rejected installs turn a bounded guest into an unbounded host leak.
+    // here, or repeated rejected installs turn a bounded guest into an unbounded host leak
+    // — the custody of any call its source parked included, since nothing is left to
+    // consume those answers and no handle survives to release them later.
     disposed = true;
+    activeHostCalls.releaseAll();
     disposePhantoms();
     try {
       if (ctx.alive) ctx.dispose();
@@ -434,6 +437,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // strand every parked caller — a DEFERRED one included, whose answer would
       // otherwise never come (realm-queue.ts's time-bound invariant).
       invocationSettler.failAll(new Error("guest realm disposed"));
+      // And end custody of every call the host never answered: nothing inside this realm
+      // will consume those answers now, so holding their charge would pin the node pool
+      // on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
+      activeHostCalls.releaseAll();
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
       // continuation runs as a microtask after failAll, and a handle released after its
       // context died would abort the whole wasm module. See `newRuntime` for the ordering

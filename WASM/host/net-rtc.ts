@@ -75,16 +75,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Copy out the two fields we use, so no adapter-owned object or attacker-chosen extra
+ *  property survives an async signaling wait. */
 function sessionDescription(value: unknown): SdpSignal["sdp"] | undefined {
-    if (!(isRecord(value)
-        && (value.type === "offer" || value.type === "answer")
-        && typeof value.sdp === "string"
-        // Charge the string's worst-case retained UTF-16 storage. This is deliberately
-        // checked before policy or RTCPeerConnection sees attacker-controlled SDP.
-        && value.sdp.length <= MAX_SDP_BYTES / 2)) return undefined;
-    // Keep no adapter-owned object or attacker-chosen extra properties across an async
-    // signaling wait.
+    if (!(isRecord(value) && (value.type === "offer" || value.type === "answer")
+        && typeof value.sdp === "string")) return undefined;
     return { type: value.type, sdp: value.sdp };
+}
+
+/** An INBOUND description: also charged for the worst-case retained UTF-16 storage, before
+ *  policy or RTCPeerConnection sees it. The cap is not applied to our own
+ *  `localDescription` — an oversized offer is the peer's refusal to make, and dropping it
+ *  here would stall a negotiation nobody refused. */
+function peerSessionDescription(value: unknown): SdpSignal["sdp"] | undefined {
+    const sdp = sessionDescription(value);
+    return sdp && (sdp.sdp ?? "").length <= MAX_SDP_BYTES / 2 ? sdp : undefined;
 }
 
 function iceCandidate(value: unknown): RTCIceCandidateInit | undefined {
@@ -125,7 +130,7 @@ function signalMsg(value: unknown): SignalMsg | undefined {
         : { from: value.from, to: value.to };
     if (value.type === "hello") return { type: "hello", ...base };
     if (value.type === "sdp") {
-        const sdp = sessionDescription(value.sdp);
+        const sdp = peerSessionDescription(value.sdp);
         if (sdp) return { type: "sdp", ...base, sdp };
     }
     if (value.type === "ice") {
@@ -179,13 +184,17 @@ export class RtcChannel extends MessageChannel {
 // carries an authenticated link loses its data channel to the transport's own deadline,
 // and the entry with it.
 export const MAX_UNESTABLISHED_PEERS = 256;
-/** Maximum retained UTF-16 storage for one inbound or outbound SDP string. */
+/** Maximum retained UTF-16 storage for one INBOUND SDP string (`peerSessionDescription`). */
 export const MAX_SDP_BYTES = 256 * 1024;
 /** Count and byte bounds for candidate work retained per peer. */
 export const MAX_PENDING_ICE_CANDIDATES = 256;
 export const MAX_PENDING_ICE_BYTES = 256 * 1024;
 /** A relayed hello/offer that never completes ICE/DTLS cannot retain a peer forever. */
 export const UNESTABLISHED_PEER_TTL_MS = 30_000;
+/** Inbound signals waiting on the ordered lane, each retaining its decoded message. One
+ *  relay carries every peer, so overflow DROPS the newcomer rather than tearing anything
+ *  down: a dropped signal costs one redial, a failed channel costs every peer on it. */
+export const MAX_QUEUED_SIGNALS = 256;
 export class RtcNetwork implements ChannelFactory {
     opts;
     private readonly ownId: string;
@@ -195,6 +204,7 @@ export class RtcNetwork implements ChannelFactory {
     /** One ordered lane for the signaling state machine. Promise-returning WebRTC methods
      *  may yield, but a later SDP/ICE message must not overtake the operation in flight. */
     private signalTail: Promise<void> = Promise.resolve();
+    private queuedSignals = 0;
     private closed = false;
     constructor(opts: RtcNetworkOptions) {
         this.opts = opts;
@@ -372,18 +382,24 @@ export class RtcNetwork implements ChannelFactory {
         if (!this.closed)
             this.opts.signaling.send(msg);
     }
-    /** Append one inbound message to the signaling lane. Returning this promise is useful
-     *  to synchronous/test adapters; production adapters may ignore it. Keep a recovered
-     *  tail so one unexpected rejection cannot permanently poison the lane. */
+    /** Append one inbound message to the signaling lane, bounded by `MAX_QUEUED_SIGNALS`:
+     *  a lane is a queue, and a queue nobody counts is the hole this whole layer closes.
+     *  Returning this promise is useful to synchronous/test adapters; production adapters
+     *  may ignore it. Keep a recovered tail so one unexpected rejection cannot permanently
+     *  poison the lane. */
     private enqueueSignal(value: unknown): Promise<void> {
         // Decode synchronously so an oversized/adapter-owned object is never captured by
         // the promise lane while an earlier WebRTC operation is still in flight.
         let msg: SignalMsg | undefined;
         try { msg = signalMsg(value); }
         catch { return Promise.resolve(); }
-        if (!msg)
+        if (!msg || this.closed || this.queuedSignals >= MAX_QUEUED_SIGNALS)
             return Promise.resolve();
-        const run = this.signalTail.then(() => this.onSignal(msg));
+        this.queuedSignals++;
+        const run = this.signalTail.then(() => {
+            this.queuedSignals--;
+            return this.onSignal(msg);
+        });
         this.signalTail = run.catch(() => { /* onSignal already contains the boundary */ });
         return run;
     }
@@ -455,9 +471,8 @@ export class RtcNetwork implements ChannelFactory {
         const e = this.peers.get(msg.from);
         if (!e || !msg.candidate)
             return;
-        // Every candidate enters the same bounded queue. Before SDP it waits there; after
-        // SDP the lane below consumes it. This keeps concurrent/direct callers from
-        // entering addIceCandidate independently even if they bypass the signaling lane.
+        // One queue for both phases: before SDP it waits, after SDP the lane below drains
+        // it — so a direct caller cannot enter addIceCandidate outside the meter.
         const candidateBytes = iceCandidateBytes(msg.candidate);
         if (e.pendingIce.length >= MAX_PENDING_ICE_CANDIDATES
             || candidateBytes > MAX_PENDING_ICE_BYTES - e.pendingIceBytes) {
@@ -471,10 +486,9 @@ export class RtcNetwork implements ChannelFactory {
         if (e.pc.remoteDescription)
             await this.flushIce(msg.from, e);
     }
-    /** Join this entry's candidate lane — the same shape as the inbound signaling one, so
-     *  at most one addIceCandidate is in flight per entry. Every caller gets a turn of its
-     *  own rather than a drain already running, which is what keeps a candidate queued
-     *  behind a finishing one from being left in the queue with nobody to feed it. */
+    /** Join this entry's candidate lane: one `addIceCandidate` in flight per entry. Each
+     *  caller gets a turn of its OWN rather than a drain already running, so a candidate
+     *  queued behind a finishing drain is never left with nobody to feed it. */
     private flushIce(peerId: string, e: PeerEntry): Promise<void> {
         const run = (e.iceDrain ?? Promise.resolve()).then(() => this.drainIce(peerId, e));
         e.iceDrain = run.catch(() => { /* drainIce already contains the boundary */ });

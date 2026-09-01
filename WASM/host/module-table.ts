@@ -358,11 +358,9 @@ export class ModuleTable implements PureModuleLoader {
     if (!w) return { bytes: null, ms: 0 };
     if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
     const bound = deadlineMs ?? this.deadlineMs;
-    // Bytes are not this table's to account for: a module call arrives only from the guest
-    // seam, inside a `host.call` whose `ActiveHostCall` (realm-queue.ts) owns `payload` — a
-    // copy private to that call — and stays charged until the module settles, the transfer
-    // copy `call` makes included. Execution IS this table's: one in-flight call per module,
-    // so a spinning module burns one core for one bound, not one per caller.
+    // Bytes are not this table's to account for: the enclosing `host.call`'s
+    // `ActiveHostCall` owns `payload` until the module settles (§12.3). Execution IS —
+    // one in-flight call per module, so a spinner burns one core for one bound.
     const started = w.tail.then(() => this.call(w, payload, bound));
     w.tail = started.catch(() => {});
     return started;

@@ -409,12 +409,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
         };
-        let answer: Promise<Uint8Array> | Uint8Array;
-        try {
-            answer = hostCall(name, new Uint8Array(payload), budget);
-        } catch (e) {
-            throw e;
-        }
+        // A synchronous throw is a refused NAME, which fails at the guest's call site
+        // (guest-seam.ts); guest.go releases the call it had already admitted.
+        const answer = hostCall(name, new Uint8Array(payload), budget);
         void Promise.resolve(answer).then(
             (bytes: Uint8Array) => {
                 bridge.realmSettle(realm, callId, bytes, null);
@@ -430,12 +427,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
         DEFAULT_MAX_NODE_HOST_CALLS, DEFAULT_MAX_NODE_HOST_CALL_BYTES);
     let disposed = false;
-    // The JS half of the same time-bound invariant safe-js.ts's realm keeps (realm-queue.ts):
-    // `bridge.realmCall`'s resolve/reject are handed straight to Go, so without this a
-    // deferred entrypoint's `result` has nothing watching it from THIS side of the seam at
-    // all — it would depend entirely on guest.go's own settleAll running on dispose, an IPC
-    // round trip this wrapper has no way to verify happened. Tracking here makes the
-    // property hold at the owner of the invocation, independent of that plumbing.
+    // The JS half of safe-js.ts's time-bound invariant (§12.3). `realmCall` hands its
+    // resolve/reject straight to Go, so a deferred entrypoint's `result` would otherwise
+    // depend entirely on guest.go's settleAll — a round trip this side cannot verify.
     const settler = createInvocationSettler();
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm
@@ -462,11 +456,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         ),
         dispose: () => {
             disposed = true;
-            // Settle every invocation this wrapper is still tracking BEFORE tearing the Go
-            // realm down: closing it also rejects them (guest.go's settleAll), but asserting
-            // it here first is what makes the guarantee hold at this owner regardless of
-            // that second mechanism — a rejection racing a later Go-side settlement is a
-            // harmless no-op (a Promise settles once), never a double report.
+            // Before the Go teardown, not after: guest.go's settleAll rejects these too,
+            // but asserting it here makes the guarantee hold at this owner. Racing that
+            // second mechanism is a no-op — a Promise settles once.
             settler.failAll(new Error("guest realm disposed"));
             bridge.realmDispose(realm);
         },

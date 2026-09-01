@@ -18,7 +18,10 @@ const sodium = _sodium;
 
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES }
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
+  DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
+  DEFAULT_MAX_QUEUED_REALM_INVOCATIONS, DEFAULT_MAX_NODE_HOST_CALLS,
+  DEFAULT_MAX_NODE_HOST_CALL_BYTES, DERIVED_NODE_MEMORY_CEILING_BYTES }
   = await imp("build/core/wasm-limits.js");
 const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES }
   = await imp("build/core/net-limits.js");
@@ -394,6 +397,26 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ordinaryCalls.dispose();
 }
 
+console.log("\n§12.3 — the node pool covers one realm's whole share");
+{
+  // The pool has to be a multiple of the SUM of the per-realm ceilings that draw on it.
+  // Sized off the host-call ceiling alone it came out equal to DEFAULT_MAX_LIVE_TIMERS, so
+  // one app arming its own legitimate timer quota spent the entire node allowance and
+  // refused every sibling's next call — a ceiling the pool cannot cover is a starvation
+  // schedule, not a ceiling.
+  const realmObjects = DEFAULT_MAX_OUTSTANDING_HOST_CALLS + DEFAULT_MAX_LIVE_TIMERS
+    + DEFAULT_MAX_QUEUED_REALM_INVOCATIONS;
+  const realmBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;
+  ok(DEFAULT_MAX_NODE_HOST_CALLS >= 2 * realmObjects,
+    "the node object pool holds more than one realm's every countable owner at once");
+  ok(DEFAULT_MAX_NODE_HOST_CALL_BYTES >= 2 * realmBytes,
+    "the node byte pool holds more than one realm's every byte owner at once");
+  // Not circular: this is the sum measured against a real machine, so growing any owner
+  // has to be a deliberate choice rather than a number nobody added up.
+  ok(DERIVED_NODE_MEMORY_CEILING_BYTES <= 1024 * 1024 * 1024,
+    "the summed floor of every node-scoped owner still fits a modest machine");
+}
+
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
 {
   const active = createActiveHostCallRegistry(2, 8);
@@ -414,6 +437,11 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   child.release();
   siblingB.admit(1, 3).release();
 
+  // A realm that dies with calls still parked releases them: nothing is left to consume
+  // those answers, and no handle survives that could release them later — so holding the
+  // charge would pin the node allowance on one backend that never answers. The two ways a
+  // realm can die (construction failure, dispose) are both checked, and a backend that
+  // settles afterwards must be a no-op, never a second release.
   const teardownParent = createCustodyAllowance(2, 1);
   let settleOrphan;
   await rejects(createSafeRealm({
@@ -426,19 +454,33 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
     hostCall: () => new Uint8Array(),
     custodyAllowance: teardownParent,
   });
-  await rejects(afterFailure.call(new Uint8Array()),
-    "teardown does not launder a non-cancellable call's retained bytes");
+  ok((await afterFailure.call(new Uint8Array()))[0] === 7,
+    "a realm that failed to construct released what its parked call held");
   settleOrphan(new Uint8Array());
   await sleep(20);
   ok((await afterFailure.call(new Uint8Array()))[0] === 7,
-    "a retired owner releases its parent only when backend work actually settles");
+    "an orphaned backend settling later is a no-op, not a second release");
+
+  let settleAtDispose;
+  const disposedWithParked = await createSafeRealm({
+    source: 'async function handle() { await host.call("park", Uint8Array.of(1)); return Uint8Array.of(1); }',
+    hostCall: () => new Promise((resolve) => { settleAtDispose = resolve; }),
+    custodyAllowance: teardownParent,
+  });
+  // dispose() rejects this invocation; the caller holds the error, so consume it here.
+  disposedWithParked.call(new Uint8Array()).catch(() => {});
+  await sleep(20);
+  disposedWithParked.dispose();
+  ok((await afterFailure.call(new Uint8Array()))[0] === 7,
+    "disposing a realm with a call still parked releases its charge too");
+  settleAtDispose(new Uint8Array());
   afterFailure.dispose();
 
   let closed = false;
   const gates = [];
   const seen = [];
   const queued = serializeCalls((payload) => {
-    seen.push([...payload]);
+    seen.push(payload);
     let release;
     const gate = new Promise((resolve) => { release = resolve; });
     gates.push(release);
@@ -446,17 +488,15 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   }, () => closed ? new Error("closed") : null, 1);
   const one = Uint8Array.of(1);
   const firstInvocation = queued(one);
-  one[0] = 9;
   await sleep(0);
   const two = Uint8Array.of(2, 3, 4, 5);
   const secondInvocation = queued(two);
-  two.fill(9);
   await rejects(queued(Uint8Array.of(6)), "a queued invocation count is bounded");
   gates.shift()();
   await firstInvocation;
   await sleep(0);
-  ok(seen[0][0] === 1 && seen[1].join() === "2,3,4,5",
-    "the realm-entry owner snapshots payloads before queueing");
+  ok(seen[0] === one && seen[1] === two,
+    "a waiting invocation BORROWS its payload — the bytes already have an owner");
   gates.shift()();
   await secondInvocation;
   // Depth, not bytes: a payload far past any byte ceiling this queue could have had is

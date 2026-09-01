@@ -5,10 +5,8 @@
 // what an app can reach. Which medium the bytes land in decides nothing.
 
 import { type Fs, type FsStat } from "../core/fs.js";
-// The quota constants live in core/wasm-limits.ts, not here: they are one term of that
-// file's derived node-memory ceiling (DERIVED_NODE_MEMORY_CEILING_BYTES), which needs them
-// without core importing this host-layer file. Re-exported so an existing import of them
-// from this module keeps working.
+// The quotas live in core/wasm-limits.ts so its derived node-memory ceiling can name them
+// without core importing a host file; re-exported here, where they are applied.
 import { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
 export { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
 
@@ -44,8 +42,8 @@ export class MemoryFs implements Fs {
     if (nextUsed > this.maxBytes) {
       throw new Error(`memory-fs: byte quota exceeded (cap ${this.maxBytes})`);
     }
-    // Quota is checked before copying, and the old value remains intact if allocation
-    // fails. Commit of map entry and accounting follows the successful copy.
+    // Checked before the copy, committed after it: a failed allocation leaves the old
+    // value and the accounting intact.
     const stored = bytes.slice();
     this.map.set(key, stored);
     this.used = nextUsed;

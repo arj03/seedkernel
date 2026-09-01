@@ -24,17 +24,14 @@ var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. Each has
 	// its own guest seam, which is why net-settle routing is per realm rather than one
 	// global hook.
-	realms        = map[int64]*guestRealm{}
-	retiredRealms = map[int64]*guestRealm{}
-	// nodeHostCalls/nodeHostBytes are PROCESS-scoped, not per-shell: this loader stands up
-	// exactly one shell per process (main.go boot()), unlike the JS host's `nodeCustody`
-	// (host/shell-core.ts bootShell), which is allocated fresh per bootShell call because a
-	// JS process may run several shells at once. Several shells here would therefore SHARE
-	// one pool rather than each getting its own — an isolation this scope does not claim to
-	// give, and the reason maxNodeHostCalls/maxNodeHostBytes simply restate the most recent
-	// createRealm's ceiling: with one pool there is nothing to reconcile between differing
-	// callers, and refusing construction over a number that disagrees would deny a caller
-	// service to protect an isolation that was never on offer.
+	realms = map[int64]*guestRealm{}
+	// The shim mints ids as one strictly increasing sequence (native-shim.ts), so refusing
+	// anything below the high-water mark is the whole reuse check.
+	lastRealmID int64
+	// The §12.3 node pool, PROCESS-scoped here where the JS host's `nodeCustody` is
+	// per-bootShell: this loader stands up exactly one shell (main.go boot()). Several
+	// would share one pool, which is why the ceilings simply restate the latest
+	// createRealm's — there is no isolation between them to reconcile.
 	nodeHostCalls    int
 	nodeHostBytes    int64
 	maxNodeHostCalls int
@@ -87,7 +84,7 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 	b.SetPropertyStr("createRealm", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
-		if id <= 0 || realms[id] != nil || retiredRealms[id] != nil {
+		if id <= lastRealmID {
 			return nil, errors.New("createRealm: invalid or duplicate realm id")
 		}
 		mem := uint64(t.Args()[3].Int64())
@@ -107,18 +104,13 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if maxHostCalls <= 0 || maxHostCallBytes <= 0 || nodeCalls <= 0 || nodeBytes <= 0 {
 			return nil, errors.New("createRealm: no outstanding host-call limits supplied")
 		}
-		// Process-scoped (see the var block above): restate the ceiling on every call
-		// rather than latching the first one. In practice every caller in this process
-		// passes the same shared-default numbers (native-shim.ts), so this is a no-op
-		// after the first realm; it exists so a caller that legitimately differs is
-		// honored, not refused.
+		// Restated rather than latched (see the var block): every caller in this process
+		// passes the same shared defaults, so this is a no-op after the first realm.
 		maxNodeHostCalls, maxNodeHostBytes = nodeCalls, nodeBytes
+		lastRealmID = id
 		g, err := newGuestRealm(el, t.Args()[1].String(), t.Args()[2], mem, budget,
 			maxHostCalls, maxHostCallBytes)
 		if err != nil {
-			if g != nil && len(g.hostCalls) > 0 {
-				retiredRealms[id] = g
-			}
 			return nil, err
 		}
 		realms[id] = g
@@ -142,11 +134,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 	b.SetPropertyStr("realmSettle", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a disposed realm is a no-op: the Transport promise behind it
 		// outlives an uninstall.
-		id := t.Args()[0].Int64()
-		g := realms[id]
-		if g == nil {
-			g = retiredRealms[id]
-		}
+		g := realms[t.Args()[0].Int64()]
 		if g == nil {
 			return nil, nil
 		}
@@ -154,11 +142,6 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if _, live := g.hostCalls[callID]; !live {
 			return nil, nil
 		}
-		defer func() {
-			if len(g.hostCalls) == 0 {
-				delete(retiredRealms, id)
-			}
-		}()
 		if t.Args()[2].IsNull() || t.Args()[2].IsUndefined() {
 			g.settleNet(callID, nil, t.Args()[3].String())
 			return nil, nil
@@ -185,9 +168,6 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if g := realms[id]; g != nil {
 			delete(realms, id)
 			g.close()
-			if len(g.hostCalls) > 0 {
-				retiredRealms[id] = g
-			}
 		}
 		return nil, nil
 	}))
@@ -213,7 +193,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
-		return g, err
+		return nil, err
 	}
 	// The Web globals quickjs-ng lacks (TextEncoder/atob, the microtask queue), fetched
 	// from the host realm so both realms polyfill from ONE text (host/native-polyfills.ts);
@@ -610,6 +590,13 @@ func (g *guestRealm) close() {
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 	g.settleAll("guest realm closed")
+	// The custody these hold ends here: the guest that would have consumed the answers is
+	// gone, so what a still-pending backend holds is the host's own allocation, not this
+	// realm's (§12.3). Keeping the charge would pin the node pool on any backend that
+	// never answers, with nothing left alive to release it.
+	for callID := range g.hostCalls {
+		g.releaseHostCall(callID)
+	}
 	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil

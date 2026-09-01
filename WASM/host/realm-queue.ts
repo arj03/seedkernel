@@ -17,10 +17,10 @@ function checkedBytes(bytes: number): number {
 /** One active call's custody. Further host copies are reserved before creation and all
  * capacity remains owned until response delivery or terminal failure has completed.
  *
- * Bounded in TIME as well as size: a `release()` nothing is committed to calling bounds
- * only until the freeing event fails to happen. Here that commitment is the realm's own
- * settlement path (§12.3) — the answer promise this is charged against settles on the
- * realm's clock, or failing that on dispose (`InvocationSettler` below). */
+ * Bounded in TIME as well as size (§12.3): the host's answer releases it, and disposal
+ * releases whatever never answered — the guest that would have consumed it is gone, so
+ * what a still-pending backend holds is the host's own memory, not this realm's. Without
+ * that second path one unanswering backend pins the node pool for good. */
 export interface ActiveHostCall {
   reserve(bytes: number): void;
   release(): void;
@@ -56,22 +56,25 @@ export function createCustodyAllowance(maxObjects: number, maxBytes: number): Cu
   };
 }
 
-/** Own every guest-to-host copy and promise slot from admission through settlement.
- * Operation names are intentionally absent HERE — not because resource policy is
- * "name-blind" in general (it is not: `MemoryFs`'s quota and `isIrreversible` are both
- * legitimately keyed on the operation), but because the rule is narrower than that. A name
- * may TIGHTEN what an owner admits, never relax one, and a bound is enforced by the OWNER
- * of the resource — this registry, for an active host call — never by the dispatcher that
- * routed the call here. This owner has no name-keyed exemption to give, so it takes none.
- * The live id, count slot, and actual source width are admitted atomically. */
+/** Own every guest-to-host copy and promise slot from admission through settlement (§12.3).
+ * Id, count slot and actual source width are admitted atomically. No operation name reaches
+ * here: policy elsewhere is legitimately name-keyed (`MemoryFs`'s quota, `isIrreversible`),
+ * but a name may only TIGHTEN what an owner admits, and this owner has no exemption to
+ * give — the resource's owner decides, never the dispatcher that routed the call. */
 export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   parent?: CustodyAllowance,
-): { admit(callId: number, payloadBytes: number): ActiveHostCall } {
+): {
+  admit(callId: number, payloadBytes: number): ActiveHostCall;
+  releaseAll(): void;
+} {
   const active = new Map<number, ActiveHostCall>();
   let bytes = 0;
   return {
+    releaseAll(): void {
+      for (const call of [...active.values()]) call.release();
+    },
     admit(callId: number, payloadBytes: number): ActiveHostCall {
       if (!Number.isSafeInteger(callId)) throw new Error("guest: invalid host call id");
       if (active.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
@@ -158,13 +161,11 @@ export function createInvocationSettler(): InvocationSettler {
 
 /** Serialize realm entry, bounding the DEPTH of what waits on the Promise chain.
  *
- * Deliberately no byte ceiling of its own. Every payload reaching here is already owned for
- * a period that strictly contains this one: an inbound read by its link, from arrival until
- * the invocation settles (transport-host.ts); a guest-issued call by the calling realm's
- * `ActiveHostCall`; a local host caller's by whoever allocated it. A second byte counter
- * over the same bytes would bound nothing and would reject work the real owner had already
- * admitted — which is failure dressed as a limit, since a rejected invocation is an error
- * to its caller and not backpressure. Depth is this queue's own: waiting invocations are
+ * Depth only, and the payload is BORROWED, not copied — both follow from the same fact:
+ * every payload reaching here is already owned for a period that contains this one (§12.3),
+ * by the link that read it, by the calling realm's `ActiveHostCall`, or by the host caller
+ * that allocated it. Counting or copying those bytes again would double the memory the
+ * ownership rule exists to bound. Depth is this queue's own: waiting invocations are
  * objects on a chain nobody else counts. */
 export function serializeCalls(
   invoke: (payload: Uint8Array) => Invocation,
@@ -189,14 +190,6 @@ export function serializeCalls(
       return Promise.reject(err);
     }
     queuedCalls++;
-    let queuedPayload: Uint8Array;
-    try {
-      queuedPayload = payload.slice();
-    } catch (err) {
-      queuedCalls--;
-      releaseParent?.();
-      throw err;
-    }
     let owned = true;
     const releaseEntry = () => {
       if (!owned) return;
@@ -208,7 +201,7 @@ export function serializeCalls(
       try {
         const err = notReady();
         if (err) throw err;
-        return invoke(queuedPayload);
+        return invoke(payload);
       } finally {
         releaseEntry();
       }

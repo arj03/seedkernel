@@ -157,7 +157,13 @@ class WsFramer {
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
     this.parts = new ByteParts();      // inbound: handshake head, then frames
     this.open = false;
-    this.opened = new Promise((resolve) => { this.resolveOpen = resolve; });
+    // `send` parks here until the upgrade completes, so it must be able to end badly too
+    // or an upgrade that never lands parks every write forever (§12.6, `abort` below).
+    this.opened = new Promise((resolve, reject) => {
+      this.resolveOpen = resolve;
+      this.rejectOpen = reject;
+    });
+    this.opened.catch(() => {}); // no unhandled rejection when nothing was parked
     this.fragOpcode = -1;
     this.frags = [];
     this.fragBytes = 0;
@@ -216,9 +222,15 @@ class WsFramer {
   }
 
   /** The close frame rides the same byte stream after the end-of-stream record just
-   *  written, so it cannot overtake it — the ordering that record depends on. */
+   *  written, so it cannot overtake it — the ordering that record depends on. On a stream
+   *  that never upgraded a bare CLOSE frame is not a farewell but garbage mid-head. */
   goodbye() {
-    return this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL);
+    return this.open ? this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL) : Promise.resolve();
+  }
+
+  /** Terminal: no upgrade will complete, so fail whatever parked on it. */
+  abort() {
+    this.rejectOpen(new Error("ws: link closed before the upgrade completed"));
   }
 
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain

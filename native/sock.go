@@ -43,6 +43,7 @@ type netHost struct {
 	// synchronously handed to TransportHost's existing driver-wide allowance.
 	inboundReadBytes  int
 	inboundReadSlices int
+	readSpace         *sync.Cond // signalled as staging custody is released
 
 	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
@@ -187,15 +188,27 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
+// waitSpace is lazily built so a zero-value netHost still works; always called under mu.
+func (n *netHost) waitSpace() *sync.Cond {
+	if n.readSpace == nil {
+		n.readSpace = sync.NewCond(&n.mu)
+	}
+	return n.readSpace
+}
+
 // reserveInboundRead charges a socket read before the reader makes the retained copy that
-// crosses into el.post. This is a driver-wide native staging allowance, so thousands of
-// individually paused links cannot each hold one unmetered 64 KiB delivery ahead of JS.
+// crosses into el.post — the driver-wide staging allowance of §12.6. A full window WAITS,
+// parking this reader goroutine so the socket's own receive window carries the pressure to
+// the peer; only a read that can never fit is refused, since waiting would park forever.
 func (n *netHost) reserveInboundRead(length int) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if length < 0 || n.inboundReadSlices >= n.maxInboundReadSlices ||
-		length > n.maxInboundReadBytes-n.inboundReadBytes {
+	if length < 0 || length > n.maxInboundReadBytes || n.maxInboundReadSlices <= 0 {
 		return false
+	}
+	for n.inboundReadSlices >= n.maxInboundReadSlices ||
+		length > n.maxInboundReadBytes-n.inboundReadBytes {
+		n.waitSpace().Wait()
 	}
 	n.inboundReadSlices++
 	n.inboundReadBytes += length
@@ -206,6 +219,7 @@ func (n *netHost) releaseInboundRead(length int) {
 	n.mu.Lock()
 	n.inboundReadSlices--
 	n.inboundReadBytes -= length
+	n.waitSpace().Broadcast()
 	n.mu.Unlock()
 }
 
@@ -306,8 +320,8 @@ func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
 // goroutine, which owns all QuickJS access.
 func (n *netHost) onMsg(id int64) func([]byte) bool {
 	return func(b []byte) bool {
-		// The readLoop's buffer is borrowed and reused. Reserve BEFORE copying it; on
-		// refusal there is no retained allocation and nothing enters the event-loop queue.
+		// The readLoop's buffer is borrowed and reused. Reserve BEFORE copying it, and on
+		// a read that can never fit leave nothing allocated and nothing posted.
 		if !n.reserveInboundRead(len(b)) {
 			return false
 		}

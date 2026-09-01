@@ -33,8 +33,7 @@ class LoopbackChannel {
     const p = this.peer;
     queueMicrotask(() => { if (p && !p.dead) p.msg?.(bytes); });
   }
-  // Delivery is a microtask handoff, not a real backlog (core/socket-seam.ts `RawLink.buffered`
-  // is a required contract): this fake genuinely retains nothing once send() returns.
+  // Honest: delivery is a microtask handoff, so nothing is retained past send().
   buffered() { return 0; }
   onData(cb) { this.msg = cb; }
   onClose(cb) { this.cls = cb; }

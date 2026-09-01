@@ -14,7 +14,7 @@ const rtc = await imp("build/host/net-rtc.js");
 const {
   RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
   MAX_SDP_BYTES, MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES,
-  UNESTABLISHED_PEER_TTL_MS,
+  UNESTABLISHED_PEER_TTL_MS, MAX_QUEUED_SIGNALS,
 } = rtc;
 import { testkit } from "./testkit.mjs";
 
@@ -419,6 +419,50 @@ await test("an unestablished peer expires on a host-owned deadline", async () =>
     net?.close();
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;
+  }
+});
+
+await test("the signaling lane bounds how many decoded signals may wait on it", async () => {
+  // The lane exists to keep a later SDP from overtaking an operation in flight — and a
+  // lane is a queue. Nothing else counts it: the per-peer caps are only reached once a
+  // message is ACTED on, so without this bound a relay can park unbounded SDP here.
+  let deliver = null;
+  const signaling = { send() {}, onMessage(cb) { deliver = cb; }, close() {} };
+  let admitted = 0;
+  let releaseHead;
+  const held = new Promise((resolve) => { releaseHead = resolve; });
+  const net = new RtcNetwork({
+    peerId: peerId(0),
+    signaling,
+    admitPeer: () => { admitted++; return true; },
+    peerConnectionFactory: () => ({
+      signalingState: "stable",
+      remoteDescription: null,
+      addEventListener() {},
+      createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
+      // The head of the lane parks here, so everything behind it has to wait.
+      setRemoteDescription: () => held,
+      async setLocalDescription() {},
+      async addIceCandidate() {},
+      close() {},
+    }),
+  });
+  try {
+    const big = "s".repeat(MAX_SDP_BYTES / 2);
+    const sent = MAX_QUEUED_SIGNALS + 64;
+    for (let i = 1; i <= sent; i++) {
+      deliver({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } });
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    assert(admitted === 1, `only the head of the lane may run while it is parked, got ${admitted}`);
+    releaseHead();
+    // Drain: every signal the lane accepted now runs, and nothing more.
+    for (let i = 0; i < sent + 8; i++) await new Promise((r) => setTimeout(r, 0));
+    assert(admitted <= MAX_QUEUED_SIGNALS + 1,
+      `the lane must drop past ${MAX_QUEUED_SIGNALS} waiting signals, ran ${admitted} of ${sent}`);
+    assert(admitted < sent, "an unbounded lane would have run every one of them");
+  } finally {
+    net.close();
   }
 });
 

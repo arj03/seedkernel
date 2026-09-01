@@ -45,13 +45,10 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       return parts.length;
     },
     // The stall clock's progress signal (core/socket-seam.ts `RawLink.buffered`):
-    // bytes written but not yet on the wire. Plain writes never bump this — a test drives
-    // it directly to model a backpressured socket, draining or stuck — UNLESS
-    // `trackBacklog` is set, in which case `send` grows it by exactly what it was handed:
-    // the host's own outbound owner (transport-host.ts `LinkOutboundOwner`) reconciles its
-    // retained bytes against the DELTA of this report, so a value invented independent of
-    // what was actually written is drained away as a phantom on the very next reconcile —
-    // a test simulating a slow real backlog needs a real write behind it.
+    // bytes written but not yet on the wire, driven directly by a test to model a socket
+    // that is backpressured, draining or stuck. `trackBacklog` instead grows it by what
+    // `send` was handed: `LinkOutboundOwner` reconciles against the DELTA of this report,
+    // so a backlog with no real write behind it is drained away as a phantom at once.
     backlog: 0,
     buffered() { return this.backlog; },
     send(bytes) {
@@ -227,12 +224,8 @@ await test("the deadline is a STALL clock: a request still draining out is not l
   // A clock armed when the request is QUEUED times our own upload and blames the holder
   // for our backlog: a 50 MB PUT queued ~42 MB behind its sockets would cancel every
   // request in the window at its 5 s deadline while the wire moves perfectly.
-  //
-  // `trackBacklog` makes `chans[0].backlog` grow by exactly what a write puts there,
-  // matching how the host's own outbound owner reconciles retained bytes against the
-  // DELTA of this report (host/transport-host.ts `LinkOutboundOwner`): a backlog set
-  // independent of a real write is a phantom the very next reconcile drains away, so the
-  // 40 KB below has to be a real request payload, not an invented number.
+  // `trackBacklog` because `LinkOutboundOwner` reconciles against the delta of the
+  // adapter's report: the 40 KB has to be a real request payload, not an invented number.
   const chans = wirePair({ trackBacklog: true });
   const st = keep(await linked(chans, {}, { mode: "hang" }));
   const proto = PROTO;
@@ -406,6 +399,25 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
   await settle();
   assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
+});
+
+await test("A REFUSED SEND fails the link, never one record", async (keep) => {
+  // `link/send` is awaited and byte-metered, so the occupant's OWN host-call budget can
+  // refuse to issue a write the driver never sees — and `host.call` raises that
+  // synchronously. Swallowing it would leave the link open with a hole in a nonce-ordered
+  // stream, and the peer would tear it down as a forgery: our backpressure, blamed on it.
+  let refuse = false;
+  const chans = wirePair();
+  const st = keep(await linked(chans, {
+    onHostCall: (name) => {
+      if (refuse && name === "link/send") throw new Error("guest: budget refused this write");
+    },
+  }));
+  await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
+  refuse = true;
+  await st.A.sendNoReply(st.B.peerId, PROTO, Uint8Array.of(1));
+  await until(() => st.a.closed, 4000, "the refused write must end the link");
+  assert(st.a.closed, "a record that could not be issued must fail its link");
 });
 
 await test("PRE-AUTH QUEUE: tiny frames are bounded by count", async (keep) => {

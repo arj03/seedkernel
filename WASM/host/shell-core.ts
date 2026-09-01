@@ -526,12 +526,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
         // already refused any non-object).
         const appConfig = b.manifest.guest.config ?? {};
-        // The third preamble: not what the author signed (`APP`) nor what the operator set
-        // for this app (`LOCAL`), but what the HOST will admit — the budgets a guest is
-        // measured against, told to it rather than discovered by being refused. A guest
-        // pacing its own fan-out to these turns a hard rejection into a window; the
-        // ceilings still enforce, for a guest that does not bother. Anything that changes
-        // what the realm actually admits must change what is advertised here with it.
+        // The third preamble (§12.5): not what the author signed (`APP`) nor what the
+        // operator set (`LOCAL`), but what the host will admit — told to the guest rather
+        // than discovered by being refused, so it can window its own fan-out. Anything
+        // that changes what the realm admits must change what is advertised here with it.
         const hostBudgets: JsonObject = {
             maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
             maxOutstandingHostCallBytes: DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,

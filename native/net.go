@@ -290,9 +290,10 @@ func (c *sockChannel) readLoop() {
 				spoke = true
 				conn.SetReadDeadline(time.Time{}) // said something: the guest's link deadlines own it now
 			}
-			// onMsg reserves the native driver-wide staging allowance before it copies
-			// this borrowed scratch slice into the event-loop queue. A refusal is terminal:
-			// leaving the socket open would only let the same peer retry outside the meter.
+			// onMsg charges the §12.6 staging allowance before copying this borrowed
+			// scratch slice, stalling here when the window is full. It answers false only
+			// for a read that can never fit; leaving that socket open would just let the
+			// peer retry outside the meter.
 			if !c.onMsg(chunk[:n]) {
 				c.fail()
 				return

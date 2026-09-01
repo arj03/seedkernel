@@ -192,8 +192,8 @@ This is the chat shell's sandboxed-iframe confinement (§11) generalised: "run z
 
 - **Live timers and their bodies** — one realm may hold at most 1,024 deadlines (`DEFAULT_MAX_LIVE_TIMERS`) and 4 MiB of copied opaque timer bodies (`DEFAULT_MAX_TIMER_PAYLOAD_BYTES`). A guest has no `setTimeout` of its own, so every armed deadline and body is **host-side** state. Re-arm is transactional; clear, fire, and realm disposal release body accounting before anything can re-enter the realm.
 - **Outstanding host calls and their inputs** — at most 256 unresolved calls and 16 MiB of aggregate copied input per realm (`DEFAULT_MAX_OUTSTANDING_HOST_CALLS`, `DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES`), plus a response's bytes for the moment they coexist with the request that asked. The registry admits the call id, the count slot and the payload's actual width together, before the copy crosses out of QuickJS, so neither many tiny fire-and-forget calls nor a handful of maximum-sized network deliveries can multiply host-side buffers and promises outside the confined heap. Settlement is what releases, and settlement is guaranteed: disposing a realm settles every invocation still in flight, so a guest that defers an answer (`__deferred`) and never gives it cannot pin its caller's charge past its own realm's life. Both realm targets keep this registry, because each is the first place able to refuse before *its* copy is made.
-- **Invocations waiting to enter a realm** — 256 deep per realm (`DEFAULT_MAX_QUEUED_REALM_INVOCATIONS`). Serialization decides *when* a guest frame may run; this bounds how many may be waiting for it. Depth only, and the absence of a byte companion is the ownership rule doing its work: the bytes of a waiting invocation are already owned for a longer period by whoever handed them over — an inbound read by its link, until the invocation settles; a guest-issued call by the calling realm's registry — so charging them again here would reject work its real owner had already admitted.
-- **A parent allowance for the node** — the three bounds above are per realm, and a node holds many. `DEFAULT_MAX_NODE_HOST_CALLS` / `_CALL_BYTES` (4× the per-realm ceilings) is one pool they all draw from, so finite per-realm numbers cannot multiply without limit. It bounds the process, not realms from one another: there is no per-realm floor, so siblings can starve each other once it is spent.
+- **Invocations waiting to enter a realm** — 256 deep per realm (`DEFAULT_MAX_QUEUED_REALM_INVOCATIONS`). Serialization decides *when* a guest frame may run; this bounds how many may be waiting for it. Depth only, and the payload is *borrowed* rather than copied. Both follow from the ownership rule doing its work: the bytes of a waiting invocation are already owned for a longer period by whoever handed them over — an inbound read by its link, until the invocation settles; a guest-issued call by the calling realm's registry. Charging them again would reject work its real owner had already admitted, and copying them again would double the very memory the rule exists to bound.
+- **A parent allowance for the node** — the three bounds above are per realm, and a node holds many. `DEFAULT_MAX_NODE_HOST_CALLS` / `_CALL_BYTES` is one pool they all draw from, so finite per-realm numbers cannot multiply without limit. It is sized at four times the **sum** of one realm's ceilings, never a multiple of any single one: taken from the host-call ceiling alone, the object pool came out exactly equal to `DEFAULT_MAX_LIVE_TIMERS`, so one app arming its own legitimate timer quota spent the whole node allowance and refused every sibling's next call — a per-realm ceiling the pool cannot cover is not a ceiling but a starvation schedule. It bounds the process, not realms from one another: there is no per-realm floor, so siblings can starve each other once it is spent.
 
 **`Shell.close()` waits for in-flight calls.** Every entry into a slot's guest (`dispatch` or a handle's `invoke`) is chained onto one wait (`inFlight` in `shell-core.ts`), and `close()` defers realm disposal until that wait settles. A call parked mid-await — a repair pass waiting out an unreachable peer — must not resume into a freed QuickJS context. Uninstall and revoke dispose immediately; a handle held past that rejects by naming the slot rather than calling into a freed realm.
 
@@ -558,7 +558,14 @@ same rule as the frame caps, applied to the host-side structures a link occupies
   remains charged while dispatched as well as while held above an unpausable browser
   adapter, so 4,096 raw links cannot each buy an independent realm invocation and hold
   window. The link whose next read crosses either aggregate ceiling is failed; reservations
-  are released only when a dispatched call settles or held input is dropped.
+  are released only when a dispatched call settles or held input is dropped. The native
+  target charges the same ceiling a second time, on the copy its reader goroutine stages
+  toward QuickJS, released only once synchronous delivery has handed custody to the driver
+  above — the two windows overlap by design, and inbound host memory there is bounded at
+  twice this figure. That one **waits** instead of failing: a reader goroutine is the one
+  place backpressure costs nothing, and the socket's own receive window carries it to the
+  peer. Failing there would put a capacity cliff far below `MAX_RAW_LINKS`, where a burst of
+  honest links kills most of itself.
 - **`MAX_OUTBOUND_QUEUE_BYTES` (16 MiB) and `MAX_OUTBOUND_QUEUE_SLICES` (4096)** bound
   authenticated writes waiting below the transport. The byte limit caps large responses and
   the count limit caps tiny ones and their per-write bookkeeping. The guest applies the same
@@ -572,7 +579,19 @@ same rule as the frame caps, applied to the host-side structures a link occupies
   holding nothing. `MAX_NODE_OUTBOUND_QUEUE_BYTES`/`_SLICES` (4× each) is the parent
   allowance every link draws from, so per-link ceilings cannot multiply by `MAX_RAW_LINKS`.
   Crossing any of them fails the whole link rather than dropping a write from the ordered
-  stream.
+  stream — and so does a refusal the occupant meets *before* the driver, since its own
+  `host.call` budget can decline to issue the write at all under load. A record that was
+  sealed and never landed is a hole in a nonce-ordered stream: the peer's next decrypt
+  fails and it tears the link down as a forgery, blaming a peer for our own backpressure.
+  So every refusal under the record layer ends the link, never one record.
+- **A teardown must not queue behind the wire it is ending.** The occupant runs one work
+  chain per link so a teardown cannot overtake a record still being sealed — but a step
+  already parked *on* the wire would then hold that chain against the very event meant to
+  end it. The WebSocket codec parks every write until its upgrade completes, so a peer that
+  finishes TCP, dribbles a partial head and stops would park msg1 forever and leave the
+  handshake deadline's own abort queued behind it: no close, and the slot and raw link held
+  until the socket happened to die on its own. `close`/`abort` therefore sever the wire
+  synchronously first; the parked write fails, and the queued teardown then runs.
 
 #### 12.6.2b One master seed, one identity
 
