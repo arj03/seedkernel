@@ -199,7 +199,7 @@ func (n *netHost) waitSpace() *sync.Cond {
 }
 
 // reserveInboundRead charges a socket read before the reader makes the retained copy that
-// crosses into el.post — the driver-wide staging allowance of §12.6. A full window WAITS,
+// crosses into el.post — the driver-wide staging allowance of §16.1. A full window WAITS,
 // parking this reader goroutine so the socket's own receive window carries the pressure to
 // the peer; only a read that can never fit is refused, since waiting would park forever.
 func (n *netHost) reserveInboundRead(length int) bool {
