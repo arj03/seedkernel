@@ -147,26 +147,17 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 	}
 }
 
-// TestGuestRealmReusedRealmIDIsRefused pins the shim's id contract at the Go side: ids are
-// minted as one strictly increasing sequence, so anything at or below the high-water mark
-// is a bug or a forgery and never a second realm quietly displacing the first.
-func TestGuestRealmReusedRealmIDIsRefused(t *testing.T) {
+// TestGuestRealmIDsAreMintedByTheirOwner pins the bridge's handle contract at the Go side:
+// the map that owns realms also mints their opaque ids, so callers have no id to reuse or
+// forge and successive realms can never quietly displace one another.
+func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
 	bootRealm(t)
-	mk := func(id int64) error {
-		src := fmt.Sprintf(
-			`bridge.createRealm(%d, "function handle(){ return new Uint8Array(); }", () => {}, %d, 1000, 10, 1048576)`,
-			id, 64<<20)
-		_, err := qc.Eval("mk.js", qjs.Code(src))
-		return err
+	const mk = `bridge.createRealm("function handle(){ return new Uint8Array(); }", () => {}, 67108864, 1000, 10, 1048576)`
+	if _, err := qc.Eval("mk.js", qjs.Code(`globalThis.__realmIds = [`+mk+`, `+mk+`];`)); err != nil {
+		t.Fatalf("create realms: %v", err)
 	}
-	if err := mk(1); err != nil {
-		t.Fatalf("first realm: %v", err)
-	}
-	if err := mk(1); err == nil {
-		t.Fatal("a reused realm id was accepted")
-	}
-	if err := mk(2); err != nil {
-		t.Fatalf("the next id in sequence: %v", err)
+	if got := evalString(t, "String(__realmIds[0] > 0 && __realmIds[1] > __realmIds[0])"); got != "true" {
+		t.Fatalf("realm ids are not positive and strictly increasing: %s", got)
 	}
 }
 

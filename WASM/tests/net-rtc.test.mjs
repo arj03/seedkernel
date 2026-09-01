@@ -25,6 +25,17 @@ const { test, assert, summary } = testkit();
 // transport link above it authenticates, so a genuine fleet is unconstrained; only NEW
 // speculative entries are.
 const peerId = (n) => String(n).padStart(64, "0");
+const wire = (msg) => {
+  const tag = msg.type === "hello" ? "h"
+    : msg.type === "ice" ? "i"
+    : msg.sdp.type === "offer" ? "o" : "a";
+  const fields = [tag, msg.from, msg.to ?? ""];
+  if (msg.type === "hello") return fields.join("\0");
+  if (msg.type === "sdp") return [...fields, msg.sdp.sdp].join("\0");
+  const c = msg.candidate;
+  return [...fields, c.candidate, c.sdpMid ?? "", c.sdpMLineIndex?.toString() ?? "",
+    c.usernameFragment ?? ""].join("\0");
+};
 
 function stubPeerConnection() {
   const listeners = new Map();
@@ -47,7 +58,7 @@ await test("net-rtc exports the signaling seam, not a WebSocket relay implementa
   assert(!("relaySignaling" in rtc), "the kernel must not ship a rendezvous wire implementation");
 });
 
-await test("RtcNetwork validates opaque signaling messages before admitting them", async () => {
+await test("RtcNetwork validates encoded signaling strings before admitting them", async () => {
   let receive = () => {};
   let admitted = 0;
   let pcs = 0;
@@ -79,24 +90,28 @@ await test("RtcNetwork validates opaque signaling messages before admitting them
 
   const malformed = [
     null,
-    "hello",
     [],
     {},
-    { type: "hello", from: "not-a-peer" },
-    { type: "hello", from: peerId(1), to: 7 },
-    { type: "sdp", from: peerId(1) },
-    { type: "sdp", from: peerId(1), sdp: { type: "bogus", sdp: "x" } },
-    { type: "ice", from: peerId(1) },
-    { type: "ice", from: peerId(1), candidate: { candidate: "x", sdpMLineIndex: -1 } },
+    "hello",
+    wire({ type: "hello", from: "not-a-peer" }),
+    wire({ type: "hello", from: peerId(1), to: "not-a-peer" }),
+    wire({ type: "sdp", from: peerId(1), sdp: { type: "offer", sdp: "x\0y" } }),
+    wire({ type: "ice", from: peerId(1), candidate: { candidate: "x", sdpMLineIndex: -1 } }),
+    `h${peerId(1)}trailing`,
+    `H${peerId(1)}`,
+    `x${peerId(1)}`,
+    `i${peerId(1)}00000005x`,
+    `i${peerId(1)}ffffffffffffffffffffffffffffffff`,
   ];
   for (const msg of malformed) await receive(msg);
   assert(admitted === 0, `malformed messages must be dropped before policy (got ${admitted})`);
   assert(pcs === 0 && net.peers.size === 0, "malformed messages must not allocate peer connections");
 
-  await receive({ type: "hello", from: peerId(1) });
-  assert(admitted === 1 && pcs === 1, "a valid opaque hello must reach policy and create one peer");
-  assert(sent.length === 1 && sent[0].type === "hello" && sent[0].to === peerId(1),
-    "a valid broadcast hello must receive one directed reply");
+  await receive(wire({ type: "hello", from: peerId(1) }));
+  assert(admitted === 1 && pcs === 1, "a valid encoded hello must reach policy and create one peer");
+  assert(sent.length === 1 && typeof sent[0] === "string"
+      && sent[0] === wire({ type: "hello", from: ownId, to: peerId(1) }),
+    "a broadcast hello must receive one byte-exact encoded-string reply");
   net.close();
 });
 
@@ -115,12 +130,12 @@ await test("RtcNetwork rejects oversized SDP before policy or WebRTC", async () 
     },
   });
   const overLimit = "x".repeat(MAX_SDP_BYTES / 2 + 1);
-  await receive({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: overLimit } });
+  await receive(wire({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: overLimit } }));
   assert(admitted === 0 && pcs === 0 && net.peers.size === 0,
     "oversized SDP must be dropped at decoding, before policy and connection allocation");
 
   const atLimit = "x".repeat(MAX_SDP_BYTES / 2);
-  await receive({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: atLimit } });
+  await receive(wire({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: atLimit } }));
   assert(admitted === 1 && pcs === 1 && net.peers.size === 1,
     "SDP at the documented UTF-16 storage ceiling must remain admitted");
   net.close();
@@ -149,12 +164,12 @@ await test("inbound signaling handlers run in arrival order", async () => {
       return made.pc;
     },
   });
-  const offer = receive({
+  const offer = receive(wire({
     type: "sdp", from: peerId(1), to: ownId,
     sdp: { type: "offer", sdp: "offer" },
-  });
+  }));
   await remoteStarted;
-  const hello = receive({ type: "hello", from: peerId(2), to: ownId });
+  const hello = receive(wire({ type: "hello", from: peerId(2), to: ownId }));
   await Promise.resolve();
   assert(pcs === 1, "a later message must not start while an earlier WebRTC operation is in flight");
   releaseRemote();
@@ -196,8 +211,8 @@ await test("post-description ICE candidates drain one at a time", async () => {
   // Through the inbound boundary, the only way a candidate arrives: one signaling lane
   // serializes every handler, so a drain cannot start while another is mid-candidate and
   // there is no second per-entry lane to keep in step with this one.
-  const first = receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } });
-  const second = receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } });
+  const first = receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } }));
+  const second = receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } }));
   await firstStarted;
   assert(calls === 1 && maxActive === 1,
     "a later candidate must wait while the preceding addIceCandidate is in flight");
@@ -348,23 +363,23 @@ await test("pending ICE is normalized and bounded by candidate count", async () 
     },
   });
   const remote = peerId(1);
-  await receive({ type: "hello", from: remote, to: peerId(0) });
+  await receive(wire({ type: "hello", from: remote, to: peerId(0) }));
   const original = {
     candidate: "candidate:1", sdpMid: "0", sdpMLineIndex: 0,
     usernameFragment: "u", extra: { retained: new Uint8Array(1024) },
   };
-  await receive({ type: "ice", from: remote, to: peerId(0), candidate: original });
+  await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: original }));
   const entry = net.peers.get(remote);
   assert(entry.pendingIce.length === 1, "a valid early candidate must be queued");
   assert(entry.pendingIce[0] !== original && !("extra" in entry.pendingIce[0]),
     "the pending queue must retain a normalized candidate, never the signaling object");
 
   for (let i = 1; i < MAX_PENDING_ICE_CANDIDATES; i++) {
-    await receive({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: `candidate:${i}` } });
+    await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: `candidate:${i}` } }));
   }
   assert(entry.pendingIce.length === MAX_PENDING_ICE_CANDIDATES && !made[0].pc.closed,
     "the exact pending-candidate count ceiling must remain admitted");
-  await receive({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: "one-too-many" } });
+  await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: "one-too-many" } }));
   assert(!net.peers.has(remote) && made[0].pc.closed,
     "crossing the pending-candidate count ceiling must release the speculative peer");
   net.close();
@@ -380,13 +395,13 @@ await test("pending ICE is bounded by aggregate string bytes", async () => {
     signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
     peerConnectionFactory: () => made.pc,
   });
-  await receive({ type: "hello", from: remote, to: ownId });
+  await receive(wire({ type: "hello", from: remote, to: ownId }));
   // Candidate accounting uses the worst-case two bytes per JS string code unit.
   const full = "x".repeat(MAX_PENDING_ICE_BYTES / 2);
-  await receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: full } });
+  await receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: full } }));
   assert(net.peers.get(remote).pendingIceBytes === MAX_PENDING_ICE_BYTES,
     "the exact pending ICE byte ceiling must remain admitted");
-  await receive({ type: "ice", from: remote, to: ownId, candidate: { candidate: "x" } });
+  await receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "x" } }));
   assert(!net.peers.has(remote) && made.pc.closed,
     "crossing the pending ICE byte ceiling must release the speculative peer");
   net.close();
@@ -453,7 +468,7 @@ await test("the signaling lane bounds how many decoded signals may wait on it", 
     const big = "s".repeat(MAX_SDP_BYTES / 2);
     const sent = MAX_QUEUED_SIGNALS + 64;
     for (let i = 1; i <= sent; i++) {
-      deliver({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } });
+      deliver(wire({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } }));
     }
     await new Promise((r) => setTimeout(r, 0));
     assert(admitted === 1, `only the head of the lane may run while it is parked, got ${admitted}`);

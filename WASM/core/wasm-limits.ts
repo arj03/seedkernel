@@ -1,8 +1,6 @@
 // Module memory bounds, read off the bytes before instantiation (§4.3). An imported
 // or shared memory is refused. Compute is bounded at each target's engine.
 
-import { MAX_INBOUND_HOLD_BYTES, MAX_NODE_OUTBOUND_QUEUE_BYTES } from "./net-limits.js";
-
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
 
@@ -51,7 +49,8 @@ export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
 
 /** Confined realms one node may hold at once (`slots`, shell-core.ts). The MULTIPLICAND:
  *  every per-realm ceiling here is one of these times this number, which is what makes the
- *  total at the end of this file a ceiling rather than a floor. Bounding the count is also
+ *  node total a ceiling rather than a floor — that sum is added up and measured against a
+ *  real machine in tests/verify-hardening.mjs (§12.3). Bounding the count is also
  *  why nothing here is pooled BETWEEN realms: an allowance apps draw on in common is one
  *  app's standing way to refuse another's calls by being busy, while a quota per tenant
  *  times a bounded tenant count reaches the same total with no such channel. Slots are the
@@ -64,31 +63,16 @@ export const DEFAULT_MAX_APP_SLOTS = 8;
  *  none can be looser about what a bundle may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
-/** Metadata bound for one signed bundle. The memory sum below normally binds first, but
+/** Metadata bound for one signed bundle. Aggregate module memory normally binds first, but
  *  zero-memory declarations must not turn admission into an unbounded module-array walk. */
 export const DEFAULT_MAX_BUNDLE_MODULES = 256;
 
 /** The default in-memory `Fs` backend's whole quota (host/fs-memory.ts `MemoryFs`), so a
  *  successful put cannot turn bounded in-flight calls into unbounded permanent process RAM.
- *  Declared here rather than in fs-memory.ts so the total below can name it without core
- *  importing a host file; fs-memory.ts re-exports it. */
+ *  Declared here rather than in fs-memory.ts so one file holds every node-scoped ceiling
+ *  the §12.3 sum adds up; fs-memory.ts re-exports it. */
 export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
-
-// Every owner above is finite, but only their SUM is checkable against real machine RAM.
-// Adding a node-scoped owner of admitted host memory means adding its term here, not just
-// declaring its own constant. A worst case rather than a floor: what one realm may hold is
-// multiplied by the bound on realms, which is what that bound is for.
-export const DERIVED_NODE_MEMORY_CEILING_BYTES =
-    DEFAULT_MAX_APP_SLOTS * (
-      DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES // copied host-call inputs and their answers
-    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES         // copied timer bodies
-    + DEFAULT_REALM_MEMORY_BYTES              // §12.3 — one confined guest heap
-    + DEFAULT_MAX_MODULE_MEMORY_BYTES)        // §4.3 — one bundle's aggregate module memory
-  + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, aggregated over every link
-  + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — inbound reads: native staging and the driver window
-                                  // hold the same read at once, by design (sock.go)
-  + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether

@@ -95,42 +95,11 @@ export function createActiveHostCallRegistry(
 export interface Invocation {
   /** The entrypoint's answer, which is what the caller of `call` receives. A deferred
    *  entrypoint (`__deferred`) hands it to an arbitrary later turn under no wall-clock
-   *  bound, so only dispose can guarantee it settles — hence `InvocationSettler`. */
+   *  bound, so only the realm's own dispose can guarantee it settles (safe-js.ts,
+   *  native-shim.ts). */
   result: Promise<Uint8Array>;
   /** Settles when this realm is free for the next invocation. */
   released: Promise<unknown>;
-}
-
-/** Rejectors for invocations whose `result` has not settled, owned by the realm engine
- *  (safe-js.ts, native-shim.ts) and never by this queue: only the realm knows how its own
- *  `result` is produced, so only it can force one terminal. `failAll` on dispose is what
- *  makes `ActiveHostCall`'s time bound hold against a guest that defers and never answers. */
-export interface InvocationSettler {
-  /** Register one in-flight rejector; call the returned function once that invocation
-   *  settles on its own, or spent rejectors accumulate for the realm's lifetime. */
-  track(reject: (err: Error) => void): () => void;
-  /** Reject every still-tracked invocation. Rejecting an already-settled promise is a
-   *  no-op, so racing a natural settlement never double-reports. */
-  failAll(err: Error): void;
-}
-
-export function createInvocationSettler(): InvocationSettler {
-  const live = new Set<(err: Error) => void>();
-  return {
-    // Each invocation registers a rejector of its own, so untracking is idempotent by
-    // being a set deletion — nothing here needs a spent flag to guard it.
-    track(reject) {
-      live.add(reject);
-      return () => live.delete(reject);
-    },
-
-    failAll(err) {
-      for (const reject of [...live]) {
-        live.delete(reject);
-        reject(err);
-      }
-    },
-  };
 }
 
 /** Serialize realm entry, bounding the DEPTH of what waits on the Promise chain.

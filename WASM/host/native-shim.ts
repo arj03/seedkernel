@@ -10,7 +10,7 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { createInvocationSettler, serializeCalls } from "./realm-queue.js";
+import { serializeCalls } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -64,8 +64,8 @@ declare const bridge: {
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
-  createRealm(realmId: number, source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
-              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): void;
+  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
+              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
   realmCall(realm: number, payload: Uint8Array,
@@ -390,11 +390,12 @@ const embeddedTransportAuthor = (() => {
  *  native realm does NOT enforce it through QuickJS — New_QJS's maxExecutionTime is inert in
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
-let nativeRealmSeq = 0;
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-    // Go does not pump this guest queue during evaluation, so settlement cannot precede
-    // assignment (§12.3).
-    const realm = ++nativeRealmSeq;
+    // Go mints the handle, but createRealm runs the guest's top-level code before returning
+    // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
+    // because settling is a HOST-realm microtask and Go pumps only between turns, never
+    // inside a bridge call, so no settlement can precede the assignment below (§12.3).
+    let realm = 0;
     // Go supplies the live segment remainder because it owns this realm's execution
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
@@ -419,14 +420,10 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         );
         return null;
     };
-    bridge.createRealm(realm, source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
         deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
         DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
     let disposed = false;
-    // The JS half of safe-js.ts's time-bound invariant (§12.3). `realmCall` hands its
-    // resolve/reject straight to Go, so a deferred entrypoint's `result` would otherwise
-    // depend entirely on guest.go's settleAll — a round trip this side cannot verify.
-    const settler = createInvocationSettler();
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm
         // contract (realm-queue.ts) is what keeps the two targets from differing about
@@ -436,13 +433,10 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                 // The executor runs synchronously, so `deferred` carries Go's answer by
                 // the time the return statement reads it.
                 let deferred = false;
-                let untrack: (() => void) | undefined;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    const settle = (fn: () => void) => { untrack?.(); fn(); };
-                    untrack = settler.track((err) => settle(() => reject(err)));
                     deferred = bridge.realmCall(realm, payload,
-                        (bytes: Uint8Array) => settle(() => resolve(new Uint8Array(bytes))),
-                        (msg: string) => settle(() => reject(new Error(msg)))) === 1;
+                        (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
+                        (msg: string) => reject(new Error(msg))) === 1;
                 });
                 return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
             },
@@ -450,10 +444,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         ),
         dispose: () => {
             disposed = true;
-            // Before the Go teardown, not after: guest.go's settleAll rejects these too,
-            // but asserting it here makes the guarantee hold at this owner. Racing that
-            // second mechanism is a no-op — a Promise settles once.
-            settler.failAll(new Error("guest realm disposed"));
+            // guest.go's close() runs settleAll before it frees anything, so every callback
+            // it still owns is rejected synchronously here — safe-js.ts needs its own
+            // registry for this, and this target does not (§12.3).
             bridge.realmDispose(realm);
         },
     };

@@ -45,10 +45,10 @@ export interface PeerEntry {
 
 
 export interface Signaling {
-    send(msg: unknown): void;
-    /** Deliver one implementation-defined inbound message. RtcNetwork owns decoding its
-     *  private protocol; a signaling adapter need only transport opaque values. */
-    onMessage(cb: (msg: unknown) => void): void;
+    /** Carry one opaque encoded negotiation message. A relay adapter transports this
+     *  string verbatim; it never owns or interprets JavaScript message objects. */
+    send(message: string): void;
+    onMessage(cb: (message: string) => void): void;
     close(): void;
 }
 
@@ -63,47 +63,19 @@ interface SignalBase {
 type HelloSignal = SignalBase & { type: "hello" };
 type SdpSignal = SignalBase & {
     type: "sdp";
-    sdp: RTCSessionDescriptionInit & { type: "offer" | "answer" };
+    sdp: RTCSessionDescriptionInit & { type: "offer" | "answer"; sdp: string };
 };
-type IceSignal = SignalBase & { type: "ice"; candidate: RTCIceCandidateInit };
+type IceSignal = SignalBase & {
+    type: "ice";
+    candidate: RTCIceCandidateInit & { candidate: string };
+};
 type SignalMsg = HelloSignal | SdpSignal | IceSignal;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Copy out the two fields we use, so no adapter-owned object or attacker-chosen extra
- *  property survives an async signaling wait. */
-function sessionDescription(value: unknown): SdpSignal["sdp"] | undefined {
-    if (!(isRecord(value) && (value.type === "offer" || value.type === "answer")
-        && typeof value.sdp === "string")) return undefined;
+/** Copy the platform description into the private signaling vocabulary. */
+function sessionDescription(value: RTCSessionDescriptionInit | null): SdpSignal["sdp"] | undefined {
+    if (!value || (value.type !== "offer" && value.type !== "answer")
+        || typeof value.sdp !== "string") return undefined;
     return { type: value.type, sdp: value.sdp };
-}
-
-/** An INBOUND description: also charged for the worst-case retained UTF-16 storage, before
- *  policy or RTCPeerConnection sees it. The cap is not applied to our own
- *  `localDescription` — an oversized offer is the peer's refusal to make, and dropping it
- *  here would stall a negotiation nobody refused. */
-function peerSessionDescription(value: unknown): SdpSignal["sdp"] | undefined {
-    const sdp = sessionDescription(value);
-    return sdp && (sdp.sdp ?? "").length <= MAX_SDP_BYTES / 2 ? sdp : undefined;
-}
-
-function iceCandidate(value: unknown): RTCIceCandidateInit | undefined {
-    if (!isRecord(value) || typeof value.candidate !== "string") return undefined;
-    if (!((value.sdpMid === undefined || value.sdpMid === null || typeof value.sdpMid === "string")
-        && (value.sdpMLineIndex === undefined || value.sdpMLineIndex === null
-            || (typeof value.sdpMLineIndex === "number" && Number.isInteger(value.sdpMLineIndex)
-                && value.sdpMLineIndex >= 0 && value.sdpMLineIndex <= 0xffff))
-        && (value.usernameFragment === undefined || value.usernameFragment === null
-            || typeof value.usernameFragment === "string"))) return undefined;
-    // Retain only the standard scalar fields. In particular, never queue the signaling
-    // adapter's original object or attacker-chosen extra properties.
-    const candidate: RTCIceCandidateInit = { candidate: value.candidate };
-    if (value.sdpMid !== undefined) candidate.sdpMid = value.sdpMid;
-    if (value.sdpMLineIndex !== undefined) candidate.sdpMLineIndex = value.sdpMLineIndex;
-    if (value.usernameFragment !== undefined) candidate.usernameFragment = value.usernameFragment;
-    return candidate;
 }
 
 /** Conservative retained storage for candidate strings. JS engines may store strings as
@@ -116,27 +88,49 @@ function iceCandidateBytes(candidate: RTCIceCandidateInit): number {
         + stringBytes(candidate.usernameFragment);
 }
 
-/** Decode the kernel's private negotiation protocol at the untrusted signaling boundary. */
-function signalMsg(value: unknown): SignalMsg | undefined {
-    if (!isRecord(value) || typeof value.from !== "string" || !isHex64(value.from))
+// The private negotiation frame (§12.6), NUL-separated: tag | from | to-or-empty | payload,
+// tags h/o/a/i, an absent ICE scalar empty. Not JSON — a relay broadcasts the string
+// verbatim and parses nothing. NUL is outside SDP's and ICE's grammar, so a stray one can
+// only change the field COUNT, which every branch below pins exactly: a malformed frame is
+// refused, never reinterpreted as a different field.
+function encodeSignal(msg: SignalMsg): string {
+    const tag = msg.type === "hello" ? "h"
+        : msg.type === "ice" ? "i"
+        : msg.sdp.type === "offer" ? "o" : "a";
+    const fields = [tag, msg.from, msg.to ?? ""];
+    if (msg.type === "hello") return fields.join("\0");
+    if (msg.type === "sdp") return [...fields, msg.sdp.sdp].join("\0");
+    const c = msg.candidate;
+    return [...fields, c.candidate, c.sdpMid ?? "", c.sdpMLineIndex?.toString() ?? "",
+        c.usernameFragment ?? ""].join("\0");
+}
+
+/** Decode one private negotiation frame at the untrusted signaling boundary. */
+function signalMsg(wire: string): SignalMsg | undefined {
+    if (typeof wire !== "string" || wire.length > MAX_SIGNAL_CHARS)
         return undefined;
-    if (value.to !== undefined && (typeof value.to !== "string" || !isHex64(value.to)))
-        return undefined;
-    const base: SignalBase = value.to === undefined
-        ? { from: value.from }
-        : { from: value.from, to: value.to };
-    if (value.type === "hello") return { type: "hello", ...base };
-    if (value.type === "sdp") {
-        const sdp = peerSessionDescription(value.sdp);
-        if (sdp) return { type: "sdp", ...base, sdp };
+    const parts = wire.split("\0");
+    if (parts.length < 3) return undefined;
+    const [tag, from, directed] = parts;
+    if (!isHex64(from) || (directed !== "" && !isHex64(directed))) return undefined;
+    const base: SignalBase = directed === "" ? { from } : { from, to: directed };
+    if (tag === "h") return parts.length === 3 ? { type: "hello", ...base } : undefined;
+    if (tag === "o" || tag === "a") {
+        const sdp = parts[3];
+        return parts.length === 4 && sdp.length <= MAX_SDP_BYTES / 2
+            ? { type: "sdp", ...base, sdp: { type: tag === "o" ? "offer" : "answer", sdp } }
+            : undefined;
     }
-    if (value.type === "ice") {
-        const candidate = iceCandidate(value.candidate);
-        // Cap each candidate before either the bounded queue or WebRTC sees it.
-        if (candidate && iceCandidateBytes(candidate) <= MAX_PENDING_ICE_BYTES)
-            return { type: "ice", ...base, candidate };
-    }
-    return undefined;
+    if (tag !== "i" || parts.length !== 7) return undefined;
+    const line = parts[5] === "" ? undefined : Number(parts[5]);
+    if (line !== undefined && (!Number.isInteger(line) || line < 0 || line > 0xffff
+        || String(line) !== parts[5])) return undefined;
+    const candidate: IceSignal["candidate"] = { candidate: parts[3] };
+    if (parts[4] !== "") candidate.sdpMid = parts[4];
+    if (line !== undefined) candidate.sdpMLineIndex = line;
+    if (parts[6] !== "") candidate.usernameFragment = parts[6];
+    return iceCandidateBytes(candidate) <= MAX_PENDING_ICE_BYTES
+        ? { type: "ice", ...base, candidate } : undefined;
 }
 
 export interface RtcNetworkOptions {
@@ -181,11 +175,15 @@ export class RtcChannel extends MessageChannel {
 // carries an authenticated link loses its data channel to the transport's own deadline,
 // and the entry with it.
 export const MAX_UNESTABLISHED_PEERS = 256;
-/** Maximum retained UTF-16 storage for one INBOUND SDP string (`peerSessionDescription`). */
+/** Maximum retained UTF-16 storage for one inbound SDP string. */
 export const MAX_SDP_BYTES = 256 * 1024;
 /** Count and byte bounds for candidate work retained per peer. */
 export const MAX_PENDING_ICE_CANDIDATES = 256;
 export const MAX_PENDING_ICE_BYTES = 256 * 1024;
+/** Refuse a frame by LENGTH before splitting it, so a relay cannot make us allocate the
+ *  parts array first: the widest text either payload cap allows, plus this grammar's fixed
+ *  overhead — tag, two peer ids, six separators, sdpMLineIndex's widest decimal. */
+const MAX_SIGNAL_CHARS = Math.max(MAX_SDP_BYTES, MAX_PENDING_ICE_BYTES) / 2 + 1 + 64 + 64 + 5 + 6;
 /** A relayed hello/offer that never completes ICE/DTLS cannot retain a peer forever. */
 export const UNESTABLISHED_PEER_TTL_MS = 30_000;
 /** Inbound signals waiting on the ordered lane, each retaining its decoded message. One
@@ -204,6 +202,7 @@ export class RtcNetwork implements ChannelFactory {
     private queuedSignals = 0;
     private closed = false;
     constructor(opts: RtcNetworkOptions) {
+        if (!isHex64(opts.peerId)) throw new Error("rtc: peerId must be 64 lowercase hex characters");
         this.opts = opts;
         this.ownId = opts.peerId;
         // Resolved once per network rather than per ensurePeer, so the browser global is
@@ -263,8 +262,12 @@ export class RtcNetwork implements ChannelFactory {
         // keep a Node console process alive.
         (e.establishmentTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
         pc.addEventListener("icecandidate", (ev) => {
-            if (this.peers.get(peerId) === e && ev.candidate)
-                this.sendSignal({ type: "ice", from: this.ownId, to: peerId, candidate: ev.candidate.toJSON() });
+            const c = ev.candidate?.toJSON();
+            if (this.peers.get(peerId) === e && typeof c?.candidate === "string")
+                this.sendSignal({ type: "ice", from: this.ownId, to: peerId, candidate: {
+                    candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex,
+                    usernameFragment: c.usernameFragment,
+                } });
         });
         pc.addEventListener("negotiationneeded", async () => {
             // Single entry point for offers — fires when the impolite side creates the
@@ -376,18 +379,18 @@ export class RtcNetwork implements ChannelFactory {
     // ── signaling handlers: hello / sdp / ice (perfect negotiation) ───────────────
     private sendSignal(msg: SignalMsg): void {
         if (!this.closed)
-            this.opts.signaling.send(msg);
+            this.opts.signaling.send(encodeSignal(msg));
     }
     /** Append one inbound message to the signaling lane, bounded by `MAX_QUEUED_SIGNALS`:
      *  a lane is a queue, and a queue nobody counts is the hole this whole layer closes.
      *  Returning this promise is useful to synchronous/test adapters; production adapters
      *  may ignore it. Keep a recovered tail so one unexpected rejection cannot permanently
      *  poison the lane. */
-    private enqueueSignal(value: unknown): Promise<void> {
-        // Decode synchronously so an oversized/adapter-owned object is never captured by
+    private enqueueSignal(wire: string): Promise<void> {
+        // Decode synchronously so an adapter-owned string is never captured by
         // the promise lane while an earlier WebRTC operation is still in flight.
         let msg: SignalMsg | undefined;
-        try { msg = signalMsg(value); }
+        try { msg = signalMsg(wire); }
         catch { return Promise.resolve(); }
         if (!msg || this.closed || this.queuedSignals >= MAX_QUEUED_SIGNALS)
             return Promise.resolve();

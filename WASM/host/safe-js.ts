@@ -27,7 +27,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
-import { createActiveHostCallRegistry, createInvocationSettler, serializeCalls, type Invocation } from "./realm-queue.js";
+import { createActiveHostCallRegistry, serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
@@ -232,7 +232,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // budget interrupt during a continuation, or dispose() while a call is parked or deferred
   // — leaves it permanently pending. A bound that turns a runaway or silent guest into a
   // hung host is not much of a bound, so the realm fails them explicitly.
-  const invocationSettler = createInvocationSettler();
+  const liveInvocations = new Set<(err: Error) => void>();
+  const failInvocations = (err: Error): void => {
+    for (const reject of liveInvocations) reject(err);
+    liveInvocations.clear();
+  };
 
   // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
   // preamble's half of the contract), then pump so the awaiting continuation runs.
@@ -251,7 +255,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     } catch (err) {
       // The guest was interrupted while resuming, so nothing inside the realm will ever
       // settle the caller's promise: fail it here, or `call()` hangs forever.
-      invocationSettler.failAll(err instanceof Error ? err : new Error(String(err)));
+      failInvocations(err instanceof Error ? err : new Error(String(err)));
     } finally {
       clock.end();
       id.dispose();
@@ -400,14 +404,14 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     const result = (async () => {
       let rejectThis!: (err: Error) => void;
       const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
-      const untrack = invocationSettler.track(rejectThis);
+      liveInvocations.add(rejectThis);
       let consumed = false;
       try {
         const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
         consumed = true;
         return takeBytes(ctx, ctx.unwrapResult(settled as never));
       } finally {
-        untrack();
+        liveInvocations.delete(rejectThis);
         // An invocation that lost the race to failAll has no consumer for the settled
         // result, so if the guest promise still settles afterwards its dup'd handle would be
         // orphaned and abort the module at runtime free. Release it when it lands.
@@ -430,7 +434,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller — a DEFERRED one included, whose answer would
       // otherwise never come (realm-queue.ts's time-bound invariant).
-      invocationSettler.failAll(new Error("guest realm disposed"));
+      failInvocations(new Error("guest realm disposed"));
       // And end custody of every call the host never answered: nothing inside this realm
       // will consume those answers now, so holding their charge would pin this realm's
       // allowance on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).

@@ -288,7 +288,7 @@ func shutdown() {
 		g.discard() // guest runtime only — the host realm it borrowed values from dies below
 	}
 	realms = map[int64]*guestRealm{}
-	lastRealmID = 0
+	realmSeq = 0
 	if qrt != nil {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil

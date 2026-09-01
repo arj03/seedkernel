@@ -65,12 +65,15 @@ export interface TransportHostOptions {
   onLinkClosed?: (linkId: number, reason: number) => void;
 }
 
-/** One link's continuous outbound custody, spanning adapter pre-open buffering and the
- * platform socket backlog. What the adapter still holds IS the charge — this owner keeps no
- * model of the queue beside it, only the totals it has admitted against the node's. */
+/** One link's continuous outbound custody (§12.6), spanning adapter pre-open buffering and
+ * the platform socket backlog. What the adapter still holds IS the charge; the sizes queue
+ * is only what turns its one byte total back into the slices that make it up. */
 class LinkOutboundOwner {
-  private charged = 0;
-  private slices = 0;
+  /** Admitted write sizes in send order, so a drained PREFIX can be retired without
+   *  waiting for the whole backlog to empty — the node-wide slice count is shared, and one
+   *  busy link that never reaches an idle moment would otherwise hold it to the ceiling. */
+  private readonly queued: number[] = [];
+  private charged = 0; // === sum(queued)
   private closed = false;
 
   constructor(
@@ -96,13 +99,19 @@ class LinkOutboundOwner {
   }
 
   /** Hand back what the platform has drained since the last look. Growth is never taken on
-   *  trust — only writes admitted here are ever charged — and the slice count retires all at
-   *  once at an empty queue, the one moment a byte total says how many writes it holds. */
+   *  trust — only writes admitted here are ever charged. Every transport behind this seam is
+   *  ORDERED, so the report is a suffix of what was admitted: a slice is gone once the bytes
+   *  behind it already cover the report, and a partly drained head stays charged in full. */
   private settle(now: number | null): void {
-    if (now === null || now >= this.charged) return;
-    this.releaseParent(this.charged - now, now === 0 ? this.slices : 0);
-    if (now === 0) this.slices = 0;
-    this.charged = now;
+    if (now === null) return;
+    let n = 0, bytes = 0;
+    while (n < this.queued.length && this.charged - bytes - this.queued[n] >= now) {
+      bytes += this.queued[n++];
+    }
+    if (n === 0) return;
+    this.queued.splice(0, n);
+    this.charged -= bytes;
+    this.releaseParent(bytes, n);
   }
 
   send(bytes: Uint8Array): void {
@@ -110,29 +119,32 @@ class LinkOutboundOwner {
     const now = this.report();
     if (now === null) throw new Error("socket: adapter cannot report its outbound backlog");
     this.settle(now);
-    if (this.slices >= MAX_OUTBOUND_QUEUE_SLICES
+    if (this.queued.length >= MAX_OUTBOUND_QUEUE_SLICES
       || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.charged
       || !this.reserveParent(bytes.length)) {
       throw new Error("socket: outbound queue limit exceeded");
     }
     this.charged += bytes.length;
-    this.slices++;
+    this.queued.push(bytes.length);
     try { this.channel.send(bytes); }
     catch (err) { this.releaseAll(); throw err; }
     this.settle(this.report());
   }
 
+  /** The occupant's stall clock wants the platform's live number, not the slice-rounded
+   *  charge: an adapter that answers is exact, and only a mute one falls back (§12.6). */
   buffered(): number {
-    this.settle(this.report());
-    return this.charged;
+    const now = this.report();
+    this.settle(now);
+    return now ?? this.charged;
   }
 
   releaseAll(): void {
     if (this.closed) return;
     this.closed = true;
-    this.releaseParent(this.charged, this.slices);
+    this.releaseParent(this.charged, this.queued.length);
+    this.queued.length = 0;
     this.charged = 0;
-    this.slices = 0;
   }
 }
 

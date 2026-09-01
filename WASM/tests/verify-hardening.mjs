@@ -20,9 +20,11 @@ const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
   DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS,
-  DEFAULT_REALM_MEMORY_BYTES, DERIVED_NODE_MEMORY_CEILING_BYTES }
+  DEFAULT_REALM_MEMORY_BYTES, DEFAULT_MAX_MODULE_MEMORY_BYTES,
+  DEFAULT_MEMORY_FS_MAX_BYTES }
   = await imp("build/core/wasm-limits.js");
-const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES }
+const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES,
+  MAX_NODE_OUTBOUND_QUEUE_BYTES, MAX_INBOUND_HOLD_BYTES }
   = await imp("build/core/net-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, verifyManifest, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
@@ -398,18 +400,25 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
 console.log("\n§12.3 — a bounded realm count is what makes the node total a ceiling");
 {
-  // Every owner in this file is per realm and none is pooled between realms: a shared
-  // allowance is a standing way for a busy app to refuse a quiet sibling's calls, and one
-  // realm's ceiling times a bound on realms reaches the same total without one. So the
-  // multiplication has to actually appear in the sum — otherwise each per-realm number is
-  // a floor that an install list nobody counts multiplies at will.
-  const perRealm = DEFAULT_REALM_MEMORY_BYTES + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
-    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES;
-  ok(DERIVED_NODE_MEMORY_CEILING_BYTES >= DEFAULT_MAX_APP_SLOTS * perRealm,
-    "the derived ceiling multiplies what one realm may hold by the bound on realms");
-  // Not circular: this is the sum measured against a real machine, so growing any owner
-  // has to be a deliberate choice rather than a number nobody added up.
-  ok(DERIVED_NODE_MEMORY_CEILING_BYTES <= 2 * 1024 * 1024 * 1024,
+  // Every owner is per realm and none is pooled between realms: a shared allowance is a
+  // standing way for a busy app to refuse a quiet sibling's calls, and one realm's ceiling
+  // times a bound on realms reaches the same total without one. So the multiplication has
+  // to appear in the sum — otherwise each per-realm number is a floor that an install list
+  // nobody counts multiplies at will. This sum is where the node total lives: adding a
+  // node-scoped owner of admitted host memory means adding its term HERE, not just
+  // declaring its own constant.
+  const perRealm = DEFAULT_REALM_MEMORY_BYTES  // §12.3 — one confined guest heap
+    + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES  // copied host-call inputs and their answers
+    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES          // copied timer bodies
+    + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3 — one bundle's aggregate module memory
+  const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
+    + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, over every link
+    + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — native staging and the driver window hold the
+                                    // same read at once, by design (native/sock.go)
+    + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
+  // Not circular: the sum is measured against a real machine, so growing any owner has to
+  // be a deliberate choice rather than a number nobody added up.
+  ok(nodeMemoryCeiling <= 2 * 1024 * 1024 * 1024,
     "the summed worst case of every node-scoped owner still fits a modest machine");
 }
 
@@ -752,6 +761,20 @@ console.log("\n§12.6 — host socket send queues are bounded");
   byCount.channel.send(Uint8Array.of(1));
   ok(byCount.channel.buffered() === 0 && byCount.transport.closed,
     "crossing the outbound slice ceiling closes and releases the link");
+
+  // Slices retire as the drained PREFIX, not all at once at an empty queue. The count is
+  // shared node-wide, so a link that stays busy and never reaches an idle instant would
+  // otherwise hold it at its high-water mark until the socket closed.
+  const half = MAX_OUTBOUND_QUEUE_SLICES / 2;
+  const drain = openedChannel();
+  for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) drain.channel.send(Uint8Array.of(1));
+  drain.transport.bufferedAmount -= half; // the platform put half of them on the wire
+  for (let i = 0; i < half; i++) drain.channel.send(Uint8Array.of(1));
+  ok(!drain.failed() && drain.channel.buffered() === MAX_OUTBOUND_QUEUE_SLICES,
+    "exactly the slices the platform wrote are freed for reuse");
+  drain.channel.send(Uint8Array.of(1));
+  ok(drain.transport.closed,
+    "and no more: the ceiling still bites on the undrained remainder");
 
   const parentLinks = [0, 1].map(() => {
     const listeners = new Map();

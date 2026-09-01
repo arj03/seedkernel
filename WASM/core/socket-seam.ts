@@ -11,10 +11,12 @@ export interface RawLink {
   /** `graceful` permits flushing queued writes. */
   close(graceful?: boolean): void;
   /** Bytes awaiting transmission: the stall clock's progress signal, and the only release
-   *  signal `LinkOutboundOwner` (transport-host.ts) has as writes leave this adapter. Omit
-   *  it only when nothing is retained past `send`; omitting it while really buffering
-   *  grows the link's charge to the ceiling with an empty socket. Implemented, it must
-   *  answer — one that throws fails its link rather than reading as "holding nothing". */
+   *  signal `LinkOutboundOwner` (transport-host.ts) has as writes leave this adapter, read
+   *  as a SUFFIX of the writes it admitted — an adapter draining out of send order would
+   *  retire the wrong slices. Omit it only when nothing is retained past `send`; omitting
+   *  it while really buffering grows the link's charge to the ceiling with an empty
+   *  socket. Implemented, it must answer — one that throws fails its link rather than
+   *  reading as "holding nothing". */
   buffered?(): number;
   /** Unauthenticated key for per-source limits; never a peer identity. */
   readonly remoteAddr?: string;

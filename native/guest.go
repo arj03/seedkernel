@@ -23,11 +23,10 @@ import (
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. Each has
 	// its own guest seam, which is why net-settle routing is per realm rather than one
-	// global hook.
-	realms = map[int64]*guestRealm{}
-	// The shim mints ids as one strictly increasing sequence (native-shim.ts), so refusing
-	// anything below the high-water mark is the whole reuse check.
-	lastRealmID int64
+	// global hook. The map mints the handles too, so a caller has no id to reuse or forge
+	// and one realm can never quietly displace another.
+	realms   = map[int64]*guestRealm{}
+	realmSeq int64
 )
 
 type guestRealm struct {
@@ -75,33 +74,30 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 // with a guest — no guest seam, no preamble assembly, no bundle facts, no dispatch.
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 	b.SetPropertyStr("createRealm", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		id := t.Args()[0].Int64()
-		if id <= lastRealmID {
-			return nil, errors.New("createRealm: invalid or duplicate realm id")
-		}
-		mem := uint64(t.Args()[3].Int64())
+		mem := uint64(t.Args()[2].Int64())
 		if mem == 0 {
 			// A 0 is a caller that forgot, and an unbounded realm is a confinement hole.
 			return nil, errors.New("createRealm: no memory limit supplied (the shim resolves the shared default)")
 		}
 		// A negative value is the shim's encoding of Infinity — no budget, said explicitly.
 		budget := time.Duration(0)
-		if ms := t.Args()[4].Int64(); ms > 0 {
+		if ms := t.Args()[3].Int64(); ms > 0 {
 			budget = time.Duration(ms) * time.Millisecond
 		}
-		maxHostCalls := int(t.Args()[5].Int64())
-		maxHostCallBytes := t.Args()[6].Int64()
+		maxHostCalls := int(t.Args()[4].Int64())
+		maxHostCallBytes := t.Args()[5].Int64()
 		if maxHostCalls <= 0 || maxHostCallBytes <= 0 {
 			return nil, errors.New("createRealm: no outstanding host-call limits supplied")
 		}
-		lastRealmID = id
-		g, err := newGuestRealm(el, t.Args()[1].String(), t.Args()[2], mem, budget,
+		realmSeq++
+		id := realmSeq
+		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget,
 			maxHostCalls, maxHostCallBytes)
 		if err != nil {
 			return nil, err
 		}
 		realms[id] = g
-		return t.Context().NewUndefined(), nil
+		return t.Context().NewInt64(id), nil
 	}))
 	b.SetPropertyStr("realmCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]
