@@ -13,7 +13,8 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const rtc = await imp("build/host/net-rtc.js");
 const {
   RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
-  MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES, UNESTABLISHED_PEER_TTL_MS,
+  MAX_SDP_BYTES, MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES,
+  UNESTABLISHED_PEER_TTL_MS,
 } = rtc;
 import { testkit } from "./testkit.mjs";
 
@@ -96,6 +97,140 @@ await test("RtcNetwork validates opaque signaling messages before admitting them
   assert(admitted === 1 && pcs === 1, "a valid opaque hello must reach policy and create one peer");
   assert(sent.length === 1 && sent[0].type === "hello" && sent[0].to === peerId(1),
     "a valid broadcast hello must receive one directed reply");
+  net.close();
+});
+
+await test("RtcNetwork rejects oversized SDP before policy or WebRTC", async () => {
+  let receive = () => {};
+  let admitted = 0;
+  let pcs = 0;
+  const ownId = peerId(0);
+  const net = new RtcNetwork({
+    peerId: ownId,
+    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
+    admitPeer() { admitted++; return true; },
+    peerConnectionFactory: () => {
+      pcs++;
+      return stubPeerConnection().pc;
+    },
+  });
+  const overLimit = "x".repeat(MAX_SDP_BYTES / 2 + 1);
+  await receive({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: overLimit } });
+  assert(admitted === 0 && pcs === 0 && net.peers.size === 0,
+    "oversized SDP must be dropped at decoding, before policy and connection allocation");
+
+  const atLimit = "x".repeat(MAX_SDP_BYTES / 2);
+  await receive({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: atLimit } });
+  assert(admitted === 1 && pcs === 1 && net.peers.size === 1,
+    "SDP at the documented UTF-16 storage ceiling must remain admitted");
+  net.close();
+});
+
+await test("inbound signaling handlers run in arrival order", async () => {
+  let receive = () => {};
+  let remoteStartedResolve, releaseRemote;
+  const remoteStarted = new Promise((resolve) => { remoteStartedResolve = resolve; });
+  const remoteBlocked = new Promise((resolve) => { releaseRemote = resolve; });
+  let pcs = 0;
+  const ownId = peerId(0);
+  const net = new RtcNetwork({
+    peerId: ownId,
+    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
+    peerConnectionFactory: () => {
+      const made = stubPeerConnection();
+      pcs++;
+      if (pcs === 1) {
+        made.pc.setRemoteDescription = async function (sdp) {
+          remoteStartedResolve();
+          await remoteBlocked;
+          this.remoteDescription = sdp;
+        };
+      }
+      return made.pc;
+    },
+  });
+  const offer = receive({
+    type: "sdp", from: peerId(1), to: ownId,
+    sdp: { type: "offer", sdp: "offer" },
+  });
+  await remoteStarted;
+  const hello = receive({ type: "hello", from: peerId(2), to: ownId });
+  await Promise.resolve();
+  assert(pcs === 1, "a later message must not start while an earlier WebRTC operation is in flight");
+  releaseRemote();
+  await Promise.all([offer, hello]);
+  assert(pcs === 2, "the queued message must run after the earlier handler completes");
+  net.close();
+});
+
+await test("post-description ICE uses one drain under direct concurrency", async () => {
+  let firstStartedResolve, secondStartedResolve, releaseFirst;
+  const firstStarted = new Promise((resolve) => { firstStartedResolve = resolve; });
+  const secondStarted = new Promise((resolve) => { secondStartedResolve = resolve; });
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  let calls = 0, active = 0, maxActive = 0;
+  const made = stubPeerConnection();
+  made.pc.addIceCandidate = async () => {
+    calls++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    if (calls === 1) {
+      firstStartedResolve();
+      await firstBlocked;
+    } else {
+      secondStartedResolve();
+    }
+    active--;
+  };
+  const ownId = peerId(0);
+  const remote = peerId(1);
+  const net = new RtcNetwork({
+    peerId: ownId,
+    signaling: { send() {}, onMessage() {}, close() {} },
+    peerConnectionFactory: () => made.pc,
+  });
+  const entry = net.ensurePeer(remote);
+  entry.pc.remoteDescription = { type: "offer", sdp: "ready" };
+
+  // Call the handler directly to prove the per-entry drain owns this invariant rather
+  // than getting it only incidentally from the inbound signaling lane above.
+  const first = net.onSignal({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } });
+  const second = net.onSignal({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } });
+  await firstStarted;
+  assert(calls === 1 && maxActive === 1,
+    "a later candidate must wait while the preceding addIceCandidate is in flight");
+  releaseFirst();
+  await secondStarted;
+  await Promise.all([first, second]);
+  assert(calls === 2 && maxActive === 1, "candidate operations must remain strictly serialized");
+  net.close();
+});
+
+await test("a duplicate RTC data channel is actively closed", async () => {
+  const ownId = peerId(0);
+  const remote = peerId(1);
+  const made = stubPeerConnection();
+  const net = new RtcNetwork({
+    peerId: ownId,
+    signaling: { send() {}, onMessage() {}, close() {} },
+    peerConnectionFactory: () => made.pc,
+  });
+  let accepted = 0;
+  await net.listen(undefined, undefined, () => { accepted++; });
+  const channel = () => ({
+    binaryType: "", bufferedAmount: 0, closes: 0,
+    send() {},
+    close() { this.closes++; },
+    addEventListener() {},
+  });
+  const first = channel();
+  const duplicate = channel();
+  const entry = net.ensurePeer(remote);
+  net.bindLink(remote, entry, first, false);
+  net.bindLink(remote, entry, duplicate, false);
+  assert(accepted === 1, "only the first data channel may be handed to the transport");
+  assert(first.closes === 0 && duplicate.closes === 1,
+    "the duplicate data channel must be closed instead of left live and unowned");
   net.close();
 });
 

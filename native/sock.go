@@ -34,8 +34,15 @@ type netHost struct {
 	listeners []net.Listener // bound listeners, closed on network teardown
 
 	// Policy values installed by host/native-shim.ts before any socket is opened.
-	maxLiveChannels int
-	closeGrace      time.Duration
+	maxLiveChannels      int
+	closeGrace           time.Duration
+	maxInboundReadBytes  int
+	maxInboundReadSlices int
+
+	// Native staging custody: copied socket reads posted toward QuickJS but not yet
+	// synchronously handed to TransportHost's existing driver-wide allowance.
+	inboundReadBytes  int
+	inboundReadSlices int
 
 	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
@@ -51,21 +58,26 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 2 {
+		if len(t.Args()) < 4 {
 			return nil, errors.New("net: no socket limits supplied")
 		}
 		maxLive := int(t.Args()[0].Int64())
 		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
-		if maxLive <= 0 || grace <= 0 {
+		maxInboundBytes := int(t.Args()[2].Int64())
+		maxInboundSlices := int(t.Args()[3].Int64())
+		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
 			return nil, errors.New("net: invalid socket limits")
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.maxLiveChannels != 0 || n.closeGrace != 0 {
+		if n.maxLiveChannels != 0 || n.closeGrace != 0 ||
+			n.maxInboundReadBytes != 0 || n.maxInboundReadSlices != 0 {
 			return nil, errors.New("net: socket limits already installed")
 		}
 		n.maxLiveChannels = maxLive
 		n.closeGrace = grace
+		n.maxInboundReadBytes = maxInboundBytes
+		n.maxInboundReadSlices = maxInboundSlices
 		return t.Context().NewUndefined(), nil
 	}))
 
@@ -175,6 +187,28 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
+// reserveInboundRead charges a socket read before the reader makes the retained copy that
+// crosses into el.post. This is a driver-wide native staging allowance, so thousands of
+// individually paused links cannot each hold one unmetered 64 KiB delivery ahead of JS.
+func (n *netHost) reserveInboundRead(length int) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if length < 0 || n.inboundReadSlices >= n.maxInboundReadSlices ||
+		length > n.maxInboundReadBytes-n.inboundReadBytes {
+		return false
+	}
+	n.inboundReadSlices++
+	n.inboundReadBytes += length
+	return true
+}
+
+func (n *netHost) releaseInboundRead(length int) {
+	n.mu.Lock()
+	n.inboundReadSlices--
+	n.inboundReadBytes -= length
+	n.mu.Unlock()
+}
+
 // allocInbound is alloc for a socket nobody asked for: it refuses once the host holds
 // maxLiveChannels. The count is read under the same lock that hands out the id, so the
 // only slack is at most one connection per accept goroutine.
@@ -270,11 +304,22 @@ func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
 
 // onMsg/onClose run on a socket reader goroutine; they hand the work to the loop
 // goroutine, which owns all QuickJS access.
-func (n *netHost) onMsg(id int64) func([]byte) {
-	return func(b []byte) {
-		// b is freshly allocated and ours (the rawChannel onMsg contract), so capture it
-		// directly — one fewer full pass over every inbound byte.
-		n.el.post(func() { n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b)) })
+func (n *netHost) onMsg(id int64) func([]byte) bool {
+	return func(b []byte) bool {
+		// The readLoop's buffer is borrowed and reused. Reserve BEFORE copying it; on
+		// refusal there is no retained allocation and nothing enters the event-loop queue.
+		if !n.reserveInboundRead(len(b)) {
+			return false
+		}
+		owned := append([]byte(nil), b...)
+		n.el.post(func() {
+			// NewArrayBuffer copies into QuickJS, whose synchronous __netDeliver then enters
+			// TransportHost's existing allowance. Release native staging custody only after
+			// that handoff returns, including when the JS dispatcher rejects or throws.
+			defer n.releaseInboundRead(len(owned))
+			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(owned))
+		})
+		return true
 	}
 }
 

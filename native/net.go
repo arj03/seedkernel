@@ -43,7 +43,8 @@ func dialTCP(addr string) (net.Conn, error) {
 // an arbitrary slice of the stream and implies no boundary, which the transport bundle's
 // framer imposes on the far side of __net. A channel owns one socket, one read goroutine
 // and one writer goroutine. send only queues — safe from any goroutine — and takes
-// ownership of its slice; onMsg likewise hands the callee a fresh slice it owns.
+// ownership of its slice. onMsg borrows the read buffer only for the call; the native
+// host reserves its shared staging allowance before making any retained copy.
 type rawChannel interface {
 	send(bytes []byte) bool
 	buffered() int
@@ -60,7 +61,7 @@ type rawChannel interface {
 // doubles as the pre-connect buffer, and one writer draining one FIFO keeps later
 // messages from overtaking earlier ones (PeerLink's HELLO, a WS upgrade request).
 type sockChannel struct {
-	onMsg   func([]byte)
+	onMsg   func([]byte) bool // false means the native driver-wide read allowance refused it
 	onClose func()
 
 	mu         sync.Mutex
@@ -82,7 +83,7 @@ func newReadGate() chan struct{} {
 
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
-func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+func newDialChannel(addr string, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
@@ -107,7 +108,7 @@ func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace 
 
 // newInboundChannel wraps an already-open accepted socket: its writer starts immediately,
 // while the caller starts readLoop once the JS channel is registered (netHost.wrapInbound).
-func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go c.writeLoop()
@@ -289,7 +290,13 @@ func (c *sockChannel) readLoop() {
 				spoke = true
 				conn.SetReadDeadline(time.Time{}) // said something: the guest's link deadlines own it now
 			}
-			c.onMsg(append([]byte(nil), chunk[:n]...))
+			// onMsg reserves the native driver-wide staging allowance before it copies
+			// this borrowed scratch slice into the event-loop queue. A refusal is terminal:
+			// leaving the socket open would only let the same peer retry outside the meter.
+			if !c.onMsg(chunk[:n]) {
+				c.fail()
+				return
+			}
 		} else if err == nil {
 			// A zero-byte, nil-error read made no realm turn to return the token.
 			c.resume()

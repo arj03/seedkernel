@@ -5,8 +5,10 @@ export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
 /** Aggregate inbound bytes one driver admits across dispatched and held reads. A browser
  *  WebSocket and an RTCDataChannel cannot be paused, while a pausable socket still owns one
  *  dispatched read until the serialized realm releases it; both therefore reserve from the
- *  same driver-wide window before a read crosses into the realm. Past it, the arriving
- *  link fails instead of multiplying this host-memory allowance by the raw-link ceiling.
+ *  same driver-wide window before a read crosses into the realm. The native adapter also
+ *  applies this window to socket reads staged toward QuickJS, reserving before its retained
+ *  copy and releasing only after custody enters the driver below. Past either boundary, the
+ *  arriving link fails instead of multiplying host memory by the raw-link ceiling.
  *
  *  The window is what a pipelining peer really runs at, not a guess: seedstore's holder
  *  ingest bench (1 MiB batched STOREs against a zero-latency fabric, the hardest case there

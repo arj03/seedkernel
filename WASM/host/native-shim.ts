@@ -15,6 +15,8 @@ import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
+  MAX_INBOUND_HOLD_BYTES,
+  MAX_INBOUND_HOLD_SLICES,
   TCP_LINGER_MS,
 } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -183,7 +185,8 @@ export const fs: Fs = {
 /** Go's raw byte-stream primitives (§12.1). */
 declare const __net: {
   /** Install host-owned socket limits before any channel can be opened. */
-  install(maxLiveChannels: number, closeGraceMs: number): void;
+  install(maxLiveChannels: number, closeGraceMs: number,
+          maxInboundReadBytes: number, maxInboundReadSlices: number): void;
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
@@ -202,7 +205,8 @@ declare const __net: {
 
 // Policy values live in shared TypeScript and cross once when the primitive is installed;
 // Go retains the mechanisms that must act before JS can observe an accepted socket.
-__net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS);
+__net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS,
+              MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //

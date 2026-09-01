@@ -20,11 +20,17 @@ import (
 const testCloseGrace = time.Second
 
 func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	return newInboundChannel(conn, onMsg, onClose, testCloseGrace)
+	return newInboundChannel(conn, func(b []byte) bool {
+		onMsg(append([]byte(nil), b...))
+		return true
+	}, onClose, testCloseGrace)
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, onMsg, onClose, testCloseGrace)
+	return newDialChannel(addr, func(b []byte) bool {
+		onMsg(append([]byte(nil), b...))
+		return true
+	}, onClose, testCloseGrace)
 }
 
 func waitOn(t *testing.T, ch <-chan struct{}, what string) {
@@ -358,6 +364,86 @@ func TestNetHostAcceptCeiling(t *testing.T) {
 	}
 	if _, ok := n.allocInbound(); !ok {
 		t.Fatal("the ceiling did not release as channels drained")
+	}
+}
+
+// TestNetHostInboundReadAllowance pins the native side of the driver-wide inbound meter.
+// It is shared across links (not one allowance per sockChannel), refuses on either byte or
+// slice exhaustion without changing its totals, and returns all custody after delivery.
+func TestNetHostInboundReadAllowance(t *testing.T) {
+	n := &netHost{maxInboundReadBytes: 8, maxInboundReadSlices: 2}
+	if !n.reserveInboundRead(5) || !n.reserveInboundRead(3) {
+		t.Fatal("reads at the exact aggregate byte/slice ceilings must be admitted")
+	}
+	if n.reserveInboundRead(0) {
+		t.Fatal("a third staged slice must be refused even when it carries no bytes")
+	}
+	if got := n.inboundReadBytes; got != 8 {
+		t.Fatalf("refusal changed staged bytes: got %d, want 8", got)
+	}
+	n.releaseInboundRead(5)
+	if n.reserveInboundRead(6) {
+		t.Fatal("a read crossing the remaining aggregate byte allowance was admitted")
+	}
+	if !n.reserveInboundRead(4) {
+		t.Fatal("released native staging custody was not reusable")
+	}
+	n.releaseInboundRead(3)
+	n.releaseInboundRead(4)
+	if n.inboundReadBytes != 0 || n.inboundReadSlices != 0 {
+		t.Fatalf("native staging custody leaked: %d bytes, %d slices",
+			n.inboundReadBytes, n.inboundReadSlices)
+	}
+}
+
+// TestNetHostOnMsgRefusesBeforePost covers the exact pre-meter edge: when the shared
+// allowance is full, onMsg returns without copying into or posting toward the event loop.
+// A nil QuickJS context is intentional — touching the delivery path would panic the test.
+func TestNetHostOnMsgRefusesBeforePost(t *testing.T) {
+	el := &eventLoop{tasks: make(chan func(), 1)}
+	n := &netHost{el: el, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	if !n.reserveInboundRead(4) {
+		t.Fatal("failed to occupy the test allowance")
+	}
+	if n.onMsg(1)([]byte("x")) {
+		t.Fatal("onMsg admitted a read after the shared native allowance was full")
+	}
+	if len(el.tasks) != 0 {
+		t.Fatal("a refused read was posted toward QuickJS")
+	}
+	n.releaseInboundRead(4)
+	if !n.onMsg(1)([]byte("ok")) {
+		t.Fatal("onMsg refused a read after staging capacity was released")
+	}
+	if n.inboundReadBytes != 2 || n.inboundReadSlices != 1 || len(el.tasks) != 1 {
+		t.Fatalf("accepted read was not charged before post: %d bytes, %d slices, %d tasks",
+			n.inboundReadBytes, n.inboundReadSlices, len(el.tasks))
+	}
+	// Do not execute the task against this test's intentionally nil QuickJS context.
+	// Discard its retained closure and mirror the defer it would run after delivery.
+	<-el.tasks
+	n.releaseInboundRead(2)
+}
+
+// TestSockChannelReadAdmissionRefusalIsTerminal ensures a peer cannot keep retrying reads
+// outside the staging meter: refusal closes the socket and reports the link down once.
+func TestSockChannelReadAdmissionRefusalIsTerminal(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	closed := make(chan struct{}, 1)
+	var attempts atomic.Int32
+	c := newInboundChannel(c1, func([]byte) bool {
+		attempts.Add(1)
+		return false
+	}, func() { closed <- struct{}{} }, testCloseGrace)
+	go c.readLoop()
+
+	if _, err := c2.Write([]byte("refused")); err != nil {
+		t.Fatal(err)
+	}
+	waitOn(t, closed, "an over-budget native read must fail its link")
+	if attempts.Load() != 1 {
+		t.Fatalf("read admission attempted %d times, want exactly once", attempts.Load())
 	}
 }
 
