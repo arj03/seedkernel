@@ -5,13 +5,13 @@
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import _sodium from "libsodium-wrappers";
-import { testkit, makeAuthor } from "./testkit.mjs";
+import { testkit, makeAuthor, importBuilt } from "./testkit.mjs";
 import { readGuestSource } from "../scripts/guest-source.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const imp = (p) => import(pathToFileURL(join(root, p)).href);
+const imp = importBuilt(root);
 
 await _sodium.ready;
 const sodium = _sodium;
@@ -51,9 +51,8 @@ const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { createActiveHostCallRegistry, serializeCalls } = await imp("build/host/realm-queue.js");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const { ok, throws, summary } = testkit();
+const { ok, throws, summary, sleep } = testkit();
 /** Await a promise and assert it rejects — the async form of `throws`, which is what a
  *  build that stands up workers now needs (`PureModuleLoader.build` is async). */
 const rejects = async (p, msg) => { let threw = false; try { await p; } catch { threw = true; } ok(threw, msg); };

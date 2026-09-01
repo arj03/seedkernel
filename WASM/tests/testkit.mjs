@@ -8,6 +8,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+/** An `imp(path)` closure bound to `root`: resolves a `build/...`-relative path to a file
+ *  URL and imports it. Every suite needs the same binding \u2014 this is the one definition. */
+export function importBuilt(root) {
+  return (p) => import(pathToFileURL(join(root, p)).href);
+}
+
 export function testkit({ verbose = true } = {}) {
   let pass = 0, fail = 0;
   const cleanups = [];
@@ -17,6 +23,17 @@ export function testkit({ verbose = true } = {}) {
   const throws = (fn, m) => { try { fn(); ok(false, m); } catch { ok(true, m); } };
   const note = (s) => console.log(`       \u00b7 ${s}`);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  /** `ok`, normalizing both sides first \u2014 a mismatch reports readable expected/got text
+   *  rather than two objects `console.error` would print as `[object Object]`. */
+  const assertEqual = (actual, expected, m) => {
+    const norm = (v) => {
+      if (v === null || v === undefined) return String(v);
+      if (typeof v === "object") return JSON.stringify([...v]);
+      return v;
+    };
+    const a = norm(actual), e = norm(expected);
+    ok(a === e, `${m}: expected ${e}, got ${a}`);
+  };
   /** Register a per-test cleanup (a shell to close, a node to dispose). */
   const keep = (o) => { cleanups.push(o); return o; };
   /** Close everything kept so far. */
@@ -49,16 +66,15 @@ export function testkit({ verbose = true } = {}) {
     console.log(`\n${label}: ${pass} passed, ${fail} failed`);
     process.exit(fail === 0 ? 0 : 1);
   };
-  return { assert, ok, throws, note, sleep, keep, test, summary };
+  return { assert, ok, assertEqual, throws, note, sleep, keep, test, summary };
 }
 
 // The author helper below reaches the loader's own derivations rather than restating them
 // — a test-side copy of an identity rule would agree with itself and nothing else.
 // Resolved from this file's location; every suite runs after `npm run build`.
-const { hybridAuthorId } = await import(
-  pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle.js")).href);
-const { hybridAuthorKeysFromSeed } = await import(
-  pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle-author.js")).href);
+const impBuilt = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
+const { hybridAuthorId } = await impBuilt("build/host/bundle.js");
+const { hybridAuthorKeysFromSeed } = await impBuilt("build/host/bundle-author.js");
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
  *  the two derive — built through the SHIPPED seed→key-set derivation, so a suite that
