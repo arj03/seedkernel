@@ -14,7 +14,7 @@ const rtc = await imp("build/host/net-rtc.js");
 const {
   RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
   MAX_SDP_BYTES, MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES,
-  UNESTABLISHED_PEER_TTL_MS, MAX_QUEUED_SIGNALS,
+  UNESTABLISHED_PEER_TTL_MS, MAX_QUEUED_SIGNALS, MAX_QUEUED_SIGNAL_BYTES,
 } = rtc;
 import { testkit } from "./testkit.mjs";
 
@@ -439,6 +439,68 @@ await test("an unestablished peer expires on a host-owned deadline", async () =>
   }
 });
 
+await test("a peer that establishes but never carries a channel expires too", async () => {
+  // Establishing leaves the speculative-entry CAP, which is all `established` was ever
+  // about. It is not a reason to drop the deadline: the polite side never opens the data
+  // channel, so a peer that completes DTLS/ICE and then stays silent arms no channel watch
+  // — with the deadline cleared at "connected" nothing would ever reap it, and a relay
+  // could hold peer connections without limit outside the cap that counts them.
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => {
+    const timer = { fn, ms, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = (timer) => { timer.cleared = true; };
+  let net;
+  try {
+    const made = stubPeerConnection();
+    // The factory is resolved once, at construction, so the connection each peer gets is
+    // chosen through this cell rather than by reassigning the option.
+    let next = made;
+    // Ours sorts ABOVE theirs, so this node is the POLITE side and never opens a channel.
+    const ownId = peerId(9);
+    net = new RtcNetwork({
+      peerId: ownId,
+      signaling: { send() {}, onMessage() {}, close() {} },
+      peerConnectionFactory: () => next.pc,
+    });
+    await net.listen(undefined, undefined, () => {});
+    const remote = peerId(1);
+    await net.onSignal({ type: "hello", from: remote, to: ownId });
+    const entry = net.peers.get(remote);
+    assert(entry && entry.polite && !entry.linked, "the polite side must not open a channel of its own");
+    made.pc.connectionState = "connected";
+    made.listeners.get("connectionstatechange")();
+    assert(entry.established, "a completed DTLS/ICE connection leaves the speculative cap");
+    assert(!timers[0].cleared, "leaving the cap must not disarm the entry's deadline");
+    timers[0].fn();
+    assert(!net.peers.has(remote) && made.pc.closed,
+      "an established peer with no data channel must still expire");
+
+    // The control: both facts true is the one state the deadline lets stand.
+    const linkedPeer = stubPeerConnection();
+    next = linkedPeer;
+    const other = peerId(2);
+    await net.onSignal({ type: "hello", from: other, to: ownId });
+    const liveEntry = net.peers.get(other);
+    linkedPeer.pc.connectionState = "connected";
+    linkedPeer.listeners.get("connectionstatechange")();
+    linkedPeer.listeners.get("datachannel")({
+      channel: { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} },
+    });
+    assert(liveEntry.established && liveEntry.linked, "the control peer is established and linked");
+    timers[timers.length - 1].fn();
+    assert(net.peers.get(other) === liveEntry, "a peer that is both must survive its deadline");
+  } finally {
+    net?.close();
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+});
+
 await test("the signaling lane bounds how many decoded signals may wait on it", async () => {
   // The lane exists to keep a later SDP from overtaking an operation in flight — and a
   // lane is a queue. Nothing else counts it: the per-peer caps are only reached once a
@@ -465,7 +527,9 @@ await test("the signaling lane bounds how many decoded signals may wait on it", 
     }),
   });
   try {
-    const big = "s".repeat(MAX_SDP_BYTES / 2);
+    // Small offers on purpose: this is the COUNT bound's test, and a maximum-sized one
+    // would be stopped by the byte companion first (the test below).
+    const big = "s".repeat(64);
     const sent = MAX_QUEUED_SIGNALS + 64;
     for (let i = 1; i <= sent; i++) {
       deliver(wire({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } }));
@@ -478,6 +542,49 @@ await test("the signaling lane bounds how many decoded signals may wait on it", 
     assert(admitted <= MAX_QUEUED_SIGNALS + 1,
       `the lane must drop past ${MAX_QUEUED_SIGNALS} waiting signals, ran ${admitted} of ${sent}`);
     assert(admitted < sent, "an unbounded lane would have run every one of them");
+  } finally {
+    net.close();
+  }
+});
+
+await test("the signaling lane bounds the BYTES waiting on it, not only the count", async () => {
+  // A count alone is half a bound: one relay carries every peer and the per-message caps
+  // admit a 256 KiB offer, so MAX_QUEUED_SIGNALS of them would make this lane the largest
+  // single allowance on the node — bigger than a confined guest heap.
+  let deliver = null;
+  let admitted = 0;
+  let releaseHead;
+  const held = new Promise((resolve) => { releaseHead = resolve; });
+  const net = new RtcNetwork({
+    peerId: peerId(0),
+    signaling: { send() {}, onMessage(cb) { deliver = cb; }, close() {} },
+    admitPeer: () => { admitted++; return true; },
+    peerConnectionFactory: () => ({
+      signalingState: "stable",
+      remoteDescription: null,
+      addEventListener() {},
+      createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
+      setRemoteDescription: () => held,
+      async setLocalDescription() {},
+      async addIceCandidate() {},
+      close() {},
+    }),
+  });
+  try {
+    const big = "s".repeat(MAX_SDP_BYTES / 2);
+    // Worst-case UTF-16 storage of one decoded offer: the description plus the sender id.
+    const perSignal = 2 * (big.length + 64);
+    const fits = Math.floor(MAX_QUEUED_SIGNAL_BYTES / perSignal);
+    const sent = MAX_QUEUED_SIGNALS + 64;
+    for (let i = 1; i <= sent; i++) {
+      deliver(wire({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } }));
+    }
+    releaseHead();
+    for (let i = 0; i < sent + 8; i++) await new Promise((r) => setTimeout(r, 0));
+    assert(admitted <= fits + 1,
+      `the lane must drop past ${MAX_QUEUED_SIGNAL_BYTES} waiting bytes, ran ${admitted} (fits ${fits})`);
+    assert(admitted < MAX_QUEUED_SIGNALS,
+      "the byte companion must bite before the count does on maximum-sized offers");
   } finally {
     net.close();
   }

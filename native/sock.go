@@ -101,19 +101,21 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return t.Context().NewInt32(int32(bound)), nil
 	}))
+	// No answer: admission is the driver's per-link owner (host/transport-host.ts), which
+	// has already charged these bytes against this socket's `buffered()`. A send for a
+	// channel that is gone is dropped, exactly as one on a dead channel is.
 	o.SetPropertyStr("send", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
-			return t.Context().NewBool(false), nil
+			return nil, nil
 		}
-		id := t.Args()[0].Int64()
-		if ch := n.get(id); ch != nil {
+		if ch := n.get(t.Args()[0].Int64()); ch != nil {
 			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without another. It
 			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
 			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
-				return t.Context().NewBool(ch.send(b)), nil
+				ch.send(b)
 			}
 		}
-		return t.Context().NewBool(true), nil
+		return nil, nil
 	}))
 	o.SetPropertyStr("buffered", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 1 {

@@ -189,8 +189,10 @@ declare const __net: {
   connect(host: string, port: number): number;
   /** Bind a listener; returns the bound port, or -1 on failure. */
   listen(host: string, port: number): number;
-  /** Queue bytes for the writer goroutine (never blocks the loop goroutine). */
-  send(id: number, bytes: Uint8Array): boolean;
+  /** Queue bytes for the writer goroutine (never blocks the loop goroutine). Answers
+   *  nothing: admission happened at the driver's per-link owner, which charged these bytes
+   *  against `buffered()` below before calling. */
+  send(id: number, bytes: Uint8Array): void;
   /** Bytes queued for the writer goroutine but not yet handed to the socket. */
   buffered(id: number): number;
   /** Release the next socket read after one serialized transport-realm invocation. */
@@ -226,9 +228,7 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
   return {
     stream: true,
     remoteAddr,
-    send: (bytes) => {
-      if (!__net.send(id, bytes)) throw new Error("socket: outbound queue limit exceeded");
-    },
+    send: (bytes) => { __net.send(id, bytes); },
     buffered: () => __net.buffered(id),
     // Go consumes a one-read token before invoking us, so the false edge is already
     // applied at the socket; the true edge returns the token after the realm turn.

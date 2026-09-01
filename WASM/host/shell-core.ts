@@ -176,22 +176,37 @@ interface RealmTimers extends HostTimers {
   clearAll(): void;
 }
 
-/** A timer table over `fire`, which returns the guest-chosen body to its realm.
+/** A timer table over `fire`, which carries one body into its realm and answers when that
+ *  invocation has settled.
  *  The table is the resource being spent, so the cap lives here rather than in the seam:
- *  the seam never learns that a timer fired, so a count kept there would only ever grow. */
+ *  the seam never learns that a timer fired, so a count kept there would only ever grow.
+ *
+ *  What it retains is the REALM-ENTRY buffer — the caller-id prefix already framed in — not
+ *  the guest's payload. One copy rather than two, and the charge is the bytes that actually
+ *  enter the realm rather than a number 32 short of them.
+ *
+ *  Firing MOVES that custody, it does not end it: `realm.call` borrows the buffer and the
+ *  entry queue counts depth alone (realm-queue.ts), so between the deadline and the answer
+ *  this table is the only owner it has. Releasing at the deadline would leave the busiest
+ *  moment — fired bodies queued behind a serialized realm — charged to nobody. */
 export function createRealmTimers(
-    fire: (payload: Uint8Array) => void,
+    fire: (payload: Uint8Array) => Promise<unknown> | void,
     max = DEFAULT_MAX_LIVE_TIMERS,
     maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
 ): RealmTimers {
-    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; payloadBytes: number }>();
-    let payloadBytes = 0;
+    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; bodyBytes: number }>();
+    /** Bodies waiting for their deadline. */
+    let armedBytes = 0;
+    /** Bodies handed to `fire` whose invocation has not settled. Held apart from
+     *  `armedBytes` because a fired body has left the table's id space — it can no longer
+     *  be cleared or re-armed — while its bytes are still this realm's. */
+    let firingBytes = 0;
     const clear = (id: number) => {
         const entry = live.get(id);
         if (entry !== undefined) {
             clearTimeout(entry.timer);
             live.delete(id);
-            payloadBytes -= entry.payloadBytes;
+            armedBytes -= entry.bodyBytes;
         }
     };
     return {
@@ -200,13 +215,13 @@ export function createRealmTimers(
             // and only a NEW id can be the one over the line.
             if (!live.has(id) && live.size >= max)
                 throw new Error(`guest: too many live timers (cap ${max})`);
-            const previousBytes = live.get(id)?.payloadBytes ?? 0;
-            const nextBytes = payloadBytes - previousBytes + payload.byteLength;
-            if (nextBytes > maxPayloadBytes)
+            const previousBytes = live.get(id)?.bodyBytes ?? 0;
+            const nextBytes = armedBytes - previousBytes + HOST_CALLER_ID.length + payload.byteLength;
+            if (nextBytes + firingBytes > maxPayloadBytes)
                 throw new Error(`guest: live timer payloads exceed byte cap ${maxPayloadBytes}`);
             // Copy only after both checks pass. The guest-call request buffer can then be
             // collected, and the table retains exactly the bytes it accounts for.
-            const body = payload.slice();
+            const body = concatBytes([HOST_CALLER_ID, payload]);
             clear(id);
             // Dropped from the table BEFORE the realm is re-entered, so a guest that
             // re-arms the same id from inside its own `timer` entrypoint arms the new
@@ -215,17 +230,31 @@ export function createRealmTimers(
                 const entry = live.get(id);
                 if (!entry || entry.timer !== timer) return;
                 live.delete(id);
-                payloadBytes -= entry.payloadBytes;
-                fire(body);
+                armedBytes -= entry.bodyBytes;
+                firingBytes += entry.bodyBytes;
+                let released = false;
+                const release = () => {
+                    if (released) return;
+                    released = true;
+                    firingBytes -= entry.bodyBytes;
+                };
+                let handed: Promise<unknown> | void;
+                // A fire that throws, or that carried the body nowhere, ends its custody in
+                // this turn rather than waiting for an answer nobody promised.
+                try { handed = fire(body); } catch { handed = undefined; }
+                if (handed) void handed.then(release, release);
+                else release();
             }, ms);
-            live.set(id, { timer, payloadBytes: body.byteLength });
-            payloadBytes += body.byteLength;
+            live.set(id, { timer, bodyBytes: body.byteLength });
+            armedBytes += body.byteLength;
         },
         clear,
         clearAll() {
             for (const { timer } of live.values()) clearTimeout(timer);
             live.clear();
-            payloadBytes = 0;
+            armedBytes = 0;
+            // `firingBytes` drains on its own: disposal settles every invocation still in
+            // flight (realm-queue.ts), and each fired body releases as its answer lands.
         },
     };
 }
@@ -456,17 +485,19 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  standing when it fires (a transport handover replaces it while the slot stays). */
     const newSlot = (loaded: LoadedBundle, pureModules: PureModules, onInbound: LoadBundleOptions["onInbound"]): AppSlot => {
         let slot: AppSlot;
-        const timers = createRealmTimers((payload) => {
+        const timers = createRealmTimers((body) =>
             // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
-            // an event the host delivers into the guest, not a host authority. It carries
-            // the HOST's caller id followed by the opaque body supplied to `timer/arm`;
-            // event framing belongs to the guest whose `handle` reads it. A
-            // guest's `handle` may throw on it; there is no caller left to reject — the
-            // arming call returned turns ago — so report and swallow.
-            void slot.realm?.call(concatBytes([HOST_CALLER_ID, payload])).catch((err: unknown) => {
+            // an event the host delivers into the guest, not a host authority. The body is
+            // already framed — the HOST's caller id followed by what `timer/arm` supplied,
+            // built once by the table that retains it; event framing above that belongs to
+            // the guest whose `handle` reads it. A guest's `handle` may throw on it; there
+            // is no caller left to reject — the arming call returned turns ago — so report
+            // and swallow. Returned rather than discarded: the table holds this body's
+            // charge until the invocation settles, and a slot whose realm is already gone
+            // releases it now by answering nothing.
+            slot.realm?.call(body).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
-            });
-        });
+            }));
         const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
         const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {

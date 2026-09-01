@@ -39,7 +39,12 @@ export interface PeerEntry {
   pendingIce: RTCIceCandidateInit[];
   /** Worst-case UTF-16 storage retained by queued or in-flight candidate strings. */
   pendingIceBytes: number;
-  /** Speculative entries must establish before this host-owned deadline. */
+  /** The one host-owned deadline every entry gets. An entry that has not both established
+   *  AND bound its data channel when it fires is forgotten — two conditions rather than
+   *  one, because either alone leaves a hole: a peer that never completes ICE is the
+   *  speculative entry `admitNewPeer` counts, while a peer that completes ICE and then
+   *  simply never opens a channel escapes that count (`established`) and has nothing else
+   *  to reap it (`bindLink`'s channel watch never arms). */
   establishmentTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -82,10 +87,23 @@ function sessionDescription(value: RTCSessionDescriptionInit | null): SdpSignal[
  *  UTF-16, so charging two bytes per code unit avoids allocating an encoding just to
  *  measure untrusted signaling input and never understates its host-memory cost. */
 function iceCandidateBytes(candidate: RTCIceCandidateInit): number {
-    const stringBytes = (value: string | null | undefined) => value === undefined || value === null ? 0 : value.length * 2;
-    return stringBytes(candidate.candidate)
-        + stringBytes(candidate.sdpMid)
-        + stringBytes(candidate.usernameFragment);
+    return utf16Bytes(candidate.candidate)
+        + utf16Bytes(candidate.sdpMid)
+        + utf16Bytes(candidate.usernameFragment);
+}
+
+function utf16Bytes(value: string | null | undefined): number {
+    return value === undefined || value === null ? 0 : value.length * 2;
+}
+
+/** Retained storage for one decoded signal waiting on the lane, in the same currency. The
+ *  peer ids are fixed-width but charged with the rest: what the queue holds is the whole
+ *  message, and an owner that counts only the interesting field is an owner with a gap. */
+function signalBytes(msg: SignalMsg): number {
+    const ids = utf16Bytes(msg.from) + utf16Bytes(msg.to);
+    if (msg.type === "sdp") return ids + utf16Bytes(msg.sdp.sdp);
+    if (msg.type === "ice") return ids + iceCandidateBytes(msg.candidate);
+    return ids;
 }
 
 // The private negotiation frame (§12.6), NUL-separated: tag | from | to-or-empty | payload,
@@ -184,12 +202,19 @@ export const MAX_PENDING_ICE_BYTES = 256 * 1024;
  *  parts array first: the widest text either payload cap allows, plus this grammar's fixed
  *  overhead — tag, two peer ids, six separators, sdpMLineIndex's widest decimal. */
 const MAX_SIGNAL_CHARS = Math.max(MAX_SDP_BYTES, MAX_PENDING_ICE_BYTES) / 2 + 1 + 64 + 64 + 5 + 6;
-/** A relayed hello/offer that never completes ICE/DTLS cannot retain a peer forever. */
+/** A relayed hello/offer that never becomes a live link cannot retain a peer forever. */
 export const UNESTABLISHED_PEER_TTL_MS = 30_000;
 /** Inbound signals waiting on the ordered lane, each retaining its decoded message. One
  *  relay carries every peer, so overflow DROPS the newcomer rather than tearing anything
  *  down: a dropped signal costs one redial, a failed channel costs every peer on it. */
 export const MAX_QUEUED_SIGNALS = 256;
+/** Byte companion to `MAX_QUEUED_SIGNALS`, in the same conservative UTF-16 currency as
+ *  `iceCandidateBytes`. A count alone is half a bound here for the reason it is everywhere
+ *  else in this runtime: the per-message caps above admit a 256 KiB offer, so 256 of them
+ *  would make this lane the largest single allowance on the node. Sized for what a real
+ *  rendezvous queues — a fleet's worth of few-KiB offers and answers — so the pairing bites
+ *  only on the shape nobody sends honestly. Overflow drops the newcomer, as the count does. */
+export const MAX_QUEUED_SIGNAL_BYTES = 4 * 1024 * 1024;
 export class RtcNetwork implements ChannelFactory {
     opts;
     private readonly ownId: string;
@@ -200,6 +225,7 @@ export class RtcNetwork implements ChannelFactory {
      *  may yield, but a later SDP/ICE message must not overtake the operation in flight. */
     private signalTail: Promise<void> = Promise.resolve();
     private queuedSignals = 0;
+    private queuedSignalBytes = 0;
     private closed = false;
     constructor(opts: RtcNetworkOptions) {
         if (!isHex64(opts.peerId)) throw new Error("rtc: peerId must be 64 lowercase hex characters");
@@ -256,7 +282,9 @@ export class RtcNetwork implements ChannelFactory {
         };
         this.peers.set(peerId, e);
         e.establishmentTimer = setTimeout(() => {
-            if (this.peers.get(peerId) === e && !e.established) this.forget(peerId);
+            if (this.peers.get(peerId) !== e) return;
+            e.establishmentTimer = null; // it has fired; nothing left for forget() to clear
+            if (!(e.established && e.linked)) this.forget(peerId);
         }, UNESTABLISHED_PEER_TTL_MS);
         // A speculative browser connection should expire, but the deadline alone must not
         // keep a Node console process alive.
@@ -296,12 +324,11 @@ export class RtcNetwork implements ChannelFactory {
                 // A completed DTLS/ICE connection is no longer a speculative entry the
                 // relay conjured for free (admitNewPeer). Whether the transport ABOVE it
                 // authenticates is that guest's business from here — this file's watch
-                // ends at the peer connection.
+                // ends at the peer connection. The deadline is NOT cleared here: leaving
+                // the cap is not the same as being a live link, and a connection that
+                // establishes and then never carries a channel would otherwise have
+                // nothing left to reap it. The one timer decides, once, on both facts.
                 e.established = true;
-                if (e.establishmentTimer !== null) {
-                    clearTimeout(e.establishmentTimer);
-                    e.establishmentTimer = null;
-                }
             }
             else if (s === "disconnected") {
                 // A transient path failure (network blip, NAT rebind): restartIce()
@@ -331,11 +358,12 @@ export class RtcNetwork implements ChannelFactory {
      *  this file still owns is the CHANNEL, so it watches the one event that says the
      *  channel is gone.
      *
-     *  That watch is what bounds the entry table. A `hello` costs a peer connection, and
-     *  `admitNewPeer` stops counting an entry once DTLS/ICE establishes — cheap enough that
-     *  a relay naming fabricated peers could otherwise allocate without limit. It cannot,
-     *  because the transport above tears an unauthenticated link down on its own deadline
-     *  (`unverifiedTimeoutMs`), the driver closes the channel, and the entry goes with it.
+     *  That watch is what reaps a LINKED entry: the transport above tears an
+     *  unauthenticated link down on its own deadline (`unverifiedTimeoutMs`), the driver
+     *  closes the channel, and the entry goes with it. It says nothing about an entry that
+     *  never got a channel — the polite side never opens one, so a peer that completes
+     *  DTLS/ICE and then stays silent arms no watch here at all. That case is the
+     *  entry's own `establishmentTimer`, which is why it survives establishment.
      *
      *  A channel with nowhere to go is not bound at all: the driver has not started its
      *  listeners yet, so the negotiation must be free to hand this peer over again rather
@@ -394,9 +422,14 @@ export class RtcNetwork implements ChannelFactory {
         catch { return Promise.resolve(); }
         if (!msg || this.closed || this.queuedSignals >= MAX_QUEUED_SIGNALS)
             return Promise.resolve();
+        const bytes = signalBytes(msg);
+        if (bytes > MAX_QUEUED_SIGNAL_BYTES - this.queuedSignalBytes)
+            return Promise.resolve();
         this.queuedSignals++;
+        this.queuedSignalBytes += bytes;
         const run = this.signalTail.then(() => {
             this.queuedSignals--;
+            this.queuedSignalBytes -= bytes;
             return this.onSignal(msg);
         });
         this.signalTail = run.catch(() => { /* onSignal already contains the boundary */ });

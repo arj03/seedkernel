@@ -46,7 +46,7 @@ func dialTCP(addr string) (net.Conn, error) {
 // ownership of its slice. onMsg borrows the read buffer only for the call; the native
 // host reserves its shared staging allowance before making any retained copy.
 type rawChannel interface {
-	send(bytes []byte) bool
+	send(bytes []byte)
 	buffered() int
 	resume()
 	close(graceful bool)
@@ -118,12 +118,15 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), c
 // send queues bytes for the writer goroutine and returns immediately, never touching the
 // socket. It takes ownership of bytes (sock.go hands over a fresh JsTypedArrayToGo copy),
 // so nothing is copied here. A send on a dead channel is dropped silently, like a
-// node:net write after destroy.
-func (c *sockChannel) send(bytes []byte) bool {
+// node:net write after destroy. It answers nothing: what one link may hold is the driver's
+// per-link owner (host/transport-host.ts `LinkOutboundOwner`), which charges every write
+// against this socket's `buffered()` BEFORE it reaches here. A refusal from this primitive
+// would be a second gate on the same bytes, with no owner behind it.
+func (c *sockChannel) send(bytes []byte) {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
-		return true
+		return
 	}
 	c.queue = append(c.queue, bytes)
 	c.queued += len(bytes)
@@ -133,7 +136,6 @@ func (c *sockChannel) send(bytes []byte) bool {
 	// the frame hits the wire now, overlapping the sender's JS turn — ~10% round-trip
 	// latency on the Net benches. A hint only: correctness never depends on it.
 	runtime.Gosched()
-	return true
 }
 
 // buffered is the transport-owned stall clock's view of this socket: bytes accepted from
