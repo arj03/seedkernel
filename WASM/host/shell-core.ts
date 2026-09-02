@@ -9,9 +9,10 @@ import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type S
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
 import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
+import { monotonicMs } from "./realm-queue.js";
 import { type SafeRealm } from "./safe-js.js";
 import type { Keypair } from "../core/subkeys.js";
 
@@ -178,7 +179,7 @@ interface RealmTimers extends HostTimers {
 
 /** A timer table over `fire`, which carries one body into its realm and answers when that
  *  invocation has settled.
- *  The table is the resource being spent, so the cap lives here rather than in the seam:
+ *  The table is the resource being spent, so the caps live here rather than in the seam:
  *  the seam never learns that a timer fired, so a count kept there would only ever grow.
  *
  *  What it retains is the REALM-ENTRY buffer — the caller-id prefix already framed in — not
@@ -188,11 +189,18 @@ interface RealmTimers extends HostTimers {
  *  Firing MOVES that custody, it does not end it: `realm.call` borrows the buffer and the
  *  entry queue counts depth alone (realm-queue.ts), so between the deadline and the answer
  *  this table is the only owner it has. Releasing at the deadline would leave the busiest
- *  moment — fired bodies queued behind a serialized realm — charged to nobody. */
+ *  moment — fired bodies queued behind a serialized realm — charged to nobody.
+ *
+ *  It owns this realm's share of the node's CLOCK for the same reason it owns those bytes:
+ *  a fired deadline is the one initiation a guest hands ITSELF, so no upstream owner bounds
+ *  its rate (§12.3). Firing spends that share, and a deadline coming due with it spent is
+ *  SLIPPED rather than failed — which an honest table never reaches. */
 export function createRealmTimers(
     fire: (payload: Uint8Array) => Promise<unknown> | void,
     max = DEFAULT_MAX_LIVE_TIMERS,
     maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
+    budgetMs = DEFAULT_GUEST_DEADLINE_MS,
+    clockDivisor = SELF_INITIATED_CLOCK_DIVISOR,
 ): RealmTimers {
     const live = new Map<number, { timer: ReturnType<typeof setTimeout>; bodyBytes: number }>();
     /** Bodies waiting for their deadline. */
@@ -201,6 +209,28 @@ export function createRealmTimers(
      *  `armedBytes` because a fired body has left the table's id space — it can no longer
      *  be cleared or re-armed — while its bytes are still this realm's. */
     let firingBytes = 0;
+    /** Fired invocations still outstanding. The clock is charged for the ONE period any of
+     *  them is open rather than per invocation: a serialized realm is occupied once. */
+    let firing = 0;
+    /** Banked clock, in ms. Capped at one invocation, so an idle app's deadline fires the
+     *  moment it comes due; floored at minus the same, so one long fire cannot mortgage the
+     *  table past `budgetMs * clockDivisor`. An unbudgeted realm banks `Infinity`. */
+    let credit = budgetMs;
+    let creditAt = monotonicMs();
+    /** A realm that can run nothing has no clock to share, and pacing it would only spin a
+     *  slip loop against invocations already late when the queue admits them. */
+    const paced = budgetMs > 0;
+    /** Spend the period since the last reading at the wall's own rate while busy, and earn it
+     *  back at `1 / clockDivisor` throughout — so an always-busy table settles at exactly that
+     *  share. Called BEFORE each transition, so a period is charged in the mode it ran in. */
+    const accrue = (): void => {
+        const now = monotonicMs();
+        const elapsed = now - creditAt;
+        creditAt = now;
+        if (!(elapsed > 0)) return;
+        credit += elapsed / clockDivisor - (firing > 0 ? elapsed : 0);
+        credit = Math.max(-budgetMs, Math.min(budgetMs, credit));
+    };
     const clear = (id: number) => {
         const entry = live.get(id);
         if (entry !== undefined) {
@@ -223,20 +253,36 @@ export function createRealmTimers(
             // collected, and the table retains exactly the bytes it accounts for.
             const body = concatBytes([HOST_CALLER_ID, payload]);
             clear(id);
-            // Dropped from the table BEFORE the realm is re-entered, so a guest that
-            // re-arms the same id from inside its own `timer` entrypoint arms the new
-            // deadline rather than having it cleared out from under it on the way out.
-            const timer = setTimeout(() => {
+            /** The handle standing for this id. A slip replaces it, so the attempt behind the
+             *  old one finds it changed and does nothing — as a re-arm of the id already does. */
+            let handle: ReturnType<typeof setTimeout> | undefined;
+            const attempt = (): void => {
                 const entry = live.get(id);
-                if (!entry || entry.timer !== timer) return;
+                if (!entry || entry.timer !== handle) return;
+                accrue();
+                if (paced && credit <= 0) {
+                    // Slipped, never failed or dropped: a share held against the node's other
+                    // slots is not an error an honest app should have to handle. The wait is
+                    // what buys a positive share back, capped to `setTimeout`'s range.
+                    handle = setTimeout(attempt, Math.min(0x7fffffff, Math.ceil((1 - credit) * clockDivisor)));
+                    live.set(id, { timer: handle, bodyBytes: entry.bodyBytes });
+                    return;
+                }
+                // Dropped from the table BEFORE the realm is re-entered, so a guest that
+                // re-arms the same id from inside its own `timer` entrypoint arms the new
+                // deadline rather than having it cleared out from under it on the way out.
                 live.delete(id);
                 armedBytes -= entry.bodyBytes;
                 firingBytes += entry.bodyBytes;
+                firing += 1;
                 let released = false;
                 const release = () => {
                     if (released) return;
                     released = true;
                     firingBytes -= entry.bodyBytes;
+                    // The busy period ends where the byte custody does: at the answer.
+                    accrue();
+                    firing -= 1;
                 };
                 let handed: Promise<unknown> | void;
                 // A fire that throws, or that carried the body nowhere, ends its custody in
@@ -244,8 +290,9 @@ export function createRealmTimers(
                 try { handed = fire(body); } catch { handed = undefined; }
                 if (handed) void handed.then(release, release);
                 else release();
-            }, ms);
-            live.set(id, { timer, bodyBytes: body.byteLength });
+            };
+            handle = setTimeout(attempt, ms);
+            live.set(id, { timer: handle, bodyBytes: body.byteLength });
             armedBytes += body.byteLength;
         },
         clear,
@@ -253,8 +300,9 @@ export function createRealmTimers(
             for (const { timer } of live.values()) clearTimeout(timer);
             live.clear();
             armedBytes = 0;
-            // `firingBytes` drains on its own: disposal settles every invocation still in
-            // flight (realm-queue.ts), and each fired body releases as its answer lands.
+            // `firingBytes` and an open busy period drain on their own: disposal settles every
+            // invocation still in flight (realm-queue.ts), and each fired body releases as its
+            // answer lands.
         },
     };
 }
@@ -479,11 +527,16 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             }
         }
     };
+    /** This load's per-invocation ceiling: this load's number, else the node's, else the
+     *  shared one (§12.3). One place, because two owners are measured against it — the realm
+     *  `standRealm` stands, and the clock its timer table banks one invocation of. */
+    const deadlineFor = (load: LoadBundleOptions): number =>
+        load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
     /** An empty slot for `loaded`, with its timer table already pointed at the realm the
      *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
      *  which is the correct reading anyway: the realm a deadline re-enters is the one
      *  standing when it fires (a transport handover replaces it while the slot stays). */
-    const newSlot = (loaded: LoadedBundle, pureModules: PureModules, onInbound: LoadBundleOptions["onInbound"]): AppSlot => {
+    const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: LoadBundleOptions): AppSlot => {
         let slot: AppSlot;
         const timers = createRealmTimers((body) =>
             // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
@@ -493,11 +546,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             // the guest whose `handle` reads it. A guest's `handle` may throw on it; there
             // is no caller left to reject — the arming call returned turns ago — so report
             // and swallow. Returned rather than discarded: the table holds this body's
-            // charge until the invocation settles, and a slot whose realm is already gone
-            // releases it now by answering nothing.
+            // charge, and the clock it is spending, until the invocation settles, and a slot
+            // whose realm is already gone releases both now by answering nothing.
             slot.realm?.call(body).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
-            }));
+            }),
+            // Banked against THIS slot's ceiling, not the node's default.
+            DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, deadlineFor(load));
         const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
         const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
@@ -509,7 +564,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             realm: null,
             active: false,
             timers,
-            onInbound,
+            onInbound: load.onInbound,
         };
         return slot;
     };
@@ -550,7 +605,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 + jsonPreamble("LOCAL", localConfig) + b.guestSource,
             hostCall: seamFor(slot),
             memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-            deadlineMs: load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
+            deadlineMs: deadlineFor(load),
         });
     };
     /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
@@ -770,7 +825,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             refuseContested(loaded, key);
             refuseOverfull(key);
             const pureModules = await loadBundleModules(moduleLoader, v);
-            const slot = newSlot(loaded, pureModules, loadOpts.onInbound);
+            const slot = newSlot(loaded, pureModules, loadOpts);
             // Stand the guest, before anything already standing is replaced. Every app is a
             // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
             // discovering that at the first frame would leave the mark advanced for a

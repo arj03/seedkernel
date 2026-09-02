@@ -19,7 +19,8 @@ const sodium = _sodium;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
-  DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS,
+  DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS, DEFAULT_GUEST_DEADLINE_MS,
+  SELF_INITIATED_CLOCK_DIVISOR,
   DEFAULT_REALM_MEMORY_BYTES, DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_MEMORY_FS_MAX_BYTES }
   = await imp("build/core/wasm-limits.js");
@@ -431,6 +432,18 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
     "the signaling lane's byte companion binds before its count does");
 }
 
+console.log("\n§12.3 — and a bounded self-initiated share is what makes the node's CLOCK one");
+{
+  // Memory's total above is a standing quantity; time's is a share of ONE clock, and only the
+  // work a guest hands itself needs a term in it — every other initiation is bounded by the
+  // owner that admitted it (§12.3). Both halves live HERE for the reason the memory sum does:
+  // a second way for a guest to initiate its own work means adding its term to this block.
+  ok(DEFAULT_MAX_APP_SLOTS * DEFAULT_GUEST_DEADLINE_MS <= 60_000,
+    "every slot spending its banked invocation at once is a stall someone added up");
+  ok(DEFAULT_MAX_APP_SLOTS / SELF_INITIATED_CLOCK_DIVISOR <= 1 / 2,
+    "a full node's summed self-initiated share leaves half the clock to peers and the host loop");
+}
+
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
 {
   const active = createActiveHostCallRegistry(2, 8);
@@ -585,6 +598,45 @@ console.log("\n§12.3 — timer count and copied payload bytes are bounded per r
   inFlight.arm(2, 60_000, new Uint8Array(8));
   ok(true, "and is released once the invocation it was handed to settles");
   inFlight.clearAll();
+}
+
+console.log("\n§12.3 — a realm's self-initiated work is paced by its share of the node's clock");
+{
+  // Re-arming at ms=0 from inside the timer entrypoint: the one initiation a guest issues to
+  // itself, each fire taking a fresh full budget (§12.3). Scaled down so the RATIO is what is
+  // under test, and run at a divisor of 1 as its own control — there a busy table earns back
+  // exactly what it spends, which is the unpaced behaviour this replaced.
+  const budgetMs = 40, occupyMs = 20, spinForMs = 400;
+  const spin = async (clockDivisor) => {
+    let fires = 0;
+    let table;
+    table = createRealmTimers(() => {
+      fires += 1;
+      table.arm(1, 0, new Uint8Array(1));
+      return sleep(occupyMs);
+    }, 10, 4096, budgetMs, clockDivisor);
+    table.arm(1, 0, new Uint8Array(1));
+    await sleep(spinForMs);
+    table.clearAll();
+    return fires;
+  };
+  const unpaced = await spin(1);
+  const paced = await spin(4);
+  ok(unpaced > 2 * paced,
+    `an unpaced table holds the clock the whole window (${unpaced} fires vs ${paced} paced)`);
+  // The bank is one whole invocation, so the first fires come free and the share paces the rest.
+  ok(paced * occupyMs <= spinForMs / 4 + 2 * budgetMs,
+    `a spinning guest stays inside its share of the clock (${paced} × ${occupyMs}ms in ${spinForMs}ms)`);
+
+  // Metered on the clock the fires occupy and never on how many there are, so the transport's
+  // own shape — a cheap deadline per link, all coming due at once — meets none of it. Pacing
+  // THAT would be a regression rather than a bound.
+  let cheap = 0;
+  const honest = createRealmTimers(() => { cheap += 1; });
+  for (let id = 0; id < 64; id++) honest.arm(id, 0, new Uint8Array(1));
+  await sleep(60);
+  ok(cheap === 64, `64 deadlines that cost nothing all fire at once (${cheap})`);
+  honest.clearAll();
 }
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");

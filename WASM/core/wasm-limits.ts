@@ -53,6 +53,13 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
  *  operator's own admin path (§12.4), so this bounds an install list, never a peer's reach. */
 export const DEFAULT_MAX_APP_SLOTS = 8;
 
+/** One realm's share of the node's clock for the work it hands ITSELF — a fired deadline,
+ *  the one initiation with no upstream owner to bound its rate (§12.3). Metered per realm by
+ *  `createRealmTimers` (shell-core.ts). Twice the slot count, so a full node's summed share
+ *  is half its clock; that sum is added up in tests/verify-hardening.mjs beside the memory
+ *  one, and a second way for a guest to initiate its own work belongs in it. */
+export const SELF_INITIATED_CLOCK_DIVISOR = 2 * DEFAULT_MAX_APP_SLOTS;
+
 /** Default ceiling on a module's declared linear memory, applied at the shared admission
  *  path (§3) against the tighter of this and the target loader's own ceiling
  *  (`PureModuleLoader.maxModuleMemoryBytes`) — so a host may hold its isolates to less and
