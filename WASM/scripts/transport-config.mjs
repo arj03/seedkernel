@@ -17,6 +17,10 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   maxFrameBytes: MAX_FRAME_BYTES,
   maxPreAuthQueueSlices: 4096,
   linkIdleTimeoutMs: 300_000,
+  // How long one open correlation waits for its peer before the transport gives up on it.
+  // A deployment whose invocation deadline is shorter than this should say so: an app can
+  // only route around a silent holder while it still has segment left (§16.1).
+  requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),
   // Peers this program dials, as `{ peerId, dest, contactSecret? }` in hex. Empty by
   // default because a cohort is a DEPLOYMENT's fact, not an author's — an installation

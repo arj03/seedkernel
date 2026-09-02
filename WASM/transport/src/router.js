@@ -90,6 +90,7 @@ const REQ_HEAD_LEN = 1 + 4 + 1;
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
+    this.timers = new Map();    // corr → the retention bound on that entry
     this.nextCorr = 1;
   }
 
@@ -99,6 +100,8 @@ class ReqRes {
     const p = this.pending.get(corr);
     if (!p) return;
     this.pending.delete(corr);
+    const t = this.timers.get(corr);
+    if (t) { clearTimer(t); this.timers.delete(corr); }
     if (ok) p.d.settle(concatBytes([Uint8Array.from([1]), payload]));
     else p.d.settle(Uint8Array.from([0]));
   }
@@ -108,8 +111,15 @@ class ReqRes {
   }
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
-   *  returned (null for a noReply send, which carries corr 0 and nothing waits on). The
-   *  kernel owns the invocation deadline and releases the caller if this never answers. */
+   *  returned (null for a noReply send, which carries corr 0 and nothing waits on).
+   *
+   *  The kernel owns the caller's TIME and no field here can name it. What this arms is the
+   *  transport's own retention bound on the correlation it just opened — the same kind of
+   *  bound `handshakeTimeoutMs` puts on a half-open link and `linkIdleTimeoutMs` on a silent
+   *  one, and the pending map is the last waiting state that had none. It only ever gives up
+   *  EARLIER than the caller's segment, so it mints nothing; what it buys is the difference
+   *  between one silent peer and a dead invocation, since a fan-out settles as a whole and a
+   *  peer that vanished mid-link sends no close for anything else to notice (§16.1). */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
@@ -117,6 +127,12 @@ class ReqRes {
       this.pending.set(corr, { to, d });
     }
     this.sendFrame(to, frame);
+    if (!noReply && requestTimeoutMs > 0) {
+      this.timers.set(corr, armTimer(requestTimeoutMs, () => {
+        this.timers.delete(corr);
+        this.finish(corr, false, EMPTY);
+      }));
+    }
   }
 
   buildReq(corr, noReply, proto, payload) {
@@ -183,6 +199,8 @@ class ReqRes {
   }
 
   close() {
+    for (const t of this.timers.values()) clearTimer(t);
+    this.timers.clear();
     // Settle rather than drop: every one of these is an app parked on a `_net` call.
     for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
     this.pending.clear();
