@@ -144,12 +144,12 @@ const OP = { SEND: "send", RAW: "op", SEEN: "seen", FROM: "from" };
 /** One local op through the harness app's slot-bound handle, with the host's caller id in
  *  front of THIS app's own op framing — the name is the app's vocabulary and the shell
  *  never reads it. */
-function invoke(app, op, args = new Uint8Array(0)) {
+function invoke(app, op, args = new Uint8Array(0), deadlineMs) {
   const b = new Uint8Array(1 + op.length + args.length);
   b[0] = op.length;
   for (let i = 0; i < op.length; i++) b[1 + i] = op.charCodeAt(i) & 0xff;
   b.set(args, 1 + op.length);
-  return app.invoke(b);
+  return app.invoke(b, deadlineMs);
 }
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
@@ -175,15 +175,14 @@ export function harnessAppKey(author) {
 }
 
 /** The `send` op's argument bytes:
- *  `[noReply u8][deadline u32][to blob][proto blob][payload blob]` (transport/src/core.js).
+ *  `[noReply u8][to blob][proto blob][payload blob]` (transport/src/core.js).
  *  Written once here because three suites build it. */
-export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply = false } = {}) {
+export function sendArgs(to, payload, { proto = PROTO, noReply = false } = {}) {
   const p = new TextEncoder().encode(proto);
-  const out = new Uint8Array(1 + 4 + 4 + 32 + 4 + p.length + 4 + payload.length);
+  const out = new Uint8Array(1 + 4 + 32 + 4 + p.length + 4 + payload.length);
   let off = 0;
   out[off++] = noReply ? 1 : 0;
   const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
-  u32(deadlineMs);
   u32(32);
   out.set(Buffer.from(to, "hex"), off); off += 32;
   u32(p.length);
@@ -196,7 +195,7 @@ export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply =
 /** One request out of `shell`, through the harness app it loaded — the path a real
  *  deployment uses. */
 export async function appRequest(app, to, payload, opts) {
-  const r = await invoke(app, OP.SEND, sendArgs(to, payload, opts));
+  const r = await invoke(app, OP.SEND, sendArgs(to, payload, opts), opts?.deadlineMs);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 }
@@ -255,7 +254,6 @@ export async function makeTransportHost(opts = {}) {
       admitPeers: opts.admitPeers.map((peer) => Buffer.from(peer).toString("hex")),
     }),
     ...(opts.connsPerPeer === undefined ? {} : { connsPerPeer: opts.connsPerPeer }),
-    ...(opts.requestDeadlineMs === undefined ? {} : { requestDeadlineMs: opts.requestDeadlineMs }),
     ...(opts.transportHalfOpen?.unverified === undefined ? {} : { maxHalfOpenUnverified: opts.transportHalfOpen.unverified }),
     ...(opts.transportHalfOpen?.perSource === undefined ? {} : { maxHalfOpenPerSource: opts.transportHalfOpen.perSource }),
     ...(opts.transportHalfOpen?.verified === undefined ? {} : { maxHalfOpenVerified: opts.transportHalfOpen.verified }),
@@ -296,20 +294,20 @@ export async function makeTransportHost(opts = {}) {
   const enc = new TextEncoder();
   const call = (to, proto, payload, deadlineMs, noReply) => {
     // The `send` op's own argument order (transport/src/core.js):
-    // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+    // [noReply u8][to blob][proto blob][payload blob]. The deadline is kernel state on
+    // `invoke`, not guest protocol data.
     const p = enc.encode(proto);
-    const out = new Uint8Array(1 + 4 + 4 + 32 + 4 + p.length + 4 + payload.length);
+    const out = new Uint8Array(1 + 4 + 32 + 4 + p.length + 4 + payload.length);
     let off = 0;
     out[off++] = noReply ? 1 : 0;
     const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
-    u32(deadlineMs ?? 0);
     u32(32);
     out.set(Buffer.from(to, "hex"), off); off += 32;
     u32(p.length);
     out.set(p, off); off += p.length;
     u32(payload.length);
     out.set(payload, off);
-    return invoke(app, OP.SEND, out);
+    return invoke(app, OP.SEND, out, deadlineMs);
   };
   /** One request out, resolving with the response bytes — or rejecting, which is what
    *  the `[0]` failure byte means (an unreachable peer, a deadline, a refusal). */
@@ -318,7 +316,7 @@ export async function makeTransportHost(opts = {}) {
     if (r[0] !== 1) throw new Error("net: request failed");
     return r.slice(1);
   };
-  node.sendNoReply = (to, proto, payload) => call(to, proto, payload, 0, true);
+  node.sendNoReply = (to, proto, payload) => call(to, proto, payload, undefined, true);
   node.app = app;
   node.appKey = app.key;
   /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller

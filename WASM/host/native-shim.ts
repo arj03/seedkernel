@@ -10,7 +10,7 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { serializeCalls } from "./realm-queue.js";
+import { createHandoffDeadlines, serializeCalls } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -68,8 +68,10 @@ declare const bridge: {
               maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
-  realmCall(realm: number, payload: Uint8Array,
-            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): number;
+  realmCall(realm: number, payload: Uint8Array, callId: number,
+            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
+            deadlineMs: number): number;
+  realmCancel(realm: number, callId: number): void;
   realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
   realmDispose(realm: number): void;
 };
@@ -391,6 +393,9 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
+    // The wall-clock half of this realm's host-call custody: one armed deadline per
+    // unsettled call, dropped with the realm so no timer outlives it (realm-queue.ts).
+    const handoffDeadlines = createHandoffDeadlines();
     // Go mints the handle, but createRealm runs the guest's top-level code before returning
     // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
     // because settling is a HOST-realm microtask and Go pumps only between turns, never
@@ -407,46 +412,63 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
         };
+        if (budget.remainingMs <= 0)
+            throw new Error("guest: handoff deadline exhausted before host.call");
         // A synchronous throw is a refused NAME, which fails at the guest's call site
         // (guest-seam.ts); guest.go releases the call it had already admitted.
         const answer = hostCall(name, new Uint8Array(payload), budget);
-        void Promise.resolve(answer).then(
-            (bytes: Uint8Array) => {
-                bridge.realmSettle(realm, callId, bytes, null);
-            },
-            (e: unknown) => {
-                bridge.realmSettle(realm, callId, null, errMessage(e));
-            },
+        // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
+        // by the same arm and neither can follow the other (realm-queue.ts).
+        void handoffDeadlines.race(budget.remainingMs, answer,
+            "guest: host.call handoff deadline exceeded").then(
+            (bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null),
+            (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)),
         );
         return null;
     };
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
         deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
         DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
+    const configuredDeadlineMs = deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
+    let invocationSeq = 0;
     let disposed = false;
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm
         // contract (realm-queue.ts) is what keeps the two targets from differing about
         // when a second entrypoint may begin.
         call: serializeCalls(
-            (payload: Uint8Array) => {
+            (payload: Uint8Array, handoffDeadlineMs: number) => {
                 // The executor runs synchronously, so `deferred` carries Go's answer by
                 // the time the return statement reads it.
+                invocationSeq++;
+                if (!Number.isSafeInteger(invocationSeq))
+                    throw new Error("guest: realm invocation id exhausted");
+                const callId = invocationSeq;
                 let deferred = false;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    deferred = bridge.realmCall(realm, payload,
+                    deferred = bridge.realmCall(realm, payload, callId,
                         (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
-                        (msg: string) => reject(new Error(msg))) === 1;
+                        (msg: string) => reject(new Error(msg)),
+                        handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs) === 1;
                 });
-                return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
+                return {
+                    result,
+                    released: deferred ? Promise.resolve() : result.catch(() => { }),
+                    cancel: () => bridge.realmCancel(realm, callId),
+                };
             },
             () => (disposed ? new Error("guest realm disposed") : null),
+            configuredDeadlineMs,
         ),
         dispose: () => {
             disposed = true;
             // guest.go's close() runs settleAll before it frees anything, so every callback
             // it still owns is rejected synchronously here — safe-js.ts needs its own
-            // registry for this, and this target does not (§12.3).
+            // registry for this, and this target does not (§12.3). The armed deadlines are
+            // host-side and do NOT go with it: a timer waiting to reject a call this realm
+            // no longer holds keeps the host's event loop alive for the whole of its
+            // remainder, so a one-shot process would linger a full budget past its work.
+            handoffDeadlines.disarmAll();
             bridge.realmDispose(realm);
         },
     };
@@ -538,7 +560,6 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         // Contact policy is transport config (§12.6.3).
         transportConfig: transportConfigFrom(
             peers,
-            cfg.requestDeadlineMs === undefined ? undefined : String(cfg.requestDeadlineMs),
             cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         ),
     });

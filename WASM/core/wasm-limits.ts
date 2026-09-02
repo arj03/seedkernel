@@ -15,8 +15,10 @@ export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
  *  ship are held to one number rather than two that drift. */
 export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
 
-/** Default budget of guest execution time per entrypoint invocation (§12.3). Generous for
- *  any real request, and short enough that a wedged guest frees the host thread. */
+/** Default budget per entrypoint invocation (§12.3): guest execution AND the wall clock of
+ *  every handoff the invocation makes — queue wait, a parked host call, socket backlog, a
+ *  deferred answer. Generous for any real request, and short enough that a wedged guest
+ *  frees the host thread. */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
 /** How many deadlines one guest realm may hold at once (§12.3), enforced per realm by the
@@ -40,12 +42,6 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
  *  a stalled destination from turning the caller's confined heap into unbounded host
  *  memory. Applies to every host call, not only networking. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
-
-/** How deep one realm's entry queue may get. A DEPTH bound with no byte companion, on
- *  purpose: a waiting invocation's bytes are already owned for a longer period by whoever
- *  handed them over — an inbound read by its link, a guest call by the calling realm's
- *  active-call registry. See `serializeCalls` (host/realm-queue.ts). */
-export const DEFAULT_MAX_QUEUED_REALM_INVOCATIONS = 1 << 8;
 
 /** Confined realms one node may hold at once (`slots`, shell-core.ts). The MULTIPLICAND:
  *  every per-realm ceiling here is one of these times this number, which is what makes the

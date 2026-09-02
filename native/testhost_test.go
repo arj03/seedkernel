@@ -119,7 +119,6 @@ type nodeConfig struct {
 	Listen           *hostPort `json:"listen,omitempty"`
 	WsListen         *hostPort `json:"wsListen,omitempty"`
 	Peers            []string  `json:"peers,omitempty"`
-	RequestDeadline  int       `json:"requestDeadlineMs,omitempty"`
 }
 
 type hostPort struct {
@@ -213,7 +212,7 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 	tb.Helper()
 	bootRealmIn(tb, dir)
 	policyJSON = withTransportAuthor(tb, policyJSON)
-	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, RequestDeadline: 2000}
+	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON
 	}

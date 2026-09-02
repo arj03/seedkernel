@@ -61,7 +61,6 @@ const cohort = configuredPeers.map((p) => {
     dest: p.dest ?? "",
   };
 });
-const requestDeadlineMs = policy("requestDeadlineMs");
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
 // These policies and their defaults belong to this signed program. LOCAL is the
@@ -504,10 +503,9 @@ entry("linkClosed", (r) => {
 entry("timer", (r) => fireTimer(r.u32()));
 
 /** App-facing send: deferred because the peer's response is another invocation of this
- *  realm. `deadlineMs` 0 → node default. */
+ *  realm. Its deadline is kernel handoff state, not a field in this content protocol. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
-  const deadlineMs = r.u32() || requestDeadlineMs;
   // `blob` is a VIEW of the caller's argument bytes; `.slice()` below is the first copy.
   const to = r.blob();
   const protoIn = r.blob();
@@ -523,11 +521,11 @@ entry("send", (r, caller) => {
   const proto = protoIn.slice();
   const payload = payloadIn.slice();
   if (noReply) {
-    reqres.request(null, toHex(to), proto, payload, true, 0);
+    reqres.request(null, toHex(to), proto, payload, true);
     return Uint8Array.from([1]);
   }
   const d = defer();
-  reqres.request(d, toHex(to), proto, payload, false, deadlineMs);
+  reqres.request(d, toHex(to), proto, payload, false);
   return d.promise;
 });
 

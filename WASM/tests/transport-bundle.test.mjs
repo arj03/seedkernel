@@ -110,7 +110,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: {
-      config: { requestDeadlineMs: 321, networkKey: "operator-cannot-replace-this" },
+      config: { linkIdleTimeoutMs: 321, networkKey: "operator-cannot-replace-this" },
       bundle: transportBlob,
     },
     createRealm: async (o) => {
@@ -124,9 +124,9 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   const [appConfig, localConfig] = Function(
     source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
   )();
-  assert(appConfig.requestDeadlineMs === TRANSPORT_APP_CONFIG.requestDeadlineMs,
+  assert(appConfig.connsPerPeer === TRANSPORT_APP_CONFIG.connsPerPeer,
     "transport defaults arrive from signed APP config");
-  assert(localConfig.requestDeadlineMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.networkKey),
+  assert(localConfig.linkIdleTimeoutMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.networkKey),
     "bootShell transport.config reaches LOCAL while the host-owned node fact wins a collision");
   shell.close();
 }
@@ -142,7 +142,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     grants: { link: [transportAuthor] },
   }));
   const transportOptions = { channels, listen, load: false, bundle: transportBlob };
-  const transportConfig = { requestDeadlineMs: 800 };
+  const transportConfig = {};
   // A test may pause a candidate right after its realm stands, before the shell publishes
   // it: its LOCAL facts are installed, but the incumbent still owns `_net`, which exposes
   // address-book updates in the replacement window deterministically.

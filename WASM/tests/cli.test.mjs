@@ -134,15 +134,6 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   ok(host.stood.guestDeadlineMs === Infinity, "--guest-timeout 0 is Infinity — no budget, said explicitly");
 }
 
-// A transport-program knob uses the bundle's installation-local config path, not the
-// socket driver's options.
-{
-  const host = fakeHost(["--key", join(work, "t.key"), "--request-deadline", "250"]);
-  await runCli(host);
-  ok(host.stood.transportConfig?.requestDeadlineMs === 250,
-    "--request-deadline reaches the signed transport as transportConfig");
-}
-
 // App config belongs to the bundle named in the same invocation. It is not node setup,
 // which would also feed it to the transport and every later bundle on this shell.
 {

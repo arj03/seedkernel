@@ -106,15 +106,14 @@ const netBenchHarness = `
 	  const bApp = await b.shell.loadBundleBlob(__appBlob);
 
 	  // The transport's 'send' op argument order (transport/src/core.js):
-	  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+	  // [noReply u8][to blob][proto blob][payload blob].
 	  const proto = new TextEncoder().encode(%q);
 	  const to = fromHex(aId);
 	  const sendArgs = (payload) => {
-	    const out = new Uint8Array(1 + 4 + 4 + to.length + 4 + proto.length + 4 + payload.length);
+	    const out = new Uint8Array(1 + 4 + to.length + 4 + proto.length + 4 + payload.length);
 	    let off = 0;
 	    out[off++] = 0;
 	    const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
-	    u32(0);                                  // deadline: the node's default
 	    u32(to.length); out.set(to, off); off += to.length;
 	    u32(proto.length); out.set(proto, off); off += proto.length;
 	    u32(payload.length); out.set(payload, off);

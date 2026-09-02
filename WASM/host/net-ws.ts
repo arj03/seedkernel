@@ -18,7 +18,7 @@ import { parseDest } from "./peer-addr.js";
  *  conforming implementation (the browser global, Bun's, or a test double). */
 export interface WsLike {
   binaryType: string;
-  /** Bytes queued but not yet on the wire — the stall clock's progress signal
+  /** Bytes queued but not yet on the wire — the host owner's custody signal
    *  (socket-seam.ts `RawLink.buffered`). Optional: not every WebSocket-shaped
    *  object in a test double reports it. */
   bufferedAmount?: number;

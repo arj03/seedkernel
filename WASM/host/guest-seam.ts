@@ -36,7 +36,7 @@ export interface SeamCrypto {
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
 export interface SeamCalls {
-    call(id: string, payload: Uint8Array): Promise<Uint8Array> | null;
+    call(id: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
 }
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
@@ -53,9 +53,6 @@ export interface RawNet {
     /** Tear a link down. `graceful` asks the channel to flush already-written bytes
      *  first (socket-seam.ts `RawLink.close`). */
     close(linkId: number, graceful: boolean): void;
-    /** Bytes written to this link that are not yet on the wire (socket-seam.ts
-     *  `RawLink.buffered`). The transport host supplies 0 when its channel cannot say. */
-    buffered(linkId: number): number;
     /** Route one request this occupant decoded off its links: `(claim, attribution,
      *  payload)`, answered with the claimant's bytes. No new authority — the call names no
      *  link, and all three arguments are already the caller's own to choose, so it is worth
@@ -65,7 +62,7 @@ export interface RawNet {
      *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
      *  frame, since a realm serializes its invocations. The caller must therefore fire this
      *  and return from its event rather than await it inside one. */
-    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
+    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -186,7 +183,7 @@ const HANDLER_KEYS: readonly string[] = [
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
-type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+type SeamHandler = (payload: Uint8Array, budget?: CallBudget) => Uint8Array | Promise<Uint8Array>;
 /** Residual host-transform table (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     return {
@@ -495,21 +492,16 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             rawNet().close(readU32BE(payload, 0), payload[4] === 1);
             return NONE;
         },
-        "link/stat": (payload) => {
-            const out = new Uint8Array(4);
-            writeU32BE(out, 0, rawNet().buffered(readU32BE(payload, 0)));
-            return out;
-        },
         // Inbound attributed delivery (§12.10), the one `link` name that carries something
         // INTO the node rather than out of it: `[claimLen u8][claim][attribution 32]
         // [payload …]`. The attribution is fixed at the kernel's caller-id width — it IS
         // that field, filled with the authenticated sender — so nothing here is
         // length-delimited except the claim, and the payload simply runs to the end. One
         // request per call is what makes that safe.
-        "link/deliver": (payload) => {
+        "link/deliver": (payload, budget) => {
             const attrAt = 1 + payload[0];
             const bodyAt = attrAt + HOST_CALLER_ID.length;
-            return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt));
+            return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt), budget?.remainingMs);
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {
@@ -576,7 +568,9 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // on a later turn, never inside this guest's frame; an id nothing claims is refused
         // by name rather than parked on a promise no one will settle.
         if (localServices.has(name)) {
-            const answer = grants.calls.call(name, payload);
+            if (budget !== undefined && budget.remainingMs <= 0)
+                throw new Error("guest-seam: execution budget exhausted before " + name);
+            const answer = grants.calls.call(name, payload, budget?.remainingMs);
             if (!answer)
                 throw new Error("guest-seam: no realm claims " + name);
             return answer;
@@ -599,7 +593,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
             // (every crypto name, clock, link, timer) resolves in a microtask exactly like
             // a round-tripping one. An inline THROW propagates synchronously, on purpose —
             // see the contract above.
-            return Promise.resolve(fn(payload));
+            return Promise.resolve(fn(payload, budget));
         }
         // Any other name is one of THIS slot's private modules, by its manifest name. The
         // slot wired this value directly, so no name can reach another app. Ungated like

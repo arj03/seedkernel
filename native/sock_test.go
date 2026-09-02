@@ -177,7 +177,7 @@ func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 }
 
 // TestSockChannelBufferedReportsQueue pins the fact the native RawLink exposes to the
-// transport's stall clock. No writer is started, so every byte remains deterministically
+// host's outbound custody owner. No writer is started, so every byte remains deterministically
 // queued until a non-graceful close drops it.
 func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	c := &sockChannel{wake: make(chan struct{}, 1)}

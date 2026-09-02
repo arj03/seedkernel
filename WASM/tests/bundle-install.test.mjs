@@ -1235,7 +1235,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "the neighbour holds the claim the candidate is about to reach for");
 
     let rejected = false;
-    const localConfig = { custom: "kept", networkKey: "caller-value", requestDeadlineMs: 1 };
+    const localConfig = { custom: "kept", networkKey: "caller-value", linkIdleTimeoutMs: 1 };
     try { await shell.loadBundleBlob(blob, { localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
     const [, candidateLocal] = Function(
@@ -1244,7 +1244,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(candidateLocal.custom === "kept",
       "a link slot keeps the load's ordinary installation-local config");
     assert(candidateLocal.networkKey === "00".repeat(32) &&
-      candidateLocal.requestDeadlineMs === 1 && candidateLocal.peerId === undefined,
+      candidateLocal.linkIdleTimeoutMs === 1 && candidateLocal.peerId === undefined,
       "only the driver's one immutable node fact overrides a same-named LOCAL key");
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second privileged init path");

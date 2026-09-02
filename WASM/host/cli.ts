@@ -28,7 +28,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
   "bundle", "op", "app-config", "revoke", "uninstall",
-  "request-deadline", "guest-timeout", "guest-memory", "transport",
+  "guest-timeout", "guest-memory", "transport",
 ]);
 
 /** File access, as the flow needs it: a read that answers `null` for "absent" rather
@@ -62,11 +62,10 @@ export interface NodeRuntime {
 
 /** This node's transport config, shared by the CLI and native assemblies (§12.6). */
 export function transportConfigFrom(
-  peerSpecs: readonly string[], requestDeadline?: string, contactSecret?: Uint8Array,
+  peerSpecs: readonly string[], contactSecret?: Uint8Array,
 ): JsonObject | undefined {
   const cfg: JsonObject = {};
   if (peerSpecs.length > 0) cfg.peers = peersConfig(peerSpecs);
-  if (requestDeadline !== undefined) cfg.requestDeadlineMs = Number(requestDeadline);
   if (contactSecret !== undefined) cfg.contactSecret = toHex(contactSecret);
   return Object.keys(cfg).length > 0 ? cfg : undefined;
 }
@@ -244,7 +243,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     wsListen: args.has("ws-listen")
       ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
-    transportConfig: transportConfigFrom(peers, args.get("request-deadline"),
+    transportConfig: transportConfigFrom(peers,
       contactSecretPath === undefined ? undefined : loadHex32(host, contactSecretPath, "--contact-secret")),
     // Guest resource bounds (§12.3), which only widen or tighten the shell's own
     // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,

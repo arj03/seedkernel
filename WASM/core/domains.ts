@@ -38,7 +38,7 @@ export const HOST_SERVICES = {
     timer: { privilege: "app", calls: ["arm", "clear"] },
     link: {
         privilege: "link",
-        calls: ["open", "send", "close", "stat", "deliver"],
+        calls: ["open", "send", "close", "deliver"],
         events: ["linkOpen", "linkBytes", "linkClosed"],
     },
 } as const;

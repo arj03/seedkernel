@@ -16,7 +16,6 @@ const N_LINK_SEND = "link/send";
 const N_LINK_CLOSE = "link/close";
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
-const N_LINK_STAT = "link/stat";
 // The one link name that carries something IN rather than out: a request this program
 // decoded off a link, handed to the host's claim routing.
 const N_LINK_DELIVER = "link/deliver";
@@ -220,11 +219,6 @@ async function netLinkOpen(dest) {
 /** Answer once the raw-link owner has accepted the bytes. */
 function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)).then(() => {}); }
 function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {}); }
-/** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
- *  or a channel that cannot say — both read as "nothing queued", which leaves the
- *  stall clock to the deadline alone. */
-async function netLinkBuffered(linkId) { return readU32BE(await host.call(N_LINK_STAT, args([linkId], [])), 0); }
-
 /** Hand ONE request this program decoded to the host's claim routing:
  *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
  *  (empty both for a claim no peer may reach and for a handler that failed — one fact at

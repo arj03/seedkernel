@@ -419,14 +419,13 @@ const probeGuestSource = `
 `
 
 // probeSendArgs encodes the `send` op's arguments:
-// [noReply u8][deadline u32][to blob][proto blob][payload blob].
+// [noReply u8][to blob][proto blob][payload blob].
 func probeSendArgs(toHexID, proto string, payload []byte) []byte {
 	to, err := hex.DecodeString(toHexID)
 	if err != nil {
 		panic("probeSendArgs: " + err.Error())
 	}
 	out := []byte{0}
-	out = binary.BigEndian.AppendUint32(out, 0) // deadline: the node's default
 	out = binary.BigEndian.AppendUint32(out, uint32(len(to)))
 	out = append(out, to...)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(proto)))

@@ -67,7 +67,7 @@ type sockChannel struct {
 	mu         sync.Mutex
 	conn       net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
 	queue      [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
-	queued     int      // bytes held in queue, reported to the transport's stall clock
+	queued     int      // bytes held in queue, reported to the host's outbound owner
 	dead       bool
 	closeGrace time.Duration // installed from the shared TypeScript network policy
 
@@ -138,9 +138,9 @@ func (c *sockChannel) send(bytes []byte) {
 	runtime.Gosched()
 }
 
-// buffered is the transport-owned stall clock's view of this socket: bytes accepted from
-// the guest whose conn.Write has not completed. The bundle decides how much queued progress
-// is acceptable; this primitive only reports the fact.
+// buffered is the host custody owner's view of this socket: bytes accepted from the guest
+// whose conn.Write has not completed. This primitive reports the fact; transport content
+// neither reads it nor derives time policy from it.
 func (c *sockChannel) buffered() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

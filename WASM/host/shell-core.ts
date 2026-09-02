@@ -90,7 +90,7 @@ export interface Shell {
      *  is slot-bound, this is local reach, `link/deliver` is peer reach. An embedder or the
      *  CLI composes the op frame (op-frame.ts) — this is how the node's own transport is
      *  asked to wait for a cohort, list peers, or learn an address. */
-    call(serviceId: string, payload: Uint8Array): Promise<Uint8Array> | null;
+    call(serviceId: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
     /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
      *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
     fs?: Fs;
@@ -130,7 +130,7 @@ export interface AppHandle extends LoadedBundle {
      *  load stood. A replacement load stands a new slot under the same key, so a handle
      *  taken before it keeps naming the version it was handed and rejects once that slot
      *  is disposed. The replacement load returns the new handle. */
-    invoke(payload: Uint8Array): Promise<Uint8Array>;
+    invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
 }
 
 // Re-exported so a target reaches the admission constructors from the same module it gets
@@ -363,10 +363,10 @@ export interface BootShellOptions {
      *  occupant cannot choose. Drop it from the preimage and a transport on one network can
      *  mint transcripts another's verifier accepts. */
     networkKey?: Uint8Array;
-    /** This node's DEFAULT budget of guest execution time per entrypoint invocation, in ms.
-     *  Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. Counts time the guest
-     *  is *running*, not time parked on a host seam, so it bounds a wedged guest without
-     *  penalising one awaiting the network. The operator's number, not the author's: unlike
+    /** This node's DEFAULT guest execution and handoff budget per entrypoint invocation,
+     *  in ms. Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables the local ceiling.
+     *  A finite initiating caller still narrows an unbounded callee. The operator's number,
+     *  not the author's: unlike
      *  the module memory ceiling (§4.3), how long this node spends on one message is a
      *  property of the deployment. */
     guestDeadlineMs?: number;
@@ -595,7 +595,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // may be installed before its service, and a later load may replace that
                 // service — a claimant captured at seam construction would pin this realm
                 // to whoever was there first.
-                calls: { call: (id, payload) => callClaimant(localClaims, id, callerId, payload) },
+                calls: { call: (id, payload, deadlineMs) => callClaimant(localClaims, id, callerId, payload, deadlineMs) },
                 rawNet: links ? netHost?.rawNet() : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
@@ -625,8 +625,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
      *  prefix, never the guest's own spelling. The null arm is reachable only from guest
      *  top-level code while its candidate realm is still being constructed. */
-    const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
-        ? slot.realm.call(input)
+    const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number) => slot.realm
+        ? slot.realm.call(input, deadlineMs)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
     /** Chain a host-initiated call onto `inFlight`, so `close()` waits for it rather than
      *  freeing the realm out from under it (§12.3). */
@@ -636,8 +636,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     };
     /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
      *  caller id the shell holds (loopback and socket events). */
-    const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
-        callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
+    const hostCallSlot = (slot: AppSlot, body: Uint8Array, deadlineMs?: number): Promise<Uint8Array> =>
+        callSlot(slot, concatBytes([HOST_CALLER_ID, body]), deadlineMs);
     /** Add the host-owned network key to transport `LOCAL` (§12.10). */
     const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
         if (!hasLink(slot)) return localConfig;
@@ -688,26 +688,26 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     /** Frame `[attribution ‖ payload]` and enter a slot's guest — the shape both a
      *  cross-realm call and a peer-inbound frame arrive as (`callClaimant`,
      *  `deliverInbound`). */
-    const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> => {
+    const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> => {
         const input = new Uint8Array(attribution.length + payload.length);
         input.set(attribution, 0);
         input.set(payload, attribution.length);
-        return callSlot(slot, input);
+        return callSlot(slot, input, deadlineMs);
     };
     /** Hand a request to the realm claiming `claim` in `book`. `null` when nothing claims
      *  it — an answer, rather than a promise no one will settle. */
-    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null => {
         const slot = book.get(claim);
-        return slot ? callFramed(slot, attribution, payload) : null;
+        return slot ? callFramed(slot, attribution, payload, deadlineMs) : null;
     };
     /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
      *  on `peerClaims`, so a `services` claim is unreachable by a peer by construction
      *  rather than by a second test against the slot's manifest. The resolved answer also
      *  goes to the slot's `onInbound`, if its load named one. */
-    const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+    const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null => {
         const slot = peerClaims.get(claim);
         if (!slot) return null;
-        const answer = callFramed(slot, attribution, payload);
+        const answer = callFramed(slot, attribution, payload, deadlineMs);
         if (slot.onInbound) {
             const onInbound = slot.onInbound;
             // Two-arg `.then`, not a bare call plus a stray `.catch`: this branch's own
@@ -731,8 +731,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             return slot ? keyOf(slot) : null;
         },
         routes: () => [...peerClaims, ...localClaims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
-        call: (serviceId, payload) => {
-            const answer = callClaimant(localClaims, serviceId, HOST_CALLER_ID, payload);
+        call: (serviceId, payload, deadlineMs) => {
+            const answer = callClaimant(localClaims, serviceId, HOST_CALLER_ID, payload, deadlineMs);
             return answer && track(answer);
         },
         fs,
@@ -826,8 +826,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 key,
                 fs: slot.fsScope,
                 appScope: slot.appScope,
-                invoke: (payload) => slot.active
-                    ? track(hostCallSlot(slot, payload))
+                invoke: (payload, deadlineMs) => slot.active
+                    ? track(hostCallSlot(slot, payload, deadlineMs))
                     : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
             };
             return handle;

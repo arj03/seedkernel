@@ -16,7 +16,7 @@ export abstract class BufferedChannel {
      *  transport that cannot say; `buffered()` still reports the pre-open queue. */
     protected backlog(): number { return 0; }
     /** Written-but-not-yet-on-the-wire bytes: the pre-open queue plus the transport's
-     *  own backlog. Feeds the transport bundle's stall clock (socket-seam.ts). */
+     *  own backlog. Feeds the host's outbound custody owner (socket-seam.ts). */
     buffered(): number { return this.pendingBytes + this.backlog(); }
     send(bytes: Uint8Array): void {
         if (this.dead)
@@ -97,7 +97,7 @@ export abstract class BufferedChannel {
  *  console peer's own peer-connection implementation has to satisfy. */
 export interface MessageTransport {
     binaryType: string;
-    /** Bytes queued but not yet on the wire — the stall clock's progress signal
+    /** Bytes queued but not yet on the wire — the host owner's custody signal
      *  (socket-seam.ts `RawLink.buffered`). Optional: not every transport-shaped
      *  object in a test double reports it. */
     bufferedAmount?: number;
@@ -130,7 +130,7 @@ export class MessageChannel extends BufferedChannel {
     protected write(bytes: Uint8Array): void {
         this.t.send(bytes);
     }
-    /** The transport's own send backlog. */
+    /** The platform transport's own send backlog. */
     protected backlog(): number { return this.t.bufferedAmount ?? 0; }
     // Both real transports drain their queued frames before going away, so a
     // graceful stop needs nothing extra here.

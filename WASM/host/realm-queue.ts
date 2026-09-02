@@ -1,16 +1,10 @@
-// The per-realm boundary owners shared by both realm factories (safe-js.ts on the JS
-// platform, native-shim.ts over Go's quickjs-ng): active guest-to-host calls, and the
-// serialized entry of payloads into the guest.
-//
-// Every owner here is scoped to ONE realm and none is shared between realms. The node's
-// total is what these admit times `DEFAULT_MAX_APP_SLOTS` (core/wasm-limits.ts), which is
-// the same bound a pool held in common would give — without the pool's standing channel
-// for a busy app to refuse a quiet one's calls.
+// Per-realm host-side owners shared by the JS and native realm factories: active
+// guest-to-host calls and serialized entry into one confined realm.
 
 import {
+  DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-  DEFAULT_MAX_QUEUED_REALM_INVOCATIONS,
 } from "../core/wasm-limits.js";
 
 function checkedBytes(bytes: number): number {
@@ -20,27 +14,13 @@ function checkedBytes(bytes: number): number {
   return bytes;
 }
 
-/** One active call's custody, held from admission through settlement. Further host copies
- * are reserved before they are made, and everything reserved stays owned until the response
- * has been delivered or the call has terminally failed.
- *
- * Bounded in TIME as well as size (§12.3): the host's answer releases it, and disposal
- * releases whatever never answered — the guest that would have consumed it is gone, so what
- * a still-pending backend holds is the host's own memory, not this realm's. Without that
- * second path one unanswering backend pins the realm's allowance for good. */
+/** One active call's custody, held from admission through settlement. */
 export interface ActiveHostCall {
   reserve(bytes: number): void;
   release(): void;
 }
 
-/** Own every guest-to-host copy and promise slot from admission through settlement (§12.3).
- * Id, count slot and actual source width are admitted atomically. The id is the guest's own,
- * so it is checked here rather than trusted: guest.go must key its parked calls by it to
- * route settlements, and a target that admitted a duplicate where the other refuses one
- * would be the two engines disagreeing about the guest's ABI. No operation name reaches here
- * either: policy elsewhere is legitimately name-keyed (`MemoryFs`'s quota, `isIrreversible`),
- * but a name may only TIGHTEN what an owner admits, and this owner has no exemption to
- * give — the resource's owner decides, never the dispatcher that routed the call. */
+/** Own every guest-to-host copy and promise slot from admission through settlement. */
 export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
@@ -86,58 +66,115 @@ export function createActiveHostCallRegistry(
       };
       active.set(callId, call);
       return call;
-
     },
   };
 }
 
-/** One entrypoint invocation, in the two moments that are not always the same. */
+/** One entrypoint invocation, split into its answer and queue-release moments. */
 export interface Invocation {
-  /** The entrypoint's answer, which is what the caller of `call` receives. A deferred
-   *  entrypoint (`__deferred`) hands it to an arbitrary later turn under no wall-clock
-   *  bound, so only the realm's own dispose can guarantee it settles (safe-js.ts,
-   *  native-shim.ts). */
   result: Promise<Uint8Array>;
-  /** Settles when this realm is free for the next invocation. */
   released: Promise<unknown>;
+  /** Drop host-side settlement state if the handoff deadline wins. */
+  cancel?(reason: Error): void;
 }
 
-/** Serialize realm entry, bounding the DEPTH of what waits on the Promise chain.
+/** Monotonic milliseconds. A deadline here is the distance between two readings, so a wall
+ *  clock is the wrong source: a step backwards expires every live one at once and a step
+ *  forwards extends them all. Node, Bun and the browsers answer natively; the native host
+ *  realm is given it beside `setTimeout` (native/loop.go). */
+export const monotonicMs = (): number => performance.now();
+
+/** Convert a live remainder into the absolute deadline that crosses this handoff. */
+const deadlineAt = (remainingMs: number): number => {
+  if (remainingMs === Infinity) return Infinity;
+  if (!Number.isFinite(remainingMs) || remainingMs < 0) {
+    throw new Error("guest: handoff deadline must be a non-negative finite duration or Infinity");
+  }
+  return monotonicMs() + remainingMs;
+};
+
+/** An absolute deadline as the REJECTION its owner races the real answer against. That shape
+ *  is the whole of the "exactly one settlement" rule here — `Promise.race` already grants it,
+ *  so no owner needs a claim flag of its own, and expiry arrives at every call site as
+ *  ordinary failure rather than a second settlement path. `disarm` ends it, since a timer
+ *  nobody awaits still holds the host's event loop open. Re-armed in pieces for a ceiling
+ *  past `setTimeout`'s range, which fires at once if handed over whole; the Error costs
+ *  nothing unless it lands. */
+const expiryAt = (at: number, message: string): { rejects: Promise<never>; disarm(): void } => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reject!: (err: Error) => void;
+  const rejects = new Promise<never>((_, rj) => { reject = rj; });
+  const arm = (): void => {
+    const left = at - monotonicMs();
+    if (left <= 0) return reject(new Error(message));
+    timer = setTimeout(arm, Math.min(left, 0x7fffffff));
+  };
+  if (at !== Infinity) arm();
+  return { rejects, disarm: () => clearTimeout(timer) };
+};
+
+/** Every handoff deadline a realm has armed for a call it has not settled — the wall-clock
+ *  half of the custody the active-call registry keeps in bytes, ended by the same three
+ *  events. `disarmAll` is not tidiness: nothing inside a disposed realm will consume those
+ *  answers, and each abandoned timer holds the host's event loop for the rest of its
+ *  remainder, so a one-shot process would linger a full budget past its work. */
+export function createHandoffDeadlines(): {
+  /** `answer`, or the deadline's rejection — whichever lands first. */
+  race<T>(remainingMs: number, answer: Promise<T>, message: string): Promise<T>;
+  disarmAll(): void;
+} {
+  const armed = new Set<() => void>();
+  return {
+    race(remainingMs, answer, message) {
+      const at = deadlineAt(remainingMs);
+      if (at === Infinity) return answer;
+      const { rejects, disarm } = expiryAt(at, message);
+      const drop = (): void => { armed.delete(drop); disarm(); };
+      armed.add(drop);
+      return Promise.race([answer, rejects]).finally(drop);
+    },
+    disarmAll(): void {
+      for (const drop of [...armed]) drop();
+    },
+  };
+}
+
+/** Serialize realm entry under one deadline that starts at admission.
  *
- * Depth only, and the payload is BORROWED, not copied — both follow from the same fact:
- * every payload reaching here is already owned for a period that contains this one (§12.3),
- * by the link that read it, by the calling realm's `ActiveHostCall`, or by the host caller
- * that allocated it. Counting or copying those bytes again would double the memory the
- * ownership rule exists to bound. Depth is this queue's own: waiting invocations are
- * objects on a chain nobody else counts. */
+ * Payload bytes are borrowed from a longer-lived upstream owner. Queue depth is likewise
+ * derived from those bounded callers rather than capped by an unrelated number here. The
+ * absolute deadline covers queue wait, guest execution, and a deferred answer. */
 export function serializeCalls(
-  invoke: (payload: Uint8Array) => Invocation,
+  invoke: (payload: Uint8Array, deadlineMs: number) => Invocation,
   notReady: () => Error | null,
-  maxQueuedCalls = DEFAULT_MAX_QUEUED_REALM_INVOCATIONS,
-): (payload: Uint8Array) => Promise<Uint8Array> {
+  defaultDeadlineMs = DEFAULT_GUEST_DEADLINE_MS,
+): (payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> {
+  const LATE = "guest: realm invocation handoff deadline exceeded";
   let tail: Promise<unknown> = Promise.resolve();
-  let queued = 0;
-  return (payload) => {
-    // Closed owners stop admission immediately. Already accepted work checks again when it
-    // reaches the front because teardown can overtake it while it waits.
+  return (payload, suppliedDeadlineMs) => {
     const admissionError = notReady();
     if (admissionError) return Promise.reject(admissionError);
-    if (queued >= maxQueuedCalls) {
-      return Promise.reject(new Error(`guest: too many queued realm invocations (cap ${maxQueuedCalls})`));
-    }
-    queued++;
+
+    let at: number;
+    // A callee may tighten its configured ceiling, never mint time for the caller.
+    try { at = deadlineAt(Math.min(suppliedDeadlineMs ?? defaultDeadlineMs, defaultDeadlineMs)); }
+    catch (err) { return Promise.reject(err); }
+    const { rejects, disarm } = expiryAt(at, LATE);
+    let invocation: Invocation | undefined;
+    // Drop the host-side settlement state of an invocation the deadline overtook mid-flight.
+    void rejects.catch((err: Error) => invocation?.cancel?.(err));
+
+    // Stay behind the predecessor even when the caller times out while queued: a
+    // caller-facing race used as `tail` would break serialization. The clock is re-read at
+    // the front rather than trusting a flag, so a late timer cannot admit an expired entry.
     const started = tail.then(() => {
-      try {
-        const err = notReady();
-        if (err) throw err;
-        return invoke(payload);
-      } finally {
-        queued--;
-      }
+      if (monotonicMs() >= at) throw new Error(LATE);
+      const err = notReady();
+      if (err) throw err;
+      invocation = invoke(payload, at === Infinity ? Infinity : Math.max(0, at - monotonicMs()));
+      return invocation;
     });
-    // A failed invocation must not poison later work. The caller owns the real rejection;
-    // this internal tail consumes both outcomes.
-    tail = started.then((inv) => inv.released, () => {}).then(() => {}, () => {});
-    return started.then((inv) => inv.result);
+    tail = Promise.race([started.then((inv) => inv.released), rejects]).catch(() => {});
+    return Promise.race([started.then((inv) => inv.result), rejects]).finally(disarm);
   };
 }

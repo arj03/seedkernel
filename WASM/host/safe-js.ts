@@ -27,7 +27,9 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
-import { createActiveHostCallRegistry, serializeCalls, type Invocation } from "./realm-queue.js";
+import {
+  createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls, type Invocation,
+} from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
@@ -41,15 +43,17 @@ export interface SafeRealmOptions {
   /** Hard cap on the realm's heap (default 64 MiB). A runaway guest hits this
    *  instead of the host's memory. */
   memoryLimitBytes?: number;
-  /** Guest execution budget per entrypoint, in ms. Running time, not wall clock.
-   *  `Infinity` disables; omit for default. */
+  /** Guest execution and handoff budget per entrypoint, in ms. `Infinity` disables;
+   *  omit for default. */
   deadlineMs?: number;
 }
 
 export interface SafeRealm {
   /** Invoke the guest's one `handle` entrypoint with `[caller 32][body …]` — the only
    *  way in, for both roles. Serialized per realm (realm-queue.ts). */
-  call(payload: Uint8Array): Promise<Uint8Array>;
+  /** `deadlineMs` is the initiating owner's live remainder. Omission means a
+   *  host-initiated call and takes this realm's configured ceiling. */
+  call(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
   dispose(): void;
 }
 
@@ -65,50 +69,59 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : (u8.slice().buffer as ArrayBuffer);
 }
 
-/** Guest execution-time accounting: budget over running time only (§12.3). */
+/** Guest execution-time accounting under the current invocation's handoff deadline (§12.3). */
 interface ExecClock {
   /** Guest code is about to run. */
   begin(): void;
   /** Guest code has returned control to the host. */
   end(): void;
-  /** Start a fresh budget — one entrypoint invocation. */
-  reset(): void;
+  /** Start one invocation, narrowed by the handoff remainder that admitted it. */
+  reset(deadlineMs?: number): void;
   /** The guest's remaining execution segment, in ms — read at the moment a call is made,
    *  and carried as a module call's deadline, so a module runs under the budget of the
    *  segment that called it (§4.3). Infinity for an unbounded realm. */
   remaining(): number;
   /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module call,
-   *  whose time is the guest's by §4.3 but is burned while the segment is closed. Without it
-   *  a deadline bounds one call and nothing bounds the sequence: a guest looping
-   *  `await host.call("spinner")` advances its own clock by microseconds per turn and draws
-   *  a fresh full budget each time. A parked `fs/*` or `_net` call is NOT charged — that is
-   *  waiting, and charging it would kill the initiator the split exists to protect. */
+   *  whose time is the guest's by §4.3 but is burned while the segment is closed. What it
+   *  bounds that the handoff deadline cannot is CONCURRENT burn: a guest awaiting one module
+   *  at a time spends wall clock at the same rate, so the deadline already stops it, but a
+   *  guest fanning out to N workers burns N ms of CPU per ms of its own wait. Summing the
+   *  measured burns is what holds that sum inside the window the invocation was admitted
+   *  under, instead of multiplying it by however many modules the bundle ships. */
   charge(ms: number): void;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
 function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock {
   ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES);
-  const budgetMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
+  const configuredMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
+  let budgetMs = configuredMs;
+  let wallDeadline = Infinity;
   let consumedMs = 0;
   let segmentStart = 0;
   let running = false;
-  // Installed only when there is a budget to enforce: the handler crosses out of wasm into
-  // JS every few thousand bytecodes, so one that can never return true is a real cost paid
-  // for a guard nobody armed. While installed it reads `running`, so a parked initiator is
-  // never interrupted.
-  if (Number.isFinite(budgetMs)) {
-    ctx.runtime.setInterruptHandler(
-      () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
-    );
-  }
+  // An unbounded realm can still receive a finite caller-owned handoff, so the interrupt
+  // handler is installed for dynamic invocation limits rather than only for the default.
+  ctx.runtime.setInterruptHandler(() => {
+    if (!running) return false;
+    const now = monotonicMs();
+    return consumedMs + (now - segmentStart) > budgetMs || now >= wallDeadline;
+  });
   return {
-    begin() { segmentStart = Date.now(); running = true; },
-    end() { if (running) { consumedMs += Date.now() - segmentStart; running = false; } },
-    reset() { consumedMs = 0; },
+    begin() { segmentStart = monotonicMs(); running = true; },
+    end() { if (running) { consumedMs += monotonicMs() - segmentStart; running = false; } },
+    reset(deadlineMs = configuredMs) {
+      if (deadlineMs !== Infinity && (!Number.isFinite(deadlineMs) || deadlineMs < 0)) {
+        throw new Error("guest: invalid invocation handoff deadline");
+      }
+      budgetMs = Math.min(configuredMs, deadlineMs);
+      wallDeadline = deadlineMs === Infinity ? Infinity : monotonicMs() + deadlineMs;
+      consumedMs = 0;
+    },
     remaining() {
-      if (!running || !Number.isFinite(budgetMs)) return Infinity;
-      return Math.max(0, budgetMs - consumedMs - (Date.now() - segmentStart));
+      const now = monotonicMs();
+      const spent = consumedMs + (running ? now - segmentStart : 0);
+      return Math.max(0, Math.min(budgetMs - spent, wallDeadline - now));
     },
     charge(ms) { if (ms > 0) consumedMs += ms; },
   };
@@ -191,6 +204,9 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const clock = configureRealm(ctx, opts);
   let disposed = false;
   const activeHostCalls = createActiveHostCallRegistry();
+  // The wall-clock half of the same custody: one armed deadline per unsettled host call,
+  // disposed with the realm so an abandoned timer cannot outlive it (realm-queue.ts).
+  const handoffDeadlines = createHandoffDeadlines();
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -227,7 +243,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
 
   // Rejectors for calls currently awaiting a guest promise (§12.3) — a DEFERRED entrypoint
-  // included, whose answer has no wall-clock bound at all (realm-queue.ts). A guest promise
+  // included. Its handoff deadline supplies the wall-clock bound (realm-queue.ts). A guest promise
   // is settled from *inside* the realm, so anything that stops the realm mid-flight — a
   // budget interrupt during a continuation, or dispose() while a call is parked or deferred
   // — leaves it permanently pending. A bound that turns a runaway or silent guest into a
@@ -276,6 +292,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
+    if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
     // Inspect the borrowed view first, reserve both count and bytes, and only then copy.
     // `getArrayBuffer` owns a lifetime but not another payload-sized allocation.
     const [payload, activeCall] = (() => {
@@ -295,7 +312,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       activeCall.release();
       throw err;
     }
-    void Promise.resolve(answer).then(
+    // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
+    // its own: the arm below is the only one, for a backend answer and a late one alike.
+    void handoffDeadlines.race(budget.remainingMs, Promise.resolve(answer),
+      "guest: host.call handoff deadline exceeded").then(
       (bytes) => {
         try {
           if (disposed || !ctx.alive) return;
@@ -371,12 +391,12 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
    *
    *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
    *  the moment the synchronous segment ends, which is before the answer exists. */
-  const invoke = (payload: Uint8Array): Invocation => {
+  const invoke = (payload: Uint8Array, deadlineMs: number): Invocation => {
     // Safe unconditionally because the queue guarantees nothing else is RUNNING. A deferred
     // entrypoint has already ended its segment by the time the next one resets, so what it
     // spends settling later is charged to whichever window is open — which is whose turn
     // the guest code actually runs on.
-    clock.reset();
+    clock.reset(deadlineMs);
     stageArg(ctx, payload);
     // evalCode runs the entrypoint synchronously up to its first await; the completion value
     // is either the bytes (sync entrypoint) or a pending guest promise (async entrypoint).
@@ -401,9 +421,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
     // Read before anything awaits, so no later invocation's `__invoke` can have cleared it.
     const deferred = wasDeferred();
+    let cancel = (_reason: Error): void => {};
     const result = (async () => {
       let rejectThis!: (err: Error) => void;
       const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
+      cancel = (reason) => rejectThis(reason);
       liveInvocations.add(rejectThis);
       let consumed = false;
       try {
@@ -422,12 +444,17 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     })();
     // A deferred answer must not go unhandled while nothing is awaiting `released`:
     // the caller holds `result` and its real error, so the release arm swallows.
-    return { result, released: deferred ? Promise.resolve() : result.catch(() => {}) };
+    return {
+      result,
+      released: deferred ? Promise.resolve() : result.catch(() => {}),
+      cancel: (reason) => cancel(reason),
+    };
   };
 
   return {
     call: serializeCalls(invoke, () =>
-      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null),
+      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
+      opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
@@ -438,7 +465,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // And end custody of every call the host never answered: nothing inside this realm
       // will consume those answers now, so holding their charge would pin this realm's
       // allowance on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
+      // Their deadlines go with them: a timer left waiting to reject a call this realm no
+      // longer holds keeps the host's event loop alive for the whole of its remainder, so a
+      // one-shot process would linger a full budget past the work it came to do.
       activeHostCalls.releaseAll();
+      handoffDeadlines.disarmAll();
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
       // continuation runs as a microtask after failAll, and a handle released after its
       // context died would abort the whole wasm module. See `newRuntime` for the ordering

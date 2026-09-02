@@ -10,7 +10,7 @@ import "testing"
 func TestBootNodeDerivesIdentity(t *testing.T) {
 	bootRealm(t)
 	seedHex := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	st, err := startNode(nodeConfig{KeyHex: seedHex, ContactSecretHex: testContactSecretHex, RequestDeadline: 2000})
+	st, err := startNode(nodeConfig{KeyHex: seedHex, ContactSecretHex: testContactSecretHex})
 	if err != nil {
 		t.Fatal("bootNode:", err)
 	}

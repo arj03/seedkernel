@@ -32,7 +32,7 @@ func ensureBooted(tb testing.TB) {
 			return
 		}
 		evalString(tb, "openStore("+jsonString(dir)+")")
-		cfg := nodeConfig{KeyHex: testKeyHex(tb), RequestDeadline: 2000}
+		cfg := nodeConfig{KeyHex: testKeyHex(tb)}
 		_, benchBootErr = startNode(cfg)
 	})
 	if benchBootErr != nil {

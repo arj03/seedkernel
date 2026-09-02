@@ -44,7 +44,7 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       queueMicrotask(() => { if (!this.peer.dead) this.peer.msg?.(one); });
       return parts.length;
     },
-    // The stall clock's progress signal (core/socket-seam.ts `RawLink.buffered`):
+    // The host owner's custody signal (core/socket-seam.ts `RawLink.buffered`):
     // bytes written but not yet on the wire, driven directly by a test to model a socket
     // that is backpressured, draining or stuck. `trackBacklog` instead grows it by what
     // `send` was handed: `LinkOutboundOwner` reconciles against the DELTA of this report,
@@ -220,37 +220,25 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   assert(!longSettled, "a peer's short-deadline request must not settle its long-deadline one");
 });
 
-await test("the deadline is a STALL clock: a request still draining out is not late", async (keep) => {
-  // A clock armed when the request is QUEUED times our own upload and blames the holder
-  // for our backlog: a 50 MB PUT queued ~42 MB behind its sockets would cancel every
-  // request in the window at its 5 s deadline while the wire moves perfectly.
-  // `trackBacklog` because `LinkOutboundOwner` reconciles against the delta of the
-  // adapter's report: the 40 KB has to be a real request payload, not an invented number.
+await test("the handoff deadline includes time in the outbound socket queue", async (keep) => {
+  // The deadline belongs to the initiating call, so transport content cannot extend it by
+  // observing that bytes are still draining. `trackBacklog` proves the timeout happens
+  // while this request's real bytes are still held by the adapter.
   const chans = wirePair({ trackBacklog: true });
   const st = keep(await linked(chans, {}, { mode: "hang" }));
   const proto = PROTO;
-  // Draining 4 KB at a time — slower than the 100 ms deadline, so a queue-time clock
-  // would fire ~9 times over.
+  // Draining 4 KB at a time is slower than the 100 ms owner deadline.
   const drain = setInterval(() => { chans[0].backlog = Math.max(0, chans[0].backlog - 4_000); }, 40);
 
   const t0 = Date.now();
   const settled = st.A.request(st.B.peerId, proto, new Uint8Array(40_000), 100)
     .then(() => "resolved", () => Date.now() - t0);
 
-  // While it drains, the request must survive well past its own deadline.
-  await new Promise((r) => setTimeout(r, 300));
-  let done = false;
-  settled.then(() => { done = true; });
-  await new Promise((r) => setTimeout(r, 0));
-  assert(!done, `a request whose bytes are still going out must not be timed out (backlog ${chans[0].backlog})`);
-
-  // Once drained the peer genuinely owes an answer, so the clock becomes a plain
-  // silence window and settles — a stall clock is not a licence to hang.
   const ms = await settled;
   clearInterval(drain);
-  assert(typeof ms === "number", "an unanswered request must still reject once its bytes are out");
-  assert(ms > 300, `it must have outlived the queueing phase (settled after ${ms}ms)`);
-  assert(ms < 3000, `it must settle soon after draining, not hang (took ${ms}ms)`);
+  assert(typeof ms === "number", "an unanswered request must reject");
+  assert(ms < 1000, `the kernel deadline must not be extended by transport progress (${ms}ms)`);
+  assert(chans[0].backlog > 0, "the deadline fires while the initiating owner's bytes are still queued");
 });
 
 await test("a stalled link still settles on the deadline", async (keep) => {
@@ -513,7 +501,7 @@ await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied",
   assert(refused.includes("over the frame cap"), `an over-cap send must be refused, got ${refused || "no error"}`);
   // ...and a malformed destination, which is what the hex conversion would have run on.
   let badTo = "";
-  const args = new Uint8Array(1 + 4 + 4 + 4 + 4 + 4); // noReply, deadline, to(0), proto(0), payload(0)
+  const args = new Uint8Array(1 + 4 + 4 + 4); // noReply, to(0), proto(0), payload(0)
   try { await st.A.op("send", args); } catch (e) { badTo = String(e); }
   assert(badTo.includes("32-byte peer id"), `a malformed peer id must be refused, got ${badTo || "no error"}`);
   assert(!st.a.closed && !st.b.closed, "a refused send must not disturb the link");

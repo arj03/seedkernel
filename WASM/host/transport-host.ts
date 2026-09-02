@@ -37,7 +37,7 @@ export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
 /** The claim routing a `link/deliver` call is handed to (§12.10). `null` for a claim no
  *  peer may reach. Inbound attributed delivery costs no grant beyond `link` itself: the
  *  occupant that saw the plaintext is the one that attributes it. */
-export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array> | null;
+export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
   /** Network isolation key; absent selects the public network (§12.6.3). */
@@ -131,13 +131,8 @@ class LinkOutboundOwner {
     this.settle(this.report());
   }
 
-  /** The occupant's stall clock wants the platform's live number, not the slice-rounded
-   *  charge: an adapter that answers is exact, and only a mute one falls back (§12.6). */
-  buffered(): number {
-    const now = this.report();
-    this.settle(now);
-    return now ?? this.charged;
-  }
+  /** Reconcile platform progress before the node-wide parent admits another write. */
+  reconcile(): void { this.settle(this.report()); }
 
   releaseAll(): void {
     if (this.closed) return;
@@ -218,9 +213,22 @@ export class TransportHost {
     this.inboundReadBytes -= length;
   }
 
+  /** The node-wide allowance, as it stands without asking anyone to look again. */
+  private outboundFits(length: number): boolean {
+    return this.outboundSlices < (this.opts.maxOutboundSlices ?? MAX_NODE_OUTBOUND_QUEUE_SLICES)
+      && length <= (this.opts.maxOutboundBytes ?? MAX_NODE_OUTBOUND_QUEUE_BYTES) - this.outboundBytes;
+  }
+
   private reserveOutbound(length: number): boolean {
-    if (this.outboundSlices >= (this.opts.maxOutboundSlices ?? MAX_NODE_OUTBOUND_QUEUE_SLICES)
-      || length > (this.opts.maxOutboundBytes ?? MAX_NODE_OUTBOUND_QUEUE_BYTES) - this.outboundBytes) {
+    if (!this.outboundFits(length)) {
+      // Pull-based adapters report drain only when asked, and the link being written has
+      // already reconciled ITSELF (LinkOutboundOwner.send). Sweeping the others is what
+      // keeps bytes that have already left one link from refusing a write on another — but
+      // only a refusal needs the exact number, so the sweep stays off the per-write path
+      // rather than costing every send a walk of the whole link table.
+      for (const owner of this.outbound.values()) owner.reconcile();
+    }
+    if (!this.outboundFits(length)) {
       return false;
     }
     this.outboundSlices++;
@@ -324,21 +332,15 @@ export class TransportHost {
         // the event universal on a later turn; a backend callback racing it is idempotent.
         queueMicrotask(() => this.channelClosed(linkId, channel));
       },
-      // A link that is gone, or a channel that cannot say, both read 0 — the safe answer:
-      // the occupant's stall clock sees no progress and lets the deadline decide.
-      buffered: (linkId) => {
-        if (!bound()) return 0;
-        try { return this.outbound.get(linkId)?.buffered() ?? 0; } catch { return 0; }
-      },
       // Inbound attributed delivery (§12.10): one request the occupant decoded, routed
       // through the shell's claim table and answered back to the occupant, which frames it
       // and writes it on the wire. Under the same binding check as every op above and no
       // further grant — the occupant names no link here, and it already chose all three of
       // these arguments. A claim no peer may reach and a handler that threw both answer
       // EMPTY, so refusal and silence are one fact at this boundary.
-      deliver: (claim, attribution, payload) => {
+      deliver: (claim, attribution, payload, deadlineMs) => {
         if (!bound() || !this.deliver) return Promise.resolve(EMPTY);
-        const answer = this.deliver(claim, attribution, payload);
+        const answer = this.deliver(claim, attribution, payload, deadlineMs);
         if (!answer) return Promise.resolve(EMPTY);
         return answer.then((bytes) => bytes ?? EMPTY, () => EMPTY);
       },

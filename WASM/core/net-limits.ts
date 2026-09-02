@@ -23,8 +23,8 @@ export const MAX_INBOUND_HOLD_SLICES = 4096;
 
 /** Bytes one socket adapter may retain for writes that have not reached the wire. The
  *  transport may have many authenticated producers (local requests and peer responses),
- *  so observing backlog for stall clocks is not enough: the adapter that owns the queue
- *  fails the link before accepting a write past this ceiling. */
+ *  so the adapter reports backlog to the host owner for custody reconciliation and the
+ *  owner fails the link before accepting a write past this ceiling. */
 export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_FRAME_BYTES;
 
 /** Count companion to `MAX_OUTBOUND_QUEUE_BYTES`. Tiny writes otherwise fit millions of

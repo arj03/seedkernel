@@ -1,4 +1,4 @@
-// Link router + request/response layer (§12.6): correlation, protocol ids, stall clocks.
+// Link router + request/response layer (§12.6): correlation and protocol ids.
 
 // ── the router ────────────────────────────────────────────────────────────────
 
@@ -14,10 +14,6 @@ class Router {
   }
 
   linkCount(peerId) { const a = this.links.get(peerId); return a ? a.length : 0; }
-  /** This peer's routable links, for the stall clock's backlog read. Empty for a peer
-   *  still dialing, whose frames sit in the pre-auth pool instead (Core.sendFrame). */
-  linksTo(peerId) { return this.links.get(peerId) || []; }
-
   send(to, frame) {
     const pool = this.links.get(to);
     if (!pool || pool.length === 0) return false;
@@ -91,12 +87,9 @@ class Router {
  *  `send` op measures a caller's arguments against the frame cap before copying them. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
 
-// Stall clock, §16.1.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
-    this.timers = new Map();    // corr → timerId
-    this.sent = new Map();      // peerId → bytes handed to its links, ever
     this.nextCorr = 1;
   }
 
@@ -106,49 +99,8 @@ class ReqRes {
     const p = this.pending.get(corr);
     if (!p) return;
     this.pending.delete(corr);
-    const t = this.timers.get(corr);
-    if (t) { clearTimer(t); this.timers.delete(corr); }
     if (ok) p.d.settle(concatBytes([Uint8Array.from([1]), payload]));
     else p.d.settle(Uint8Array.from([0]));
-  }
-
-  /** Count bytes on their way to a peer — the numerator of the progress measure. */
-  note(to, n) { this.sent.set(to, (this.sent.get(to) || 0) + n); }
-
-  /** Bytes of ours that have actually left for this peer: everything handed over, less
-   *  what its links are still holding. Flat while the wire is not moving.
-   *  Async: link/stat answers a Promise like every seam call, so the reads FAN OUT —
-   *  one round trip for the peer rather than one per link. The ids are taken in this
-   *  turn, before the first await: the pool is live, and a link retired mid-read would
-   *  otherwise shorten the array being walked and skip a sibling's backlog. */
-  async flushed(to) {
-    const ids = router.linksTo(to).map((link) => link.linkId);
-    const held = await Promise.all(ids.map((id) => netLinkBuffered(id)));
-    let buffered = 0;
-    for (const n of held) buffered += n;
-    return (this.sent.get(to) || 0) - buffered;
-  }
-
-  /** Arm one request's stall clock (§16.1 `REQUEST_DEADLINE_MS`). `owed` is `sent`
-   *  including this request's own frame — the point at which it has finished being
-   *  asked. Baseline taken on first expiry, not here, at the cost of one deadline of
-   *  grace: see §16.1 for why. */
-  armStall(corr, to, deadlineMs, owed) {
-    let mark = null;
-    const tick = async () => {
-      this.timers.delete(corr);
-      if (!this.pending.has(corr)) return;
-      const now = await this.flushed(to);
-      // Still going out, and moving: we have not finished asking. Anything else —
-      // drained (the peer owes us an answer) or stuck (the wire is one) — settles.
-      if (now < owed && (mark === null || now > mark)) {
-        mark = now;
-        this.timers.set(corr, armTimer(deadlineMs, tick));
-        return;
-      }
-      this.finish(corr, false, EMPTY);
-    };
-    this.timers.set(corr, armTimer(deadlineMs, tick));
   }
 
   attach(sendFrame) {
@@ -156,20 +108,15 @@ class ReqRes {
   }
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
-   *  returned (null for a noReply send, which carries corr 0 and nothing waits on);
-   *  `deadlineMs` is the caller's, already resolved against the node's default. */
-  request(d, to, proto, payload, noReply, deadlineMs) {
+   *  returned (null for a noReply send, which carries corr 0 and nothing waits on). The
+   *  kernel owns the invocation deadline and releases the caller if this never answers. */
+  request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
       this.pending.set(corr, { to, d });
     }
-    // Count the frame before it is handed over, so the first stall check cannot read a
-    // `flushed` that already includes bytes this request has not yet contributed.
-    this.note(to, frame.length);
-    const owed = this.sent.get(to);
     this.sendFrame(to, frame);
-    if (!noReply) this.armStall(corr, to, deadlineMs, owed);
   }
 
   buildReq(corr, noReply, proto, payload) {
@@ -236,8 +183,6 @@ class ReqRes {
   }
 
   close() {
-    for (const t of this.timers.values()) clearTimer(t);
-    this.timers.clear();
     // Settle rather than drop: every one of these is an app parked on a `_net` call.
     for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
     this.pending.clear();

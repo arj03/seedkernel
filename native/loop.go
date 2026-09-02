@@ -118,6 +118,18 @@ func (el *eventLoop) pumpAll() {
 
 func (el *eventLoop) install() {
 	g := el.c.Global()
+	// A monotonic clock, beside the timers that answer to it. The kernel's handoff deadlines
+	// are distances between two readings (host/realm-queue.ts), which Date cannot supply:
+	// a clock step backwards would fire every live deadline at once and a step forwards
+	// would silently extend them. Resolution is the millisecond the deadlines are stated in
+	// — the same the wall clock gave — and the epoch is this process, which is all a
+	// distance needs. Node, Bun and the browsers answer this natively.
+	epoch := time.Now()
+	perf := el.c.NewObject()
+	perf.SetPropertyStr("now", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewInt64(time.Since(epoch).Milliseconds()), nil
+	}))
+	g.SetPropertyStr("performance", perf)
 	g.SetPropertyStr("setTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
 		args := t.Args()
 		if len(args) < 1 {

@@ -1008,10 +1008,13 @@ async function testModuleCallChargedToGuestBudget() {
     deadlineMs: 5000,
   });
   const t0 = Date.now();
-  const out = await realm.call(new Uint8Array());
+  let firstFailure = "";
+  try { await realm.call(new Uint8Array()); }
+  catch (e) { firstFailure = e.message; }
   const spent = Date.now() - t0;
   realm.dispose();
-  assert(out !== null && out.length === 0, "the module answered empty at the guest's deadline");
+  assert(firstFailure.includes("deadline"),
+    "the module's bounded empty answer cannot arrive after the enclosing handoff expired");
   // The burn is ~4.9s, so the whole call is ~5s; the module itself died at the ~100ms
   // that remained, NOT at the table's 60s default — a broken deadline flow would hang
   // this call for a minute instead.
@@ -1036,7 +1039,7 @@ async function testModuleCallChargedToGuestBudget() {
   catch (e) { killed = e.message; }
   const looped = Date.now() - t1;
   looper.dispose();
-  assert(killed.includes("budget exhausted"),
+  assert(killed.includes("budget exhausted") || killed.includes("deadline"),
     `a guest looping on a spinning module is refused, not endless (ran ${looped}ms, got: ${killed || "no throw"})`);
   // ~1 s of module burn spends the 1 s budget, and the next turn throws. The upper bound
   // is what fails if either half is dropped.

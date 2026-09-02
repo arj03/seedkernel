@@ -46,7 +46,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     load: false,
     bundle: transportBlob,
   };
-  const transportConfig = { requestDeadlineMs: 2000, ...extraConfig };
+  const transportConfig = { ...extraConfig };
   // bootShell owns the adapter but leaves the load and listeners to this test, which
   // starts them by hand below.
   const { shell, transport } = await bootShell({

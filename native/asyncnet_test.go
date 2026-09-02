@@ -105,15 +105,14 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  const peer = fromHex(APP.peer);                       // A's 32-byte public key
 		  const proto = new TextEncoder().encode("probe");      // the app A claims
 		  // [opLen u8]["send"] then the op's args:
-		  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+		  // [noReply u8][to blob][proto blob][payload blob].
 		  const opName = "send";
-		  const req = new Uint8Array(1 + opName.length + 1 + 4 + 4 + 32 + 4 + proto.length + 4 + msg.length);
+		  const req = new Uint8Array(1 + opName.length + 1 + 4 + 32 + 4 + proto.length + 4 + msg.length);
 		  req[0] = opName.length;
 		  for (let i = 0; i < opName.length; i++) req[1 + i] = opName.charCodeAt(i);
 		  let off = 1 + opName.length;
 		  const dv = new DataView(req.buffer);
 		  req[off++] = 0;                       // noReply
-		  dv.setUint32(off, 0); off += 4;       // deadline: the node's default
 		  dv.setUint32(off, 32); off += 4;
 		  req.set(peer, off); off += 32;
 		  dv.setUint32(off, proto.length); off += 4;

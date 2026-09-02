@@ -43,14 +43,17 @@ type guestRealm struct {
 
 	// calls are initiator calls in flight, keyed by an id the guest carries back. Each
 	// holds the host-realm resolve/reject of the Promise the shim handed the shell.
-	calls   map[int64]*initiatorCall
-	callSeq int64
+	calls map[int64]*initiatorCall
 
 	// Execution budget (README §12.3), mirroring safe-js.ts's ExecClock. `consumed` counts
-	// only segments where guest code actually holds the thread, so host-side await time is
-	// nobody's budget (a tight budget would kill an initiator parked on a slow request).
+	// segments where guest code holds the thread; the separate caller-owned wall deadline
+	// continues across host waits, realm queueing and deferred answers.
 	budget   time.Duration
 	consumed time.Duration
+	// The current invocation is additionally narrowed by the caller-owned wall deadline.
+	// A zero invocationDeadline is the explicit unbounded case.
+	invocationBudget   time.Duration
+	invocationDeadline time.Time
 	// End of the currently-running segment. The host-call bridge reads this while guest
 	// code is on the stack so a module inherits the caller's live remainder.
 	segmentDeadline time.Time
@@ -108,11 +111,23 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if err != nil {
 			return nil, err
 		}
+		callID := t.Args()[2].Int64()
+		deadlineMs := t.Args()[5].Int64()
 		deferred := 0
-		if g.call(payload, t.Args()[2], t.Args()[3]) {
+		if g.call(callID, payload, t.Args()[3], t.Args()[4], deadlineMs) {
 			deferred = 1
 		}
 		return t.Context().NewInt64(int64(deferred)), nil
+	}))
+	b.SetPropertyStr("realmCancel", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		g := realms[t.Args()[0].Int64()]
+		if g == nil {
+			return nil, nil
+		}
+		if c := g.takeCall(t.Args()[1].Int64()); c != nil {
+			c.free()
+		}
+		return nil, nil
 	}))
 	b.SetPropertyStr("realmSettle", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a disposed realm is a no-op: the Transport promise behind it
@@ -172,7 +187,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
 		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		hostCalls: make(map[int64]int64), maxHostCalls: maxHostCalls,
-		maxHostCallBytes: maxHostCallBytes, budget: budget,
+		maxHostCallBytes: maxHostCallBytes, budget: budget, invocationBudget: budget,
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -321,17 +336,31 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 // onDone/onFail settle the shim's Promise when the entrypoint's own promise settles. It
 // reports synchronously whether the entrypoint DEFERRED its answer, which tells the shim's
 // queue the realm is free again even though nothing has settled.
-func (g *guestRealm) call(payload []byte, onDone, onFail *qjs.Value) bool {
+func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) bool {
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
 		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
 		return false
 	}
-	g.callSeq++
-	id := g.callSeq
+	if _, duplicate := g.calls[id]; duplicate {
+		g.reportCall(onFail.Dup(), g.hostQc.NewString("guest: duplicate live realm invocation id"))
+		return false
+	}
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
 	argV := g.qc.NewArrayBuffer(payload)
 	g.consumed = 0 // one top-level entrypoint invocation, one budget
+	g.invocationBudget = g.budget
+	g.invocationDeadline = time.Time{}
+	if deadlineMs >= 0 {
+		remaining := time.Duration(deadlineMs) * time.Millisecond
+		if remaining <= 0 {
+			remaining = time.Nanosecond
+		}
+		g.invocationDeadline = time.Now().Add(remaining)
+		if g.invocationBudget == 0 || remaining < g.invocationBudget {
+			g.invocationBudget = remaining
+		}
+	}
 	res, err := g.within(func() (*qjs.Value, error) {
 		return g.qc.Invoke(g.start, g.qc.NewUndefined(), g.qc.NewInt64(id), argV)
 	})
@@ -360,9 +389,18 @@ func (g *guestRealm) call(payload []byte, onDone, onFail *qjs.Value) bool {
 // armed at the floor, so the failure routes through the guest's own promises.
 func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err error) {
 	remaining := time.Duration(0)
-	if g.budget > 0 {
-		if remaining = g.budget - g.consumed; remaining <= 0 {
+	if g.invocationBudget > 0 {
+		if remaining = g.invocationBudget - g.consumed; remaining <= 0 {
 			remaining = time.Nanosecond
+		}
+	}
+	if !g.invocationDeadline.IsZero() {
+		wall := time.Until(g.invocationDeadline)
+		if wall <= 0 {
+			wall = time.Nanosecond
+		}
+		if remaining == 0 || wall < remaining {
+			remaining = wall
 		}
 	}
 	restore := g.rt.Budget(remaining)
@@ -387,7 +425,7 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 	// budget just exhausted, and the caller would wait out its timeout. Settling here
 	// closes that gap. `consumed` deliberately stays blown so jobs the interrupted frame
 	// left behind stop at their first check; the next entrypoint starts fresh (see call).
-	budgetErr := fmt.Errorf("guest realm: execution budget of %s exceeded", g.budget)
+	budgetErr := fmt.Errorf("guest realm: invocation deadline of %s exceeded", g.invocationBudget)
 	g.settleAll(budgetErr.Error())
 	if err == nil {
 		err = budgetErr

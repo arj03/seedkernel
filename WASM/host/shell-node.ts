@@ -51,9 +51,9 @@ export interface NodeShellOptions {
     transportBundle?: Uint8Array;
     /** Transport `LOCAL` config, such as peers and `contactSecret` (§12.10). */
     transportConfig?: JsonObject;
-    /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3). Counts
-     *  time the guest is running, not time parked on a host seam, so it bounds a wedged
-     *  guest without penalising one awaiting the network. `Infinity` disables it. Threaded
+    /** Guest execution and handoff budget per entrypoint invocation, in ms (§12.3).
+     *  It bounds guest compute, queue wait, host waits, and deferred answers. `Infinity`
+     *  disables the local ceiling; an initiating finite caller still narrows it. Threaded
      *  through to the shell because a bound no target can set is a bound nobody has. */
     guestDeadlineMs?: number;
     /** QuickJS heap cap for the guest realm, in bytes (§12.3). Omitted ⇒ the 64 MiB
