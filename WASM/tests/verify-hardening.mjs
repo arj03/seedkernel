@@ -432,16 +432,16 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
     "the signaling lane's byte companion binds before its count does");
 }
 
-console.log("\n§12.3 — and a bounded self-initiated share is what makes the node's CLOCK one");
+console.log("\n§12.3 — guest-created invocation roots have a bounded clock share");
 {
-  // Memory's total above is a standing quantity; time's is a share of ONE clock, and only the
-  // work a guest hands itself needs a term in it — every other initiation is bounded by the
-  // owner that admitted it (§12.3). Both halves live HERE for the reason the memory sum does:
-  // a second way for a guest to initiate its own work means adding its term to this block.
+  // Memory's total above is a standing quantity and really is a total. Time's is not: a
+  // peer or host can replace settled work immediately. A timer is different because it is
+  // the one fresh invocation root a guest creates ITSELF; calls descended from an existing
+  // root inherit its deadline. A second self-created root mechanism belongs in this sum.
   ok(DEFAULT_MAX_APP_SLOTS * DEFAULT_GUEST_DEADLINE_MS <= 60_000,
     "every slot spending its banked invocation at once is a stall someone added up");
   ok(DEFAULT_MAX_APP_SLOTS / SELF_INITIATED_CLOCK_DIVISOR <= 1 / 2,
-    "a full node's summed self-initiated share leaves half the clock to peers and the host loop");
+    "a full node's summed self-initiated share is at most half the clock, so it cannot be the majority");
 }
 
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
@@ -602,8 +602,8 @@ console.log("\n§12.3 — timer count and copied payload bytes are bounded per r
 
 console.log("\n§12.3 — a realm's self-initiated work is paced by its share of the node's clock");
 {
-  // Re-arming at ms=0 from inside the timer entrypoint: the one initiation a guest issues to
-  // itself, each fire taking a fresh full budget (§12.3). Scaled down so the RATIO is what is
+  // Re-arming at ms=0 from inside the timer entrypoint: the one fresh invocation root a guest
+  // creates itself, each fire taking a fresh full budget (§12.3). Scaled down so the RATIO is
   // under test, and run at a divisor of 1 as its own control — there a busy table earns back
   // exactly what it spends, which is the unpaced behaviour this replaced.
   const budgetMs = 40, occupyMs = 20, spinForMs = 400;

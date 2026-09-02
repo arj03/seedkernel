@@ -79,8 +79,9 @@ const maxAuthed = policy("maxAuthedLinks");
 const linkIdleTimeoutMs = policy("linkIdleTimeoutMs");
 // How long one open correlation is retained waiting for its peer's response; 0 disables.
 // Not the caller's deadline — the kernel owns that and no field here can name it — but the
-// transport's bound on its own waiting state, so a peer that went silent is given up on
-// while the caller still has segment left to ask someone else.
+// transport's bound on its own waiting state. It gives the caller time to ask someone else
+// only when configured shorter than that caller's live remainder; otherwise the kernel
+// deadline wins and this timer cleans the correlation afterwards.
 const requestTimeoutMs = policy("requestTimeoutMs");
 // How long a link may stay pre-authentication: the dialing side's whole handshake, and
 // the shorter clock an accept runs until a msg1 opens under the contact secret. 0

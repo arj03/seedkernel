@@ -19,7 +19,8 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   linkIdleTimeoutMs: 300_000,
   // How long one open correlation waits for its peer before the transport gives up on it.
   // A deployment whose invocation deadline is shorter than this should say so: an app can
-  // only route around a silent holder while it still has segment left (§16.1).
+  // only route around a silent holder while it still has segment left. Otherwise its kernel
+  // deadline wins and this timer cleans the transport's correlation afterwards (§16.1).
   requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),
   // Peers this program dials, as `{ peerId, dest, contactSecret? }` in hex. Empty by

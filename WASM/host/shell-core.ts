@@ -191,10 +191,16 @@ interface RealmTimers extends HostTimers {
  *  this table is the only owner it has. Releasing at the deadline would leave the busiest
  *  moment — fired bodies queued behind a serialized realm — charged to nobody.
  *
- *  It owns this realm's share of the node's CLOCK for the same reason it owns those bytes:
- *  a fired deadline is the one initiation a guest hands ITSELF, so no upstream owner bounds
- *  its rate (§12.3). Firing spends that share, and a deadline coming due with it spent is
- *  SLIPPED rather than failed — which an honest table never reaches. */
+ *  It owns this realm's share of the node's CLOCK because a fired deadline is the one FRESH
+ *  invocation root a guest creates itself (§12.3). Peerless cross-realm calls are not fresh:
+ *  they inherit the active root's deadline. Firing spends this share, and a deadline coming
+ *  due with it spent is SLIPPED rather than failed. This paces self-created roots; it is not
+ *  a bound on the node's clock, which external roots can occupy one bounded invocation after
+ *  another.
+ *
+ *  What it measures is the WALL period across a fire, because handing the body over and being
+ *  told the answer landed is all it sees. A body that parks on a host call is charged as if it
+ *  had spun — a safe over-approximation because it can only pace that realm harder. */
 export function createRealmTimers(
     fire: (payload: Uint8Array) => Promise<unknown> | void,
     max = DEFAULT_MAX_LIVE_TIMERS,

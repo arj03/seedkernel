@@ -220,6 +220,26 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   assert(!longSettled, "a peer's short-deadline request must not settle its long-deadline one");
 });
 
+await test("a silent peer's correlation is retired on the transport's own timeout", async (keep) => {
+  // Hold B's encrypted response after the request reaches its app. A's 100ms transport
+  // timeout must beat the still-live 2s kernel deadline, and the response released later
+  // must be ignored rather than poisoning the next correlation or closing the link.
+  const st = keep(await upPair(undefined, { transportConfig: { requestTimeoutMs: 100 } }));
+  st.chans[1].hold();
+  const t0 = Date.now();
+  const timedOut = await st.A.request(st.B.peerId, PROTO, Uint8Array.from([7]), 2000)
+    .then(() => "resolved", () => Date.now() - t0);
+  assert(typeof timedOut === "number", "the transport timeout rejects an unanswered correlation");
+  assert(timedOut < 1200, `the 100ms transport timeout wins before the 2s caller deadline (${timedOut}ms)`);
+
+  const released = st.chans[1].flush();
+  assert(released > 0, "the timed-out request really had a late response waiting on the wire");
+  await settle(50);
+  const next = await st.A.request(st.B.peerId, PROTO, Uint8Array.from([8]), 1000);
+  assert(next.length === 1 && next[0] === 8, "a late response is ignored and the next correlation still settles");
+  assert(await aUp(st), "retiring one correlation does not close its healthy link");
+});
+
 await test("the handoff deadline includes time in the outbound socket queue", async (keep) => {
   // The deadline belongs to the initiating call, so transport content cannot extend it by
   // observing that bytes are still draining. `trackBacklog` proves the timeout happens

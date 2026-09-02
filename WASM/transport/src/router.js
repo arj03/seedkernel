@@ -116,10 +116,11 @@ class ReqRes {
    *  The kernel owns the caller's TIME and no field here can name it. What this arms is the
    *  transport's own retention bound on the correlation it just opened — the same kind of
    *  bound `handshakeTimeoutMs` puts on a half-open link and `linkIdleTimeoutMs` on a silent
-   *  one, and the pending map is the last waiting state that had none. It only ever gives up
-   *  EARLIER than the caller's segment, so it mints nothing; what it buys is the difference
-   *  between one silent peer and a dead invocation, since a fan-out settles as a whole and a
-   *  peer that vanished mid-link sends no close for anything else to notice (§16.1). */
+   *  one, and the pending map is the last waiting state that had none. It cannot EXTEND the
+   *  kernel's deadline. When shorter it leaves the caller time to try another peer; when
+   *  longer it only cleans this correlation after the caller has expired. That cleanup still
+   *  matters because a peer that vanished mid-link sends no close for anything else to notice
+   *  (§16.1). */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
