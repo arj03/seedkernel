@@ -216,56 +216,41 @@ func (c *sockChannel) writeLoop() {
 	}
 }
 
-// close is the deliberate teardown: it does NOT fire onClose (the owner asked for it), and
-// a fail() racing behind it stays silent because dead is set. A graceful close retains the
-// queue for the writer to flush under closeGrace; a non-graceful close drops it and closes
-// the socket immediately.
-func (c *sockChannel) close(graceful bool) {
+// terminate is the channel's sole dead transition, made idempotent by the dead flag:
+// whichever of close/fail arrives first wins and the other returns silently, so a fail()
+// racing behind a deliberate close never fires onClose for it. flush keeps the queue for
+// the writer to drain under closeGrace; notify fires onClose, which only the error path
+// wants — a deliberate close was the owner's own request.
+func (c *sockChannel) terminate(flush, notify bool) {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
 		return
 	}
 	c.dead = true
-	conn := c.conn
-	if !graceful {
+	if !flush {
 		c.queue, c.queued = nil, 0
 	}
-	c.mu.Unlock()
-	if conn == nil {
-		return // dial still in flight: its goroutine sees dead and closes the fresh conn
-	}
-	if !graceful {
-		conn.Close()
-		c.signal() // wake a parked writer so it observes dead and exits
-		c.wakeReader()
-		return
-	}
-	conn.SetWriteDeadline(time.Now().Add(c.closeGrace))
-	c.signal() // the writer flushes the queue, then Close()s and exits
-	c.wakeReader()
-}
-
-// fail is the error teardown: close the socket and fire onClose so the owner drops the
-// channel; queued messages are dropped, since the link is broken. Idempotent via the dead
-// flag.
-func (c *sockChannel) fail() {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	c.queue, c.queued = nil, 0
 	conn := c.conn
 	c.mu.Unlock()
+	// A nil conn is a dial still in flight: its goroutine sees dead and closes the fresh
+	// conn itself. Neither loop has started yet, so the wakes below are inert.
 	if conn != nil {
-		conn.Close() // also unblocks a writer mid-Write; it errors out, sees dead, and exits
+		if flush {
+			conn.SetWriteDeadline(time.Now().Add(c.closeGrace))
+		} else {
+			conn.Close() // also unblocks a writer mid-Write; it errors out, sees dead, and exits
+		}
 	}
-	c.signal() // wake a parked writer so it observes dead and exits
+	c.signal() // wake a parked writer so it flushes, or observes dead and exits
 	c.wakeReader()
-	c.onClose()
+	if notify {
+		c.onClose()
+	}
 }
+
+func (c *sockChannel) close(graceful bool) { c.terminate(graceful, false) }
+func (c *sockChannel) fail()               { c.terminate(false, true) }
 
 // The wire: bytes pass through verbatim. Whether a link is length-prefixed or RFC 6455
 // framed is the transport bundle's decision and its code (transport/src).
