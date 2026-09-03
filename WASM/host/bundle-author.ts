@@ -2,13 +2,14 @@
 // signing or packing surface; this module depends on the verifier's manifest validation so
 // an author's accepted vocabulary cannot drift behind what a loader will accept.
 import { concatBytes, toHex, enc } from "../core/util.js";
-import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../core/domains.js";
+import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../core/domains.js";
 import { callerOf, readOp, writeOp } from "./op-frame.js";
 import {
     GUEST_FILE,
     MANIFEST_FILE,
     genesisHash,
     hybridAuthorId,
+    manifestSigningInput,
     moduleFile,
     validateManifest,
     type BundleGuest,
@@ -74,10 +75,7 @@ export function signManifest(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: 
         throw new Error("bundle: no ML-DSA-65 signer — cannot sign a manifest");
     }
     const json = encodeManifest(m);
-    const pre = concatBytes([
-        DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ),
-        keys.ed.publicKey, keys.mlDsa.publicKey, json,
-    ]);
+    const pre = manifestSigningInput(keys.ed.publicKey, keys.mlDsa.publicKey, json);
     const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
     const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
     return concatBytes([

@@ -229,7 +229,7 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 /** Signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. Both keys sign, and
  *  each commits to the other, so the pair cannot be taken apart. */
-function manifestPreimage(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
+export function manifestSigningInput(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
     return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, json]);
 }
 /** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. The whole key
@@ -418,7 +418,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
     const mlSig = env.slice(OFF_ML_SIG, OFF_JSON);
     const json = env.slice(OFF_JSON);
-    const pre = manifestPreimage(edPk, mlPk, json);
+    const pre = manifestSigningInput(edPk, mlPk, json);
     // Both, always: a break in either half then rejects valid bundles (recoverable) instead
     // of admitting forged ones (not).
     if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk))

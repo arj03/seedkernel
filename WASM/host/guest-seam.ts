@@ -318,6 +318,10 @@ export function appSignScope(key: {
 }, author: Uint8Array, app: string): SignScope {
     return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
+/** The one scoped-signature transcript: `domain ‖ scope ‖ message`. */
+function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message: Uint8Array): Uint8Array {
+    return concatBytes([scope.domain, scope.scope, message]);
+}
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). Same scope as `appSignScope`. */
 export function appSigner(
     sodium: SeamCrypto,
@@ -331,14 +335,13 @@ export function appSigner(
     verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
     const scope = appSignScope(key, author, app);
-    const pre = (msg: Uint8Array) => concatBytes([scope.domain, scope.scope, msg]);
     return {
         sign(msg) {
-            return sodium.crypto_sign_detached(pre(msg), scope.key.privateKey);
+            return sodium.crypto_sign_detached(scopedSigningInput(scope, msg), scope.key.privateKey);
         },
         verify(pk, sig, msg) {
             try {
-                return sodium.crypto_sign_verify_detached(sig, pre(msg), pk);
+                return sodium.crypto_sign_verify_detached(sig, scopedSigningInput(scope, msg), pk);
             }
             catch {
                 return false;
@@ -419,7 +422,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             const s = grants.signScope;
             if (!s)
                 throw new Error("guest-seam: node/sign needs a slot-derived scope (signing is never raw)");
-            return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
+            return sodium.crypto_sign_detached(scopedSigningInput(s, payload), s.key.privateKey);
         },
         // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the caller
         // supplies the key but never the scope, so a signature under any other scope answers
@@ -433,7 +436,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             if (payload.length < 96)
                 throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
             try {
-                return sodium.crypto_sign_verify_detached(payload.slice(32, 96), concatBytes([s.domain, s.scope, payload.slice(96)]), payload.slice(0, 32)) ? ONE : ZERO;
+                return sodium.crypto_sign_verify_detached(payload.slice(32, 96), scopedSigningInput(s, payload.slice(96)), payload.slice(0, 32)) ? ONE : ZERO;
             }
             catch {
                 return ZERO;
