@@ -21,7 +21,10 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 /** Residual guest-visible host transforms. This is legacy vocabulary, not a menu of computations:
  *  a pure transform belongs in the bundle that uses it. Keep a name here only while the
- *  host itself already carries and calls the same implementation. */
+ *  host itself already carries and calls the same implementation — which is why this list
+ *  is at its floor rather than shrinking: dropping a name duplicates code the artifact
+ *  already ships, and a module cannot borrow the host's copy without exporting the linear
+ *  memory the node key lives in (docs/SECURITY.md). */
 export const HOST_TRANSFORM_NAMES = [
     "blake2b-256",
     "chacha20poly1305-ietf/seal",
