@@ -16,11 +16,11 @@ The message path does **no asymmetric cryptography and no recursion**: routing a
 
 So the costs worth measuring are the three places real cryptography lives, all off the dispatch hot path:
 
-- **Per connection:** the AKE handshake (§12.6) — one Ed25519 sign + verify and one X25519 exchange, amortised across the whole session.
+- **Per connection:** the AKE handshake (§12.6) — one Ed25519 sign + verify, one ephemeral X25519 exchange, and one ML-KEM-768 encapsulation or decapsulation per endpoint, amortised across the whole session.
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6) — symmetric, fast, the steady-state transport cost.
 - **Per bundle load:** one manifest verify — Ed25519 *and* ML-DSA-65, the one suite requiring both (§12.4) — plus a BLAKE2b-256 content hash per module. Once, at install, which is why the second verify and the ~5.3 KB envelope cost nothing that shows: a manifest is never on the message path (§13).
 
-The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (net round-trip, fs, the crypto primitives, the record layer); `WASM/tests/run.mjs` exercises the same paths end-to-end on the JS target, and seed store's `WASM/tests/bench.mjs` measures storage throughput. There is no signed-message microbenchmark anymore because there is no signed message — a chat frame crosses the WASM boundary only for the module call its guest makes.
+The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (net round-trip, fs, the crypto primitives, the record layer); `npm test` from `WASM/` exercises the same paths end-to-end on the JS target, and seed store's `WASM/tests/bench.mjs` measures storage throughput. There is no signed-message microbenchmark anymore because there is no signed message — a chat frame crosses the WASM boundary only for the module call its guest makes.
 
 ### 10.2 Distribution Size
 
@@ -28,7 +28,7 @@ This is the one place these figures live; the README's shared-artifact list poin
 
 | Component | Size |
 |---|---|
-| host/*.js — minified (`build-min`, runtime code only) | ~168 KB |
+| `core/*.js` + hand-written `host/*.js` — minified (`build-min`, excluding the embedded transport) | ~168 KB |
 | the embedded transport bundle (`host/transport-bundle.js` — the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~160 KB |
 | libsodium.wasm (core build: the host trust root and current channel fast paths) | 217 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 135 KB |
@@ -39,7 +39,7 @@ This is the one place these figures live; the README's shared-artifact list poin
 
 The `host/*.js` layer is the whole runtime: bundle slots and claim routing, raw net and fs seams, the guest seam, safe-js, verification, policy, and the transport driver. Pure modules remain target values owned privately by a slot. The transport protocol is signed content (`transport/src/*.js` plus `ws.wasm` and `mlkem768.wasm`); the first copy ships inside the artifact because a node has no network until it has a transport, and a later signed bundle can replace it. Core libsodium backs the trust-root crypto and the current channel's remaining host transforms. QuickJS is lazy: a shell with no installed slot never pays for a realm.
 
-`npm run build` emits the host twice: the readable `build/` (~446 KB of runtime code, doc comments intact) for debugging and a comment-stripped `build-min/` (~313 KB, ~108 KB gzipped) for shipping. Roughly a third of both is the generated `transport-bundle.js`, the signed bundle embedded verbatim — it carries no doc comments to strip, so it passes through nearly unchanged and dilutes the ratio. The hand-written host alone goes ~286 KB → ~154 KB, because those sources are close to half doc comment, and that is where the cut comes from. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does it — no bundler, no new dependencies; it prints the gzipped totals on every run. The table's host figure is the shipped, minified build.
+`npm run build` emits the host twice: the readable `build/` (~446 KB of runtime code, doc comments intact) for debugging and a comment-stripped `build-min/` (~329 KB in the current build) for shipping. Roughly half of the minified tree is the generated `transport-bundle.js`, the signed bundle embedded verbatim — it carries no doc comments to strip, so it passes through nearly unchanged and dilutes the ratio. The hand-written host alone goes ~286 KB → ~154 KB, because those sources are close to half doc comment, and that is where the cut comes from. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does it — no bundler, no new dependencies; it prints the current plain and gzipped totals on every run. The table separates the hand-written host from the embedded transport so it does not count either twice.
 
 ---
 
@@ -51,7 +51,7 @@ The app itself lives in [seedchat](https://github.com/arj03/seedchat), not in th
 
 What the demo stands up is a browser shell owning the host's table and its one install path, a WebRTC socket seam (`RtcNetwork`, `host/net-rtc.ts`, §12.7) under the transport bundle, the safe-js guest realm, and a sandboxed iframe — every byte of chat UI and logic arrives as a signed bundle admitted at runtime.
 
-On load it generates an Ed25519 identity, constructs a host (§3), and loads an admission policy (§12.5) approving modules whose author is the local identity — or, for apps received from a peer, one the user consents to. That consent decision is the browser's own policy state, and it is the only one the shell has to make: names cannot contend (§5.1), so a multi-app shell arbitrates *whether code runs*, never *who holds a name*. The table starts empty. The user picks a chat app (`v1 — text only`, `v2 — text + image + nick`); the shell builds a **signed bundle** — a `manifest.bundle` (the local key's Ed25519 signature over the manifest, which commits to the guest's and the module's `genesisHash`) plus `guest.js` and the app's `.wasm`, packed into one blob (§12.4) — verifies it, and the loader admits the app under that policy (§12.4). This is the *same* bundle format seed store loads; a chat app is just a guest that calls its one module. Upgrading v1→v2 is a re-admit at the same name under the same key — the same key derives the same name — and the new manifest re-states the `chat` protocol claim, so routing follows the install (§12.10). Peers hand these bundles to each other in an `OFFER` frame; the recipient re-verifies the original author's manifest signature and admits it the same way — and because the manifest signs the guest and module hashes, the bundle survives any number of transitive relays and still authenticates against its original author (the store-and-forward property an offer needs, §12.4).
+On load it generates an Ed25519 channel identity, constructs a host (§3), and loads an admission policy (§12.5) approving app authors the user trusts. Seedchat's authoring tools build each **hybrid-signed bundle** — a `manifest.bundle` carrying Ed25519 and ML-DSA-65 public keys and signatures (both required), plus `guest.js` and the app's `.wasm`; the manifest commits to the guest and module `genesisHash` values (§12.4). The table starts empty. A user may install `v1 — text only` or `v2 — text + image + nick`; a v1→v2 release under the same `(author, app)` replaces that slot atomically and re-states the `chat` protocol claim. A different app that contests an occupied claim is refused rather than silently taking it (§12.10). Peers may relay these bundles in an `OFFER` frame; the recipient re-verifies both original author signatures and applies its own policy, so the bundle remains attributable across any number of relays.
 
 Peers connect over a WebRTC mesh from `RtcNetwork` (`host/net-rtc.ts`, §12.7). Every delivered frame is already attributed to an authenticated peer, so chat rides the Transport request plane as `[req][protocolId][type][chatType‖body]`. The shell resolves the protocol claim directly to a slot, prepends that peer key, and invokes the slot's guest under its budget; the guest may call its private chat module. A peer states only the protocol, while the receiving user's installed claims decide which verified implementation renders it.
 
@@ -176,7 +176,7 @@ A name the manifest never granted does not resolve — the seam refuses it, and 
 
 ### 12.3 Zero-authority JS realms
 
-Logic that is inherently async or awkward as a *synchronous* WASM module runs as confined JS in a QuickJS-compiled-to-WASM realm (`host/safe-js.ts`, `./safe-js`). A fresh realm has only the ECMAScript intrinsics — it cannot even *name* `fs`/`net`/`process`/`fetch` — and reaches out only through the injected `host.call` seam. Every name answers a Promise: host transforms may compute inline, while `fs/*`, cross-realm calls and bare module names round-trip. So the guest is ordinary async/await JS, a fan-out is `Promise.all`, and there is **one** realm — a single non-Asyncify build — serving both roles.
+Logic that is inherently async or awkward as a *synchronous* WASM module runs as confined JS in a QuickJS-compiled-to-WASM realm (`host/safe-js.ts`). A fresh realm has only the ECMAScript intrinsics — it cannot even *name* `fs`/`net`/`process`/`fetch` — and reaches out only through the injected `host.call` seam. Every name answers a Promise: host transforms may compute inline, while `fs/*`, cross-realm calls and bare module names round-trip. So the guest is ordinary async/await JS, a fan-out is `Promise.all`, and there is **one** realm — a single non-Asyncify build — serving both roles.
 
 **And one way in.** `realm.call(bytes)` — one invocation of the guest's single `handle` entrypoint — is the whole seam, for the initiator and the holder alike. There is no entrypoint *name* on the seam to pick: the argument is `[caller 32][body …]`, of which only the caller id is the host's, so which role an invocation serves is something the guest reads out of its own body format and never something the kernel selects. A synchronous second seam is not available to be offered either: a holder answers from local storage, and storage cannot answer in the same turn on a target whose backend is asynchronous (§12.1). Both roles are therefore ordinary async invocations of that one entrypoint, and there is one shape to reason about rather than two whose difference is a property of what the guest happens to call.
 
@@ -258,12 +258,12 @@ Both public keys are inside both preimages, so the pair cannot be taken apart: a
 
 **The author id is derived, not carried.** It is `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` — 32 bytes, like an Ed25519 key, so `appKeyFor` and every app key (§5.1), every policy entry and every freshness mark are written against one fixed-width identity. One suite means one derivation: nothing downstream has to ask which rule produced the 32 bytes it holds. Two reasons it is the hash and not simply the Ed25519 key:
 
-- **Otherwise hybrid signing buys nothing at the moment it should pay.** An attacker who eventually breaks Ed25519 forges that half and generates a *fresh* ML-DSA key for the other. Both signatures verify; if the id were the Ed25519 key, the id would be unchanged, and the forged bundle would land on the real author's names. Hashing the whole key set makes the identity unreachable without both private keys — which is the property "hybrid" is supposed to name.
-- **The id's width is load-bearing far outside the envelope.** A suite that widened it would change name derivation, the policy file format, and the freshness key at once.
+- **Otherwise hybrid signing buys nothing at the moment it should pay.** An attacker who eventually breaks Ed25519 forges that half and generates a *fresh* ML-DSA key for the other. Both signatures verify; if the id were the Ed25519 key, the id would be unchanged, and the forged bundle could replace the real author's `(author, app)` slot. Hashing the whole key set makes the identity unreachable without both private keys — which is the property "hybrid" is supposed to name.
+- **The id's width is load-bearing far outside the envelope.** A suite that widened it would change app-key construction, the policy file format, and the freshness key at once.
 
 A later suite deriving its id the same way would face the same consequence — an author moving to it would get a **new identity**: new app keys, a fresh freshness lineage, a new policy entry. That is the honest reading rather than a wart, since a manifest signed under a different suite is a *different* statement about who signed. It is also why each multi-key suite writes its own derivation rather than parameterising this one: its key set is a different shape, so there is nothing to share but the mistake of deriving two identities the same way.
 
-**One seed is the whole author.** `hybridAuthorKeysFromSeed` derives the Ed25519 half from a 32-byte seed directly and the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)` (§16.1). The label is a KDF tag, not a signing prefix (no trailing NUL), and it is **frozen**: changing it re-identifies every author built from a seed. The function lives in the offline-only `bundle-author.ts` rather than in each build script because a copy that drifts fails as a *changed author id* — a bundle landing under a stranger's name and a policy pin matching nobody, which no test catches because each copy agrees with itself. Pass the 32-byte seed, not libsodium's 64-byte secret key.
+**One seed is the whole author.** `hybridAuthorKeysFromSeed` derives the Ed25519 half from a 32-byte seed directly and the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)` (§16.1). The label is a KDF tag, not a signing prefix (no trailing NUL), and it is **frozen**: changing it re-identifies every author built from a seed. The function lives in the offline-only `bundle-author.ts` rather than in each build script because a copy that drifts fails as a *changed author id* — a bundle gets a different internal app key and every policy pin misses, which no test catches when each copy agrees only with itself. Pass the 32-byte seed, not libsodium's 64-byte secret key.
 
 **Manifest fields.**
 
@@ -370,25 +370,25 @@ There is no per-module allowlist: the manifest IS the definitive list of authori
 
 **Omitting `--policy` is deny-all, not "no policy".** A node with no configured predicate runs `denyAll`: it boots, serves, and refuses every manifest. Trust is something an operator adds deliberately; the absence of a decision is never permission. One shared constant (`denyAll`) resolves this, so every target — the Node shell and the native loader (§12.9) — boots the same posture, with no permissive default of its own.
 
-**Revocation is host-side, and it is one action.** A module is a pure transform with no imports (§4.2), so nothing in the sandbox can reach the loader — there is no revoke-message, and revocation is not something a bundle can carry.
+**Revocation is host-side, and it is one action.** A module is a pure transform with no capability imports (§4.2), so nothing in the sandbox can reach the loader — there is no revoke-message, and revocation is not something a bundle can carry.
 
-What it answers is the case freshness cannot. `version` orders an author's own releases; it says nothing about whether the key is still theirs. A **stolen author key** clears the freshness guard trivially — the thief signs `version + 1` — and lands on the same names, because the same key derives them (§5.1). Every release after the theft is, to the loader, an ordinary upgrade.
+What it answers is the case freshness cannot. `version` orders an author's own releases; it says nothing about whether the key is still theirs. A **stolen author key set** clears the freshness guard trivially — the thief signs `version + 1` — and lands in the same `(author, app)` slot with the same declared claims. Every release after the theft is, to the loader, an ordinary upgrade.
 
 So the store that holds the freshness marks also holds a set of **written-off author keys**, read into `ctx.revoked` and answered by `notRevoked` before the version: a revoked key's bundles are refused whatever they contain and whatever version they claim. `shell.revoke(authorHex)` does both halves in one call — record the key, then uninstall every app it already landed, found by the author half of the app key (§5.1). Both the Node shell and the native loader (§12.9) expose it as `--revoke <hex,…>`, alongside `--uninstall <appKey,…>` for the narrower case; a shell embedding the core calls the method.
 
-**Both halves, or neither.** Uninstalling alone leaves nothing to stop the thief's next bundle re-landing on the same names; recording alone leaves the compromised code running. Neither implies the other, and an operator performing them by hand — edit `allowed-keys.json`, call uninstall — can do one and not the other, or do them in the order that leaves a window. That, rather than the absence of a certificate format, was the gap.
+**Both halves, or neither.** Uninstalling alone leaves nothing to stop the thief's next bundle re-landing in the same `(author, app)` slot and reclaiming its protocols or services; recording alone leaves the compromised code running. Neither implies the other, and an operator performing them by hand — edit `allowed-keys.json`, call uninstall — can do one and not the other, or do them in the order that leaves a window. That, rather than the absence of a certificate format, was the gap.
 
 **It is deliberately not a protocol.** No signed certificate, no wire format, nothing to distribute — a revocation is a local decision by the operator, who is the TCB (§14), recorded in local state. A fleet applies it the way it applies any other operator decision: by whatever configuration path already reaches those nodes. Building a signed, relayable revocation object would mean deciding who may sign one, which is a second trust set and a second key-management problem to solve the first — worth it for a public deployment admitting third-party authors, and out of scope here.
 
 **The check is composed by the shell, not supplied by the operator.** It is a predicate like any other — `notRevoked`, reading `ctx.revoked` — but it is the shell that ANDs it in front of whatever the operator configured, so no posture can be a way to lose it: `admitAll` is still revocation-checked, and so is an interactive dialog that always says yes. One composition, in the shared core, holds for every target and every delivery path.
 
-**Recovery is a new key, not an un-revoke.** The runtime never removes a key from the set: it survives a later edit that puts the key back in `authors`, so re-admitting a compromised author takes more than forgetting why it was removed. It survives reboots wherever the store does — the Node shell and the native loader persist it through the same atomic write as the freshness marks; the browser chat-shell holds both in memory, so there, as with freshness, a revocation lasts only as long as the page. An author who lost a key republishes under a new one, which derives its own names and its own freshness mark and is unaffected by the dead key's state. Genuinely undoing a revocation means editing the store file out of band — the same escape hatch as rolling a freshness mark back, and the same reason it exists.
+**Recovery is a new key, not an un-revoke.** The runtime never removes a key from the set: it survives a later edit that puts the key back in `authors`, so re-admitting a compromised author takes more than forgetting why it was removed. It survives reboots wherever the store does — the Node shell and the native loader persist it through the same atomic write as the freshness marks; the browser chat-shell holds both in memory, so there, as with freshness, a revocation lasts only as long as the page. An author who lost a key republishes under a new one, which gets a new internal app key and freshness mark and may claim names released when the old app was revoked. Genuinely undoing a revocation means editing the store file out of band — the same escape hatch as rolling a freshness mark back, and the same reason it exists.
 
 **Scope.** The set is keyed by author, not by `(author, app)` or by version range. A key is compromised or it is not; "this key was good through v6" would invite rolling back to v6 under a key the operator has just decided to stop trusting. The remedy for a merely *bad release* is the ordinary path below — a higher `version` from the same author.
 
-**The emergency path is the ordinary path.** There is no "replace this module directly" seam, and its absence is deliberate. If a bug is found in a module, the fix is a signed bundle at a higher `version` from the same author, admitted under the policy above — the same act on a running node as on a booting one, exercised on every release rather than held in reserve for the day it is needed. A dedicated emergency seam would be a second way to occupy a slot, reachable only in a crisis and therefore least tested exactly when it matters most; and it would be the one entry in the table with no signature behind it, sitting at a name it could not have derived, so nothing could afterward say who authored what runs there. An operator's emergency powers are the powers they use daily: sign a bundle, load it. The narrow case this forecloses — a module so broken the node cannot reach the point of loading a bundle — is a boot-path failure, answered by the operator's control of what the node boots with (a different bundle on disk, a rollback), not by an in-process seam whose own code path would have to survive whatever broke the first.
+**The emergency path is the ordinary path.** There is no "replace this module directly" seam, and its absence is deliberate. If a bug is found in a module, the fix is a signed bundle at a higher `version` from the same author, admitted under the policy above — the same act on a running node as on a booting one, exercised on every release rather than held in reserve for the day it is needed. A dedicated emergency seam would be a second way to occupy a slot, reachable only in a crisis and therefore least tested exactly when it matters most; it would place an unsigned value into a slot or claim map, so nothing could afterward say who authored what runs there. An operator's emergency powers are the powers they use daily: sign a bundle, load it. The narrow case this forecloses — a module so broken the node cannot reach the point of loading a bundle — is a boot-path failure, answered by the operator's control of what the node boots with (a different bundle on disk, a rollback), not by an in-process seam whose own code path would have to survive whatever broke the first.
 
-The *guest's* §12.2 requires are **not** gated by this file — they come from the signed manifest, bounded by which bundle the operator chose to run (`--bundle`). No per-author gate is needed because the one dangerous power — raw node-identity signing — isn't grantable at all: a guest's `node/sign` is confined to its app scope (§12.2, §14), and the rest (`fs`, `net`, hashing, …) are ordinary app powers.
+Every `guest.requires` entry is signed, checked against the host service catalog, and enforced by the guest seam (§12.2). Admission additionally gates privileged services by author: today `link` requires both the operator's `grants.link` decision and the booted transport-author pin. `node/sign` is available only through the slot-derived scope, never as a raw node-key oracle; filesystem, timers, and other declared services remain confined to the admitted slot.
 
 ### 12.6 Node↔node transport: channel identity binding
 
@@ -400,32 +400,36 @@ Four handshake messages, then records. **A message is a bare body — there is n
 byte.**
 
 ```
-msg1  i→r   [suite: 1][eph_i: 32][seal(k1; nonce_i): 48]      81 B  contact proof, no identity
-msg2  r→i   [eph_r: 32][seal(k2; nonce_r): 48]                80 B  contact proof, no identity
-msg3  i→r   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]            112 B  the caller names itself
-msg4  r→i   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]            112 B  the receiver answers, or not
-FRAME       [AEAD record ..]                                        only after authentication
+msg1  i→r   [suite: 1][eph_i: 32][kem_pk_i: 1184]
+             [seal(k_probe; nonce_i: 32): 48]               1,265 B  contact proof, no identity
+msg2  r→i   [eph_r: 32][kem_ct: 1088]
+             [seal(k2; nonce_r: 32): 48]                    1,168 B  hybrid reply, no identity
+msg3  i→r   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]             112 B  the caller names itself
+msg4  r→i   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]             112 B  the receiver answers, or not
+FRAME       [AEAD record ..]                                          only after authentication
+```
 
 Which message a body is follows from the reader's role and how far the exchange has got:
 the initiator reads msg2 then msg4, the responder msg1 then msg3, and every message after
-authentication is a record. That state is the reader's own — it must hold it to answer at
-all — so the sender has no say in which path a message takes, and each handshake message
-is accepted only at its exact width. A post-authentication message has exactly one
-destination, the AEAD open, which fails closed and tears the link down. The `suite` field
-of msg1 is the one self-describing byte on the wire, and it is a body field, covered by
-both signatures.
-```
+authentication is a record. That state is the reader's own, so the sender cannot steer the
+parser; each handshake message is accepted only at its exact width. A post-authentication
+message has exactly one destination, the AEAD open, which fails closed and tears the link
+down. The `suite` field of msg1 is the one self-describing byte on the wire, and both
+identity signatures cover it through the transcript.
 
-`eph` is a fresh **ephemeral X25519 public key**, generated per connection. `seal` is
-ChaCha20-Poly1305-IETF at nonce zero under the named key; each key encrypts exactly one
-message, so the nonce need never vary.
+`eph` is a fresh **ephemeral X25519 public key** and `kem_pk_i` is a fresh ML-KEM-768
+encapsulation key, both generated per connection by the initiator. The responder generates
+its own X25519 ephemeral and encapsulates to `kem_pk_i`; the initiator decapsulates
+`kem_ct`. `seal` is ChaCha20-Poly1305-IETF at nonce zero under the named key; each key
+encrypts exactly one message, so the AEAD nonce need never vary.
 
 **Neither identity appears in cleartext, and only a dialer speaks unprompted.** An
 accepting node stays silent until a msg1 opens under its **contact secret** (§12.6.3), so a
 stranger who opens a socket sees what it would see from a port that is not listening. The
 caller then names itself at msg3, *before* the receiver has said anything about itself, so a
 caller the receiver declines learns nothing — not even whether the identity it dialed is
-there. Both identities travel under keys derived from `ee`, which dies with the connection.
+there. Both identities travel under keys derived from `ee` **and** the ephemeral ML-KEM
+secret, both erased once the session keys exist.
 See [CHANNEL](CHANNEL.md) §3–§4 for why the identities are deferred and why the ordering is
 worth a second round trip.
 
@@ -434,28 +438,36 @@ keys; the same network key is the slot's signing scope, so their AUTH signatures
 disjoint too (§12.6.3).
 
 ```
-root = H(DOMAIN_channel ‖ network_key)
-k1   = KDF(contact,      H(root ‖ suite ‖ eph_i))
-h1   = H(root ‖ msg1)
-ee   = X25519(eph_i_sk, eph_r) = X25519(eph_r_sk, eph_i)
-k2   = KDF(ee ‖ contact, h1)
-h2   = H(h1 ‖ msg2)     k3 = KDF(ee ‖ contact, h2)   sig_i = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
-h3   = H(h2 ‖ msg3)     k4 = KDF(ee ‖ contact, h3)   sig_r = Sign(DOMAIN_channel ‖ root ‖ h3 ‖ id_r)
+root    = H(DOMAIN_channel ‖ network_key)
+k_probe = KDF(contact, H(root ‖ suite ‖ eph_i ‖ kem_pk_i), LABEL_probe)
+h1      = H(root ‖ msg1)
+ee      = X25519(eph_i_sk, eph_r) = X25519(eph_r_sk, eph_i)
+pq      = ML-KEM-768.Decaps(kem_sk_i, kem_ct)
+        = ML-KEM-768.Encaps(kem_pk_i).shared_secret
+k2      = KDF(ee ‖ pq ‖ contact, h1, LABEL_msg2)
+h2      = H(h1 ‖ msg2)
+k3      = KDF(ee ‖ pq ‖ contact, h2, LABEL_msg3)
+sig_i   = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
+h3      = H(h2 ‖ msg3)
+k4      = KDF(ee ‖ pq ‖ contact, h3, LABEL_msg4)
+sig_r   = Sign(DOMAIN_channel ‖ root ‖ h3 ‖ id_r)
 
 Sign(m) = Ed25519(DOMAIN_link_scope ‖ network_key ‖ m)   — the prefix is the host's (§12.2)
-h4   = H(h3 ‖ msg4)     k_i2r, k_r2i = KDF(ee ‖ contact, h4, "…i->r-v1\0" / "…r->i-v1\0")
+h4      = H(h3 ‖ msg4)
+k_i2r, k_r2i = KDF(ee ‖ pq ‖ contact, h4, "…i->r-v1\0" / "…r->i-v1\0")
 ```
 
 Both early messages carry a seal keyed by the contact secret, so neither side reveals an
 identity to a party without it.
 
-**`suite` names the handshake, and is not negotiated.** `0x02` is the concealed suite
-(§16.1): Ed25519 identity, ephemeral X25519, contact secret, ChaCha20-Poly1305 records. A
-link speaks exactly one suite — an unrecognised id draws silence, and every message is a
+**`suite` names the handshake, and is not negotiated.** `0x03` is the concealed hybrid suite
+(§16.1): Ed25519 identity, ephemeral X25519 + ML-KEM-768, contact secret, and
+ChaCha20-Poly1305 records. A link speaks exactly one suite — an unrecognised id draws
+silence, and every message is a
 fixed width per suite, so trailing bytes are malformed rather than forward-compatible.
-There is no list, no fallback, and no "highest common" rule. Suite `0x01`, which carried
-both identities in cleartext, is removed rather than disabled. Because the byte is folded
-into the transcript root at `h1`, both signatures cover it: an in-path attacker who flips
+There is no list, no fallback, and no "highest common" rule. Superseded suites are removed
+rather than disabled. Because the byte is folded
+into the first transcript hash `h1`, both signatures cover it: an in-path attacker who flips
 it only makes the two ends sign different bytes. A suite is *chosen* by the endpoints,
 never *forced* by the network (§14.1). The bytes a node sends and the bytes it folds into
 the transcript are one construction in the transport bundle.
@@ -463,7 +475,7 @@ the transcript are one construction in the transport bundle.
 **Each signature commits to its own identity and the whole transcript.** `sig_i` covers the
 channel-tagged content `DOMAIN_channel ‖ root ‖ h2 ‖ id_i` under the slot's host-applied
 `DOMAIN_link_scope ‖ network_key`, and `h2` chains `DOMAIN_channel`, msg1 and msg2 — hence
-the suite, both ephemeral keys and both nonces. So a signature collected on one connection,
+the suite, both X25519 ephemerals, the KEM public key and ciphertext, and both nonces. So a signature collected on one connection,
 even from a node used as a signing oracle, names the wrong exchange elsewhere and fails to
 verify; see §14. The identity is committed explicitly because it travels *inside* a
 ciphertext rather than in the hashed wire bytes. `DOMAIN_channel` is
@@ -472,16 +484,16 @@ cannot double as another of its formats over the same bytes; the *cross-protocol
 separation is the host's `DOMAIN_link_scope` prefix, which no occupant can reach past. An
 outbound dial pins `expectPeerId`: if msg4
 presents a different key, the link closes, and it closes *before* the dial is treated as
-live. Frames sent before authentication are queued, bounded by `MAX_QUEUE_BYTES` (1 MiB)
-with oldest-dropped — a byte bound, not a frame count — so a peer that never authenticates
-cannot make a node hoard memory.
+live. Frames sent before authentication are queued with oldest-dropped, bounded by both
+`MAX_QUEUE_BYTES` (1 MiB) and `maxPreAuthQueueSlices` (4,096), so neither large frames nor
+many tiny frames can make a node hoard memory.
 
 **This is an AKE.** The identity signatures cover the transcript that carries both
-ephemeral keys, so they authenticate the key exchange (SIGMA-style; since each signature
+X25519 ephemerals and the KEM exchange, so they authenticate the key exchange (SIGMA-style; since each signature
 already covers its own identity there is no separate identity-MAC seam). The responder
-authenticates at msg3 and may carry application data alongside msg4 (1.5 RTT); the
-initiator authenticates at msg4 (2 RTT). Session keys derive from `ee` and the contact
-secret over the full transcript hash, with roles assigning the directions — the initiator
+authenticates the initiator at msg3 (1.5 RTT); the initiator authenticates the responder at
+msg4 (2 RTT). Application data begins with the following record. Session keys derive from `ee`, the ML-KEM secret,
+and the contact secret over the full transcript hash, with roles assigning the directions — the initiator
 encrypts with `k_i2r` and decrypts with `k_r2i`, the responder mirrors. Every
 post-handshake FRAME is a **ChaCha20-Poly1305-IETF record** under the sending key, with an
 implicit monotonic per-direction `(epoch, counter)` nonce and strict enforcement on
@@ -489,32 +501,30 @@ receive. There is exactly one post-handshake frame type — the AEAD record — 
 split and no downgrade seam. That nonce and the dispatch above both rest on the pipe
 delivering whole messages in order, which every socket seam beneath supplies.
 
-**The handshake uses no long-term Diffie–Hellman key at all**: `ee` is ephemeral on both
-sides, and the contact secret and network key are KDF inputs. So the channel Ed25519 key
+**The handshake uses no long-term Diffie–Hellman or KEM key at all**: `ee` and the KEM key
+material are ephemeral, and the contact secret and network key are KDF inputs. So the channel Ed25519 key
 stays signing-only and never takes a DH role (§14), and a node address needs no DH key —
-which is also why the post-quantum suite will not change the address format
+which is why the post-quantum `0x03` landing did not change the address format
 ([CHANNEL](CHANNEL.md) §11).
 
-**Refusals are silent, and that is load-bearing.** Every way a handshake can fail before
-authentication — wrong contact secret, wrong network, malformed message, bad signature, an
-identity the peer lint declines — does nothing at all and lets the deadline expire. Closing
-on any of them would answer a question, which is the enumeration this suite exists to
-close. The one exception is an `expectPeerId` mismatch at msg4, which aborts: we named
-ourselves at msg3, so there is nothing left to hide. See §12.6.2 for what the silence costs
+**Refusals are silent, and that is load-bearing.** Every way the responder can refuse before
+revealing itself — wrong contact secret, wrong network, malformed message, bad signature,
+or a caller its peer lint declines at msg3 — does nothing and lets the deadline expire.
+Closing on any of them would answer a question, which is the enumeration this suite exists
+to close. Initiator-side `expectPeerId` and peer-lint rejections at msg4 instead abort: the
+initiator already named itself at msg3, so there is nothing left to hide. See §12.6.2 for what the silence costs
 and [CHANNEL](CHANNEL.md) §5 for why it is worth paying.
 
 #### 12.6.2 Half-open budgets
 
 A refused connection stays open until its deadline rather than being dropped, so the
 budgets are what stands between a stranger and the node. The half-open limiter lives in the
-transport bundle and is shared by every socket seam a host stands up; the two frame caps it
-works against are the *host's* (`core/net-limits.ts`), because a limit protecting a resource
-must be declared by whoever owns the resource — a host importing its own flood bound from
-the module it is bounding would be taking the bounded party's word for the bound. Measured
-behaviour lives in
+transport bundle and is shared by every socket seam a host stands up. The host owns the
+post-authentication application cap (`MAX_FRAME_BYTES`); the signed transport owns its tighter
+pre-authentication framer cap (`MAX_HANDSHAKE_FRAME_BYTES`). Measured behaviour lives in
 `tests/transport-load.test.mjs`; the reasoning is in [CHANNEL](CHANNEL.md) §5.
 
-- **No cryptography before proof.** An accepting link generates its ephemeral keypair only
+- **No asymmetric cryptography before proof.** An accepting link generates its X25519 and ML-KEM keypairs only
   once a msg1 opens; verifying msg1 is a hash and a Poly1305 check. A stranger costs a
   socket, a timer and no asymmetric operations.
 - **Three budgets.** `MAX_HALF_OPEN_UNVERIFIED` (1024) for callers that have not yet produced
@@ -537,9 +547,9 @@ behaviour lives in
   address book redials on the next send. Observing the second requires the contact secret, so
   the split leaks nothing.
 - **`MAX_HANDSHAKE_FRAME_BYTES` (8 KiB) caps inbound reassembly pre-auth**, raised to
-  `MAX_FRAME_BYTES` by the bundle's own framer on authentication — both numbers stay the
-  host's (`core/net-limits.ts`), supplied in `LOCAL`, and what the occupant chooses is only
-  when the transition happens. Applying the full application cap to an unauthenticated peer let a
+  the host-resolved `MAX_FRAME_BYTES` by the bundle's own framer on authentication. The
+  pre-authentication constant lives in `transport/src/framing.js`; the application ceiling
+  is host-owned and may be lowered through `LOCAL`. Applying the full application cap to an unauthenticated peer let a
   stranger reserve megabytes per connection. Hybrid suite `0x03` makes msg1 1,265 bytes
   and msg2 1,168 bytes because it carries an ML-KEM-768 encapsulation key and ciphertext.
   Both remain comfortably below 8 KiB. At that cap against
@@ -548,7 +558,7 @@ behaviour lives in
 
 **Framer reassembly is linear, and there is one parser per link.** A TCP message arrives in arbitrarily small slices. Joining every slice onto one buffer makes a dribbled full-size frame cost a quadratic number of copies; keeping every slice as it arrived costs a view and a pinned chunk buffer per byte, times the half-open budget. The bundle's `ByteParts` (`transport/src/framing.js`) merges slices below 8 KiB into a doubling tail buffer so every byte moves a constant number of times and the live slice count is bounded by bytes/`MERGE_BELOW`. A slice at or above that size is kept as it arrived. The WebSocket framer serializes `push` so two parses never run over one buffer: `frames()` takes a frame before awaiting its decode, so a second parser would read the frame after it, and `raiseCap()` lands only when msg4 is *delivered*, so a second parser would measure a frame riding the same segment against the pre-auth cap and refuse a legitimate link.
 
-**A request inherits the initiating kernel deadline.** The transport's `send` op carries no time field and its request/response table arms no private clock. The app's remaining handoff deadline crosses the `_net` realm call, covers the pre-auth pool and socket backlog, and remains attached to a deferred answer. Socket `buffered()` is therefore host-only custody accounting for `LinkOutboundOwner`; it is not exposed as `link/stat`, and transport content cannot extend an owner's time because bytes happen to be moving.
+**A request inherits the initiating kernel deadline.** The transport's `send` op carries no time field. The app's remaining handoff deadline crosses the `_net` realm call, covers the pre-auth pool and socket backlog, and remains attached to a deferred answer. Separately, the transport arms `requestTimeoutMs` (10 s by default, `0` disables) only to retire its own pending correlation; that timer cannot extend the inherited kernel deadline. Socket `buffered()` is therefore host-only custody accounting for `LinkOutboundOwner`; it is not exposed as `link/stat`, and transport content cannot extend an owner's time because bytes happen to be moving.
 
 **Underneath all of them, the host keeps its own coarse bounds.** Everything above is content
 policy: "half-open", "verified" and "authenticated" are states only the occupant can see, so
@@ -557,7 +567,7 @@ platform owns is cruder and comes first, since a socket costs a descriptor and a
 entry the moment it is accepted, turns before the guest has formed any opinion about it. The
 same rule as the frame caps, applied to the host-side structures a link occupies:
 
-- **`MAX_RAW_LINKS` (4096)** bounds the driver's own link table, on the single path that
+- **`DEFAULT_MAX_RAW_LINKS` (4096)** bounds the driver's own link table, on the single path that
   mints a link id — a guest dial, an accepted connection, a host-managed handover. It
   **refuses** rather than evicts, because which link is worth keeping is precisely the
   judgement this layer does not have, and it sits well above the sum of the tiers so an
@@ -574,7 +584,7 @@ same rule as the frame caps, applied to the host-side structures a link occupies
   above — the two windows overlap by design, and inbound host memory there is bounded at
   twice this figure. That one **waits** instead of failing: a reader goroutine is the one
   place backpressure costs nothing, and the socket's own receive window carries it to the
-  peer. Failing there would put a capacity cliff far below `MAX_RAW_LINKS`, where a burst of
+  peer. Failing there would put a capacity cliff far below `DEFAULT_MAX_RAW_LINKS`, where a burst of
   honest links kills most of itself.
 - **`MAX_QUEUED_SIGNAL_BYTES` (4 MiB) and `MAX_QUEUED_SIGNALS` (256)** bound the one ordered
   WebRTC signaling lane, node-wide: a lane is a queue, and the decoded message each entry
@@ -605,7 +615,7 @@ same rule as the frame caps, applied to the host-side structures a link occupies
   fails its link rather than being read as holding nothing. An adapter that drained out of
   send order would retire the wrong slices, which is why the seam requires ordering it
   already has. `MAX_NODE_OUTBOUND_QUEUE_BYTES`/`_SLICES` (4× each) is the parent
-  allowance every link draws from, so per-link ceilings cannot multiply by `MAX_RAW_LINKS`.
+  allowance every link draws from, so per-link ceilings cannot multiply by `DEFAULT_MAX_RAW_LINKS`.
   Crossing any of them fails the whole link rather than dropping a write from the ordered
   stream — and so does a refusal the occupant meets *before* the driver, since its own
   `host.call` budget can decline to issue the write at all under load. A record that was
@@ -678,9 +688,9 @@ the node, and updates the guest without reinstalling it. Existing links remain v
 
 ### 12.7 Browser↔console WebRTC
 
-§12.6's channel rides any whole-message pipe, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `peers` surface as the TCP and WebSocket transports.
+§12.6's channel rides any whole-message pipe, and a WebRTC `RTCDataChannel` is one. `RtcNetwork` therefore exposes the same `ChannelFactory`/`RawLink` seam as the TCP and WebSocket adapters; the signed transport bundle above that seam provides peer addressing and send operations.
 
-**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the app-neutral [`seedrelay`](https://github.com/arj03/seedrelay) server is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and the transport bundle's channel stack (§12.6) rides on top — `RtcNetwork` **is** the node's `ChannelFactory`, so each established data channel reaches the driver as an ordinary `RawLink`. Its `Arrival` carries `weDialed` and `expectPeerId`, but no listener because signaling created the link. The AKE/record/routing state machine then runs in the signed bundle exactly as over TCP, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing authenticated link between two connected peers — and transports one opaque encoded string in each direction, never JavaScript message objects; the supplied rendezvous only broadcasts it verbatim. The compact NUL-separated frame is decoded once inside `RtcNetwork`, before policy or allocation. Signaling carries *no* SDP-fingerprint signature, because identity is proven in-channel: the transport bundle's handshake runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. Signaling input is treated as untrusted host memory: speculative peer connections expire after 30 seconds without reaching `connected`, and ICE candidates queued before a remote description are normalized to the four standard scalar fields and capped per peer at 256 candidates / 256 KiB aggregate string storage. Crossing either pending-ICE limit tears the speculative peer down. The rendezvous carries no credential either: an RTC link opens under the node's *own* contact secret, which is the deployment's, so a peer outside it draws no response at all and signaling never has a secret to leak. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing its own `peerConnectionFactory` — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. That factory is the app's, not the runtime's: the seam this file owns is a byte duplex, and an ICE/DTLS/SCTP implementation is one way to produce one, so the runtime declares no dependency on any. A console peer wants a pure-JS library (it bundles into `bun --compile`, where a native binding like `node-datachannel` segfaults) wrapped to the W3C subset used above — seedstore's `scripts/werift-pc.mjs` does exactly that over werift.
+**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the app-neutral [`seedrelay`](https://github.com/arj03/seedrelay) server is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and the transport bundle's channel stack (§12.6) rides on top — `RtcNetwork` **is** the node's `ChannelFactory`, so each established data channel reaches the driver as an ordinary `RawLink`. Its `Arrival` carries `weDialed` and `expectPeerId`, but no listener because signaling created the link. The AKE/record/routing state machine then runs in the signed bundle exactly as over TCP; applications reach the transport's local service rather than calling the adapter directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing authenticated link between two connected peers — and transports one opaque encoded string in each direction, never JavaScript message objects; the supplied rendezvous only broadcasts it verbatim. The compact NUL-separated frame is decoded once inside `RtcNetwork`, before policy or allocation. Signaling carries *no* SDP-fingerprint signature, because identity is proven in-channel: the transport bundle's handshake runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. Signaling input is treated as untrusted host memory: speculative peer connections expire after 30 seconds without reaching `connected`, and ICE candidates queued before a remote description are normalized to the four standard scalar fields and capped per peer at 256 candidates / 256 KiB aggregate string storage. Crossing either pending-ICE limit tears the speculative peer down. The rendezvous carries no credential either: an RTC link opens under the node's *own* contact secret, which is the deployment's, so a peer outside it draws no response at all and signaling never has a secret to leak. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing its own `peerConnectionFactory` — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. That factory is the app's, not the runtime's: the seam this file owns is a byte duplex, and an ICE/DTLS/SCTP implementation is one way to produce one, so the runtime declares no dependency on any. A console peer wants a pure-JS library (it bundles into `bun --compile`, where a native binding like `node-datachannel` segfaults) wrapped to the W3C subset used above — seedstore's `scripts/werift-pc.mjs` does exactly that over werift.
 
 **Confidentiality.** Like every transport, the WebRTC fabric's frames are confidential and integrity-protected by the §12.6 AKE record layer. A data channel is also DTLS-encrypted, a redundant-but-harmless second layer underneath. As on the raw transports, the in-channel AUTH supplies the identity binding DTLS alone does not (§11).
 
@@ -700,7 +710,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 
 **The CLI is shared code, not a per-target wrapper.** `runCli` (`host/cli.ts`) owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy` (§14), the order — remedies, then the bundle, then the one-shots, then serve (§12.5) — and every line printed. A target supplies a `CliHost`: files, one console line, raw stdout, entropy, and "stand a node up on this platform". That is five members, none of which decides anything, and it is the whole difference between running a node on Node and running one from the native binary (§12.9). Argument *tokenizing* is not the point of sharing it — a dozen lines that fail loudly — the flag set and the sequence are, because a decision made twice is one that eventually gets made differently. Unknown flags are refused rather than ignored, which is the failure that used to be silent: a mistyped `--polcy` produced a deny-all node that boots, serves, installs nothing, and looks exactly like a policy doing its job.
 
-`--transport` supplies a signed transport bundle from disk instead of the artifact the build embeds (`TRANSPORT_BUNDLE_B64`) — a node with its own pinned transport author, or a newer protocol than the binary ships (§12.6). `--contact-secret` names a *file* holding 64 hex characters (§12.6.3), never the secret itself: an argument is visible in `ps` output and shell history. `--app-config` requires `--bundle` and supplies that one load's `LOCAL` JSON; it is never node setup and never reaches the transport bundle. `--peers` is the transport's, and goes in as `transport.config.peers` on the automatic load rather than being taught to a driver afterwards — the address book is the occupant's (§12.10) — so a malformed peer reference fails before anything is listening. Request time is the initiating realm's kernel-owned handoff deadline, configured through `--guest-timeout`, not transport JSON. Once the node is up the flow waits for that cohort with an ordinary claim call, `Shell.call` on the id the transport bundle claims: a `null` answer is "nothing here is the network", which is what an operator who typed `--peers` on a node whose policy admitted no transport must be told.
+`--transport` supplies a signed transport bundle from disk instead of the artifact the build embeds (`TRANSPORT_BUNDLE_B64`) — a node with its own pinned transport author, or a newer protocol than the binary ships (§12.6). `--contact-secret` names a *file* holding 64 hex characters (§12.6.3), never the secret itself: an argument is visible in `ps` output and shell history. `--app-config` requires `--bundle` and supplies that one load's `LOCAL` JSON; it is never node setup and never reaches the transport bundle. `--peers` is the transport's, and goes in as `transport.config.peers` on the automatic load rather than being taught to a driver afterwards — the address book is the occupant's (§12.10) — so a malformed peer reference fails before anything is listening. The initiating realm's kernel-owned handoff deadline is configured through `--guest-timeout`; transport `requestTimeoutMs` only retires its own pending correlation and cannot extend that deadline. Once the node is up the flow waits for that cohort with an ordinary claim call, `Shell.call` on the id the transport bundle claims: a `null` answer is "nothing here is the network", which is what an operator who typed `--peers` on a node whose policy admitted no transport must be told.
 
 **`--op` names an op the CLI does not know, and that is the whole of its app-facing surface.** One flag rather than one per operation, because an op is a name travelling in `handle`'s payload (§12.2) and the runtime passes it through unread: a storage `put` and a chat `render` are reachable the same way, and neither is spelled anywhere in the kernel. **stdin is the argument and stdout is the response** — `handle`'s ABI exactly, bytes in and bytes out — so nothing here decodes, formats, or knows an app's argument shape. Neither a flag per operation nor a *choice* of argument flag can avoid knowing it, since which one an operator needs is decided by the app; composing bytes is the shell's job. `log` therefore goes to **stderr** on both targets, since an operator line landing in the middle of a response would corrupt a redirect. The op targets the app `--bundle` just loaded through that load's returned handle — not through "the only app", which a node with a network cannot mean, since its transport is an ordinary app too (§12.10).
 
@@ -762,7 +772,7 @@ One module-path cost differs by design: on the JS targets every module call roun
 
 ### 12.10 Protocol routing — which app handles a message
 
-Admission (§12.5) decides whether code may run. It does not decide who gets traffic, and after §5.1 it cannot: a node may hold two apps that both serve chat, authored by different keys, landed at names that never collide. Something has to say which one a message goes to.
+Admission (§12.5) decides whether code may run. Routing is a separate, signed fact: each installed app declares the peer protocols and local services it claims, and each claim map permits one active owner per literal name.
 
 **A frame names a protocol, not an app.** What travels is a protocol id in the Transport req frame (§12.6) — a chat message carries one, a storage message carries its op. It never names an app, an author, or a module: those are node-local (§5.1), and a wire that named them would make every peer's install choices everyone else's business.
 
@@ -782,9 +792,9 @@ To deliver, the host looks up the complete slot and invokes its guest `handle` w
 
 **The claim maps are a projection of installed slots.** There are two, one per audience: `peerClaims` from every verified manifest's `protocols`, `localClaims` from its `services`. One owner per name *within* a map; the shell recomputes both on each atomic slot replacement or removal, and nothing persists routing separately.
 
-**Three rules fall out of that projection.** An update uses only its new claims; a later installed slot wins a contested id; uninstall reveals the preceding installed claimant. The displaced slot remains complete and private, merely idle.
+**Three rules fall out of that projection.** An update uses only its new claims; a replacement under the same `(author, app)` key may atomically change those claims; and a different app contesting any active peer or local claim is refused before commit. Uninstall releases the removed slot's claims; it does not reveal a shadow claimant because none can be installed.
 
-**Installing is the whole of taking over a protocol, and it is the operator's act.** Point a second chat app at a node and it takes over `chat-v1`; drop it again and the first one resumes. No uninstall of the incumbent, no name to vacate, and no second command — because the two apps were never competing for a slot, only for the last word. That is the practical payoff of putting the author in the name: succeeding an abandoned app stops requiring cooperation from its author. What makes it safe to fuse into the install is that installing is *already* the trusted act: the policy (§12.5) decided the author may run code on this node, and routing frames to code that is already running is strictly less than that.
+**Installing does not silently take over another app's protocol.** To replace a claimant from a different `(author, app)`, the operator first removes the incumbent or installs the successor under a different free claim. This makes ownership deterministic and prevents installation order from changing routing behind an already admitted app. The host-internal app key still allows different authors to reuse an `app` label; it does not namespace literal protocol or service claims.
 **A claim is not authority, which is why a signed one is fine.** A protocol id routes frames a peer already chose to send, to code this host's policy already admitted. It cannot make unadmitted code run, widen a guest's `guest.requires` (§12.2), reach another app's fs scope, or let one app sign in another's namespace. Nothing about integrity or authenticity rests on it, and two nodes disagreeing about a routing are each simply serving what they installed. The worst a wrong claim does is deliver to the wrong app of two the operator chose to install — recoverable by uninstalling one.
 
 **Two claim lists, two maps, two audiences.** A manifest signs `protocols`, what a PEER may reach, and `services`, what a CO-RESIDENT guest — and the host itself — may reach with one call. Both share one charset: alphanumeric-or-`_` first character, then alphanumerics and `._/-`, at most 64 bytes. Uniqueness is **per list**: a duplicate within one is ambiguous and refused, while the same name in both is not — it says "reachable either way", two reaches to one owner, which is more than a single union map could express and needs no rule to allow. Which list a name sits in is a fact the manifest STATES, never a fact its spelling implies — `_net` is a spelling convention this repo's own transport bundle uses for its local service id, not a kernel-known reservation, and a name with no leading `_` claims under `services` exactly as well as one that has it.

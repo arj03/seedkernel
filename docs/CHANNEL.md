@@ -18,7 +18,7 @@ Three capabilities are denied:
 | Capability | Denied by |
 | --- | --- |
 | **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1) and the message ordering (§4) |
-| **Attribute** — watch a flow, learn which pair it belongs to | both identities travelling under the ephemeral–ephemeral secret (§3) |
+| **Attribute** — watch a flow, learn which pair it belongs to | both identities travelling under the hybrid ephemeral secrets (§3) |
 | **Membership-test** — ask a node "would you talk to key P?" | silent refusal on every pre-auth path (§5) |
 
 Two things it does not provide, stated here rather than buried: a node at a stable
@@ -31,13 +31,14 @@ different project. §9 has the full list.
 
 ## 2. Shape
 
-Four messages. The initiator opens with an ephemeral and a seal keyed by the receiver's
-contact secret; the receiver answers with an ephemeral and a seal of its own; the caller
+Four messages. The initiator opens with an X25519 ephemeral, an ML-KEM-768 public key, and
+a seal keyed by the receiver's contact secret; the receiver answers with its X25519
+ephemeral, an ML-KEM ciphertext, and a seal derived from both shared secrets. The caller
 then names itself; and only then does the receiver name itself.
 
 ```
-msg1  i→r   ephemeral + contact proof          — no identity
-msg2  r→i   ephemeral + contact proof          — no identity
+msg1  i→r   X25519 ephemeral + KEM pk + contact proof  — no identity
+msg2  r→i   X25519 ephemeral + KEM ct + hybrid proof  — no identity
 msg3  i→r   the caller names itself
 msg4  r→i   the receiver answers, or does not
 ```
@@ -45,24 +46,24 @@ msg4  r→i   the receiver answers, or does not
 Wire layout, exact widths, the key schedule and the constants are normative and live in
 [RUNTIME](RUNTIME.md) §12.6. Everything below is why they are that way.
 
-## 3. Identities travel under the ephemeral–ephemeral secret
+## 3. Identities travel under the hybrid ephemeral secrets
 
-Neither public key appears in cleartext. Both are sealed under keys derived from `ee`,
-which exists only for the life of the connection, so a node seized years later yields
-nothing from a recording of one.
+Neither identity public key appears in cleartext. Both are sealed under keys derived from
+the ephemeral X25519 secret `ee` and the ephemeral ML-KEM secret. Both are erased once the
+session keys exist, so a node seized years later yields nothing from a recording of one.
 
 This is why identities wait for the third and fourth messages rather than the first. At
 msg1 the only key in existence is long-term, so anything sealed there is sealed under a key
 that lives for years — the property Noise names for its `IK` pattern and WireGuard
 documents as a known limitation: compromising a responder's private key plus a traffic log
-reveals who sent every recorded handshake. Deferring past `ee` makes concealment
-forward-secret for both ends.
+reveals who sent every recorded handshake. Deferring identity disclosure until both `ee`
+and the ML-KEM secret exist makes concealment forward-secret and hybrid for both ends.
 
 The handshake therefore uses **no long-term Diffie–Hellman key at all**. `ee` is ephemeral
 on both sides; the contact secret and network key are KDF inputs. Two consequences worth
 having: the Ed25519 identity key stays signing-only, as §12.6 requires, without the
 Ed25519→Curve25519 conversion Secret Handshake needs; and a node address carries no DH key,
-so the post-quantum suite will not change the address format (§11).
+so the post-quantum `0x03` landing did not change the address format (§11).
 
 ---
 
@@ -89,8 +90,10 @@ connection forever.
 
 ## 5. Refusals are silent
 
-Every pre-authentication failure does nothing at all and lets the deadline expire, so an
-unauthorised caller cannot distinguish this node from a port that is not listening.
+Every refusal before the responder reveals its identity does nothing at all and lets the
+deadline expire, so an unauthorised caller cannot distinguish this node from a port that is
+not listening. After the initiator has revealed itself at msg3, its local msg4 peer-pin or
+peer-policy rejection may abort because there is no responder identity left to conceal.
 
 The alternative — closing on a bad message — answers a question. "I am a seedkernel node
 and that is not the key" is exactly the oracle §1 removes, and it is available to anyone
@@ -296,7 +299,7 @@ Three reasons, in order of weight.
    authentication needs the deferred variants and does not exist today.
 2. **Noise's static-key guidance costs us an address field.** A Noise static must be a DH
    key, so adopting Noise means a second long-term key per node, published in every address
-   and 1216 bytes once it goes hybrid. §7 satisfies the *spirit* of that guidance — the
+   and 1,216 bytes if that long-term address key were hybrid X25519 + ML-KEM-768. §7 satisfies the *spirit* of that guidance — the
    identity key never takes a DH role — without publishing a DH key at all.
 3. **No standard pattern gives the ordering in §4.**
 
@@ -313,9 +316,9 @@ an authenticated goodbye — which is where §12.6.1's end-of-stream record came
 network key is adopted outright (§6.2).
 
 Not adopted wholesale because it requires the identity key to take a DH role, converting
-Ed25519 to Curve25519, which §12.6 rules out; and because it has no suite byte, so there is
-nowhere to put an ML-KEM encapsulation key. §14.1 identifies the channel as the one
-migration on a real deadline, which makes that the heaviest objection.
+Ed25519 to Curve25519, which §12.6 rules out; and because it has no suite byte for the
+ML-KEM fields that suite `0x03` now carries. The reserved suite byte made that migration
+self-describing without changing the node address or adding a round trip.
 
 ---
 

@@ -29,7 +29,7 @@ cd ../../your-client
 npm install
 ```
 
-The browser artifacts require the additional `npm run build:browser` build described in the [main README](../README.md#build-variants-and-client-api).
+The browser artifacts require the additional `npm run build:browser` build described in the [main README](../README.md#get-started).
 
 ## 1. Authoring — build and sign the bundle format (§12.4)
 
