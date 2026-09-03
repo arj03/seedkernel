@@ -7,6 +7,7 @@
 // framing from the destination or listener label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
+import { errMessage } from "../core/util.js";
 import { LISTENER, type Arrival, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { TCP_LINGER_MS } from "../core/net-limits.js";
 import { parseDest } from "./peer-addr.js";
@@ -42,10 +43,20 @@ function nodeRawStream(socket: Socket): RawLink {
 }
 function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
     return new Promise<number>((resolve, reject) => {
+        // Detached below, because `reject` on a settled promise is silent AND `once`
+        // unregisters it: left armed, it eats the first post-bind error and leaves the
+        // second to reach a server with no `error` listener, which ends the process.
         server.once("error", reject);
         server.listen(opt.port, opt.host, () => {
+            server.removeListener("error", reject);
             const a = server.address() as { port: number } | null;
-            resolve(a && typeof a === "object" ? a.port : 0);
+            const port = a && typeof a === "object" ? a.port : 0;
+            // A LISTENING server's error is an accept that failed (EMFILE and friends).
+            // The connection is lost, the listener is not: report and stay up.
+            server.on("error", (err) => {
+                console.error(`[net] accept on ${opt.host}:${port}: ${errMessage(err)}`);
+            });
+            resolve(port);
         });
     });
 }
