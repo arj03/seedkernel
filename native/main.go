@@ -44,7 +44,7 @@ type boundModule struct {
 var (
 	ctx = context.Background()
 	// rt holds every installed app module and the env shims they import: the untrusted
-	// code the module-call bound arms (boot).
+	// code the module-call bound arms (bootModuleTable).
 	rt wazero.Runtime
 	// rtCore is the TCB's own runtime (libsodium, ML-DSA, ML-KEM), deliberately not armed:
 	// a wedged libsodium is a host bug, not a confinement breach.
@@ -64,6 +64,40 @@ var (
 // The §4.1 scratch default arrives from the shared host (core/wasm-limits.ts
 // DEFAULT_SCRATCH_SIZE) with every slot build, so Go owns no copy that could drift from
 // the JS table's. A module needing more exports a `scratchSize` global.
+
+// bootModuleTable stands the table up: the runtime every installed app module is
+// instantiated on, plus the import shims those modules resolve against. Both belong here
+// rather than in boot(), which owns engines the table has nothing to do with.
+func bootModuleTable() error {
+	// WithCloseOnContextDone arms the termination check compiled into every loop of every
+	// app module, which is what gives the §4.3 bound teeth. Calls carry the calling guest's
+	// own remaining segment.
+	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
+		WithCloseOnContextDone(true))
+	// AssemblyScript's three imports, exactly the set the JS host resolves (a subset would
+	// make "does this module load" a property of the target). All inert — `seed` is a
+	// constant (§4.2), `trace` drops args (§4.3), `abort` need not trap.
+	env := rt.NewHostModuleBuilder("env")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
+	if _, err := env.Instantiate(ctx); err != nil {
+		return fmt.Errorf("module imports: %w", err)
+	}
+	return nil
+}
+
+// closeModuleTable releases the table whole: closing the runtime frees every instance and
+// its compiled code, and the slot map naming them goes with it. Paired with the above so
+// the table's state has ONE teardown — state added beside `rt` and `moduleSlots` is
+// released here, not by remembering to add a line to shutdown().
+func closeModuleTable() {
+	if rt != nil {
+		_ = rt.Close(ctx)
+		rt = nil
+	}
+	moduleSlots = map[string]map[string]*boundModule{}
+}
 
 // replaceModuleSlot replaces one opaque handle's whole module set. wazero frees neither
 // instances nor compiled code, so dropping the map value alone leaks per re-install.
@@ -241,23 +275,12 @@ func instantiateWasm(wasm []byte, scratchDefault uint32, bindDeadline time.Durat
 func boot() error {
 	shutdown()
 	var err error
-	// WithCloseOnContextDone arms the termination check compiled into every loop of every
-	// app module. Calls carry the guest segment's own deadline; rtCore stays unarmed.
-	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
-		WithCloseOnContextDone(true))
+	if err = bootModuleTable(); err != nil {
+		return err
+	}
 	rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rtCore)
 	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
-	// AssemblyScript's three imports, exactly the set the JS host resolves (a subset would
-	// make "does this module load" a property of the target). All inert — `seed` is a
-	// constant (§4.2), `trace` drops args (§4.3), `abort` need not trap.
-	env := rt.NewHostModuleBuilder("env")
-	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
-	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
-	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
-	if _, err := env.Instantiate(ctx); err != nil {
-		return fmt.Errorf("module imports: %w", err)
-	}
 
 	if qrt, err = qjs.New(); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
@@ -293,15 +316,11 @@ func shutdown() {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil
 	}
-	if rt != nil {
-		_ = rt.Close(ctx)
-		rt = nil
-	}
+	closeModuleTable()
 	if rtCore != nil {
 		_ = rtCore.Close(ctx)
 		rtCore = nil
 	}
-	moduleSlots = map[string]map[string]*boundModule{}
 }
 
 // exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
