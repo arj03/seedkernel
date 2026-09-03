@@ -8,9 +8,9 @@ import { verifyBundle, FreshnessMarks, freshnessPathFor, type JsonObject, type P
 import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import {
-  bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
+  bootShell, type AppHandle, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { CausalContext, createHandoffDeadlines, serializeCalls, type CausalClock } from "./realm-queue.js";
+import { CausalContext, createHandoffDeadlines, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -386,7 +386,7 @@ const embeddedTransportAuthor = (() => {
     }
 })();
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm driven by
- *  Go's event loop, presenting the same `SafeRealm` safe-js.ts does. The promise plumbing
+ *  Go's event loop, implementing the same neutral `Realm` contract as safe-js.ts. The promise plumbing
  *  stays here rather than in Go: `nativeCall` closes over this realm, so a settled op routes
  *  to the realm that parked it structurally, and Go needs no promise primitive of its own.
  *

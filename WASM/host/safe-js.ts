@@ -26,37 +26,11 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
-import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
+import { guestPreamble, type CallBudget } from "./guest-seam.js";
 import {
   CausalContext, createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls,
-  type CausalClock, type Invocation,
+  type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
-
-/** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
- *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
-export type { HostCall };
-
-export interface SafeRealmOptions {
-  /** Guest source. Runs in the sandbox; must declare the one `handle(arg)` entrypoint. */
-  source: string;
-  /** The seam this realm calls out through — its whole view of the host. */
-  hostCall: HostCall;
-  /** Hard cap on the realm's heap (default 64 MiB). A runaway guest hits this
-   *  instead of the host's memory. */
-  memoryLimitBytes?: number;
-  /** Guest execution and handoff budget per entrypoint, in ms. `Infinity` disables;
-   *  omit for default. */
-  deadlineMs?: number;
-}
-
-export interface SafeRealm {
-  /** Invoke the guest's one `handle` entrypoint with `[caller 32][body …]` — the only
-   *  way in, for both roles. Serialized per realm (realm-queue.ts). */
-  /** `deadlineMs` is the initiating owner's live remainder. Omission means a
-   *  host-initiated call and takes this realm's configured ceiling. */
-  call(payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
-  dispose(): void;
-}
 
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
@@ -93,7 +67,7 @@ interface ExecClock {
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
-function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock {
+function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
   ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES);
   const configuredMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   let budgetMs = configuredMs;
@@ -180,7 +154,7 @@ const disposeDisposableResult = (result: unknown): void => {
  *  run first, after which nothing can re-enter (the queue fails on `disposed`). */
 const newRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
 
-export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
+export const createSafeRealm: RealmFactory = async (opts) => {
   const mod = await getModule();
   // NOT `mod.newContext()`: that couples the runtime's lifetime to the context's, freeing
   // both in the same breath — the teardown order described above, which dispose() must
@@ -506,4 +480,4 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       timer.unref?.();
     },
   };
-}
+};

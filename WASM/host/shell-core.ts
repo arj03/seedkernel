@@ -12,9 +12,11 @@ import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
 import { PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
-import { monotonicMs, type CausalClock } from "./realm-queue.js";
-import { type SafeRealm } from "./safe-js.js";
+import { monotonicMs, type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
+
+/** Neutral realm contracts exposed through the shell facade clients configure. */
+export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
  *  (ManifestVerifier) plus the remaining guest crypto ops (SeamCrypto). Core libsodium
@@ -31,20 +33,6 @@ export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
 export function isAdmissionRejected(err: unknown): boolean {
     return errMessage(err).includes(ADMISSION_REJECTED);
 }
-
-/** How a target creates the confined realm a guest runs in (§12.3): `createSafeRealm`
- *  (safe-js.ts) on the JS platforms, a quickjs-ng realm on Go's event loop (native/guest.go)
- *  on the native one. Same contract either way — one `call` that may await, invocations
- *  serialized per realm. The shell always supplies both bounds, so a factory never has to
- *  decide what "omitted" means. */
-export type RealmFactory = (opts: {
-    source: string;
-    hostCall: HostCall;
-    memoryLimitBytes?: number;
-    /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
-     *  factory's own default (`DEFAULT_GUEST_DEADLINE_MS` on both targets). */
-    deadlineMs?: number;
-}) => Promise<SafeRealm>;
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
@@ -154,7 +142,7 @@ interface AppSlot {
    *  app, its `DOMAIN_link_scope ‖ networkKey` when it reaches `link` — a fact of the
    *  slot, not a second name. */
   signingScope: SignScope;
-  realm: SafeRealm | null;
+  realm: Realm | null;
   /** Set once this slot's freshness mark and claims have committed; until then its seam
    *  refuses the calls disposing the slot could not take back (`seamFor`). */
   active: boolean;

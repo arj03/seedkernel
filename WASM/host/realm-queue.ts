@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
 } from "../core/wasm-limits.js";
+import type { HostCall } from "./guest-seam.js";
 
 function checkedBytes(bytes: number): number {
   if (!Number.isSafeInteger(bytes) || bytes < 0) {
@@ -84,6 +85,30 @@ export interface Invocation {
 export interface CausalClock {
   charge(ms: number): void;
 }
+
+/** Everything a target needs to construct one confined guest realm. */
+export interface RealmOptions {
+  /** Guest source. Runs in the sandbox; must declare the one `handle(arg)` entrypoint. */
+  source: string;
+  /** The seam this realm calls out through — its whole view of the host. */
+  hostCall: HostCall;
+  /** Hard cap on this realm's heap. Omitted means the target's shared default. */
+  memoryLimitBytes?: number;
+  /** Guest execution and handoff budget per entrypoint, in ms. `Infinity` disables it;
+   * omitted means the target's shared default. */
+  deadlineMs?: number;
+}
+
+/** One confined guest realm, independent of the target that implements it. */
+export interface Realm {
+  /** Invoke the guest's `handle` with `[caller 32][body …]`. Calls are serialized per realm.
+   * An omitted deadline means a host-initiated call and uses this realm's configured ceiling. */
+  call(payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
+  dispose(): void;
+}
+
+/** How a platform constructs its implementation of a confined realm. */
+export type RealmFactory = (opts: RealmOptions) => Promise<Realm>;
 
 /** The causal clock active while host code synchronously enters or resumes one realm.
  * Nested entries restore their caller's clock, including when the inner operation throws. */
