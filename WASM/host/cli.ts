@@ -27,7 +27,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
  *  node whose policy is doing its job. The allowlist makes the typo say so. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
-  "bundle", "op", "app-config", "revoke", "uninstall",
+  "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
 
@@ -217,14 +217,14 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const key = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
   const bundlePath = args.get("bundle");
-  if (args.has("app-config") && bundlePath === undefined) {
-    throw new Error("--app-config requires --bundle so the configuration has one app scope");
+  if (args.has("local-config") && bundlePath === undefined) {
+    throw new Error("--local-config requires --bundle so the configuration has one app scope");
   }
   // Checked here, not at the load, so a malformed file fails before a node is listening.
   let localConfig: JsonObject | undefined;
-  if (args.has("app-config")) {
-    const parsed: unknown = JSON.parse(utf8.decode(mustRead(host, args.get("app-config")!, "--app-config")));
-    if (!isJsonObject(parsed)) throw new Error("--app-config must hold a JSON object");
+  if (args.has("local-config")) {
+    const parsed: unknown = JSON.parse(utf8.decode(mustRead(host, args.get("local-config")!, "--local-config")));
+    if (!isJsonObject(parsed)) throw new Error("--local-config must hold a JSON object");
     localConfig = parsed;
   }
 
@@ -284,7 +284,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   if (bundlePath !== undefined) {
     let loaded: AppHandle;
     try {
-      // The file named by --app-config belongs only to this explicit load. It never
+      // The file named by --local-config belongs only to this explicit load. It never
       // reaches the transport bundle stood above or another app loaded into this shell.
       loaded = await shell.loadBundleBlob(
         mustRead(host, bundlePath, "--bundle"),

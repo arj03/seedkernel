@@ -72,7 +72,7 @@ echo "interop: author=$AUTHOR  transport=$TRANSPORT_AUTHOR  holders=$HOLDERS  sr
 PEERS=""
 for i in $(seq 0 $((HOLDERS-1))); do
   port=$((BASEPORT+i)); d="$WORK/h$i"; mkdir -p "$d"
-  node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" \
+  node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" \
     --dir "$d/data" --key "$d/key" --listen "127.0.0.1:$port" \
     > "$d/log" 2>&1 &
   PIDS+=($!)
@@ -109,19 +109,19 @@ fs.writeFileSync(process.argv[2], Buffer.concat([b.subarray(0,32), b.subarray(48
 check() { cmp -s "$1" "$SRC" && echo "  ✓ $2" || { echo "  ✗ $2 (mismatch)"; exit 1; }; }
 
 # 1. Go put → node get
-put "$WORK/a.arg" "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/ga" --key "$WORK/ga.key"
-node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" \
+put "$WORK/a.arg" "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/ga" --key "$WORK/ga.key"
+node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" \
   --op get --dir "$WORK/ng" --key "$WORK/ng.key" < "$WORK/a.arg" > "$WORK/got1.bin" 2>/dev/null
 check "$WORK/got1.bin" "Go put → node get"
 
 # 2. node put → Go get
-put "$WORK/b.arg" node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/np" --key "$WORK/np.key"
-"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg" --key "$WORK/gg.key" < "$WORK/b.arg" > "$WORK/got2.bin" 2>/dev/null
+put "$WORK/b.arg" node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/np" --key "$WORK/np.key"
+"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg" --key "$WORK/gg.key" < "$WORK/b.arg" > "$WORK/got2.bin" 2>/dev/null
 check "$WORK/got2.bin" "node put → Go get"
 
 # 3. bun put → Go get
-put "$WORK/c.arg" bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/bp" --key "$WORK/bp.key"
-"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg3" --key "$WORK/gg3.key" < "$WORK/c.arg" > "$WORK/got3.bin" 2>/dev/null
+put "$WORK/c.arg" bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/bp" --key "$WORK/bp.key"
+"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg3" --key "$WORK/gg3.key" < "$WORK/c.arg" > "$WORK/got3.bin" 2>/dev/null
 check "$WORK/got3.bin" "bun put → Go get"
 
 echo "INTEROP OK — Go ↔ JS (node + bun) parity across the cohort"

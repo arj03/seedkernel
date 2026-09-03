@@ -10,7 +10,7 @@ import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
-import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
+import { PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
 import { type SafeRealm } from "./safe-js.js";
@@ -624,7 +624,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         const b = slot.verifiedBundle;
         const links = hasLink(slot);
         // As signed. Tells a bare `host.call` name from this bundle's own module
-        // (guest-seam.ts dispatch), and feeds the irreversibility guard below.
+        // (guest-seam.ts dispatch).
         const localServices = new Set(b.manifest.guest.calls ?? []);
         // The 32 bytes this realm is attributed by when it calls another: the app key,
         // hashed. The same shape as the sender key prepended to an inbound frame, so a
@@ -669,16 +669,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 call: slot.pureModules.call,
             },
         });
-        // A candidate's top level runs before its mark and claims commit, so until then the
-        // seam refuses what disposing that candidate could not take back (`isIrreversible`).
-        // Everything a guest initializes from stays open. A link occupant receives the
-        // node facts through its installation-local config, never by reading them off this
-        // seam. The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
+        // A candidate's top level runs before its mark and claims commit, and the realm
+        // factory runs it SYNCHRONOUSLY inside this seam (native-shim.ts) — so anything it
+        // reaches for has already landed by the time the commit window decides. Authority
+        // therefore begins at the first post-commit invocation: disposing a candidate is a
+        // real undo because a candidate did nothing to undo. One rule over the whole
+        // vocabulary and not a list of the names that bite, because the list is what goes
+        // stale when a service is added. A top level still initializes — from `APP`/`LOCAL`
+        // and never off this seam, which is why a link occupant's node facts are folded
+        // into its installation-local config (§12.6) rather than read back through here.
+        // The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
         return (name, payload, budget) => {
-            // A cross-realm call leaves something behind in the CALLEE the way `fs/put`
-            // does here. Folded in at this slot rather than into `isIrreversible`, which
-            // knows the dispatch catalog and nothing about one slot's `calls`.
-            if (!slot.active && (isIrreversible(name) || localServices.has(name))) {
+            if (!slot.active) {
                 throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
             }
             return fullSeam(name, payload, budget);

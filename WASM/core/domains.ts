@@ -80,13 +80,6 @@ export const PRIVILEGES: readonly Privilege[] = [
  *  it decoded off its own links, under this one privilege and never a second — the call
  *  names no link, and all three of its arguments are the occupant's own to choose. */
 export const PRIVILEGE_LINK = "link" satisfies Privilege;
-/** Methods that leave something behind, typed against the catalog so a rename here is a
- *  build error. Refused until the slot commits (§3.1). A LOCAL service id (§12.10) is
- *  irreversible by the same rule, folded in by shell-core.ts's `seamFor`. */
-const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs/delete"]);
-export function isIrreversible(name: string): boolean {
-    return IRREVERSIBLE.has(name);
-}
 // Manifest suite: first byte of the envelope, covered by the signature. Channel suite
 // lives in the transport bundle (ake.js), not here — §14.1.
 /** Hybrid Ed25519 + ML-DSA-65, both must verify. `0x01` retired, `0x03` next. */

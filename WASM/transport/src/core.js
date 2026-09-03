@@ -417,28 +417,35 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-// Early calls await this promise (§12.3).
-const ready = (async () => {
-  ownPk = (await host.call(N_IDENTITY, NOTHING)).slice();
-  ownId = toHex(ownPk);
-  router = new Router(ownPk, ownId);
-  reqres = new ReqRes();
-  core = new Core();
-  reqres.attach((to, frame) => core.sendFrame(to, frame));
-  router.sink = (from, frame) => reqres.onFrame(from, frame);
-  // The cohort edges stay in this heap; the host reads them with the `peers` op.
-  router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-  router.onPeerDown = (peerId) => { connected.delete(peerId); };
-  for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
-})();
-// Avoid an unhandled rejection if the realm is disposed before its first invocation.
-ready.catch(() => {});
+// Started by the FIRST invocation, never at top level: a candidate's seam refuses every
+// name until its installation commits (§3.1), so there is no host to ask our identity of
+// while this file is being evaluated. Early calls await the promise (§12.3).
+let ready = null;
+function start() {
+  if (ready) return ready;
+  ready = (async () => {
+    ownPk = (await host.call(N_IDENTITY, NOTHING)).slice();
+    ownId = toHex(ownPk);
+    router = new Router(ownPk, ownId);
+    reqres = new ReqRes();
+    core = new Core();
+    reqres.attach((to, frame) => core.sendFrame(to, frame));
+    router.sink = (from, frame) => reqres.onFrame(from, frame);
+    // The cohort edges stay in this heap; the host reads them with the `peers` op.
+    router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
+    router.onPeerDown = (peerId) => { connected.delete(peerId); };
+    for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
+  })();
+  // Avoid an unhandled rejection if the realm is disposed mid-setup.
+  ready.catch(() => {});
+  return ready;
+}
 
 /** Pre-ready calls defer without holding the realm queue (§12.3). */
 function handle(argBytes) {
   if (core) return dispatch(argBytes);
   globalThis.__deferred = true;
-  return ready.then(() => dispatch(argBytes));
+  return start().then(() => dispatch(argBytes));
 }
 
 function dispatch(argBytes) {

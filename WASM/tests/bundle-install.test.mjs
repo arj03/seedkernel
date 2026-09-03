@@ -1159,10 +1159,12 @@ async function testPersistFailureRollsBack() {
 // ─── Test: a candidate realm cannot act before its installation commits ─────
 //
 // Guest source is evaluated before the freshness mark and claim table land so it can
-// register its entrypoints. In that window the seam refuses what disposing the candidate
-// could not take back — a durable write, a call that already reached another realm — and
-// nothing else: a rejected upgrade must not leave the installed version's keyspace or its
-// neighbours touched.
+// register its entrypoints, and the realm factory runs it SYNCHRONOUSLY inside the seam —
+// so anything it reaches for has already landed by the time the commit window decides. The
+// seam therefore refuses the WHOLE vocabulary in that window, reads and the bundle's own
+// modules included: a rejected upgrade must leave the installed version's keyspace, its
+// neighbours, and the links of whatever it was replacing untouched. A guest initializes
+// from its preamble, which is why the candidate's `LOCAL` is still asserted complete here.
 async function testCandidateRealmCannotActBeforeCommit() {
   console.log("Test: a candidate realm cannot act before its installation commits");
   const { admitAll } = await imp("build/host/policy.js");
@@ -1195,23 +1197,30 @@ async function testCandidateRealmCannotActBeforeCommit() {
   // only counts entries, and everything else — including every offside attempt — gets the
   // offside probing below, pushed into `candidates` in load order.
   let loadingNeighbor = false;
-  // A REAL socket-less driver (the browser-edge shape), so a link read is the seam's true
-  // read through the candidate's own unpublished binding, and the pin — this author's — is
-  // what lets a `link`-reaching candidate get as far as the seam under test.
+  // A REAL socket-less driver (the browser-edge shape): a `link`-reaching bundle has
+  // nowhere to go on a shell with no raw-link driver, so without one this candidate never
+  // reaches the seam under test. The pin — this author's — is the other half of that.
   const shell = await bootTestShell({
       fs, freshnessStore: store, pinAuthor: author,
       createRealm: async ({ hostCall, source }) => {
         if (loadingNeighbor) {
           return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
         }
+        // One per kind the old irreversibility list sorted into open and closed: a durable
+        // write, a cross-realm call, a link op, a pure read, a crypto transform, and this
+        // bundle's own module. All six are one kind now.
         const refused = [];
-        for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
+        for (const [name, payload] of [
+          ["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)],
+          ["_svc", new Uint8Array()],
+          ["link/open", new Uint8Array(32)],
+          ["node/identity", new Uint8Array()],
+          ["crypto/blake2b-256", new Uint8Array()],
+          ["fwd", Uint8Array.of(4)],
+        ]) {
           try { await hostCall(name, payload); } catch { refused.push(name); }
         }
-        // Candidate config is complete before publication (§12.10).
-        const openBytes = await hostCall("link/open", new Uint8Array(32));
-        const moduleAnswer = await hostCall("fwd", Uint8Array.of(4));
-        const candidate = { hostCall, refused, openBytes, moduleAnswer, source, calls: 0 };
+        const candidate = { hostCall, refused, source, calls: 0 };
         candidates.push(candidate);
         return {
           call: async () => { candidate.calls++; return new Uint8Array(); },
@@ -1248,13 +1257,11 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "only the driver's one immutable node fact overrides a same-named LOCAL key");
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second privileged init path");
-    assertEqual(candidates[0].refused.sort(), ["_svc", "fs/put"],
-      "a candidate reaches neither a durable write nor another realm");
+    assertEqual(candidates[0].refused.sort(),
+      ["_svc", "crypto/blake2b-256", "fs/put", "fwd", "link/open", "node/identity"],
+      "a candidate reaches nothing at all — not a write, another realm, a link, or a read");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
-    assertEqual(candidates[0].openBytes[0] & 0xff, 0,
-      "the reads a guest initializes from stay open — a link read answers no route");
-    assert(candidates[0].moduleAnswer[0] === 4, "…as do its own verified modules");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
     store.fail = false;
@@ -1344,9 +1351,15 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-      const r = { calls: [], disposed: false, call: async (p) => { r.calls.push(opNameOf(p) === "timer" ? "timer" : "invoke"); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+      // Armed on this realm's FIRST entry, not from `createRealm`: a candidate's seam
+      // refuses everything until its installation commits (§3.1), which is the same
+      // reason a real guest defers its setup to its first invocation.
+      const r = { calls: [], disposed: false, call: async (p) => {
+        r.calls.push(opNameOf(p) === "timer" ? "timer" : "invoke");
+        if (!r.armed) { r.armed = true; await o.hostCall("timer/arm", arm(1, 200)); }
+        return new Uint8Array();
+      }, dispose() { r.disposed = true; } };
       realms.push(r);
-      await o.hostCall("timer/arm", arm(1, 200));
       return r;
     },
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),

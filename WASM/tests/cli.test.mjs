@@ -144,7 +144,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   let loadOpts = null;
   const author = new Uint8Array(32).fill(0x44);
   const host = fakeHost([
-    "--key", join(work, "app.key"), "--bundle", bundlePath, "--app-config", configPath,
+    "--key", join(work, "app.key"), "--bundle", bundlePath, "--local-config", configPath,
   ], {
     shell: {
       loadBundleBlob: async (_blob, opts) => {
@@ -154,18 +154,18 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
     },
   });
   await runCli(host);
-  ok(host.stood.config === undefined, "--app-config is not shell-wide node setup");
+  ok(host.stood.config === undefined, "--local-config is not shell-wide node setup");
   ok(loadOpts?.localConfig.mode === "local" && loadOpts.localConfig.nested[1].enabled === true,
-    "--app-config is attached to the explicit bundle load as general JSON");
+    "--local-config is attached to the explicit bundle load as general JSON");
 }
 {
   const configPath = join(work, "orphan.json");
   writeFileSync(configPath, "{}");
-  const host = fakeHost(["--key", join(work, "orphan.key"), "--app-config", configPath]);
+  const host = fakeHost(["--key", join(work, "orphan.key"), "--local-config", configPath]);
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
   ok(msg.includes("requires --bundle") && host.stood === null,
-    "--app-config without an app target is refused before a shell is stood up");
+    "--local-config without an app target is refused before a shell is stood up");
 }
 
 // --contact-secret names a FILE of hex, on every target. Passing the secret itself on the
