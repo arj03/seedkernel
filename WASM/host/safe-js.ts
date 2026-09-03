@@ -28,7 +28,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget } from "./guest-seam.js";
 import {
-  CausalContext, createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls,
+  CausalContext, createActiveHostCallRegistry, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
 
@@ -189,9 +189,11 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   let disposed = false;
   const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
-  // The wall-clock half of the same custody: one armed deadline per unsettled host call,
-  // disposed with the realm so an abandoned timer cannot outlive it (realm-queue.ts).
-  const handoffDeadlines = createHandoffDeadlines();
+  // The wall-clock half of the same custody, on one wake per tier: the host calls this realm
+  // has not answered, and the invocations waiting to enter it. Both die with the realm; they
+  // are deliberately not one queue (realm-queue.ts).
+  const hostCallDeadlines = createDeadlineQueue();
+  const entryDeadlines = createDeadlineQueue();
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -307,7 +309,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     }
     // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
     // its own: the arm below is the only one, for a backend answer and a late one alike.
-    void handoffDeadlines.race(budget.remainingMs, Promise.resolve(answer),
+    void raceDeadline(hostCallDeadlines, budget.remainingMs, Promise.resolve(answer),
       "guest: host.call handoff deadline exceeded").then(
       (bytes) => {
         try {
@@ -437,17 +439,11 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         }
       }
     })();
-    // A deferred answer must not go unhandled while nothing is awaiting `released`:
-    // the caller holds `result` and its real error, so the release arm swallows.
-    return {
-      result,
-      released: deferred ? Promise.resolve() : result.catch(() => {}),
-      cancel: (reason) => cancel(reason),
-    };
+    return { result, deferred, cancel: (reason) => cancel(reason) };
   };
 
   return {
-    call: serializeCalls(invoke, () =>
+    call: serializeCalls(entryDeadlines, invoke, () =>
       (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
     opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
     dispose(): void {
@@ -464,7 +460,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       // longer holds keeps the host's event loop alive for the whole of its remainder, so a
       // one-shot process would linger a full budget past the work it came to do.
       activeHostCalls.releaseAll();
-      handoffDeadlines.disarmAll();
+      hostCallDeadlines.disarmAll();
+      entryDeadlines.disarmAll();
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
       // continuation runs as a microtask after failAll, and a handle released after its
       // context died would abort the whole wasm module. See `newRuntime` for the ordering

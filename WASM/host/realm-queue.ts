@@ -71,12 +71,15 @@ export function createActiveHostCallRegistry(
   };
 }
 
-/** One entrypoint invocation, split into its answer and queue-release moments. */
+/** One entrypoint invocation. Settling `result` normally releases the realm for the next
+ *  one; a DEFERRED entrypoint (`__deferred`) ended its execution segment before its answer
+ *  exists, so it releases the realm at once and answers under the same deadline later. */
 export interface Invocation {
   result: Promise<Uint8Array>;
-  released: Promise<unknown>;
-  /** Drop host-side settlement state if the handoff deadline wins. */
-  cancel?(reason: Error): void;
+  deferred?: boolean;
+  /** The handoff deadline won: drop the host-side settlement state and reject `result`
+   *  with `reason`, so nothing is left holding an answer the queue has stopped waiting for. */
+  cancel(reason: Error): void;
 }
 
 /** The clock owner of one causally-related tree of work. A timer fire mints one and
@@ -140,50 +143,113 @@ const deadlineAt = (remainingMs: number): number => {
   return monotonicMs() + remainingMs;
 };
 
-/** An absolute deadline as the REJECTION its owner races the real answer against. That shape
- *  is the whole of the "exactly one settlement" rule here — `Promise.race` already grants it,
- *  so no owner needs a claim flag of its own, and expiry arrives at every call site as
- *  ordinary failure rather than a second settlement path. `disarm` ends it, since a timer
- *  nobody awaits still holds the host's event loop open. Re-armed in pieces for a ceiling
- *  past `setTimeout`'s range, which fires at once if handed over whole; the Error costs
- *  nothing unless it lands. */
-const expiryAt = (at: number, message: string): { rejects: Promise<never>; disarm(): void } => {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let reject!: (err: Error) => void;
-  const rejects = new Promise<never>((_, rj) => { reject = rj; });
-  const arm = (): void => {
-    const left = at - monotonicMs();
-    if (left <= 0) return reject(new Error(message));
-    timer = setTimeout(arm, Math.min(left, 0x7fffffff));
-  };
-  if (at !== Infinity) arm();
-  return { rejects, disarm: () => clearTimeout(timer) };
-};
+/** One deadline a realm is holding time against. `expire` settles the thing it guards; it
+ *  may not touch this queue's other records, which every caller here honours by rejecting
+ *  a promise or posting a microtask rather than reaching back in. */
+export interface Deadline {
+  at: number;
+  expire(): void;
+}
 
-/** Every handoff deadline a realm has armed for a call it has not settled — the wall-clock
- *  half of the custody the active-call registry keeps in bytes, ended by the same three
- *  events. `disarmAll` is not tidiness: nothing inside a disposed realm will consume those
- *  answers, and each abandoned timer holds the host's event loop for the rest of its
- *  remainder, so a one-shot process would linger a full budget past its work. */
-export function createHandoffDeadlines(): {
-  /** `answer`, or the deadline's rejection — whichever lands first. */
-  race<T>(remainingMs: number, answer: Promise<T>, message: string): Promise<T>;
+/** A set of deadlines a realm has armed for work it has not settled, sharing one physical
+ *  timer — the wall-clock half of the custody the active-call registry keeps in bytes.
+ *  Records are unordered, because a caller may put a short budget behind a long one, and
+ *  the scan that finds the earliest runs when the timer fires, never on the call path.
+ *
+ *  Between fires the armed wake is retained rather than cleared and re-armed per call,
+ *  which on the native target is two host calls through the trampoline for a deadline that
+ *  a fast local dispatch never reaches. It is safe because `timerAt` is only ever EARLIER
+ *  than anything still pending: a wake that turns out to be unneeded re-arms, and no
+ *  deadline can fire late. `disarmAll` is not tidiness — nothing inside a disposed realm
+ *  will consume those answers, and the wake would hold the host's event loop for the rest
+ *  of its remainder, so a one-shot process would linger a full budget past its work.
+ *
+ *  A realm keeps ONE OF THESE PER TIER — its invocations, and the host calls made under
+ *  them — and must not fold them together, however alike they look. Those deadlines are
+ *  NESTED, not peers: a host call is admitted with what is left of the invocation that
+ *  makes it, so it is always a hair earlier, and every one of them would jostle the wake
+ *  the outer deadline is already waiting on. The outer one then fires late by however much
+ *  the host's timer clock is coarser than this one's — and it loses the race against the
+ *  guest budget derived from it, which is the very thing it exists to backstop. */
+export function createDeadlineQueue(): {
+  add(deadline: Deadline): void;
+  drop(deadline: Deadline): void;
   disarmAll(): void;
 } {
-  const armed = new Set<() => void>();
+  const pending: Deadline[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timerAt = Infinity;
+  const clear = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    timerAt = Infinity;
+  };
+  /** Expire what is due, then re-arm for the earliest that is left — in pieces, for a
+   *  ceiling past `setTimeout`'s range, which fires at once if handed over whole.
+   *
+   *  "Due" is anything inside one millisecond, because that is all `setTimeout` resolves:
+   *  a host whose timer clock is not this one's wakes a hair EARLY often enough, and
+   *  re-arming for that remainder buys a whole further tick — overshooting the deadline by
+   *  more than firing now undershoots it. A ceiling that lands a fraction early is the
+   *  conservative side of a custody bound; one that lands a tick late hands the guest time
+   *  it was never granted, and loses races against the budgets derived from it. */
+  const arm = (): void => {
+    clear();
+    const now = monotonicMs();
+    let soonest = Infinity;
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const deadline = pending[i];
+      if (deadline.at - now >= 1) soonest = Math.min(soonest, deadline.at);
+      else { pending.splice(i, 1); deadline.expire(); }
+    }
+    if (soonest === Infinity) return;
+    timerAt = Math.min(soonest, now + 0x7fffffff);
+    timer = setTimeout(arm, timerAt - now);
+  };
   return {
-    race(remainingMs, answer, message) {
-      const at = deadlineAt(remainingMs);
-      if (at === Infinity) return answer;
-      const { rejects, disarm } = expiryAt(at, message);
-      const drop = (): void => { armed.delete(drop); disarm(); };
-      armed.add(drop);
-      return Promise.race([answer, rejects]).finally(drop);
+    add(deadline) {
+      pending.push(deadline);
+      // Re-arm only for a wake that is a whole tick better, never for a fraction of one.
+      // Re-arming restarts the host's timer against ITS clock, which is coarser than this
+      // one; doing that for a sub-millisecond gain buys nothing and costs the accuracy of
+      // the wake already standing — and, on a guest calling out under a budget derived
+      // from the invocation's own deadline, that is once per host call.
+      if (timer === undefined || deadline.at < timerAt - 1) arm();
+      else (timer as ReturnType<typeof setTimeout> & { ref?(): void }).ref?.();
+    },
+    drop(deadline) {
+      const index = pending.indexOf(deadline);
+      if (index < 0) return;
+      pending.splice(index, 1);
+      // Nothing is waiting on the retained wake now, so it must not hold a process up on
+      // its own account; `add` refs it back. No-op off Node, whose loop is explicit.
+      if (pending.length === 0) {
+        (timer as (ReturnType<typeof setTimeout> & { unref?(): void }) | undefined)?.unref?.();
+      }
     },
     disarmAll(): void {
-      for (const drop of [...armed]) drop();
+      clear();
+      pending.length = 0;
     },
   };
+}
+
+/** `answer`, or this deadline's REJECTION — whichever lands first. That shape is the whole
+ *  of the "exactly one settlement" rule here, so no owner needs a claim flag of its own and
+ *  expiry arrives at every call site as ordinary failure rather than a second settlement
+ *  path; the Error costs nothing unless it lands. */
+export function raceDeadline<T>(deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
+  remainingMs: number, answer: Promise<T>, message: string): Promise<T> {
+  const at = deadlineAt(remainingMs);
+  if (at === Infinity) return answer;
+  return new Promise<T>((resolve, reject) => {
+    const deadline: Deadline = { at, expire: () => reject(new Error(message)) };
+    deadlines.add(deadline);
+    answer.then(
+      (value) => { deadlines.drop(deadline); resolve(value); },
+      (err: unknown) => { deadlines.drop(deadline); reject(err); },
+    );
+  });
 }
 
 /** Serialize realm entry under one deadline that starts at admission.
@@ -192,12 +258,81 @@ export function createHandoffDeadlines(): {
  * derived from those bounded callers rather than capped by an unrelated number here. The
  * absolute deadline covers queue wait, guest execution, and a deferred answer. */
 export function serializeCalls(
+  deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
   invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
   notReady: () => Error | null,
   defaultDeadlineMs = DEFAULT_GUEST_DEADLINE_MS,
 ): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";
-  let tail: Promise<unknown> = Promise.resolve();
+  interface Entry extends Deadline {
+    payload: Uint8Array;
+    causalClock?: CausalClock;
+    resolve(value: Uint8Array): void;
+    reject(reason: unknown): void;
+    invocation?: Invocation;
+    settled: boolean;
+  }
+  // A FIFO and an explicit occupant, not a promise chain: a chain waits by RESOLVING one
+  // promise with another, and each of those hops is a wake of the native target's loop.
+  const waiting: Entry[] = [];
+  let running: Entry | undefined;
+  let pumping = false;
+  const settled = Promise.resolve();
+
+  /** Settle the caller once, from whichever arm reaches it first. */
+  const finish = (entry: Entry, ok: boolean, value: unknown): void => {
+    if (entry.settled) return;
+    entry.settled = true;
+    deadlines.drop(entry);
+    if (ok) entry.resolve(value as Uint8Array);
+    else entry.reject(value);
+  };
+  /** Give the realm to whoever is next, on a fresh turn. */
+  const pump = (): void => {
+    if (pumping || running !== undefined || waiting.length === 0) return;
+    pumping = true;
+    void settled.then(enterNext);
+  };
+  /** Hand the realm on. The DEADLINE does this too, so an answer that never comes cannot
+   *  hold the realm past the budget its invocation was admitted under. */
+  const release = (entry: Entry): void => {
+    if (running !== entry) return;
+    running = undefined;
+    pump();
+  };
+  /** Shared by every entry rather than closed over one, so admission allocates the record
+   *  and nothing else. `this` is the entry the queue is expiring. */
+  function expire(this: Entry): void {
+    const err = new Error(LATE);
+    finish(this, false, err);
+    this.invocation?.cancel(err);
+    release(this);
+  }
+  const enterNext = (): void => {
+    pumping = false;
+    while (running === undefined && waiting.length > 0) {
+      const entry = waiting.shift() as Entry;
+      if (entry.settled) continue;              // its deadline overtook it while it queued
+      // Read at the FRONT rather than trusting a flag, so a late timer cannot admit an
+      // expired entry — and spent as this invocation's remainder, so it is read only once.
+      const now = monotonicMs();
+      if (now >= entry.at) { entry.expire(); continue; }
+      const err = notReady();
+      if (err) { finish(entry, false, err); continue; }
+      running = entry;
+      try {
+        entry.invocation = invoke(entry.payload,
+          entry.at === Infinity ? Infinity : entry.at - now, entry.causalClock);
+      } catch (thrown) { running = undefined; finish(entry, false, thrown); continue; }
+      entry.invocation.result.then(
+        (value) => { finish(entry, true, value); release(entry); },
+        (thrown: unknown) => { finish(entry, false, thrown); release(entry); });
+      // A deferred entrypoint ended its execution segment before its answer exists, so the
+      // realm is free now and the answer lands later under this same deadline.
+      if (entry.invocation.deferred) void settled.then(() => release(entry));
+    }
+  };
+
   return (payload, suppliedDeadlineMs, causalClock) => {
     const admissionError = notReady();
     if (admissionError) return Promise.reject(admissionError);
@@ -206,22 +341,11 @@ export function serializeCalls(
     // A callee may tighten its configured ceiling, never mint time for the caller.
     try { at = deadlineAt(Math.min(suppliedDeadlineMs ?? defaultDeadlineMs, defaultDeadlineMs)); }
     catch (err) { return Promise.reject(err); }
-    const { rejects, disarm } = expiryAt(at, LATE);
-    let invocation: Invocation | undefined;
-    // Drop the host-side settlement state of an invocation the deadline overtook mid-flight.
-    void rejects.catch((err: Error) => invocation?.cancel?.(err));
-
-    // Stay behind the predecessor even when the caller times out while queued: a
-    // caller-facing race used as `tail` would break serialization. The clock is re-read at
-    // the front rather than trusting a flag, so a late timer cannot admit an expired entry.
-    const started = tail.then(() => {
-      if (monotonicMs() >= at) throw new Error(LATE);
-      const err = notReady();
-      if (err) throw err;
-      invocation = invoke(payload, at === Infinity ? Infinity : Math.max(0, at - monotonicMs()), causalClock);
-      return invocation;
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const entry: Entry = { at, payload, causalClock, resolve, reject, settled: false, expire };
+      if (at !== Infinity) deadlines.add(entry);
+      waiting.push(entry);
+      pump();
     });
-    tail = Promise.race([started.then((inv) => inv.released), rejects]).catch(() => {});
-    return Promise.race([started.then((inv) => inv.result), rejects]).finally(disarm);
   };
 }

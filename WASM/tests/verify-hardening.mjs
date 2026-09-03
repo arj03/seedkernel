@@ -52,7 +52,7 @@ const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { createActiveHostCallRegistry, serializeCalls } = await imp("build/host/realm-queue.js");
+const { createActiveHostCallRegistry, createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
 const { ok, throws, summary, sleep } = testkit();
 /** Await a promise and assert it rejects — the async form of `throws`, which is what a
@@ -500,15 +500,44 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   settleAtDispose(new Uint8Array());
   afterFailure.dispose();
 
+  // A realm queue retains one wakeup across fast calls instead of allocating and
+  // crossing the host timer seam for every invocation. It is still explicit custody:
+  // disposal clears that one wakeup immediately.
+  const nativeSetTimeout = globalThis.setTimeout;
+  const nativeClearTimeout = globalThis.clearTimeout;
+  let deadlineArms = 0, deadlineClears = 0;
+  try {
+    globalThis.setTimeout = (fn, ms, ...args) => {
+      deadlineArms++;
+      return nativeSetTimeout(fn, ms, ...args);
+    };
+    globalThis.clearTimeout = (timer) => {
+      deadlineClears++;
+      return nativeClearTimeout(timer);
+    };
+    const shared = createDeadlineQueue();
+    const batched = serializeCalls(shared,
+      (payload) => ({ result: Promise.resolve(payload), cancel: () => {} }), () => null, 5000);
+    await Promise.all([batched(Uint8Array.of(1)), batched(Uint8Array.of(2)), batched(Uint8Array.of(3))]);
+    ok(deadlineArms === 1 && deadlineClears === 0,
+      "fast serialized calls share one armed deadline instead of cycling timers");
+    shared.disarmAll();
+    ok(deadlineClears === 1, "disposing the realm's deadline queue clears its shared wakeup");
+  } finally {
+    globalThis.setTimeout = nativeSetTimeout;
+    globalThis.clearTimeout = nativeClearTimeout;
+  }
+
   let closed = false;
   const gates = [];
   const seen = [];
-  const queued = serializeCalls((payload) => {
+  const queuedDeadlines = createDeadlineQueue();
+  const queued = serializeCalls(queuedDeadlines, (payload) => {
     seen.push(payload);
-    let release;
-    const gate = new Promise((resolve) => { release = resolve; });
+    let release, fail;
+    const gate = new Promise((resolve, reject) => { release = resolve; fail = reject; });
     gates.push(release);
-    return { result: gate.then(() => payload), released: gate };
+    return { result: gate.then(() => payload), cancel: (reason) => fail(reason) };
   }, () => closed ? new Error("closed") : null, 500);
   const one = Uint8Array.of(1);
   const firstInvocation = queued(one);
@@ -532,8 +561,20 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   gates.shift()();
   ok((await large).length === 32 * 1024 * 1024,
     "the entry queue borrows bytes already charged to the initiating owner");
+  // The RUNNING entry's deadline frees the realm, not just its caller: `cancel` rejects the
+  // invocation, which is what the queue waits on, so a wedged answer cannot hold the realm
+  // past the budget it was admitted under and the entry behind it still runs.
+  const wedged = queued(Uint8Array.of(9), 25);
+  await sleep(0);
+  const behind = queued(Uint8Array.of(10), 500);
+  await rejects(wedged, "a wedged invocation is failed by the deadline it was admitted under");
+  await sleep(0);
+  ok(gates.length === 2, "…and the realm went to the entry behind it rather than staying held");
+  gates.pop()();
+  await behind;
   closed = true;
   await rejects(queued(new Uint8Array()), "a closed realm stops admitting immediately");
+  queuedDeadlines.disarmAll();
 
   // A deferred result keeps no fresh clock of its own: it retains the handoff deadline
   // admitted with the call, including across another realm's host.call.

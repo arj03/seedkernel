@@ -10,7 +10,7 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { CausalContext, createHandoffDeadlines, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CausalContext, createDeadlineQueue, raceDeadline, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -396,9 +396,11 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-  // The wall-clock half of this realm's host-call custody: one armed deadline per
-  // unsettled call, dropped with the realm so no timer outlives it (realm-queue.ts).
-  const handoffDeadlines = createHandoffDeadlines();
+  // This realm's wall-clock custody, on one wake per tier: the host calls it has not
+  // answered, and the invocations waiting to enter it. Both die with the realm; they are
+  // deliberately not one queue (realm-queue.ts).
+  const hostCallDeadlines = createDeadlineQueue();
+  const entryDeadlines = createDeadlineQueue();
   // Go mints the handle, but createRealm runs the guest's top-level code before returning
   // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
   // because settlement is a HOST-realm microtask, and that realm is not pumped from
@@ -430,7 +432,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
         causalClock?.charge(elapsedNs / 1_000_000);
       });
-    void handoffDeadlines.race(budget.remainingMs, answer,
+    void raceDeadline(hostCallDeadlines, budget.remainingMs, answer,
       "guest: host.call handoff deadline exceeded").then(
       (bytes: Uint8Array) => settle(bytes, null),
       (e: unknown) => settle(null, errMessage(e)),
@@ -448,6 +450,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // contract (realm-queue.ts) is what keeps the two targets from differing about
     // when a second entrypoint may begin.
     call: serializeCalls(
+      entryDeadlines,
       (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
         // The executor runs synchronously, so `deferred` carries Go's answer by
         // the time the return statement reads it.
@@ -456,7 +459,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
           throw new Error("guest: realm invocation id exhausted");
         const callId = invocationSeq;
         let deferred = false;
+        let fail!: (reason: Error) => void;
         const result = new Promise<Uint8Array>((resolve, reject) => {
+          fail = reject;
           const report = causalContext.run(causalClock, () => bridge.realmCall(
             realm, payload, callId,
             (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
@@ -468,8 +473,10 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         });
         return {
           result,
-          released: deferred ? Promise.resolve() : result.catch(() => { }),
-          cancel: () => bridge.realmCancel(realm, callId),
+          deferred,
+          // guest.go's realmCancel drops the parked callbacks rather than calling them, so
+          // the rejection the queue needs to see is made here (realm-queue.ts `cancel`).
+          cancel: (reason) => { bridge.realmCancel(realm, callId); fail(reason); },
         };
       },
       () => (disposed ? new Error("guest realm disposed") : null),
@@ -483,7 +490,8 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
       // host-side and do NOT go with it: a timer waiting to reject a call this realm
       // no longer holds keeps the host's event loop alive for the whole of its
       // remainder, so a one-shot process would linger a full budget past its work.
-      handoffDeadlines.disarmAll();
+      hostCallDeadlines.disarmAll();
+      entryDeadlines.disarmAll();
       bridge.realmDispose(realm);
     },
   };
@@ -636,7 +644,7 @@ const GUEST_DRIVER = `
 "use strict";
 // Returns 1 when the entrypoint handed its answer to a later turn (the guest's own
 // deferred marker) — Go's signal that the realm is free for the next invocation even
-// though this one has not settled (realm-queue.ts's Invocation.released). Read after
+// though this one has not settled (realm-queue.ts's Invocation.deferred). Read after
 // __invoke's synchronous segment, and __invoke cleared the flag on entry, so it
 // describes exactly this invocation.
 globalThis.__start = function (id, arg) {
