@@ -28,7 +28,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
 import {
-  createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls,
+  CausalContext, createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls,
   type CausalClock, type Invocation,
 } from "./realm-queue.js";
 
@@ -213,13 +213,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
-  let currentCausalClock: CausalClock | undefined;
-  const withCausalClock = <T>(causalClock: CausalClock | undefined, fn: () => T): T => {
-    const previous = currentCausalClock;
-    currentCausalClock = causalClock;
-    try { return fn(); }
-    finally { currentCausalClock = previous; }
-  };
+  const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
   // The wall-clock half of the same custody: one armed deadline per unsettled host call,
   // disposed with the realm so an abandoned timer cannot outlive it (realm-queue.ts).
@@ -281,7 +275,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // Every handle is released in `finally`, which is load-bearing rather than tidy: this
     // call can be interrupted mid-flight by the budget, and a runtime freed with live handles
     // aborts the whole wasm module at dispose() time.
-    withCausalClock(causalClock, () => {
+    causalContext.run(causalClock, () => {
       clock.begin(causalClock);
       try {
         const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
@@ -311,7 +305,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment is
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
-    const causalClock = currentCausalClock;
+    const causalClock = causalContext.current;
     const budget: CallBudget = {
       remainingMs: clock.remaining(),
       charge: (ms) => { clock.charge(ms); causalClock?.charge(ms); },
@@ -431,7 +425,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // by each deferred's own executePendingJobs on settle.
     let evalResult: QuickJSHandle | undefined;
     let settledNative: Promise<unknown> | undefined;
-    withCausalClock(causalClock, () => {
+    causalContext.run(causalClock, () => {
       clock.begin(causalClock);
       try {
         evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc, "safe-js-invoke.js"));

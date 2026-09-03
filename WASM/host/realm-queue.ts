@@ -85,6 +85,21 @@ export interface CausalClock {
   charge(ms: number): void;
 }
 
+/** The causal clock active while host code synchronously enters or resumes one realm.
+ * Nested entries restore their caller's clock, including when the inner operation throws. */
+export class CausalContext {
+  private active: CausalClock | undefined;
+
+  get current(): CausalClock | undefined { return this.active; }
+
+  run<T>(clock: CausalClock | undefined, fn: () => T): T {
+    const previous = this.active;
+    this.active = clock;
+    try { return fn(); }
+    finally { this.active = previous; }
+  }
+}
+
 /** Monotonic milliseconds. A deadline here is the distance between two readings, so a wall
  *  clock is the wrong source: a step backwards expires every live one at once and a step
  *  forwards extends them all. Node, Bun and the browsers answer natively; the native host

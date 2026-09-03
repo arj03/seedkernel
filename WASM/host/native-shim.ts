@@ -10,7 +10,7 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { createHandoffDeadlines, serializeCalls, type CausalClock } from "./realm-queue.js";
+import { CausalContext, createHandoffDeadlines, serializeCalls, type CausalClock } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -404,13 +404,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // because settlement is a HOST-realm microtask, and that realm is not pumped from
     // inside bridge.createRealm, so none can precede the assignment below (§12.3).
     let realm = 0;
-    let currentCausalClock: CausalClock | undefined;
-    const withCausalClock = <T>(causalClock: CausalClock | undefined, fn: () => T): T => {
-        const previous = currentCausalClock;
-        currentCausalClock = causalClock;
-        try { return fn(); }
-        finally { currentCausalClock = previous; }
-    };
+    const causalContext = new CausalContext();
     // Go supplies the live segment remainder because it owns this realm's execution
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
@@ -418,7 +412,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
         // Go admitted this call before making the cross-realm copy. This adapter only
         // routes and settles; post-copy accounting here would be a second policy authority.
-        const causalClock = currentCausalClock;
+        const causalClock = causalContext.current;
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
@@ -432,7 +426,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
         // by the same arm and neither can follow the other (realm-queue.ts).
         const settle = (bytes: Uint8Array | null, error: string | null): void =>
-            withCausalClock(causalClock, () => {
+            causalContext.run(causalClock, () => {
                 const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
                 causalClock?.charge(elapsedNs / 1_000_000);
             });
@@ -463,7 +457,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                 const callId = invocationSeq;
                 let deferred = false;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    const report = withCausalClock(causalClock, () => bridge.realmCall(
+                    const report = causalContext.run(causalClock, () => bridge.realmCall(
                         realm, payload, callId,
                         (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
                         (msg: string) => reject(new Error(msg)),
