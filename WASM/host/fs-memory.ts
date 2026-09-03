@@ -1,7 +1,7 @@
 // The in-RAM `Fs` backend — the portable one, for tests and ephemeral nodes, and the shape
 // a browser backend (OPFS/IndexedDB) will mirror. It sits with the other backends
 // (`fs-node.ts`, Go's `native/fs.go`), not in core: core is the seam it satisfies and the
-// key rule (core/fs.ts), with the wrappers that apply them in shell-core.ts — those decide
+// key rule (core/fs.ts), with the wrappers that apply them in fs-view.ts — those decide
 // what an app can reach. Which medium the bytes land in decides nothing.
 
 import { type Fs, type FsStat } from "../core/fs.js";

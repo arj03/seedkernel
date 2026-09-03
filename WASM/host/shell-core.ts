@@ -1,18 +1,21 @@
 // Platform-neutral shell (§12.9). `bootShell` is THE assembly path — defaults, the
-// transport author pin, the claim maps, the load order — and the only way to a Shell, so
+// transport author pin, the slot table, the load order — and the only way to a Shell, so
 // there is no second constructor that could skip the pin. Targets displace platform members
 // only (main.ts, native-shim.ts, seedchat, seedstore). Signed bundles are the only way slots
 // land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
-import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
+import { type Fs } from "../core/fs.js";
+import { validatedFs, scopedFs } from "./fs-view.js";
+import { createRealmTimers } from "./realm-timers.js";
+import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
-import { monotonicMs, type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
+import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** Neutral realm contracts exposed through the shell facade clients configure. */
@@ -59,7 +62,7 @@ export interface LoadBundleOptions {
      *  Scoped to THIS load rather than the shell; a replacement load carries its own.
      *  Observation only: it cannot change what the caller receives, it is never consulted
      *  for a host loopback `invoke` or a cross-realm call, and a throw from it is swallowed. */
-    onInbound?: (claim: string, from: Uint8Array, answer: Uint8Array) => void;
+    onInbound?: InboundObserver;
 }
 
 export interface Shell {
@@ -113,7 +116,7 @@ export interface AppHandle extends LoadedBundle {
     fs?: Fs;
     /** The fs keyspace prefix this app's view is scoped under — the derivation the shell
      *  computed (`appScopeFor`, bundle.ts). For a caller reading the raw backend cold
-     *  (outside a running node), `scopedFs(raw, appScope)` re-derives the same view. */
+     *  (outside a running node), `scopedFs(raw, appScope)` (fs-view.ts) re-derives it. */
     appScope: string;
     /** Loopback invoke into this app's one `handle` entrypoint, bound to THE SLOT this
      *  load stood. A replacement load stands a new slot under the same key, so a handle
@@ -122,227 +125,11 @@ export interface AppHandle extends LoadedBundle {
     invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
 }
 
-// Re-exported so a target reaches the admission constructors from the same module it gets
-// bootShell from. Pure-module builders remain target implementations, not shell API.
+// Re-exported so a target reaches the admission constructors, and an app's fs view, from
+// the same module it gets bootShell from — how the pieces are split across files here is
+// not a client's problem. Pure-module builders remain target implementations, not shell API.
 export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
-/** A slot's realm. Nullable for exactly the window between the holder being made and the
- *  factory resolving, inside one `loadBundleBlob` — a slot only enters `slots` with its
- *  realm standing, and teardown reads the settled handle synchronously, because the
- *  callers that dispose are deciding right then what the node holds. */
-interface AppSlot {
-  verifiedBundle: LoadedBundle;
-  pureModules: PureModules;
-  fsScope?: Fs;
-  /** The fs keyspace prefix this slot's view is scoped under (bundle.ts `appScopeFor`) —
-   *  computed once per load and carried on the returned `AppHandle`, so a caller's cold
-   *  read of the raw backend needs the derivation the shell already did. */
-  appScope: string;
-  /** THE one scope this slot's `node/sign`/`node/verify` are wired to (`slotSignScope`,
-   *  guest-seam.ts): the slot's own `DOMAIN_guest ‖ author ‖ app` when it is an ordinary
-   *  app, its `DOMAIN_link_scope ‖ networkKey` when it reaches `link` — a fact of the
-   *  slot, not a second name. */
-  signingScope: SignScope;
-  realm: Realm | null;
-  /** Set once this slot's freshness mark and claims have committed; until then its seam
-   *  refuses the calls disposing the slot could not take back (`seamFor`). */
-  active: boolean;
-  /** This realm's deadlines. Per SLOT rather than per shell, because a timer is a pending
-   *  re-entry into one particular realm: the cap is then one guest's to spend, and
-   *  disposing that realm cancels exactly its own (`disposeSlot`). */
-  timers: RealmTimers;
-  /** THIS load's answer observer (`LoadBundleOptions.onInbound`), or absent. Carried on
-   *  the slot rather than read from the load call's own options at call time, because a
-   *  peer-inbound frame can land at any point after commit, long after that call
-   *  returned. A replacement load's slot gets its own value or none — never the outgoing
-   *  slot's, the same rule `realmMemoryBytes` follows. */
-  onInbound?: LoadBundleOptions["onInbound"];
-}
-
-/** Per-realm timer table. Cap live count and retained bytes; `clearAll` before realm
- *  disposal (§12.3). */
-interface RealmTimers extends HostTimers {
-  /** Cancel every live deadline. Called only from `disposeSlot`, before the realm goes. */
-  clearAll(): void;
-}
-
-/** A timer table over `fire`, which carries one body into its realm and answers when that
- *  invocation has settled.
- *  The table is the resource being spent, so the caps live here rather than in the seam:
- *  the seam never learns that a timer fired, so a count kept there would only ever grow.
- *
- *  What it retains is the REALM-ENTRY buffer — the caller-id prefix already framed in — not
- *  the guest's payload. One copy rather than two, and the charge is the bytes that actually
- *  enter the realm rather than a number 32 short of them.
- *
- *  Firing MOVES that custody, it does not end it: `realm.call` borrows the buffer and the
- *  entry queue counts depth alone (realm-queue.ts), so between the deadline and the answer
- *  this table is the only owner it has. Releasing at the deadline would leave the busiest
- *  moment — fired bodies queued behind a serialized realm — charged to nobody.
- *
- *  It owns this realm's share of the node's CLOCK because a fired deadline is the one FRESH
- *  invocation root a guest creates itself (§12.3). Peerless cross-realm calls are not fresh:
- *  they inherit the active root's deadline. Firing spends this share, and a deadline coming
- *  due with it spent is SLIPPED rather than failed. This paces self-created roots; it is not
- *  a bound on the node's clock, which external roots can occupy one bounded invocation after
- *  another.
- *
- *  Each fire mints a causal clock carried through guest continuations, host-service and
- *  module calls, and cross-realm delivery. Those execution sites debit their measured burn;
- *  time parked on I/O costs nothing, and returning early cannot detach descendants from the
- *  root. */
-export function createRealmTimers(
-    fire: (payload: Uint8Array, causalClock: CausalClock) => Promise<unknown> | void,
-    max = DEFAULT_MAX_LIVE_TIMERS,
-    maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
-    budgetMs = DEFAULT_GUEST_DEADLINE_MS,
-    clockDivisor = SELF_INITIATED_CLOCK_DIVISOR,
-): RealmTimers {
-    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; bodyBytes: number }>();
-    /** Bodies waiting for their deadline. */
-    let armedBytes = 0;
-    /** Bodies handed to `fire` whose invocation has not settled. Held apart from
-     *  `armedBytes` because a fired body has left the table's id space — it can no longer
-     *  be cleared or re-armed — while its bytes are still this realm's. */
-    let firingBytes = 0;
-    /** Banked execution, in ms. Capped at one invocation, so an idle app's deadline fires the
-     *  moment it comes due; floored at minus the same, so one costly root cannot mortgage the
-     *  table past `budgetMs * clockDivisor`. An unbudgeted realm banks `Infinity`. */
-    let credit = budgetMs;
-    let creditAt = monotonicMs();
-    /** A realm that can run nothing has no clock to share, and pacing it would only spin a
-     *  slip loop against invocations already late when the queue admits them. */
-    const paced = budgetMs > 0;
-    /** Earn at `1 / clockDivisor` in real time. Execution is debited separately by the
-     *  causal clock passed into a fire, so a root parked on I/O earns while it waits. */
-    const accrue = (): void => {
-        const now = monotonicMs();
-        const elapsed = now - creditAt;
-        creditAt = now;
-        if (!(elapsed > 0)) return;
-        credit += elapsed / clockDivisor;
-        credit = Math.max(-budgetMs, Math.min(budgetMs, credit));
-    };
-    const newCausalClock = (): CausalClock => ({
-        charge(ms) {
-            if (!(Number.isFinite(ms) && ms > 0)) return;
-            accrue();
-            credit = Math.max(-budgetMs, credit - ms);
-        },
-    });
-    const clear = (id: number) => {
-        const entry = live.get(id);
-        if (entry !== undefined) {
-            clearTimeout(entry.timer);
-            live.delete(id);
-            armedBytes -= entry.bodyBytes;
-        }
-    };
-    return {
-        arm(id, ms, payload) {
-            // Counted before the re-arm, so replacing a live deadline is always allowed
-            // and only a NEW id can be the one over the line.
-            if (!live.has(id) && live.size >= max)
-                throw new Error(`guest: too many live timers (cap ${max})`);
-            const previousBytes = live.get(id)?.bodyBytes ?? 0;
-            const nextBytes = armedBytes - previousBytes + HOST_CALLER_ID.length + payload.byteLength;
-            if (nextBytes + firingBytes > maxPayloadBytes)
-                throw new Error(`guest: live timer payloads exceed byte cap ${maxPayloadBytes}`);
-            // Copy only after both checks pass. The guest-call request buffer can then be
-            // collected, and the table retains exactly the bytes it accounts for.
-            const body = concatBytes([HOST_CALLER_ID, payload]);
-            clear(id);
-            /** The handle standing for this id. A slip replaces it, so the attempt behind the
-             *  old one finds it changed and does nothing — as a re-arm of the id already does. */
-            let handle: ReturnType<typeof setTimeout> | undefined;
-            const attempt = (): void => {
-                const entry = live.get(id);
-                if (!entry || entry.timer !== handle) return;
-                accrue();
-                if (paced && credit <= 0) {
-                    // Slipped, never failed or dropped: a share held against the node's other
-                    // slots is not an error an honest app should have to handle. The wait is
-                    // what buys a positive share back, capped to `setTimeout`'s range.
-                    handle = setTimeout(attempt, Math.min(0x7fffffff, Math.ceil((1 - credit) * clockDivisor)));
-                    live.set(id, { timer: handle, bodyBytes: entry.bodyBytes });
-                    return;
-                }
-                // Dropped from the table BEFORE the realm is re-entered, so a guest that
-                // re-arms the same id from inside its own `timer` entrypoint arms the new
-                // deadline rather than having it cleared out from under it on the way out.
-                live.delete(id);
-                armedBytes -= entry.bodyBytes;
-                firingBytes += entry.bodyBytes;
-                let released = false;
-                const release = () => {
-                    if (released) return;
-                    released = true;
-                    firingBytes -= entry.bodyBytes;
-                };
-                let handed: Promise<unknown> | void;
-                // A fire that throws, or that carried the body nowhere, ends its custody in
-                // this turn rather than waiting for an answer nobody promised.
-                try { handed = fire(body, newCausalClock()); } catch { handed = undefined; }
-                if (handed) void handed.then(release, release);
-                else release();
-            };
-            handle = setTimeout(attempt, ms);
-            live.set(id, { timer: handle, bodyBytes: body.byteLength });
-            armedBytes += body.byteLength;
-        },
-        clear,
-        clearAll() {
-            for (const { timer } of live.values()) clearTimeout(timer);
-            live.clear();
-            armedBytes = 0;
-            // `firingBytes` drains on its own: disposal settles every invocation still in
-            // flight (realm-queue.ts), and each fired body releases as its answer lands.
-        },
-    };
-}
-
-// ── the fs key rule, applied once (core/fs.ts `isSafeFsKey`) ─────────────────
-//
-// The rule itself is a consensus predicate and lives in the core; the host applies it here,
-// in the two places it must, over whichever backend the target supplied.
-
-/** Apply the key rule over a backend. Rejected keys throw; `list`/`stat` exempt.
- *  Sits under `scopedFs` so the composite `scope + key` is checked. */
-export function validatedFs(inner: Fs): Fs {
-  const check = (key: string): string => {
-    if (!isSafeFsKey(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
-    return key;
-  };
-  // `async` so a refusal is a REJECTION, like every other failure on this seam. A
-  // synchronous throw would reach a caller that only attached `.catch` as an exception.
-  return {
-    async get(key) { return inner.get(check(key)); },
-    async put(key, bytes) { return inner.put(check(key), bytes); },
-    async size(key) { return inner.size(check(key)); },
-    list: (prefix) => inner.list(prefix),
-    async delete(key) { return inner.delete(check(key)); },
-    stat: () => inner.stat(),
-  };
-}
-
-/** Scope a backend to one app's keyspace (§12.2). `scope` is `appScopeFor`'s
- *  fixed-length prefix. `stat()` is not scoped — it describes the physical backend. */
-export function scopedFs(inner: Fs, scope: string): Fs {
-  // The head of every key this app will ever reach, so it is checked at construction
-  // rather than on the first `put`. Charset only (`isSafeFsScope`): the bare-dot and
-  // device-name cases are about a complete name and do not apply to a prefix.
-  if (!isSafeFsScope(scope)) throw new Error(`fs: unsafe scope ${JSON.stringify(scope)}`);
-  const outward = (key: string): string => scope + key;
-  return {
-    get: (key) => inner.get(outward(key)),
-    put: (key, bytes) => inner.put(outward(key), bytes),
-    size: (key) => inner.size(outward(key)),
-    // An absent prefix means everything in this scope and nothing else. Keys come back
-    // stripped, so the guest only handles names it chose and the scope stays host-side.
-    list: async (prefix) => (await inner.list(outward(prefix ?? ""))).map((k) => k.slice(scope.length)),
-    delete: (key) => inner.delete(outward(key)),
-    stat: () => inner.stat(),
-  };
-}
+export { scopedFs } from "./fs-view.js";
 
 /** This node's network, whole (§12.6). */
 export interface TransportOptions extends Omit<TransportHostOptions, "networkKey"> {
@@ -442,9 +229,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // `false` is a node with no disk, the one member whose absence is NOT its default:
     // omitted asks for the in-memory backend, said-as-false asks for none.
     const backend = opts.fs === false ? undefined : opts.fs ?? new ((await import("./fs-memory.js")).MemoryFs)();
-    // The key rule applied once, over whatever backend this target supplied, so every host
-    // admits exactly the same key space — which is what decides the contents a node stores
-    // and advertises.
+    // The one place the key rule is applied to a target's backend (fs-view.ts).
     const fs = backend ? validatedFs(backend) : undefined;
     const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
     const createRealm = opts.createRealm
@@ -482,44 +267,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
     });
 
-    // ── what this node holds ────────────────────────────────────────────────────
-    const slots: AppSlot[] = [];
-    /** Two audiences, two maps (§12.10): `peerClaims` from every installed manifest's
-     *  `protocols`, `localClaims` from its `services`. Which map holds a name IS its reach,
-     *  so an inbound frame is one lookup and nothing tests the manifest a second time. Both
-     *  are projections of what is installed — nothing to write, persist or keep in step —
-     *  and materialized rather than scanned because each is read once per delivery.
-     *
-     *  A name in both is a bundle saying "reachable either way", so uniqueness is enforced
-     *  per map (`refuseContested`), never across them. */
-    const peerClaims = new Map<string, AppSlot>();
-    const localClaims = new Map<string, AppSlot>();
+    // ── what this node holds (slot-table.ts) ────────────────────────────────────
+    const table = createSlotTable();
     // The tail of every host-initiated call into a realm. close() defers realm disposal onto
     // this, so a call parked mid-await (a repair pass on an unreachable peer, an operator
     // waiting for a cohort) is never resumed into a freed realm — a QuickJS
     // use-after-free (§12.3).
     let inFlight = Promise.resolve();
-    const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
-    /** Each signed list paired with the map it claims in, so every caller iterating a
-     *  bundle's claims covers both audiences. */
-    const booksOf = (manifest: LoadedBundle["manifest"]): readonly (readonly [Map<string, AppSlot>, readonly string[], string])[] => [
-        [peerClaims, manifest.protocols ?? [], "protocols"],
-        [localClaims, manifest.services ?? [], "services"],
-    ];
-    const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
-    /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has
-     *  ONE event sink, so two holders are not a composition — the second would take the
-     *  node's sockets off the first, silently. A pure function of the signed manifest, so
-     *  there is nothing here to store or keep in step — `slots.find(hasLink)` IS the
-     *  binding's holder. */
-    const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
-    const releaseClaims = (slot: AppSlot) => {
-        for (const [book, names] of booksOf(slot.verifiedBundle.manifest)) {
-            for (const claim of names) {
-                if (book.get(claim) === slot) book.delete(claim);
-            }
-        }
-    };
     /** This load's per-invocation ceiling: this load's number, else the node's, else the
      *  shared one (§12.3). One place, because two owners are measured against it — the realm
      *  `standRealm` stands, and the clock its timer table banks one invocation of. */
@@ -532,16 +286,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: LoadBundleOptions): AppSlot => {
         let slot: AppSlot;
         const timers = createRealmTimers((body, causalClock) =>
-            // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
-            // an event the host delivers into the guest, not a host authority. The body is
-            // already framed — the HOST's caller id followed by what `timer/arm` supplied,
-            // built once by the table that retains it; event framing above that belongs to
-            // the guest whose `handle` reads it. A guest's `handle` may throw on it; there
-            // is no caller left to reject — the arming call returned turns ago — so report
-            // and swallow. Returned rather than discarded: the table holds this body's byte
-            // charge until the invocation settles. Its causal clock is separate and follows
-            // every descendant call, including work that outlives this top-level answer; a
-            // slot whose realm is already gone releases the body now by answering nothing.
+            // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
+            // event the host delivers, not a host authority, and `body` arrives pre-framed. A
+            // throw has no caller left to reject — the arming call returned turns ago — so it
+            // is reported and swallowed. The promise is RETURNED, not discarded: that is what
+            // ends the table's custody of these bytes (realm-timers.ts).
             slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             }),
@@ -577,7 +326,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         const json = JSON.stringify(value);
         return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
     };
-    /** Stand one candidate realm. It remains outside `slots` and the claim maps until this
+    /** Stand one candidate realm. It stays out of the slot table until this
      *  and the freshness write both succeed. Both bounds resolve per load: this load's
      *  number, else the node's default, else the shared one — never the author's, since a
      *  bundle cannot ask for more of the host than the operator gave it. */
@@ -610,7 +359,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  `"app"` authority, so every realm gets a table. */
     const seamFor = (slot: AppSlot): HostCall => {
         const b = slot.verifiedBundle;
-        const links = hasLink(slot);
+        const links = table.hasLink(slot);
         // As signed. Tells a bare `host.call` name from this bundle's own module
         // (guest-seam.ts dispatch).
         const localServices = new Set(b.manifest.guest.calls ?? []);
@@ -618,7 +367,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // hashed. The same shape as the sender key prepended to an inbound frame, so a
         // callee reads one field whether the caller was a peer or a co-resident app. Zero
         // is the HOST's own, and no app key derives it.
-        const callerId = genesisHash(sodium, enc.encode(keyOf(slot)));
+        const callerId = genesisHash(sodium, enc.encode(table.keyOf(slot)));
         const fullSeam = createGuestSeam({
             platform: { sodium, identity: opts.identity, now },
             grants: {
@@ -645,7 +394,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // service — a claimant captured at seam construction would pin this realm
                 // to whoever was there first.
                 calls: { call: (id, payload, deadlineMs, causalClock) =>
-                    callClaimant(localClaims, id, callerId, payload, deadlineMs, causalClock) },
+                    callClaimant(table.localClaimant(id), callerId, payload, deadlineMs, causalClock) },
                 rawNet: links ? netHost?.rawNet() : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
@@ -686,81 +435,42 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
-    /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
-     *  caller id the shell holds (loopback and socket events). */
-    const hostCallSlot = (slot: AppSlot, body: Uint8Array, deadlineMs?: number): Promise<Uint8Array> =>
-        callSlot(slot, concatBytes([HOST_CALLER_ID, body]), deadlineMs);
     /** Add the host-owned network key to transport `LOCAL` (§12.10). */
     const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
-        if (!hasLink(slot)) return localConfig;
+        if (!table.hasLink(slot)) return localConfig;
         const facts = netHost?.initialConfig();
         if (!facts)
             throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
         return { ...localConfig, ...facts };
     };
-    /** Refuse a candidate contesting a claim or the raw-link binding another identity
-     *  holds (§12.10). Asked before candidate code runs, then again in the commit window.
-     *  Per MAP: the same name under `protocols` and `services` is two claims, not a
-     *  contest. */
-    /** Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
-     *  install list nobody counts would leave each of those ceilings a floor rather than a
-     *  bound. A replacement takes the slot it already holds and is never refused here.
-     *  Checked twice like the contest below, and for the same reason: this is the cheap
-     *  early refusal, and the commit window re-checks what another load may have taken. */
-    const refuseOverfull = (key: string) => {
-        if (slots.length >= DEFAULT_MAX_APP_SLOTS && !slots.some((installed) => keyOf(installed) === key))
-            throw new Error(`shell: this node already holds its ${DEFAULT_MAX_APP_SLOTS} app slots — uninstall one before installing another`);
-    };
-    const refuseContested = (loaded: LoadedBundle, key: string) => {
-        for (const [book, names, audience] of booksOf(loaded.manifest)) {
-            for (const claim of names) {
-                const incumbent = book.get(claim);
-                if (incumbent && keyOf(incumbent) !== key) {
-                    throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(incumbent)}'`);
-                }
-            }
-        }
-        // Refused rather than shadowed for the same reason a claim is, and LOUDLY because
-        // the alternative is a node that looks installed and is off the network: the
-        // incumbent keeps its claims and its realm, and only its sockets stop answering.
-        const linkIncumbent = slots.find(hasLink);
-        if (linkIncumbent && keyOf(linkIncumbent) !== key && reachesLink(loaded.manifest)) {
-            throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkIncumbent)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
-        }
-    };
     const doUninstall = (appKey: string) => {
-        const i = slots.findIndex((slot) => keyOf(slot) === appKey);
-        if (i < 0) return false;
-        const [slot] = slots.splice(i, 1);
-        releaseClaims(slot);
-        if (hasLink(slot)) netHost?.release();
+        const slot = table.remove(appKey);
+        if (!slot) return false;
+        if (table.hasLink(slot)) netHost?.release();
         disposeSlot(slot);
         return true;
     };
-    /** Frame `[attribution ‖ payload]` and enter a slot's guest — the shape both a
-     *  cross-realm call and a peer-inbound frame arrive as (`callClaimant`,
-     *  `deliverInbound`). */
+    /** Frame `[attribution ‖ payload]` and enter a slot's guest — the one shape every door
+     *  into a realm arrives as: a host event (the host's own zero caller id), a cross-realm
+     *  call, and a peer-inbound frame. */
     const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array,
-        deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> => {
-        const input = new Uint8Array(attribution.length + payload.length);
-        input.set(attribution, 0);
-        input.set(payload, attribution.length);
-        return callSlot(slot, input, deadlineMs, causalClock);
-    };
-    /** Hand a request to the realm claiming `claim` in `book`. `null` when nothing claims
-     *  it — an answer, rather than a promise no one will settle. */
-    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array,
-        payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
-        const slot = book.get(claim);
-        return slot ? callFramed(slot, attribution, payload, deadlineMs, causalClock) : null;
-    };
+        deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
+        callSlot(slot, concatBytes([attribution, payload]), deadlineMs, causalClock);
+    /** An event the HOST writes into a slot (loopback and socket events). */
+    const hostCallSlot = (slot: AppSlot, body: Uint8Array, deadlineMs?: number): Promise<Uint8Array> =>
+        callFramed(slot, HOST_CALLER_ID, body, deadlineMs);
+    /** Hand a request to a claimant, or answer `null` when nothing claims it — an answer,
+     *  rather than a promise no one will settle. */
+    const callClaimant = (slot: AppSlot | undefined, attribution: Uint8Array,
+        payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null =>
+        slot ? callFramed(slot, attribution, payload, deadlineMs, causalClock) : null;
     /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
-     *  on `peerClaims`, so a `services` claim is unreachable by a peer by construction
+     *  on the PEER book, so a `services` claim is unreachable by a peer by construction
      *  rather than by a second test against the slot's manifest. The resolved answer also
      *  goes to the slot's `onInbound`, if its load named one. */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array,
         deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
-        const slot = peerClaims.get(claim);
+        const slot = table.peerClaimant(claim);
         if (!slot) return null;
         const answer = callFramed(slot, attribution, payload, deadlineMs, causalClock);
         if (slot.onInbound) {
@@ -782,12 +492,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
 
     const shell: Shell = {
         resolve(name) {
-            const slot = peerClaims.get(name) ?? localClaims.get(name);
-            return slot ? keyOf(slot) : null;
+            const slot = table.owner(name);
+            return slot ? table.keyOf(slot) : null;
         },
-        routes: () => [...peerClaims, ...localClaims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
+        routes: table.routes,
         call: (serviceId, payload, deadlineMs) => {
-            const answer = callClaimant(localClaims, serviceId, HOST_CALLER_ID, payload, deadlineMs);
+            const answer = callClaimant(table.localClaimant(serviceId), HOST_CALLER_ID, payload, deadlineMs);
             return answer && track(answer);
         },
         fs,
@@ -822,8 +532,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             // execute: a known loser is not worth a realm. The second check in the
             // synchronous commit window remains necessary, since another load may take a
             // free claim while this candidate is built.
-            refuseContested(loaded, key);
-            refuseOverfull(key);
+            table.refuseConflicts(loaded, key);
             const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules, loadOpts);
             // Stand the guest, before anything already standing is replaced. Every app is a
@@ -835,8 +544,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
-                refuseContested(loaded, key);
-                refuseOverfull(key);
+                table.refuseConflicts(loaded, key);
                 // A mark that cannot be persisted throws, and the store has already rolled
                 // itself back; the catch below disposes the candidate, so the running slot
                 // is untouched.
@@ -846,25 +554,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 disposeSlot(slot);
                 throw err;
             }
-            const previousIndex = slots.findIndex((installed) => keyOf(installed) === key);
-            const previous = previousIndex < 0 ? undefined : slots[previousIndex];
-            const replacingLinkOwner = previous !== undefined && hasLink(previous);
-            if (previous) releaseClaims(previous);
-            if (previousIndex < 0) slots.push(slot);
-            else slots[previousIndex] = slot;
-            for (const [book, names] of booksOf(loaded.manifest)) {
-                for (const claim of names) book.set(claim, slot);
-            }
+            const previous = table.commit(slot, key);
+            const replacingLinkOwner = previous !== undefined && table.hasLink(previous);
             // The outgoing guest's link state went with its realm (§4.3), so the sockets it
             // held are torn down here rather than left as channels nobody can speak for. So
             // did its address book, which is why the incoming guest redials from the peers
             // its own load named and not from anything retained here (§12.10). After the
             // claim hand-over above, so `onClose` finds the channels already gone and queues
             // no `linkClosed` at the new realm for links it never had. Only ever a free
-            // binding or this identity's own: `refuseContested` turned any other candidate
+            // binding or this identity's own: `refuseConflicts` turned any other candidate
             // away, and a version that DROPS `link/*` releases the binding the same way
             // dropping a claim releases the claim.
-            if (hasLink(slot)) {
+            if (table.hasLink(slot)) {
                 netHost?.activate((payload) => hostCallSlot(slot, payload));
             } else if (replacingLinkOwner) {
                 netHost?.release();
@@ -897,23 +598,16 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             // apps are gone but nothing refuses the key, and the case this exists for is a
             // key that is actively publishing.
             freshnessStore.revoke(fromHex(hex));
-            const gone = [];
-            for (const slot of [...slots]) {
-                if (toHex(slot.verifiedBundle.author) === hex) {
-                    const appKey = keyOf(slot);
-                    doUninstall(appKey);
-                    gone.push(appKey);
-                }
-            }
+            const gone = table.all()
+                .filter((slot) => toHex(slot.verifiedBundle.author) === hex)
+                .map(table.keyOf);
+            for (const appKey of gone) doUninstall(appKey);
             return gone;
         },
         close() {
             netHost?.close();
             const dispose = () => {
-                for (const slot of slots) disposeSlot(slot);
-                slots.length = 0;
-                peerClaims.clear();
-                localClaims.clear();
+                for (const slot of table.clear()) disposeSlot(slot);
             };
             inFlight.then(dispose, dispose);
         },

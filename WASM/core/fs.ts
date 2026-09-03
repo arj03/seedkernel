@@ -49,8 +49,8 @@ export function isSafeFsKey(key: string): boolean {
   return key !== "." && key !== ".." && SAFE_CHARS.test(key) && !isReservedDeviceName(key);
 }
 
-/** Whether `scope` — the host-derived prefix an app's keys live under (shell-core
- *  `scopedFs`) — is representable as the head of every key it will ever reach. The
+/** Whether `scope` — the host-derived prefix an app's keys live under (`scopedFs`,
+ *  host/fs-view.ts) — is representable as the head of every key it will ever reach. The
  *  charset only: a scope is not a whole key, so the bare-dot and device-name cases
  *  (which are about a complete name) do not apply to it. */
 export function isSafeFsScope(scope: string): boolean {

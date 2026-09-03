@@ -42,7 +42,8 @@ withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.w
 /** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
  *  identity policy pins and app keys lead with. `ed` doubles as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
-const { bootShell, scopedFs, createRealmTimers } = await imp("build/host/shell-core.js");
+const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
+const { createRealmTimers } = await imp("build/host/realm-timers.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
