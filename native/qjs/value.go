@@ -267,12 +267,10 @@ func (v *Value) byteArrayLength() (int64, error) {
 	return int64(size), nil
 }
 
-// checkWindow validates a view's [offset, offset+length) against the buffer's REAL size —
-// the size QuickJS itself reports, never the caller's numbers alone, since byteOffset and
-// byteLength are ordinary JS properties a hostile object can forge (viewWindow).
-//
-// Compare by subtraction, not addition: a hostile pair near 2^62 would overflow
-// offset+length and pass an additive check.
+// checkWindow validates a view's [offset, offset+length) against the buffer size QuickJS
+// itself reports — never the caller's numbers alone, since byteOffset and byteLength are
+// ordinary JS properties a hostile object can forge (viewWindow). Compare by subtraction:
+// a hostile pair near 2^62 would overflow offset+length and pass an additive check.
 func checkWindow(size, offset, length int64) error {
 	if offset < 0 || length < 0 || offset > size || length > size-offset {
 		return errors.New("qjs: typed array view out of range")
@@ -321,10 +319,9 @@ func (c *Context) hasException() bool {
 }
 
 // prop reads property `name`, refusing — and CLEARING — an exception the read left
-// standing. Bare GetPropertyStr is fine for a property this process wrote; this is for one
-// whose shape is the caller's, where a throwing getter would otherwise leave the flag set
-// for whatever unrelated JS call ran next to inherit (c.exception's JS_GetException is
-// what clears it). The returned value is the caller's to Free.
+// standing, which a throwing getter would otherwise leave for the next unrelated call in
+// the realm to inherit. Bare GetPropertyStr is fine for a property this process wrote; this
+// is for one whose shape is the caller's. The returned value is the caller's to Free.
 func (v *Value) prop(name string) (*Value, error) {
 	p := v.GetPropertyStr(name)
 	if v.c.hasException() {
@@ -349,10 +346,9 @@ func (v *Value) numberProp(name string) (int64, error) {
 	return n, nil
 }
 
-// viewWindow reads a typed array / DataView's own byteOffset and byteLength. Both are
-// ordinary JS properties of an object the caller supplied, so neither is trusted to be a
-// number and neither may poison the realm on the way out (see prop). The pair is still
-// validated against the buffer's real size by the reader that consumes it.
+// viewWindow reads a view's own byteOffset and byteLength — ordinary JS properties of an
+// object the caller supplied, so neither is trusted to be a number (prop). The pair is
+// validated against the real buffer by whoever reads the window (checkWindow).
 func (v *Value) viewWindow() (offset, length int64, err error) {
 	if offset, err = v.numberProp("byteOffset"); err != nil {
 		return 0, 0, err
@@ -468,12 +464,10 @@ func (c *Context) Pump() error {
 	return c.exception()
 }
 
-// typedArrayView resolves a view (TypedArray/DataView) onto its backing ArrayBuffer plus
-// the view's own window — the SLOW path only, the caller having already ruled out a bare
-// ArrayBuffer. That exclusion is what makes buf unconditionally the caller's to Free: a
-// bare buffer IS its own .buffer, and freeing a borrowed value as if owned detaches the
-// source out from under QuickJS (toByteArray). The window is the caller's own untrusted
-// numbers, checked against the real buffer by whoever reads it (checkWindow).
+// typedArrayView resolves a view (TypedArray/DataView) onto its backing ArrayBuffer and its
+// window — the SLOW path only, a bare ArrayBuffer already ruled out by the caller. That
+// exclusion is what makes buf unconditionally the caller's to Free: a bare buffer IS its own
+// .buffer, and freeing a borrowed value as if owned detaches the source (toByteArray).
 func typedArrayView(input *Value) (buf *Value, offset, length int64, err error) {
 	if buf, err = input.prop("buffer"); err != nil {
 		return nil, 0, 0, err

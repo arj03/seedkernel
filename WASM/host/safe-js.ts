@@ -189,9 +189,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   let disposed = false;
   const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
-  // The wall-clock half of the same custody, on one wake per tier: the host calls this realm
-  // has not answered, and the invocations waiting to enter it. Both die with the realm; they
-  // are deliberately not one queue (realm-queue.ts).
+  // The wall-clock half of the same custody (§12.3): one wake for the host calls this realm
+  // has not answered, one for the invocations waiting to enter it — never merged, and both
+  // disarmed with the realm (realm-queue.ts).
   const hostCallDeadlines = createDeadlineQueue();
   const entryDeadlines = createDeadlineQueue();
 
@@ -458,9 +458,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       // And end custody of every call the host never answered: nothing inside this realm
       // will consume those answers now, so holding their charge would pin this realm's
       // allowance on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
-      // Their deadlines go with them: a timer left waiting to reject a call this realm no
-      // longer holds keeps the host's event loop alive for the whole of its remainder, so a
-      // one-shot process would linger a full budget past the work it came to do.
+      // Their armed deadlines go with them (`disarmAll`).
       activeHostCalls.releaseAll();
       hostCallDeadlines.disarmAll();
       entryDeadlines.disarmAll();

@@ -396,9 +396,9 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-  // This realm's wall-clock custody, on one wake per tier: the host calls it has not
-  // answered, and the invocations waiting to enter it. Both die with the realm; they are
-  // deliberately not one queue (realm-queue.ts).
+  // This realm's wall-clock custody (§12.3): one wake for the host calls it has not
+  // answered, one for the invocations waiting to enter it — never merged, and both
+  // disarmed with the realm (realm-queue.ts).
   const hostCallDeadlines = createDeadlineQueue();
   const entryDeadlines = createDeadlineQueue();
   // Go mints the handle, but createRealm runs the guest's top-level code before returning
@@ -492,12 +492,10 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     ),
     dispose: () => {
       disposed = true;
-      // guest.go's close() runs settleAll before it frees anything, so every callback
-      // it still owns is rejected synchronously here — safe-js.ts needs its own
-      // registry for this, and this target does not (§12.3). The armed deadlines are
-      // host-side and do NOT go with it: a timer waiting to reject a call this realm
-      // no longer holds keeps the host's event loop alive for the whole of its
-      // remainder, so a one-shot process would linger a full budget past its work.
+      // guest.go's close() runs settleAll before it frees anything, so every callback it
+      // still owns is rejected synchronously here — safe-js.ts needs its own registry for
+      // this, and this target does not (§12.3). The armed deadlines are host-side and do
+      // NOT go with it, so disarm them here (realm-queue.ts `disarmAll`).
       hostCallDeadlines.disarmAll();
       entryDeadlines.disarmAll();
       bridge.realmDispose(realm);

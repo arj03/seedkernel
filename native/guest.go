@@ -329,9 +329,8 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 // reports synchronously whether the entrypoint DEFERRED its answer, which tells the shim's
 // queue the realm is free again even though nothing has settled.
 func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) (bool, time.Duration) {
-	// Neither refusal below retains the callback past the report, so both hand reportCall
-	// the BORROWED argument: a Dup here would be a reference nothing is left to release
-	// (reportCall frees the argument value, never the callback).
+	// Neither refusal below retains the callback past the report, so both pass it BORROWED:
+	// a Dup here would be a reference nothing is left to release.
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
 		g.reportCall(onFail, g.hostQc.NewString(err.Error()))

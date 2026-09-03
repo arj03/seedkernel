@@ -68,10 +68,8 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 }
 
 // A view's byteOffset/byteLength/buffer are ordinary properties of an object the CALLER
-// supplies, and on the guest seam that caller is untrusted code. A property that cannot be
-// read as a number — or a getter that throws — must be refused, and must not leave the
-// exception standing for the next unrelated call in that realm to inherit as its own
-// failure.
+// supplies — untrusted code on the guest seam. One that is not a number, or a getter that
+// throws, must be refused without leaving the exception for the next call to inherit.
 func TestJsTypedArrayToGoHostileProperties(t *testing.T) {
 	bootRealm(t)
 	for _, tc := range []struct{ name, src string }{

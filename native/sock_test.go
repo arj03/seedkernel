@@ -500,9 +500,9 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 	}
 }
 
-// A reader parked on a full staging window is waiting for custody the event loop hands
-// back. Teardown means no loop, so nothing will ever hand it back: close() has to release
-// the reader with a refusal instead of leaving the goroutine parked for the process's life.
+// A reader parked on a full staging window waits for custody the event loop hands back.
+// Teardown means no loop, so close() must refuse it rather than leave the goroutine parked
+// for the life of the process.
 func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
 	n := &netHost{chans: map[int64]rawChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
 	if !n.reserveInboundRead(4) {
@@ -529,10 +529,9 @@ func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
 	}
 }
 
-// boot() is documented as idempotent — each one releases the previous one's engines. The
-// network is not an engine but outlives one just as badly: a listener nothing closes keeps
-// its fd and its accept goroutine, and the readers behind it go on posting into an event
-// loop that no longer runs, against a QuickJS context that has been freed.
+// boot() is idempotent — each one releases the previous one's engines. The network is not
+// an engine but outlives one just as badly: a listener nothing closes keeps its fd and its
+// accept goroutine, and the readers behind it post into a loop that no longer runs.
 func TestShutdownClosesTheNetwork(t *testing.T) {
 	before := runtime.NumGoroutine()
 	const boots = 3

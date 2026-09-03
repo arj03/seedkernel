@@ -29,14 +29,12 @@ func ensureBooted(tb testing.TB) {
 			return
 		}
 		benchDataDir = dir
-		// Standing on the sentinel until the realm is actually up: the helpers below report
-		// a failure with tb.Fatal, which unwinds THIS goroutine while leaving the Once done
-		// — so without it a later benchmark would find benchBootErr nil and run against a
-		// half-built realm.
+		// The helpers below fail with tb.Fatal, which unwinds this goroutine but leaves the
+		// Once done — so hold the sentinel until the realm is actually up, or a later
+		// benchmark finds benchBootErr nil and runs against a half-built realm.
 		benchBootErr = errors.New("the first benchmark to stand the realm up failed")
-		// The same standing-up every test does, harness included — a bench realm assembled
-		// its own way is the second assembly path this target exists not to have, and the
-		// one it drifted into left `teachAddr` undefined, which no benchmark could reach.
+		// The same standing-up every test does: a bench realm assembled its own way is the
+		// second assembly path this target exists not to have.
 		bootRealmIn(tb, dir)
 		cfg := nodeConfig{KeyHex: testKeyHex(tb)}
 		_, benchBootErr = startNode(cfg)

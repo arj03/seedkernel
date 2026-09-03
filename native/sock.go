@@ -32,9 +32,8 @@ type netHost struct {
 	chans     map[int64]rawChannel
 	nextID    int64
 	listeners []net.Listener // bound listeners, closed on network teardown
-	// closed marks the host torn down with the realm that owned it (close). A reader
-	// parked on the staging allowance below is released by it rather than waiting for
-	// custody nothing is left to hand back.
+	// Torn down with the realm that owned it (close): a reader parked on the staging
+	// allowance below is released by it, not left waiting for custody nobody can hand back.
 	closed bool
 
 	// Policy values installed by host/native-shim.ts before any socket is opened.
@@ -320,14 +319,12 @@ func (n *netHost) closeListeners() {
 	}
 }
 
-// close tears the whole network down with the realm that owned it: every listener (which
-// ends its accept goroutine and releases the fd) and every live channel (which ends its
-// reader and its writer). Without it a re-boot would leave the previous one's sockets
-// running against a freed QuickJS context, posting into an event loop nobody drains — the
-// engines shutdown() releases are only half of what a boot stands up.
+// close tears the network down with the realm that owned it: every listener (ending its
+// accept goroutine and releasing the fd) and every live channel (ending its reader and its
+// writer). Without it a re-boot leaves the previous one's sockets posting into an event loop
+// nobody drains, against a freed QuickJS context (main.go's shutdown).
 //
-// Hard, not graceful: the realm the flushed bytes were for is being freed, and onClose is
-// deliberately not fired for the same reason.
+// Hard, not graceful, and onClose is not fired: the realm those bytes were for is going.
 func (n *netHost) close() {
 	n.closeListeners()
 	n.mu.Lock()

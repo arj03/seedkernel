@@ -1,6 +1,5 @@
-# The indentation rule, where an editor reads it. Line endings are deliberately not stated:
-# `.gitattributes` owns them, and a Windows checkout is meant to hold CRLF while the index
-# holds LF.
+# Line endings are deliberately absent: `.gitattributes` owns them, and a Windows checkout
+# is meant to hold CRLF while the index holds LF.
 root = true
 
 [*]

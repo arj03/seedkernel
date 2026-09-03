@@ -490,10 +490,8 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   // dispose() rejects this invocation; the caller holds the error, so consume it here.
   disposedWithParked.call(new Uint8Array()).catch(() => {});
   await sleep(20);
-  // The parked call's handoff deadline is host-side state exactly like its byte charge, and
-  // dispose() must end both. A timer nobody is left waiting for still holds the host's event
-  // loop open for the whole of its remainder — enough to make a one-shot process linger a
-  // full budget past the work it came to do — so the count is read either side of dispose.
+  // The parked call's handoff deadline is host-side state exactly like its byte charge and
+  // dispose() must end both (§12.3), so the timer count is read either side of dispose.
   const armedAtDispose = liveTimers();
   disposedWithParked.dispose();
   ok(armedAtDispose > 0 && liveTimers() < armedAtDispose,
@@ -503,9 +501,8 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   settleAtDispose(new Uint8Array());
   afterFailure.dispose();
 
-  // A realm queue retains one wakeup across fast calls instead of allocating and
-  // crossing the host timer seam for every invocation. It is still explicit custody:
-  // disposal clears that one wakeup immediately.
+  // Fast serialized calls share one retained wake rather than crossing the host timer seam
+  // per invocation, and disposal still clears it at once (realm-queue.ts).
   const nativeSetTimeout = globalThis.setTimeout;
   const nativeClearTimeout = globalThis.clearTimeout;
   let deadlineArms = 0, deadlineClears = 0;

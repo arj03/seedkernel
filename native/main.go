@@ -38,9 +38,8 @@ var (
 	qrt    *qjs.Runtime
 	// el drives the host realm and every confined realm attached to it (loop.go).
 	el *eventLoop
-	// nh owns the listeners and sockets of the booted network (sock.go). Held here rather
-	// than only inside boot() because shutdown() has to close them: they outlive the realm
-	// otherwise, running against a context that is already gone.
+	// nh owns the booted network's listeners and sockets (sock.go). Package-level rather
+	// than boot()-local because shutdown() has to close them; they outlive the realm.
 	nh *netHost
 )
 
@@ -82,11 +81,11 @@ func boot() error {
 }
 
 // shutdown releases a previous boot's engines: every confined realm, the host realm, and
-// the wazero runtimes holding each module's compiled code — plus the sockets and listeners
-// the network stood up, which are not engines but outlive one just as badly.
+// the wazero runtimes holding each module's compiled code — plus the network's listeners
+// and sockets, which are not engines but outlive one just as badly.
 func shutdown() {
-	// First: the reader goroutines it stops would otherwise keep posting into the loop and
-	// dispatching into the host realm being freed below.
+	// The network first: the reader goroutines it stops would otherwise keep posting into
+	// the loop and dispatching into the host realm freed below.
 	if nh != nil {
 		nh.close()
 		nh = nil

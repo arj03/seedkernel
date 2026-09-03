@@ -1,9 +1,8 @@
-// The shipped host tree. `build/` keeps its doc comments for debugging; `build-min/` is what
-// a browser vendors, and over half its gzipped bytes would be those comments — so this is a
-// second `tsc` pass with `removeComments`, nothing more. The compiler that already builds
-// the host is the one thing on hand that can tell a regex literal from a division, so there
-// is no hand-written lexer here to get that wrong, and no output to gate through
-// `node --check`. One `npm run build` produces both trees.
+// The shipped host tree (§10.2). `build/` keeps its doc comments for debugging;
+// `build-min/` is what a browser vendors, and over half its gzipped bytes would be those
+// comments — so this is a second `tsc` pass with `removeComments`, nothing more. Letting
+// the compiler strip them is what keeps a hand-written lexer, which cannot tell a regex
+// literal from a division, out of the build. One `npm run build` produces both trees.
 
 import { readFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { gzipSync } from "node:zlib";

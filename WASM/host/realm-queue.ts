@@ -155,26 +155,19 @@ export interface Deadline {
   expire(): void;
 }
 
-/** A set of deadlines a realm has armed for work it has not settled, sharing one physical
- *  timer — the wall-clock half of the custody the active-call registry keeps in bytes.
- *  Records are not deadline-sorted: a caller may put a short budget behind a long one, and
- *  the scan that finds the earliest runs when the timer fires, never on the call path.
+/** The deadlines a realm has armed for work it has not settled, sharing one physical timer
+ *  — the wall-clock half of the custody the active-call registry keeps in bytes (§12.3).
+ *  Unsorted: the scan for the earliest runs when the timer fires, never on the call path.
+ *  The wake is retained between fires rather than cycled per call — on native, two host
+ *  calls through the trampoline for a deadline a fast dispatch never reaches — which is
+ *  safe because `timerAt` is only ever EARLIER than anything pending: an unneeded wake
+ *  re-arms, and none can fire late.
  *
- *  Between fires the armed wake is retained rather than cleared and re-armed per call,
- *  which on the native target is two host calls through the trampoline for a deadline that
- *  a fast local dispatch never reaches. It is safe because `timerAt` is only ever EARLIER
- *  than anything still pending: a wake that turns out to be unneeded re-arms, and no
- *  deadline can fire late. `disarmAll` is not tidiness — nothing inside a disposed realm
- *  will consume those answers, and the wake would hold the host's event loop for the rest
- *  of its remainder, so a one-shot process would linger a full budget past its work.
- *
- *  A realm keeps ONE OF THESE PER TIER — its invocations, and the host calls made under
- *  them — and must not fold them together, however alike they look. Those deadlines are
- *  NESTED, not peers: a host call is admitted with what is left of the invocation that
- *  makes it, so it is always a hair earlier, and every one of them would jostle the wake
- *  the outer deadline is already waiting on. The outer one then fires late by however much
- *  the host's timer clock is coarser than this one's — and it loses the race against the
- *  guest budget derived from it, which is the very thing it exists to backstop. */
+ *  ONE PER TIER — invocations, and the host calls made under them — never folded together.
+ *  Those deadlines are NESTED, not peers: a host call is admitted with what is left of its
+ *  invocation, so it is always a hair earlier and would jostle the wake the outer deadline
+ *  waits on. That one then fires late by the host timer clock's coarseness and loses the
+ *  race against the guest budget derived from it, which is what it exists to backstop. */
 export function createDeadlineQueue(): {
   add(deadline: Deadline): void;
   drop(deadline: Deadline): void;
@@ -188,15 +181,12 @@ export function createDeadlineQueue(): {
     timer = undefined;
     timerAt = Infinity;
   };
-  /** Expire what is due, then re-arm for the earliest that is left — in pieces, for a
-   *  ceiling past `setTimeout`'s range, which fires at once if handed over whole.
-   *
-   *  "Due" is anything inside one millisecond, because that is all `setTimeout` resolves:
-   *  a host whose timer clock is not this one's wakes a hair EARLY often enough, and
-   *  re-arming for that remainder buys a whole further tick — overshooting the deadline by
-   *  more than firing now undershoots it. A ceiling that lands a fraction early is the
-   *  conservative side of a custody bound; one that lands a tick late hands the guest time
-   *  it was never granted, and loses races against the budgets derived from it. */
+  /** Expire what is due, then re-arm for the earliest that is left — in pieces, since a
+   *  ceiling past `setTimeout`'s range fires at once if handed over whole. "Due" is
+   *  anything inside a millisecond, which is all `setTimeout` resolves: a host whose timer
+   *  clock is not this one's wakes a hair early often enough, and re-arming for that
+   *  remainder buys a whole further tick. Early is the conservative side of a custody bound;
+   *  a tick late hands the guest time it was never granted. */
   const arm = (): void => {
     clear();
     const now = monotonicMs();
@@ -212,11 +202,9 @@ export function createDeadlineQueue(): {
   return {
     add(deadline) {
       pending.add(deadline);
-      // Re-arm only for a wake that is a whole tick better, never for a fraction of one.
-      // Re-arming restarts the host's timer against ITS clock, which is coarser than this
-      // one; doing that for a sub-millisecond gain buys nothing and costs the accuracy of
-      // the wake already standing — and, on a guest calling out under a budget derived
-      // from the invocation's own deadline, that is once per host call.
+      // Only for a wake a whole tick better: re-arming restarts the host's coarser timer,
+      // so a sub-millisecond gain costs the standing wake's accuracy — and a guest calling
+      // out under its invocation's deadline would pay that once per host call.
       if (timer === undefined || deadline.at < timerAt - 1) arm();
       else (timer as ReturnType<typeof setTimeout> & { ref?(): void }).ref?.();
     },
@@ -228,6 +216,8 @@ export function createDeadlineQueue(): {
         (timer as (ReturnType<typeof setTimeout> & { unref?(): void }) | undefined)?.unref?.();
       }
     },
+    /** Disposal ends the wake with the realm (§12.3): nothing is left to consume those
+     *  answers, and a retained one would hold the host's loop for its whole remainder. */
     disarmAll(): void {
       clear();
       pending.clear();
@@ -236,9 +226,8 @@ export function createDeadlineQueue(): {
 }
 
 /** `answer`, or this deadline's REJECTION — whichever lands first. That shape is the whole
- *  of the "exactly one settlement" rule here, so no owner needs a claim flag of its own and
- *  expiry arrives at every call site as ordinary failure rather than a second settlement
- *  path; the Error costs nothing unless it lands. */
+ *  "exactly one settlement" rule here: no owner needs a claim flag, and expiry arrives at
+ *  every call site as ordinary failure rather than a second settlement path. */
 export function raceDeadline<T>(deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
   remainingMs: number, answer: Promise<T>, message: string): Promise<T> {
   const at = deadlineAt(remainingMs);
@@ -280,13 +269,10 @@ export function serializeCalls(
   let pumping = false;
   const settled = Promise.resolve();
 
-  /** Settle the caller once, from whichever arm reaches it first — and let go of the
-   *  payload in the same breath. Those bytes are BORROWED from the caller's own owner
-   *  (§12.3), so the moment this call has been answered they are no longer the queue's to
-   *  hold: an entry the deadline overtook stays in the FIFO until the front reaches it,
-   *  and a predecessor that never answers would otherwise root every follower's payload
-   *  behind it. What is left is an inert record, bounded by the same admitting owners the
-   *  queue's depth already is. */
+  /** Settle the caller once, from whichever arm reaches it first, and let go of the payload
+   *  in the same breath: those bytes are BORROWED (§12.3), and an entry the deadline
+   *  overtook stays in the FIFO until the front reaches it — so a predecessor that never
+   *  answers would otherwise root every follower's payload behind it. */
   const finish = (entry: Entry, ok: boolean, value: unknown): void => {
     if (entry.settled) return;
     entry.settled = true;
