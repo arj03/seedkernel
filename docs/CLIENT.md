@@ -213,7 +213,7 @@ The op names and their argument order are the transport bundle's own content, no
 
 Clients also depend on generated files: package entry points resolve into `build`, while browser staging copies `build-min`, `browser`, and `quickjs/dist`. These trees are outputs behind the public entry points, not additional entry points of their own. The sibling `file:` dependencies used today are directory links; the package's `files` list records the corresponding trees that a packed distribution must carry.
 
-- `seedkernel-wasm/build-min/**` is the minified browser host, vendored into a web root by [seedstore's staging script](https://github.com/arj03/seedstore/blob/main/WASM/scripts/build-browser-demo.mjs) and [seedchat's vendor script](https://github.com/arj03/seedchat/blob/main/scripts/vendor.mjs). This is a dependency on *output*: `build-min` is gitignored, so a checkout of this repo that has never run `npm run build:host:min` stages nothing.
+- `seedkernel-wasm/build-min/**` is the minified browser host — the compiled `core/` and `host/` trees and nothing else — vendored into a web root by [seedstore's staging script](https://github.com/arj03/seedstore/blob/main/WASM/scripts/build-browser-demo.mjs) and [seedchat's vendor script](https://github.com/arj03/seedchat/blob/main/scripts/vendor.mjs). This is a dependency on *output*: `build-min` is gitignored, so a checkout of this repo that has never run `npm run build:host:min` stages nothing.
 
 ## Two traps a browser client hits
 

@@ -273,12 +273,12 @@ export async function makeTransportHost(opts = {}) {
     transport,
     createRealm: async (o) => createSafeRealm(opts.onHostCall
       ? {
-          ...o,
-          hostCall: (...args) => {
-            opts.onHostCall(...args);
-            return o.hostCall(...args);
-          },
-        }
+        ...o,
+        hostCall: (...args) => {
+          opts.onHostCall(...args);
+          return o.hostCall(...args);
+        },
+      }
       : o),
     admit: policy,
   });

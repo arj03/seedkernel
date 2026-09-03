@@ -21,15 +21,10 @@ export function fromHex(hex: string): Uint8Array {
 
 /** 32 bytes as lowercase hex — the shape of every key and secret an operator types.
  *  `fromHex` maps a non-hex pair to 0, so an unvalidated decode turns a typo into a
- *  different-but-plausible 32 bytes. Scanned by hand rather than by a regex literal: the
- *  minifier (scripts/minify.mjs) has no lexer to tell a regex from a division. */
+ *  different-but-plausible 32 bytes. */
+const HEX64 = /^[0-9a-f]{64}$/;
 export function isHex64(s: string): boolean {
-  if (s.length !== 64) return false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false; // 0-9 / a-f
-  }
-  return true;
+  return HEX64.test(s);
 }
 
 export function concatBytes(parts: Uint8Array[]): Uint8Array {

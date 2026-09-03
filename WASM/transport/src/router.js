@@ -123,6 +123,10 @@ class ReqRes {
    *  (§16.1). */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
+    // The wire carries corr as a u32, so the counter wraps where the wire does: past 2^32 a
+    // plain JS number would key `pending` on something no peer echo can match, and every
+    // request from then on would only ever end at `requestTimeoutMs`. 0 is noReply's.
+    if (this.nextCorr > 0xffffffff) this.nextCorr = 1;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
       this.pending.set(corr, { to, d });

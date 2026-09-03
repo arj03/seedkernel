@@ -338,7 +338,8 @@ export class ModuleTable implements PureModuleLoader {
     // After the load settles, an engine crash — not a wasm trap, which the worker catches
     // and reports as a null result — fails the in-flight call with the same empty answer
     // and leaves the module to respawn.
-    worker.onError(() => {      if (ref.worker !== worker) return;
+    worker.onError(() => {
+      if (ref.worker !== worker) return;
       for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
       ref.pending.clear();
       ref.worker = null;

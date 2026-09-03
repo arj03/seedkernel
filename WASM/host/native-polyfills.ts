@@ -125,5 +125,5 @@ const POLYFILLS = `
  *  `guestDriver` are (native/guest.go). A guest gets the encoders and the microtask queue;
  *  the console branch no-ops there, since a confined realm holds no bridge. */
 export function nativePolyfills(): string {
-    return POLYFILLS;
+  return POLYFILLS;
 }

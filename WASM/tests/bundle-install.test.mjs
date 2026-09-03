@@ -331,7 +331,7 @@ async function testManifestClaimIsTheRouting() {
     {
       assert(verifyManifest(sodium, signManifest(sodium, author,
         { app: "dual", version: 1, protocols: ["both"], services: ["both"], modules: [], guest: GUEST() })) !== null,
-        "a name claimed in BOTH `protocols` and `services` is two reaches, not a conflict");
+      "a name claimed in BOTH `protocols` and `services` is two reaches, not a conflict");
       let threw = false;
       try {
         verifyManifest(sodium, signManifest(sodium, author,
@@ -1201,33 +1201,33 @@ async function testCandidateRealmCannotActBeforeCommit() {
   // nowhere to go on a shell with no raw-link driver, so without one this candidate never
   // reaches the seam under test. The pin — this author's — is the other half of that.
   const shell = await bootTestShell({
-      fs, freshnessStore: store, pinAuthor: author,
-      createRealm: async ({ hostCall, source }) => {
-        if (loadingNeighbor) {
-          return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
-        }
-        // One per kind the old irreversibility list sorted into open and closed: a durable
-        // write, a cross-realm call, a link op, a pure read, a crypto transform, and this
-        // bundle's own module. All six are one kind now.
-        const refused = [];
-        for (const [name, payload] of [
-          ["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)],
-          ["_svc", new Uint8Array()],
-          ["link/open", new Uint8Array(32)],
-          ["node/identity", new Uint8Array()],
-          ["crypto/blake2b-256", new Uint8Array()],
-          ["fwd", Uint8Array.of(4)],
-        ]) {
-          try { await hostCall(name, payload); } catch { refused.push(name); }
-        }
-        const candidate = { hostCall, refused, source, calls: 0 };
-        candidates.push(candidate);
-        return {
-          call: async () => { candidate.calls++; return new Uint8Array(); },
-          dispose() {},
-        };
-      },
-      admit: admitAll,
+    fs, freshnessStore: store, pinAuthor: author,
+    createRealm: async ({ hostCall, source }) => {
+      if (loadingNeighbor) {
+        return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
+      }
+      // One per kind the old irreversibility list sorted into open and closed: a durable
+      // write, a cross-realm call, a link op, a pure read, a crypto transform, and this
+      // bundle's own module. All six are one kind now.
+      const refused = [];
+      for (const [name, payload] of [
+        ["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)],
+        ["_svc", new Uint8Array()],
+        ["link/open", new Uint8Array(32)],
+        ["node/identity", new Uint8Array()],
+        ["crypto/blake2b-256", new Uint8Array()],
+        ["fwd", Uint8Array.of(4)],
+      ]) {
+        try { await hostCall(name, payload); } catch { refused.push(name); }
+      }
+      const candidate = { hostCall, refused, source, calls: 0 };
+      candidates.push(candidate);
+      return {
+        call: async () => { candidate.calls++; return new Uint8Array(); },
+        dispose() {},
+      };
+    },
+    admit: admitAll,
   });
   const key = appKey(author.id, "offside");
   try {
@@ -1254,7 +1254,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "a link slot keeps the load's ordinary installation-local config");
     assert(candidateLocal.networkKey === "00".repeat(32) &&
       candidateLocal.linkIdleTimeoutMs === 1 && candidateLocal.peerId === undefined,
-      "only the driver's one immutable node fact overrides a same-named LOCAL key");
+    "only the driver's one immutable node fact overrides a same-named LOCAL key");
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second privileged init path");
     assertEqual(candidates[0].refused.sort(),

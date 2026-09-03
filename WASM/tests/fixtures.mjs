@@ -43,7 +43,7 @@ export { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 export const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMarks,
-         verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
+  verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 export const { signManifest, packBundle, guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
 export const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");

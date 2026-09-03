@@ -43,7 +43,7 @@ type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number, deadl
 /** The opaque native-module slots and realm plumbing Go exposes (main.go). */
 declare const bridge: {
   buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number,
-               bindDeadlineMs: number): void;
+    bindDeadlineMs: number): void;
   callModule(slot: string, module: string, payload: Uint8Array, deadlineMs: number): ArrayBuffer | null;
   disposeModules(slot: string): number;
   /** Process arguments after the program name, as a JSON array — not a joined string,
@@ -65,13 +65,13 @@ declare const bridge: {
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
-              maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
+    maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
   /** Invoke the realm's one `handle` entrypoint. Answers both facts the queue needs as one
    *  number — `elapsedNs * 2`, the execution charged to this causal turn, with the
    *  `__deferred` marker in the low bit — so the dispatch path allocates nothing. */
   realmCall(realm: number, payload: Uint8Array, callId: number,
-            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
-            deadlineMs: number): number;
+    onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
+    deadlineMs: number): number;
   realmCancel(realm: number, callId: number): void;
   /** Settle one guest host.call and drain the continuation it made runnable. Returns the
    *  execution time of that causal turn in nanoseconds. */
@@ -188,7 +188,7 @@ export const fs: Fs = {
 declare const __net: {
   /** Install host-owned socket limits before any channel can be opened. */
   install(maxLiveChannels: number, closeGraceMs: number,
-          maxInboundReadBytes: number, maxInboundReadSlices: number): void;
+    maxInboundReadBytes: number, maxInboundReadSlices: number): void;
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
@@ -210,7 +210,7 @@ declare const __net: {
 // Policy values live in shared TypeScript and cross once when the primitive is installed;
 // Go retains the mechanisms that must act before JS can observe an accepted socket.
 __net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS,
-              MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
+  MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //
@@ -284,31 +284,31 @@ globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(po
  *  values). The handle is target plumbing and never an app identity. */
 let moduleSlotSeq = 0;
 const modules: PureModuleLoader = {
-    build(mods) {
-        const slot = `slot:${++moduleSlotSeq}`;
-        bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE, DEFAULT_GUEST_DEADLINE_MS);
-        return {
-            call(module, payload, deadlineMs) {
-                // The bridge call runs the module synchronously inside the Go event loop, so
-                // the wall clock around it IS the module's own compute — nothing sits queued
-                // behind earlier calls (the native target serializes per slot in Go). Return
-                // it as `ms` so the seam bills actual work, matching the JS worker's report.
-                // `performance` is a JS-target global; the quickjs-ng host realm has Date.
-                const clock = (typeof performance === "object" && typeof performance.now === "function")
-                    ? () => performance.now()
-                    : () => Date.now();
-                const t0 = clock();
-                const bound = deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS
-                    : (deadlineMs === Infinity ? -1 : deadlineMs);
-                const r = bridge.callModule(slot, module, payload, bound);
-                return Promise.resolve({
-                    bytes: r === null ? null : new Uint8Array(r),
-                    ms: clock() - t0,
-                });
-            },
-            dispose() { bridge.disposeModules(slot); },
-        };
-    },
+  build(mods) {
+    const slot = `slot:${++moduleSlotSeq}`;
+    bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE, DEFAULT_GUEST_DEADLINE_MS);
+    return {
+      call(module, payload, deadlineMs) {
+        // The bridge call runs the module synchronously inside the Go event loop, so
+        // the wall clock around it IS the module's own compute — nothing sits queued
+        // behind earlier calls (the native target serializes per slot in Go). Return
+        // it as `ms` so the seam bills actual work, matching the JS worker's report.
+        // `performance` is a JS-target global; the quickjs-ng host realm has Date.
+        const clock = (typeof performance === "object" && typeof performance.now === "function")
+          ? () => performance.now()
+          : () => Date.now();
+        const t0 = clock();
+        const bound = deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS
+          : (deadlineMs === Infinity ? -1 : deadlineMs);
+        const r = bridge.callModule(slot, module, payload, bound);
+        return Promise.resolve({
+          bytes: r === null ? null : new Uint8Array(r),
+          ms: clock() - t0,
+        });
+      },
+      dispose() { bridge.disposeModules(slot); },
+    };
+  },
 };
 /** The data directory a store was opened on, or null for a realm that never opened one
  *  (the native tests' bare `makeTransportNode`, which needs no durable marks). It names
@@ -318,72 +318,72 @@ let storeDir: string | null = null;
  *  belong. Called by `standUp` below once `--dir` has been read, and by the native test
  *  harness — the one place either learns where this node's disk is. */
 function openStore(dir: string): void {
-    __fs.open(dir);
-    storeDir = dir;
+  __fs.open(dir);
+  storeDir = dir;
 }
 /** The freshness store over the Go file seam (§12.4). The marks live in a SIBLING of the
  *  data dir (`freshnessPathFor`, shared with the Node shell) so a `fs`-capable guest cannot
  *  reach its own mark. A realm with no store open keeps its marks in memory. */
 class NativeFreshnessStore extends FreshnessMarks {
-    path;
-    constructor(dir: string | null) {
-        const path = dir === null ? null : freshnessPathFor(dir);
-        let json: string | null = null;
-        if (path !== null) {
-            const raw = bridge.readFile(path);
-            if (raw !== null) json = utf8dec.decode(new Uint8Array(raw));
-        }
-        super(json);
-        this.path = path;
+  path;
+  constructor(dir: string | null) {
+    const path = dir === null ? null : freshnessPathFor(dir);
+    let json: string | null = null;
+    if (path !== null) {
+      const raw = bridge.readFile(path);
+      if (raw !== null) json = utf8dec.decode(new Uint8Array(raw));
     }
-    persist(json: string) {
-        if (this.path === null) return;
-        // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
-        // land", which is what rolls a revocation back and un-binds a load whose mark could
-        // not be raised — swallowing it would report both as successes while the next boot
-        // re-admits the revoked author. 0600, a node's own downgrade guard.
-        bridge.writeFile(this.path, utf8.encode(json), 0o600);
-    }
+    super(json);
+    this.path = path;
+  }
+  override persist(json: string) {
+    if (this.path === null) return;
+    // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
+    // land", which is what rolls a revocation back and un-binds a load whose mark could
+    // not be raised — swallowing it would report both as successes while the next boot
+    // re-admits the revoked author. 0600, a node's own downgrade guard.
+    bridge.writeFile(this.path, utf8.encode(json), 0o600);
+  }
 }
 /** This target's socket seam: the transport driver's ChannelFactory over Go's sockets,
  *  producing RawLinks identically to the node:net factory, so the transport bundle's link
  *  state machine runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
-    // Go has no TLS socket here, so `wss://` is unroutable (§12.1).
-    connect: (dest) => {
-        const d = parseDest(dest);
-        if (!d || d.scheme === "wss")
-            return null;
-        return netConnectRaw(d.host, d.port);
-    },
-    listen: (tcp, ws, onAccept) => Promise.resolve({
-        port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(s, { listener: LISTENER.TCP })) : 0,
-        wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(s, { listener: LISTENER.WS })) : 0,
-    }),
-    // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
-    close: () => { netCloseListeners(); },
+  // Go has no TLS socket here, so `wss://` is unroutable (§12.1).
+  connect: (dest) => {
+    const d = parseDest(dest);
+    if (!d || d.scheme === "wss")
+      return null;
+    return netConnectRaw(d.host, d.port);
+  },
+  listen: (tcp, ws, onAccept) => Promise.resolve({
+    port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(s, { listener: LISTENER.TCP })) : 0,
+    wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(s, { listener: LISTENER.WS })) : 0,
+  }),
+  // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
+  close: () => { netCloseListeners(); },
 };
 /** The artifact-shipped transport bundle, as raw bytes (transport-bundle.js). */
 const embeddedTransport = (() => {
-    try {
-        return transportBundleBytes();
-    }
-    catch {
-        return null;
-    }
+  try {
+    return transportBundleBytes();
+  }
+  catch {
+    return null;
+  }
 })();
 /** Who signed the transport this artifact ships — hex, DERIVED from the blob rather than
  *  restated anywhere. It is the id an operator pins under `grants.link` in a policy file
  *  (§12.5). Empty if the artifact carries no transport. */
 const embeddedTransportAuthor = (() => {
-    if (!embeddedTransport)
-        return "";
-    try {
-        return toHex(verifyBundle(sodium, embeddedTransport).author);
-    }
-    catch {
-        return "";
-    }
+  if (!embeddedTransport)
+    return "";
+  try {
+    return toHex(verifyBundle(sodium, embeddedTransport).author);
+  }
+  catch {
+    return "";
+  }
 })();
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm driven by
  *  Go's event loop, implementing the same neutral `Realm` contract as safe-js.ts. The promise plumbing
@@ -396,97 +396,97 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-    // The wall-clock half of this realm's host-call custody: one armed deadline per
-    // unsettled call, dropped with the realm so no timer outlives it (realm-queue.ts).
-    const handoffDeadlines = createHandoffDeadlines();
-    // Go mints the handle, but createRealm runs the guest's top-level code before returning
-    // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
-    // because settlement is a HOST-realm microtask, and that realm is not pumped from
-    // inside bridge.createRealm, so none can precede the assignment below (§12.3).
-    let realm = 0;
-    const causalContext = new CausalContext();
-    // Go supplies the live segment remainder because it owns this realm's execution
-    // clock. A native module runs synchronously inside that same segment, so its elapsed
-    // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
-    // second charge when guest-seam's common module path settles.
-    const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
-        // Go admitted this call before making the cross-realm copy. This adapter only
-        // routes and settles; post-copy accounting here would be a second policy authority.
-        const causalClock = causalContext.current;
-        const budget: CallBudget = {
-            remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
-            charge: () => {},
-            causalClock,
+  // The wall-clock half of this realm's host-call custody: one armed deadline per
+  // unsettled call, dropped with the realm so no timer outlives it (realm-queue.ts).
+  const handoffDeadlines = createHandoffDeadlines();
+  // Go mints the handle, but createRealm runs the guest's top-level code before returning
+  // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
+  // because settlement is a HOST-realm microtask, and that realm is not pumped from
+  // inside bridge.createRealm, so none can precede the assignment below (§12.3).
+  let realm = 0;
+  const causalContext = new CausalContext();
+  // Go supplies the live segment remainder because it owns this realm's execution
+  // clock. A native module runs synchronously inside that same segment, so its elapsed
+  // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
+  // second charge when guest-seam's common module path settles.
+  const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
+    // Go admitted this call before making the cross-realm copy. This adapter only
+    // routes and settles; post-copy accounting here would be a second policy authority.
+    const causalClock = causalContext.current;
+    const budget: CallBudget = {
+      remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
+      charge: () => {},
+      causalClock,
+    };
+    if (budget.remainingMs <= 0)
+      throw new Error("guest: handoff deadline exhausted before host.call");
+    // A synchronous throw is a refused NAME, which fails at the guest's call site
+    // (guest-seam.ts); guest.go releases the call it had already admitted.
+    const answer = hostCall(name, new Uint8Array(payload), budget);
+    // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
+    // by the same arm and neither can follow the other (realm-queue.ts).
+    const settle = (bytes: Uint8Array | null, error: string | null): void =>
+      causalContext.run(causalClock, () => {
+        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
+        causalClock?.charge(elapsedNs / 1_000_000);
+      });
+    void handoffDeadlines.race(budget.remainingMs, answer,
+      "guest: host.call handoff deadline exceeded").then(
+      (bytes: Uint8Array) => settle(bytes, null),
+      (e: unknown) => settle(null, errMessage(e)),
+    );
+    return null;
+  };
+  realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+    deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
+    DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
+  const configuredDeadlineMs = deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
+  let invocationSeq = 0;
+  let disposed = false;
+  return {
+    // Serialized in the shared TS rather than in Go: one implementation of the realm
+    // contract (realm-queue.ts) is what keeps the two targets from differing about
+    // when a second entrypoint may begin.
+    call: serializeCalls(
+      (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
+        // The executor runs synchronously, so `deferred` carries Go's answer by
+        // the time the return statement reads it.
+        invocationSeq++;
+        if (!Number.isSafeInteger(invocationSeq))
+          throw new Error("guest: realm invocation id exhausted");
+        const callId = invocationSeq;
+        let deferred = false;
+        const result = new Promise<Uint8Array>((resolve, reject) => {
+          const report = causalContext.run(causalClock, () => bridge.realmCall(
+            realm, payload, callId,
+            (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
+            (msg: string) => reject(new Error(msg)),
+            handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
+          // `elapsedNs * 2 | deferred` — see the bridge declaration above.
+          deferred = report % 2 === 1;
+          causalClock?.charge(Math.floor(report / 2) / 1_000_000);
+        });
+        return {
+          result,
+          released: deferred ? Promise.resolve() : result.catch(() => { }),
+          cancel: () => bridge.realmCancel(realm, callId),
         };
-        if (budget.remainingMs <= 0)
-            throw new Error("guest: handoff deadline exhausted before host.call");
-        // A synchronous throw is a refused NAME, which fails at the guest's call site
-        // (guest-seam.ts); guest.go releases the call it had already admitted.
-        const answer = hostCall(name, new Uint8Array(payload), budget);
-        // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
-        // by the same arm and neither can follow the other (realm-queue.ts).
-        const settle = (bytes: Uint8Array | null, error: string | null): void =>
-            causalContext.run(causalClock, () => {
-                const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
-                causalClock?.charge(elapsedNs / 1_000_000);
-            });
-        void handoffDeadlines.race(budget.remainingMs, answer,
-            "guest: host.call handoff deadline exceeded").then(
-            (bytes: Uint8Array) => settle(bytes, null),
-            (e: unknown) => settle(null, errMessage(e)),
-        );
-        return null;
-    };
-    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
-        DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
-    const configuredDeadlineMs = deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
-    let invocationSeq = 0;
-    let disposed = false;
-    return {
-        // Serialized in the shared TS rather than in Go: one implementation of the realm
-        // contract (realm-queue.ts) is what keeps the two targets from differing about
-        // when a second entrypoint may begin.
-        call: serializeCalls(
-            (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
-                // The executor runs synchronously, so `deferred` carries Go's answer by
-                // the time the return statement reads it.
-                invocationSeq++;
-                if (!Number.isSafeInteger(invocationSeq))
-                    throw new Error("guest: realm invocation id exhausted");
-                const callId = invocationSeq;
-                let deferred = false;
-                const result = new Promise<Uint8Array>((resolve, reject) => {
-                    const report = causalContext.run(causalClock, () => bridge.realmCall(
-                        realm, payload, callId,
-                        (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
-                        (msg: string) => reject(new Error(msg)),
-                        handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
-                    // `elapsedNs * 2 | deferred` — see the bridge declaration above.
-                    deferred = report % 2 === 1;
-                    causalClock?.charge(Math.floor(report / 2) / 1_000_000);
-                });
-                return {
-                    result,
-                    released: deferred ? Promise.resolve() : result.catch(() => { }),
-                    cancel: () => bridge.realmCancel(realm, callId),
-                };
-            },
-            () => (disposed ? new Error("guest realm disposed") : null),
-            configuredDeadlineMs,
-        ),
-        dispose: () => {
-            disposed = true;
-            // guest.go's close() runs settleAll before it frees anything, so every callback
-            // it still owns is rejected synchronously here — safe-js.ts needs its own
-            // registry for this, and this target does not (§12.3). The armed deadlines are
-            // host-side and do NOT go with it: a timer waiting to reject a call this realm
-            // no longer holds keeps the host's event loop alive for the whole of its
-            // remainder, so a one-shot process would linger a full budget past its work.
-            handoffDeadlines.disarmAll();
-            bridge.realmDispose(realm);
-        },
-    };
+      },
+      () => (disposed ? new Error("guest realm disposed") : null),
+      configuredDeadlineMs,
+    ),
+    dispose: () => {
+      disposed = true;
+      // guest.go's close() runs settleAll before it frees anything, so every callback
+      // it still owns is rejected synchronously here — safe-js.ts needs its own
+      // registry for this, and this target does not (§12.3). The armed deadlines are
+      // host-side and do NOT go with it: a timer waiting to reject a call this realm
+      // no longer holds keeps the host's event loop alive for the whole of its
+      // remainder, so a one-shot process would linger a full budget past its work.
+      handoffDeadlines.disarmAll();
+      bridge.realmDispose(realm);
+    },
+  };
 };
 /** Everything that crosses back to Go crosses as BYTES — the currency of this seam, and
  *  the one shape Go's await harness carries out of a settled promise. A JSON report is no
@@ -502,13 +502,13 @@ let admissionPolicy = policyFromJson(null);
 /** Point the realm at a policy config (§12.5). `null` restores the deny-all default;
  *  malformed JSON throws, so a typo fails loudly rather than silently widening trust. */
 function setPolicy(json: string | null): void {
-    admissionPolicy = policyFromJson(json);
+  admissionPolicy = policyFromJson(json);
 }
 /** The one shell, or a clear error if Go asked for something before booting one. */
 function theShell() {
-    if (!shell)
-        throw new Error("native: bootNode has not run");
-    return shell;
+  if (!shell)
+    throw new Error("native: bootNode has not run");
+  return shell;
 }
 /** Stand a node up on this platform via the shared `bootShell` (§12.9). Config is an
  *  object so a positional drift against Go is a type error, and it is cli.ts's
@@ -516,64 +516,64 @@ function theShell() {
  *  The store and its policy are not in it: on this target they are realm state, set
  *  before the boot rather than passed to it (`openStore`, `setPolicy`). */
 async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime> {
-    const { shell, transport } = await bootShell({
-        sodium, identity: cfg.identity, modules, fs,
-        freshnessStore: new NativeFreshnessStore(storeDir),
-        networkKey: cfg.networkKey,
-        // The sockets and the signed program that drives them, in one object.
-        transport: {
-            channels,
-            listen: cfg.listen,
-            wsListen: cfg.wsListen,
-            bundle: cfg.transportBundle,
-            config: cfg.transportConfig,
-        },
-        // The admission predicate in force (§12.5): the shell closes over this
-        // indirection rather than a fixed predicate, so trust can be narrowed or widened
-        // without restarting the node (`setPolicy`).
-        admit: (v, ctx) => admissionPolicy(v, ctx),
-        guestDeadlineMs: cfg.guestDeadlineMs,
-        realmMemoryBytes: cfg.realmMemoryBytes,
-        createRealm,
-    });
-    return { shell, transport: transport! };
+  const { shell, transport } = await bootShell({
+    sodium, identity: cfg.identity, modules, fs,
+    freshnessStore: new NativeFreshnessStore(storeDir),
+    networkKey: cfg.networkKey,
+    // The sockets and the signed program that drives them, in one object.
+    transport: {
+      channels,
+      listen: cfg.listen,
+      wsListen: cfg.wsListen,
+      bundle: cfg.transportBundle,
+      config: cfg.transportConfig,
+    },
+    // The admission predicate in force (§12.5): the shell closes over this
+    // indirection rather than a fixed predicate, so trust can be narrowed or widened
+    // without restarting the node (`setPolicy`).
+    admit: (v, ctx) => admissionPolicy(v, ctx),
+    guestDeadlineMs: cfg.guestDeadlineMs,
+    realmMemoryBytes: cfg.realmMemoryBytes,
+    createRealm,
+  });
+  return { shell, transport: transport! };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so
  *  Go can print the real ports. */
 async function bootNode(cfgJson: string): Promise<Uint8Array> {
-    const cfg = JSON.parse(cfgJson);
-    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Derived
-    // HERE, by the shared subkey code the JS CLI runs, so this target's peer id is the key
-    // the JS shell would compute from the same seed. Go holds the seed and nothing else.
-    const key = deriveNodeKey(sodium, fromHex(cfg.keyHex));
-    setPolicy(cfg.policyJson);
-    // The cohort is parsed BEFORE the boot and goes in as the transport's own configuration:
-    // the address book is the transport guest's, so a peer list is something a transport is
-    // loaded WITH, not something taught to a driver afterwards (§12.10).
-    const peers: string[] = cfg.peers ?? [];
-    const s = await makeTransportNode({
-        identity: key,
-        listen: cfg.listen,
-        wsListen: cfg.wsListen,
-        // Contact policy is transport config (§12.6.3).
-        transportConfig: transportConfigFrom(
-            peers,
-            cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
-        ),
-    });
-    shell = s.shell;
-    const network = s.transport;
-    if (peers.length > 0) {
-        // The same diagnosis the operator flow gives `--peers`, through the same door.
-        // Best-effort: the op settles on its own deadline, so a member that is not up yet
-        // delays the boot but never fails it.
-        await awaitCohort(s.shell, "peers were configured, but there is nothing to dial from");
-    }
-    const status = {
-        peerId: toHex(key.publicKey), port: network.port, wsPort: network.wsPort,
-    };
-    return utf8.encode(JSON.stringify(status));
+  const cfg = JSON.parse(cfgJson);
+  // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Derived
+  // HERE, by the shared subkey code the JS CLI runs, so this target's peer id is the key
+  // the JS shell would compute from the same seed. Go holds the seed and nothing else.
+  const key = deriveNodeKey(sodium, fromHex(cfg.keyHex));
+  setPolicy(cfg.policyJson);
+  // The cohort is parsed BEFORE the boot and goes in as the transport's own configuration:
+  // the address book is the transport guest's, so a peer list is something a transport is
+  // loaded WITH, not something taught to a driver afterwards (§12.10).
+  const peers: string[] = cfg.peers ?? [];
+  const s = await makeTransportNode({
+    identity: key,
+    listen: cfg.listen,
+    wsListen: cfg.wsListen,
+    // Contact policy is transport config (§12.6.3).
+    transportConfig: transportConfigFrom(
+      peers,
+      cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
+    ),
+  });
+  shell = s.shell;
+  const network = s.transport;
+  if (peers.length > 0) {
+    // The same diagnosis the operator flow gives `--peers`, through the same door.
+    // Best-effort: the op settles on its own deadline, so a member that is not up yet
+    // delays the boot but never fails it.
+    await awaitCohort(s.shell, "peers were configured, but there is nothing to dial from");
+  }
+  const status = {
+    peerId: toHex(key.publicKey), port: network.port, wsPort: network.wsPort,
+  };
+  return utf8.encode(JSON.stringify(status));
 }
 
 // ── the operator flow ────────────────────────────────────────────────────────
@@ -582,47 +582,47 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
  *  the deny-all reading of an absent `--policy`, the order remedies run in and the console
  *  lines are all cli.ts's. */
 function nativeCliHost(): CliHost {
-    return {
-        banner: "seedkernel-loader",
-        argv: JSON.parse(bridge.argv()) as string[],
-        readFile(path) {
-            const r = bridge.readFile(path);
-            return r === null ? null : new Uint8Array(r);
-        },
-        writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
-        log(line) { bridge.log(line); },
-        stdout(bytes) { bridge.stdout(bytes); },
-        stdin() { return new Uint8Array(bridge.stdin()); },
-        sodium,
-        async standUp(cfg: NodeSetup) {
-            // Where this node's disk is, and who may install on it — both before the
-            // transport bundle lands, because that load is governed by the policy and
-            // its freshness mark belongs beside the store.
-            openStore(cfg.dir);
-            setPolicy(cfg.policyJson ?? null);
-            // NodeSetup EXTENDS TransportNodeConfig, so the rest of the config crosses
-            // unchanged — no field-by-field copy to fall out of step.
-            const stood = await makeTransportNode(cfg);
-            // One "the shell" per realm, whichever entry point stood it up.
-            shell = stood.shell;
-            return stood;
-        },
-    };
+  return {
+    banner: "seedkernel-loader",
+    argv: JSON.parse(bridge.argv()) as string[],
+    readFile(path) {
+      const r = bridge.readFile(path);
+      return r === null ? null : new Uint8Array(r);
+    },
+    writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
+    log(line) { bridge.log(line); },
+    stdout(bytes) { bridge.stdout(bytes); },
+    stdin() { return new Uint8Array(bridge.stdin()); },
+    sodium,
+    async standUp(cfg: NodeSetup) {
+      // Where this node's disk is, and who may install on it — both before the
+      // transport bundle lands, because that load is governed by the policy and
+      // its freshness mark belongs beside the store.
+      openStore(cfg.dir);
+      setPolicy(cfg.policyJson ?? null);
+      // NodeSetup EXTENDS TransportNodeConfig, so the rest of the config crosses
+      // unchanged — no field-by-field copy to fall out of step.
+      const stood = await makeTransportNode(cfg);
+      // One "the shell" per realm, whichever entry point stood it up.
+      shell = stood.shell;
+      return stood;
+    },
+  };
 }
 /** Run the operator flow. Go calls this with no arguments — every choice comes from the
  *  argv it hands back through the bridge — and reads back whether the node is listening,
  *  which is the one thing Go still decides: whether to keep its event loop running. */
 async function runMain(): Promise<Uint8Array> {
-    const { serving, close } = await runCli(nativeCliHost());
-    if (!serving) close();
-    return utf8.encode(JSON.stringify({ serving }));
+  const { serving, close } = await runCli(nativeCliHost());
+  if (!serving) close();
+  return utf8.encode(JSON.stringify({ serving }));
 }
 /** Node-like file convenience over the native platform's byte bridge. The returned
  *  handle remains with the caller; the platform keeps no key-to-handle registry. */
 async function loadBundleFile(path: string): Promise<AppHandle> {
-    const raw = bridge.readFile(path);
-    if (raw === null) throw new Error(`cannot read ${path}`);
-    return theShell().loadBundleBlob(new Uint8Array(raw));
+  const raw = bridge.readFile(path);
+  if (raw === null) throw new Error(`cannot read ${path}`);
+  return theShell().loadBundleBlob(new Uint8Array(raw));
 }
 
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): one pre-compiled
@@ -630,7 +630,7 @@ async function loadBundleFile(path: string): Promise<AppHandle> {
  *  guest ABI (that is `guestPreamble`) but this target's twin of what safe-js.ts does —
  *  fetched by Go rather than restated as a Go string TypeScript never saw. */
 function guestDriver(): string {
-    return GUEST_DRIVER;
+  return GUEST_DRIVER;
 }
 const GUEST_DRIVER = `
 "use strict";

@@ -111,7 +111,7 @@ await test("RtcNetwork validates encoded signaling strings before admitting them
   assert(admitted === 1 && pcs === 1, "a valid encoded hello must reach policy and create one peer");
   assert(sent.length === 1 && typeof sent[0] === "string"
       && sent[0] === wire({ type: "hello", from: ownId, to: peerId(1) }),
-    "a broadcast hello must receive one byte-exact encoded-string reply");
+  "a broadcast hello must receive one byte-exact encoded-string reply");
   net.close();
 });
 

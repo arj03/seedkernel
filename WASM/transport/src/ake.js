@@ -38,7 +38,7 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 // it sees a descriptor close, while farewell vs. defensive abort vs. cut stream is a fact
 // only the end holding the session keys ever had.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
-      REASON_LOCAL = 4, REASON_TRUNCATED = 5;
+  REASON_LOCAL = 4, REASON_TRUNCATED = 5;
 
 function reasonCode(link) {
   const r = link.closeReason;

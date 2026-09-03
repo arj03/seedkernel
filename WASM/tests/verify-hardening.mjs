@@ -417,7 +417,7 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
     + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, over every link
     + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — native staging and the driver window hold the
-                                    // same read at once, by design (native/sock.go)
+  // same read at once, by design (native/sock.go)
     + MAX_QUEUED_SIGNAL_BYTES       // §12.6 — the WebRTC signaling lane, one per node
     + MAX_UNESTABLISHED_PEERS * MAX_PENDING_ICE_BYTES // and one ICE queue per speculative peer
     + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
@@ -873,7 +873,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   )();
   ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-    "the realm's host-call budget is advertised to the guest, not only enforced against it");
+  "the realm's host-call budget is advertised to the guest, not only enforced against it");
   bare.close();
 }
 

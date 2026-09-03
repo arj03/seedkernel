@@ -28,18 +28,18 @@ This is the one place these figures live; the README's shared-artifact list poin
 
 | Component | Size |
 |---|---|
-| `core/*.js` + hand-written `host/*.js` — minified (`build-min`, excluding the embedded transport) | ~168 KB |
+| `core/*.js` + hand-written `host/*.js` — minified (`build-min`, excluding the embedded transport) | ~161 KB |
 | the embedded transport bundle (`host/transport-bundle.js` — the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~160 KB |
 | libsodium.wasm (core build: the host trust root and current channel fast paths) | 217 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 135 KB |
 | mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`, §12.4) | 16 KB |
-| **Total browser deployment** | **~696 KB** |
+| **Total browser deployment** | **~689 KB** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, already counted inside the transport bundle; not a host artifact |
 | QuickJS realm engine (the in-repo quickjs-ng 0.16.1 emscripten build, `quickjs/` — the same engine source the native loader compiles, §12.9) — only loaded when a bundle's guest runs (§12.3) | ~570 KB |
 
 The `host/*.js` layer is the whole runtime: bundle slots and claim routing, raw net and fs seams, the guest seam, safe-js, verification, policy, and the transport driver. Pure modules remain target values owned privately by a slot. The transport protocol is signed content (`transport/src/*.js` plus `ws.wasm` and `mlkem768.wasm`); the first copy ships inside the artifact because a node has no network until it has a transport, and a later signed bundle can replace it. Core libsodium backs the trust-root crypto and the current channel's remaining host transforms. QuickJS is lazy: a shell with no installed slot never pays for a realm.
 
-`npm run build` emits the host twice: the readable `build/` (~446 KB of runtime code, doc comments intact) for debugging and a comment-stripped `build-min/` (~329 KB in the current build) for shipping. Roughly half of the minified tree is the generated `transport-bundle.js`, the signed bundle embedded verbatim — it carries no doc comments to strip, so it passes through nearly unchanged and dilutes the ratio. The hand-written host alone goes ~286 KB → ~154 KB, because those sources are close to half doc comment, and that is where the cut comes from. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does it — no bundler, no new dependencies; it prints the current plain and gzipped totals on every run. The table separates the hand-written host from the embedded transport so it does not count either twice.
+`npm run build` emits the host twice: the readable `build/` (~465 KB of runtime code, doc comments intact) for debugging and a comment-stripped `build-min/` (~317 KB in the current build) for shipping. Roughly half of the minified tree is the generated `transport-bundle.js`, the signed bundle embedded verbatim — it carries no doc comments to strip, so it passes through nearly unchanged and dilutes the ratio. The hand-written host alone goes ~308 KB → ~161 KB, because those sources are close to half doc comment, and that is where the cut comes from. It is a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) — no bundler and no new dependency, and the compiler is the one thing on hand that can tell a regex literal from a division, so nothing hand-written is lexing the host; it prints the current plain and gzipped totals on every run. The table separates the hand-written host from the embedded transport so it does not count either twice.
 
 ---
 

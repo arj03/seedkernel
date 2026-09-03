@@ -1,0 +1,20 @@
+# The indentation rule, where an editor reads it. Line endings are deliberately not stated:
+# `.gitattributes` owns them, and a Windows checkout is meant to hold CRLF while the index
+# holds LF.
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+
+[*.{c,h}]
+indent_size = 4
+
+[*.md]
+trim_trailing_whitespace = false

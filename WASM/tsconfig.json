@@ -4,6 +4,10 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "strict": true,
+    // A subclass that means to replace a base method must say so: `FreshnessMarks.persist`
+    // has a no-op base, so a renamed base would leave both stores silently not persisting
+    // and the next boot re-admitting a revoked author (§12.4).
+    "noImplicitOverride": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,

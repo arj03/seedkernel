@@ -33,7 +33,7 @@ writeFileSync(resolve(outDir, "libsodium-core.mjs"), patchedCore);
 // the .wasm — the wrappers invoke the core as `a({getRandomValue:function(){…}})`.
 const wrap = readFileSync(wrapSrc, "utf8");
 const wrapPatched = wrap
-    .replace('import e from"libsodium"', 'import e from"./libsodium-core.mjs"')
+  .replace('import e from"libsodium"', 'import e from"./libsodium-core.mjs"')
   .replace(
     "a({getRandomValue:function(){",
     "a({instantiateWasm:async(imports,cb)=>{" +

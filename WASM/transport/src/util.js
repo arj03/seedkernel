@@ -47,13 +47,23 @@ function bytesCompare(a, b) {
   return a.length === b.length ? 0 : (a.length < b.length ? -1 : 1);
 }
 
+/** UTF-8, not CESU-8: a surrogate PAIR is one four-byte sequence. The other end of this
+ *  seam is the platform's TextEncoder/TextDecoder, so encoding the halves separately would
+ *  make an astral `dest` read back as a different string on the host side. A lone surrogate
+ *  becomes U+FFFD, which is what TextEncoder does with one. */
 function utf8Encode(s) {
   const out = [];
   for (let i = 0; i < s.length; i++) {
     let c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdfff) {
+      const lo = s.charCodeAt(i + 1);
+      if (c < 0xdc00 && lo >= 0xdc00 && lo <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00); i++; }
+      else c = 0xfffd;
+    }
     if (c < 0x80) out.push(c);
     else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
   }
   return new Uint8Array(out);
 }
@@ -63,8 +73,13 @@ function utf8Decode(b) {
   for (let i = 0; i < b.length; i++) {
     const c = b[i];
     if (c < 0x80) s += String.fromCharCode(c);
-    else if ((c & 0xe0) === 0xc0) { s += String.fromCharCode(((c & 31) << 6) | (b[i + 1] & 63)); i++; }
-    else { s += String.fromCharCode(((c & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63)); i += 2; }
+    else if ((c & 0xe0) === 0xc0) { s += String.fromCharCode(((c & 31) << 6) | (b[i + 1] & 63)); i += 1; }
+    else if ((c & 0xf0) === 0xe0) { s += String.fromCharCode(((c & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63)); i += 2; }
+    else {
+      const cp = (((c & 7) << 18) | ((b[i + 1] & 63) << 12) | ((b[i + 2] & 63) << 6) | (b[i + 3] & 63)) - 0x10000;
+      s += String.fromCharCode(0xd800 | (cp >> 10), 0xdc00 | (cp & 0x3ff));
+      i += 3;
+    }
   }
   return s;
 }

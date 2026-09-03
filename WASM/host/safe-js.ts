@@ -449,7 +449,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   return {
     call: serializeCalls(invoke, () =>
       (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
-      opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
+    opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
