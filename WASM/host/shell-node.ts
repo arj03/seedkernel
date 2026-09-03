@@ -7,12 +7,12 @@
 //
 // The operator's side — flags, defaults, boot sequence, console lines — is `cli.ts`, which
 // every target runs; `main-node.ts` binds it to this platform.
-import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
 import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
-import { NodeFs } from "./fs-node.js";
+import { NodeFs, writeFileAtomic } from "./fs-node.js";
 import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -100,12 +100,9 @@ export class FileFreshnessStore extends FreshnessMarks {
         this.path = path;
     }
     persist(json: string): void {
-        // Temp + rename, because a bare writeFileSync truncates in place: a crash mid-write
-        // leaves truncated JSON, which the constructor reads as "start empty" — every
-        // downgrade mark silently discarded on the next boot (§12.4).
-        const tmp = `${this.path}.${process.pid}.tmp`;
-        writeFileSync(tmp, json);
-        renameSync(tmp, this.path);
+        // Atomic (fs-node.ts): truncated JSON is what the constructor reads as "start
+        // empty" — every downgrade mark silently discarded on the next boot (§12.4).
+        writeFileAtomic(this.path, json);
     }
 }
 // The realm factory (§12.3) is deliberately not stated here: bootShell's default IS the

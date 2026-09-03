@@ -2,7 +2,7 @@
 // file per key under a directory, no nested paths. Content-addressing and quota are the
 // app's, layered on top.
 
-import { mkdirSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 // The seam is async (core/fs.ts), so this backend is genuinely async rather than sync
 // calls in an async wrapper: a node serving requests should not block its only thread on
 // a disk read. `mkdirSync` is the exception and stays sync — it runs once, in the
@@ -14,6 +14,16 @@ import { join } from "node:path";
 
 import type { Fs, FsStat } from "../core/fs.js";
 import { FS_AVAILABLE_UNKNOWN } from "../core/fs.js";
+
+/** Write a whole file or none: a temp beside the target, then a rename onto it. A bare
+ *  `writeFileSync` truncates in place, so a crash mid-write leaves a partial file that the
+ *  next boot reads as something else entirely. Node-local and sync, because both callers
+ *  are boot-time state a node cannot start without (main-node.ts, shell-node.ts). */
+export function writeFileAtomic(path: string, data: Uint8Array | string, mode?: number): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
+  renameSync(tmp, path);
+}
 
 export class NodeFs implements Fs {
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }

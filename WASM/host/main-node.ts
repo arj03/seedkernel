@@ -8,20 +8,12 @@
 // Everything below is platform: files, stdout, entropy, and "stand a node up on Node".
 // Which flags exist and what the node does with them is `cli.ts`, the same module the
 // native binary runs inside QuickJS.
-import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { runCli, type CliHost, type NodeSetup } from "./cli.js";
 import { bootNodeShell } from "./shell-node.js";
+import { writeFileAtomic } from "./fs-node.js";
 import { loadCrypto } from "./crypto-node.js";
 import { errMessage } from "../core/util.js";
-
-/** Write atomically: a temp beside the target, then a rename onto it. What this writes is
- *  the node's master seed, and a seed half-written on a first boot is a node whose identity
- *  changes the next time it starts. */
-function writeFileAtomic(path: string, bytes: Uint8Array, mode?: number): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, bytes, mode === undefined ? undefined : { mode });
-  renameSync(tmp, path);
-}
 
 async function nodeHost(): Promise<CliHost> {
   const sodium = await loadCrypto();
@@ -34,6 +26,8 @@ async function nodeHost(): Promise<CliHost> {
       try { return new Uint8Array(readFileSync(path)); }
       catch { return null; }
     },
+    // Atomic (fs-node.ts): what this writes is the node's master seed, and a seed
+    // half-written on a first boot is a node whose identity changes when it restarts.
     writeFile: writeFileAtomic,
     // STDERR, not stdout: stdout carries an app's raw `--op` response bytes, which an
     // operator line landing in it would corrupt.

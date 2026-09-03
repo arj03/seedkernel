@@ -13,7 +13,7 @@ import { concatBytes, enc } from "./util.js";
 /** Kept narrow so subkey derivation is testable without a whole crypto backend. */
 export interface SubkeyCrypto {
   crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
-  crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
+  crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
 
 /** An Ed25519 keypair — the one name for this shape in the tree. */

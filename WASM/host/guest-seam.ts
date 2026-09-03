@@ -7,6 +7,7 @@ import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_T
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
+import type { Keypair } from "../core/subkeys.js";
 
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
@@ -18,10 +19,7 @@ export interface SignScope {
      *  the link slot. */
     scope: Uint8Array;
     /** The keypair that signs. */
-    key: {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
+    key: Keypair;
 }
 
 /** The libsodium surface the remaining host crypto names use. */
@@ -84,10 +82,7 @@ export interface SeamPlatform {
     sodium: SeamCrypto;
     /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key SIGN
      *  uses is `grants.signScope.key`, chosen by the slot — not this. */
-    identity: {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
+    identity: Keypair;
     /** Wall clock (ms), defaulted by the shell before constructing a seam. */
     now: () => number;
 }
@@ -312,10 +307,7 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
 }
 /** An ordinary app's signing scope: `DOMAIN_guest ‖ author ‖ app`. Two bundles derive
  *  disjoint scopes. */
-export function appSignScope(key: {
-    publicKey: Uint8Array;
-    privateKey: Uint8Array;
-}, author: Uint8Array, app: string): SignScope {
+export function appSignScope(key: Keypair, author: Uint8Array, app: string): SignScope {
     return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
 /** The one scoped-signature transcript: `domain ‖ scope ‖ message`. */
@@ -325,7 +317,7 @@ function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message:
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). Same scope as `appSignScope`. */
 export function appSigner(
     sodium: SeamCrypto,
-    key: { publicKey: Uint8Array; privateKey: Uint8Array },
+    key: Keypair,
     author: Uint8Array, app: string,
 ): {
     sign(msg: Uint8Array): Uint8Array;
@@ -354,10 +346,7 @@ export function appSigner(
  *  look at it — the transport bundle tags its own handshake format inside it, so changing
  *  that format is a bundle update and never a kernel change. An absent network key is the
  *  public network's zero key, said explicitly (§12.6). */
-export function linkSignScope(key: {
-    publicKey: Uint8Array;
-    privateKey: Uint8Array;
-}, networkKey?: Uint8Array): SignScope {
+export function linkSignScope(key: Keypair, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_LINK_SCOPE, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
 }
 /** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
@@ -366,13 +355,8 @@ export function linkSignScope(key: {
  *  fact of the slot, not a second name. A function of admitted facts only: nothing local,
  *  and nothing from `protocols`, which move per version and would silently restate what
  *  signed records mean. */
-export function slotSignScope(node: {
-    identity: {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
-    networkKey?: Uint8Array;
-}, author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
+export function slotSignScope(node: { identity: Keypair; networkKey?: Uint8Array },
+    author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
     return privileges.includes(PRIVILEGE_LINK)
         ? linkSignScope(node.identity, node.networkKey)
         : appSignScope(node.identity, author, app);
