@@ -9,7 +9,7 @@
 // the record layer, the routing — is the transport bundle's, identical to the TCP path.
 // The WebSocket global is touched only inside `connect` (or an injected factory), so
 // importing it where WebSocket is absent is safe.
-import type { ChannelFactory, RawLink } from "../core/socket-seam.js";
+import type { ChannelFactory, ListenAddress, RawLink } from "../core/socket-seam.js";
 import { MessageChannel } from "./net-channel.js";
 import { parseDest } from "./peer-addr.js";
 
@@ -62,8 +62,8 @@ export class WsNetwork implements ChannelFactory {
   /** A browser binds nothing: every inbound link here is dialed by the far end at us as
    *  a client, never accepted by this factory. */
   async listen(
-    _tcp: { host: string; port: number } | undefined,
-    _ws: { host: string; port: number } | undefined,
+    _tcp: ListenAddress | undefined,
+    _ws: ListenAddress | undefined,
     _onAccept: (channel: RawLink) => void,
   ): Promise<{ port: number; wsPort: number }> {
     return { port: 0, wsPort: 0 };

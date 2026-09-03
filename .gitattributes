@@ -1,0 +1,17 @@
+# Line endings are a property of the repo, not of whichever machine wrote a file last.
+# The index holds LF for every text file; this says what a checkout turns that into, so a
+# file cannot end up half-CRLF because one tool appended LF to a CRLF file.
+* text=auto
+
+# Read by a POSIX shell, so LF regardless of platform: bash takes a CRLF `export HOME=/root`
+# as `/root\r` and corrupts every path derived from it (native/gorun.sh says the same).
+*.sh text eol=lf
+
+# Applied against LF sources, so the patch itself has to stay LF.
+*.patch -text
+
+# Rewritten by the Go toolchain, which emits LF.
+go.mod text eol=lf
+go.sum text eol=lf
+
+*.wasm binary

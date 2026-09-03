@@ -7,7 +7,7 @@
 // framing from the destination or listener label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
-import { LISTENER, type Arrival, type RawLink } from "../core/socket-seam.js";
+import { LISTENER, type Arrival, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { TCP_LINGER_MS } from "../core/net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
@@ -40,7 +40,7 @@ function nodeRawStream(socket: Socket): RawLink {
         buffered: () => socket.writableLength,
     };
 }
-function listenOn(server: TcpServer, opt: { host: string; port: number }): Promise<number> {
+function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
     return new Promise<number>((resolve, reject) => {
         server.once("error", reject);
         server.listen(opt.port, opt.host, () => {
@@ -63,13 +63,7 @@ export class NodeChannelFactory {
         if (!d || d.scheme === "wss") return null;
         return nodeRawStream(tcpConnect(d.port, d.host));
     }
-    async listen(tcp: {
-        host: string;
-        port: number;
-    } | undefined, ws: {
-        host: string;
-        port: number;
-    } | undefined, onAccept: (channel: RawLink, arrival?: Arrival) => void): Promise<{
+    async listen(tcp: ListenAddress | undefined, ws: ListenAddress | undefined, onAccept: (channel: RawLink, arrival?: Arrival) => void): Promise<{
         port: number;
         wsPort: number;
     }> {

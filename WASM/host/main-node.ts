@@ -41,8 +41,9 @@ async function nodeHost(): Promise<CliHost> {
     },
     sodium,
     async standUp(cfg: NodeSetup) {
-      // NodeShellOptions is NodeSetup plus this platform's optional members, so the config
-      // crosses unchanged — no field-by-field copy to fall out of step.
+      // NodeShellOptions EXTENDS NodeSetup, so the config crosses unchanged — no
+      // field-by-field copy to fall out of step, and a new field reaches this platform
+      // by existing rather than by being remembered here.
       return bootNodeShell(cfg);
     },
   };

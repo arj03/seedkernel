@@ -10,55 +10,22 @@
 import { readFileSync } from "node:fs";
 import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
-import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
+import { FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
 import { NodeFs, writeFileAtomic } from "./fs-node.js";
 import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
-import type { Keypair } from "../core/subkeys.js";
 import { type Fs } from "../core/fs.js";
 import { errMessage } from "../core/util.js";
-import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
+import type { NodeRuntime as CliNodeRuntime, NodeSetup } from "./cli.js";
 
-export interface NodeShellOptions {
-    /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
-     *  accepts no installs. */
-    policyJson?: string;
-    /** Directory backing the fs.* capability. */
-    dir: string;
-    /** This node's keypair (README §12.6) — the derived channel keypair, whose public
-     *  half is the peer id and the node's one identity (§12.9). */
-    identity: Keypair;
-    listen?: {
-        host: string;
-        port: number;
-    };
-    wsListen?: {
-        host: string;
-        port: number;
-    };
-    /** Optional network key — which network this node belongs to (an isolation
-     *  boundary, not a gate; §12.6). Absent ⇒ the public network. */
-    networkKey?: Uint8Array;
+/** What booting a node on THIS platform takes: everything the operator flow already reads
+ *  from flags (`NodeSetup`, cli.ts), plus the one seam only a caller inside the process can
+ *  hand over. Extending rather than restating it is what keeps `standUp` a pass-through. */
+export interface NodeShellOptions extends NodeSetup {
     /** The socket seam the transport driver dials and listens through. Defaults to
      *  a NodeChannelFactory on listen/wsListen. */
     channels?: ChannelFactory;
-    /** The signed transport bundle blob, defaulting to the artifact's own. This blob is
-     *  what the node's transport author PIN is derived from, so it is how an operator runs
-     *  a transport other than the shipped one; the policy must additionally grant that
-     *  author the `link` privilege (never the plain `authors` list). A shell without an
-     *  admitted transport bundle has no network. */
-    transportBundle?: Uint8Array;
-    /** Transport `LOCAL` config, such as peers and `contactSecret` (§12.10). */
-    transportConfig?: JsonObject;
-    /** Guest execution and handoff budget per entrypoint invocation, in ms (§12.3).
-     *  It bounds guest compute, queue wait, host waits, and deferred answers. `Infinity`
-     *  disables the local ceiling; an initiating finite caller still narrows it. Threaded
-     *  through to the shell because a bound no target can set is a bound nobody has. */
-    guestDeadlineMs?: number;
-    /** QuickJS heap cap for the guest realm, in bytes (§12.3). Omitted ⇒ the 64 MiB
-     *  default. Raise it for an app that streams large windows through the guest. */
-    realmMemoryBytes?: number;
 }
 
 /** The Node-side Shell — the platform-neutral CoreShell plus a file-backed

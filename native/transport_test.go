@@ -129,8 +129,8 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();
 		  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
-		  const a = await makeTransportNode({ identity: idA, %s timeoutMs: 1000 });
-		  const b = await makeTransportNode({ identity: idB, timeoutMs: 1000 });
+		  const a = await makeTransportNode({ identity: idA, %s });
+		  const b = await makeTransportNode({ identity: idB });
 		  await a.transport.start();
 		  await a.shell.loadBundleBlob(__probe);
 		  const bApp = await b.shell.loadBundleBlob(__probe);

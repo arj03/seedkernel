@@ -14,7 +14,7 @@ import {
   MAX_OUTBOUND_QUEUE_SLICES,
 } from "../core/net-limits.js";
 import { type LinkEvent } from "../core/domains.js";
-import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
 import type { CausalClock } from "./realm-queue.js";
@@ -56,8 +56,8 @@ export interface TransportHostOptions {
  *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
  *  and its `link/open` calls answer "no route". */
   channels?: ChannelFactory;
-  listen?: { host: string; port: number };
-  wsListen?: { host: string; port: number };
+  listen?: ListenAddress;
+  wsListen?: ListenAddress;
   /** One link went down, with the occupant's one-byte reason (transport/src/ake.js
  *  `REASON_*`) — a clean farewell, a defensive teardown, a cut stream. The host relays the
  *  number and never interprets it: the vocabulary belongs to whichever bundle holds the

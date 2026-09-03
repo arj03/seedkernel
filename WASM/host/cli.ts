@@ -8,6 +8,7 @@
 import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
+import type { ListenAddress } from "../core/socket-seam.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
 import { OpArgs, writeOp } from "./op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
@@ -39,19 +40,47 @@ export interface CliFiles {
   writeFile(path: string, bytes: Uint8Array, mode?: number): void;
 }
 
-/** What a node needs to exist, once the flags have been read. The targets build it from
- *  very different parts — `NodeFs` + `node:net` here, a wazero table + Go sockets there —
- *  which is why `standUp` is a member rather than code in this file. */
-export interface NodeSetup {
-  dir: string;
-  policyJson?: string;
+/** What standing a node up takes wherever it runs: an identity, where it listens, and the
+ *  signed transport program that is its network (§12.6). NOT the store or the gate on it —
+ *  a target that opens those separately, before the transport bundle lands, takes this
+ *  rather than the `NodeSetup` below. */
+export interface TransportNodeConfig {
+  /** This node's keypair (README §12.6) — the derived channel keypair, whose public
+   *  half is the peer id and the node's one identity (§12.9). */
   identity: Keypair;
-  listen?: { host: string; port: number };
-  wsListen?: { host: string; port: number };
-  transportConfig?: JsonObject;
-  guestDeadlineMs?: number;
-  realmMemoryBytes?: number;
+  listen?: ListenAddress;
+  wsListen?: ListenAddress;
+  /** Optional network key — which network this node belongs to (an isolation
+   *  boundary, not a gate; §12.6). Absent ⇒ the public network. */
+  networkKey?: Uint8Array;
+  /** The signed transport bundle blob, defaulting to the artifact's own. This blob is
+   *  what the node's transport author PIN is derived from, so it is how an operator runs
+   *  a transport other than the shipped one; the policy must additionally grant that
+   *  author the `link` privilege (never the plain `authors` list). A shell without an
+   *  admitted transport bundle has no network. */
   transportBundle?: Uint8Array;
+  /** Transport `LOCAL` config, such as peers and `contactSecret` (§12.10). */
+  transportConfig?: JsonObject;
+  /** Guest execution and handoff budget per entrypoint invocation, in ms (§12.3).
+   *  It bounds guest compute, queue wait, host waits, and deferred answers. `Infinity`
+   *  disables the local ceiling; an initiating finite caller still narrows it. Threaded
+   *  through to the shell because a bound no target can set is a bound nobody has. */
+  guestDeadlineMs?: number;
+  /** QuickJS heap cap for the guest realm, in bytes (§12.3). Omitted ⇒ the shell's
+   *  default. Raise it for an app that streams large windows through the guest. */
+  realmMemoryBytes?: number;
+}
+
+/** What a node needs to exist, once the flags have been read: the above, plus the store
+ *  and who may install on it. The targets build it from very different parts — `NodeFs` +
+ *  `node:net` here, a wazero table + Go sockets there — which is why `standUp` is a
+ *  member rather than code in this file. */
+export interface NodeSetup extends TransportNodeConfig {
+  /** Directory backing the fs.* capability. */
+  dir: string;
+  /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
+   *  accepts no installs. */
+  policyJson?: string;
 }
 
 /** Platform-owned channel integration kept beside the shell. */

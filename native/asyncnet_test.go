@@ -44,8 +44,8 @@ func TestAsyncNetInitiator(t *testing.T) {
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
 		                           grants: { link: [embeddedTransportAuthor] } }));
 		globalThis.__setup = (async () => {
-		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
-		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
+		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 } });
+		  const b = await makeTransportNode({ identity: idB });
 		  globalThis.netA = a.transport;
 		  globalThis.netB = b.transport;
 		  globalThis.__nodeA = a;

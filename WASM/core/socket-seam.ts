@@ -37,11 +37,21 @@ export interface Arrival {
 /** Standard listener labels interpreted by the transport bundle. */
 export const LISTENER = { TCP: "tcp", WS: "ws" } as const;
 
+/** Where a listener binds: a host and a port, with port 0 meaning "ask the OS". One shape
+ *  from the operator's `--listen`/`--ws-listen` through the node config and the driver
+ *  down to this seam, so a bind address cannot mean one thing at one end of that chain and
+ *  something else at the other. Not a destination: dialing takes a STRING whose scheme the
+ *  factory interprets (`connect`, peer-addr.ts `parseDest`). */
+export interface ListenAddress {
+  host: string;
+  port: number;
+}
+
 export interface ChannelFactory {
   connect?(dest: string): RawLink | null;
   listen(
-    tcp: { host: string; port: number } | undefined,
-    ws: { host: string; port: number } | undefined,
+    tcp: ListenAddress | undefined,
+    ws: ListenAddress | undefined,
     onAccept: (channel: RawLink, arrival?: Arrival) => void,
   ): Promise<{ port: number; wsPort: number }>;
   /** Stop the listeners. Open channels are closed by the core. */

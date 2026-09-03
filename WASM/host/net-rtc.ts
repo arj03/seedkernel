@@ -16,7 +16,7 @@
 // `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
 // owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel } from "./net-channel.js";
-import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { isHex64 } from "../core/util.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
@@ -241,8 +241,8 @@ export class RtcNetwork implements ChannelFactory {
      *  deliberately absent (socket-seam.ts `ChannelFactory`): RTC peers come from
      *  signaling, never from an address. */
     async listen(
-        _tcp: { host: string; port: number } | undefined,
-        _ws: { host: string; port: number } | undefined,
+        _tcp: ListenAddress | undefined,
+        _ws: ListenAddress | undefined,
         onAccept: (channel: RawLink, arrival?: Arrival) => void,
     ): Promise<{ port: number; wsPort: number }> {
         this.onAccept = onAccept;

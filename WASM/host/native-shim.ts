@@ -4,8 +4,8 @@
 // inside QuickJS, bundled with every module it imports into native/host-shell.gen.js by
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
-import { verifyBundle, FreshnessMarks, freshnessPathFor, type JsonObject, type PureModuleLoader } from "./bundle.js";
-import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
+import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup, type TransportNodeConfig } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type Shell, type ShellSodium,
@@ -510,28 +510,12 @@ function theShell() {
         throw new Error("native: bootNode has not run");
     return shell;
 }
-/** Stand a node up on this platform via the shared `bootShell` (§12.9).
- *  Config is an object so a positional drift against Go is a type error. */
-async function makeTransportNode(cfg: {
-    identity: Keypair;
-    listen?: {
-        host: string;
-        port: number;
-    };
-    wsListen?: {
-        host: string;
-        port: number;
-    };
-    /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate. */
-    networkKey?: Uint8Array;
-    transportConfig?: JsonObject;
-    /** The §12.3 guest bounds, threaded through to `bootShell`: a bound the shell accepts
-     *  but no target can set is a bound nobody has. */
-    guestDeadlineMs?: number;
-    realmMemoryBytes?: number;
-    /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
-    transportBundle?: Uint8Array;
-}): Promise<NodeRuntime> {
+/** Stand a node up on this platform via the shared `bootShell` (§12.9). Config is an
+ *  object so a positional drift against Go is a type error, and it is cli.ts's
+ *  `TransportNodeConfig` so a field added for one target cannot go missing on this one.
+ *  The store and its policy are not in it: on this target they are realm state, set
+ *  before the boot rather than passed to it (`openStore`, `setPolicy`). */
+async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime> {
     const { shell, transport } = await bootShell({
         sodium, identity: cfg.identity, modules, fs,
         freshnessStore: new NativeFreshnessStore(storeDir),
@@ -616,15 +600,9 @@ function nativeCliHost(): CliHost {
             // its freshness mark belongs beside the store.
             openStore(cfg.dir);
             setPolicy(cfg.policyJson ?? null);
-            const stood = await makeTransportNode({
-                identity: cfg.identity,
-                listen: cfg.listen,
-                wsListen: cfg.wsListen,
-                transportConfig: cfg.transportConfig,
-                guestDeadlineMs: cfg.guestDeadlineMs,
-                realmMemoryBytes: cfg.realmMemoryBytes,
-                transportBundle: cfg.transportBundle,
-            });
+            // NodeSetup EXTENDS TransportNodeConfig, so the rest of the config crosses
+            // unchanged — no field-by-field copy to fall out of step.
+            const stood = await makeTransportNode(cfg);
             // One "the shell" per realm, whichever entry point stood it up.
             shell = stood.shell;
             return stood;

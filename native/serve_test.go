@@ -50,7 +50,7 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   globalThis.__peerId = toHex(id.publicKey);
   const node = await makeTransportNode({
     // Contact policy is transport config (§12.6.3).
-    identity: id, transportConfig: { contactSecret: contactSecretHex }, timeoutMs: 2000,
+    identity: id, transportConfig: { contactSecret: contactSecretHex },
   });
   globalThis.__requesterNode = node;
   const net = node.transport;
