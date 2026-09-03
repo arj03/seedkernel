@@ -267,11 +267,23 @@ func (v *Value) byteArrayLength() (int64, error) {
 	return int64(size), nil
 }
 
+// checkWindow validates a view's [offset, offset+length) against the buffer's REAL size —
+// the size QuickJS itself reports, never the caller's numbers alone, since byteOffset and
+// byteLength are ordinary JS properties a hostile object can forge (viewWindow).
+//
+// Compare by subtraction, not addition: a hostile pair near 2^62 would overflow
+// offset+length and pass an additive check.
+func checkWindow(size, offset, length int64) error {
+	if offset < 0 || length < 0 || offset > size || length > size-offset {
+		return errors.New("qjs: typed array view out of range")
+	}
+	return nil
+}
+
 // toByteArrayWindow copies just the [offset, offset+length) window, with the same
-// ownership story as toByteArray. The window is validated against the buffer size QuickJS
-// itself reports — never the caller's numbers alone — so a forged byteOffset/byteLength
-// cannot read past the buffer. O(window), so a small view over a large buffer neither
-// copies nor pins the whole backing store.
+// ownership story as toByteArray and the window checked against the buffer QuickJS reports
+// (checkWindow). O(window), so a small view over a large buffer neither copies nor pins the
+// whole backing store.
 func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
 	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
 	if packed == 0 {
@@ -279,10 +291,8 @@ func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
 	}
 	addr, size := v.c.rt.unpackPtr(packed)
 	v.c.rt.freeAt(packed) // the malloc'd cell only — addr is the live buffer, owned by JS
-	// Compare by subtraction, not addition: offset and length arrive from JS getters, and a
-	// hostile pair near 2^62 would overflow offset+length.
-	if offset < 0 || length < 0 || offset > int64(size) || length > int64(size)-offset {
-		return nil, errors.New("qjs: typed array view out of range")
+	if err := checkWindow(int64(size), offset, length); err != nil {
+		return nil, err
 	}
 	out := make([]byte, length)
 	if length > 0 {
@@ -458,6 +468,31 @@ func (c *Context) Pump() error {
 	return c.exception()
 }
 
+// typedArrayView resolves a view (TypedArray/DataView) onto its backing ArrayBuffer plus
+// the view's own window — the SLOW path only, the caller having already ruled out a bare
+// ArrayBuffer. That exclusion is what makes buf unconditionally the caller's to Free: a
+// bare buffer IS its own .buffer, and freeing a borrowed value as if owned detaches the
+// source out from under QuickJS (toByteArray). The window is the caller's own untrusted
+// numbers, checked against the real buffer by whoever reads it (checkWindow).
+func typedArrayView(input *Value) (buf *Value, offset, length int64, err error) {
+	if buf, err = input.prop("buffer"); err != nil {
+		return nil, 0, 0, err
+	}
+	if buf.IsUndefined() || buf.IsNull() {
+		buf.Free()
+		return nil, 0, 0, errors.New("qjs: value has no ArrayBuffer backing")
+	}
+	if !buf.isByteArray() {
+		buf.Free()
+		return nil, 0, 0, errors.New("qjs: value is not a byte array")
+	}
+	if offset, length, err = input.viewWindow(); err != nil {
+		buf.Free()
+		return nil, 0, 0, err
+	}
+	return buf, offset, length, nil
+}
+
 // JsTypedArrayToGo returns the bytes of a TypedArray/DataView/ArrayBuffer as an
 // independent Go copy. The source is NOT detached, so the same value (a shared singleton,
 // a node key signed against many peers) can be read any number of times, and callers never
@@ -473,21 +508,11 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	if input.isByteArray() {
 		return input.toByteArray(), nil
 	}
-	buffer, err := input.prop("buffer")
+	buffer, offset, length, err := typedArrayView(input)
 	if err != nil {
 		return nil, err
 	}
 	defer buffer.Free()
-	if buffer.IsUndefined() || buffer.IsNull() {
-		return nil, errors.New("qjs: value has no ArrayBuffer backing")
-	}
-	if !buffer.isByteArray() {
-		return nil, errors.New("qjs: value is not a byte array")
-	}
-	offset, length, err := input.viewWindow()
-	if err != nil {
-		return nil, err
-	}
 	return buffer.toByteArrayWindow(offset, length)
 }
 
@@ -501,27 +526,17 @@ func JsTypedArrayByteLength(input *Value) (int64, error) {
 	if input.isByteArray() {
 		return input.byteArrayLength()
 	}
-	buffer, err := input.prop("buffer")
+	buffer, offset, length, err := typedArrayView(input)
 	if err != nil {
 		return 0, err
 	}
 	defer buffer.Free()
-	if buffer.IsUndefined() || buffer.IsNull() {
-		return 0, errors.New("qjs: value has no ArrayBuffer backing")
-	}
-	if !buffer.isByteArray() {
-		return 0, errors.New("qjs: value is not a byte array")
-	}
-	offset, length, err := input.viewWindow()
-	if err != nil {
-		return 0, err
-	}
 	bufferLength, err := buffer.byteArrayLength()
 	if err != nil {
 		return 0, err
 	}
-	if offset < 0 || length < 0 || offset > bufferLength || length > bufferLength-offset {
-		return 0, errors.New("qjs: typed array view out of range")
+	if err := checkWindow(bufferLength, offset, length); err != nil {
+		return 0, err
 	}
 	return length, nil
 }
