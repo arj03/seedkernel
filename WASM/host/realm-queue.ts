@@ -134,6 +134,10 @@ export class CausalContext {
  *  realm is given it beside `setTimeout` (native/loop.go). */
 export const monotonicMs = (): number => performance.now();
 
+/** What a settled queue entry's payload field is replaced by — one shared empty view, so
+ *  letting go of borrowed bytes allocates nothing and the field stays non-optional. */
+const NO_PAYLOAD = new Uint8Array(0);
+
 /** Convert a live remainder into the absolute deadline that crosses this handoff. */
 const deadlineAt = (remainingMs: number): number => {
   if (remainingMs === Infinity) return Infinity;
@@ -153,7 +157,7 @@ export interface Deadline {
 
 /** A set of deadlines a realm has armed for work it has not settled, sharing one physical
  *  timer — the wall-clock half of the custody the active-call registry keeps in bytes.
- *  Records are unordered, because a caller may put a short budget behind a long one, and
+ *  Records are not deadline-sorted: a caller may put a short budget behind a long one, and
  *  the scan that finds the earliest runs when the timer fires, never on the call path.
  *
  *  Between fires the armed wake is retained rather than cleared and re-armed per call,
@@ -176,7 +180,7 @@ export function createDeadlineQueue(): {
   drop(deadline: Deadline): void;
   disarmAll(): void;
 } {
-  const pending: Deadline[] = [];
+  const pending = new Set<Deadline>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timerAt = Infinity;
   const clear = (): void => {
@@ -197,10 +201,9 @@ export function createDeadlineQueue(): {
     clear();
     const now = monotonicMs();
     let soonest = Infinity;
-    for (let i = pending.length - 1; i >= 0; i--) {
-      const deadline = pending[i];
+    for (const deadline of pending) {
       if (deadline.at - now >= 1) soonest = Math.min(soonest, deadline.at);
-      else { pending.splice(i, 1); deadline.expire(); }
+      else { pending.delete(deadline); deadline.expire(); }
     }
     if (soonest === Infinity) return;
     timerAt = Math.min(soonest, now + 0x7fffffff);
@@ -208,7 +211,7 @@ export function createDeadlineQueue(): {
   };
   return {
     add(deadline) {
-      pending.push(deadline);
+      pending.add(deadline);
       // Re-arm only for a wake that is a whole tick better, never for a fraction of one.
       // Re-arming restarts the host's timer against ITS clock, which is coarser than this
       // one; doing that for a sub-millisecond gain buys nothing and costs the accuracy of
@@ -218,18 +221,16 @@ export function createDeadlineQueue(): {
       else (timer as ReturnType<typeof setTimeout> & { ref?(): void }).ref?.();
     },
     drop(deadline) {
-      const index = pending.indexOf(deadline);
-      if (index < 0) return;
-      pending.splice(index, 1);
+      if (!pending.delete(deadline)) return;
       // Nothing is waiting on the retained wake now, so it must not hold a process up on
       // its own account; `add` refs it back. No-op off Node, whose loop is explicit.
-      if (pending.length === 0) {
+      if (pending.size === 0) {
         (timer as (ReturnType<typeof setTimeout> & { unref?(): void }) | undefined)?.unref?.();
       }
     },
     disarmAll(): void {
       clear();
-      pending.length = 0;
+      pending.clear();
     },
   };
 }
@@ -279,10 +280,17 @@ export function serializeCalls(
   let pumping = false;
   const settled = Promise.resolve();
 
-  /** Settle the caller once, from whichever arm reaches it first. */
+  /** Settle the caller once, from whichever arm reaches it first — and let go of the
+   *  payload in the same breath. Those bytes are BORROWED from the caller's own owner
+   *  (§12.3), so the moment this call has been answered they are no longer the queue's to
+   *  hold: an entry the deadline overtook stays in the FIFO until the front reaches it,
+   *  and a predecessor that never answers would otherwise root every follower's payload
+   *  behind it. What is left is an inert record, bounded by the same admitting owners the
+   *  queue's depth already is. */
   const finish = (entry: Entry, ok: boolean, value: unknown): void => {
     if (entry.settled) return;
     entry.settled = true;
+    entry.payload = NO_PAYLOAD;
     deadlines.drop(entry);
     if (ok) entry.resolve(value as Uint8Array);
     else entry.reject(value);
@@ -344,8 +352,12 @@ export function serializeCalls(
     return new Promise<Uint8Array>((resolve, reject) => {
       const entry: Entry = { at, payload, causalClock, resolve, reject, settled: false, expire };
       if (at !== Infinity) deadlines.add(entry);
-      waiting.push(entry);
-      pump();
+      // `add` expires a deadline already inside the host timer's one-tick resolution
+      // synchronously. Do not turn that already-settled call into a FIFO tombstone.
+      if (!entry.settled) {
+        waiting.push(entry);
+        pump();
+      }
     });
   };
 }

@@ -358,6 +358,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // consume those answers and no handle survives to release them later.
     disposed = true;
     activeHostCalls.releaseAll();
+    hostCallDeadlines.disarmAll();
+    entryDeadlines.disarmAll();
     disposePhantoms();
     try {
       if (ctx.alive) ctx.dispose();

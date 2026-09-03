@@ -439,9 +439,17 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     );
     return null;
   };
-  realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-    deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
-    DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
+  try {
+    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+      deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
+      DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
+  } catch (err) {
+    // A guest may have parked host calls before its top-level source failed. No Realm handle
+    // will be returned to own their wakeups, so construction itself must end that custody.
+    hostCallDeadlines.disarmAll();
+    entryDeadlines.disarmAll();
+    throw err;
+  }
   const configuredDeadlineMs = deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   let invocationSeq = 0;
   let disposed = false;

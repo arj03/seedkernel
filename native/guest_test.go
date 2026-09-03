@@ -45,6 +45,24 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 	}
 }
 
+func TestGuestRealmFailedConstructionClearsHostDeadlines(t *testing.T) {
+	bootRealm(t)
+	before := len(el.timers)
+	if _, err := qc.Eval("failed-realm-fixture.js", qjs.Code(`
+		globalThis.__failedRealmSource = 'host.call("park", new Uint8Array()); throw new Error("init failed")';
+		globalThis.__neverAnswer = () => new Promise(() => {});
+	`)); err != nil {
+		t.Fatal("build failed-realm fixture:", err)
+	}
+	if _, err := callRealm(`createRealm({ source: __failedRealmSource,
+		hostCall: __neverAnswer, deadlineMs: 10000 })`, 3*time.Second); err == nil {
+		t.Fatal("failed realm construction unexpectedly completed")
+	}
+	if got := len(el.timers); got != before {
+		t.Fatalf("failed realm construction left %d host deadline timer(s), want %d", got, before)
+	}
+}
+
 func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`

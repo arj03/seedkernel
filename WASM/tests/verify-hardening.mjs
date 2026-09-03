@@ -462,11 +462,15 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   // charge would pin the realm's allowance on a backend that never answers. The two ways a
   // realm can die (construction failure, dispose) are both checked, and a backend that
   // settles afterwards must be a no-op, never a second release.
+  const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const timersBeforeFailedConstruction = liveTimers();
   let settleOrphan;
   await rejects(createSafeRealm({
     source: 'host.call("hold", Uint8Array.of(1)); throw new Error("init failed");',
     hostCall: () => new Promise((resolve) => { settleOrphan = resolve; }),
   }), "failed realm construction reports its source error");
+  ok(liveTimers() === timersBeforeFailedConstruction,
+    "failed realm construction disarms host-call deadlines it can no longer own");
   const afterFailure = await createSafeRealm({
     source: 'async function handle() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
     hostCall: () => new Uint8Array(),
@@ -490,7 +494,6 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   // dispose() must end both. A timer nobody is left waiting for still holds the host's event
   // loop open for the whole of its remainder — enough to make a one-shot process linger a
   // full budget past the work it came to do — so the count is read either side of dispose.
-  const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const armedAtDispose = liveTimers();
   disposedWithParked.dispose();
   ok(armedAtDispose > 0 && liveTimers() < armedAtDispose,
