@@ -325,7 +325,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 			// The test driver's twin of the shell's callSlot: the host's 32 zero-byte
 			// caller id in front of the guest's own op framing (composed here, since the
 			// kernel writing it would learn the guest's vocabulary).
-			globalThis.__realmCall = (op, arg) => {
+			globalThis.__realmCall = (op, arg, causalClock) => {
 			  const body = new Uint8Array(arg);
 			  const framed = new Uint8Array(1 + op.length + body.length);
 			  framed[0] = op.length;
@@ -333,7 +333,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 			  framed.set(body, 1 + op.length);
 			  const input = new Uint8Array(32 + framed.length);
 			  input.set(framed, 32);
-			  return __realm.call(input);
+			  return __realm.call(input, undefined, causalClock);
 			};
 			return new Uint8Array(0);
 		})`,

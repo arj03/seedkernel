@@ -28,7 +28,8 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
 import {
-  createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls, type Invocation,
+  createActiveHostCallRegistry, createHandoffDeadlines, monotonicMs, serializeCalls,
+  type CausalClock, type Invocation,
 } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
@@ -53,7 +54,7 @@ export interface SafeRealm {
    *  way in, for both roles. Serialized per realm (realm-queue.ts). */
   /** `deadlineMs` is the initiating owner's live remainder. Omission means a
    *  host-initiated call and takes this realm's configured ceiling. */
-  call(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
+  call(payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
   dispose(): void;
 }
 
@@ -72,7 +73,7 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
 /** Guest execution-time accounting under the current invocation's handoff deadline (§12.3). */
 interface ExecClock {
   /** Guest code is about to run. */
-  begin(): void;
+  begin(causalClock?: CausalClock): void;
   /** Guest code has returned control to the host. */
   end(): void;
   /** Start one invocation, narrowed by the handoff remainder that admitted it. */
@@ -99,6 +100,7 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
   let wallDeadline = Infinity;
   let consumedMs = 0;
   let segmentStart = 0;
+  let segmentClock: CausalClock | undefined;
   let running = false;
   // An unbounded realm can still receive a finite caller-owned handoff, so the interrupt
   // handler is installed for dynamic invocation limits rather than only for the default.
@@ -108,8 +110,16 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
     return consumedMs + (now - segmentStart) > budgetMs || now >= wallDeadline;
   });
   return {
-    begin() { segmentStart = monotonicMs(); running = true; },
-    end() { if (running) { consumedMs += monotonicMs() - segmentStart; running = false; } },
+    begin(causalClock) { segmentStart = monotonicMs(); segmentClock = causalClock; running = true; },
+    end() {
+      if (!running) return;
+      const elapsed = monotonicMs() - segmentStart;
+      consumedMs += elapsed;
+      running = false;
+      const owner = segmentClock;
+      segmentClock = undefined;
+      owner?.charge(elapsed);
+    },
     reset(deadlineMs = configuredMs) {
       if (deadlineMs !== Infinity && (!Number.isFinite(deadlineMs) || deadlineMs < 0)) {
         throw new Error("guest: invalid invocation handoff deadline");
@@ -203,6 +213,13 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
+  let currentCausalClock: CausalClock | undefined;
+  const withCausalClock = <T>(causalClock: CausalClock | undefined, fn: () => T): T => {
+    const previous = currentCausalClock;
+    currentCausalClock = causalClock;
+    try { return fn(); }
+    finally { currentCausalClock = previous; }
+  };
   const activeHostCalls = createActiveHostCallRegistry();
   // The wall-clock half of the same custody: one armed deadline per unsettled host call,
   // disposed with the realm so an abandoned timer cannot outlive it (realm-queue.ts).
@@ -256,28 +273,31 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
 
   // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
   // preamble's half of the contract), then pump so the awaiting continuation runs.
-  const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle): void => {
+  const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle,
+    causalClock?: CausalClock): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
     // The continuation of a parked `await` is guest code, so it runs on the guest's budget.
     // Every handle is released in `finally`, which is load-bearing rather than tidy: this
     // call can be interrupted mid-flight by the budget, and a runtime freed with live handles
     // aborts the whole wasm module at dispose() time.
-    clock.begin();
-    try {
-      const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
-      res.dispose();
-      pumpJobs();
-    } catch (err) {
-      // The guest was interrupted while resuming, so nothing inside the realm will ever
-      // settle the caller's promise: fail it here, or `call()` hangs forever.
-      failInvocations(err instanceof Error ? err : new Error(String(err)));
-    } finally {
-      clock.end();
-      id.dispose();
-      arg.dispose();
-      settler.dispose();
-    }
+    withCausalClock(causalClock, () => {
+      clock.begin(causalClock);
+      try {
+        const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
+        res.dispose();
+        pumpJobs();
+      } catch (err) {
+        // The guest was interrupted while resuming, so nothing inside the realm will ever
+        // settle the caller's promise: fail it here, or `call()` hangs forever.
+        failInvocations(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        clock.end();
+        id.dispose();
+        arg.dispose();
+        settler.dispose();
+      }
+    });
   };
 
   // The single seam. QuickJS calls it synchronously; the answer never comes back this
@@ -291,7 +311,12 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment is
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
-    const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
+    const causalClock = currentCausalClock;
+    const budget: CallBudget = {
+      remainingMs: clock.remaining(),
+      charge: (ms) => { clock.charge(ms); causalClock?.charge(ms); },
+      causalClock,
+    };
     if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
     // Inspect the borrowed view first, reserve both count and bytes, and only then copy.
     // `getArrayBuffer` owns a lifetime but not another payload-sized allocation.
@@ -322,10 +347,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
           // Request and response coexist while copying the result into the guest. Reserve
           // that overlap and keep the call live through guest-side settlement.
           activeCall.reserve(bytes.byteLength);
-          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));
+          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), causalClock);
         } catch (err) {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)));
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)), causalClock);
           }
         } finally {
           activeCall.release();
@@ -334,7 +359,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       (err) => {
         try {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)));
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)), causalClock);
           }
         } finally {
           activeCall.release();
@@ -391,7 +416,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
    *
    *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
    *  the moment the synchronous segment ends, which is before the answer exists. */
-  const invoke = (payload: Uint8Array, deadlineMs: number): Invocation => {
+  const invoke = (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock): Invocation => {
     // Safe unconditionally because the queue guarantees nothing else is RUNNING. A deferred
     // entrypoint has already ended its segment by the time the next one resets, so what it
     // spends settling later is charged to whichever window is open — which is whose turn
@@ -406,19 +431,21 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // by each deferred's own executePendingJobs on settle.
     let evalResult: QuickJSHandle | undefined;
     let settledNative: Promise<unknown> | undefined;
-    clock.begin();
-    try {
-      evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc, "safe-js-invoke.js"));
-      settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
-      pumpJobs();
-    } finally {
-      // Closed before the await below: past this point the host is waiting on the seam,
-      // which is not the guest's time to spend.
-      clock.end();
-      // resolvePromise has consumed the value; the eval handle must go back even when
-      // pumpJobs throws, or it aborts the module at runtime free.
-      evalResult?.dispose();
-    }
+    withCausalClock(causalClock, () => {
+      clock.begin(causalClock);
+      try {
+        evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc, "safe-js-invoke.js"));
+        settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
+        pumpJobs();
+      } finally {
+        // Closed before the await below: past this point the host is waiting on the seam,
+        // which is not the guest's time to spend.
+        clock.end();
+        // resolvePromise has consumed the value; the eval handle must go back even when
+        // pumpJobs throws, or it aborts the module at runtime free.
+        evalResult?.dispose();
+      }
+    });
     // Read before anything awaits, so no later invocation's `__invoke` can have cleared it.
     const deferred = wasDeferred();
     let cancel = (_reason: Error): void => {};

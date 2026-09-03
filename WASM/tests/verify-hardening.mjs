@@ -610,10 +610,14 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   const spin = async (clockDivisor) => {
     let fires = 0;
     let table;
-    table = createRealmTimers(() => {
+    table = createRealmTimers((_body, causalClock) => {
       fires += 1;
       table.arm(1, 0, new Uint8Array(1));
-      return sleep(occupyMs);
+      // Stand in for the realm's execution report. Burn real time too, so divisor 1 is
+      // the control where execution spend and concurrent credit accrual cancel exactly.
+      const started = performance.now();
+      while (performance.now() - started < occupyMs) { /* guest is computing */ }
+      causalClock.charge(performance.now() - started);
     }, 10, 4096, budgetMs, clockDivisor);
     table.arm(1, 0, new Uint8Array(1));
     await sleep(spinForMs);
@@ -637,6 +641,70 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   await sleep(60);
   ok(cheap === 64, `64 deadlines that cost nothing all fire at once (${cheap})`);
   honest.clearAll();
+
+  // Waiting is not execution. Start below an empty bank, then keep the first fire parked
+  // longer than recovery takes. Its successor must become admissible WHILE the first is
+  // still awaiting; charging dispatch-to-settlement wall time would keep it slipped until
+  // the wait ended and then make it buy the same credit a second time.
+  let waitingFires = 0;
+  let releaseWait;
+  const waiting = createRealmTimers((_body, causalClock) => {
+    waitingFires += 1;
+    if (waitingFires !== 1) return;
+    causalClock.charge(2 * budgetMs); // clamps the bank to -budgetMs
+    return new Promise((resolve) => { releaseWait = resolve; });
+  }, 10, 4096, budgetMs, 4);
+  waiting.arm(1, 0, new Uint8Array(1));
+  await sleep(20);
+  waiting.arm(2, 0, new Uint8Array(1));
+  await sleep(220); // -40 -> +1 earns in 164 ms at a divisor of 4
+  ok(waitingFires === 2,
+    "a timer root earns clock credit while its entrypoint is parked on I/O");
+  releaseWait();
+  waiting.clearAll();
+
+  // The inverse escape is returning before descendant work: await once (so lineage must
+  // survive settlement), call a second realm without awaiting it, and let that callee
+  // launch module-like work without awaiting that either. The late charge must still land
+  // on the timer root after both entrypoints have already answered.
+  let moduleCharged;
+  const callee = await createSafeRealm({
+    source: 'function handle() { void host.call("work", new Uint8Array()); return new Uint8Array(); }',
+    hostCall: (_name, _payload, budget) => new Promise((resolve) => {
+      setTimeout(() => {
+        budget.charge(2 * budgetMs);
+        moduleCharged?.();
+        resolve(new Uint8Array());
+      }, 10);
+    }),
+  });
+  const caller = await createSafeRealm({
+    source: `async function handle() {
+      await host.call("pause", new Uint8Array());
+      void host.call("callee", new Uint8Array());
+      return new Uint8Array();
+    }`,
+    hostCall: (name, payload, budget) => name === "pause"
+      ? sleep(10).then(() => new Uint8Array())
+      : callee.call(payload, budget.remainingMs, budget.causalClock),
+  });
+  let rootedFires = 0;
+  const rooted = createRealmTimers((body, causalClock) => {
+    rootedFires += 1;
+    return caller.call(body, undefined, causalClock);
+  }, 10, 4096, budgetMs, 4);
+  const charged = new Promise((resolve) => { moduleCharged = resolve; });
+  rooted.arm(1, 0, new Uint8Array(1));
+  await charged;
+  rooted.arm(2, 0, new Uint8Array(1));
+  await sleep(30);
+  ok(rootedFires === 1,
+    "fire-and-forget work remains charged through an await and a cross-realm call");
+  await sleep(210);
+  ok(rootedFires === 2, "the descendant charge slips only the root's next fire, then recovers");
+  rooted.clearAll();
+  caller.dispose();
+  callee.dispose();
 }
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");

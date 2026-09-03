@@ -197,6 +197,51 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	}
 }
 
+// A timer root pays for native guest execution on both sides of an await, but not for the
+// wait itself. This pins the Go-to-TypeScript execution report as well as restoration of
+// the causal clock while the settled host call's continuation is drained.
+func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("causal-clock-seam.js", qjs.Code(`
+		globalThis.__guestSeam = () => new Promise((resolve) =>
+		  setTimeout(() => resolve(new Uint8Array()), 150));
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		async function handle() {
+		  await host.call("pause", new Uint8Array());
+		  return new Uint8Array([7]);
+		}
+	`, 1000)
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	if _, err := qc.Eval("causal-clock-call.js", qjs.Code(`
+		globalThis.__causalMs = 0;
+		globalThis.__causalSegments = 0;
+		globalThis.__causalClock = { charge(ms) { __causalMs += ms; __causalSegments++; } };
+		globalThis.__meteredRealmCall = (op, arg) => __realmCall(op, arg, __causalClock);
+	`)); err != nil {
+		t.Fatal("install causal clock:", err)
+	}
+	started := time.Now()
+	out, err := callRealm("__meteredRealmCall", 5*time.Second,
+		qc.NewString("wait"), qc.NewArrayBuffer(nil))
+	wall := time.Since(started)
+	if err != nil || !bytes.Equal(out, []byte{7}) {
+		t.Fatalf("metered call = %v, err = %v", out, err)
+	}
+	if got := evalString(t, "String(__causalSegments)"); got != "2" {
+		t.Fatalf("causal execution segments = %s, want initial entry + resumed continuation", got)
+	}
+	charged, err := strconv.ParseFloat(evalString(t, "String(__causalMs)"), 64)
+	if err != nil || charged <= 0 {
+		t.Fatalf("reported causal execution = %v ms, want a positive measurement", charged)
+	}
+	if charged >= float64((wall-75*time.Millisecond).Nanoseconds())/1e6 {
+		t.Fatalf("reported %.3fms execution across a %s call: the 150ms wait was charged", charged, wall)
+	}
+}
+
 func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build-seam.js", qjs.Code(`
@@ -487,10 +532,10 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	}
 }
 
-// The budget also covers continuations the loop pumps directly. A plain `await` (no
-// host.call) resumes through eventLoop.pumpAll rather than settleNet, which was once
-// outside every guard the realm had: one `await Promise.resolve()` bought an unbounded
-// loop, since only the segment before the await was budgeted.
+// The budget also covers continuations the realm pump drains directly. A plain `await`
+// (no host.call) resumes through that pump rather than settleNet, which was once outside
+// every guard the realm had: one `await Promise.resolve()` bought an unbounded loop,
+// since only the segment before the await was budgeted.
 //
 // Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
 // the loop must be driven by whoever is waiting on it.
@@ -504,7 +549,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	}
 	newTestRealmBudget(t, "{}", `
 		async function handle() {
-			await Promise.resolve();   // resumes via pumpAll, not settleNet
+		  await Promise.resolve();   // resumes via the realm pump, not settleNet
 			for (;;) {}
 		}
 	`, 300)

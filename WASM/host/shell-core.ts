@@ -12,7 +12,7 @@ import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_APP_SLOTS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
 import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
-import { monotonicMs } from "./realm-queue.js";
+import { monotonicMs, type CausalClock } from "./realm-queue.js";
 import { type SafeRealm } from "./safe-js.js";
 import type { Keypair } from "../core/subkeys.js";
 
@@ -198,11 +198,11 @@ interface RealmTimers extends HostTimers {
  *  a bound on the node's clock, which external roots can occupy one bounded invocation after
  *  another.
  *
- *  What it measures is the WALL period across a fire, because handing the body over and being
- *  told the answer landed is all it sees. A body that parks on a host call is charged as if it
- *  had spun — a safe over-approximation because it can only pace that realm harder. */
+ *  Each fire mints a causal clock carried through guest continuations, module calls and
+ *  cross-realm delivery. Those execution sites debit their measured burn; time parked on
+ *  I/O costs nothing, and returning early cannot detach descendants from the root. */
 export function createRealmTimers(
-    fire: (payload: Uint8Array) => Promise<unknown> | void,
+    fire: (payload: Uint8Array, causalClock: CausalClock) => Promise<unknown> | void,
     max = DEFAULT_MAX_LIVE_TIMERS,
     maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
     budgetMs = DEFAULT_GUEST_DEADLINE_MS,
@@ -215,28 +215,31 @@ export function createRealmTimers(
      *  `armedBytes` because a fired body has left the table's id space — it can no longer
      *  be cleared or re-armed — while its bytes are still this realm's. */
     let firingBytes = 0;
-    /** Fired invocations still outstanding. The clock is charged for the ONE period any of
-     *  them is open rather than per invocation: a serialized realm is occupied once. */
-    let firing = 0;
-    /** Banked clock, in ms. Capped at one invocation, so an idle app's deadline fires the
-     *  moment it comes due; floored at minus the same, so one long fire cannot mortgage the
+    /** Banked execution, in ms. Capped at one invocation, so an idle app's deadline fires the
+     *  moment it comes due; floored at minus the same, so one costly root cannot mortgage the
      *  table past `budgetMs * clockDivisor`. An unbudgeted realm banks `Infinity`. */
     let credit = budgetMs;
     let creditAt = monotonicMs();
     /** A realm that can run nothing has no clock to share, and pacing it would only spin a
      *  slip loop against invocations already late when the queue admits them. */
     const paced = budgetMs > 0;
-    /** Spend the period since the last reading at the wall's own rate while busy, and earn it
-     *  back at `1 / clockDivisor` throughout — so an always-busy table settles at exactly that
-     *  share. Called BEFORE each transition, so a period is charged in the mode it ran in. */
+    /** Earn at `1 / clockDivisor` in real time. Execution is debited separately by the
+     *  causal clock passed into a fire, so a root parked on I/O earns while it waits. */
     const accrue = (): void => {
         const now = monotonicMs();
         const elapsed = now - creditAt;
         creditAt = now;
         if (!(elapsed > 0)) return;
-        credit += elapsed / clockDivisor - (firing > 0 ? elapsed : 0);
+        credit += elapsed / clockDivisor;
         credit = Math.max(-budgetMs, Math.min(budgetMs, credit));
     };
+    const newCausalClock = (): CausalClock => ({
+        charge(ms) {
+            if (!(Number.isFinite(ms) && ms > 0)) return;
+            accrue();
+            credit = Math.max(-budgetMs, credit - ms);
+        },
+    });
     const clear = (id: number) => {
         const entry = live.get(id);
         if (entry !== undefined) {
@@ -280,20 +283,16 @@ export function createRealmTimers(
                 live.delete(id);
                 armedBytes -= entry.bodyBytes;
                 firingBytes += entry.bodyBytes;
-                firing += 1;
                 let released = false;
                 const release = () => {
                     if (released) return;
                     released = true;
                     firingBytes -= entry.bodyBytes;
-                    // The busy period ends where the byte custody does: at the answer.
-                    accrue();
-                    firing -= 1;
                 };
                 let handed: Promise<unknown> | void;
                 // A fire that throws, or that carried the body nowhere, ends its custody in
                 // this turn rather than waiting for an answer nobody promised.
-                try { handed = fire(body); } catch { handed = undefined; }
+                try { handed = fire(body, newCausalClock()); } catch { handed = undefined; }
                 if (handed) void handed.then(release, release);
                 else release();
             };
@@ -306,9 +305,8 @@ export function createRealmTimers(
             for (const { timer } of live.values()) clearTimeout(timer);
             live.clear();
             armedBytes = 0;
-            // `firingBytes` and an open busy period drain on their own: disposal settles every
-            // invocation still in flight (realm-queue.ts), and each fired body releases as its
-            // answer lands.
+            // `firingBytes` drains on its own: disposal settles every invocation still in
+            // flight (realm-queue.ts), and each fired body releases as its answer lands.
         },
     };
 }
@@ -544,17 +542,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  standing when it fires (a transport handover replaces it while the slot stays). */
     const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: LoadBundleOptions): AppSlot => {
         let slot: AppSlot;
-        const timers = createRealmTimers((body) =>
+        const timers = createRealmTimers((body, causalClock) =>
             // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
             // an event the host delivers into the guest, not a host authority. The body is
             // already framed — the HOST's caller id followed by what `timer/arm` supplied,
             // built once by the table that retains it; event framing above that belongs to
             // the guest whose `handle` reads it. A guest's `handle` may throw on it; there
             // is no caller left to reject — the arming call returned turns ago — so report
-            // and swallow. Returned rather than discarded: the table holds this body's
-            // charge, and the clock it is spending, until the invocation settles, and a slot
-            // whose realm is already gone releases both now by answering nothing.
-            slot.realm?.call(body).catch((err: unknown) => {
+            // and swallow. Returned rather than discarded: the table holds this body's byte
+            // charge until the invocation settles. Its causal clock is separate and follows
+            // every descendant call, including work that outlives this top-level answer; a
+            // slot whose realm is already gone releases the body now by answering nothing.
+            slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             }),
             // Banked against THIS slot's ceiling, not the node's default.
@@ -656,7 +655,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // may be installed before its service, and a later load may replace that
                 // service — a claimant captured at seam construction would pin this realm
                 // to whoever was there first.
-                calls: { call: (id, payload, deadlineMs) => callClaimant(localClaims, id, callerId, payload, deadlineMs) },
+                calls: { call: (id, payload, deadlineMs, causalClock) =>
+                    callClaimant(localClaims, id, callerId, payload, deadlineMs, causalClock) },
                 rawNet: links ? netHost?.rawNet() : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
@@ -686,8 +686,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
      *  prefix, never the guest's own spelling. The null arm is reachable only from guest
      *  top-level code while its candidate realm is still being constructed. */
-    const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number) => slot.realm
-        ? slot.realm.call(input, deadlineMs)
+    const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => slot.realm
+        ? slot.realm.call(input, deadlineMs, causalClock)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
     /** Chain a host-initiated call onto `inFlight`, so `close()` waits for it rather than
      *  freeing the realm out from under it (§12.3). */
@@ -749,26 +749,29 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     /** Frame `[attribution ‖ payload]` and enter a slot's guest — the shape both a
      *  cross-realm call and a peer-inbound frame arrive as (`callClaimant`,
      *  `deliverInbound`). */
-    const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> => {
+    const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array,
+        deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> => {
         const input = new Uint8Array(attribution.length + payload.length);
         input.set(attribution, 0);
         input.set(payload, attribution.length);
-        return callSlot(slot, input, deadlineMs);
+        return callSlot(slot, input, deadlineMs, causalClock);
     };
     /** Hand a request to the realm claiming `claim` in `book`. `null` when nothing claims
      *  it — an answer, rather than a promise no one will settle. */
-    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null => {
+    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array,
+        payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
         const slot = book.get(claim);
-        return slot ? callFramed(slot, attribution, payload, deadlineMs) : null;
+        return slot ? callFramed(slot, attribution, payload, deadlineMs, causalClock) : null;
     };
     /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
      *  on `peerClaims`, so a `services` claim is unreachable by a peer by construction
      *  rather than by a second test against the slot's manifest. The resolved answer also
      *  goes to the slot's `onInbound`, if its load named one. */
-    const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null => {
+    const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array,
+        deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
         const slot = peerClaims.get(claim);
         if (!slot) return null;
-        const answer = callFramed(slot, attribution, payload, deadlineMs);
+        const answer = callFramed(slot, attribution, payload, deadlineMs, causalClock);
         if (slot.onInbound) {
             const onInbound = slot.onInbound;
             // Two-arg `.then`, not a bare call plus a stray `.catch`: this branch's own

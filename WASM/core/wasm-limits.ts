@@ -55,10 +55,11 @@ export const DEFAULT_MAX_APP_SLOTS = 8;
 
 /** One realm's clock share for fresh invocation roots the guest creates ITSELF (§12.3).
  *  Calls descended from existing work inherit its absolute deadline; a fired timer starts
- *  a new one and can re-arm its successor forever. Metered by `createRealmTimers`
- *  (shell-core.ts). Twice the slot count keeps those self-created roots to half the clock
- *  in steady state after the initial bank. It does not cap the rate of peer- or host-created
- *  roots and is therefore not a node-wide CPU total. */
+ *  a new one and can re-arm its successor forever. `createRealmTimers` gives that root a
+ *  causal clock which follows continuations and cross-realm descendants, debiting measured
+ *  execution rather than I/O wait. Twice the slot count keeps those self-created roots to
+ *  half a CPU in steady state after the initial bank. It does not cap the rate of peer- or
+ *  host-created roots and is therefore not a node-wide CPU total. */
 export const SELF_INITIATED_CLOCK_DIVISOR = 2 * DEFAULT_MAX_APP_SLOTS;
 
 /** Default ceiling on a module's declared linear memory, applied at the shared admission

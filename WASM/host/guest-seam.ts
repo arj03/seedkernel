@@ -6,6 +6,7 @@ import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
+import type { CausalClock } from "./realm-queue.js";
 
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
@@ -36,7 +37,7 @@ export interface SeamCrypto {
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
 export interface SeamCalls {
-    call(id: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
+    call(id: string, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null;
 }
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
@@ -62,7 +63,7 @@ export interface RawNet {
      *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
      *  frame, since a realm serializes its invocations. The caller must therefore fire this
      *  and return from its event rather than await it inside one. */
-    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
+    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -154,6 +155,9 @@ export interface CallBudget {
     remainingMs: number;
     /** Bill `ms` of host-side CPU to that segment. */
     charge(ms: number): void;
+    /** The self-initiated root this call descends from, if any. Propagated across realm
+     * calls so the root pays for execution in every callee, never for time awaiting it. */
+    causalClock?: CausalClock;
 }
 
 /** The host half of `host.call`. EVERY name answers a Promise — the seam is async,
@@ -501,7 +505,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         "link/deliver": (payload, budget) => {
             const attrAt = 1 + payload[0];
             const bodyAt = attrAt + HOST_CALLER_ID.length;
-            return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt), budget?.remainingMs);
+            return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt), budget?.remainingMs, budget?.causalClock);
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {
@@ -570,7 +574,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         if (localServices.has(name)) {
             if (budget !== undefined && budget.remainingMs <= 0)
                 throw new Error("guest-seam: execution budget exhausted before " + name);
-            const answer = grants.calls.call(name, payload, budget?.remainingMs);
+            const answer = grants.calls.call(name, payload, budget?.remainingMs, budget?.causalClock);
             if (!answer)
                 throw new Error("guest-seam: no realm claims " + name);
             return answer;

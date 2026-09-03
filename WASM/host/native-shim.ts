@@ -10,7 +10,7 @@ import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { createHandoffDeadlines, serializeCalls } from "./realm-queue.js";
+import { createHandoffDeadlines, serializeCalls, type CausalClock } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -66,13 +66,15 @@ declare const bridge: {
   stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
               maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
-  /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
-   *  later turn (the `__deferred` marker), 0 otherwise. */
+  /** Invoke the realm's one `handle` entrypoint and report both queue transfer and the
+   *  execution charged to this causal turn. */
   realmCall(realm: number, payload: Uint8Array, callId: number,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
-            deadlineMs: number): number;
+            deadlineMs: number): { deferred: boolean; elapsedNs: number };
   realmCancel(realm: number, callId: number): void;
-  realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
+  /** Settle one guest host.call and drain the continuation it made runnable. Returns the
+   *  execution time of that causal turn in nanoseconds. */
+  realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): number;
   realmDispose(realm: number): void;
 };
 
@@ -398,9 +400,16 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     const handoffDeadlines = createHandoffDeadlines();
     // Go mints the handle, but createRealm runs the guest's top-level code before returning
     // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
-    // because settling is a HOST-realm microtask and Go pumps only between turns, never
-    // inside a bridge call, so no settlement can precede the assignment below (§12.3).
+    // because settlement is a HOST-realm microtask, and that realm is not pumped from
+    // inside bridge.createRealm, so none can precede the assignment below (§12.3).
     let realm = 0;
+    let currentCausalClock: CausalClock | undefined;
+    const withCausalClock = <T>(causalClock: CausalClock | undefined, fn: () => T): T => {
+        const previous = currentCausalClock;
+        currentCausalClock = causalClock;
+        try { return fn(); }
+        finally { currentCausalClock = previous; }
+    };
     // Go supplies the live segment remainder because it owns this realm's execution
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
@@ -411,7 +420,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
+            causalClock: currentCausalClock,
         };
+        const causalClock = currentCausalClock;
         if (budget.remainingMs <= 0)
             throw new Error("guest: handoff deadline exhausted before host.call");
         // A synchronous throw is a refused NAME, which fails at the guest's call site
@@ -419,10 +430,15 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         const answer = hostCall(name, new Uint8Array(payload), budget);
         // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
         // by the same arm and neither can follow the other (realm-queue.ts).
+        const settle = (bytes: Uint8Array | null, error: string | null): void =>
+            withCausalClock(causalClock, () => {
+                const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
+                causalClock?.charge(elapsedNs / 1_000_000);
+            });
         void handoffDeadlines.race(budget.remainingMs, answer,
             "guest: host.call handoff deadline exceeded").then(
-            (bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null),
-            (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)),
+            (bytes: Uint8Array) => settle(bytes, null),
+            (e: unknown) => settle(null, errMessage(e)),
         );
         return null;
     };
@@ -437,7 +453,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         // contract (realm-queue.ts) is what keeps the two targets from differing about
         // when a second entrypoint may begin.
         call: serializeCalls(
-            (payload: Uint8Array, handoffDeadlineMs: number) => {
+            (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
                 // The executor runs synchronously, so `deferred` carries Go's answer by
                 // the time the return statement reads it.
                 invocationSeq++;
@@ -446,10 +462,13 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                 const callId = invocationSeq;
                 let deferred = false;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    deferred = bridge.realmCall(realm, payload, callId,
+                    const report = withCausalClock(causalClock, () => bridge.realmCall(
+                        realm, payload, callId,
                         (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
                         (msg: string) => reject(new Error(msg)),
-                        handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs) === 1;
+                        handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
+                    deferred = report.deferred;
+                    causalClock?.charge(report.elapsedNs / 1_000_000);
                 });
                 return {
                     result,

@@ -113,11 +113,13 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		}
 		callID := t.Args()[2].Int64()
 		deadlineMs := t.Args()[5].Int64()
-		deferred := 0
-		if g.call(callID, payload, t.Args()[3], t.Args()[4], deadlineMs) {
-			deferred = 1
-		}
-		return t.Context().NewInt64(int64(deferred)), nil
+		deferred, elapsed := g.call(callID, payload, t.Args()[3], t.Args()[4], deadlineMs)
+		// Preserve sub-millisecond segments: the timer meter is a rate bound, so rounding
+		// every short turn down to zero would make a fast re-arm loop free.
+		report := t.Context().NewObject()
+		report.SetPropertyStr("deferred", t.Context().NewBool(deferred))
+		report.SetPropertyStr("elapsedNs", t.Context().NewInt64(elapsed.Nanoseconds()))
+		return report, nil
 	}))
 	b.SetPropertyStr("realmCancel", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]
@@ -134,32 +136,27 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		// outlives an uninstall.
 		g := realms[t.Args()[0].Int64()]
 		if g == nil {
-			return nil, nil
+			return t.Context().NewInt64(0), nil
 		}
 		callID := t.Args()[1].Int64()
 		if _, live := g.hostCalls[callID]; !live {
-			return nil, nil
+			return t.Context().NewInt64(0), nil
 		}
 		if t.Args()[2].IsNull() || t.Args()[2].IsUndefined() {
-			g.settleNet(callID, nil, t.Args()[3].String())
-			return nil, nil
+			return t.Context().NewInt64(g.settleNet(callID, nil, t.Args()[3].String()).Nanoseconds()), nil
 		}
 		resultBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
 		if err != nil {
-			g.settleNet(callID, nil, "net result not bytes")
-			return nil, nil
+			return t.Context().NewInt64(g.settleNet(callID, nil, "net result not bytes").Nanoseconds()), nil
 		}
 		if err := g.reserveHostCall(callID, resultBytes); err != nil {
-			g.settleNet(callID, nil, err.Error())
-			return nil, nil
+			return t.Context().NewInt64(g.settleNet(callID, nil, err.Error()).Nanoseconds()), nil
 		}
 		bytes, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
-			g.settleNet(callID, nil, "net result not bytes")
-			return nil, nil
+			return t.Context().NewInt64(g.settleNet(callID, nil, "net result not bytes").Nanoseconds()), nil
 		}
-		g.settleNet(callID, bytes, "")
-		return nil, nil
+		return t.Context().NewInt64(g.settleNet(callID, bytes, "").Nanoseconds()), nil
 	}))
 	b.SetPropertyStr("realmDispose", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
@@ -336,15 +333,15 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 // onDone/onFail settle the shim's Promise when the entrypoint's own promise settles. It
 // reports synchronously whether the entrypoint DEFERRED its answer, which tells the shim's
 // queue the realm is free again even though nothing has settled.
-func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) bool {
+func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) (bool, time.Duration) {
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
 		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
-		return false
+		return false, 0
 	}
 	if _, duplicate := g.calls[id]; duplicate {
 		g.reportCall(onFail.Dup(), g.hostQc.NewString("guest: duplicate live realm invocation id"))
-		return false
+		return false, 0
 	}
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
 	argV := g.qc.NewArrayBuffer(payload)
@@ -377,9 +374,13 @@ func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, d
 			defer c.free()
 			g.reportCall(c.onFail, g.hostQc.NewString(err.Error()))
 		}
-		return false
+		return false, g.consumed
 	}
-	return deferred
+	// Drain every runnable continuation before returning to the host realm. Besides
+	// advancing Promise.resolve chains in this turn, this keeps the causal clock that
+	// entered through bridge.realmCall on the stack while descendant host calls are made.
+	g.pump()
+	return deferred, g.consumed
 }
 
 // within runs one entry into the realm under the execution budget: it opens a clock
@@ -517,16 +518,17 @@ func (g *guestRealm) releaseHostCall(callID int64) {
 }
 
 // settleNet resolves or rejects the guest Promise parked under callID when the host
-// realm's Transport promise settles (`bytes` fulfils, `msg` rejects); the loop's next
-// pump runs the awaiting continuation.
-func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
+// realm's Transport promise settles (`bytes` fulfils, `msg` rejects), then drains the
+// awaiting continuation before returning its execution time to the bridge.
+func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Duration {
 	if _, parked := g.hostCalls[callID]; !parked {
-		return
+		return 0
 	}
 	defer g.releaseHostCall(callID)
 	if g.checkAlive() != nil {
-		return // the realm the continuation belonged to no longer exists
+		return 0 // the realm the continuation belonged to no longer exists
 	}
+	before := g.consumed
 	var res *qjs.Value
 	var err error
 	if bytes != nil {
@@ -556,6 +558,11 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
 			g.settleAll(fmt.Sprintf("guest realm failed delivering a net result: %v", err))
 		}
 	}
+	// `__netResolve` queues the awaiting continuation. Run it now rather than in the
+	// loop's anonymous guest pump, so bridge.realmSettle can report its execution to the
+	// same causal root and any host.call it creates inherits that root synchronously.
+	g.pump()
+	return g.consumed - before
 }
 
 // takeCall consumes an in-flight initiator call, so a duplicate settlement is a no-op.

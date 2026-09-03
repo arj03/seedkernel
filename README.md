@@ -142,11 +142,11 @@ The reference composition stacks the layers so each depends only on the layers b
 - **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the host and is still an ordinary bundle.
 - **Not-core is not the same as replaceable.** The bundle verifier, the guest seam and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
 - The host's dispatch does exactly one thing: resolve the protocol to an app and invoke its guest. No built-in policies, I/O, or dispatch loop beyond the seam it is handed. Lower layers gate higher layers; each layer sees only downward.
-- Untrusted code is **bounded** as well as confined. A WASM module declares its linear-memory ceiling in the module bytes and the loader reads it there, before instantiating, refusing anything unbounded or over budget; a JS guest runs under a heap cap and an operator-set execution/handoff deadline (5 s by default), enforced on every target by QuickJS's interrupt handler. The deadline starts before realm queueing and crosses every `host.call` as the initiating owner's live remainder, so parking or deferring cannot mint time. A module that burns that remainder is killed at the engine and answered empty, exactly as a trap is (§4.3, §14).
-- **Boundedness has three laws, because three quantities compose differently:**
-  - **Retained space — continuous custody.** Every host-side byte caused by untrusted input is charged to a finite owner from creation until destruction. A handoff reserves in the receiver before releasing the sender; a bound on the number of owners makes the node's memory total a sum that is checked against a real machine.
+- **Confinement and boundedness answer different questions.** Confinement restricts what downloaded code can reach: a guest receives only its wired capabilities. Boundedness restricts what work admitted from that guest can consume. The executors have outer limits—a WASM module must declare an acceptable linear-memory ceiling, and a JS realm has a heap cap—but those limits alone do not bound the calls, queues, buffers, and descendant work created when the code runs.
+- **Every invocation creates a causal work tree.** A peer or the host may trigger admission, but the receiving runtime creates the root and assigns its bounded deadline; a guest can create a fresh root only through a timer. Calls across host services, modules, queues, and other realms are descendants of that root. Three quantities in the tree compose differently and therefore need three separate laws:
+  - **Retained space — continuous custody.** Every host-side byte caused by admitted work is charged to a finite owner from creation until destruction. A handoff reserves in the receiver before releasing the sender; a bound on the number of owners makes the node's memory total a sum that is checked against a real machine.
   - **Causal lifetime — a monotone deadline.** One absolute deadline starts at an invocation root and can only shrink as calls cross queues, realms, modules and socket output. A callee cannot mint time by parking or handing work onward.
-  - **Initiation rate — explicit scheduling.** A bound on bytes or work in flight says nothing about how quickly completed work can be replaced. A timer fire is the one fresh invocation root a guest can create for itself, so those roots draw from a per-realm clock share. Peer- and host-initiated roots remain bounded per invocation, not in aggregate; the runtime makes no node-wide CPU guarantee (§12.3, §12.6).
+  - **Initiation rate — explicit scheduling.** A bound on bytes or work in flight says nothing about how quickly completed work can be replaced. A timer fire is the one fresh root a guest can create for itself, so it receives a causal clock carried through continuations, modules, and cross-realm descendants. That root spends measured execution, not time parked on I/O, from a per-realm share; returning without awaiting a child does not make the child free. Roots supplied externally remain bounded individually, not in aggregate; the runtime makes no node-wide CPU guarantee (§12.3, §12.6).
 - Node-to-node links are confidential by default — the transport bundle opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket and WebRTC and needing no external TLS or Noise tunnel.
 - The channel authenticates one hop, not the whole path. An app that **relays** messages through intermediaries cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top. Bundles already work this way, which is why they need no channel at all.
 - Modules are private slot values, not a shell namespace. JS may use a map and native an opaque Go handle, but neither is part of routing or the shell API (§3).
@@ -155,14 +155,14 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,422 LOC)**
+**Shared — compiled once, run by all three targets (2,435 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 511 |
-| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 329 |
-| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 503 |
-| Shell, node assembly and claim routing (§12.9, §12.10) | `host/shell-core.ts` | 477 |
+| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 331 |
+| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 508 |
+| Shell, node assembly and claim routing (§12.9, §12.10) | `host/shell-core.ts` | 483 |
 | Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/peer-addr.ts`, `host/op-frame.ts` | 315 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id and the host-call names | `core/*.ts` (7 files) | 287 |
 
@@ -177,8 +177,8 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, manifest-verifier plumbing, entry points, key derivation | 1,512 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (427) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,159 Go + 520 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, manifest-verifier plumbing, entry points, key derivation | 1,539 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (444) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,158 Go + 537 TS |
 
 What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it reaches the driver as a `RawLink` through the one `ChannelFactory` seam, and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,499 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 

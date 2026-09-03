@@ -17,6 +17,7 @@ import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
+import type { CausalClock } from "./realm-queue.js";
 import { OpArgs } from "./op-frame.js";
 
 const EMPTY = new Uint8Array(0);
@@ -37,7 +38,8 @@ export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
 /** The claim routing a `link/deliver` call is handed to (§12.10). `null` for a claim no
  *  peer may reach. Inbound attributed delivery costs no grant beyond `link` itself: the
  *  occupant that saw the plaintext is the one that attributes it. */
-export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> | null;
+export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array,
+  deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
   /** Network isolation key; absent selects the public network (§12.6.3). */
@@ -338,9 +340,9 @@ export class TransportHost {
       // further grant — the occupant names no link here, and it already chose all three of
       // these arguments. A claim no peer may reach and a handler that threw both answer
       // EMPTY, so refusal and silence are one fact at this boundary.
-      deliver: (claim, attribution, payload, deadlineMs) => {
+      deliver: (claim, attribution, payload, deadlineMs, causalClock) => {
         if (!bound() || !this.deliver) return Promise.resolve(EMPTY);
-        const answer = this.deliver(claim, attribution, payload, deadlineMs);
+        const answer = this.deliver(claim, attribution, payload, deadlineMs, causalClock);
         if (!answer) return Promise.resolve(EMPTY);
         return answer.then((bytes) => bytes ?? EMPTY, () => EMPTY);
       },

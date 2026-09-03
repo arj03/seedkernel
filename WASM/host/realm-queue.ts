@@ -78,6 +78,13 @@ export interface Invocation {
   cancel?(reason: Error): void;
 }
 
+/** The clock owner of one causally-related tree of work. A timer fire mints one and
+ * realms carry it through every continuation and cross-realm call. Waiting costs
+ * nothing; only a realm execution segment or module burn calls `charge`. */
+export interface CausalClock {
+  charge(ms: number): void;
+}
+
 /** Monotonic milliseconds. A deadline here is the distance between two readings, so a wall
  *  clock is the wrong source: a step backwards expires every live one at once and a step
  *  forwards extends them all. Node, Bun and the browsers answer natively; the native host
@@ -145,13 +152,13 @@ export function createHandoffDeadlines(): {
  * derived from those bounded callers rather than capped by an unrelated number here. The
  * absolute deadline covers queue wait, guest execution, and a deferred answer. */
 export function serializeCalls(
-  invoke: (payload: Uint8Array, deadlineMs: number) => Invocation,
+  invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
   notReady: () => Error | null,
   defaultDeadlineMs = DEFAULT_GUEST_DEADLINE_MS,
-): (payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> {
+): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";
   let tail: Promise<unknown> = Promise.resolve();
-  return (payload, suppliedDeadlineMs) => {
+  return (payload, suppliedDeadlineMs, causalClock) => {
     const admissionError = notReady();
     if (admissionError) return Promise.reject(admissionError);
 
@@ -171,7 +178,7 @@ export function serializeCalls(
       if (monotonicMs() >= at) throw new Error(LATE);
       const err = notReady();
       if (err) throw err;
-      invocation = invoke(payload, at === Infinity ? Infinity : Math.max(0, at - monotonicMs()));
+      invocation = invoke(payload, at === Infinity ? Infinity : Math.max(0, at - monotonicMs()), causalClock);
       return invocation;
     });
     tail = Promise.race([started.then((inv) => inv.released), rejects]).catch(() => {});
