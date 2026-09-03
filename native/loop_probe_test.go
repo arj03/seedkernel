@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -97,5 +98,31 @@ func TestHostClockIsSubMillisecond(t *testing.T) {
 	})()`)
 	if got != "fractional" {
 		t.Fatalf("performance.now() moves in %s; host-service compute would meter as zero", got)
+	}
+}
+
+// TestAwaitIgnoresStaleSettle covers the one way a finished await can still reach into the
+// next one. __settle is installed per context and outlives the await that wrote it, and the
+// loop's timer heap is shared across awaits — so the promise of a timed-out call can resolve
+// during a *later* await and, before awaitGen tokens, would settle that await with the
+// previous call's result. The first await here abandons a 300ms promise after 60ms; the
+// second runs long enough (500ms) for that promise to land inside it.
+func TestAwaitIgnoresStaleSettle(t *testing.T) {
+	ensureBooted(t)
+
+	kind, _, _, err := el.await(`(new Promise(r => setTimeout(() => r(new Uint8Array([7])), 300)))`, 60*time.Millisecond)
+	if err != nil {
+		t.Fatal("abandoned await:", err)
+	}
+	if kind != 2 {
+		t.Fatalf("first await: kind=%d, want 2 (timed out)", kind)
+	}
+
+	kind, value, msg, err := el.await(`(new Promise(r => setTimeout(() => r(new Uint8Array([1])), 500)))`, 5*time.Second)
+	if err != nil || kind != 0 {
+		t.Fatalf("second await: kind=%d msg=%q err=%v", kind, msg, err)
+	}
+	if len(value) != 1 || value[0] != 1 {
+		t.Fatalf("second await settled with %v — the abandoned await's result leaked into it", value)
 	}
 }
