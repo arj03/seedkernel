@@ -663,6 +663,47 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   releaseWait();
   waiting.clearAll();
 
+  // Host compute is execution too, and it is the half no guest segment is open to see: a
+  // body that only calls host services parks between every one of them. The seam times the
+  // SYNCHRONOUS span of each handler, so libsodium's work lands on the root while an I/O
+  // name — whose promise is already back — bills nothing, and there is no list of which
+  // names are which. A verify that FAILS still did the work, hence the measurement is in
+  // `finally`: otherwise a re-arm loop of deliberately bad signatures would be free.
+  {
+    const burnMs = 15;
+    const burningSodium = Object.create(sodium);
+    burningSodium.crypto_sign_verify_detached = (...args) => {
+      const started = performance.now();
+      while (performance.now() - started < burnMs) { /* libsodium is working */ }
+      return sodium.crypto_sign_verify_detached(...args);
+    };
+    const identity = sodium.crypto_sign_keypair();
+    const seam = createGuestSeam({
+      platform: { sodium: burningSodium, identity, now: () => Date.now(), peers: () => [] },
+      grants: {
+        names: ALL_HOST_SERVICES, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS,
+        signScope: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },
+      },
+      modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
+    });
+    const meter = () => {
+      let charged = 0;
+      return { budget: { remainingMs: 5_000, charge() {}, causalClock: { charge(ms) { charged += ms; } } },
+        spent: () => charged };
+    };
+    // 96 bytes is the fixed prefix: a garbage pk and sig over an empty message, which the
+    // handler runs to completion before answering [0].
+    const cpu = meter();
+    ok((await seam("node/verify", new Uint8Array(96), cpu.budget))[0] === 0,
+      "a bad signature answers [0] rather than throwing");
+    ok(cpu.spent() >= burnMs,
+      `a host-service call bills its compute to the causal root (${cpu.spent().toFixed(1)}ms >= ${burnMs}ms)`);
+    const io = meter();
+    await seam("fs/get", new TextEncoder().encode("absent"), io.budget);
+    ok(io.spent() < burnMs / 2,
+      `a host name that round-trips bills only its dispatch (${io.spent().toFixed(1)}ms)`);
+  }
+
   // The inverse escape is returning before descendant work: await once (so lineage must
   // survive settlement), call a second realm without awaiting it, and let that callee
   // launch module-like work without awaiting that either. The late charge must still land

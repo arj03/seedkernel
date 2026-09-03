@@ -1,6 +1,9 @@
 package qjs
 
-import "errors"
+import (
+	"errors"
+	"math"
+)
 
 // Context is a QuickJS execution context bound to a Runtime.
 type Context struct {
@@ -97,6 +100,12 @@ func (c *Context) NewInt32(v int32) *Value {
 	return c.callV("QJS_NewInt32", c.handle, uint64(uint32(v)))
 }
 func (c *Context) NewInt64(v int64) *Value { return c.callV("QJS_NewInt64", c.handle, uint64(v)) }
+
+// NewFloat64 makes a JS number carrying the full double. The shim takes the bits rather
+// than an f64 so the flat QJS_* ABI stays integer-only across the wasm boundary.
+func (c *Context) NewFloat64(v float64) *Value {
+	return c.callV("QJS_NewFloat64", c.handle, math.Float64bits(v))
+}
 
 func (c *Context) NewString(s string) *Value {
 	ptr := c.rt.writeCStr(s)
@@ -390,16 +399,20 @@ func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
 }
 
 // Pump runs the QuickJS job queue (microtasks and settled-promise reactions) to
-// completion. QJS_Eval calls js_std_loop after evaluating, and since the loader supplies
-// Go-backed timers there are no os timers to wait on, so it drains the pending jobs and
-// returns immediately. The event loop calls this after every re-entry into JS so promise
-// chains advance. Verified by TestQjsPumpModel.
+// completion, and reports whether a job left an exception standing. The loader supplies
+// Go-backed timers, so there are no os timers to wait on and this returns as soon as the
+// queue is empty. The event loop calls it after every re-entry into JS so promise chains
+// advance, and guest.go calls it once per invocation and per settlement to keep the causal
+// clock on the stack — a path hot enough that the drain is called directly rather than as
+// QJS_Eval's trailing side effect, which had to compile and run an expression first.
+// Verified by TestQjsPumpModel.
 func (c *Context) Pump() error {
-	v, err := c.Eval("<pump>", Code("0"))
-	if v != nil {
-		v.Free()
+	// js_std_loop answers JS_HasException: an int, so the same narrowing every other
+	// predicate export gets before it is read as a flag.
+	if int32(c.rt.call("js_std_loop", c.handle)) == 0 {
+		return nil
 	}
-	return err
+	return c.exception()
 }
 
 // JsTypedArrayToGo returns the bytes of a TypedArray/DataView/ArrayBuffer as an

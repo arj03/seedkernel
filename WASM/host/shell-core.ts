@@ -198,9 +198,10 @@ interface RealmTimers extends HostTimers {
  *  a bound on the node's clock, which external roots can occupy one bounded invocation after
  *  another.
  *
- *  Each fire mints a causal clock carried through guest continuations, module calls and
- *  cross-realm delivery. Those execution sites debit their measured burn; time parked on
- *  I/O costs nothing, and returning early cannot detach descendants from the root. */
+ *  Each fire mints a causal clock carried through guest continuations, host-service and
+ *  module calls, and cross-realm delivery. Those execution sites debit their measured burn;
+ *  time parked on I/O costs nothing, and returning early cannot detach descendants from the
+ *  root. */
 export function createRealmTimers(
     fire: (payload: Uint8Array, causalClock: CausalClock) => Promise<unknown> | void,
     max = DEFAULT_MAX_LIVE_TIMERS,

@@ -114,12 +114,16 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		callID := t.Args()[2].Int64()
 		deadlineMs := t.Args()[5].Int64()
 		deferred, elapsed := g.call(callID, payload, t.Args()[3], t.Args()[4], deadlineMs)
-		// Preserve sub-millisecond segments: the timer meter is a rate bound, so rounding
-		// every short turn down to zero would make a fast re-arm loop free.
-		report := t.Context().NewObject()
-		report.SetPropertyStr("deferred", t.Context().NewBool(deferred))
-		report.SetPropertyStr("elapsedNs", t.Context().NewInt64(elapsed.Nanoseconds()))
-		return report, nil
+		// Two facts, one number, because this is the dispatch path and an object would cost
+		// an allocation and two interned property writes per invocation. Nanoseconds, not
+		// milliseconds: the timer meter is a rate bound, so rounding every short turn down
+		// to zero would make a fast re-arm loop free. A duration this wide stays exact as a
+		// double for some 52 days of realm execution, well past any realm's lifetime.
+		report := elapsed.Nanoseconds() << 1
+		if deferred {
+			report |= 1
+		}
+		return t.Context().NewInt64(report), nil
 	}))
 	b.SetPropertyStr("realmCancel", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]

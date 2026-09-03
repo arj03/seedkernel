@@ -6,17 +6,19 @@ import (
 	"seedloader/qjs"
 )
 
-// TestQjsPumpModel is the gate for the whole no-rebuild async design. It verifies
-// the two facts the Go-owned event loop relies on:
+// TestQjsPumpModel is the gate for the whole Go-owned async design. It verifies the two
+// facts the event loop relies on:
 //
 //  1. Invoke (QJS_Call) does NOT run the job queue — a microtask queued during an
 //     invoked JS callback stays pending afterwards.
-//  2. Eval("0") DOES run the job queue (QJS_Eval calls js_std_loop), draining that
-//     pending microtask — and returns promptly (no os timers registered, so it
-//     does not block).
+//  2. Pump DOES run it, draining that pending microtask, and returns promptly: the
+//     loader registers no os timers, so js_std_loop has nothing to wait on.
 //
-// If (2) fails we cannot pump jobs from Go without rebuilding qjs.wasm to export
-// JS_ExecutePendingJob.
+// Pump reached the queue through QJS_Eval's trailing js_std_loop back when the engine
+// blob was vendored and its exports were not ours to choose. It calls js_std_loop
+// directly now (csrc/qjswasm.cmake), which is the same drain without compiling and
+// running an expression first — a cost every pump paid, and the loop pumps after every
+// re-entry into JS.
 func TestQjsPumpModel(t *testing.T) {
 	rt, err := qjs.New()
 	if err != nil {
@@ -40,15 +42,14 @@ func TestQjsPumpModel(t *testing.T) {
 	}
 	flagAfterInvoke := c.Global().GetPropertyStr("__flag").Int32()
 
-	// Pump: a trivial Eval runs js_std_loop, which drains pending jobs.
-	if _, err := c.Eval("pump.js", qjs.Code("0")); err != nil {
+	if err := c.Pump(); err != nil {
 		t.Fatal("pump:", err)
 	}
 	flagAfterPump := c.Global().GetPropertyStr("__flag").Int32()
 
-	t.Logf("flag after Invoke=%d, after Eval-pump=%d", flagAfterInvoke, flagAfterPump)
+	t.Logf("flag after Invoke=%d, after Pump=%d", flagAfterInvoke, flagAfterPump)
 	if flagAfterPump != 1 {
-		t.Fatalf("Eval-pump did not drain the queued microtask (flag=%d); the no-rebuild loop is not viable", flagAfterPump)
+		t.Fatalf("Pump did not drain the queued microtask (flag=%d); the Go-driven loop is not viable", flagAfterPump)
 	}
 }
 
@@ -71,5 +72,30 @@ func TestQjsAwaitsOsTimer(t *testing.T) {
 	}
 	if got := v.Int32(); got != 42 {
 		t.Fatalf("QJS_Eval did not await the os.setTimeout promise: got %d, want 42", got)
+	}
+}
+
+// The host realm's monotonic clock must answer FRACTIONAL milliseconds, as Node and the
+// browsers do. The guest seam meters host compute by the distance across one synchronous
+// handler (host/guest-seam.ts), and an ed25519 verify does not last a whole millisecond:
+// a truncating clock would read every one of them as free, and with it a timer re-arm
+// loop built out of them (§12.3). Nothing else fails if this regresses, so it is asserted
+// here rather than left to a pacing test that would still pass at zero.
+func TestHostClockIsSubMillisecond(t *testing.T) {
+	bootRealm(t)
+	// Two readings around a busy wait far shorter than a millisecond. Whole-ms truncation
+	// answers "0" for the difference on all but the unlucky reading that straddles a tick,
+	// so the loop retries: one fractional reading is proof, many zeroes are not.
+	got := evalString(t, `(() => {
+	  for (let attempt = 0; attempt < 100; attempt++) {
+	    const started = performance.now();
+	    while (performance.now() === started) { /* wait for the clock to move at all */ }
+	    const step = performance.now() - started;
+	    if (step > 0 && step < 1) return "fractional";
+	  }
+	  return "whole milliseconds";
+	})()`)
+	if got != "fractional" {
+		t.Fatalf("performance.now() moves in %s; host-service compute would meter as zero", got)
 	}
 }

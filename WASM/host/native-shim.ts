@@ -66,11 +66,12 @@ declare const bridge: {
   stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
               maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
-  /** Invoke the realm's one `handle` entrypoint and report both queue transfer and the
-   *  execution charged to this causal turn. */
+  /** Invoke the realm's one `handle` entrypoint. Answers both facts the queue needs as one
+   *  number — `elapsedNs * 2`, the execution charged to this causal turn, with the
+   *  `__deferred` marker in the low bit — so the dispatch path allocates nothing. */
   realmCall(realm: number, payload: Uint8Array, callId: number,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
-            deadlineMs: number): { deferred: boolean; elapsedNs: number };
+            deadlineMs: number): number;
   realmCancel(realm: number, callId: number): void;
   /** Settle one guest host.call and drain the continuation it made runnable. Returns the
    *  execution time of that causal turn in nanoseconds. */
@@ -417,12 +418,12 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
         // Go admitted this call before making the cross-realm copy. This adapter only
         // routes and settles; post-copy accounting here would be a second policy authority.
+        const causalClock = currentCausalClock;
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
-            causalClock: currentCausalClock,
+            causalClock,
         };
-        const causalClock = currentCausalClock;
         if (budget.remainingMs <= 0)
             throw new Error("guest: handoff deadline exhausted before host.call");
         // A synchronous throw is a refused NAME, which fails at the guest's call site
@@ -467,8 +468,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
                         (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
                         (msg: string) => reject(new Error(msg)),
                         handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
-                    deferred = report.deferred;
-                    causalClock?.charge(report.elapsedNs / 1_000_000);
+                    // `elapsedNs * 2 | deferred` — see the bridge declaration above.
+                    deferred = report % 2 === 1;
+                    causalClock?.charge(Math.floor(report / 2) / 1_000_000);
                 });
                 return {
                     result,

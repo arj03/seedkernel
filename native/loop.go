@@ -121,13 +121,15 @@ func (el *eventLoop) install() {
 	// A monotonic clock, beside the timers that answer to it. The kernel's handoff deadlines
 	// are distances between two readings (host/realm-queue.ts), which Date cannot supply:
 	// a clock step backwards would fire every live deadline at once and a step forwards
-	// would silently extend them. Resolution is the millisecond the deadlines are stated in
-	// — the same the wall clock gave — and the epoch is this process, which is all a
-	// distance needs. Node, Bun and the browsers answer this natively.
+	// would silently extend them. The epoch is this process, which is all a distance needs.
+	// FRACTIONAL milliseconds, as Node and the browsers answer: deadlines are stated in whole
+	// ones, but the seam meters host compute by the distance across one synchronous handler
+	// (host/guest-seam.ts), and truncating each of those to zero would make an ed25519
+	// verify — or a re-arm loop built out of them — free against the causal clock (§12.3).
 	epoch := time.Now()
 	perf := el.c.NewObject()
 	perf.SetPropertyStr("now", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewInt64(time.Since(epoch).Milliseconds()), nil
+		return t.Context().NewFloat64(float64(time.Since(epoch).Nanoseconds()) / 1e6), nil
 	}))
 	g.SetPropertyStr("performance", perf)
 	g.SetPropertyStr("setTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {

@@ -53,6 +53,10 @@ set_target_properties(qjswasm PROPERTIES
 
 target_link_options(qjswasm PRIVATE 
     "LINKER:--export=js_std_await"
+    # The job queue, drained on its own rather than as the side effect of evaluating a
+    # throwaway expression: the loop pumps after every re-entry into JS, and a compile plus
+    # eval per pump is the dispatch path's largest avoidable cost (qjs.go Pump).
+    "LINKER:--export=js_std_loop"
     "LINKER:--export=New_QJS"
     "LINKER:--export=New_QJSContext"
     "LINKER:--export=QJS_FreeValue"

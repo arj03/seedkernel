@@ -6,7 +6,7 @@ import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
-import type { CausalClock } from "./realm-queue.js";
+import { monotonicMs, type CausalClock } from "./realm-queue.js";
 
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
@@ -597,7 +597,28 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
             // (every crypto name, clock, link, timer) resolves in a microtask exactly like
             // a round-tripping one. An inline THROW propagates synchronously, on purpose —
             // see the contract above.
-            return Promise.resolve(fn(payload, budget));
+            //
+            // The SYNCHRONOUS span is host compute spent on this caller's behalf: libsodium
+            // runs ed25519, x25519 and the AEADs to completion before returning, while an
+            // I/O name returns its promise having done nothing. Measuring exactly that span
+            // bills the causal root (§12.3) for host CPU and leaves waiting free, with no
+            // second list of which names are which to keep in step with the catalog. In
+            // `finally` because an AEAD that rejects a bad tag has already done the whole
+            // open. Not `budget.charge`: this is the root's pacing share, not the calling
+            // realm's own execution segment (§4.3), which the host is not running inside.
+            //
+            // Only a timer root carries a clock, so the reading is skipped entirely for
+            // peer- and host-initiated work — which is every seam call the transport makes
+            // on the frame path, and the reason this measurement costs that path nothing.
+            const owner = budget?.causalClock;
+            if (owner === undefined)
+                return Promise.resolve(fn(payload, budget));
+            const at = monotonicMs();
+            try {
+                return Promise.resolve(fn(payload, budget));
+            } finally {
+                owner.charge(monotonicMs() - at);
+            }
         }
         // Any other name is one of THIS slot's private modules, by its manifest name. The
         // slot wired this value directly, so no name can reach another app. Ungated like
