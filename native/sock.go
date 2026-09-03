@@ -32,6 +32,10 @@ type netHost struct {
 	chans     map[int64]rawChannel
 	nextID    int64
 	listeners []net.Listener // bound listeners, closed on network teardown
+	// closed marks the host torn down with the realm that owned it (close). A reader
+	// parked on the staging allowance below is released by it rather than waiting for
+	// custody nothing is left to hand back.
+	closed bool
 
 	// Policy values installed by host/native-shim.ts before any socket is opened.
 	maxLiveChannels      int
@@ -208,9 +212,14 @@ func (n *netHost) reserveInboundRead(length int) bool {
 	if length < 0 || length > n.maxInboundReadBytes || n.maxInboundReadSlices <= 0 {
 		return false
 	}
-	for n.inboundReadSlices >= n.maxInboundReadSlices ||
-		length > n.maxInboundReadBytes-n.inboundReadBytes {
+	for !n.closed && (n.inboundReadSlices >= n.maxInboundReadSlices ||
+		length > n.maxInboundReadBytes-n.inboundReadBytes) {
 		n.waitSpace().Wait()
+	}
+	if n.closed {
+		// Torn down while parked: the loop this read was waiting to enter is gone, so the
+		// window will never open again and the only answer left is to refuse.
+		return false
 	}
 	n.inboundReadSlices++
 	n.inboundReadBytes += length
@@ -309,6 +318,31 @@ func (n *netHost) closeListeners() {
 	for _, ln := range lns {
 		ln.Close()
 	}
+}
+
+// close tears the whole network down with the realm that owned it: every listener (which
+// ends its accept goroutine and releases the fd) and every live channel (which ends its
+// reader and its writer). Without it a re-boot would leave the previous one's sockets
+// running against a freed QuickJS context, posting into an event loop nobody drains — the
+// engines shutdown() releases are only half of what a boot stands up.
+//
+// Hard, not graceful: the realm the flushed bytes were for is being freed, and onClose is
+// deliberately not fired for the same reason.
+func (n *netHost) close() {
+	n.closeListeners()
+	n.mu.Lock()
+	chans := n.chans
+	n.chans = map[int64]rawChannel{}
+	n.mu.Unlock()
+	// Before releasing the parked readers, so one that wakes finds its channel already dead
+	// and its fail() a no-op rather than a notification into the dying realm.
+	for _, ch := range chans {
+		ch.close(false)
+	}
+	n.mu.Lock()
+	n.closed = true
+	n.waitSpace().Broadcast()
+	n.mu.Unlock()
 }
 
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine

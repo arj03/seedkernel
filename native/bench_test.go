@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -28,10 +29,15 @@ func ensureBooted(tb testing.TB) {
 			return
 		}
 		benchDataDir = dir
-		if benchBootErr = boot(); benchBootErr != nil {
-			return
-		}
-		evalString(tb, "openStore("+jsonString(dir)+")")
+		// Standing on the sentinel until the realm is actually up: the helpers below report
+		// a failure with tb.Fatal, which unwinds THIS goroutine while leaving the Once done
+		// — so without it a later benchmark would find benchBootErr nil and run against a
+		// half-built realm.
+		benchBootErr = errors.New("the first benchmark to stand the realm up failed")
+		// The same standing-up every test does, harness included — a bench realm assembled
+		// its own way is the second assembly path this target exists not to have, and the
+		// one it drifted into left `teachAddr` undefined, which no benchmark could reach.
+		bootRealmIn(tb, dir)
 		cfg := nodeConfig{KeyHex: testKeyHex(tb)}
 		_, benchBootErr = startNode(cfg)
 	})

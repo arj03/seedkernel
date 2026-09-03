@@ -208,6 +208,25 @@ func evalString(tb testing.TB, expr string) string {
 	return v.String()
 }
 
+// awaitOK drives the loop until expr's promise settles and fails the test unless it
+// FULFILLED, returning the bytes it resolved with. Every test that awaits an expression
+// expected to succeed goes through here rather than el.await directly: a rejection comes
+// back from el.await as kind 1 with a nil error, so `if _, _, _, err := el.await(…); err
+// != nil` reads like a check and silently passes on the failure it was written to catch.
+// A test that asserts on a rejection or a timeout — the kind itself being the subject —
+// calls el.await and reads the kind (loop_probe_test.go).
+func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
+	tb.Helper()
+	kind, value, msg, err := el.await(expr, timeout)
+	if err != nil {
+		tb.Fatalf("%s: %v", what, err)
+	}
+	if kind != 0 {
+		tb.Fatalf("%s: kind=%d msg=%q", what, kind, msg)
+	}
+	return value
+}
+
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)

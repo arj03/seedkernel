@@ -66,3 +66,40 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 		t.Fatal("out-of-range window accepted")
 	}
 }
+
+// A view's byteOffset/byteLength/buffer are ordinary properties of an object the CALLER
+// supplies, and on the guest seam that caller is untrusted code. A property that cannot be
+// read as a number — or a getter that throws — must be refused, and must not leave the
+// exception standing for the next unrelated call in that realm to inherit as its own
+// failure.
+func TestJsTypedArrayToGoHostileProperties(t *testing.T) {
+	bootRealm(t)
+	for _, tc := range []struct{ name, src string }{
+		{"symbol offset", `({ buffer: new ArrayBuffer(8), byteOffset: Symbol("x"), byteLength: 4 })`},
+		{"throwing length", `({ buffer: new ArrayBuffer(8), byteOffset: 0, get byteLength() { throw new Error("boom"); } })`},
+		{"throwing buffer", `({ get buffer() { throw new Error("nope"); } })`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := qc.Eval("hostile-view-test.js", qjs.Code("("+tc.src+")"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer v.Free()
+			if b, err := qjs.JsTypedArrayToGo(v); err == nil {
+				t.Fatalf("JsTypedArrayToGo accepted it, returning %v", b)
+			}
+			if n, err := qjs.JsTypedArrayByteLength(v); err == nil {
+				t.Fatalf("JsTypedArrayByteLength accepted it, returning %d", n)
+			}
+			// The realm is still usable: the refusal took the exception with it.
+			r, err := qc.Eval("after-hostile-view.js", qjs.Code(`1 + 1`))
+			if err != nil {
+				t.Fatalf("the refusal poisoned the next call: %v", err)
+			}
+			defer r.Free()
+			if got := r.String(); got != "2" {
+				t.Fatalf("1 + 1 = %s", got)
+			}
+		})
+	}
+}

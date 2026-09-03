@@ -329,13 +329,16 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 // reports synchronously whether the entrypoint DEFERRED its answer, which tells the shim's
 // queue the realm is free again even though nothing has settled.
 func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) (bool, time.Duration) {
+	// Neither refusal below retains the callback past the report, so both hand reportCall
+	// the BORROWED argument: a Dup here would be a reference nothing is left to release
+	// (reportCall frees the argument value, never the callback).
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
-		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
+		g.reportCall(onFail, g.hostQc.NewString(err.Error()))
 		return false, 0
 	}
 	if _, duplicate := g.calls[id]; duplicate {
-		g.reportCall(onFail.Dup(), g.hostQc.NewString("guest: duplicate live realm invocation id"))
+		g.reportCall(onFail, g.hostQc.NewString("guest: duplicate live realm invocation id"))
 		return false, 0
 	}
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
@@ -548,7 +551,8 @@ func (g *guestRealm) takeCall(id int64) *initiatorCall {
 }
 
 // reportCall hands one result to a host-realm callback and releases the argument
-// (Invoke only borrows it).
+// (Invoke only borrows it). `cb` is BORROWED: an initiatorCall's callbacks outlive the
+// report and are released by its free(), so a caller that Dup'd one must free it itself.
 func (g *guestRealm) reportCall(cb *qjs.Value, arg *qjs.Value) {
 	res, err := g.hostQc.Invoke(cb, g.hostQc.NewUndefined(), arg)
 	arg.Free()

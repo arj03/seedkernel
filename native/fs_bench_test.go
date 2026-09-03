@@ -75,25 +75,25 @@ func BenchmarkNodeFsGet64K(b *testing.B) {
 // boundary out of the per-op number, exactly as the net benches do.
 
 func BenchmarkFsPutJS64K(b *testing.B) {
-	el := setupFsJS(b)
+	setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("__benchPut(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("__benchPut(%d)", b.N))
 	b.StopTimer()
 }
 
 func BenchmarkFsGetJS64K(b *testing.B) {
-	el := setupFsJS(b)
+	setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("__benchGet(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("__benchGet(%d)", b.N))
 	b.StopTimer()
 }
 
-// setupFsJS boots the shared shell, uses the process-wide benchmark data dir,
-// seeds one block, and returns the loop the benches drive. The seed put is itself an
-// awaited async call — `fs.put` returning a Promise is the whole point of the seam.
-func setupFsJS(b *testing.B) *eventLoop {
+// setupFsJS boots the shared shell, uses the process-wide benchmark data dir and seeds one
+// block, leaving __benchPut/__benchGet ready to run on the shared loop. The seed put is
+// itself an awaited async call — `fs.put` returning a Promise is the whole point of the seam.
+func setupFsJS(b *testing.B) {
 	ensureBooted(b)
 	// Do not re-point the process-wide realm at b.TempDir(): Go removes that directory
 	// when this benchmark ends, while later benchmarks still use the same store.
@@ -104,10 +104,7 @@ func setupFsJS(b *testing.B) *eventLoop {
 	`)); err != nil {
 		b.Fatal(err)
 	}
-	if kind, _, msg, err := el.await(`__benchPut(1)`, 8*time.Second); err != nil || kind != 0 {
-		b.Fatalf("seed put: kind=%d msg=%q err=%v", kind, msg, err)
-	}
-	return el
+	awaitOK(b, "seed put", `__benchPut(1)`, 8*time.Second)
 }
 
 // ── node-open index scan (FsBlobStore constructor: one ReadDir + N stats) ────

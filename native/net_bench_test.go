@@ -156,9 +156,9 @@ const netBenchHarness = `
 
 // setupNetBench stands up the harness in the shared benchmark realm: A's listeners are
 // bound inside __netSetup (makeTransportNode awaits start()), both nodes load the bench
-// app, and B is pointed at A's bound port. The returned loop drives
-// benchPingN/benchFetchN/benchUploadN.
-func setupNetBench(b *testing.B) *eventLoop {
+// app, and B is pointed at A's bound port, leaving benchPingN/benchFetchN/benchUploadN
+// ready to run on the shared loop.
+func setupNetBench(b *testing.B) {
 	ensureBooted(b)
 	// Once per REALM, not once per call. The realm is shared across benchmarks
 	// (ensureBooted) and the framework re-enters each benchmark to grow b.N, so a second
@@ -182,25 +182,16 @@ func setupNetBench(b *testing.B) *eventLoop {
 		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(src)); err != nil {
 			b.Fatal("harness:", err)
 		}
-		if kind, _, msg, err := el.await(`__netSetup`, 8*time.Second); err != nil || kind != 0 {
-			b.Fatalf("__netSetup: kind=%d msg=%q err=%v", kind, msg, err)
-		}
+		awaitOK(b, "__netSetup", `__netSetup`, 8*time.Second)
 	}
-	return el // already wired: listeners bound, app loaded, peer addressed
 }
 
-// benchAwait drives one JS request loop to completion and fails the bench if it rejects
-// (so a number is only ever reported for round-trips that actually succeeded). The
-// timeout scales with b.N as a safety net — it bounds a hang, not the real run.
-func benchAwait(b *testing.B, el *eventLoop, expr string) {
+// benchAwait drives one JS request loop to completion and fails the bench unless it
+// resolves (so a number is only ever reported for round-trips that actually succeeded).
+// The timeout scales with b.N as a safety net — it bounds a hang, not the real run.
+func benchAwait(b *testing.B, expr string) {
 	b.Helper()
-	kind, _, msg, err := el.await(expr, time.Duration(b.N)*5*time.Millisecond+10*time.Second)
-	if err != nil {
-		b.Fatal(err)
-	}
-	if kind != 0 {
-		b.Fatalf("%s rejected: %s", expr, msg)
-	}
+	awaitOK(b, expr, expr, time.Duration(b.N)*5*time.Millisecond+10*time.Second)
 }
 
 // BenchmarkGuestDispatch times ONE guest entrypoint invocation with no socket in the
@@ -210,27 +201,27 @@ func benchAwait(b *testing.B, el *eventLoop, expr string) {
 // floor a round-trip number is measured against: it says whether a regression is the
 // wire, the record layer, or the guest boundary.
 func BenchmarkGuestDispatch(b *testing.B) {
-	el := setupNetBench(b)
-	benchAwait(b, el, "benchLocalN(1)") // warmup: the realm is built lazily
+	setupNetBench(b)
+	benchAwait(b, "benchLocalN(1)") // warmup: the realm is built lazily
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("benchLocalN(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("benchLocalN(%d)", b.N))
 	b.StopTimer()
 }
 
 func BenchmarkNetRoundTrip(b *testing.B) {
-	el := setupNetBench(b)
-	benchAwait(b, el, "benchPingN(1)") // warmup: dial + PeerLink handshake (amortized out)
+	setupNetBench(b)
+	benchAwait(b, "benchPingN(1)") // warmup: dial + PeerLink handshake (amortized out)
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("benchPingN(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("benchPingN(%d)", b.N))
 	b.StopTimer()
 }
 
 func BenchmarkNetFetch64K(b *testing.B) {
-	el := setupNetBench(b)
+	setupNetBench(b)
 	b.SetBytes(blockBytes)
-	benchAwait(b, el, "benchFetchN(1)") // warmup
+	benchAwait(b, "benchFetchN(1)") // warmup
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("benchFetchN(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("benchFetchN(%d)", b.N))
 	b.StopTimer()
 }
 
@@ -240,10 +231,10 @@ func BenchmarkNetFetch64K(b *testing.B) {
 // dispatch) — the path a PUT hits at the holder, which no other bench exercises (Fetch
 // has A *send* the bulk and *receive* a tiny request).
 func BenchmarkNetUpload1M(b *testing.B) {
-	el := setupNetBench(b)
+	setupNetBench(b)
 	b.SetBytes(1 << 20)
-	benchAwait(b, el, "benchUploadN(1)") // warmup
+	benchAwait(b, "benchUploadN(1)") // warmup
 	b.ResetTimer()
-	benchAwait(b, el, fmt.Sprintf("benchUploadN(%d)", b.N))
+	benchAwait(b, fmt.Sprintf("benchUploadN(%d)", b.N))
 	b.StopTimer()
 }

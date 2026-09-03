@@ -78,13 +78,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 	}
 
 	// Bind A's listener (sets netA.port), then point B at A.
-	if _, _, _, err := el.await("(async () => { await __setup; globalThis.__nodeBApp = await __nodeB.shell.loadBundleBlob(__probe); await netA.start(); await __nodeA.shell.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
-		t.Fatal("start:", err)
-	}
+	awaitOK(t, "start", "(async () => { await __setup; globalThis.__nodeBApp = await __nodeB.shell.loadBundleBlob(__probe); await netA.start(); await __nodeA.shell.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second)
 	// Eval would block on the promise without advancing the event loop.
-	if _, _, _, err := el.await(`teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.port)`, 5*time.Second); err != nil {
-		t.Fatal("addr:", err)
-	}
+	awaitOK(t, "addr", `teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.port)`, 5*time.Second)
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and
 	// await the response. The await is the whole point — it suspends until the host

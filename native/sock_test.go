@@ -11,6 +11,7 @@ package main
 import (
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -496,5 +497,59 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 	c.mu.Unlock()
 	if !dead {
 		t.Fatal("the channel must be dead after close/fail")
+	}
+}
+
+// A reader parked on a full staging window is waiting for custody the event loop hands
+// back. Teardown means no loop, so nothing will ever hand it back: close() has to release
+// the reader with a refusal instead of leaving the goroutine parked for the process's life.
+func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
+	n := &netHost{chans: map[int64]rawChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	if !n.reserveInboundRead(4) {
+		t.Fatal("failed to occupy the test allowance")
+	}
+	answered := make(chan bool, 1)
+	go func() { answered <- n.reserveInboundRead(2) }()
+	select {
+	case <-answered:
+		t.Fatal("a read was admitted while the staging window was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	n.close()
+	select {
+	case admitted := <-answered:
+		if admitted {
+			t.Fatal("a read was admitted after teardown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close() left a reader parked on the staging window")
+	}
+	if n.reserveInboundRead(1) {
+		t.Fatal("a fresh read was admitted after teardown")
+	}
+}
+
+// boot() is documented as idempotent — each one releases the previous one's engines. The
+// network is not an engine but outlives one just as badly: a listener nothing closes keeps
+// its fd and its accept goroutine, and the readers behind it go on posting into an event
+// loop that no longer runs, against a QuickJS context that has been freed.
+func TestShutdownClosesTheNetwork(t *testing.T) {
+	before := runtime.NumGoroutine()
+	const boots = 3
+	for i := 0; i < boots; i++ {
+		bootRealm(t)
+		// Through __net itself, so the accept goroutine under test is the real one.
+		evalString(t, `String(__net.listen("127.0.0.1", 0))`)
+	}
+	shutdown()
+	// The accept goroutines end when Accept() returns ErrClosed, which is not synchronous
+	// with the Close() that causes it.
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("shutdown left %d goroutines running (%d before %d boots, %d after)",
+			after-before, before, boots, after)
 	}
 }

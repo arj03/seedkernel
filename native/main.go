@@ -38,6 +38,10 @@ var (
 	qrt    *qjs.Runtime
 	// el drives the host realm and every confined realm attached to it (loop.go).
 	el *eventLoop
+	// nh owns the listeners and sockets of the booted network (sock.go). Held here rather
+	// than only inside boot() because shutdown() has to close them: they outlive the realm
+	// otherwise, running against a context that is already gone.
+	nh *netHost
 )
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
@@ -64,7 +68,7 @@ func boot() error {
 	// primitives above, and its load-time Web globals come from host/native-polyfills.ts.
 	exposeSodium(qc, sd)
 	exposeFs(qc)
-	nh := exposeNet(qc, el)
+	nh = exposeNet(qc, el)
 	exposeBridge(qc)
 	if _, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS)); err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
@@ -78,8 +82,15 @@ func boot() error {
 }
 
 // shutdown releases a previous boot's engines: every confined realm, the host realm, and
-// the wazero runtimes holding each module's compiled code.
+// the wazero runtimes holding each module's compiled code — plus the sockets and listeners
+// the network stood up, which are not engines but outlive one just as badly.
 func shutdown() {
+	// First: the reader goroutines it stops would otherwise keep posting into the loop and
+	// dispatching into the host realm being freed below.
+	if nh != nil {
+		nh.close()
+		nh = nil
+	}
 	for _, g := range realms {
 		g.discard() // guest runtime only — the host realm it borrowed values from dies below
 	}

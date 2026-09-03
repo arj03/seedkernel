@@ -310,6 +310,49 @@ func (c *Context) hasException() bool {
 	return int32(c.rt.call("JS_HasException", c.handle)) != 0
 }
 
+// prop reads property `name`, refusing — and CLEARING — an exception the read left
+// standing. Bare GetPropertyStr is fine for a property this process wrote; this is for one
+// whose shape is the caller's, where a throwing getter would otherwise leave the flag set
+// for whatever unrelated JS call ran next to inherit (c.exception's JS_GetException is
+// what clears it). The returned value is the caller's to Free.
+func (v *Value) prop(name string) (*Value, error) {
+	p := v.GetPropertyStr(name)
+	if v.c.hasException() {
+		p.Free()
+		return nil, errors.New("qjs: reading ." + name + ": " + v.c.exception().Error())
+	}
+	return p, nil
+}
+
+// numberProp is prop plus the ToInt64 conversion, which throws in its own right on a value
+// no number can be made of (a Symbol, an object whose valueOf throws).
+func (v *Value) numberProp(name string) (int64, error) {
+	p, err := v.prop(name)
+	if err != nil {
+		return 0, err
+	}
+	defer p.Free()
+	n := p.Int64()
+	if v.c.hasException() {
+		return 0, errors.New("qjs: ." + name + " is not a number: " + v.c.exception().Error())
+	}
+	return n, nil
+}
+
+// viewWindow reads a typed array / DataView's own byteOffset and byteLength. Both are
+// ordinary JS properties of an object the caller supplied, so neither is trusted to be a
+// number and neither may poison the realm on the way out (see prop). The pair is still
+// validated against the buffer's real size by the reader that consumes it.
+func (v *Value) viewWindow() (offset, length int64, err error) {
+	if offset, err = v.numberProp("byteOffset"); err != nil {
+		return 0, 0, err
+	}
+	if length, err = v.numberProp("byteLength"); err != nil {
+		return 0, 0, err
+	}
+	return offset, length, nil
+}
+
 func (c *Context) exception() error {
 	val := c.callV("JS_GetException", c.handle)
 	defer val.Free()
@@ -430,7 +473,10 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	if input.isByteArray() {
 		return input.toByteArray(), nil
 	}
-	buffer := input.GetPropertyStr("buffer")
+	buffer, err := input.prop("buffer")
+	if err != nil {
+		return nil, err
+	}
 	defer buffer.Free()
 	if buffer.IsUndefined() || buffer.IsNull() {
 		return nil, errors.New("qjs: value has no ArrayBuffer backing")
@@ -438,8 +484,10 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	if !buffer.isByteArray() {
 		return nil, errors.New("qjs: value is not a byte array")
 	}
-	offset := input.GetPropertyStr("byteOffset").Int64()
-	length := input.GetPropertyStr("byteLength").Int64()
+	offset, length, err := input.viewWindow()
+	if err != nil {
+		return nil, err
+	}
 	return buffer.toByteArrayWindow(offset, length)
 }
 
@@ -453,7 +501,10 @@ func JsTypedArrayByteLength(input *Value) (int64, error) {
 	if input.isByteArray() {
 		return input.byteArrayLength()
 	}
-	buffer := input.GetPropertyStr("buffer")
+	buffer, err := input.prop("buffer")
+	if err != nil {
+		return 0, err
+	}
 	defer buffer.Free()
 	if buffer.IsUndefined() || buffer.IsNull() {
 		return 0, errors.New("qjs: value has no ArrayBuffer backing")
@@ -461,8 +512,10 @@ func JsTypedArrayByteLength(input *Value) (int64, error) {
 	if !buffer.isByteArray() {
 		return 0, errors.New("qjs: value is not a byte array")
 	}
-	offset := input.GetPropertyStr("byteOffset").Int64()
-	length := input.GetPropertyStr("byteLength").Int64()
+	offset, length, err := input.viewWindow()
+	if err != nil {
+		return 0, err
+	}
 	bufferLength, err := buffer.byteArrayLength()
 	if err != nil {
 		return 0, err

@@ -77,12 +77,10 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 		conns = append(conns, conn)
 	}
 	// Drive the Go-owned QuickJS loop so every posted accept reaches the transport guest.
-	if kind, _, msg, err := el.await(`(async () => {
+	awaitOK(t, "drain accepts", `(async () => {
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		return new Uint8Array(0);
-	})()`, 2*time.Second); err != nil || kind != 0 {
-		t.Fatalf("drain accepts: kind=%d msg=%q err=%v", kind, msg, err)
-	}
+	})()`, 2*time.Second)
 
 	// Every admitted socket is silent and therefore has nothing to read, but remains open.
 	for i, conn := range conns[:8] {
@@ -169,13 +167,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		t.Fatal("loadProbe:", err)
 	}
 
-	kind, value, msg, err := el.await("startTest()", 8*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if kind != 0 {
-		t.Fatalf("request did not resolve: kind=%d msg=%q", kind, msg)
-	}
+	value := awaitOK(t, "request did not resolve", "startTest()", 8*time.Second)
 	if want := []byte{10, 20, 30}; !bytes.Equal(value, want) {
 		t.Fatalf("response = %v, want %v", value, want)
 	}
