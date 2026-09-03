@@ -104,13 +104,11 @@ const timers = new Map();
 // Deferred teardowns (see Link constructor): flushed after the current event.
 const deferQueue = [];
 
-// Links that are down but whose SOCKET the platform has not reported yet, by id. A link we
-// tore down ourselves is out of every pool the moment it finishes — but the causal event,
-// `linkClosed`, arrives a turn later and its return is the only thing that carries WHY. So
-// the link is kept here until that event consumes it. Bounded by construction: the driver
-// answers every close with exactly one `linkClosed`, including on a sever, and each one
-// drains its entry.
-const closing = new Map();
+// Every link by the id the platform names it with. Outlives the link's own teardown on
+// purpose: `linkClosed` arrives a turn later, and its return is the only thing that carries
+// WHY the link went. Bounded — ids are never reused, and the driver answers every link with
+// exactly one `linkClosed`, which drains the entry.
+const linksById = new Map();
 
 // The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
 // when a socket is accepted, moves to `verified` when a msg1 opens under the contact
@@ -272,6 +270,7 @@ class Core {
       onFrame: (pid, frame) => router.deliver(pid, frame),
       onClose: (l) => this.forget(l),
     });
+    linksById.set(link.linkId, link);
     // `connecting` is keyed by peer because it is what steers an outbound frame at a link
     // that has not authenticated yet — a dial whose peer we cannot name steers nothing, so
     // it waits in `inbound` like an accept. (`spec.weDialed` is still passed to `Link`; it
@@ -295,9 +294,7 @@ class Core {
       if (Core.drop(this.connecting, pid, link)) break;
     }
     router.remove(link);
-    // Out of every pool, but not yet out of this program: `linkClosed` still has to be
-    // able to say why it went (see `closing`).
-    closing.set(link.linkId, link);
+    // Left in `linksById`: `linkClosed` has yet to ask why it went.
   }
 
   // A frame for a peer with no routable link yet: dial, then hand the frame to the
@@ -358,22 +355,6 @@ class Core {
     router.closeAll();
     for (const l of pending) l.close();
   }
-}
-
-/** Every link, wherever it currently sits: authenticated ones live in the router's pools,
- *  pre-auth ones in the core's connecting/inbound tables, and one already torn down waits
- *  in `closing` for the socket event that will ask why. */
-function findLink(linkId) {
-  const gone = closing.get(linkId);
-  if (gone) return gone;
-  for (const pool of router.links.values()) {
-    for (const link of pool) if (link.linkId === linkId) return link;
-  }
-  for (const arr of core.connecting.values()) {
-    for (const link of arr) if (link.linkId === linkId) return link;
-  }
-  for (const link of core.inbound) if (link.linkId === linkId) return link;
-  return null;
 }
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
@@ -490,7 +471,7 @@ entry("linkOpen", (r) => {
  *  step, the AEAD — but answers nothing: a request it decoded goes to the host as this
  *  program's own `link/deliver` call, on a later turn. */
 entry("linkBytes", async (r) => {
-  const link = findLink(r.u32());
+  const link = linksById.get(r.u32());
   if (link) await link.onWire(r.blob());
   // Explicit, because this op is `async`: `handle`'s `|| NOTHING` sees a truthy Promise
   // and never applies, so a bare `undefined` here would reach the seam's return check.
@@ -500,13 +481,13 @@ entry("linkBytes", async (r) => {
 /** The socket is gone. The return is the one-byte reason (`reasonCode`, ake.js) — a fact
  *  only this program ever held, since it is the end with the session keys. It carries no
  *  link id: the event names the link, so a return cannot speak about another socket, and a
- *  link already reported is off `closing` and answers nothing a second time. */
+ *  link already reported is off `linksById` and answers nothing a second time. */
 entry("linkClosed", (r) => {
   const linkId = r.u32();
-  const link = findLink(linkId);
+  const link = linksById.get(linkId);
   if (!link) return NOTHING;
   link.onChannelClosed();
-  closing.delete(linkId);
+  linksById.delete(linkId);
   return Uint8Array.of(reasonCode(link));
 });
 
