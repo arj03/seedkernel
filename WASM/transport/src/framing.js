@@ -138,14 +138,10 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 /** An HTTP upgrade head is tiny; anything larger is not one. */
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
-/** Run this bundle's own ws.wasm — an ordinary `host.call`. An empty answer is the
- *  module's failure signal (§4). Every seam call answers a Promise; `host.call` is
- *  already one, so nothing to normalize here. */
+/** Run this bundle's own ws.wasm — an ordinary `host.call`, whose failure the seam
+ *  already rejects (§12.2). */
 function wsCall(req) {
-  return host.call(N_WS, req).then((out) => {
-    if (!out || out.length === 0) throw new Error("ws: module error");
-    return out;
-  });
+  return host.call(N_WS, req);
 }
 
 class WsFramer {

@@ -913,13 +913,13 @@ async function testModuleCallBound() {
   const beats = setInterval(() => heartbeats++, 25);
 
   const t0 = Date.now();
-  // A 120 ms bound. Null at the table — exactly what a trap produces — which the guest
-  // seam reads as empty BYTES, so nothing downstream changes.
+  // A 120 ms bound. Null at the table — exactly what a trap produces, and what the guest
+  // seam rejects on (§12.2).
   const r = await host.callModule(spinKey, "spin", new Uint8Array([1]), 120);
   const spent = Date.now() - t0;
   clearInterval(beats);
 
-  assert(r === null, "the spin answers like a trap — null at the table, empty bytes at the seam");
+  assert(r === null, "the spin answers like a trap — null at the table, a rejection at the seam");
   assert(spent >= 100 && spent < 3000, `it is killed near its bound, not eventually (${spent}ms)`);
   assert(heartbeats > 0, "the host thread was alive the whole time the module spun");
 

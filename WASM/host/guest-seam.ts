@@ -623,7 +623,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // Any other name is one of THIS slot's private modules, by its manifest name. The
         // slot wired this value directly, so no name can reach another app. Ungated like
         // `crypto/*`. A name the app never installed is a typo, refused by name; a module
-        // that runs and FAILS is a different event and answers empty bytes.
+        // that runs and fails is a different event, and rejects like any other (§12.2).
         if (!modules.names.has(name))
             throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
         // Module call charged to caller's segment (§4.3). Refuse if nothing left —
@@ -636,7 +636,11 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
             // module calls serialized through one worker would otherwise charge their
             // queue wait quadratically.
             budget?.charge(ms);
-            return bytes ?? NONE;
+            // Null is the table's failure, empty is a module that said nothing (§12.2).
+            // Folding them together would make every caller guess failure from a length.
+            if (bytes === null)
+                throw new Error("guest-seam: module " + name + " failed");
+            return bytes;
         });
     };
 }

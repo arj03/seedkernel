@@ -122,10 +122,10 @@ port.onmessage = (e) => {
     return;
   }
   if (m.type === "call") {
-    // A trap, an oversized result, a negative length — all the same empty answer, the shape
-    // a caller downstream already reads for a failed transform. ms is this worker's own
-    // time inside handle — the module's actual compute, excluding queue wait — which is what
-    // the caller's execution budget is billed (§12.3).
+    // A trap, an oversized result, a negative length — all null, which the seam rejects
+    // (§12.2); a 0-length answer stays a value. ms is this worker's own time inside
+    // handle — the module's actual compute, excluding queue wait — which is what the
+    // caller's execution budget is billed (§12.3).
     let bytes = null, wipeLen = m.payload.byteLength;
     const t0 = performance.now();
     try {
