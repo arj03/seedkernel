@@ -497,9 +497,9 @@ export function freshnessPathFor(dir: string): string {
  *  each target subclasses it with its own persistence seam (`persist`). On its own this is
  *  an in-memory store. */
 export class FreshnessMarks {
-    marks = new Map();
+    private readonly marks = new Map<string, number>();
     /** Author keys written off (§12.5), as lowercase hex. */
-    revoked = new Set();
+    private readonly revoked = new Set<string>();
     /** Seed from `{ marks, revoked }`. Absent input = first boot: start empty, which is
      *  "unrevoked" — so a target's `persist` must be atomic. Bare pre-revocation maps throw
      *  rather than reading as empty (would discard every downgrade guard). */
