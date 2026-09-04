@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
@@ -67,6 +67,52 @@ const akeFuzzJS = `
   const CONTACT = "b7".repeat(32);
   const LOCAL = { networkKey: NETWORK_KEY, contactSecret: CONTACT, peers: [], admitPeers: [] };
 
+  // ── entropy a fuzzer can reproduce ─────────────────────────────────────────
+  //
+  // Everything random in this handshake arrives through one host name (ake.js randomBytes →
+  // node/random): the x25519 ephemeral, the ML-KEM keygen seed, its encapsulation coins,
+  // and the nonce msg1 seals. Left to libsodium, one fuzz input drives a DIFFERENT exchange
+  // on every execution — so a crash the corpus records need not reproduce when it is
+  // replayed, and a shaped-record patch that happened to overwrite a ciphertext byte with
+  // the value already there in one run changes it in the next. A target whose answer
+  // depends on which run it is cannot be minimized.
+  //
+  // A xorshift32 stream, restarted at the head of every probe, makes an input a function of
+  // itself again. It is entropy for a HARNESS, not for a peer: the two things a stranger
+  // must not be able to guess are NETWORK_KEY and CONTACT above, which are fixed constants
+  // either way, and no probe below asks anything of the ephemerals but that the code under
+  // test refuse what it should.
+  let rng = 0;
+  const reseed = () => { rng = 0x9e3779b9 | 0; }; // never zero: xorshift32 sticks there
+  const fuzzRandom = (n) => {
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      rng ^= rng << 13; rng |= 0;
+      rng ^= rng >>> 17;
+      rng ^= rng << 5; rng |= 0;
+      out[i] = rng & 0xff;
+    }
+    return out;
+  };
+  reseed();
+  // Real libsodium behind every primitive; only the one call that must not vary is ours.
+  const fuzzSodium = Object.assign({}, sodium, { randombytes_buf: fuzzRandom });
+
+  // Which host names an execution actually reached, recorded at the seam the harness already
+  // owns. This is the handshake's own progress: ake.js is not instrumented and does not need
+  // to be, because the names it calls ARE its milestones — the x25519 over a point the input
+  // chose, the ML-KEM call, the identity verify. Nothing else separates a msg1 refused on its
+  // suite byte from one that got a responder all the way to an encapsulation, and the fuzzer
+  // has to be able to tell those apart to climb from one to the other (fuzz_cov_test.go).
+  //
+  // The mlkem module's op byte rides along: keygen, encapsulation and decapsulation are three
+  // different distances into the exchange.
+  let reached = [];
+  const noteCall = (name, bytes) => {
+    const tag = name === "mlkem" ? "mlkem:" + bytes[0] : name;
+    if (reached.indexOf(tag) < 0) reached.push(tag);
+  };
+
   // What the handshake reaches that is not crypto: a socket and a clock. Both are
   // RECORDED rather than performed. The wire is what every assertion here is about, and a
   // deadline that actually fired would retire an exchange the fuzzer is still driving —
@@ -104,10 +150,14 @@ const akeFuzzJS = `
   // scope. The seam is wired the way a link slot's is (shell-core.ts slotSignScope) —
   // libsodium behind the crypto names, node/sign and node/verify bound to
   // DOMAIN_link_scope with this network key, and the bundle's own modules over the §4 ABI.
-  const mkNode = () => {
-    const identity = sodium.crypto_sign_keypair();
+  const mkNode = (seedByte) => {
+    // A FIXED identity per node, for the same reason the entropy above is fixed: this key
+    // is signed over in every transcript the harness builds, so a fresh keypair per process
+    // would make a recorded failure a different exchange to replay. Distinct per node
+    // because a link refuses its own key reflected back at it (openIdentity).
+    const identity = sodium.crypto_sign_seed_keypair(new Uint8Array(32).fill(seedByte));
     const seam = createGuestSeam({
-      platform: { sodium: sodium, identity: identity, now: () => Date.now() },
+      platform: { sodium: fuzzSodium, identity: identity, now: () => Date.now() },
       grants: {
         names: bundle.manifest.guest.requires,
         signScope: linkSignScope(identity, fromHex(NETWORK_KEY)),
@@ -123,7 +173,7 @@ const akeFuzzJS = `
         }),
       },
     });
-    const host = { call: (name, bytes) => seam(name, bytes) };
+    const host = { call: (name, bytes) => { noteCall(name, bytes); return seam(name, bytes); } };
     const F = new Function("APP", "LOCAL", "host", src + RET)(APP, LOCAL, host);
     F.setOwnPk(identity.publicKey.slice());
     return F;
@@ -131,7 +181,7 @@ const akeFuzzJS = `
 
   // TWO nodes, because a node refuses its own key as reflected traffic — openIdentity
   // says so at msg3 — so one scope playing both ends could never reach a session.
-  const A = mkNode(), B = mkNode();
+  const A = mkNode(0x11), B = mkNode(0x22);
   const drain = () => { A.drainDeferred(); B.drainDeferred(); };
 
   // Every link this scope has built and not yet released.
@@ -154,6 +204,10 @@ const akeFuzzJS = `
     }
     drain();
     armedTimers.clear();
+    // Once per probe, and this is the one place that is true — so the entropy every
+    // exchange below draws on starts at the same byte for the same input, however many
+    // executions the fuzzer has already run in this process.
+    reseed();
   };
 
   let nextLink = 1;
@@ -185,15 +239,24 @@ const akeFuzzJS = `
     for (let i = 0; i < 6; i++) { await l.work; drain(); }
   };
   const take = () => { const out = wire; wire = []; return out; };
-  const reset = () => { wire = []; closes = 0; delivered = 0; authed = 0; };
+  // Cleared here, which is exactly where the harness stops setting an exchange up and starts
+  // feeding it the fuzzer's bytes — so the call log names what the INPUT reached, not what
+  // building a session to feed it to costs.
+  const reset = () => { wire = []; closes = 0; delivered = 0; authed = 0; reached = []; };
 
-  // Cut the fuzzer's stream at the offsets it chose; each piece is one platform-framed
-  // message. Zero-length pieces are dropped, so the splits only ever name real messages.
+  // Cut the fuzzer's stream at the sizes it chose, each a big-endian uint32; every piece is
+  // one platform-framed message. A byte apiece could not name the two widths that matter —
+  // msg1 and msg2 both run past a kilobyte, since each carries an ML-KEM key — so the only
+  // splits that ever landed on a message boundary were the ones the trailing remainder
+  // produced by accident, and a seed meaning "cut after msg1" was really saying that width
+  // modulo 256. Four bytes reaches a whole maximum-sized record as easily as a msg3.
+  // Zero-length pieces are dropped, so the splits only ever name real messages.
   const cut = (stream, splits) => {
     const out = [];
     let off = 0;
-    for (const s of splits) {
-      const n = Math.min(s, stream.length - off);
+    for (let i = 0; i + 3 < splits.length; i += 4) {
+      const want = ((splits[i] << 24) | (splits[i + 1] << 16) | (splits[i + 2] << 8) | splits[i + 3]) >>> 0;
+      const n = Math.min(want, stream.length - off);
       if (n > 0) out.push(stream.subarray(off, off + n));
       off += n;
       if (off >= stream.length) break;
@@ -228,18 +291,23 @@ const akeFuzzJS = `
     authed: l.authed, nAuth: authed, delivered: delivered,
     wire: take().map((b) => b.length),
     closes: closes, closed: l.closed, stalled: l.stalled,
-    recvCtr: l.recvCtr, recvEpoch: l.recvEpoch,
+    recvCtr: l.recvCtr, recvEpoch: l.recvEpoch, reached: reached.slice(),
   }, extra || {}));
 
-  // Rewrite bytes at offsets the fuzzer chose, counting only the ones that CHANGED
-  // something: a patch that writes back the byte already there leaves a valid message, and
-  // an assertion keyed on "was this modified" would be wrong about it.
+  // Rewrite bytes at offsets the fuzzer chose, and report how many POSITIONS ended up
+  // holding something other than what they held before. What the callers key on is "is this
+  // still the message this session built", so the answer has to come from comparing the
+  // finished buffer against a snapshot of it — counting writes that changed the byte under
+  // them at the time gets it wrong in both directions: a write of the value already there
+  // changes nothing, and two writes to one offset can put the original back while the count
+  // says the message was corrupted.
   const patchBytes = (buf, patch) => {
-    let n = 0;
+    const before = buf.slice();
     for (let i = 0; i + 2 < patch.length; i += 3) {
-      const at = (((patch[i] << 8) | patch[i + 1]) >>> 0) % buf.length;
-      if (buf[at] !== patch[i + 2]) { buf[at] = patch[i + 2]; n++; }
+      buf[(((patch[i] << 8) | patch[i + 1]) >>> 0) % buf.length] = patch[i + 2];
     }
+    let n = 0;
+    for (let i = 0; i < buf.length; i++) if (buf[i] !== before[i]) n++;
     return n;
   };
 
@@ -435,6 +503,11 @@ type akeOutcome struct {
 	RecvCtr   int    `json:"recvCtr"`
 	RecvEpoch int    `json:"recvEpoch"`
 	Patched   int    `json:"patched"` // shaped probes: bytes the fuzzer actually changed
+	// Host names this execution reached, for the mutator alone (fuzz_cov_test.go). No
+	// assertion reads it: what a link is ALLOWED to do is stated in the fields above, and a
+	// claim about which primitives it called on the way would pin the implementation rather
+	// than the property.
+	Reached []string `json:"reached"`
 }
 
 // akeLens is the handshake's own arithmetic, read out of the module scope rather than
@@ -517,12 +590,52 @@ func akeRun(t *testing.T, probe string, args ...*qjs.Value) akeOutcome {
 	return o
 }
 
-// akeCovName is how far one link GOT, in the terms the mutator should be steered by
-// (fuzz_cov_test.go). A handshake's states are few and its bytes are many, so this is the
-// whole of what the fuzzer can be told: which of them the link ended in.
-func akeCovName(what string, o akeOutcome) string {
-	return fmt.Sprintf("%s closed=%v stalled=%v authed=%v wire=%s delivered=%s threw=%v",
-		what, o.Closed, o.Stalled, o.Authed, covBucket(len(o.Wire)), covBucket(o.Delivered), o.Threw != "")
+// akeSplitsOf encodes message sizes the way the probes read them: one big-endian uint32
+// each. Wider than framing's uint16 because these pieces are whole messages rather than
+// stream slices, and one of them is a 2 MiB record. The fuzzer mutates these bytes freely;
+// this is for the seeds, which want to NAME a handshake width rather than spell it.
+func akeSplitsOf(ns ...int) []byte {
+	out := make([]byte, 0, len(ns)*4)
+	for _, n := range ns {
+		out = binary.BigEndian.AppendUint32(out, uint32(n))
+	}
+	return out
+}
+
+// akeSeamMilestone maps the host names ake.js reaches to the progress each one stands for.
+//
+// The names it calls on EVERY execution — node/random, link/send, link/close, the timers,
+// the transcript hash — are deliberately absent: a milestone every input passes is not a
+// gradient, it is a constant. What is left is the sequence a msg1 has to earn its way
+// through, one entry per step, so an input that got to the encapsulation and an input that
+// died on the suite byte are two different sets of blocks rather than one "closed".
+var akeSeamMilestone = map[string]covID{
+	"crypto/x25519/dh":                  covAkeDh,
+	"mlkem:0":                           covAkeKemKeygen,
+	"mlkem:1":                           covAkeKemEncaps,
+	"mlkem:2":                           covAkeKemDecaps,
+	"crypto/chacha20poly1305-ietf/seal": covAkeAeadSeal,
+	"crypto/chacha20poly1305-ietf/open": covAkeAeadOpen,
+	"node/verify":                       covAkeVerify,
+	"node/sign":                         covAkeSign,
+}
+
+// covMarkAke marks how far one link GOT (fuzz_cov_test.go): what it ended as, and every
+// step of the handshake it reached on the way. The six targets share these ids because they
+// share a subject — one Link, driven from different stages.
+func covMarkAke(o akeOutcome) {
+	covMarkIf(o.Threw != "", covAkeThrew)
+	covMarkIf(o.Closed, covAkeClosed)
+	covMarkIf(o.Stalled, covAkeStalled)
+	covMarkIf(len(o.Wire) > 0, covAkeWrote)
+	covMarkIf(o.Authed, covAkeAuthed)
+	covMarkIf(o.Delivered > 0, covAkeDelivered)
+	covMarkIf(o.RecvCtr > 0, covAkeRecordOpened)
+	for _, name := range o.Reached {
+		if id, ok := akeSeamMilestone[name]; ok {
+			covMark(id)
+		}
+	}
 }
 
 // silentUnderFire is the concealment claim, stated once for every pre-authentication link:
@@ -531,7 +644,7 @@ func akeCovName(what string, o akeOutcome) string {
 // already see — an over-cap message, which it measured itself.
 func silentUnderFire(t *testing.T, what string, o akeOutcome, stream, splits []byte) {
 	t.Helper()
-	covPath(akeCovName(what, o))
+	covMarkAke(o)
 	if o.Threw != "" {
 		t.Fatalf("%s: threw out of onWire (%q) — stream %d bytes, splits %v: %x",
 			what, o.Threw, len(stream), head(splits), head(stream))
@@ -574,28 +687,33 @@ func FuzzAkeAccept(f *testing.F) {
 	}
 	// A message that OPENS, and the shapes around it: the mutator works outward from the
 	// one input that reaches the KEM and the identity proof.
-	f.Add(msg1, []byte{})
-	f.Add(msg1, []byte{200, 200, 200, 200, 200, 200, 200})
-	f.Add(append(append([]byte{}, msg1...), msg1...), []byte{byte(akeSizes.M1 % 256)})
-	f.Add(msg1[:len(msg1)-1], []byte{})
-	f.Add(append(append([]byte{}, msg1...), 0), []byte{})
+	f.Add(msg1, akeSplitsOf())
+	f.Add(msg1, akeSplitsOf(200, 200, 200, 200, 200, 200, 200))
+	// Two whole msg1s, cut exactly between them — the second one meeting a link that has
+	// already answered the first. A byte-wide split could not say this.
+	f.Add(append(append([]byte{}, msg1...), msg1...), akeSplitsOf(akeSizes.M1))
+	f.Add(msg1[:len(msg1)-1], akeSplitsOf())
+	f.Add(append(append([]byte{}, msg1...), 0), akeSplitsOf())
+	// One msg1 delivered as two messages, split down the middle: neither half is a message
+	// at any width this protocol has.
+	f.Add(msg1, akeSplitsOf(akeSizes.M1/2))
 	// A msg1 whose suite byte is not this transport's, and one whose sealed probe is all
 	// zeroes: two refusals that must be indistinguishable from outside.
 	other := append([]byte{}, msg1...)
 	other[0] = 0x01
-	f.Add(other, []byte{})
-	f.Add(make([]byte, akeSizes.M1), []byte{})
+	f.Add(other, akeSplitsOf())
+	f.Add(make([]byte, akeSizes.M1), akeSplitsOf())
 	// The other widths, so a message that is the right size for the WRONG step is tried
 	// against a link that is not at that step.
-	f.Add(make([]byte, akeSizes.M2), []byte{})
-	f.Add(make([]byte, akeSizes.M3), []byte{})
-	f.Add([]byte{}, []byte{})
-	f.Add([]byte{0x03}, []byte{})
+	f.Add(make([]byte, akeSizes.M2), akeSplitsOf())
+	f.Add(make([]byte, akeSizes.M3), akeSplitsOf())
+	f.Add([]byte{}, akeSplitsOf())
+	f.Add([]byte{0x03}, akeSplitsOf())
 	// Past the pre-auth cap: the one refusal that is allowed to be loud.
-	f.Add(make([]byte, akeSizes.Cap+1), []byte{})
+	f.Add(make([]byte, akeSizes.Cap+1), akeSplitsOf())
 	// The same, but behind a message that already stalled the link — which onWire reads no
 	// further, so this one is never seen and the link stays silent. Found by the fuzzer.
-	f.Add(make([]byte, akeSizes.Cap+2), []byte{1})
+	f.Add(make([]byte, akeSizes.Cap+2), akeSplitsOf(1))
 
 	f.Fuzz(func(t *testing.T, stream, splits []byte) {
 		if len(stream) > 1<<18 {
@@ -629,14 +747,16 @@ func FuzzAkeAccept(f *testing.F) {
 //	side 1 — an initiator waiting for msg4, the responder's
 func FuzzAkeIdentity(f *testing.F) {
 	akeFuzzRealm(f)
-	f.Add(byte(0), make([]byte, akeSizes.M3), []byte{})
-	f.Add(byte(1), make([]byte, akeSizes.M4), []byte{})
-	f.Add(byte(0), []byte{}, []byte{})
-	f.Add(byte(1), []byte{}, []byte{})
-	f.Add(byte(0), make([]byte, akeSizes.M3-1), []byte{})
-	f.Add(byte(1), make([]byte, akeSizes.M4+1), []byte{})
-	f.Add(byte(0), make([]byte, akeSizes.M3*3), []byte{byte(akeSizes.M3)})
-	f.Add(byte(0), make([]byte, akeSizes.Cap+1), []byte{})
+	f.Add(byte(0), make([]byte, akeSizes.M3), akeSplitsOf())
+	f.Add(byte(1), make([]byte, akeSizes.M4), akeSplitsOf())
+	f.Add(byte(0), []byte{}, akeSplitsOf())
+	f.Add(byte(1), []byte{}, akeSplitsOf())
+	f.Add(byte(0), make([]byte, akeSizes.M3-1), akeSplitsOf())
+	f.Add(byte(1), make([]byte, akeSizes.M4+1), akeSplitsOf())
+	// Three back-to-back messages of exactly the width this step expects: the second and
+	// third meet a link that already refused the first.
+	f.Add(byte(0), make([]byte, akeSizes.M3*3), akeSplitsOf(akeSizes.M3, akeSizes.M3))
+	f.Add(byte(0), make([]byte, akeSizes.Cap+1), akeSplitsOf())
 
 	f.Fuzz(func(t *testing.T, side byte, stream, splits []byte) {
 		if len(stream) > 1<<18 {
@@ -671,12 +791,12 @@ func FuzzAkeIdentity(f *testing.F) {
 // checked on every `go test` run through the seed corpus regardless.
 func FuzzAkeRecord(f *testing.F) {
 	akeFuzzRealm(f)
-	f.Add([]byte{}, []byte{})
-	f.Add(make([]byte, 16), []byte{}) // exactly a tag, no ciphertext
-	f.Add(make([]byte, 15), []byte{}) // one byte short of a tag
-	f.Add(make([]byte, 64), []byte{})
-	f.Add(make([]byte, 64), []byte{16}) // two bodies, so the second meets a dead link
-	f.Add(make([]byte, akeSizes.Frame+1), []byte{})
+	f.Add([]byte{}, akeSplitsOf())
+	f.Add(make([]byte, 16), akeSplitsOf()) // exactly a tag, no ciphertext
+	f.Add(make([]byte, 15), akeSplitsOf()) // one byte short of a tag
+	f.Add(make([]byte, 64), akeSplitsOf())
+	f.Add(make([]byte, 64), akeSplitsOf(16)) // two bodies, so the second meets a dead link
+	f.Add(make([]byte, akeSizes.Frame+1), akeSplitsOf())
 
 	f.Fuzz(func(t *testing.T, stream, splits []byte) {
 		if len(stream) > akeSizes.Frame+(1<<12) {
@@ -684,7 +804,7 @@ func FuzzAkeRecord(f *testing.F) {
 		}
 		o := akeRun(t, "__fuzzAkeStage", qc.NewInt64(5),
 			qc.NewArrayBuffer(stream), qc.NewArrayBuffer(splits))
-		covPath(akeCovName("record", o))
+		covMarkAke(o)
 		if o.Threw != "" {
 			t.Fatalf("record: threw out of onWire (%q) — stream %d bytes, splits %v: %x",
 				o.Threw, len(stream), head(splits), head(stream))
@@ -944,7 +1064,7 @@ func FuzzAkeShapedRecord(f *testing.F) {
 			t.Skip()
 		}
 		o := akeRun(t, "__fuzzAkeShapedRecord", qc.NewArrayBuffer(body), qc.NewArrayBuffer(patch))
-		covPath(akeCovName("shaped record", o))
+		covMarkAke(o)
 		if o.Threw != "" {
 			t.Fatalf("shaped record: threw out of onWire (%q) — body %d bytes, patched %d",
 				o.Threw, len(body), o.Patched)

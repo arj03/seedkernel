@@ -194,17 +194,32 @@ func refusedInOwnVocabulary(t *testing.T, what string, o fuzzOutcome, data []byt
 	}
 }
 
-// covOutcome names what a probe did, in the terms the mutator should be steered by
-// (fuzz_cov_test.go): which refusal, or which verdict — never how big the input was.
-func covOutcome(what string, o fuzzOutcome) string {
+// covMarkOutcome marks what one probe reached, in the terms the mutator should be steered
+// by (fuzz_cov_test.go): which refusal, or which verdict — never how big the input was.
+//
+// All five call sites share these ids because they share a subject: the bundle reader, read
+// at different depths. A refusal MESSAGE is the one open-ended thing here — the reader has
+// dozens of them and which one it chose is the whole gradient between its refusal sites — so
+// that goes to the hashed window, carrying the error's constructor name with it (a
+// RangeError is the parser walking off its own checks, which is a finding rather than a
+// refusal).
+func covMarkOutcome(o fuzzOutcome) {
 	if o.Skip {
-		return what + " skip"
+		covMark(covBundleSkip)
+		return
 	}
 	if o.Threw {
-		return what + " " + o.Name + " " + covShape(o.Msg)
+		covMark(covBundleRefused)
+		covMarkShape(o.Name + ": " + o.Msg)
+		return
 	}
-	return what + " ok verified=" + strconv.FormatBool(o.Verified) +
-		" accepted=" + strconv.FormatBool(o.Accepted) + " files=" + covBucket(o.N)
+	covMark(covBundleOK)
+	covMarkIf(o.Verified, covBundleVerified)
+	covMarkIf(o.Accepted, covBundleAccepted)
+	if o.N == 0 {
+		covMark(covBundleFilesNone)
+	}
+	covMarkCount(o.N, covBundleFilesOne, covBundleFilesMany)
 }
 
 // head trims a failure's input to something a test log can carry.
@@ -367,7 +382,7 @@ func FuzzUnpackBundle(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzUnpack", data)
-		covPath(covOutcome("unpack", o))
+		covMarkOutcome(o)
 		refusedInOwnVocabulary(t, "unpackBundle", o, data)
 		containerAgrees(t, o, data)
 		if o.Threw {
@@ -471,7 +486,7 @@ func FuzzUnpackBundleShaped(f *testing.F) {
 		}
 		blob := shapeBlob(raw)
 		o := runProbe(t, "__fuzzUnpack", blob)
-		covPath(covOutcome("unpack", o))
+		covMarkOutcome(o)
 		refusedInOwnVocabulary(t, "unpackBundle", o, blob)
 		containerAgrees(t, o, blob)
 		if !o.Threw && !o.Proto {
@@ -515,7 +530,7 @@ func FuzzVerifyManifest(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzVerifyManifest", data)
-		covPath(covOutcome("manifest", o))
+		covMarkOutcome(o)
 		refusedInOwnVocabulary(t, "verifyManifest", o, data)
 		if o.Threw {
 			// A suite this host cannot check, or a validly signed manifest that is broken:
@@ -596,7 +611,7 @@ func FuzzVerifyBundle(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzVerifyBundle", data)
-		covPath(covOutcome("bundle", o))
+		covMarkOutcome(o)
 		refusedInOwnVocabulary(t, "verifyBundle", o, data)
 		// Both directions. The forward one is the security claim — nothing is admitted
 		// whose container, signature and content hashes do not all hold. The reverse holds
@@ -707,7 +722,7 @@ func FuzzValidateManifest(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzValidateManifest", data)
-		covPath(covOutcome("validate", o))
+		covMarkOutcome(o)
 		if o.Skip {
 			return
 		}

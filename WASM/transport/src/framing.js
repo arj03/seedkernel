@@ -370,10 +370,16 @@ class WsFramer {
   }
 }
 
-/** Case-insensitively pull a header value out of an HTTP head. */
+/** Case-insensitively pull a header value out of an HTTP head. A field whose value is
+ *  empty once its surrounding spaces and tabs are gone is not a field: the line does not
+ *  match and the scan goes on to the next, exactly as for a name that never matched.
+ *  Without the lookahead the lazy group backtracks into the leading run and hands back one
+ *  of those spaces, which is a value nobody wrote — a stranger completes an upgrade with a
+ *  blank Sec-WebSocket-Key, and a head carrying a blank line before a real key is answered
+ *  with the accept for the blank one. */
 function headerValue(head, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const m = new RegExp("^" + escaped + ":[ \\t]*(.+?)[ \\t]*$", "im").exec(head);
+  const m = new RegExp("^" + escaped + ":[ \\t]*(?![ \\t])(.+?)[ \\t]*$", "im").exec(head);
   return m ? m[1] : null;
 }
 

@@ -106,7 +106,7 @@ const framingFuzzJS = `
       ok = framer.push(chunk, (m) => msgs.push(hex(m)));
       if (!ok) break;
     }
-    return fz({ ok, msgs, cap: framer.cap });
+    return fz({ ok, msgs, cap: framer.cap, held: framer.parts.length });
   };
 
   // The same for the server side of the WebSocket framer: the HTTP upgrade head, then
@@ -149,10 +149,10 @@ const framingFuzzJS = `
 
   // ByteParts on its own, as a state machine. The framers reach it only through the shapes
   // their two formats happen to ask for; this asks directly, so accumulator replacement,
-  // partial consumption, head compaction and scan invalidation are reached deliberately
-  // rather than by luck. What is reported is exactly what a caller can see — length, what
-  // peek and take hand back, where findHeadEnd points — so agreement is agreement
-  // about the contract, and the arithmetic behind it stays free to change.
+  // partial consumption and head compaction are reached deliberately rather than by luck.
+  // What is reported is exactly what a caller can see — length, and what peek and take hand
+  // back — so agreement is agreement about the contract, and the arithmetic behind it stays
+  // free to change.
   globalThis.__fuzzByteParts = (dataAB, progAB) => {
     const data = new Uint8Array(dataAB), prog = new Uint8Array(progAB);
     const bp = new F.ByteParts();
@@ -161,7 +161,7 @@ const framingFuzzJS = `
     for (let i = 0; i + 2 < prog.length; i += 3) {
       if (bp.length > maxLen) maxLen = bp.length;
       const arg = (prog[i + 1] << 8) | prog[i + 2];
-      switch (prog[i] & 3) {
+      switch (prog[i] % 3) {
         case 0: {
           // A chunk of arg bytes cycled out of data, so every SIZE is reachable however
           // short the fuzzer's data is — 8191, 8192 and 8193 included.
@@ -177,16 +177,13 @@ const framingFuzzJS = `
         case 1:
           log.push("peek " + arg + " " + hex(bp.peek(arg)) + " len=" + bp.length);
           break;
-        case 2: {
+        default: {
           // Clamped: take past what is buffered reads a slice that is not there, and no
           // caller asks for more than a length it has already checked.
           const n = Math.min(arg, bp.length);
           log.push("take " + n + " " + hex(bp.take(n)) + " len=" + bp.length);
           break;
         }
-        default:
-          log.push("find " + bp.findHeadEnd() + " len=" + bp.length);
-          break;
       }
     }
     // maxLen is for the fuzzer's benefit rather than the oracle's: it is how the harness
@@ -236,15 +233,27 @@ type framingResult struct {
 	MaxLen int      `json:"maxLen"` // ByteParts: the high-water mark, for covPath alone
 }
 
-// framingCovName is what one framer run DID, in the terms the mutator should be steered by
-// (fuzz_cov_test.go): the verdict, whether the link opened, whether anything came out or
-// went back — never how much of it.
-func framingCovName(what string, r framingResult) string {
-	if r.Threw {
-		return what + " threw " + covShape(r.Msg)
-	}
-	return fmt.Sprintf("%s ok=%v open=%v msgs=%s wrote=%s held=%v",
-		what, r.Ok, r.Open, covBucket(len(r.Msgs)), covBucket(len(r.Wrote)), r.Held > 0)
+// covMarkLength marks what one LengthFramer run reached (fuzz_cov_test.go). Four bytes and
+// a body has few states, and these are all of them: it took the stream or refused it, it
+// delivered nothing, one message or several, and it either ended on a message boundary or
+// is still holding part of one.
+func covMarkLength(r framingResult) {
+	covMarkIf(r.Ok, covLengthOK)
+	covMarkIf(!r.Ok, covLengthRefused)
+	covMarkCount(len(r.Msgs), covLengthMsgOne, covLengthMsgMany)
+	covMarkIf(r.Held > 0, covLengthHeldPart)
+}
+
+// covMarkWsFramer marks what one WsFramer run reached — either half, since they are one
+// class in two configurations. The verdict, whether the link opened, and whether anything
+// came out or went back; never how much of it.
+func covMarkWsFramer(r framingResult) {
+	covMarkIf(r.Threw, covWsFramerThrew)
+	covMarkIf(!r.Ok, covWsFramerRefused)
+	covMarkIf(r.Open, covWsFramerOpened)
+	covMarkCount(len(r.Msgs), covWsFramerMsgOne, covWsFramerMsgMany)
+	covMarkIf(len(r.Wrote) > 0, covWsFramerWrote)
+	covMarkIf(r.Held > 0, covWsFramerHeld)
 }
 
 // framingFuzzRealm boots the realm, hangs ws.wasm off it as the framers' one host name,
@@ -637,7 +646,7 @@ func FuzzLengthFramer(f *testing.F) {
 			t.Skip()
 		}
 		got := framingRun(t, "__fuzzLengthFramer", stream, splits)
-		covPath(framingCovName("length", got))
+		covMarkLength(got)
 		// The framer's own cap, held against the scope's. Feeding `got.Cap` into the oracle
 		// instead would let a framer that started life with the WRONG ceiling — the raised
 		// one, say, on a link nobody has authenticated — agree with itself all the way.
@@ -754,7 +763,7 @@ func FuzzWsClientFramer(f *testing.F) {
 func wsFramerProperties(t *testing.T, side, probe string, newRef func() *refWsPeer, stream, splits []byte) {
 	t.Helper()
 	got := framingRun(t, probe, stream, splits)
-	covPath(framingCovName(side, got))
+	covMarkWsFramer(got)
 	if got.Threw {
 		// `read` catches the upgrade's and the frame loop's refusals itself and answers
 		// false; anything escaping is a refusal the link owner never sees as a refusal.
@@ -863,20 +872,24 @@ func sameStrings(a, b []string) bool {
 //
 // ByteParts is where every inbound byte of every link lands, and the only part of the
 // transport that keeps a data structure rather than a parse: a list of slices, a head index
-// into it, a growable tail, and a head-end scan that resumes across calls. The two framers
-// reach it only through the shapes their formats ask for, which is not the same as reaching
-// it — a length-prefixed stream never calls findHeadEnd at all, and neither format asks for
-// a chunk sized to land on the accumulator boundary. This drives it directly.
+// into it, and a growable tail. The two framers reach it only through the shapes their
+// formats ask for, which is not the same as reaching it — neither asks for a chunk sized to
+// land on the accumulator boundary, and neither ever peeks past what it is about to take.
+// This drives it directly.
 //
-// The oracle is a flat byte slice. It keeps ONE piece of state beyond the bytes — how far
-// the head scan has read — because that is contract, not arithmetic: the scan resumes where
-// it stopped, and `take` is what restarts it.
+// The oracle is a flat byte slice, which is the whole point: the contract is "these bytes,
+// in this order", and every index, accumulator and compaction behind it is free to change
+// as long as a caller cannot tell.
+//
+// The upgrade head's rolling `\r\n\r\n` scan used to live here and is now WsFramer's
+// (framing.js `scanHead`), where it can bail at the head ceiling instead of buffering an
+// oversized chunk first. It is covered where it now lives: FuzzWsFramer's oracle refuses
+// the same streams, and TestWsHandshakeHeadScansOnce holds it to scanning once.
 
 const (
 	bpPush = 0
 	bpPeek = 1
 	bpTake = 2
-	bpFind = 3
 )
 
 // bytePartsProg spells one program the way the probe reads it: an op byte and a big-endian
@@ -890,8 +903,7 @@ func bytePartsProg(opArg ...int) []byte {
 }
 
 type refByteParts struct {
-	buf     []byte
-	scanned int // bytes the head scan has already read
+	buf []byte
 }
 
 func (b *refByteParts) push(chunk []byte) { b.buf = append(b.buf, chunk...) }
@@ -901,23 +913,7 @@ func (b *refByteParts) peek(n int) []byte { return b.buf[:min(n, len(b.buf))] }
 func (b *refByteParts) take(n int) []byte {
 	out := b.buf[:n]
 	b.buf = b.buf[n:]
-	// The scan's cursor indexed the bytes that just moved, so it starts over — for n=0 as
-	// much as for any other n, which is what makes a no-op take observable at all.
-	b.scanned = 0
 	return out
-}
-
-// findHeadEnd resumes: a terminator is found by the byte that COMPLETES it, and only bytes
-// the scan has not read yet can complete one. So a second call with no take in between
-// answers about the rest of the buffer rather than about all of it.
-func (b *refByteParts) findHeadEnd() int {
-	for i := b.scanned; i < len(b.buf); i++ {
-		b.scanned = i + 1
-		if i >= 3 && b.buf[i-3] == 13 && b.buf[i-2] == 10 && b.buf[i-1] == 13 && b.buf[i] == 10 {
-			return i - 3
-		}
-	}
-	return -1
 }
 
 // refBytePartsRun is the probe's loop, op for op. The two must agree on which ops they SKIP
@@ -929,7 +925,7 @@ func refBytePartsRun(data, prog []byte) (log []string, rest string, length int) 
 	off, pushed := 0, 0
 	for i := 0; i+2 < len(prog); i += 3 {
 		arg := int(binary.BigEndian.Uint16(prog[i+1:]))
-		switch prog[i] & 3 {
+		switch prog[i] % 3 {
 		case bpPush:
 			if len(data) == 0 || pushed+arg > framingCaps.Budget {
 				break
@@ -944,11 +940,9 @@ func refBytePartsRun(data, prog []byte) (log []string, rest string, length int) 
 			log = append(log, fmt.Sprintf("push %d len=%d", arg, len(b.buf)))
 		case bpPeek:
 			log = append(log, fmt.Sprintf("peek %d %s len=%d", arg, hexOf(b.peek(arg)), len(b.buf)))
-		case bpTake:
+		default:
 			n := min(arg, len(b.buf))
 			log = append(log, fmt.Sprintf("take %d %s len=%d", n, hexOf(b.take(n)), len(b.buf)))
-		default:
-			log = append(log, fmt.Sprintf("find %d len=%d", b.findHeadEnd(), len(b.buf)))
 		}
 	}
 	return log, hexOf(b.buf), len(b.buf)
@@ -958,11 +952,10 @@ func refBytePartsRun(data, prog []byte) (log []string, rest string, length int) 
 func FuzzByteParts(f *testing.F) {
 	framingFuzzRealm(f)
 	f.Add([]byte("hello"), bytePartsProg(bpPush, 5, bpPeek, 5, bpTake, 5, bpPeek, 1))
-	f.Add([]byte("\r\n\r\n"), bytePartsProg(bpFind, 0, bpPush, 4, bpFind, 0, bpFind, 0))
-	// The head-end scan resuming across arrivals, with the terminator straddling several of
-	// them: the four-byte window is the only thing that carries it over.
-	f.Add([]byte("a\r\n\r\nb"), bytePartsProg(bpPush, 2, bpFind, 0, bpPush, 1, bpFind, 0,
-		bpPush, 1, bpFind, 0, bpPush, 1, bpFind, 0, bpPush, 1, bpFind, 0))
+	// A buffer filled one byte at a time and peeked between every arrival: the shape a
+	// dribbled frame header really has, and the one the accumulator exists for.
+	f.Add([]byte("a\r\n\r\nb"), bytePartsProg(bpPush, 2, bpPeek, 8, bpPush, 1, bpPeek, 8,
+		bpPush, 1, bpPeek, 8, bpPush, 1, bpPeek, 8, bpPush, 1, bpPeek, 8))
 	// The accumulator boundary from both sides, and the merge that follows it.
 	f.Add([]byte("ab"), bytePartsProg(bpPush, 8191, bpPush, 1, bpPush, 1, bpPeek, 8193))
 	f.Add([]byte("ab"), bytePartsProg(bpPush, 8192, bpPush, 8192, bpTake, 4, bpPeek, 16380))
@@ -974,8 +967,8 @@ func FuzzByteParts(f *testing.F) {
 	f.Add([]byte("xyz"), bytePartsProg(
 		bpPush, 9000, bpPush, 2, bpPush, 2, bpPush, 2, bpPush, 2, bpPush, 2, bpPush, 2, bpPush, 2,
 		bpTake, 9000, bpTake, 2, bpTake, 2, bpTake, 2, bpTake, 2, bpTake, 2, bpTake, 2, bpPeek, 4))
-	f.Add([]byte{}, bytePartsProg(bpPush, 100, bpTake, 100, bpFind, 0))
-	f.Add([]byte("q"), bytePartsProg(bpTake, 0, bpPeek, 9, bpFind, 0))
+	f.Add([]byte{}, bytePartsProg(bpPush, 100, bpTake, 100, bpPeek, 4))
+	f.Add([]byte("q"), bytePartsProg(bpTake, 0, bpPeek, 9, bpPush, 1))
 
 	f.Fuzz(func(t *testing.T, data, prog []byte) {
 		// The probe reports the whole buffer after every peek and take, so a program costs
@@ -993,18 +986,23 @@ func FuzzByteParts(f *testing.F) {
 		if err := json.Unmarshal(out, &got); err != nil {
 			t.Fatalf("__fuzzByteParts: undecodable answer %q: %v", out, err)
 		}
-		// The states this buffer REACHED: how many operations ran, whether the head scan ever
-		// completed, whether the accumulator boundary was crossed, and whether anything is
-		// still held. The byte counts themselves are the input restated, so they are bucketed.
-		find := "none"
+		// The states this buffer REACHED: a program long enough to trip compaction, whether
+		// anything was ever actually consumed (which is what moves the head and ends the
+		// accumulator), whether the 8 KiB boundary was crossed, and whether anything is still
+		// held. The byte counts are the input restated, so none of them is a milestone.
+		took := false
 		for _, l := range got.Log {
-			if strings.HasPrefix(l, "find ") && !strings.HasPrefix(l, "find -1") {
-				find = "hit"
+			if strings.HasPrefix(l, "take ") && !strings.HasPrefix(l, "take 0 ") {
+				took = true
 				break
 			}
 		}
-		covPath(fmt.Sprintf("byteparts ops=%s find=%s grown=%v left=%s",
-			covBucket(len(got.Log)), find, got.MaxLen >= 8192, covBucket(got.Len)))
+		// 8 consumed slices is where `take` starts dropping them (framing.js), so a program
+		// that long is the one that can reach the compaction arithmetic at all.
+		covMarkIf(len(got.Log) >= 8, covBytePartsOpsMany)
+		covMarkIf(took, covBytePartsTook)
+		covMarkIf(got.MaxLen >= 8192, covBytePartsGrown)
+		covMarkIf(got.Len > 0, covBytePartsHeld)
 		wantLog, wantRest, wantLen := refBytePartsRun(data, prog)
 		if !sameStrings(got.Log, wantLog) {
 			t.Fatalf("ByteParts: %s\nprog: %x\ndata %d bytes: %x",
@@ -1049,8 +1047,8 @@ const wsHeadAmplificationBound = 500
 //
 // The assertion is a RATIO — the same head, both ways, in the same realm on the same
 // machine — so machine speed cancels out of both sides and what is left is the shape of the
-// scan. This is the property findHeadEnd's comment claims: the head is scanned once,
-// however it arrives.
+// scan. This is the property scanHead's comment claims: the head is scanned once, however
+// it arrives.
 func TestWsHandshakeHeadScansOnce(t *testing.T) {
 	framingFuzzRealm(t)
 	// A head one byte under the ceiling with no CRLFCRLF in it: the most an accepting link
@@ -1084,9 +1082,9 @@ func TestWsHandshakeHeadScansOnce(t *testing.T) {
 
 // ── what a stranger's upgrade head costs this realm ──────────────────────────
 //
-// An accepting WebSocket link buffers bytes until it sees `\r\n\r\n`, and re-runs
-// `ByteParts.findHeadEnd` over EVERYTHING buffered on every arriving slice. The sender
-// picks the slice size, so the same 16 KiB of head is one scan or sixteen thousand of
+// An accepting WebSocket link buffers bytes until it sees `\r\n\r\n`, and
+// `WsFramer.scanHead` is what looks for it as each slice arrives. The sender picks the
+// slice size, so the same 16 KiB of head is one scan or sixteen thousand of
 // them — and the difference is work this node does for a peer it has not authenticated,
 // on the one realm every other link shares. The benchmark holds the bytes fixed and
 // varies only the chunking, so the number it prints IS the amplification.

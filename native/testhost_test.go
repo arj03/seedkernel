@@ -80,6 +80,10 @@ func bootRealm(tb testing.TB) { bootRealmIn(tb, tb.TempDir()) }
 
 func bootRealmIn(tb testing.TB, dir string) {
 	tb.Helper()
+	// Nothing below is worth running against an artifact the sources have moved past
+	// (shell_stamp_test.go). Checked here rather than per suite because every one of them
+	// evaluates that artifact and none of them can tell.
+	requireFreshShell(tb)
 	if err := boot(); err != nil {
 		tb.Fatal("boot:", err)
 	}
