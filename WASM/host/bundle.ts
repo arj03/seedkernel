@@ -54,8 +54,9 @@ export interface BundleManifest {
      *  (§12.10). Optional: an initiator-only bundle claims nothing. A claim is not authority. */
   protocols?: string[];
   /** Local service id(s) this app serves — the names a CO-RESIDENT guest may reach with
-     *  `host.call` (§12.10), never a peer. Optional; disjoint from `protocols`, since a name
-     *  in both would be ambiguous about which reach it grants. */
+     *  `host.call` (§12.10), never a peer. Optional. May OVERLAP `protocols`: these are two
+     *  maps, so a name in both is not ambiguous, it is a claim to both audiences — reachable
+     *  by a peer over the wire and by a co-resident guest by name. Uniqueness is per list. */
   services?: string[];
   modules: BundleModule[];
   /** The guest program — required. Modules are the pure transforms it drives. */
@@ -322,6 +323,8 @@ function isValidManifest(m: unknown): m is BundleManifest {
     const mm = mod;
     if (typeof mm.name !== "string" || !NAME_RE.test(mm.name))
       return false;
+    if (enc.encode(mm.name + ".wasm").length > 0xffff)
+      return false;
     if (typeof mm.hash !== "string")
       return false;
     if (seen.has(mm.name))
@@ -456,15 +459,19 @@ export function contentMatches(bytes: Uint8Array, declaredHex: string, genesisHa
 //
 //   "SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
 const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
-/** Parse a bundle blob back into its `{ file: bytes }` map. Throws on a mis-magicked or
- *  truncated blob — fail-loud, like a malformed manifest. */
+/** Parse a bundle blob back into its `{ file: bytes }` map. Throws on a mis-magicked,
+ *  truncated or self-contradicting blob — fail-loud, like a malformed manifest. */
 export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
   if (blob.length < 6 || !ARCHIVE_MAGIC.every((b, i) => blob[i] === b)) {
     throw new Error("bundle: not a bundle blob");
   }
   const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
   const count = dv.getUint16(4, false);
-  const files: Record<string, Uint8Array> = {};
+  // A NULL prototype, because the container is read before anything is verified and its
+  // names are the sender's: `files[name] = …` on an object literal reads "__proto__" as
+  // the prototype slot rather than as an entry, so that one name would both vanish from
+  // the map and re-point it at bytes the sender chose.
+  const files: Record<string, Uint8Array> = Object.create(null) as Record<string, Uint8Array>;
   let off = 6;
   for (let i = 0; i < count; i++) {
     if (off + 2 > blob.length)
@@ -479,9 +486,21 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     off += 4;
     if (off + dataLen > blob.length)
       throw new Error("bundle: truncated blob");
+    // One name, one file. A repeat would let the later entry shadow the earlier one, and
+    // the container is the one part of the format no signature covers — so a blob
+    // carrying two `manifest.bundle`s would be one bundle to a reader that keeps the last
+    // and a different bundle to one that keeps the first, from the same bytes.
+    if (name in files)
+      throw new Error(`bundle: two files named ${JSON.stringify(name)} in the blob`);
     files[name] = blob.slice(off, off + dataLen);
     off += dataLen;
   }
+  // The blob is the entries and nothing else. Same reason as the repeated name above: what
+  // is left over is covered by no signature, so bytes after the last file would make one
+  // bundle out of unboundedly many byte strings — and the blob's own hash is the identity
+  // a denylist, a freshness mark and an operator's pin are all keyed by (§12.4).
+  if (off !== blob.length)
+    throw new Error(`bundle: ${blob.length - off} trailing bytes after the last file`);
   return files;
 }
 /** Where a data directory's freshness marks live: a *sibling* of the directory, never a file

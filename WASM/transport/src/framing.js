@@ -78,19 +78,6 @@ class ByteParts {
     }
     return out;
   }
-  /** Byte offset of the first `\r\n\r\n`, or -1 when not present yet. */
-  findHeadEnd() {
-    let b0 = -1, b1 = -1, b2 = -1, b3 = -1, off = 0;
-    for (let i = this.head; i < this.parts.length; i++) {
-      const p = this.parts[i];
-      for (let j = 0; j < p.length; j++) {
-        b0 = b1; b1 = b2; b2 = b3; b3 = p[j];
-        if (b0 === 13 && b1 === 10 && b2 === 13 && b3 === 10) return off - 3;
-        off++;
-      }
-    }
-    return -1;
-  }
 }
 
 /** A length-prefixed link is writable from birth — there is no negotiation. */
@@ -160,6 +147,12 @@ class WsFramer {
       this.rejectOpen = reject;
     });
     this.opened.catch(() => {}); // no unhandled rejection when nothing was parked
+    // Rolling scan for the one-shot HTTP head terminator, carried across `read()` calls so
+    // a dribbled head is scanned once, not rescanned from the front per chunk. Owned here
+    // rather than by ByteParts: nothing else needs this shape, and it lets `scanHead` bail
+    // exactly at MAX_WS_HANDSHAKE instead of buffering an oversized chunk whole first.
+    this.headLen = 0;
+    this.h0 = -1; this.h1 = -1; this.h2 = -1; this.h3 = -1;
     this.fragOpcode = -1;
     this.frags = [];
     this.fragBytes = 0;
@@ -241,24 +234,46 @@ class WsFramer {
   }
 
   async read(chunk, deliver) {
-    this.parts.push(chunk);
     if (!this.open) {
+      const sep = this.scanHead(chunk);
+      if (sep === -2) return false; // no terminator within the head's own ceiling
+      this.parts.push(chunk);
+      if (sep < 0) return true;
       let consumed;
-      try { consumed = await this.upgrade(); } catch { return false; }
-      if (consumed < 0) return this.parts.length <= MAX_WS_HANDSHAKE;
+      try { consumed = await this.upgrade(sep); } catch { return false; }
       this.parts.take(consumed);
       this.open = true;
       this.resolveOpen();
+    } else {
+      this.parts.push(chunk);
     }
     try { return await this.frames(deliver); } catch { return false; }
   }
 
-  /** Read (client) or answer (server) the opening handshake. Returns the bytes
-   *  consumed, or -1 when the head is not complete yet. Throws on a refusal. */
-  async upgrade() {
+  /** Extend the rolling `\r\n\r\n` scan over one newly arrived pre-open chunk. Returns the
+   *  terminator's start offset in the whole pre-open stream, -1 when not found yet, or -2
+   *  once MAX_WS_HANDSHAKE bytes have been scanned with no terminator (or the terminator
+   *  itself only completes past that ceiling) — the caller refuses without buffering
+   *  whatever is left of an oversized chunk. */
+  scanHead(chunk) {
+    let h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, n = this.headLen;
+    for (let i = 0; i < chunk.length; i++) {
+      h0 = h1; h1 = h2; h2 = h3; h3 = chunk[i];
+      n++;
+      const matched = h0 === 13 && h1 === 10 && h2 === 13 && h3 === 10;
+      if (matched || n > MAX_WS_HANDSHAKE) {
+        this.h0 = h0; this.h1 = h1; this.h2 = h2; this.h3 = h3; this.headLen = n;
+        return matched && n <= MAX_WS_HANDSHAKE ? n - 4 : -2;
+      }
+    }
+    this.h0 = h0; this.h1 = h1; this.h2 = h2; this.h3 = h3; this.headLen = n;
+    return -1;
+  }
+
+  /** Read (client) or answer (server) the opening handshake, `sep` bytes into the buffered
+   *  head (from `scanHead`). Returns the bytes consumed. Throws on a refusal. */
+  async upgrade(sep) {
     await this.prepared;
-    const sep = this.parts.findHeadEnd();
-    if (sep < 0) return -1;
     const head = utf8Decode(this.parts.peek(sep));
     if (this.client) {
       // Sec-WebSocket-Accept is base64 and case-significant — compare it byte for byte

@@ -189,16 +189,26 @@ function opDecodeOne(input_len: i32): i32 {
   const b0 = load<u8>(bufPtr) as i32;
   const b1 = load<u8>(bufPtr + 1) as i32;
   const fin = (b0 & 0x80) != 0;
+  const rsv = b0 & 0x70;
   const opcode = b0 & 0x0f;
+  if (rsv != 0) { store<u8>(scratch, 2); return 1; } // RSV1/2/3 must be 0
+  if (opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10) {
+    store<u8>(scratch, 2); return 1; // unknown opcode
+  }
   if (!fin && opcode >= 8) { store<u8>(scratch, 2); return 1; }    // fragmented control frame
   const masked = (b1 & 0x80) != 0;
   if (masked != expectMasked) { store<u8>(scratch, 2); return 1; } // bad mask direction
 
   let payloadLen = b1 & 0x7f;
+  if (opcode >= 8) {
+    if (!fin || payloadLen > 125) { store<u8>(scratch, 2); return 1; } // control frames: FIN=1, payload <= 125
+    if (opcode == 8 && payloadLen == 1) { store<u8>(scratch, 2); return 1; } // close frame payload length != 1
+  }
   let headerLen = 2;
   if (payloadLen == 126) {
     if (bufLen < 4) { store<u8>(scratch, 0); return 1; }
     payloadLen = ((load<u8>(bufPtr + 2) as i32) << 8) | (load<u8>(bufPtr + 3) as i32);
+    if (payloadLen < 126) { store<u8>(scratch, 2); return 1; } // must use the minimal length encoding
     headerLen = 4;
   } else if (payloadLen == 127) {
     if (bufLen < 10) { store<u8>(scratch, 0); return 1; }
@@ -207,6 +217,7 @@ function opDecodeOne(input_len: i32): i32 {
     payloadLen = ((load<u8>(bufPtr + 6) as i32) << 24) | ((load<u8>(bufPtr + 7) as i32) << 16) |
                  ((load<u8>(bufPtr + 8) as i32) << 8) | (load<u8>(bufPtr + 9) as i32);
     if (high != 0 || payloadLen < 0 || payloadLen > MAX_FRAME_PAYLOAD) { store<u8>(scratch, 2); return 1; }
+    if (payloadLen < 65536) { store<u8>(scratch, 2); return 1; } // must use the minimal length encoding, top bit already excluded by payloadLen < 0 above
     headerLen = 10;
   }
   if (payloadLen > MAX_FRAME_PAYLOAD) { store<u8>(scratch, 2); return 1; }

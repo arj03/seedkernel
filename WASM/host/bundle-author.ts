@@ -87,13 +87,22 @@ export function signManifest(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: 
 /** Serialize a set of named bundle files into one bundle blob (bundle.ts container format). */
 export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
   const names = Object.keys(files);
+  if (names.length > 0xffff) {
+    throw new Error(`bundle: too many files (${names.length} > 65535)`);
+  }
   const header = new Uint8Array(6);
   header.set([0x53, 0x4b, 0x42, 0x31], 0); // "SKB1"
   new DataView(header.buffer).setUint16(4, names.length, false);
   const parts: Uint8Array[] = [header];
   for (const name of names) {
     const nameBytes = enc.encode(name);
+    if (nameBytes.length > 0xffff) {
+      throw new Error(`bundle: filename too long (${nameBytes.length} bytes > 65535): ${name}`);
+    }
     const data = files[name];
+    if (data.length > 0xffffffff) {
+      throw new Error(`bundle: file data too large (${data.length} bytes > 0xffffffff): ${name}`);
+    }
     const rec = new Uint8Array(2 + nameBytes.length + 4);
     const dv = new DataView(rec.buffer);
     dv.setUint16(0, nameBytes.length, false);
