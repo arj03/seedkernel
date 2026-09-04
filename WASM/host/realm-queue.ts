@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
 } from "../core/wasm-limits.js";
+import { Fifo } from "../core/util.js";
 import type { HostCall } from "./guest-seam.js";
 
 function checkedBytes(bytes: number): number {
@@ -264,7 +265,7 @@ export function serializeCalls(
   }
   // A FIFO and an explicit occupant, not a promise chain: a chain waits by RESOLVING one
   // promise with another, and each of those hops is a wake of the native target's loop.
-  const waiting: Entry[] = [];
+  const waiting = new Fifo<Entry>();
   let running: Entry | undefined;
   let pumping = false;
   const settled = Promise.resolve();
@@ -283,7 +284,7 @@ export function serializeCalls(
   };
   /** Give the realm to whoever is next, on a fresh turn. */
   const pump = (): void => {
-    if (pumping || running !== undefined || waiting.length === 0) return;
+    if (pumping || running !== undefined || waiting.size === 0) return;
     pumping = true;
     void settled.then(enterNext);
   };
@@ -304,7 +305,7 @@ export function serializeCalls(
   }
   const enterNext = (): void => {
     pumping = false;
-    while (running === undefined && waiting.length > 0) {
+    while (running === undefined && waiting.size > 0) {
       const entry = waiting.shift() as Entry;
       if (entry.settled) continue;              // its deadline overtook it while it queued
       // Read at the FRONT rather than trusting a flag, so a late timer cannot admit an

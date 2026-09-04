@@ -56,15 +56,30 @@ class ByteParts {
     }
     return out;
   }
-  /** Consume exactly `n` bytes from the front, as one buffer. */
-  take(n) {
-    const out = new Uint8Array(n);
-    let off = 0;
-    while (off < n) {
+  /** The i-th live byte, without materializing anything. Callers check `length` first, so
+   *  an `i` past the end is a bug rather than a case — it reads 0. What `peek` is for when
+   *  only a header field is wanted: peeking allocated and copied on every parse attempt,
+   *  including the ones that go straight back for more bytes. */
+  byteAt(i) {
+    for (let k = this.head; k < this.parts.length; k++) {
+      const p = this.parts[k];
+      if (i < p.length) return p[i];
+      i -= p.length;
+    }
+    return 0;
+  }
+  /** Consume exactly `n` bytes from the front, as one buffer. `prefix` leaves that many
+   *  bytes free IN FRONT of them for the caller to fill — which is what lets a request
+   *  header be written around a frame rather than the frame copied again behind one. */
+  take(n, prefix = 0) {
+    const out = new Uint8Array(prefix + n);
+    const end = prefix + n;
+    let off = prefix;
+    while (off < end) {
       const p = this.parts[this.head];
-      const need = n - off;
+      const need = end - off;
       if (p.length <= need) { out.set(p, off); off += p.length; this.parts[this.head] = null; this.head++; }
-      else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = n; }
+      else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = end; }
     }
     this.length -= n;
     // The accumulator stops accumulating once its start is consumed from: the capacity
@@ -104,7 +119,8 @@ class LengthFramer {
     this.parts.push(chunk);
     for (;;) {
       if (this.parts.length < 4) return true;
-      const len = readU32BE(this.parts.peek(4), 0);
+      const p = this.parts;
+      const len = ((p.byteAt(0) << 24) | (p.byteAt(1) << 16) | (p.byteAt(2) << 8) | p.byteAt(3)) >>> 0;
       if (len > this.cap) return false;
       if (this.parts.length < 4 + len) return true;
       deliver(this.parts.take(4 + len).subarray(4));
@@ -302,18 +318,21 @@ class WsFramer {
       if (total < 0) return true;
       if (total > this.cap) return false;
       if (this.parts.length < total) return true;
-      const whole = this.parts.take(total);
-      const req = new Uint8Array(2 + whole.length);
+      // Staged with room for the request header in front of it, so the frame is gathered
+      // out of the slice list ONCE instead of again behind a two-byte prefix.
+      const req = this.parts.take(total, 2);
       req[0] = WS_OP_DECODE_ONE;
       req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
-      req.set(whole, 2);
       const r = await wsCall(req);
       // The module saw exactly one whole frame; anything but "frame" (1) is a protocol
       // violation — bad mask direction, a fragmented control frame, a bad length.
       if (r[0] !== 1) return false;
       const fin = (r[1] & 0x80) !== 0;
       const opcode = r[1] & 0x0f;
-      const payload = r.slice(10, 10 + readU32BE(r, 6));
+      // A VIEW: the seam answers a fresh buffer per call, so nothing else can write over
+      // it, and the 10 header bytes it keeps alive are cheaper than copying the payload
+      // out of it. Retained across calls only when a fragment is held in `frags`.
+      const payload = r.subarray(10, 10 + readU32BE(r, 6));
       if (opcode === WS_OP_CONT) {
         if (this.fragOpcode < 0) return false;
         this.fragBytes += payload.length;
@@ -351,20 +370,26 @@ class WsFramer {
    *  too few bytes are buffered to know yet. All real validation is the module's; this
    *  only sizes the wait. */
   frameLength() {
-    if (this.parts.length < 2) return -1;
-    const b = this.parts.peek(10);
-    const masked = (b[1] & 0x80) !== 0;
-    const len7 = b[1] & 0x7f;
+    const p = this.parts;
+    if (p.length < 2) return -1;
+    // Read field by field rather than through `peek`: this runs once per parse attempt,
+    // and most attempts are the early returns below — which were each allocating and
+    // filling a ten-byte buffer to look at one or two of its bytes.
+    const b1 = p.byteAt(1);
+    const masked = (b1 & 0x80) !== 0;
+    const len7 = b1 & 0x7f;
     let headerLen = 2, payloadLen = len7;
     if (len7 === 126) {
-      if (this.parts.length < 4) return -1;
+      if (p.length < 4) return -1;
       headerLen = 4;
-      payloadLen = (b[2] << 8) | b[3];
+      payloadLen = (p.byteAt(2) << 8) | p.byteAt(3);
     } else if (len7 === 127) {
-      if (this.parts.length < 10) return -1;
-      if (readU32BE(b, 2) !== 0) return 0x7fffffff; // > 4 GiB: over any cap
+      if (p.length < 10) return -1;
+      // The high half of the 64-bit length: any bit set is > 4 GiB and over any cap.
+      if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return 0x7fffffff;
       headerLen = 10;
-      payloadLen = readU32BE(b, 6);
+      payloadLen = ((p.byteAt(6) << 24) | (p.byteAt(7) << 16)
+        | (p.byteAt(8) << 8) | p.byteAt(9)) >>> 0;
     }
     return headerLen + (masked ? 4 : 0) + payloadLen;
   }

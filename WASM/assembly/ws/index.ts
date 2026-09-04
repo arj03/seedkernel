@@ -58,6 +58,37 @@ function b64char(idx: i32): u8 {
   return B64.charCodeAt(idx) as u8;
 }
 
+/** XOR `len` bytes at `ptr` with the RFC 6455 masking key m0..m3, eight bytes at a time.
+ *
+ *  The key repeats every four octets counted from the PAYLOAD's own start (§5.3), and both
+ *  callers mask a run that begins there, so one little-endian word covers every group and
+ *  the doubled word covers two. A byte-at-a-time loop with a four-way select per byte was
+ *  the whole client→server data path — every frame a browser edge sends is masked.
+ *
+ *  Alignment is declared as 1 because it genuinely is: a decoded payload lands at
+ *  `scratch + 10` and an encoded one after a 2/4/10-byte header plus the key. Wasm allows
+ *  unaligned access regardless — the immediate is a hint, not a constraint — so the honest
+ *  hint costs nothing and cannot mislead an engine that acts on it. */
+function maskRun(ptr: i32, len: i32, m0: i32, m1: i32, m2: i32, m3: i32): void {
+  // Little-endian, so byte i of the word is the key octet for payload offset i.
+  const word: u32 = (m0 as u32) | ((m1 as u32) << 8) | ((m2 as u32) << 16) | ((m3 as u32) << 24);
+  const dword: u64 = (word as u64) | ((word as u64) << 32);
+  let i = 0;
+  const eights = len & ~7;
+  for (; i < eights; i += 8) {
+    store<u64>(ptr + i, load<u64>(ptr + i, 0, 1) ^ dword, 0, 1);
+  }
+  if (i + 4 <= len) {
+    store<u32>(ptr + i, load<u32>(ptr + i, 0, 1) ^ word, 0, 1);
+    i += 4;
+  }
+  for (; i < len; i++) {
+    const mb = i & 3;
+    const mask = mb == 0 ? m0 : (mb == 1 ? m1 : (mb == 2 ? m2 : m3));
+    store<u8>(ptr + i, ((load<u8>(ptr + i) as i32) ^ mask) as u8);
+  }
+}
+
 /** base64-encode [inPtr, inPtr+inLen) into outPtr; returns the byte length. */
 function base64(inPtr: i32, inLen: i32, outPtr: i32): i32 {
   let o = 0;
@@ -169,12 +200,7 @@ function opEncode(input_len: i32): i32 {
     store<u8>(scratch + outHeaderLen + 1, m1 as u8);
     store<u8>(scratch + outHeaderLen + 2, m2 as u8);
     store<u8>(scratch + outHeaderLen + 3, m3 as u8);
-    for (let i = 0; i < payloadLen; i++) {
-      const mb = i & 3;
-      const mask = mb == 0 ? m0 : (mb == 1 ? m1 : (mb == 2 ? m2 : m3));
-      const p = scratch + outPayloadPos + i;
-      store<u8>(p, ((load<u8>(p) as i32) ^ mask) as u8);
-    }
+    maskRun(scratch + outPayloadPos, payloadLen, m0, m1, m2, m3);
   }
   return outTotal;
 }
@@ -240,12 +266,7 @@ function opDecodeOne(input_len: i32): i32 {
   storeBE(scratch + 2, totalFrame);      // consumed
   storeBE(scratch + 6, payloadLen);      // payloadLen
   if (masked) {
-    for (let i = 0; i < payloadLen; i++) {
-      const mb = i & 3;
-      const mask = mb == 0 ? m0 : (mb == 1 ? m1 : (mb == 2 ? m2 : m3));
-      const p = scratch + 10 + i;
-      store<u8>(p, ((load<u8>(p) as i32) ^ mask) as u8);
-    }
+    maskRun(scratch + 10, payloadLen, m0, m1, m2, m3);
   }
   return 10 + payloadLen;
 }

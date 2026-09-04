@@ -62,6 +62,15 @@ type guestRealm struct {
 	// realm, and later calls are refused rather than panicking on a freed handle.
 	dead bool
 
+	// Whether this realm may hold a queued job. ONLY guest code queues one here — every
+	// path that reaches g.qc with anything to run goes through `within` — and Pump drains
+	// to completion, so a realm nothing has entered since its last clean drain has nothing
+	// pending. Pumping it anyway costs four wasm crossings (arm the deadline, drain, ask
+	// whether the interrupt fired, disarm), on every turn of the loop, for every realm.
+	// Set by `within`; cleared only by a drain that COMPLETED — an interrupted or throwing
+	// one may have left jobs behind, so it leaves the flag standing.
+	jobsPending bool
+
 	// Host-side calls parked for this realm (hostcalls.go). This is the authoritative
 	// native registry: it rejects before the guest-to-Go payload copy and retains custody
 	// through delivery.
@@ -401,6 +410,9 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 			remaining = wall
 		}
 	}
+	// Guest code is about to run, so this realm may hold a job from here until a drain
+	// completes (see jobsPending).
+	g.jobsPending = true
 	restore := g.rt.Budget(remaining)
 	start := time.Now()
 	g.segmentDeadline = time.Time{}
@@ -465,14 +477,19 @@ func (g *guestRealm) settleAll(msg string) {
 // spinning on its own generates no I/O, so without the nudge the caller waits out its
 // whole timeout.
 func (g *guestRealm) pump() {
-	if g.rt == nil || g.dead || !g.rt.Alive() {
+	if g.rt == nil || g.dead || !g.rt.Alive() || !g.jobsPending {
 		return
 	}
 	if _, err := g.within(func() (*qjs.Value, error) {
 		return nil, g.qc.Pump()
 	}); err != nil {
+		// The drain did not finish — a job threw, or the budget interrupt stopped one
+		// mid-frame — so jobs may remain and `jobsPending` stays set for the next round.
 		g.loop.wake()
+		return
 	}
+	// js_std_loop returned with the queue empty, and only `within` can refill it.
+	g.jobsPending = false
 }
 
 // checkAlive refuses a realm a budget kill already terminated. Callers must ask BEFORE

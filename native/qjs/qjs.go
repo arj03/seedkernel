@@ -52,8 +52,14 @@ type Runtime struct {
 	qjs           uint64 // QJSRuntime*
 	ctxt          *Context
 	reg           *registry
-	fnPool        map[string][]api.Function // per-name free list of resolved exports; see call
+	fnPools       map[string]*fnPool // per-name free list of resolved exports; see call
 }
+
+// fnPool is one export's free list of resolved instances. A POINTER in the map, not a
+// slice value: a slice value has to be read and written back to pop and again to push, so
+// every engine call — and a *Value operation is one — hashed the name four times. Through
+// the pointer it is one lookup, and the pop and the push mutate in place.
+type fnPool struct{ free []api.Function }
 
 // registry maps callback ids to Go funcs for the env.jsFunctionProxy dispatcher.
 type registry struct {
@@ -144,7 +150,7 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		o(&cfg)
 	}
 	ctx := context.Background()
-	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPool: map[string][]api.Function{}}
+	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPools: map[string]*fnPool{}}
 
 	// On any failure after the wazero runtime is created but before the module is live,
 	// close it: the runtime holds this instance's compiled machine code.
@@ -262,9 +268,10 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	// JS→wasm), while resolving fresh per call pays a lookup and an allocation every time.
 	// The per-name free list keeps both: each in-flight (possibly nested) call pops its own
 	// instance and returns it after. Single-threaded, so the pool needs no locking.
-	fn := r.acquireFn(name)
+	p := r.pool(name)
+	fn := p.acquire(r, name)
 	res, err := fn.Call(r.ctx, args...)
-	r.releaseFn(name, fn)
+	p.free = append(p.free, fn)
 	if err != nil {
 		panic(fmt.Errorf("qjs: call %s: %w", name, err))
 	}
@@ -274,12 +281,23 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	return res[0]
 }
 
-// acquireFn hands out a resolved export instance for name: a pooled one if free, so a
-// nested re-entrant call gets a distinct instance from the one in flight.
-func (r *Runtime) acquireFn(name string) api.Function {
-	if pool := r.fnPool[name]; len(pool) > 0 {
-		fn := pool[len(pool)-1]
-		r.fnPool[name] = pool[:len(pool)-1]
+// pool returns name's free list, minting it on first use. The one map lookup an engine
+// call makes.
+func (r *Runtime) pool(name string) *fnPool {
+	p := r.fnPools[name]
+	if p == nil {
+		p = &fnPool{}
+		r.fnPools[name] = p
+	}
+	return p
+}
+
+// acquire hands out a resolved export instance: a pooled one if free, so a nested
+// re-entrant call gets a distinct instance from the one in flight.
+func (p *fnPool) acquire(r *Runtime, name string) api.Function {
+	if n := len(p.free); n > 0 {
+		fn := p.free[n-1]
+		p.free = p.free[:n-1]
 		return fn
 	}
 	fn := r.mod.ExportedFunction(name)
@@ -287,11 +305,6 @@ func (r *Runtime) acquireFn(name string) api.Function {
 		panic(fmt.Errorf("qjs: missing wasm export %q", name))
 	}
 	return fn
-}
-
-// releaseFn returns an instance to its free list for a later call to reuse.
-func (r *Runtime) releaseFn(name string, fn api.Function) {
-	r.fnPool[name] = append(r.fnPool[name], fn)
 }
 
 func (r *Runtime) mallocN(n int) uint64 {

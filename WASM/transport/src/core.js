@@ -121,7 +121,10 @@ class LinkLimiter {
     this.maxPerSource = maxPerSource;
     this.max = { unverified: maxUnverified, verified: maxVerified, authed: maxAuthed };
     this.count = { unverified: 0, verified: 0, authed: 0 };
-    // One book per tier; insertion order is the eviction policy.
+    // One book per tier; insertion order is the eviction policy. A slot carries the id it
+    // was booked under, so leaving a tier is a delete rather than a scan for itself — the
+    // scan was O(n) per move, which is O(n²) across filling and promoting a full tier, and
+    // unauthenticated inbound connections are what drive it.
     this.books = { unverified: new Map(), verified: new Map(), authed: new Map() };
     this.nextId = 0;
     this.perSource = new Map();
@@ -130,10 +133,10 @@ class LinkLimiter {
   acquire(source, evict) {
     if (source !== undefined && (this.perSource.get(source) || 0) >= this.maxPerSource) return null;
     if (!this.makeRoom("unverified")) return null;
-    const slot = { source, tier: "unverified", released: false, evict, limiter: this };
+    const slot = { source, tier: "unverified", released: false, evict, limiter: this, bookId: this.nextId++ };
     if (source !== undefined) this.perSource.set(source, (this.perSource.get(source) || 0) + 1);
     this.count.unverified++;
-    this.books.unverified.set(this.nextId++, slot);
+    this.books.unverified.set(slot.bookId, slot);
     return slot;
   }
 
@@ -151,7 +154,8 @@ class LinkLimiter {
     if (this.count[slot.tier] > 0) this.count[slot.tier]--;
     slot.tier = tier;
     this.count[tier]++;
-    this.books[tier].set(this.nextId++, slot);
+    slot.bookId = this.nextId++;
+    this.books[tier].set(slot.bookId, slot);
     return true;
   }
 
@@ -175,8 +179,7 @@ class LinkLimiter {
   }
 
   unbook(slot) {
-    const book = this.books[slot.tier];
-    for (const [id, s] of book) if (s === slot) { book.delete(id); break; }
+    this.books[slot.tier].delete(slot.bookId);
   }
 
   forget(slot) {

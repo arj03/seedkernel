@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"seedloader/qjs"
@@ -40,6 +41,68 @@ var (
 // The §4.1 scratch default arrives from the shared host (core/wasm-limits.ts
 // DEFAULT_SCRATCH_SIZE) with every slot build, so Go owns no copy that could drift from
 // the JS table's. A module needing more exports a `scratchSize` global.
+
+// ── the call deadline (§4.3) ────────────────────────────────────────────────────
+//
+// moduleDeadline is the context one module call runs under, and the whole of what wazero
+// reads from it: Done() to watch and Err() to say why. A `context.WithTimeout` per call
+// measured at ~580 ns and 5 allocations — 60% of the ~970 ns an armed call costs on this
+// machine — and ws.wasm is a module call per WebSocket frame, so the bound was costing more
+// than the calls it bounds.
+//
+// One instance serves every call because the channel closes only when a call actually
+// OVERRUNS, and an overrun already ends the module: wazero closed it and callModule evicts
+// it below. So a spent instance is replaced on that rare path rather than rebuilt on the
+// hot one. Sharing is safe for the same reason `moduleSlots` needs no lock — this file runs
+// only on the event-loop goroutine, and a call is synchronous.
+type moduleDeadline struct {
+	done  chan struct{}
+	timer *time.Timer
+	fired atomic.Bool
+}
+
+func (d *moduleDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (d *moduleDeadline) Done() <-chan struct{}       { return d.done }
+func (d *moduleDeadline) Value(any) any               { return nil }
+func (d *moduleDeadline) Err() error {
+	if d.fired.Load() {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// moduleCall is the deadline the next bounded call arms.
+var moduleCall = newModuleDeadline()
+
+func newModuleDeadline() *moduleDeadline {
+	d := &moduleDeadline{done: make(chan struct{})}
+	// The CAS is belt to disarm's braces: an expiry that races a replacement must not
+	// close an already-closed channel.
+	d.timer = time.AfterFunc(time.Hour, func() {
+		if d.fired.CompareAndSwap(false, true) {
+			close(d.done)
+		}
+	})
+	d.timer.Stop()
+	return d
+}
+
+// armModuleDeadline starts the shared deadline and answers the context to call under.
+func armModuleDeadline(after time.Duration) context.Context {
+	moduleCall.timer.Reset(after)
+	return moduleCall
+}
+
+// disarmModuleDeadline stops it, replacing the instance once it has fired — a closed Done
+// channel stays closed, so re-arming a spent one would kill the next call the instant it
+// began. Stop answering false covers "already firing" as well as "already fired", which is
+// why the replacement is keyed on it rather than on the flag. DEFERRED by the caller, so a
+// panic out of the engine cannot leave a spent instance armed for the next call.
+func disarmModuleDeadline() {
+	if !moduleCall.timer.Stop() {
+		moduleCall = newModuleDeadline()
+	}
+}
 
 // bootModuleTable stands the table up: the runtime every installed app module is
 // instantiated on, plus the import shims those modules resolve against. Both belong here
@@ -127,12 +190,12 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 	}()
 	// The runtime is armed with WithCloseOnContextDone, which is what gives the §4.3
 	// bound teeth: a module that never returns is interrupted at its next loop back-edge.
-	callCtx, cancel := ctx, func() {}
+	callCtx := ctx
 	if deadline >= 0 {
-		callCtx, cancel = context.WithTimeout(ctx, deadline)
+		callCtx = armModuleDeadline(deadline)
+		defer disarmModuleDeadline()
 	}
 	r, err := w.fn.Call(callCtx, uint64(len(payload)))
-	cancel()
 	if err != nil {
 		// A trap leaves the module alive (retriable); a context-done termination closed
 		// it. Evict the wedged one so a reinstall recovers it.

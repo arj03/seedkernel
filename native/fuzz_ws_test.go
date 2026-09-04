@@ -57,7 +57,7 @@ globalThis.__wsModuleBytes = () => unpackBundle(transportBundleBytes())["ws.wasm
 
 // wsModule stands the codec up on the module table's runtime. Instantiated once per fuzz
 // process: compiling it per iteration would cost more than the parse under test.
-func wsModule(f *testing.F) *boundModule {
+func wsModule(f testing.TB) *boundModule {
 	f.Helper()
 	bootRealm(f)
 	if _, err := qc.Eval("fuzz-ws.js", qjs.Code(wsModuleJS)); err != nil {
@@ -81,7 +81,7 @@ const fuzzScratchFloor = 128 * 1024
 
 // wsCall stages one request and returns handle()'s raw length plus the module's memory,
 // UNCLAMPED — the length is the assertion's subject, so it must not be trimmed first.
-func wsCall(t *testing.T, w *boundModule, req []byte) (int64, []byte) {
+func wsCall(t testing.TB, w *boundModule, req []byte) (int64, []byte) {
 	t.Helper()
 	if uint32(len(req)) > w.size {
 		t.Fatalf("harness: %d-byte request past the module's %d-byte scratch", len(req), w.size)

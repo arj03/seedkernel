@@ -2,7 +2,7 @@
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
 
-import { toHex, fromHex } from "../core/util.js";
+import { toHex, fromHex, Fifo } from "../core/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_FRAME_BYTES,
@@ -74,7 +74,7 @@ class LinkOutboundOwner {
   /** Admitted write sizes in send order, so a drained PREFIX can be retired without
    *  waiting for the whole backlog to empty — the node-wide slice count is shared, and one
    *  busy link that never reaches an idle moment would otherwise hold it to the ceiling. */
-  private readonly queued: number[] = [];
+  private readonly queued = new Fifo<number>();
   private charged = 0; // === sum(queued)
   private closed = false;
 
@@ -107,11 +107,11 @@ class LinkOutboundOwner {
   private settle(now: number | null): void {
     if (now === null) return;
     let n = 0, bytes = 0;
-    while (n < this.queued.length && this.charged - bytes - this.queued[n] >= now) {
-      bytes += this.queued[n++];
+    while (n < this.queued.size && this.charged - bytes - this.queued.at(n) >= now) {
+      bytes += this.queued.at(n++);
     }
     if (n === 0) return;
-    this.queued.splice(0, n);
+    this.queued.drop(n);
     this.charged -= bytes;
     this.releaseParent(bytes, n);
   }
@@ -121,7 +121,7 @@ class LinkOutboundOwner {
     const now = this.report();
     if (now === null) throw new Error("socket: adapter cannot report its outbound backlog");
     this.settle(now);
-    if (this.queued.length >= MAX_OUTBOUND_QUEUE_SLICES
+    if (this.queued.size >= MAX_OUTBOUND_QUEUE_SLICES
       || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.charged
       || !this.reserveParent(bytes.length)) {
       throw new Error("socket: outbound queue limit exceeded");
@@ -139,8 +139,8 @@ class LinkOutboundOwner {
   releaseAll(): void {
     if (this.closed) return;
     this.closed = true;
-    this.releaseParent(this.charged, this.queued.length);
-    this.queued.length = 0;
+    this.releaseParent(this.charged, this.queued.size);
+    this.queued.clear();
     this.charged = 0;
   }
 }
@@ -375,11 +375,11 @@ export class TransportHost {
     // so thousands of links cannot multiply a per-link allowance behind one realm.
     let readActive = false;
     let activeBytes = 0;
-    const held: Uint8Array[] = [];
+    const held = new Fifo<Uint8Array>();
 
     const dropHeld = () => {
-      for (const bytes of held) this.releaseInboundRead(bytes.length);
-      held.length = 0;
+      for (let i = 0; i < held.size; i++) this.releaseInboundRead(held.at(i).length);
+      held.clear();
     };
     const releaseActive = () => {
       if (!readActive) return;

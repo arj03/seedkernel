@@ -187,10 +187,13 @@ type SeamHandler = (payload: Uint8Array, budget?: CallBudget) => Uint8Array | Pr
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
     "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
-    "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.slice(44), null, null, a.slice(0, 12), a.slice(12, 44)),
+    // `subarray`, not `slice`: every primitive below reads its arguments into its own
+    // storage before it returns, so a view is enough — and on the record layer's hot path
+    // `slice` copied the whole payload once more on the way in, for nothing.
+    "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.subarray(44), null, null, a.subarray(0, 12), a.subarray(12, 44)),
     "crypto/chacha20poly1305-ietf/open": (a) => {
       try {
-        const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, a.slice(44), null, a.slice(0, 12), a.slice(12, 44));
+        const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, a.subarray(44), null, a.subarray(0, 12), a.subarray(12, 44));
         return concatBytes([ONE, pt]);
       }
       catch {
@@ -200,7 +203,7 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     // [sk 32][pk 32] -> [ok u8][shared 32]. ok=0: low-order point.
     "crypto/x25519/dh": (a) => {
       try {
-        return concatBytes([ONE, sodium.crypto_scalarmult(a.slice(0, 32), a.slice(32, 64))]);
+        return concatBytes([ONE, sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))]);
       }
       catch {
         return ZERO;

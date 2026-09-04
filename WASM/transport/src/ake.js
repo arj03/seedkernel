@@ -297,6 +297,7 @@ class Link {
     this.myKem = null;
     this.kemSecret = null;
     this.queue = [];
+    this.queueHead = 0;
     this.queuedBytes = 0;
     this.outboundQueuedBytes = 0;
     this.outboundQueuedSlices = 0;
@@ -459,9 +460,20 @@ class Link {
     }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
-    while ((this.queuedBytes > MAX_QUEUE_BYTES || this.queue.length > maxPreAuthQueueSlices)
-        && this.queue.length > 1) {
-      this.queuedBytes -= this.queue.shift().length;
+    // Drop-oldest through a head index, never `shift()`: shift moves every slice still
+    // queued on each pop, and this queue sits at its cap exactly when an unauthenticated
+    // peer is flooding it — the bound doing its job is what would make dropping quadratic.
+    let live = this.queue.length - this.queueHead;
+    while ((this.queuedBytes > MAX_QUEUE_BYTES || live > maxPreAuthQueueSlices) && live > 1) {
+      this.queuedBytes -= this.queue[this.queueHead].length;
+      this.queue[this.queueHead++] = null; // dropped, and not held live until compaction
+      live--;
+    }
+    // The consumed prefix goes once it outnumbers what is still queued — the amortization
+    // ByteParts uses, and what keeps a long pre-auth flood from growing the array forever.
+    if (this.queueHead >= 8 && this.queueHead * 2 >= this.queue.length) {
+      this.queue = this.queue.slice(this.queueHead);
+      this.queueHead = 0;
     }
   }
 
@@ -626,10 +638,11 @@ class Link {
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
-    const flush = this.queue;
+    const flush = this.queue, from = this.queueHead;
     this.queue = [];
+    this.queueHead = 0;
     this.queuedBytes = 0;
-    for (const f of flush) await this.wireRecord(f);
+    for (let i = from; i < flush.length; i++) await this.wireRecord(flush[i]);
   }
 
   // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
@@ -885,6 +898,7 @@ class Link {
     this.clearIdle();
     this.releaseSlot();
     this.queue.length = 0;
+    this.queueHead = 0;
     this.queuedBytes = 0;
     if (this.sendKey) this.sendKey.fill(0);
     if (this.recvKey) this.recvKey.fill(0);

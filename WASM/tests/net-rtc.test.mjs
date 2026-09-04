@@ -370,14 +370,14 @@ await test("pending ICE is normalized and bounded by candidate count", async () 
   };
   await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: original }));
   const entry = net.peers.get(remote);
-  assert(entry.pendingIce.length === 1, "a valid early candidate must be queued");
-  assert(entry.pendingIce[0] !== original && !("extra" in entry.pendingIce[0]),
+  assert(entry.pendingIce.size === 1, "a valid early candidate must be queued");
+  assert(entry.pendingIce.peek() !== original && !("extra" in entry.pendingIce.peek()),
     "the pending queue must retain a normalized candidate, never the signaling object");
 
   for (let i = 1; i < MAX_PENDING_ICE_CANDIDATES; i++) {
     await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: `candidate:${i}` } }));
   }
-  assert(entry.pendingIce.length === MAX_PENDING_ICE_CANDIDATES && !made[0].pc.closed,
+  assert(entry.pendingIce.size === MAX_PENDING_ICE_CANDIDATES && !made[0].pc.closed,
     "the exact pending-candidate count ceiling must remain admitted");
   await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: "one-too-many" } }));
   assert(!net.peers.has(remote) && made[0].pc.closed,

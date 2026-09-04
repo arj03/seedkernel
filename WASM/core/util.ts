@@ -1,4 +1,4 @@
-// Small byte helpers shared across the runtime host. No dependencies.
+// Small helpers shared across the runtime host. No dependencies.
 
 const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
 
@@ -60,4 +60,49 @@ export function fromBase64(b64: string): Uint8Array {
 export function errMessage(e: unknown): string {
   const m = (e as Error | null)?.message;
   return m == null ? String(e) : String(m);
+}
+
+/** A queue whose pop is O(1): a head index into a plain array, with the consumed prefix
+ *  dropped once it outnumbers what is still live.
+ *
+ *  `Array.prototype.shift` moves every remaining element, so draining a full queue costs
+ *  O(n²) — and every queue here is BOUNDED, which means the quadratic term is paid exactly
+ *  when the bound is doing its job and the queue is full. The same shape as the framer's
+ *  `ByteParts`, which is where the amortization constants come from. */
+export class Fifo<T> {
+  private items: T[] = [];
+  private head = 0;
+
+  /** Live entries — never `items.length`, which counts the consumed prefix too. */
+  get size(): number { return this.items.length - this.head; }
+
+  push(v: T): void { this.items.push(v); }
+
+  /** The front, still queued. Undefined only when empty. */
+  peek(): T | undefined { return this.head < this.items.length ? this.items[this.head] : undefined; }
+
+  /** The i-th live entry, oldest first. Callers bound `i` by `size`; past it reads
+   *  undefined, which is a bug rather than a case. */
+  at(i: number): T { return this.items[this.head + i]; }
+
+  shift(): T | undefined {
+    if (this.head >= this.items.length) return undefined;
+    const v = this.items[this.head];
+    this.drop(1);
+    return v;
+  }
+
+  /** Discard the oldest `n`, for the caller that scanned a prefix before deciding. The
+   *  slots are cleared as they go: a consumed entry the array still points at would stay
+   *  reachable until the next compaction. */
+  drop(n: number): void {
+    const end = Math.min(this.head + n, this.items.length);
+    while (this.head < end) this.items[this.head++] = undefined as unknown as T;
+    if (this.head >= 8 && this.head * 2 >= this.items.length) {
+      this.items = this.items.slice(this.head);
+      this.head = 0;
+    }
+  }
+
+  clear(): void { this.items = []; this.head = 0; }
 }

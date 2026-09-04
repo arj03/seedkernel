@@ -17,7 +17,7 @@
 // owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel } from "./net-channel.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
-import { isHex64 } from "../core/util.js";
+import { isHex64, Fifo } from "../core/util.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
  *  Exported because it is the seam an app subclass works against — see the note on media
@@ -36,7 +36,7 @@ export interface PeerEntry {
   established: boolean;
   polite: boolean;
   makingOffer: boolean;
-  pendingIce: RTCIceCandidateInit[];
+  pendingIce: Fifo<RTCIceCandidateInit>;
   /** Worst-case UTF-16 storage retained by queued or in-flight candidate strings. */
   pendingIceBytes: number;
   /** The one host-owned deadline every entry gets. An entry that has not both established
@@ -278,7 +278,7 @@ export class RtcNetwork implements ChannelFactory {
     const pc = this.makePc(this.opts.rtcConfig);
     const e: PeerEntry = {
       pc, linked: false, established: false, polite: this.ownId > peerId,
-      makingOffer: false, pendingIce: [], pendingIceBytes: 0, establishmentTimer: null,
+      makingOffer: false, pendingIce: new Fifo(), pendingIceBytes: 0, establishmentTimer: null,
     };
     this.peers.set(peerId, e);
     e.establishmentTimer = setTimeout(() => {
@@ -396,7 +396,7 @@ export class RtcNetwork implements ChannelFactory {
       clearTimeout(e.establishmentTimer);
       e.establishmentTimer = null;
     }
-    e.pendingIce.length = 0;
+    e.pendingIce.clear();
     e.pendingIceBytes = 0;
     try {
       e.pc.close();
@@ -506,7 +506,7 @@ export class RtcNetwork implements ChannelFactory {
     // One queue for both phases: before SDP it waits, after SDP the lane below drains
     // it — so a direct caller cannot enter addIceCandidate outside the meter.
     const candidateBytes = iceCandidateBytes(msg.candidate);
-    if (e.pendingIce.length >= MAX_PENDING_ICE_CANDIDATES
+    if (e.pendingIce.size >= MAX_PENDING_ICE_CANDIDATES
             || candidateBytes > MAX_PENDING_ICE_BYTES - e.pendingIceBytes) {
       // The sender has made this negotiation unusable; tear it down instead of
       // retaining an ever-growing pre-description or post-description backlog.
@@ -524,15 +524,15 @@ export class RtcNetwork implements ChannelFactory {
      *  so a second drain cannot begin while this one is between candidates. */
   private async drainIce(peerId: string, e: PeerEntry): Promise<void> {
     while (!this.closed && this.peers.get(peerId) === e
-            && e.pc.remoteDescription && e.pendingIce.length > 0) {
-      const candidate = e.pendingIce[0];
+            && e.pc.remoteDescription && e.pendingIce.size > 0) {
+      const candidate = e.pendingIce.peek()!;
       const candidateBytes = iceCandidateBytes(candidate);
       try {
         await e.pc.addIceCandidate(candidate);
       }
       catch { /* stale after rollback, or rejected by the platform */ }
       // forget() may have cleared the queue while the platform operation yielded.
-      if (e.pendingIce[0] === candidate) {
+      if (e.pendingIce.peek() === candidate) {
         e.pendingIce.shift();
         e.pendingIceBytes -= candidateBytes;
       }

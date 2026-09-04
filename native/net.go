@@ -195,22 +195,22 @@ func (c *sockChannel) writeLoop() {
 			<-c.wake
 			continue
 		}
-		b := c.queue[0]
-		c.queue[0] = nil // release the payload once written, not when the queue array turns over
-		c.queue = c.queue[1:]
-		if len(c.queue) == 0 {
-			c.queue = nil // drained: free the backing array instead of pinning its high-water cap
-		}
+		// Take the WHOLE backlog, not its head: the record layer writes one frame per
+		// record, so popping one at a time cost a syscall and two lock round-trips each
+		// where one writev carries the batch (writeMsgs).
+		batch := c.queue
+		c.queue = nil // drained: free the backing array instead of pinning its high-water cap
 		c.mu.Unlock()
 		// If a close()-initiated flush hits a write error, fail() is a no-op (dead is set)
 		// and the remaining writes error instantly on the closed conn — the loop still
 		// terminates, it just drains fast.
-		c.writeMsg(b)
+		n := c.writeMsgs(batch)
 		c.mu.Lock()
-		// Keep the slice visible to buffered() while conn.Write owns it. A concurrent
-		// hard close/fail may already have released the whole allowance.
-		if c.queued >= len(b) {
-			c.queued -= len(b)
+		// Keep the batch visible to buffered() while conn.Write owns it — over-reporting for
+		// the span of one writev, which is the conservative side of a custody bound. A
+		// concurrent hard close/fail may already have released the whole allowance.
+		if c.queued >= n {
+			c.queued -= n
 		}
 		c.mu.Unlock()
 	}
@@ -253,11 +253,29 @@ func (c *sockChannel) close(graceful bool) { c.terminate(graceful, false) }
 func (c *sockChannel) fail()               { c.terminate(false, true) }
 
 // The wire: bytes pass through verbatim. Whether a link is length-prefixed or RFC 6455
-// framed is the transport bundle's decision and its code (transport/src).
-func (c *sockChannel) writeMsg(bytes []byte) {
-	if _, err := c.conn.Write(bytes); err != nil {
+// framed is the transport bundle's decision and its code (transport/src). Returns the
+// batch's byte total, which is what the caller releases from `queued`.
+func (c *sockChannel) writeMsgs(batch [][]byte) int {
+	total := 0
+	for _, b := range batch {
+		total += len(b)
+	}
+	// One frame is the latency path the send-side Gosched hands the processor over for
+	// (see send), so it stays a plain Write rather than entering the vector machinery.
+	if len(batch) == 1 {
+		if _, err := c.conn.Write(batch[0]); err != nil {
+			c.fail()
+		}
+		return total
+	}
+	// net.Buffers CONSUMES its header slice as it writes, which is safe because the batch
+	// left the queue before this goroutine took it. On a conn with no writev fast path it
+	// falls back to one Write per buffer — exactly the old loop.
+	bufs := net.Buffers(batch)
+	if _, err := bufs.WriteTo(c.conn); err != nil {
 		c.fail()
 	}
+	return total
 }
 
 func (c *sockChannel) readLoop() {
