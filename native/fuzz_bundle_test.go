@@ -752,55 +752,77 @@ func FuzzValidateManifest(f *testing.F) {
 // when it holds. Read against the consumers, not against isValidManifest: the app name is
 // length-encoded into the slot's signing scope, the module names are the table's keys, and
 // `guest.requires` is the privilege vocabulary the shell grants from.
+//
+// Decodes into `any` rather than a typed struct, and reads every field by type-asserting the
+// resulting map. `encoding/json` resolves a repeated key the same way `JSON.parse` does — the
+// last occurrence wins — but ONLY when the target has no fixed type to conflict with partway
+// through: a typed struct field records a type-mismatch error on an earlier occurrence and
+// returns it even after a later occurrence overwrites the field with a value of the right
+// type, which made this oracle refuse manifests `validateManifest` rightly accepts (found by
+// the fuzzer on `{"version":"","version":0}`). `any` has no fixed type to conflict with, so
+// it silently keeps only the last value — matching what the probe's own `JSON.parse` does.
 func manifestMustHold(data []byte) string {
-	var m struct {
-		App     *string `json:"app"`
-		Version *float64
-		Modules *[]struct {
-			Name *string `json:"name"`
-			Hash *string `json:"hash"`
-		} `json:"modules"`
-		Guest *struct {
-			Hash     *string   `json:"hash"`
-			Requires *[]string `json:"requires"`
-		} `json:"guest"`
+	var raw any
+	if json.Unmarshal(data, &raw) != nil {
+		return "it is not even an object of the manifest's shape"
 	}
-	if json.Unmarshal(data, &m) != nil {
+	m, ok := raw.(map[string]any)
+	if !ok {
 		return "it is not even an object of the manifest's shape"
 	}
 	// One length byte carries the app name into `appSignScope`, so a longer one verifies
 	// and installs, then throws on the guest's first signature.
-	if m.App == nil || *m.App == "" || len(*m.App) > 255 {
+	app, ok := m["app"].(string)
+	if !ok || app == "" || len(app) > 255 {
 		return "the app name is missing, empty or over the 255 bytes its signing scope encodes"
 	}
-	if m.Version == nil || *m.Version < 0 || *m.Version != float64(int64(*m.Version)) {
+	version, ok := m["version"].(float64)
+	if !ok || version < 0 || version != float64(int64(version)) {
 		return "the version is not a non-negative integer"
 	}
-	if m.Guest == nil || m.Guest.Hash == nil || m.Guest.Requires == nil {
+	guest, ok := m["guest"].(map[string]any)
+	if !ok {
+		return "the guest declares no hash or no requires — and every app is a guest"
+	}
+	if _, ok := guest["hash"].(string); !ok {
+		return "the guest declares no hash or no requires — and every app is a guest"
+	}
+	requires, ok := guest["requires"].([]any)
+	if !ok {
 		return "the guest declares no hash or no requires — and every app is a guest"
 	}
 	// A name outside the catalog is a grant that would quietly reach nothing at first use,
 	// which is the failure this vocabulary is closed to prevent (§12.5).
-	for _, r := range *m.Guest.Requires {
+	for _, rv := range requires {
+		r, ok := rv.(string)
+		if !ok {
+			return "guest.requires has a non-string entry"
+		}
 		if !hostServices()[r] {
 			return "guest.requires names " + strconv.Quote(r) + ", which is no service of this host"
 		}
 	}
-	if m.Modules == nil {
+	modules, ok := m["modules"].([]any)
+	if !ok {
 		return "modules is missing"
 	}
 	seen := map[string]bool{}
-	for _, mod := range *m.Modules {
-		if mod.Name == nil || mod.Hash == nil {
+	for _, modv := range modules {
+		mod, ok := modv.(map[string]any)
+		if !ok {
+			return "a module declares no name or no hash"
+		}
+		name, nameOk := mod["name"].(string)
+		if _, hashOk := mod["hash"].(string); !nameOk || !hashOk {
 			return "a module declares no name or no hash"
 		}
 		// Two modules under one name is one entry in the slot's table: the second would
 		// silently take the first's place, and a bundle's module names are what its guest
 		// reaches by.
-		if seen[*mod.Name] {
-			return "two modules are named " + strconv.Quote(*mod.Name)
+		if seen[name] {
+			return "two modules are named " + strconv.Quote(name)
 		}
-		seen[*mod.Name] = true
+		seen[name] = true
 	}
 	return ""
 }
