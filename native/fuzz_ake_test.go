@@ -134,24 +134,50 @@ const akeFuzzJS = `
   const A = mkNode(), B = mkNode();
   const drain = () => { A.drainDeferred(); B.drainDeferred(); };
 
+  // Every link this scope has built and not yet released.
+  //
+  // A stalled link keeps its deadline ARMED — that is the design, since silence has to cost
+  // the sender its slot until the normal timeout — and the guest's timer table holds the
+  // callback, which holds the link, which holds its ephemeral and its KEM state. Nothing
+  // here ever fires a clock, so an execution that does not release its links leaves them in
+  // that table for the life of the worker: at a few thousand executions a second the process
+  // is gigabytes deep and killed long before its ten minutes are up.
+  //
+  // Swept at the START of an execution, never the end, so a report is always built while its
+  // link is still live.
+  const live = [];
+  const sweep = () => {
+    for (const l of live.splice(0)) {
+      // What the host calls when a socket goes away: it clears the deadline — and with it the
+      // guest's timer entry — releases the slot and wipes the keys.
+      try { l.onChannelClosed(); } catch (e) { /* already gone */ }
+    }
+    drain();
+    armedTimers.clear();
+  };
+
   let nextLink = 1;
   // PLATFORM-FRAMED (stream: false), which is the browser WebSocket and the RTC data
   // channel: message boundaries arrive with the bytes, so the fuzzer chooses them
   // directly. Stream framing is fuzz_framing_test's subject, and putting a codec in front
   // of this one would only spend the mutator's budget re-deriving length prefixes.
-  const mkLink = (F, weDialed, limiter, source) => new F.Link({
-    linkId: nextLink++,
-    stream: false,
-    dest: "", listener: "",
-    weDialed: weDialed,
-    expectPeerId: null,
-    linkSecret: null,
-    source: source,
-    limiter: limiter,
-    onAuth: () => { authed++; },
-    onFrame: () => { delivered++; },
-    onClose: () => {},
-  });
+  const mkLink = (F, weDialed, limiter, source) => {
+    const l = new F.Link({
+      linkId: nextLink++,
+      stream: false,
+      dest: "", listener: "",
+      weDialed: weDialed,
+      expectPeerId: null,
+      linkSecret: null,
+      source: source,
+      limiter: limiter,
+      onAuth: () => { authed++; },
+      onFrame: () => { delivered++; },
+      onClose: () => {},
+    });
+    live.push(l);
+    return l;
+  };
 
   // Every seam name answers inline here, so a link's whole work chain drains in a handful
   // of microtask turns and needs no clock. Re-read each round: a step may append another.
@@ -230,7 +256,7 @@ const akeFuzzJS = `
   // reaches the KEM and the identity proof; one starting from noise never leaves the
   // first length check.
   globalThis.__akeMsg1 = async () => {
-    reset();
+    sweep(); reset();
     const d = mkLink(A, true, null, undefined);
     await settle(d);
     const out = take();
@@ -241,7 +267,7 @@ const akeFuzzJS = `
   // pieces of its choosing. The half-open slot is real, since being turned away at the
   // door is one of the outcomes concealment has to cover.
   globalThis.__fuzzAkeAccept = async (streamAB, splitsAB) => {
-    reset();
+    sweep(); reset();
     const l = mkLink(B, false, B.newLimiter(), "203.0.113.7");
     await settle(l);
     take();   // an accept says nothing unprompted; this is empty, and asserted to be
@@ -257,7 +283,7 @@ const akeFuzzJS = `
   // Stages 3 and 4 are the part of ake.js a stranger cannot reach but a cohort member
   // can: past the contact-secret probe, and still before anyone is authenticated.
   const pairTo = async (stage) => {
-    reset();
+    sweep(); reset();
     const d = mkLink(A, true, null, undefined);
     const r = mkLink(B, false, B.newLimiter(), "198.51.100.9");
     await settle(d); await settle(r);
@@ -310,7 +336,7 @@ const akeFuzzJS = `
 
   // A msg1 the door opens, over fields the fuzzer chose.
   globalThis.__fuzzAkeShapedMsg1 = async (patchAB) => {
-    reset();
+    sweep(); reset();
     // A real msg1 for its valid fields; the dialling link is also what holds a root to seal
     // a probe with. The sealed nonce is not recoverable from it and need not be — the
     // responder proves the seal and never reads the plaintext — so this supplies its own.
