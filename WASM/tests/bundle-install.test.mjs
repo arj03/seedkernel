@@ -764,6 +764,53 @@ async function testGuestBundleAndArchive() {
     try { unpackBundle(new Uint8Array([1, 2, 3])); } catch { badArchive = true; }
     assert(badArchive, "a non-bundle blob is rejected fail-loud");
 
+    // The container's three self-consistency rules, stated by name. It is the one part of
+    // a bundle no signature covers — the manifest signs its own contents, not the blob
+    // that carries it — so a reader's good manners are all that stand between "one blob,
+    // one bundle" and a blob that is two bundles depending on who reads it. Hand-built,
+    // because these are things a `Record` cannot say.
+    const containerOf = (entries) => {
+      const header = new Uint8Array(6);
+      header.set([0x53, 0x4b, 0x42, 0x31], 0); // "SKB1"
+      new DataView(header.buffer).setUint16(4, entries.length, false);
+      const parts = [header];
+      for (const [name, data] of entries) {
+        const nameBytes = enc.encode(name);
+        const rec = new Uint8Array(2 + nameBytes.length + 4);
+        const dv = new DataView(rec.buffer);
+        dv.setUint16(0, nameBytes.length, false);
+        rec.set(nameBytes, 2);
+        dv.setUint32(2 + nameBytes.length, data.length, false);
+        parts.push(rec, data);
+      }
+      return concatBytes(parts);
+    };
+    const refuses = (blob, why) => {
+      let threw = false;
+      try { unpackBundle(blob); } catch { threw = true; }
+      assert(threw, why);
+    };
+    // Two entries under one name: only the LAST manifest.bundle is the one whose signature
+    // gets checked, so a reader that keeps the first and one that keeps the last make two
+    // different bundles out of these same bytes.
+    refuses(containerOf([[MANIFEST_FILE, enc.encode("first")], [MANIFEST_FILE, enc.encode("second")]]),
+      "two files under one name are refused");
+    // Bytes past the last declared file: the blob's hash is the identity a denylist, a
+    // freshness mark and an operator's pin are all keyed by (§12.4), and this would give
+    // one bundle unboundedly many of them.
+    refuses(concatBytes([containerOf([["a", enc.encode("x")]]), new Uint8Array([0])]),
+      "trailing bytes after the last file are refused");
+    // A count that under-declares what follows says the same thing a different way.
+    refuses(concatBytes([containerOf([]), enc.encode("junk")]),
+      "a count that under-declares the entries is refused");
+    // `__proto__` is a file name like any other. On an object literal it is the prototype
+    // slot instead, so that one entry would vanish from the map AND re-point it at bytes
+    // the sender chose — before anything has been verified.
+    const withProto = unpackBundle(containerOf([["__proto__", enc.encode("x")], [GUEST_FILE, enc.encode("y")]]));
+    assert(Object.getPrototypeOf(withProto) === null, "the unpacked map has no prototype to poison");
+    assert(bytesEqual(withProto["__proto__"], enc.encode("x")), "__proto__ arrives as an ordinary entry");
+    assertEqual(Object.keys(withProto).length, 2, "a __proto__ entry costs the map nothing");
+
     // The verify half on its own: no host, no policy, no freshness — the browser
     // shell's peek path. It authenticates and yields every verified byte.
     const v = verifyBundle(sodium, packed);
