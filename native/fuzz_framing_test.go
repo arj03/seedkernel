@@ -1,5 +1,3 @@
-//go:build fuzz
-
 package main
 
 import (
@@ -159,8 +157,9 @@ const framingFuzzJS = `
     const data = new Uint8Array(dataAB), prog = new Uint8Array(progAB);
     const bp = new F.ByteParts();
     const log = [];
-    let off = 0, pushed = 0;
+    let off = 0, pushed = 0, maxLen = 0;
     for (let i = 0; i + 2 < prog.length; i += 3) {
+      if (bp.length > maxLen) maxLen = bp.length;
       const arg = (prog[i + 1] << 8) | prog[i + 2];
       switch (prog[i] & 3) {
         case 0: {
@@ -190,7 +189,10 @@ const framingFuzzJS = `
           break;
       }
     }
-    return fz({ log, rest: hex(bp.peek(bp.length)), len: bp.length });
+    // maxLen is for the fuzzer's benefit rather than the oracle's: it is how the harness
+    // tells covPath whether a run ever crossed the 8 KiB accumulator boundary, which is the
+    // one place this buffer changes strategy and nothing else in the answer shows.
+    return fz({ log, rest: hex(bp.peek(bp.length)), len: bp.length, maxLen: Math.max(maxLen, bp.length) });
   };
 
   // The caps as the module scope DECLARES them — never as a framer instance reports its
@@ -220,17 +222,29 @@ const framingFuzzJS = `
 
 // framingResult is one run of one framer over one chunking.
 type framingResult struct {
-	Ok    bool     `json:"ok"`
-	Threw bool     `json:"threw"`
-	Msg   string   `json:"msg"`
-	Msgs  []string `json:"msgs"`
-	Wrote []string `json:"wrote"`
-	Open  bool     `json:"open"`
-	Held  int      `json:"held"`
-	Cap   int      `json:"cap"`
-	Log   []string `json:"log"`  // ByteParts: one line per operation
-	Rest  string   `json:"rest"` // ByteParts: whatever is still buffered, in hex
-	Len   int      `json:"len"`
+	Ok     bool     `json:"ok"`
+	Threw  bool     `json:"threw"`
+	Msg    string   `json:"msg"`
+	Msgs   []string `json:"msgs"`
+	Wrote  []string `json:"wrote"`
+	Open   bool     `json:"open"`
+	Held   int      `json:"held"`
+	Cap    int      `json:"cap"`
+	Log    []string `json:"log"`  // ByteParts: one line per operation
+	Rest   string   `json:"rest"` // ByteParts: whatever is still buffered, in hex
+	Len    int      `json:"len"`
+	MaxLen int      `json:"maxLen"` // ByteParts: the high-water mark, for covPath alone
+}
+
+// framingCovName is what one framer run DID, in the terms the mutator should be steered by
+// (fuzz_cov_test.go): the verdict, whether the link opened, whether anything came out or
+// went back — never how much of it.
+func framingCovName(what string, r framingResult) string {
+	if r.Threw {
+		return what + " threw " + covShape(r.Msg)
+	}
+	return fmt.Sprintf("%s ok=%v open=%v msgs=%s wrote=%s held=%v",
+		what, r.Ok, r.Open, covBucket(len(r.Msgs)), covBucket(len(r.Wrote)), r.Held > 0)
 }
 
 // framingFuzzRealm boots the realm, hangs ws.wasm off it as the framers' one host name,
@@ -623,6 +637,7 @@ func FuzzLengthFramer(f *testing.F) {
 			t.Skip()
 		}
 		got := framingRun(t, "__fuzzLengthFramer", stream, splits)
+		covPath(framingCovName("length", got))
 		// The framer's own cap, held against the scope's. Feeding `got.Cap` into the oracle
 		// instead would let a framer that started life with the WRONG ceiling — the raised
 		// one, say, on a link nobody has authenticated — agree with itself all the way.
@@ -739,6 +754,7 @@ func FuzzWsClientFramer(f *testing.F) {
 func wsFramerProperties(t *testing.T, side, probe string, newRef func() *refWsPeer, stream, splits []byte) {
 	t.Helper()
 	got := framingRun(t, probe, stream, splits)
+	covPath(framingCovName(side, got))
 	if got.Threw {
 		// `read` catches the upgrade's and the frame loop's refusals itself and answers
 		// false; anything escaping is a refusal the link owner never sees as a refusal.
@@ -977,6 +993,18 @@ func FuzzByteParts(f *testing.F) {
 		if err := json.Unmarshal(out, &got); err != nil {
 			t.Fatalf("__fuzzByteParts: undecodable answer %q: %v", out, err)
 		}
+		// The states this buffer REACHED: how many operations ran, whether the head scan ever
+		// completed, whether the accumulator boundary was crossed, and whether anything is
+		// still held. The byte counts themselves are the input restated, so they are bucketed.
+		find := "none"
+		for _, l := range got.Log {
+			if strings.HasPrefix(l, "find ") && !strings.HasPrefix(l, "find -1") {
+				find = "hit"
+				break
+			}
+		}
+		covPath(fmt.Sprintf("byteparts ops=%s find=%s grown=%v left=%s",
+			covBucket(len(got.Log)), find, got.MaxLen >= 8192, covBucket(got.Len)))
 		wantLog, wantRest, wantLen := refBytePartsRun(data, prog)
 		if !sameStrings(got.Log, wantLog) {
 			t.Fatalf("ByteParts: %s\nprog: %x\ndata %d bytes: %x",

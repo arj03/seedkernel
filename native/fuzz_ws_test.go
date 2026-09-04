@@ -1,5 +1,3 @@
-//go:build fuzz
-
 package main
 
 import (
@@ -7,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 
@@ -185,6 +184,35 @@ func refDecodeOne(expectMasked bool, buf []byte) wsDecoded {
 	return wsDecoded{status: wsFrame, fin: fin, opcode: opcode, consumed: int(total), payload: payload}
 }
 
+// wsCovName is what one decode DID, in the terms the mutator should be steered by
+// (fuzz_cov_test.go): the length form it took, the verdict it reached, and what class of
+// frame it read — never a length or a payload.
+func wsCovName(expectMasked bool, buf, out []byte, n int64) string {
+	form := "short"
+	switch {
+	case len(buf) < 2:
+		form = "stub"
+	case buf[1]&0x7f == 126:
+		form = "u16"
+	case buf[1]&0x7f == 127:
+		form = "u64"
+	}
+	name := fmt.Sprintf("decodeOne masked=%v form=%s status=%d", expectMasked, form, out[0])
+	if n > 1 {
+		// The opcode by CLASS. Sixteen of them would be sixteen outcomes for one decode
+		// path, which is the fuzzer spending its corpus on a nibble it already reaches.
+		class := "reserved"
+		switch op := out[1] & 0x0f; {
+		case op <= 2:
+			class = "data"
+		case op >= 8 && op <= 10:
+			class = "control"
+		}
+		name += fmt.Sprintf(" fin=%v op=%s", out[1]&0x80 != 0, class)
+	}
+	return name
+}
+
 // FuzzWsDecodeOne is the pre-auth frame decoder. Everything a browser edge sends before
 // the handshake completes lands here first.
 func FuzzWsDecodeOne(f *testing.F) {
@@ -211,6 +239,7 @@ func FuzzWsDecodeOne(f *testing.F) {
 		if n < 1 {
 			t.Fatalf("decodeOne answered nothing for a %d-byte buffer: %x", len(buf), head(buf))
 		}
+		covPath(wsCovName(expectMasked, buf, out, n))
 		want := refDecodeOne(expectMasked, buf)
 		got := int(out[0])
 		if got != want.status {
@@ -293,6 +322,7 @@ func FuzzWsEncodeDecode(f *testing.F) {
 			outMask = 4
 		}
 		fits := outHeader+outMask+len(payload) <= wsScratchSize
+		covPath(fmt.Sprintf("encode header=%d masked=%v refused=%v", outHeader, masked, n == 0))
 		if n == 0 {
 			if fits {
 				t.Fatalf("encode: refused a %d-byte %s payload whose frame is %d bytes, inside the %d-byte scratch",

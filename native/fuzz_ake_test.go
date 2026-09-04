@@ -1,9 +1,9 @@
-//go:build fuzz
-
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -91,7 +91,13 @@ const akeFuzzJS = `
     + " newLimiter: () => new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed),"
     + " setOwnPk: (pk) => { ownPk = pk; },"
     + " drainDeferred: () => { for (const f of deferQueue.splice(0)) { try { f(); } catch (e) { /* gone */ } } },"
-    + " lens: { m1: M1_LEN, m2: M2_LEN, m3: M3_LEN, m4: M4_LEN, cap: MAX_HANDSHAKE_FRAME_BYTES, frame: maxFrameBytes }"
+    // The two step labels, for the shaped probes below: they build a message the link will
+    // OPEN, using the link's own kdf, and a label restated here would be a second copy of
+    // the one thing that separates one step's key from another's.
+    + " labels: { m3: LABEL_M3, m4: LABEL_M4 },"
+    + " lens: { m1: M1_LEN, m2: M2_LEN, m3: M3_LEN, m4: M4_LEN, cap: MAX_HANDSHAKE_FRAME_BYTES,"
+    + "   frame: maxFrameBytes, suite: SUITE_LEN, eph: EPH_LEN, kemPk: KEM_PK_LEN,"
+    + "   nonce: NONCE_LEN, tag: TAG_LEN }"
     + " };";
 
   // One node: its own identity, its own seam, its own copy of the guest program's module
@@ -191,13 +197,31 @@ const akeFuzzJS = `
     return { threw: threw, fed: fed, maxFed: maxFed, wantClose: wantClose };
   };
 
-  const report = (l, r) => fz({
+  const report = (l, r, extra) => fz(Object.assign({
     threw: r.threw, fed: r.fed, maxFed: r.maxFed, wantClose: r.wantClose,
     authed: l.authed, nAuth: authed, delivered: delivered,
     wire: take().map((b) => b.length),
     closes: closes, closed: l.closed, stalled: l.stalled,
     recvCtr: l.recvCtr, recvEpoch: l.recvEpoch,
-  });
+  }, extra || {}));
+
+  // Rewrite bytes at offsets the fuzzer chose, counting only the ones that CHANGED
+  // something: a patch that writes back the byte already there leaves a valid message, and
+  // an assertion keyed on "was this modified" would be wrong about it.
+  const patchBytes = (buf, patch) => {
+    let n = 0;
+    for (let i = 0; i + 2 < patch.length; i += 3) {
+      const at = (((patch[i] << 8) | patch[i + 1]) >>> 0) % buf.length;
+      if (buf[at] !== patch[i + 2]) { buf[at] = patch[i + 2]; n++; }
+    }
+    return n;
+  };
+
+  const cat = (a, b) => {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a); out.set(b, a.length);
+    return out;
+  };
 
   globalThis.__akeLens = () => fz(A.lens);
 
@@ -242,18 +266,20 @@ const akeFuzzJS = `
     await r.onWire(w1[0]); await settle(r);
     const w2 = take();
     if (w2.length !== 1 || w2[0].length !== A.lens.m2) return { bad: "responder answered a real msg1 with " + w2.length + " message(s)" };
-    if (stage === 3) { reset(); return { l: r }; }
+    // Both ends every time: the one under test, and the one whose turn it is to speak —
+    // which is the only thing that can sign an identity this link will accept.
+    if (stage === 3) { reset(); return { l: r, d: d, r: r }; }
     await d.onWire(w2[0]); await settle(d);
     const w3 = take();
     if (w3.length !== 1 || w3[0].length !== A.lens.m3) return { bad: "initiator answered a real msg2 with " + w3.length + " message(s)" };
-    if (stage === 4) { reset(); return { l: d }; }
+    if (stage === 4) { reset(); return { l: d, d: d, r: r }; }
     await r.onWire(w3[0]); await settle(r);
     const w4 = take();
     if (w4.length !== 1 || w4[0].length !== A.lens.m4) return { bad: "responder answered a real msg3 with " + w4.length + " message(s)" };
     await d.onWire(w4[0]); await settle(d);
     if (!d.authed || !r.authed) return { bad: "the harness handshake did not authenticate both ends" };
     reset();
-    return { l: r };
+    return { l: r, d: d, r: r };
   };
 
   globalThis.__fuzzAkeStage = async (stage, streamAB, splitsAB) => {
@@ -261,6 +287,105 @@ const akeFuzzJS = `
     if (p.bad) return fz({ bad: p.bad });
     const r = await feed(p.l, streamAB, splitsAB);
     return report(p.l, r);
+  };
+
+  // ── past the door ──────────────────────────────────────────────────────────
+  //
+  // Everything above attacks from outside the cohort, and a mutator's reach ends at the
+  // first proof: msg1's probe key is derived over the suite, the ephemeral and the KEM key,
+  // so one flipped byte anywhere changes the key its own seal must open under, and every
+  // execution dies at the same check. Whole halves of ake.js are behind that check and have
+  // never seen an input — x25519 over a chosen point, ML-KEM encapsulation over 1184 chosen
+  // bytes, the identity verify, the record layer's open.
+  //
+  // So the probes below hold what the cohort holds — the network key and the contact secret
+  // — and let the fuzzer choose everything else. That is a member of this deployment, or
+  // whoever took its contact secret, and §12.6.2 owes it exactly what it owes a stranger:
+  // nothing authenticates without a signature that verifies, nothing is delivered off a
+  // link that never authenticated, and a refusal is silence.
+  //
+  // Each message is built with the implementation's OWN primitives, on the link that will
+  // read it — its probeKey, its kdf, its sealZero — so the harness restates no derivation
+  // and cannot drift from one.
+
+  // A msg1 the door opens, over fields the fuzzer chose.
+  globalThis.__fuzzAkeShapedMsg1 = async (patchAB) => {
+    reset();
+    // A real msg1 for its valid fields; the dialling link is also what holds a root to seal
+    // a probe with. The sealed nonce is not recoverable from it and need not be — the
+    // responder proves the seal and never reads the plaintext — so this supplies its own.
+    const d = mkLink(A, true, null, undefined);
+    await settle(d);
+    const w1 = take();
+    if (w1.length !== 1 || w1[0].length !== A.lens.m1) return fz({ bad: "no msg1 to shape" });
+    const headLen = A.lens.suite + A.lens.eph + A.lens.kemPk;
+    const fields = new Uint8Array(headLen + A.lens.nonce);
+    fields.set(w1[0].subarray(0, headLen));
+    const patched = patchBytes(fields, new Uint8Array(patchAB));
+    const sealed = await d.sealZero(
+      await d.probeKey(fields.subarray(0, A.lens.suite),
+        fields.subarray(A.lens.suite, A.lens.suite + A.lens.eph),
+        fields.subarray(A.lens.suite + A.lens.eph, headLen)),
+      fields.subarray(headLen));
+    const msg = cat(fields.subarray(0, headLen), sealed);
+    reset();
+    const l = mkLink(B, false, B.newLimiter(), "203.0.113.7");
+    await settle(l);
+    take();
+    const r = await feed(l, msg, new Uint8Array(0));
+    return report(l, r, { patched: patched });
+  };
+
+  // An identity message that DECRYPTS, carrying an identity the fuzzer chose. The AEAD sits
+  // in front of the signature check, so this is the only way anything reaches the verify at
+  // all — and the only way the reflected-key refusal is reachable.
+  const shapedIdentity = async (stage, pt) => {
+    const p = await pairTo(stage);
+    if (p.bad) return { bad: p.bad };
+    const l = p.l;
+    const key = await l.kdf([l.ee, l.kemSecret], l.th, stage === 3 ? A.labels.m3 : A.labels.m4);
+    return { l: l, msg: await l.sealZero(key, pt) };
+  };
+
+  globalThis.__fuzzAkeShapedIdentity = async (stage, ptAB) => {
+    const s = await shapedIdentity(stage, new Uint8Array(ptAB));
+    if (s.bad) return fz({ bad: s.bad });
+    return report(s.l, await feed(s.l, s.msg, new Uint8Array(0)));
+  };
+
+  // The two identities no fuzzer can spell, because both need a signature over a transcript
+  // that only exists inside a link: the one whose turn it is, and OUR OWN reflected back at
+  // us. They are a pair on purpose — the genuine one proves this construction really does
+  // reach the signature check and get past it, which is the only thing that makes the
+  // reflected one's refusal evidence about the reflection rather than about a message that
+  // never opened.
+  globalThis.__akeIdentityCase = async (stage, reflected) => {
+    const p = await pairTo(stage);
+    if (p.bad) return fz({ bad: p.bad });
+    const l = p.l;
+    // signIdentity takes the transcript, so the peer signs over the one THIS link will
+    // verify against — its own is a step behind, and that is the whole of the difference.
+    const signer = reflected ? l : (stage === 3 ? p.d : p.r);
+    const si = await signer.signIdentity(l.th);
+    if (!si) return fz({ bad: "an end would not sign its identity" });
+    const key = await l.kdf([l.ee, l.kemSecret], l.th, stage === 3 ? A.labels.m3 : A.labels.m4);
+    const msg = await l.sealZero(key, cat(si.id, si.sig));
+    return report(l, await feed(l, msg, new Uint8Array(0)));
+  };
+
+  // A record this session really sealed, then corrupted at offsets the fuzzer chose. With
+  // nothing changed it is the accept path — the only place these targets exercise one.
+  globalThis.__fuzzAkeShapedRecord = async (bodyAB, patchAB) => {
+    const p = await pairTo(5);
+    if (p.bad) return fz({ bad: p.bad });
+    p.d.send(new Uint8Array(bodyAB));
+    await settle(p.d);
+    const w = take();
+    if (w.length !== 1) return fz({ bad: "one send sealed " + w.length + " record(s)" });
+    const rec = w[0].slice();
+    const patched = patchBytes(rec, new Uint8Array(patchAB));
+    reset();
+    return report(p.l, await feed(p.l, rec, new Uint8Array(0)), { patched: patched });
   };
 }
 `
@@ -283,6 +408,7 @@ type akeOutcome struct {
 	Stalled   bool   `json:"stalled"`
 	RecvCtr   int    `json:"recvCtr"`
 	RecvEpoch int    `json:"recvEpoch"`
+	Patched   int    `json:"patched"` // shaped probes: bytes the fuzzer actually changed
 }
 
 // akeLens is the handshake's own arithmetic, read out of the module scope rather than
@@ -295,6 +421,13 @@ type akeLens struct {
 	M4    int `json:"m4"`
 	Cap   int `json:"cap"`
 	Frame int `json:"frame"`
+	// msg1's field widths, for the shaped target's patch offsets, and the AEAD tag, which
+	// is what separates a step's message width from the plaintext it carries.
+	Suite int `json:"suite"`
+	Eph   int `json:"eph"`
+	KemPk int `json:"kemPk"`
+	Nonce int `json:"nonce"`
+	Tag   int `json:"tag"`
 }
 
 var akeSizes akeLens
@@ -358,12 +491,21 @@ func akeRun(t *testing.T, probe string, args ...*qjs.Value) akeOutcome {
 	return o
 }
 
+// akeCovName is how far one link GOT, in the terms the mutator should be steered by
+// (fuzz_cov_test.go). A handshake's states are few and its bytes are many, so this is the
+// whole of what the fuzzer can be told: which of them the link ended in.
+func akeCovName(what string, o akeOutcome) string {
+	return fmt.Sprintf("%s closed=%v stalled=%v authed=%v wire=%s delivered=%s threw=%v",
+		what, o.Closed, o.Stalled, o.Authed, covBucket(len(o.Wire)), covBucket(o.Delivered), o.Threw != "")
+}
+
 // silentUnderFire is the concealment claim, stated once for every pre-authentication link:
 // whatever arrives, nothing escapes into the shared realm, nobody is authenticated,
 // nothing is delivered, and the link is torn down only for something the sender could
 // already see — an over-cap message, which it measured itself.
 func silentUnderFire(t *testing.T, what string, o akeOutcome, stream, splits []byte) {
 	t.Helper()
+	covPath(akeCovName(what, o))
 	if o.Threw != "" {
 		t.Fatalf("%s: threw out of onWire (%q) — stream %d bytes, splits %v: %x",
 			what, o.Threw, len(stream), head(splits), head(stream))
@@ -516,6 +658,7 @@ func FuzzAkeRecord(f *testing.F) {
 		}
 		o := akeRun(t, "__fuzzAkeStage", qc.NewInt64(5),
 			qc.NewArrayBuffer(stream), qc.NewArrayBuffer(splits))
+		covPath(akeCovName("record", o))
 		if o.Threw != "" {
 			t.Fatalf("record: threw out of onWire (%q) — stream %d bytes, splits %v: %x",
 				o.Threw, len(stream), head(splits), head(stream))
@@ -541,6 +684,270 @@ func FuzzAkeRecord(f *testing.F) {
 		if wantClosed := o.Fed > 0; o.Closed != wantClosed {
 			t.Fatalf("record: closed=%v after %d forged body/bodies — stream %d bytes: %x",
 				o.Closed, o.Fed, len(stream), head(stream))
+		}
+	})
+}
+
+// ── the cohort's half of the handshake ───────────────────────────────────────
+//
+// The three targets above attack from outside, where a byte-level mutation cannot get past
+// msg1's contact-secret probe — the probe key is derived over the very fields a mutation
+// changes. The three below hold the deployment's own two secrets and let the fuzzer choose
+// everything the proof was in front of. See the probes for what that models and why it is
+// the right position to attack from.
+
+// patchesOf spells the patch program the shaped probes read: an offset as a big-endian
+// uint16 and the byte to write there, three bytes each. The fuzzer mutates these freely;
+// this is for the seeds, which want to NAME a field rather than find it.
+func patchesOf(atValue ...int) []byte {
+	out := make([]byte, 0, len(atValue)/2*3)
+	for i := 0; i+1 < len(atValue); i += 2 {
+		out = append(out, byte(atValue[i]>>8), byte(atValue[i]), byte(atValue[i+1]))
+	}
+	return out
+}
+
+// patchRange writes one value across a whole field, for the seeds that want a field to be
+// all of something — an all-zero ephemeral, say, which is the x25519 result every peer can
+// compute and the one an implementation must refuse.
+func patchRange(at, n, value int) []byte {
+	out := make([]byte, 0, n*3)
+	for i := 0; i < n; i++ {
+		out = append(out, patchesOf(at+i, value)...)
+	}
+	return out
+}
+
+// FuzzAkeShapedMsg1 is the handshake's expensive half: a msg1 whose probe OPENS, over an
+// ephemeral and a KEM public key the fuzzer chose. Past that door the responder does an
+// x25519 with the point it was handed and an ML-KEM encapsulation against 1184 bytes it was
+// handed, neither of which any other target reaches — and it does both for a peer that has
+// still proved nothing but knowing the contact secret.
+func FuzzAkeShapedMsg1(f *testing.F) {
+	akeFuzzRealm(f)
+	suite, eph := 0, akeSizes.Suite
+	kemPk := akeSizes.Suite + akeSizes.Eph
+	nonce := kemPk + akeSizes.KemPk
+	// Nothing changed: a real msg1, and the anchor the target rests on.
+	f.Add([]byte{})
+	// Another suite, refused before the probe is even derived.
+	f.Add(patchesOf(suite, 0x01))
+	// One byte of each field, which is the shape a mutator will mostly produce anyway.
+	f.Add(patchesOf(eph, 0))
+	f.Add(patchesOf(kemPk, 0xff))
+	// The sealed plaintext, which the responder proves and never reads.
+	f.Add(patchesOf(nonce, 0xff))
+	// The all-zero point and the all-ones one: the x25519 results every peer can compute
+	// without knowing anything, and the ones an implementation has to refuse.
+	f.Add(patchRange(eph, akeSizes.Eph, 0))
+	f.Add(patchRange(eph, akeSizes.Eph, 0xff))
+	// A KEM key that is all zeroes, and its last two bytes, where ML-KEM's own encoding
+	// checks are.
+	f.Add(patchRange(kemPk, akeSizes.KemPk, 0))
+	f.Add(patchesOf(nonce-1, 0xff, nonce-2, 0xff))
+
+	f.Fuzz(func(t *testing.T, patch []byte) {
+		if len(patch) > 3*4096 {
+			t.Skip()
+		}
+		o := akeRun(t, "__fuzzAkeShapedMsg1", qc.NewArrayBuffer(patch))
+		silentUnderFire(t, "shaped msg1", o, patch, nil)
+		// The anchor. A msg1 nothing changed is a real one, and the responder owes it a
+		// msg2 — without this the target is satisfied by a harness that never gets in the
+		// door at all, which is exactly what it exists to get past.
+		if o.Patched == 0 && len(o.Wire) != 1 {
+			t.Fatalf("shaped msg1: an UNMODIFIED msg1 was answered with %v — the probe is not opening, so nothing below the door is being reached", o.Wire)
+		}
+		// Everything else owes at most one msg2, at its one width: any second write, or one
+		// of another size, is the exchange telling the sender how far its fields got.
+		if len(o.Wire) > 1 {
+			t.Fatalf("shaped msg1: wrote %d messages (%v) for one msg1 — patched %d byte(s): %x",
+				len(o.Wire), o.Wire, o.Patched, head(patch))
+		}
+		for _, n := range o.Wire {
+			if n != akeSizes.M2 {
+				t.Fatalf("shaped msg1: answered with a %d-byte message; the only thing owed here is msg2 (%d bytes) — patched %d byte(s): %x",
+					n, akeSizes.M2, o.Patched, head(patch))
+			}
+		}
+	})
+}
+
+// FuzzAkeShapedIdentity is the identity proof itself. FuzzAkeIdentity can only ever fail the
+// AEAD in front of it; this one seals with the key the link will derive, so every execution
+// gets through to `openIdentity` and spends itself on the signature — the check the whole
+// handshake exists to make.
+//
+//	side 0 — a responder reading msg3, the initiator's identity
+//	side 1 — an initiator reading msg4, the responder's
+func FuzzAkeShapedIdentity(f *testing.F) {
+	akeFuzzRealm(f)
+	pt := akeSizes.M3 - akeSizes.Tag
+	f.Add(byte(0), make([]byte, pt))
+	f.Add(byte(1), make([]byte, pt))
+	f.Add(byte(0), bytes.Repeat([]byte{0xff}, pt))
+	// A key that is all zeroes with a signature that is not, and the other way round: the
+	// two halves are checked together, and an implementation that read only one would pass
+	// one of these.
+	f.Add(byte(0), append(make([]byte, 32), bytes.Repeat([]byte{0x01}, pt-32)...))
+	f.Add(byte(1), append(bytes.Repeat([]byte{0x01}, 32), make([]byte, pt-32)...))
+	// The anchor, and the whole reason this target is worth its executions: a message built
+	// the way the probe builds one is a message the link OPENS. The same construction
+	// carrying the identity whose turn it is authenticates (TestAkeIdentityProof pins both
+	// halves), so an execution that gets nowhere below got as far as the signature check and
+	// failed there — which is where a fuzzer should be spending its time.
+	if o := akeIdentityCase(f, 3, false); !o.Authed {
+		f.Fatal("a correctly sealed, correctly signed identity does not authenticate — this target is not reaching openIdentity at all")
+	}
+
+	f.Fuzz(func(t *testing.T, side byte, data []byte) {
+		stage, what := 3, "shaped msg3"
+		if side&1 == 1 {
+			stage, what = 4, "shaped msg4"
+		}
+		// Always the width the step declares: a wrong length is refused before the message
+		// is opened at all, which FuzzAkeIdentity already covers, and spending executions
+		// there would waste the door this target went to the trouble of opening.
+		pt := make([]byte, akeSizes.M3-akeSizes.Tag)
+		copy(pt, data)
+		o := akeRun(t, "__fuzzAkeShapedIdentity", qc.NewInt64(int64(stage)), qc.NewArrayBuffer(pt))
+		silentUnderFire(t, what, o, data, nil)
+		// Neither end answers an identity it could not verify, and neither end is talking to
+		// one it could: no byte string is a signature over this transcript.
+		if len(o.Wire) != 0 {
+			t.Fatalf("%s: wrote %v in answer to an identity that does not verify — %d bytes: %x",
+				what, o.Wire, len(data), head(data))
+		}
+	})
+}
+
+// akeIdentityCase drives one identity through a link that will open it: the peer's, or the
+// link's own reflected back at it.
+func akeIdentityCase(t testing.TB, stage int, reflected bool) akeOutcome {
+	t.Helper()
+	flag := int64(0)
+	if reflected {
+		flag = 1
+	}
+	out, err := callRealm("__akeIdentityCase", 60*time.Second,
+		qc.NewInt64(int64(stage)), qc.NewInt64(flag))
+	if err != nil {
+		t.Fatalf("__akeIdentityCase(%d, %v): the realm itself failed: %v", stage, reflected, err)
+	}
+	var o akeOutcome
+	if err := json.Unmarshal(out, &o); err != nil {
+		t.Fatalf("__akeIdentityCase(%d, %v): undecodable answer %q: %v", stage, reflected, out, err)
+	}
+	if o.Bad != "" {
+		t.Fatalf("__akeIdentityCase(%d, %v): the harness handshake broke first: %s", stage, reflected, o.Bad)
+	}
+	return o
+}
+
+// TestAkeIdentityProof pins the last two steps of the handshake at the one place a fuzzer
+// cannot reach them. Both inputs need a signature over a transcript that exists only inside
+// a link, so neither is a byte string any mutation arrives at, and they are a pair on
+// purpose:
+//
+//	the peer's identity, which must be ACCEPTED — the proof that this construction gets
+//	through the AEAD and past the signature check at all, without which the refusal below
+//	is satisfied by a message that simply never opened; and
+//
+//	our own identity reflected back at us, correctly signed, which must be refused. It is
+//	the last check in openIdentity and the only one behind a signature that verifies, so
+//	nothing else in this file can reach it. Taking it would leave a node authenticated
+//	against itself, on a transcript an echo can always produce.
+func TestAkeIdentityProof(t *testing.T) {
+	akeFuzzRealm(t)
+	for _, c := range []struct {
+		stage int
+		what  string
+		wire  int // what this end owes a peer it just proved: msg4, or nothing
+	}{
+		{3, "msg3 at a responder", akeSizes.M4},
+		{4, "msg4 at an initiator", 0},
+	} {
+		o := akeIdentityCase(t, c.stage, false)
+		if !o.Authed {
+			t.Fatalf("%s: a genuine identity, signed by the end whose turn it is, did NOT authenticate (stalled=%v closed=%v wrote %v)",
+				c.what, o.Stalled, o.Closed, o.Wire)
+		}
+		want := []int{c.wire}
+		if c.wire == 0 {
+			want = nil
+		}
+		if len(o.Wire) != len(want) || (len(want) == 1 && o.Wire[0] != want[0]) {
+			t.Fatalf("%s: answered a genuine identity with %v, want %v", c.what, o.Wire, want)
+		}
+
+		o = akeIdentityCase(t, c.stage, true)
+		if o.Authed || o.NAuth != 0 {
+			t.Fatalf("%s: AUTHENTICATED against our OWN identity — a peer that echoes our traffic has proved nothing, and this end would now hold a session with itself",
+				c.what)
+		}
+		if o.Delivered != 0 || len(o.Wire) != 0 {
+			t.Fatalf("%s: answered our own reflected identity with %v and %d frame(s) — a refusal here is silence",
+				c.what, o.Wire, o.Delivered)
+		}
+	}
+}
+
+// FuzzAkeShapedRecord is the record layer with the AEAD on the right side of the fence: a
+// record this session really sealed, corrupted at offsets the fuzzer chose. With nothing
+// changed it is the ACCEPT path, which nothing else here exercises — and an accept path
+// that works is what makes every refusal below evidence rather than a receiver that says no
+// to everything.
+func FuzzAkeShapedRecord(f *testing.F) {
+	akeFuzzRealm(f)
+	// Untouched, at both ends of the size range: the accept path.
+	f.Add([]byte("hello"), []byte{})
+	f.Add(make([]byte, 1), []byte{})
+	f.Add(bytes.Repeat([]byte{7}, 4096), []byte{})
+	// The ciphertext's first byte, and a byte inside the tag that follows it.
+	f.Add([]byte("hello"), patchesOf(0, 0))
+	f.Add([]byte("hello"), patchesOf(20, 0))
+	f.Add(bytes.Repeat([]byte{7}, 4096), patchesOf(4095, 1))
+
+	f.Fuzz(func(t *testing.T, body, patch []byte) {
+		// `send` refuses an empty frame (it is the end-of-stream marker) and one that would
+		// seal past the cap, and either would leave the probe with no record to corrupt.
+		if len(body) == 0 || len(body) > akeSizes.Frame-akeSizes.Tag || len(body) > 1<<18 {
+			t.Skip()
+		}
+		if len(patch) > 3*4096 {
+			t.Skip()
+		}
+		o := akeRun(t, "__fuzzAkeShapedRecord", qc.NewArrayBuffer(body), qc.NewArrayBuffer(patch))
+		covPath(akeCovName("shaped record", o))
+		if o.Threw != "" {
+			t.Fatalf("shaped record: threw out of onWire (%q) — body %d bytes, patched %d",
+				o.Threw, len(body), o.Patched)
+		}
+		if len(o.Wire) != 0 {
+			t.Fatalf("shaped record: answered a record with %v — a record is not a message this layer replies to", o.Wire)
+		}
+		if o.Patched == 0 {
+			// Untouched: this end sealed it, so the other end must open it — once, moving the
+			// counter once, leaving the link up.
+			if o.Delivered != 1 || o.RecvCtr != 1 || o.RecvEpoch != 0 || o.Closed {
+				t.Fatalf("shaped record: a record this session sealed was not accepted — delivered=%d recvCtr=%d recvEpoch=%d closed=%v, body %d bytes",
+					o.Delivered, o.RecvCtr, o.RecvEpoch, o.Closed, len(body))
+			}
+			return
+		}
+		// One changed byte anywhere — nonce arithmetic, ciphertext or tag — and it does not
+		// open, the counter does not move, and the link is gone.
+		if o.Delivered != 0 || o.NAuth != 0 {
+			t.Fatalf("shaped record: a record corrupted in %d byte(s) was ACCEPTED (%d delivered) — body %d bytes: %x",
+				o.Patched, o.Delivered, len(body), head(patch))
+		}
+		if o.RecvCtr != 0 || o.RecvEpoch != 0 {
+			t.Fatalf("shaped record: a failed open moved the receive counter to epoch %d ctr %d — patched %d byte(s)",
+				o.RecvEpoch, o.RecvCtr, o.Patched)
+		}
+		if !o.Closed {
+			t.Fatalf("shaped record: a record corrupted in %d byte(s) left the link up — a proved peer's stream cannot survive one",
+				o.Patched)
 		}
 	})
 }

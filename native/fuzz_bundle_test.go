@@ -1,5 +1,3 @@
-//go:build fuzz
-
 package main
 
 import (
@@ -196,6 +194,19 @@ func refusedInOwnVocabulary(t *testing.T, what string, o fuzzOutcome, data []byt
 	}
 }
 
+// covOutcome names what a probe did, in the terms the mutator should be steered by
+// (fuzz_cov_test.go): which refusal, or which verdict — never how big the input was.
+func covOutcome(what string, o fuzzOutcome) string {
+	if o.Skip {
+		return what + " skip"
+	}
+	if o.Threw {
+		return what + " " + o.Name + " " + covShape(o.Msg)
+	}
+	return what + " ok verified=" + strconv.FormatBool(o.Verified) +
+		" accepted=" + strconv.FormatBool(o.Accepted) + " files=" + covBucket(o.N)
+}
+
 // head trims a failure's input to something a test log can carry.
 func head(b []byte) []byte {
 	if len(b) > 96 {
@@ -356,6 +367,7 @@ func FuzzUnpackBundle(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzUnpack", data)
+		covPath(covOutcome("unpack", o))
 		refusedInOwnVocabulary(t, "unpackBundle", o, data)
 		containerAgrees(t, o, data)
 		if o.Threw {
@@ -459,6 +471,7 @@ func FuzzUnpackBundleShaped(f *testing.F) {
 		}
 		blob := shapeBlob(raw)
 		o := runProbe(t, "__fuzzUnpack", blob)
+		covPath(covOutcome("unpack", o))
 		refusedInOwnVocabulary(t, "unpackBundle", o, blob)
 		containerAgrees(t, o, blob)
 		if !o.Threw && !o.Proto {
@@ -502,6 +515,7 @@ func FuzzVerifyManifest(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzVerifyManifest", data)
+		covPath(covOutcome("manifest", o))
 		refusedInOwnVocabulary(t, "verifyManifest", o, data)
 		if o.Threw {
 			// A suite this host cannot check, or a validly signed manifest that is broken:
@@ -582,6 +596,7 @@ func FuzzVerifyBundle(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzVerifyBundle", data)
+		covPath(covOutcome("bundle", o))
 		refusedInOwnVocabulary(t, "verifyBundle", o, data)
 		// Both directions. The forward one is the security claim — nothing is admitted
 		// whose container, signature and content hashes do not all hold. The reverse holds
@@ -692,6 +707,7 @@ func FuzzValidateManifest(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := runProbe(t, "__fuzzValidateManifest", data)
+		covPath(covOutcome("validate", o))
 		if o.Skip {
 			return
 		}
