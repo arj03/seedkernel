@@ -178,6 +178,43 @@ Two things it does *for* you, which is why you should not try to reproduce them:
 - **The transport author pin is ANDed onto your predicate, never substituted for it.** The transport bundle is admitted under a pin derived from the blob itself, so "only this author may be the network" is the assembly's business, not something you can lose by forgetting it. Your `admit` still has to admit as well — a deny-all node has no network, and an operator keeps the power to refuse a transport author, because AND means both. Running a different transport means passing a different `transport.bundle`, which is what the pin is derived from.
 - **It is fail-closed on a privilege it does not know.** `PRIVILEGES` is derived from the capability catalog, so a privileged name added to `core/domains.ts` appears here as a privilege with no branch, and bundles reaching it are refused until the assembly is taught about it. That is what makes "privileged bundles are the pin's business" a safe thing for your consent dialog to assume.
 
+**Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither adds a host capability, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified `(author, app)` and the signed claim lists `admit` is already handed:
+
+```js
+import { allOf, policyFromJson } from "seedkernel-wasm/shell-core";
+import { appKeyFor } from "seedkernel-wasm/bundle";
+
+// Replace these placeholders with approved 64-character lowercase author ids.
+const appAuthor = "<approved app author id in hex>";
+const transportAuthor = "<approved transport author id in hex>";
+
+const basePolicy = policyFromJson(JSON.stringify({
+  authors: [appAuthor],
+  grants: { link: [transportAuthor] },
+}));
+const protocolOwners = new Map([
+  ["private-chat-v1", `${appAuthor}:private-chat`],
+]);
+const serviceOwners = new Map([
+  ["private-chat-local", `${appAuthor}:private-chat`],
+  ["_net", `${transportAuthor}:transport`],
+]);
+
+const approvedClaims = (v) => {
+  const owner = appKeyFor(v.author, v.manifest.app);
+  const matches = (claims, pins) => (claims ?? []).every(
+    (claim) => !pins.has(claim) || pins.get(claim) === owner,
+  );
+  return matches(v.manifest.protocols, protocolOwners)
+    && matches(v.manifest.services, serviceOwners);
+};
+
+// Pass as bootShell({ ...platformOptions, admit }).
+const admit = allOf(basePolicy, approvedClaims);
+```
+
+Keep the pins in operator-controlled configuration rather than reading them off the candidate, and name the approved bundles' actual app labels and service ids — `transport` and `_net` are the shipped transport's. The two maps are independent audiences, so a name needing protection in both is pinned in both, and a claim in neither is judged by `basePolicy` alone. `allOf` applies the check to every candidate, including one judged by a capability grant rather than `byPrivilege`'s `base`; the shell still supplies revocation, freshness and the transport author pin around whatever you compose.
+
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
 `loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None becomes signed bundle content. For ordinary apps, `localConfig` becomes `LOCAL` unchanged. For the slot reaching `link`, the shell adds the host-owned `networkKey`, which wins a collision. The transport reads identity through `node/identity`. Its contact secret is ordinary `LOCAL` config: `contactSecret` is 64 lowercase hex, absence means open, and the `contact` op rotates it at runtime.

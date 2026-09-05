@@ -28,7 +28,7 @@ A minimal runtime: a **host** admits signed **bundles**, and every bundle is an 
 
 **Authorization, capability gating and application logic are none of them.** They are layers that compose around the guest seam without the host knowing what any of them mean, so a node bootstraps from one trusted policy — the authors it will install, or none — into arbitrarily complex behaviour.
 
-**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be one routing lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle. Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
+**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be one routing lookup and one guest call *because* a layer beneath it did that work. That layer is an ordinary signed bundle, replaceable without rebuilding the host and trusted for what it holds — session keys and plaintext, which host confinement does not protect ([SECURITY §14](docs/SECURITY.md#14-security-considerations)). Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
 
 There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, the one `handle` entrypoint in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names, and it is reached — by the host and by every app — through the protocol id it claims, exactly as an app is.
 
@@ -159,10 +159,10 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 517 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 514 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 331 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the timer table and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 725 |
-| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 391 |
+| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 392 |
 | Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/peer-addr.ts`, `host/op-frame.ts` | 319 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id and the host-call names | `core/*.ts` (7 files) | 306 |
 
@@ -171,7 +171,7 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 - **Trust root** — the bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle. None of it is core by the end-to-end test; all of it is stuck.
 - **Vocabulary** — the domain prefixes, manifest suite id, authority names and flood bounds in `core/`. Core is the vocabulary a bundle's own signature is verified under; a bundle defining that vocabulary would be circular. A codec nothing verifies is not core. Pure transforms do not enter it either: seed store and the transport both ship their computations as modules and add no host name.
 - **A stable adapter** — the transport driver holds link ids and listeners; the signed transport owns peer, address, and contact policy. Its three events (`linkOpen`, `linkBytes`, `linkClosed`) are declared beside the `link` calls in `HOST_SERVICES`. Everything peer-shaped is an ordinary local-service call through `Shell.call`, while `link/open` passes an opaque destination to the socket factory. Listener lifecycle follows host configuration.
-- **Reuse** — protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule on every target, not because agreement is load-bearing. The optional op codec likewise stays shared so clients and guest build tools do not each restate it.
+- **Reuse** — protocol routing follows each node's installed claims (§12.10), so that row is shared to keep one rule on every target, not because peers must agree; which app owns a claim is the operator's decision, and a security one ([SECURITY §14](docs/SECURITY.md#14-security-considerations)). The optional op codec likewise stays shared so clients and guest build tools do not each restate it.
 
 **Per-target platform — the seam, written once per target**
 
