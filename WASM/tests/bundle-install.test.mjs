@@ -1544,6 +1544,72 @@ function testGeneratedOpFrame() {
   console.log("  OK\n");
 }
 
+// ─── Test: the commit window re-asks the host's gates (§12.4, §12.5) ────────────
+//
+// Module construction, the guest's top level and a consent dialog all run between admission
+// and the commit, and the mark and the revocation set move in that window.
+async function testCommitRevalidatesHostGates() {
+  console.log("Test: a candidate is re-checked against freshness and revocation at commit");
+
+  const author = testAuthor();
+  const racerKey = appKeyFor(author.id, "racer");
+  const blobAt = (version) => authorBundle(sodium, author, {
+    app: "racer", version, modules: [],
+    guestSource: `${GUEST_TEXT}//v${version}`, guestRequires: [],
+  }).blob;
+  // Which version is standing, read off the guest source — the only thing that tells the two
+  // candidates apart from inside the shell.
+  const createRealm = async ({ source }) => ({
+    call: async () => Uint8Array.of(Number(/\/\/v(\d+)$/.exec(source)[1])),
+    dispose() { },
+  });
+
+  // A v1 held in admission while v2 lands: fresh when admitted, a downgrade by commit.
+  {
+    const store = new FreshnessMarks();
+    let release;
+    const held = new Promise((r) => { release = r; });
+    const shell = await bootTestShell({
+      freshnessStore: store, createRealm,
+      admit: async (v) => { if (v.manifest.version === 1) await held; return true; },
+    });
+    try {
+      const slow = shell.loadBundleBlob(blobAt(1));
+      const winner = await shell.loadBundleBlob(blobAt(2));
+      release();
+      let refused = null;
+      try { await slow; } catch (e) { refused = e; }
+      assert(refused !== null && /downgrade/.test(refused.message),
+        "a candidate admitted before the newer version is refused at commit");
+      assertEqual(store.get(author.id, "racer"), 2, "the mark still records the version that ran");
+      assertEqual((await winner.invoke(EMPTY))[0], 2, "the newer slot is the one still standing");
+    } finally { shell.close(); }
+  }
+
+  // An author written off while its own load waits on the predicate. `revoke` tears down what
+  // is installed, and a candidate is not — so the load has to refuse itself.
+  {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    const shell = await bootTestShell({
+      freshnessStore: new FreshnessMarks(), createRealm,
+      admit: async () => { await held; return true; },
+    });
+    try {
+      const pending = shell.loadBundleBlob(blobAt(1));
+      shell.revoke(toHex(author.id));
+      release();
+      let refused = null;
+      try { await pending; } catch (e) { refused = e; }
+      assert(refused !== null && /revoked/.test(refused.message),
+        "an author revoked mid-load does not get its pending installation");
+      assert(shell.uninstall(racerKey) === false, "nothing landed for the revoked author");
+    } finally { shell.close(); }
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1570,5 +1636,6 @@ await testPersistFailureRollsBack();
 await testCandidateRealmCannotActBeforeCommit();
 await testFailedRevokePersistRollsBack();
 await testInPlaceUpgradeReleasesTheOldSlot();
+await testCommitRevalidatesHostGates();
 
 summary("Results");

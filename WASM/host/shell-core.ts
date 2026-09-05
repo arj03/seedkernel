@@ -3,7 +3,7 @@
 // there is no second constructor that could skip the pin. Targets displace platform members
 // only (main.ts, native-shim.ts, seedchat, seedstore). Signed bundles are the only way slots
 // land (§12.4).
-import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
+import { denyAll, allOf, hostGates, checkHostGates, type Admit, type AdmissionContext, type HostFacts } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
@@ -516,11 +516,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // `(bundle, context)`, with the constraints' ordering stated once at
       // construction. Nothing decides admission beside the predicate, which is what
       // makes "nothing has landed" hold for the whole decision.
-      const ctx: AdmissionContext = {
-        privileges,
+      //
+      // A function, not a value: the commit window reads it again.
+      const hostFacts = (): HostFacts => ({
         highWater: freshnessStore.get(v.author, v.manifest.app),
         revoked: freshnessStore.isRevoked(v.author),
-      };
+      });
+      const ctx: AdmissionContext = { privileges, ...hostFacts() };
       if (!(await admit(v, ctx)))
         throw new Error(ADMISSION_REJECTED);
       const loaded: LoadedBundle = {
@@ -542,8 +544,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       try {
         await standRealm(slot, configFor(slot, localConfig), loadOpts);
         // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
-        // what makes the commit atomic: the contest below, the mark, and the claim
-        // hand-over cannot be interleaved with another load or an uninstall.
+        // what makes the commit atomic: the gates below, the contest, the mark, and the
+        // claim hand-over cannot be interleaved with another load or an uninstall.
+        //
+        // Admission read these before the modules and the guest's top level ran, and both
+        // move: a newer version can land meanwhile, and `revoke` can name this author. NOT
+        // the operator's predicate — consent is not withdrawn by losing a race.
+        checkHostGates(v, hostFacts());
         table.refuseConflicts(loaded, key);
         // A mark that cannot be persisted throws, and the store has already rolled
         // itself back; the catch below disposes the candidate, so the running slot

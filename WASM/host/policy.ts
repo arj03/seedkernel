@@ -1,14 +1,15 @@
 // Admission predicate (§12.5): one pure function of (verified bundle, AdmissionContext),
 // asked once between verifyBundle and slot construction. Host gates (revocation, freshness)
-// wrap the operator's predicate so admitAll cannot lose them. Deny-all is the default.
+// wrap the operator's predicate so admitAll cannot lose them, and are asked again at commit,
+// where the facts they read may have moved. Deny-all is the default.
 
 
 import { toHex } from "../core/util.js";
 import { PRIVILEGES, type Privilege } from "../core/domains.js";
 import { type VerifiedBundle } from "./bundle.js";
 
-/** Everything a gate needs, read ONCE by the shell and handed to the predicate —
- *  which is what makes the predicate pure and its order irrelevant. */
+/** Everything a gate needs, read by the shell and handed to the predicate — which is what
+ *  makes the predicate pure and its order irrelevant. */
 export interface AdmissionContext {
   /** The privileges this bundle's `requires` reach (§12.5), derived by the shell from
    *  the catalog and never from anything the bundle says about itself. Empty ⇒ it
@@ -20,6 +21,10 @@ export interface AdmissionContext {
   /** Has this host written this author key off (§12.5)? */
   revoked: boolean;
 }
+
+/** The half of the context that MOVES: what a `revoke` or another load changes under a
+ *  load already in flight. */
+export type HostFacts = Pick<AdmissionContext, "highWater" | "revoked">;
 
 /** The ONE admission seam. `(v, ctx) → bool | Promise<bool>`.
  *  Return `true` to admit, `false` to reject silently, or throw to reject with a
@@ -33,26 +38,21 @@ export const denyAll: Admit = () => false;
 /** Any verified bundle is admitted. Shell still composes hostGates around it. */
 export const admitAll: Admit = () => true;
 
-/** Refuse a written-off author key (§12.5). Runs before every other gate. */
-const notRevoked: Admit = (v, ctx) => {
-  if (ctx.revoked) {
+/** Revocation (§12.5) before the downgrade guard (§12.4), so a written-off key never reaches
+ *  an interactive consent dialog. Equal versions reload, transport included. Sync and
+ *  throwing: the loader asks it again in the commit window, which cannot await. */
+export function checkHostGates(v: VerifiedBundle, facts: HostFacts): void {
+  if (facts.revoked) {
     throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
   }
-  return true;
-};
-
-/** Refuse a load below the persisted `(author, app)` high-water mark (§12.4).
- *  Equal versions reload. Transport uses the same ordinary mark. */
-const freshVersion: Admit = (v, ctx) => {
-  if (v.manifest.version < ctx.highWater) {
-    throw new Error(`bundle: version ${v.manifest.version} is below the (author, app) freshness high-water mark ${ctx.highWater} — downgrade refused`);
+  if (v.manifest.version < facts.highWater) {
+    throw new Error(`bundle: version ${v.manifest.version} is below the (author, app) freshness high-water mark ${facts.highWater} — downgrade refused`);
   }
-  return true;
-};
+}
 
-/** Host gates: revocation then freshness. Shell composes these around the operator's
- *  predicate so no posture can lose them. */
-export const hostGates: Admit = allOf(notRevoked, freshVersion);
+/** The same gates as a predicate. Shell composes this around the operator's predicate so no
+ *  posture can lose them. */
+export const hostGates: Admit = (v, ctx) => { checkHostGates(v, ctx); return true; };
 
 /** Admit authors whose hex id is in the closed set (§12.4). */
 export function authorAllowlist(authors: string[]): Admit {
