@@ -104,26 +104,18 @@ tidying up error paths.
 
 The cost is that a refused connection occupies a socket until its deadline instead of being
 dropped on sight, which promotes the half-open budgets from defence in depth to the thing
-standing between a stranger and the node. Three measures pay for it, and two of them exist
-because measurement contradicted the design:
+standing between a stranger and the node. Three measures bound this exposure:
 
-- **No cryptography before proof.** The accepting side used to generate an X25519 keypair in
-  its *constructor*, so every inbound TCP connection bought a keygen before the peer had
-  proved anything — the cheapest flood there is.
+- **No asymmetric cryptography before proof.** The accepting side verifies the contact-secret
+  proof before generating ephemeral keys or invoking the KEM.
 - **Separate budgets for proven and unproven callers**, so a flood without the contact
   secret cannot crowd out those that have it.
-- **Evict the oldest rather than refuse the newest.** Separating the budgets was *not*
-  sufficient on its own: a saturating flood turned each arriving peer away at the door,
-  before it could send the message that would have promoted it. Promotion cannot rescue a
-  connection that was never accepted. The oldest unverified connection is overwhelmingly
+- **Evict the oldest rather than refuse the newest.** Refusing arrivals at a full budget
+  would let a flood block peers before they could send their proof. The oldest unverified connection is overwhelmingly
   likely to be a stranger making no progress, while a legitimate caller occupies that budget
   for one round trip — so an attacker must cycle the whole budget faster than a round trip
   rather than merely fill it once. The same argument applies one tier up, which is why the
   verified budget evicts too.
-
-A correction to an earlier framing: silence did **not** make flooding materially worse. A
-connection that opened a socket and said nothing already held a slot for the full deadline.
-Silence only made garbage cost the same as silence.
 
 Constants and measured numbers: [RUNTIME](RUNTIME.md) §12.6.2 and
 `tests/transport-load.test.mjs`.
@@ -203,15 +195,10 @@ It is optional and empty by default. Revocation is key rotation — a node dropp
 rotates its contact secret, a network splitting rotates its network key — so the list is a
 convenience for expressing membership without re-keying, not a revocation mechanism.
 
-**It is a lint, and it is the occupant's.** The host used to hold the predicate and apply it
-to what the occupant reported, on the argument that a check a program applies to itself gates
-nothing against a hostile one. True — but the host was checking a key the *occupant supplied*,
-so it gated nothing against a hostile occupant either: one would simply supply a key that
-passes, or forge an attribution with no link at all. What the check actually catches is a
-buggy transport, or an honest one meeting a peer the operator did not list, and both are the
-occupant's business. So it ships as configuration at init. What holds against a hostile
-occupant is what always did, and it is not this: the occupant reaches no authority but
-`link/*`, and nothing it says about a peer widens that.
+**Peer admission depends on the transport.** The configured list is checked by the transport
+against signature-verified identities. A malicious transport can bypass it or fabricate
+attribution. The host confines the transport's service access and resource use (§14), but
+relies on it for channel confidentiality, authentication and attribution.
 
 ## 7. Why one identity key, and not a key per purpose
 
@@ -317,8 +304,8 @@ network key is adopted outright (§6.2).
 
 Not adopted wholesale because it requires the identity key to take a DH role, converting
 Ed25519 to Curve25519, which §12.6 rules out; and because it has no suite byte for the
-ML-KEM fields that suite `0x03` now carries. The reserved suite byte made that migration
-self-describing without changing the node address or adding a round trip.
+ML-KEM fields in suite `0x03`. The suite byte identifies the field layout; the handshake
+uses the same node address format and round-trip count described above.
 
 ---
 
@@ -366,7 +353,7 @@ instrumented in-process channel — rather than against a library object a test 
 
 **Where 5 lives, and why it is easy to lose.** The peer list is *configuration*, shipped to
 the occupant at init and applied by it — a LINT rather than a gate, since a host checking a
-key the occupant supplied gated nothing against a hostile occupant either. What matters is
+key supplied by a malicious occupant cannot establish authentic attribution. What matters is
 the *order*, and the invariant is entirely about order. The gate is asked
 at the first point the peer is known and before this end has revealed anything about itself:
 `onMsg3` when accepting, `onMsg4` when dialing. Asking it from `becomeAuthed()` instead
@@ -378,10 +365,10 @@ distinction.
 
 ---
 
-## 11. The post-quantum landing (suite `0x03`)
+## 11. Hybrid key establishment (suite `0x03`)
 
 **The KEM is bundle content.** `mlkem768.wasm` is the transport bundle's own import-free
-pure module, reached under the bare name `mlkem` through the same private module map as
+module, reached under the bare name `mlkem` through the same private module map as
 `ws.wasm`. It adds no host transform name, native KEM bridge or separately embedded host
 artifact. The generic module ABI is pinned to 40 NIST ACVP cases.
 
@@ -389,8 +376,7 @@ The message widths are derived in one place from named field
 lengths (`M1_LEN`…`M4_LEN`, `transport/src/ake.js`); the host never sees a handshake width. The key schedule takes a
 *list* of shared secrets, so a KEM secret joins it rather than displacing anything. And
 because the handshake publishes no long-term DH key, **a KEM never enters an address** —
-addresses stay `pk[.secret]@host:port` across the migration, which is the part that would
-otherwise have hurt.
+addresses use `pk[.secret]@host:port`.
 
 Msg1 carries the initiator's ML-KEM-768 encapsulation key and msg2 the responder's
 ciphertext: exactly 1,265 and 1,168 bytes.
@@ -414,8 +400,8 @@ invariant that the bytes a node sends are the bytes it folds into the transcript
 
 **The DoS interaction.** A refused connection is held to its deadline, and msg1 is 1,265
 bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
-both PQ widths with room while bounding a stranger to 8 MiB across the
-1,024 unverified budget. `MAX_QUEUE_BYTES` is unaffected: it bounds queued application
+both PQ widths with room while bounding a stranger to that cap times the
+unverified budget. `MAX_QUEUE_BYTES` is unaffected: it bounds queued application
 frames, not the handshake. What does change is the memory a stranger holds for
 `UNVERIFIED_TIMEOUT_MS`, and — on any datagram path — that msg1 stops fitting one common-case
 MTU. The contact-secret seal covers the KEM public key and is checked before the responder

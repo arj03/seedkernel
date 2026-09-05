@@ -114,10 +114,14 @@ func bootModuleTable() error {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
 		WithCloseOnContextDone(true))
 	// AssemblyScript's three imports, exactly the set the JS host resolves (a subset would
-	// make "does this module load" a property of the target). All inert — `seed` is a
-	// constant (§4.2), `trace` drops args (§4.3), `abort` need not trap.
+	// make "does this module load" a property of the target). None grants I/O: `seed` is a
+	// constant (§4.2) and `trace` drops args (§4.3). `abort` TRAPS — AssemblyScript calls it
+	// where the module has declared itself broken, so returning would let it run on past that
+	// point, and the same module would fail on the JS targets and continue here.
 	env := rt.NewHostModuleBuilder("env")
-	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
+	env.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, line, col uint32) {
+		panic(fmt.Sprintf("module abort at %d:%d", line, col))
+	}).Export("abort")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
 	if _, err := env.Instantiate(ctx); err != nil {

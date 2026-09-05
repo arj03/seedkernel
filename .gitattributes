@@ -1,17 +1,12 @@
 # Line endings are a property of the repo, not of whichever machine wrote a file last.
-# The index holds LF for every text file; this says what a checkout turns that into, so a
-# file cannot end up half-CRLF because one tool appended LF to a CRLF file.
-* text=auto
-
-# Read by a POSIX shell, so LF regardless of platform: bash takes a CRLF `export HOME=/root`
-# as `/root\r` and corrupts every path derived from it (native/gorun.sh says the same).
-*.sh text eol=lf
+# The index holds LF for every text file, and eol=lf makes every checkout hold LF too, on
+# every platform. It overrides a machine core.autocrlf, so a working tree cannot drift to
+# CRLF and no file can end up half-CRLF because one tool appended LF to a CRLF file. That
+# matters most for anything a POSIX shell reads: bash takes a CRLF `export HOME=/root` as
+# a path with a trailing CR and corrupts everything derived from it (native/gorun.sh).
+* text=auto eol=lf
 
 # Applied against LF sources, so the patch itself has to stay LF.
 *.patch -text
-
-# Rewritten by the Go toolchain, which emits LF.
-go.mod text eol=lf
-go.sum text eol=lf
 
 *.wasm binary
