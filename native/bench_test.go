@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"os"
 	"sync"
 	"testing"
 )
@@ -15,7 +14,6 @@ import (
 var (
 	benchBootOnce sync.Once
 	benchBootErr  error
-	benchDataDir  string
 )
 
 // ensureBooted stands the shared benchmark realm up (and a node in it, so a bench can
@@ -23,19 +21,14 @@ var (
 func ensureBooted(tb testing.TB) {
 	tb.Helper()
 	benchBootOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "seedloader-bench-")
-		if err != nil {
-			benchBootErr = err
-			return
-		}
-		benchDataDir = dir
 		// The helpers below fail with tb.Fatal, which unwinds this goroutine but leaves the
 		// Once done — so hold the sentinel until the realm is actually up, or a later
 		// benchmark finds benchBootErr nil and runs against a half-built realm.
 		benchBootErr = errors.New("the first benchmark to stand the realm up failed")
 		// The same standing-up every test does: a bench realm assembled its own way is the
-		// second assembly path this target exists not to have.
-		bootRealmIn(tb, dir)
+		// second assembly path this target exists not to have. bootRealm owns the data
+		// directory, which is what keeps it alive for the benchmarks that follow.
+		bootRealm(tb)
 		cfg := nodeConfig{KeyHex: testKeyHex(tb)}
 		_, benchBootErr = startNode(cfg)
 	})

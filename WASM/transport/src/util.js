@@ -34,9 +34,20 @@ function toHex(b) {
   for (let i = 0; i < b.length; i++) { s += HEX[b[i] >>> 4] + HEX[b[i] & 15]; }
   return s;
 }
+/** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range
+ *  character reads back as mean "not a hex digit". A table rather than `parseInt` over a
+ *  two-character slice, which allocated a string per byte. */
+const NIBBLE = new Uint8Array(128);
+for (let i = 0; i < 16; i++) {
+  NIBBLE[HEX.charCodeAt(i)] = i + 1;
+  NIBBLE["0123456789ABCDEF".charCodeAt(i)] = i + 1;
+}
 function fromHex(s) {
   const out = new Uint8Array(s.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  for (let i = 0; i < out.length; i++) {
+    const hi = NIBBLE[s.charCodeAt(i * 2)], lo = NIBBLE[s.charCodeAt(i * 2 + 1)];
+    out[i] = hi && lo ? ((hi - 1) << 4) | (lo - 1) : 0;
+  }
   return out;
 }
 

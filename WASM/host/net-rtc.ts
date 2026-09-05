@@ -29,10 +29,10 @@ export interface PeerEntry {
    *  the same peer. */
   linked: boolean;
   /** Whether the underlying peer connection has completed DTLS/ICE (`connectionState`
-   *  reached "connected"). This is what `admitNewPeer`'s speculative-entry cap asks: a
-   *  connection this far along cost a real handshake, not just a relayed `hello`, so it no
-   *  longer counts against the cap — regardless of whether the transport above it has
-   *  authenticated. */
+   *  reached "connected"). The `unestablished` counter `admitNewPeer` reads follows this
+   *  flag, and for the same reason: a connection this far along cost a real handshake, not
+   *  just a relayed `hello`, so it no longer counts against the cap — regardless of
+   *  whether the transport above it has authenticated. */
   established: boolean;
   polite: boolean;
   makingOffer: boolean;
@@ -224,6 +224,12 @@ export class RtcNetwork implements ChannelFactory {
   /** One ordered lane for the signaling state machine. Promise-returning WebRTC methods
      *  may yield, but a later SDP/ICE message must not overtake the operation in flight. */
   private signalTail: Promise<void> = Promise.resolve();
+  /** Peer entries that have not yet established, the number `admitNewPeer` bounds.
+   *  Held rather than counted: `peers` also holds every ESTABLISHED peer, which is
+   *  unbounded, so a relay spamming hellos would pay a walk of the whole fleet per
+   *  signal. Moved in exactly three places — an entry created, an entry establishing,
+   *  and an entry forgotten — which is the same set `established` itself turns on. */
+  private unestablished = 0;
   private queuedSignals = 0;
   private queuedSignalBytes = 0;
   private closed = false;
@@ -267,9 +273,7 @@ export class RtcNetwork implements ChannelFactory {
      *  speculative entries by naming arbitrary peers in hellos AND in offers, so every path
      *  that would CREATE one answers to the same cap. */
   private admitNewPeer(): boolean {
-    let unestablished = 0;
-    for (const e of this.peers.values()) if (!e.established) unestablished++;
-    return unestablished < MAX_UNESTABLISHED_PEERS;
+    return this.unestablished < MAX_UNESTABLISHED_PEERS;
   }
   ensurePeer(peerId: string): PeerEntry {
     const existing = this.peers.get(peerId);
@@ -281,6 +285,7 @@ export class RtcNetwork implements ChannelFactory {
       makingOffer: false, pendingIce: new Fifo(), pendingIceBytes: 0, establishmentTimer: null,
     };
     this.peers.set(peerId, e);
+    this.unestablished++;
     e.establishmentTimer = setTimeout(() => {
       if (this.peers.get(peerId) !== e) return;
       e.establishmentTimer = null; // it has fired; nothing left for forget() to clear
@@ -328,7 +333,10 @@ export class RtcNetwork implements ChannelFactory {
         // the cap is not the same as being a live link, and a connection that
         // establishes and then never carries a channel would otherwise have
         // nothing left to reap it. The one timer decides, once, on both facts.
-        e.established = true;
+        if (!e.established) {
+          e.established = true;
+          this.unestablished--;
+        }
       }
       else if (s === "disconnected") {
         // A transient path failure (network blip, NAT rebind): restartIce()
@@ -392,6 +400,8 @@ export class RtcNetwork implements ChannelFactory {
     const e = this.peers.get(peerId);
     if (!e || (expected && e !== expected))
       return;
+    if (!e.established)
+      this.unestablished--;
     if (e.establishmentTimer !== null) {
       clearTimeout(e.establishmentTimer);
       e.establishmentTimer = null;

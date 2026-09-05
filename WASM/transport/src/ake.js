@@ -278,6 +278,9 @@ class Link {
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
     this.expectPeerId = spec.expectPeerId;   // 32B or null
+    // The `connecting` pool this link waits in, so leaving it is one map hit rather than a
+    // scan of every peer's pool. Empty for an accept, which waits in `inbound` instead.
+    this.dialedPeerId = spec.dialedPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
@@ -871,7 +874,12 @@ class Link {
     if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
     // Not awaited, and nothing to await: a request goes to the host as its own call, and
     // this link's next record must not queue behind whoever answers it.
-    this.onFrame(this.peerId, r.pt);
+    //
+    // BOTH forms of the peer's identity travel with the frame: the hex keys the router's
+    // pools and the correlation map, the bytes are what an attribution goes to the host
+    // as. This end holds both already, so nothing downstream needs to rebuild one from
+    // the other on a per-request path.
+    this.onFrame(this.peerId, r.pt, this.peerPubkey);
   }
 
   onChannelClosed() {

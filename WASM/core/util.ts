@@ -13,9 +13,25 @@ export function toHex(b: Uint8Array): string {
   return out.join("");
 }
 
+/** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range
+ *  character reads back as mean "not a hex digit". A table rather than `parseInt` over a
+ *  two-character slice: this decodes every peer id, key and secret the runtime handles,
+ *  and the slice shape allocated a string per byte to do it. */
+const NIBBLE = (() => {
+  const t = new Uint8Array(128);
+  for (let i = 0; i < 16; i++) {
+    t["0123456789abcdef".charCodeAt(i)] = i + 1;
+    t["0123456789ABCDEF".charCodeAt(i)] = i + 1;
+  }
+  return t;
+})();
+
 export function fromHex(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length >> 1);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  for (let i = 0; i < out.length; i++) {
+    const hi = NIBBLE[hex.charCodeAt(i * 2)], lo = NIBBLE[hex.charCodeAt(i * 2 + 1)];
+    out[i] = hi && lo ? ((hi - 1) << 4) | (lo - 1) : 0;
+  }
   return out;
 }
 

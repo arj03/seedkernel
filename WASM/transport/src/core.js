@@ -267,10 +267,11 @@ class Core {
       weDialed: spec.weDialed,
       expectPeerId: spec.expectPeerId,
       linkSecret: spec.linkSecret,
+      dialedPeerId: spec.dialedPeerId,
       source: spec.source,
       limiter: spec.limiter,
       onAuth: (pid, l) => this.onAuth(pid, l),
-      onFrame: (pid, frame) => router.deliver(pid, frame),
+      onFrame: (pid, frame, pk) => router.deliver(pid, frame, pk),
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);
@@ -278,14 +279,14 @@ class Core {
     // that has not authenticated yet — a dial whose peer we cannot name steers nothing, so
     // it waits in `inbound` like an accept. (`spec.weDialed` is still passed to `Link`; it
     // decides who speaks first.)
-    if (spec.dialedPeerId) Core.push(this.connecting, spec.dialedPeerId, link);
+    if (link.dialedPeerId) Core.push(this.connecting, link.dialedPeerId, link);
     else this.inbound.add(link);
     return link;
   }
 
   onAuth(peerId, link) {
     this.inbound.delete(link);
-    Core.drop(this.connecting, peerId, link);
+    Core.drop(this.connecting, link.dialedPeerId, link);
     // The peer lint already answered at msg3/msg4, so a refused peer never reaches the
     // router. Only routing is left.
     router.promote(peerId, link);
@@ -293,9 +294,7 @@ class Core {
 
   forget(link) {
     this.inbound.delete(link);
-    for (const pid of [...this.connecting.keys()]) {
-      if (Core.drop(this.connecting, pid, link)) break;
-    }
+    Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
     // Left in `linksById`: `linkClosed` has yet to ask why it went.
   }
@@ -414,7 +413,7 @@ function start() {
     reqres = new ReqRes();
     core = new Core();
     reqres.attach((to, frame) => core.sendFrame(to, frame));
-    router.sink = (from, frame) => reqres.onFrame(from, frame);
+    router.sink = (from, frame, fromPk) => reqres.onFrame(from, frame, fromPk);
     // The cohort edges stay in this heap; the host reads them with the `peers` op.
     router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
     router.onPeerDown = (peerId) => { connected.delete(peerId); };

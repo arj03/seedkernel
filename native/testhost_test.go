@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
@@ -73,10 +74,33 @@ const nativeHandleHarness = `
 })();
 `
 
+// The data directory the standing realm is rooted in, while the harness owns it.
+//
+// A realm OUTLIVES the caller that stood it up: boot() keeps it until the next boot, so a
+// data directory removed when that test ends leaves whatever runs next writing into a path
+// that is gone — and `tb.TempDir()` has exactly that lifetime. Benchmarks are where the
+// mismatch bites, since Go runs them after the tests in one process: a bench that reboots
+// the realm handed every later one a directory testing had already deleted, which surfaced
+// as a freshness-store write failure nowhere near the boot that caused it. So the realm
+// gets a directory of the harness's own, dropped when the realm it rooted is torn down —
+// hand over hand, so a run leaves a stale directory or two behind rather than one per
+// boot.
+var ownedRealmDir string
+
 // bootRealm stands up a fresh realm on a temp data dir: the engines, the platform
 // primitives, and the one shared bundle — but no node. For tests that exercise a
 // primitive (fs, the byte seam) or the shared JS directly.
-func bootRealm(tb testing.TB) { bootRealmIn(tb, tb.TempDir()) }
+func bootRealm(tb testing.TB) {
+	tb.Helper()
+	dir, err := os.MkdirTemp("", "seedloader-realm-")
+	if err != nil {
+		tb.Fatal("realm data dir:", err)
+	}
+	bootRealmIn(tb, dir)
+	// Claimed only once the boot succeeded — bootRealmIn has just released the previous
+	// claim, and this is the directory the realm now standing reads and writes.
+	ownedRealmDir = dir
+}
 
 func bootRealmIn(tb testing.TB, dir string) {
 	tb.Helper()
@@ -86,6 +110,16 @@ func bootRealmIn(tb testing.TB, dir string) {
 	requireFreshShell(tb)
 	if err := boot(); err != nil {
 		tb.Fatal("boot:", err)
+	}
+	// boot() tore the previous realm down, so nothing reads the directory it was rooted
+	// in any more. A caller-supplied `dir` is the caller's to keep. The freshness marks
+	// are a SIBLING of the data directory rather than a file inside it (bundle.ts
+	// `freshnessPathFor`, which owns the name), so dropping a realm's directory means
+	// dropping both.
+	if ownedRealmDir != "" {
+		_ = os.RemoveAll(ownedRealmDir)
+		_ = os.Remove(ownedRealmDir + ".freshness.json")
+		ownedRealmDir = ""
 	}
 	if _, err := qc.Eval("native-handle-harness.js", qjs.Code(nativeHandleHarness)); err != nil {
 		tb.Fatal("native handle harness:", err)

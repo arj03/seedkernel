@@ -12,67 +12,62 @@ const POLYFILLS = `
 (function () {
   if (typeof globalThis.TextEncoder === "undefined") {
     globalThis.TextEncoder = class TextEncoder {
+      // Written straight into a typed array rather than pushed byte-by-byte into a plain
+      // one and converted at the end. Three bytes per UTF-16 code unit is the ceiling — a
+      // surrogate pair is two units and four bytes — plus one for the single case that
+      // beats it: a lone high surrogate in the final position consumes one unit and still
+      // writes four. That can happen once, because it ends the loop.
       encode(s) {
         s = String(s);
-        const out = [];
+        const out = new Uint8Array(s.length * 3 + 1);
+        let n = 0;
         for (let i = 0; i < s.length; i++) {
           let c = s.charCodeAt(i);
-          if (c < 0x80) out.push(c);
-          else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-          else if (c >= 0xd800 && c <= 0xdbff) {
+          if (c < 0x80) out[n++] = c;
+          else if (c < 0x800) {
+            out[n++] = 0xc0 | (c >> 6); out[n++] = 0x80 | (c & 0x3f);
+          } else if (c >= 0xd800 && c <= 0xdbff) {
             const c2 = s.charCodeAt(++i);
             c = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
-            out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-          } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+            out[n++] = 0xf0 | (c >> 18); out[n++] = 0x80 | ((c >> 12) & 0x3f);
+            out[n++] = 0x80 | ((c >> 6) & 0x3f); out[n++] = 0x80 | (c & 0x3f);
+          } else {
+            out[n++] = 0xe0 | (c >> 12); out[n++] = 0x80 | ((c >> 6) & 0x3f);
+            out[n++] = 0x80 | (c & 0x3f);
+          }
         }
-        return new Uint8Array(out);
+        return out.slice(0, n);
       }
     };
   }
   if (typeof globalThis.TextDecoder === "undefined") {
+    // Code units per String.fromCharCode call. This is the ONLY decoder the native target
+    // has — it reads every manifest, every guest source and every fs listing — so the
+    // batch is what keeps it from building those strings one concatenation per character.
+    // Well under any engine argument limit, since a batch is spread as arguments.
+    const CHUNK = 4096;
     globalThis.TextDecoder = class TextDecoder {
       decode(buf) {
         const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf || 0);
+        const units = [];
         let s = "";
         for (let i = 0; i < b.length; ) {
           let c = b[i++];
-          if (c >= 0x80) {
-            if (c < 0xe0) c = ((c & 0x1f) << 6) | (b[i++] & 0x3f);
-            else if (c < 0xf0) c = ((c & 0x0f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f);
-            else {
-              c = ((c & 0x07) << 18) | ((b[i++] & 0x3f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f);
-              c -= 0x10000;
-              s += String.fromCharCode(0xd800 + (c >> 10), 0xdc00 + (c & 0x3ff));
-              continue;
-            }
+          if (c < 0x80) units.push(c);
+          else if (c < 0xe0) units.push(((c & 0x1f) << 6) | (b[i++] & 0x3f));
+          else if (c < 0xf0) units.push(((c & 0x0f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f));
+          else {
+            c = ((c & 0x07) << 18) | ((b[i++] & 0x3f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f);
+            c -= 0x10000;
+            units.push(0xd800 + (c >> 10), 0xdc00 + (c & 0x3ff));
           }
-          s += String.fromCharCode(c);
+          if (units.length >= CHUNK) {
+            s += String.fromCharCode.apply(null, units);
+            units.length = 0;
+          }
         }
-        return s;
+        return units.length === 0 ? s : s + String.fromCharCode.apply(null, units);
       }
-    };
-  }
-
-  // atob — the embedded transport bundle is inlined as base64 and decoded at module scope.
-  // Without this the blob read as ABSENT and the node came up with no network — which is
-  // also what a deliberate deny-all policy looks like.
-  if (typeof globalThis.atob === "undefined") {
-    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    globalThis.atob = function (b64) {
-      let out = "", bits = 0, acc = 0;
-      for (let i = 0; i < b64.length; i++) {
-        const c = b64[i];
-        if (c === "=" || c === "\\n" || c === "\\r") continue;
-        const v = B64.indexOf(c);
-        if (v < 0) throw new Error("atob: bad base64 character");
-        acc = (acc << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-          bits -= 8;
-          out += String.fromCharCode((acc >> bits) & 0xff);
-        }
-      }
-      return out;
     };
   }
 

@@ -436,6 +436,12 @@ async function testFs() {
       assert(await fs.size("a.blk") >= 0, `${name}: present after put`);
       assertEqual(await fs.size("a.blk"), 5, `${name}: size reflects bytes`);
       assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: get round-trips`);
+      const read = await fs.get("a.blk");
+      const copy = read.slice();
+      copy.fill(0);
+      assert(bytesEqual(read, bytes), `${name}: returned bytes keep copying slice semantics`);
+      read.fill(0);
+      assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: a read owns its bytes independently of the store`);
 
       await fs.put("a.dsc", new Uint8Array([9]));
       await fs.put("b.blk", new Uint8Array([7, 7]));
@@ -467,6 +473,63 @@ async function testFs() {
     assert(threw, "NodeFs rejects the bare '..' key");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+
+  // A cold store must seed its byte total before concurrent mutations start changing it.
+  // Only same-file mutations need ordering, and a failed write must not poison the queue
+  // or leave the old size charged after the file was partially overwritten.
+  const disk = (await import("node:fs/promises")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const cachedDir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-cached-"));
+  const write = disk.writeFile;
+  try {
+    await write(pjoin(cachedDir, "existing"), new Uint8Array(17));
+    await write(pjoin(cachedDir, "other"), new Uint8Array(2));
+    class CountedFs extends NodeFs {
+      sizeCalls = 0;
+      async size(key) { this.sizeCalls++; return super.size(key); }
+    }
+    const fs = new CountedFs(cachedDir);
+    await Promise.all([
+      fs.put("existing", new Uint8Array(5)),
+      fs.put("shared", new Uint8Array(3)),
+      fs.put("shared", new Uint8Array(11)),
+      fs.delete("shared"),
+      fs.put("shared", new Uint8Array(7).fill(42)),
+      ...Array.from({ length: 32 }, (_, i) => fs.put(`block-${i}`, new Uint8Array(i + 1))),
+      fs.stat(),
+    ]);
+    assertEqual((await fs.stat()).used, 5 + 2 + 7 + 528, "NodeFs: cold scan and concurrent size deltas agree");
+    assert(bytesEqual(await fs.get("shared"), new Uint8Array(7).fill(42)), "NodeFs: overlapping same-file mutations preserve call order");
+    const probes = fs.sizeCalls;
+    await Promise.all(Array.from({ length: 10 }, () => fs.stat()));
+    assertEqual(fs.sizeCalls, probes, "NodeFs: repeated statistics never probe individual files");
+    await fs.put("shared", new Uint8Array(0));
+    assert(await fs.delete("shared"), "NodeFs: deleting an empty value succeeds");
+    assert(!(await fs.delete("shared")), "NodeFs: deleting a missing value leaves accounting alone");
+    assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: shrinking and deleting adjust the total");
+
+    disk.writeFile = async (path, data, ...args) => {
+      if (path === pjoin(cachedDir, "existing")) {
+        await write(path, data.subarray(0, 3), ...args);
+        throw new Error("injected failure after partial write");
+      }
+      return write(path, data, ...args);
+    };
+    syncBuiltinESMExports();
+    let failed = false;
+    try { await fs.put("existing", new Uint8Array(20)); } catch { failed = true; }
+    assert(failed, "NodeFs: a partial write still rejects");
+    assertEqual((await fs.stat()).used, 3 + 2 + 528, "NodeFs: partial-write failure accounts for the bytes actually left");
+    disk.writeFile = write;
+    syncBuiltinESMExports();
+    await fs.put("existing", new Uint8Array(8));
+    assertEqual((await fs.stat()).used, 8 + 2 + 528, "NodeFs: a failed write does not poison later writes");
+    assertEqual((await new NodeFs(cachedDir).stat()).used, (await fs.stat()).used, "NodeFs: reopening reconstructs the same total");
+  } finally {
+    disk.writeFile = write;
+    syncBuiltinESMExports();
+    rmSync(cachedDir, { recursive: true, force: true });
   }
 
   console.log("  OK\n");

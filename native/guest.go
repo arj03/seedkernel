@@ -201,7 +201,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		g.close()
 		return nil, err
 	}
-	// The Web globals quickjs-ng lacks (TextEncoder/atob, the microtask queue), fetched
+	// The Web globals quickjs-ng lacks (TextEncoder, the microtask queue), fetched
 	// from the host realm so both realms polyfill from ONE text (host/native-polyfills.ts);
 	// first, because everything after may use them.
 	if _, err := g.qc.Eval("polyfills.js", qjs.Code(hostFnString(hostQc, "nativePolyfills"))); err != nil {

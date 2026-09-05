@@ -55,14 +55,14 @@ const guestSrc =
   readFileSync(join(root, "transport/src/util.js"), "utf8") + "\n" +
   readFileSync(join(root, "transport/src/framing.js"), "utf8") + "\n" +
   `globalThis.__wsTestExports = {
-    WsFramer, ByteParts,
+    WsFramer, ByteParts, LengthFramer,
     WS_OP_CONT, WS_OP_BINARY, WS_OP_CLOSE, WS_OP_PING, WS_OP_PONG,
     MAX_HANDSHAKE_FRAME_BYTES, MAX_WS_HANDSHAKE,
   };`;
 
-function newSandbox() {
+function newSandbox(arrayType = Uint8Array) {
   const sandbox = {
-    Uint8Array, TextEncoder, TextDecoder, Promise, RegExp, console,
+    Uint8Array: arrayType, TextEncoder, TextDecoder, Promise, RegExp, console,
     host: { call: (id, req) => {
       if (id !== "ws") throw new Error(`ws-framing harness: unexpected host.call id ${id}`);
       return Promise.resolve(wsRawCall(req));
@@ -126,6 +126,43 @@ async function serverAfterUpgrade() {
 }
 
 async function run() {
+  {
+    // Complete control-sized TCP frames should allocate in proportion to their bytes,
+    // not a multi-KiB accumulation window per read. Count actual typed-array storage.
+    let allocated = 0;
+    class CountedBytes extends Uint8Array {
+      constructor(...args) {
+        super(...args);
+        if (typeof args[0] === "number") allocated += args[0];
+      }
+    }
+    const F = newSandbox(CountedBytes);
+    const framer = new F.LengthFramer(() => {});
+    const frame = new Uint8Array(68).fill(42);
+    new DataView(frame.buffer).setUint32(0, 64);
+    const delivered = [];
+    allocated = 0;
+    for (let i = 0; i < 32; i++) ok(framer.push(frame, (p) => delivered.push(p)), "small complete length frame accepted");
+    ok(allocated <= 2 * frame.length * 32, "complete small frames allocate at most twice their wire bytes");
+    ok(delivered.length === 32 && delivered.every((p) => bytesEq(p, frame.subarray(4))), "small frames deliver intact");
+    frame.fill(0);
+    ok(delivered.every((p) => p[0] === 42), "delivered frames own their bytes after input reuse");
+  }
+  {
+    // A borrowed small view may have spare capacity containing someone else's bytes.
+    // Appending must never treat that capacity as the framer's accumulator.
+    const backing = Uint8Array.from({ length: 100 }, (_, i) => i);
+    const before = backing.slice();
+    const parts = new WS.ByteParts();
+    parts.push(backing.subarray(5, 12));
+    parts.push(Uint8Array.of(200, 201));
+    ok(bytesEq(backing, before), "merging small slices never overwrites borrowed backing storage");
+    const first = parts.take(3);
+    parts.push(backing.subarray(20, 24));
+    ok(bytesEq(first, before.subarray(5, 8)), "partial consumption returns the right prefix");
+    ok(bytesEq(parts.take(parts.length), concat([before.subarray(8, 12), Uint8Array.of(200, 201), before.subarray(20, 24)])),
+      "append after partial consumption preserves the remaining bytes");
+  }
   const client = frameFactory();
   const payload = (n, seed = 0) => Uint8Array.from({ length: n }, (_, i) => (i + seed) & 0xff);
 

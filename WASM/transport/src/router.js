@@ -55,21 +55,27 @@ class Router {
 
   /** One inbound, authenticated, whole message, handed to the request/response layer:
    *  a request goes on to the host's claim routing, a response settles the app waiting
-   *  on it, and anything else is dropped there. */
-  deliver(peerId, frame) {
+   *  on it, and anything else is dropped there. `peerPubkey` is the same identity as
+   *  `peerId`, in the form the host's attribution takes — carried rather than decoded
+   *  again below (ake.js `onRecord`). */
+  deliver(peerId, frame, peerPubkey) {
     if (!this.sink || peerId === this.ownId) return;
-    this.sink(peerId, frame);
+    this.sink(peerId, frame, peerPubkey);
   }
 
+  // Keyed on the link's own peer id: a link is only ever pooled under the identity it
+  // authenticated as (`promote`), so leaving the pool is one map hit and not a walk of
+  // every peer. A link that never authenticated carries "" and finds nothing, which is
+  // the same answer the walk gave.
   remove(link) {
-    for (const [pid, pool] of this.links) {
-      const i = pool.indexOf(link);
-      if (i < 0) continue;
-      pool.splice(i, 1);
-      if (pool.length === 0) { this.links.delete(pid); this.rr.delete(pid); this.onPeerDown(pid); }
-      return true;
-    }
-    return false;
+    const pid = link.peerId;
+    const pool = this.links.get(pid);
+    if (!pool) return false;
+    const i = pool.indexOf(link);
+    if (i < 0) return false;
+    pool.splice(i, 1);
+    if (pool.length === 0) { this.links.delete(pid); this.rr.delete(pid); this.onPeerDown(pid); }
+    return true;
   }
 
   closeAll() {
@@ -150,7 +156,7 @@ class ReqRes {
     return frame;
   }
 
-  onFrame(from, frame) {
+  onFrame(from, frame, fromPubkey) {
     // A response is `[1][corr u32][payload]`, so an empty response is exactly five
     // bytes — the shortest legal frame, and the one a request nobody claims answers
     // with. Six, the request branch's floor, would drop it and make "no app serves
@@ -163,15 +169,17 @@ class ReqRes {
       // res = [1][corr u32][payload]
       const p = this.pending.get(corr);
       if (!p || p.to !== from) return; // response bound to the peer it went to
-      this.finish(corr, true, frame.slice(5));
+      // finish copies into the answer synchronously; an intermediate payload copy adds
+      // no ownership boundary. netLinkDeliver below likewise assembles its own buffer.
+      this.finish(corr, true, frame.subarray(5));
       return;
     }
     if ((kind & 1) === 0) {
       if (frame.length < 6) return; // no room for the protocol-id length byte
       const idLen = frame[5];
       if (frame.length < 6 + idLen) return;
-      const proto = frame.slice(6, 6 + idLen);
-      const payload = frame.slice(6 + idLen);
+      const proto = frame.subarray(6, 6 + idLen);
+      const payload = frame.subarray(6 + idLen);
       // One request out to the host's claim routing, answered in the continuation — the
       // mirror image of `request` above. FIRED, never awaited: the answer is another turn
       // of this realm, so the event that decoded this frame must return first. Nothing is
@@ -181,8 +189,10 @@ class ReqRes {
       // request needs no bookkeeping to be dropped by `respond`.
       //
       // This program is the link occupant, so it is the one that attributes: it saw the
-      // plaintext, and `from` is who the record layer proved wrote it.
-      netLinkDeliver(proto, fromHex(from), payload).then(
+      // plaintext, and `from` is who the record layer proved wrote it — `fromPubkey` is
+      // that same proof in bytes, handed down from the link rather than decoded from the
+      // hex, which is per-request work on identity neither end ever re-derives.
+      netLinkDeliver(proto, fromPubkey, payload).then(
         (answer) => this.respond(corr, noReply, from, answer),
         // Only the seam itself can reject — a refused claim and a handler that threw
         // both answer empty. A realm on its way down owes no response.

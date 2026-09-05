@@ -7,8 +7,9 @@ const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
-// A link message arrives in arbitrarily small slices. Merge slices below MERGE_BELOW
-// into a doubling buffer, so a dribbled frame costs linear copies, not quadratic.
+// A link message arrives in arbitrarily small slices. Borrow the first small slice;
+// only a second one needs a merging buffer. Grow it by doubling, so a dribbled frame
+// costs linear copies while a complete small frame needs no accumulator allocation.
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {
@@ -17,6 +18,7 @@ class ByteParts {
     this.head = 0;     // index of the first live slice
     this.length = 0;   // live bytes across all slices
     this.tail = -1;    // index of the growable accumulator in `parts`, or -1 for none
+    this.tailOwned = false; // borrowed slices may have spare capacity we must not write
   }
   push(chunk) {
     if (chunk.length === 0) return;
@@ -25,24 +27,24 @@ class ByteParts {
     // accumulator: no copy on the path that matters.
     if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
     if (this.tail < 0) {
-      const buf = new Uint8Array(MERGE_BELOW);
-      buf.set(chunk, 0);
       this.tail = this.parts.length;
-      this.parts.push(buf.subarray(0, chunk.length));
+      this.tailOwned = false;
+      this.parts.push(chunk);
       return;
     }
     const cur = this.parts[this.tail];
-    if (chunk.length <= cur.buffer.byteLength - cur.byteOffset - cur.length) {
+    if (this.tailOwned && chunk.length <= cur.buffer.byteLength - cur.byteOffset - cur.length) {
       const grown = new Uint8Array(cur.buffer, cur.byteOffset, cur.length + chunk.length);
       grown.set(chunk, cur.length);
       this.parts[this.tail] = grown;
       return;
     }
     const want = cur.length + chunk.length;
-    const buf = new Uint8Array(want * 2); // doubling is what makes the copying amortized
+    const buf = new Uint8Array(Math.max(MERGE_BELOW, want * 2));
     buf.set(cur, 0);
     buf.set(chunk, cur.length);
     this.parts[this.tail] = buf.subarray(0, want);
+    this.tailOwned = true;
   }
   /** Copy up to `n` bytes from the front without consuming them. */
   peek(n) {
