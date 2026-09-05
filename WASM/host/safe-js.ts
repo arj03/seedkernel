@@ -288,16 +288,18 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       causalClock,
     };
     if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
-    // Inspect the borrowed view first, reserve both count and bytes, and only then copy.
-    // `getArrayBuffer` owns a lifetime but not another payload-sized allocation.
+    // `getArrayBuffer` reads as a borrow but is not one: QTS_GetArrayBuffer mallocs a
+    // payload-sized copy (libc, so outside setMemoryLimit) that the lifetime frees, and
+    // `.slice()` must still copy again — the view dies with the lifetime and detaches on
+    // heap growth. So admission refuses an over-budget call AFTER that copy, not before.
     const [payload, activeCall] = (() => {
-      const borrowed = ctx.getArrayBuffer(payloadHandle);
+      const heapCopy = ctx.getArrayBuffer(payloadHandle);
       try {
-        const call = activeHostCalls.admit(callId, borrowed.value.byteLength);
-        try { return [borrowed.value.slice(), call] as const; }
+        const call = activeHostCalls.admit(callId, heapCopy.value.byteLength);
+        try { return [heapCopy.value.slice(), call] as const; }
         catch (err) { call.release(); throw err; }
       } finally {
-        borrowed.dispose();
+        heapCopy.dispose();
       }
     })();
     let answer: Promise<Uint8Array> | Uint8Array;
