@@ -118,6 +118,8 @@ class ReqRes {
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
    *  returned (null for a noReply send, which carries corr 0 and nothing waits on).
+   *  `proto` and `payload` are BORROWED views of the calling app's argument bytes: `buildReq`
+   *  is their only reader and must stay the first thing this does, ahead of any await.
    *
    *  The kernel owns the caller's TIME and no field here can name it. What this arms is the
    *  transport's own retention bound on the correlation it just opened — the same kind of

@@ -531,20 +531,20 @@ entry("timer", (r) => fireTimer(r.u32()));
  *  realm. Its deadline is kernel handoff state, not a field in this content protocol. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
-  // `blob` is a VIEW of the caller's argument bytes; `.slice()` below is the first copy.
+  // VIEWS of the caller's argument bytes, and they stay views: `buildReq` gathers both
+  // into the frame synchronously, before this handler returns. A defensive copy here
+  // would buy no ownership boundary and walk the payload a second time.
   const to = r.blob();
-  const protoIn = r.blob();
-  const payloadIn = r.blob();
+  const proto = r.blob();
+  const payload = r.blob();
   // Measured BEFORE anything is copied: a co-resident app naming a 50 MiB payload would
   // take this realm down before the frame it was refused for existed. A caller error, so
   // it is LOUD — the silent drop in Link.send is for a frame we chose to build.
   if (to.length !== PK_LEN) throw new Error("transport: send needs a 32-byte peer id");
-  if (protoIn.length > 0xff) throw new Error("transport: protocol id too long");
-  if (REQ_HEAD_LEN + protoIn.length + payloadIn.length > maxFrameBytes - TAG_LEN) {
+  if (proto.length > 0xff) throw new Error("transport: protocol id too long");
+  if (REQ_HEAD_LEN + proto.length + payload.length > maxFrameBytes - TAG_LEN) {
     throw new Error("transport: send over the frame cap");
   }
-  const proto = protoIn.slice();
-  const payload = payloadIn.slice();
   if (noReply) {
     reqres.request(null, toHex(to), proto, payload, true);
     return Uint8Array.from([1]);
