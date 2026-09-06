@@ -204,7 +204,7 @@ The manifest verifier ships with the host; the channel implementation ships in t
 
 Channel AUTH remains Ed25519: hybrid key establishment protects recorded ciphertext under the assumptions in [SECURITY §14.2](docs/SECURITY.md), but does not provide post-quantum peer authentication. Long-lived application signatures need their own protection.
 
-## Get started
+## Build this repo
 
 ```sh
 cd WASM
@@ -213,9 +213,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. [CLIENT](docs/CLIENT.md) is where a new app starts: a runnable first bundle, then dependency setup, authoring for release, node boot, platform adapters, loading and invocation, with seed store and seedchat as the worked examples. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seed store also points at — and its kernel seam carries only opaque encoded strings, never JavaScript message objects.
-
-`npm run build:pq` rebuilds the two PQ modules from the pinned `pq/mldsa-native` and `pq/mlkem-native` submodules; it needs `git submodule update --init` and a clang with the wasm32 target.
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seed store also points at — and its kernel seam carries only opaque encoded strings, never JavaScript message objects.
 
 ## The rest of the spec
 

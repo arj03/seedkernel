@@ -47,7 +47,7 @@ cd ../../your-client
 npm install
 ```
 
-The browser artifacts require the additional `npm run build:browser` build described in the [main README](../README.md#get-started).
+The browser artifacts require the additional `npm run build:browser` build described in the [main README](../README.md#build-this-repo).
 
 ## 1. Build and run a bundle
 
