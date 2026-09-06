@@ -1,10 +1,28 @@
-# Writing a client on Seedkernel
+# Writing bundles and clients on Seedkernel
 
-This repo is the **runtime**. Every app lives outside it and reaches the runtime only through the entry points in [`WASM/package.json`](../WASM/package.json) `exports`; a bare `seedkernel-wasm` or `seedkernel-wasm/*` specifier is the only supported way in. Two clients exist today and are the worked examples: **[seed store](https://github.com/arj03/seedstore)**, a P2P storage node with a Node CLI, a browser page and an offline bundle build, and **[seedchat](https://github.com/arj03/seedchat)**, a browser chat shell with consent-gated app installation.
+An app starts with a plain JavaScript function, `handle(bytes)`, running in a confined guest. WASM modules are optional: add them for computation the guest should delegate. A build script signs the guest and its modules into a bundle; a host program loads that bundle and connects it to a CLI, browser UI, or peers.
 
-This is a task-oriented guide to the client-facing surface, not a symbol-by-symbol reference. The export map is the API boundary, and the generated `.d.ts` file behind each entry point is the exhaustive contract. The tables below name the calls a normal client is expected to use.
+| You write | Seedkernel supplies |
+| --- | --- |
+| Guest logic, payload formats, validation, and application authorization | A confined JS realm, caller attribution, serialized invocation, and execution limits |
+| A manifest naming the app's modules, claims, and required services | Hashing, hybrid signing, bundle verification, policy enforcement, and atomic installation |
+| Optional WASM transforms with the scratch-buffer ABI | Private module loading, bounded execution, and byte transfer through `host.call` |
+| Host integration: UI or CLI, trusted authors, persistence, and peer configuration | Node/browser adapters and the shared shell; the shipped transport handles authenticated encrypted links |
 
-A client has two flows. Offline, it **authors** the signed bundle that carries its app. At runtime, it selects its **platform adapters while booting** a node, then loads and invokes the bundle. The sections follow that order.
+The work Seedkernel saves is runtime and transport plumbing. Your application still owns its data model, access rules, recovery, and user experience. The main constraints are explicit byte interfaces, declared service access, and a guest environment without Node or browser APIs.
+
+Start with [package setup](#use-the-package-from-a-sibling-checkout), then [build and run the first bundle](#1-build-and-run-a-bundle). The later sections cover node boot, platform adapters, networking, and browser staging. Apps use only the `seedkernel-wasm` and `seedkernel-wasm/*` entry points exported by [`WASM/package.json`](../WASM/package.json); their generated `.d.ts` files are the API reference.
+
+## How much code?
+
+These examples show different amounts of application work. The figures are ballpark, from a snapshot of the named sources rather than whole repositories, and nothing in this repo maintains them:
+
+| Example | Guest JS | WASM source | Additional app code |
+| --- | --- | --- | --- |
+| [seedchat](https://github.com/arj03/seedchat), text chat | a couple of dozen lines of app logic emitted by [`chatGuestSource`](https://github.com/arj03/seedchat/blob/main/browser/chat-app.js), plus a similar amount of shared framing from `guestOpFraming()` | about thirty AssemblyScript lines in the [v1 text handler](https://github.com/arj03/seedchat/blob/main/assembly/chat-app-v1/index.ts) | Browser shell, HTML UI, installation consent, contacts, signaling, and build scripts |
+| [seedstore](https://github.com/arj03/seedstore), storage | on the order of a thousand lines in [`tier2-guest.orchestration.js`](https://github.com/arj03/seedstore/blob/main/WASM/host/tier2-guest.orchestration.js), plus shared helpers assembled by [`build-guest.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/scripts/build-guest.mjs) | Separate codec and reputation modules | Storage policy, CLI/browser integration, configuration, and build scripts |
+
+Chat's guest mostly dispatches sends to the transport and incoming messages to its private renderer. Seedstore implements placement, repair, and storage coordination, so its guest is larger by more than an order of magnitude. Neither app implements the channel handshake or bundle verifier.
 
 ## Use the package from a sibling checkout
 
@@ -31,35 +49,80 @@ npm install
 
 The browser artifacts require the additional `npm run build:browser` build described in the [main README](../README.md#get-started).
 
-## 1. Authoring — build and sign the bundle format (§12.4)
+## 1. Build and run a bundle
 
-`authorBundle` (hash, assemble, validate, sign, pack — the blob, the manifest and the derived author id all come back on the value) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side, and the only two an app should make. `authorBundle` runs the same checks the verifier refuses, so an unverifiable bundle cannot be shipped, and the author id it returns is the id every consumer of your app pins. No runtime shell signs anything; a shell only verifies.
+Save this as `counter.mjs` in your client directory and run `node counter.mjs` after package setup. It builds a signed bundle, boots a local shell, installs the bundle, and invokes it twice, printing `1` and `2`. The guest is seven lines; the rest is authoring and host setup. The app itself needs no WASM build or network configuration.
 
-A minimal authoring function looks like this. `authorSeed` is a persisted 32-byte secret; do not generate a new one for each release, because it determines the author id consumers pin. `version` must increase monotonically for each `(author, app)` pair.
+The source inside `guestSource` runs in the sandbox. The imports, signing, and shell calls run in Node outside it.
 
 ```js
-import { writeFile } from "node:fs/promises";
-import { loadCrypto } from "seedkernel-wasm";
+import { loadCrypto, generateKeyPair } from "seedkernel-wasm";
 import { authorBundle, hybridAuthorKeysFromSeed } from "seedkernel-wasm/bundle-author";
+import { authorAllowlist, bootShell } from "seedkernel-wasm/shell-core";
 
-export async function buildBundle({ authorSeed, version, wasm, guestSource }) {
-  const sodium = await loadCrypto();
-  const keys = hybridAuthorKeysFromSeed(sodium, authorSeed);
-  const authored = authorBundle(sodium, keys, {
-    app: "example",
-    version,
-    protocols: ["example/v1"],
-    modules: [{ name: "codec", wasm }],
-    guestSource,
-    // What this bundle calls on the HOST — services only. What it calls on a co-resident
-    // guest is `guestCalls`, a separate list carrying no privilege.
-    guestRequires: [],
-  });
+const guestSource = `
+let count = 0;
+function handle(input) {
+  if (input.length !== 32) throw new Error("counter takes no payload");
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, count = (count + 1) >>> 0);
+  return out;
+}
+`;
 
-  await writeFile("example.skb", authored.blob);
-  return authored; // { blob, manifest, author }
+const sodium = await loadCrypto();
+const keys = hybridAuthorKeysFromSeed(sodium, sodium.randombytes_buf(32));
+const { blob, author } = authorBundle(sodium, keys, {
+  app: "counter",
+  version: 1,
+  modules: [],
+  guestSource,
+  guestRequires: [],
+});
+
+const { shell } = await bootShell({
+  sodium,
+  identity: generateKeyPair(),
+  admit: authorAllowlist([Buffer.from(author).toString("hex")]),
+});
+try {
+  const app = await shell.loadBundleBlob(blob);
+  for (let i = 0; i < 2; i++) {
+    const answer = await app.invoke(new Uint8Array());
+    console.log(new DataView(answer.buffer, answer.byteOffset, answer.byteLength).getUint32(0));
+  }
+} finally {
+  shell.close();
 }
 ```
+
+Each guest invocation receives `[caller 32 bytes][payload]`. `app.invoke` supplies the host's all-zero caller id, so an empty payload reaches this handler as 32 bytes. A peer call carries its authenticated key; a local guest call carries the calling app's id. Return only response bytes. An `async function handle` may await `host.call(name, bytes)`, which returns a promise even for a private WASM transform.
+
+This counter wraps at 2³² and keeps its state only in the guest heap. Reloading the bundle resets it. It declares no protocol or service claims, so only the host's returned `AppHandle` can invoke it. The demo deliberately creates fresh author and node keys on each run and uses in-memory storage and freshness tracking.
+
+### Turn the demo into a release
+
+Keep a private 32-byte author seed across releases and pass it to `hybridAuthorKeysFromSeed`; it determines the author id consumers pin. Increase `version` for each release of the same `(author, app)`. Run `authorBundle` in your offline build and save its `blob` as a `.skb` file, for example `await writeFile("example.skb", blob)` using `node:fs/promises`. The deployed host needs the bundle and the approved author id; it does not need the author seed. Keep a stable node identity and persistent freshness storage when running a lasting node (see §2).
+
+`authorBundle` hashes the guest and modules, validates the manifest, signs, and packs the result. `shell.loadBundleBlob` verifies the bytes, applies admission policy, and builds the running slot. Signing does not prove that your guest compiles or that its WASM meets the runtime ABI: exercise a load and invocation before publishing. Use `verifyBundle` when inspecting a blob outside a running shell.
+
+### Add only the interfaces your app needs
+
+| Need | Bundle declaration and guest code |
+| --- | --- |
+| A private WASM transform | Add `{ name: "codec", wasm }` to `modules`; call `await host.call("codec", bytes)`. The module exports `memory`, `scratch`, and `handle`, declares a memory maximum, and imports no capabilities ([ABI §4](PROTOCOL.md#4-the-wasm-module-abi)). |
+| Receive peer requests | Add a claim such as `protocols: ["counter/v1"]`. A networked host routes requests for that protocol to `handle`; your guest validates the payload and decides what the caller may do. |
+| Provide a local service | Add `services: ["counter-local"]`. The host calls it through `shell.call`; another guest also declares it in its own `guestCalls`. |
+| Send through the shipped transport | Add `guestCalls: ["_net"]`, then call `host.call("_net", encodedRequest)` using the transport's message format. The host must have configured and admitted the transport (§2). |
+| Use app-scoped storage | Add `guestRequires: ["fs"]`, then use the `fs/*` byte formats in [RUNTIME §12.2](RUNTIME.md). Durable storage requires a persistent host backend. |
+
+`guestRequires` names host **services**, such as `fs`, rather than methods such as `fs/get`. `guestCalls` names co-resident services; `protocols` and `services` declare who may call *you*. Private modules need no entry in either call list.
+
+Guests are plain scripts with ECMAScript intrinsics and four supplied globals: `host`, `HOST` (the host-call budget this load admits — `maxOutstandingHostCalls` and `maxOutstandingHostCallBytes`, advertised so a guest can window its own fan-out instead of being refused), `APP` (signed config), and `LOCAL` (installation config). They have no `fetch`, DOM, Node APIs, or runtime package imports. Bundle compatible dependencies into flat guest source; keep UI and platform code in the host client. For a multi-operation byte API, `guestOpFraming()` supplies the same `callerOf`/`readOp`/`writeOp` helpers used by host callers, so you need not write two codecs.
+
+Execution is serialized per realm and bounded. Long work must fit the deployment's budgets, and small WASM calls on JS targets pay a worker hop ([measured overhead](../README.md#the-overhead-measured)). Module memory can be discarded after a deadline failure; guest state is discarded on replacement. Persist data and design recovery around those lifetimes.
+
+### Authoring API reference
 
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
@@ -124,7 +187,7 @@ A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node
 | `./quickjs` | Nothing you call. It is the QuickJS engine `safe-js` names by bare specifier, so a **browser** client must carry it in its import map even though its own code never mentions it | the import map in [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html) |
 | `./fs`, `./fs-memory`, `./fs-node` | The `Fs` interface and safe-key checks, plus the two backends: in-memory (`bootShell`'s default) or a directory on disk | [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts), [seedstore `bench-holder.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/bench-holder.mjs) |
 | `./net-node` | `NodeChannelFactory` — TCP over `node:net`, and nothing else | [seedstore `net.test.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/net.test.mjs) |
-| `./peer-addr` | The `pk[.secret]@dest` grammar — `parsePeerRef`, `peersConfig`, `parseDest`, `parseHostPort`, `isHex64` — with no socket adapter under it. The one place a client takes the parser from, whether or not it opens a socket. `parsePeerRef(spec, "ws")` yields `{ peerId, contactSecret, dest }`, which a client hands to an `addr` call through `shell.call(...)` or, at boot, to `peersConfig(specs)` for the load's `transport.config.peers`. It takes `pk[.secret]@[wss://]host:port[/path]`, so a scheme asks for TLS and a path reaches a peer behind a reverse proxy; `parseDest` is the other half, the one a `ChannelFactory` uses to decide what it can route | the in-repo caller is [`cli.ts`](../WASM/host/cli.ts) |
+| `./peer-addr` | The `pk[.secret]@dest` grammar — `parsePeerRef`, `peersConfig`, `parseDest`, `parseHostPort` — with no socket adapter under it. The one place a client takes the parser from, whether or not it opens a socket. `parsePeerRef(spec, "ws")` yields `{ peerId, contactSecret, dest }`, which a client hands to an `addr` call through `shell.call(...)` or, at boot, to `peersConfig(specs)` for the load's `transport.config.peers`. It takes `pk[.secret]@[wss://]host:port[/path]`, so a scheme asks for TLS and a path reaches a peer behind a reverse proxy; `parseDest` is the other half, the one a `ChannelFactory` uses to decide what it can route | the in-repo caller is [`cli.ts`](../WASM/host/cli.ts) |
 | `./net-ws` | `WsNetwork` — a `ChannelFactory` that dials the `ws://`/`wss://` destinations `link/open` names, at a peer's `--ws-listen` port. No relay or STUN. Which peers, and how many links each, is the transport bundle's signed policy over its own address book, not this file's | [seedstore `p2p-cli.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/scripts/p2p-cli.mjs), [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html) |
 | `./net-rtc` | `RtcNetwork` — an accept-only `ChannelFactory` over WebRTC and an application-supplied opaque-string `Signaling` seam. Browser natively; Node/Bun by also supplying `peerConnectionFactory` | [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html), [seedchat `media-rtc.js`](https://github.com/arj03/seedchat/blob/main/browser/media-rtc.js) (subclassed for audio/video) |
 
