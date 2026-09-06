@@ -17,7 +17,7 @@ await _sodium.ready;
 const sodium = _sodium;
 
 const { ModuleTable } = await imp("build/host/module-table.js");
-const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+const { readModuleLimits, checkModuleLimits, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
   DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS, DEFAULT_GUEST_DEADLINE_MS,
   SELF_INITIATED_CLOCK_DIVISOR,
@@ -61,25 +61,44 @@ const rejects = async (p, msg) => { let threw = false; try { await p; } catch { 
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
-/** A module header plus a memory section declaring `initial`/`max` pages, and nothing else.
- *  Enough for the bounds read, which walks section headers and deliberately does not
- *  validate (core/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
-const memModule = (initialPages, maxPages) => {
-  const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; };
-  const body = [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]; // one memory, flags=1 (a maximum is declared)
-  return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 5, body.length, ...body]);
-};
+const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; };
+const section = (id, body) => [id, ...leb(body.length), ...body];
+/** A module header plus whichever sections the bounds read looks at, and nothing else.
+ *  Enough for that read, which walks section headers and deliberately does not validate
+ *  (core/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
+const rawModule = (...sections) => new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sections.flat()]);
+const memSection = (initialPages, maxPages) => section(5, [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]); // one memory, flags=1 (a maximum is declared)
+/** One funcref table of `initial` elements; `max` null declares no maximum. */
+const tableSection = (initial, max) => section(4, [0x01, 0x70,
+  ...(max === null ? [0x00, ...leb(initial)] : [0x01, ...leb(initial), ...leb(max)])]);
+/** A module importing a table (`e.t`) rather than declaring one. */
+const importedTableModule = () => rawModule(section(2, [0x01, 0x01, 0x65, 0x01, 0x74, 0x01, 0x70, 0x00, ...leb(1)]));
+const memModule = (initialPages, maxPages) => rawModule(memSection(initialPages, maxPages));
 
-console.log("\n§4.3 — declared memory is bounded before instantiation");
+console.log("\n§4.3 — declared memory and tables are bounded before instantiation");
 {
-  const a = readMemoryLimits(withMax);
-  const b = readMemoryLimits(noMax);
-  ok(a.maxPages === 256, `built module declares a 256-page maximum (got ${a.maxPages})`);
-  ok(b.maxPages === null, "the no-maximum build declares none");
-  ok(checkModuleMemory(withMax, 64 * 1024 * 1024) !== null, "a bounded module passes the budget");
-  throws(() => checkModuleMemory(noMax, 64 * 1024 * 1024), "a module with no declared maximum is refused");
-  throws(() => checkModuleMemory(withMax, 1024 * 1024), "a module above the host budget is refused");
-  throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
+  const a = readModuleLimits(withMax);
+  const b = readModuleLimits(noMax);
+  ok(a.memory.maxPages === 256, `built module declares a 256-page maximum (got ${a.memory.maxPages})`);
+  ok(b.memory.maxPages === null, "the no-maximum build declares none");
+  ok(checkModuleLimits(withMax, 64 * 1024 * 1024).memory !== null, "a bounded module passes the budget");
+  throws(() => checkModuleLimits(noMax, 64 * 1024 * 1024), "a module with no declared maximum is refused");
+  throws(() => checkModuleLimits(withMax, 1024 * 1024), "a module above the host budget is refused");
+  throws(() => checkModuleLimits(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
+
+  // A table is the other allocation a declaration alone buys: the engine reserves every
+  // element at instantiation (~28 bytes each on V8), so it meets the same budget as pages.
+  ok(a.maxTableElements === 0, "the built module declares no table");
+  ok(checkModuleLimits(rawModule(memSection(1, 1), tableSection(16, 16)), 64 * 1024 * 1024).maxTableElements === 16,
+    "a module with a small bounded table passes the budget");
+  throws(() => checkModuleLimits(rawModule(memSection(1, 1), tableSection(1, null)), 64 * 1024 * 1024),
+    "a table with no declared maximum is refused, as an unbounded memory is");
+  throws(() => checkModuleLimits(rawModule(memSection(1, 1), tableSection(10_000_000, 10_000_000)), 64 * 1024 * 1024),
+    "a table above the host budget is refused though the module's memory fits");
+  throws(() => checkModuleLimits(rawModule(tableSection(10_000_000, 10_000_000)), 64 * 1024 * 1024),
+    "a module declaring no memory is still charged for its tables");
+  throws(() => checkModuleLimits(importedTableModule(), 64 * 1024 * 1024),
+    "an imported table is refused like an imported memory (§4.2)");
 
   // The ceiling is applied ONCE, by the shared load path, against the tighter of the shared
   // default and the ceiling the target's loader declares (bundle.ts `loadBundleModules`) —
@@ -110,6 +129,14 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
       mod: { name: `m${i}` }, wasm: memModule(0, 0),
     })),
   }), "a bundle cannot evade memory accounting with unbounded zero-memory modules");
+  // Table elements join that aggregate at their own charge: 1.5M elements is 48 MiB, so one
+  // such module lands and two do not.
+  const tabled = rawModule(memSection(1, 1), tableSection(1, 1_500_000));
+  ok(await loadBundleModules(stub(undefined), bundleOf(tabled)) !== null,
+    "a module whose table fits the budget loads");
+  await rejects(loadBundleModules(stub(undefined), {
+    modules: [{ mod: { name: "a" }, wasm: tabled }, { mod: { name: "b" }, wasm: tabled }],
+  }), "declared tables are bounded in aggregate across one bundle");
 
   const host = new ModuleTable();
   const loaded = await host.build([{ name: "ok", wasm: withMax }]);

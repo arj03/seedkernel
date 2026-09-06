@@ -12,9 +12,9 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 // ─── module routing ─────────────────────────────────────────────────────
 
 export interface ModuleTableOptions {
-  /** Ceiling on each module and on the bundle's aggregate declared maximum memory.
-   *  A module above it — or one declaring no maximum at all — is refused at load
-   *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
+  /** Ceiling on each module and on the bundle's aggregate declared maximum memory and
+   *  tables. A module above it — or one declaring no maximum at all, for either — is
+   *  refused at load (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
    *  this table to something tighter than a bundle may land.
    *
    *  The table DECLARES it (`PureModuleLoader.maxModuleMemoryBytes`) and `loadBundleModules`
@@ -255,7 +255,8 @@ export class ModuleTable implements PureModuleLoader {
 
   /** Stand up a module's worker. The §4.3 memory ceiling was applied before this by the
    *  load path, off the bytes and before any worker exists (instantiation allocates the
-   *  declared initial memory); the §4 export checks run in the worker on the same load and
+   *  declared initial memory and reserves the declared tables); the §4 export checks run in
+   *  the worker on the same load and
    *  report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
     if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");

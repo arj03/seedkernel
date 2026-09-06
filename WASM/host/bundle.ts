@@ -2,7 +2,7 @@
 // Every name is derived; the manifest commits to every file hash.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, PRIVILEGES, HOST_SERVICES, isService, type Privilege, type ServiceName, } from "../core/domains.js";
-import { checkModuleMemory, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES, WASM_PAGE_BYTES } from "../core/wasm-limits.js";
+import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
   /** Logical name: the file `<name>.wasm` and the key the guest addresses it by through
@@ -132,8 +132,9 @@ export interface PureModules {
  *  over an opaque Go-owned slot. */
 export interface PureModuleLoader {
   build(mods: { name: string; wasm: Uint8Array }[]): PureModules | Promise<PureModules>;
-  /** Optional ceiling on each module and on their aggregate declared linear memory this
-     *  target holds its isolates to (§4.3), in bytes. Absent ⇒ `DEFAULT_MAX_MODULE_MEMORY_BYTES`.
+  /** Optional ceiling on each module and on their aggregate declared footprint — linear
+     *  memory and tables — this target holds its isolates to (§4.3), in bytes.
+     *  Absent ⇒ `DEFAULT_MAX_MODULE_MEMORY_BYTES`.
      *
      *  Declared here rather than applied: `loadBundleModules` takes the tighter of this and
      *  the shared ceiling, so "a target may hold itself to less, none may be looser" is a
@@ -673,23 +674,20 @@ export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundl
   if (v.modules.length > DEFAULT_MAX_BUNDLE_MODULES) {
     throw new Error(`bundle: ${v.modules.length} modules exceeds the limit of ${DEFAULT_MAX_BUNDLE_MODULES}`);
   }
-  // The §4.3 per-module and aggregate bound, read off the bytes *before* instantiation —
-  // instantiation is what allocates the declared initial memory, so a host-side check could
-  // only run after the damage. Every module is checked before any is handed down.
+  // The §4.3 per-module and aggregate bound — memory and tables both — read off the bytes
+  // *before* instantiation, which is what allocates the declared initial memory and reserves
+  // the declared tables, so a host-side check could only run after the damage. Every module
+  // is checked before any is handed down.
   //
   // The number is the tighter of what a bundle may land and what this loader holds its own
   // isolates to (`PureModuleLoader.maxModuleMemoryBytes`), composed here because this is
   // the only call site: no second place for the rule to be got wrong.
   const maxBytes = Math.min(DEFAULT_MAX_MODULE_MEMORY_BYTES, host.maxModuleMemoryBytes ?? Infinity);
-  const maxPages = Math.floor(maxBytes / WASM_PAGE_BYTES);
-  let bundlePages = 0;
+  let bundleBytes = 0;
   for (const { wasm } of v.modules) {
-    const limits = checkModuleMemory(wasm, maxBytes);
-    if (!limits)
-      continue;
-    bundlePages += limits.maxPages!;
-    if (bundlePages > maxPages) {
-      throw new Error(`bundle: modules declare ${bundlePages} aggregate memory pages, above the host budget of ${maxPages}`);
+    bundleBytes += moduleFootprintBytes(checkModuleLimits(wasm, maxBytes));
+    if (bundleBytes > maxBytes) {
+      throw new Error(`bundle: modules declare ${bundleBytes} aggregate bytes of memory and tables, above the host budget of ${maxBytes}`);
     }
   }
   // One transactional call: every module stands or none does, and the target owns that
