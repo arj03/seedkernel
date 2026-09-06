@@ -18,15 +18,14 @@
 
 A minimal runtime: a **host** admits signed **bundles**, and every bundle is an app with exactly one shape — a confined JS **guest** (the app's logic) plus, optionally, any number of restartable WASM **modules** that serve as the app's library. The guest is the only thing an inbound frame reaches: the host resolves the protocol to an app, invokes the guest's one `handle` entrypoint, and the guest drives its own modules by name when it needs a transform.
 
-The model has five parts:
+The model has two parts, a host and the bundles it admits:
 
 | Component | Role |
 | --- | --- |
-| **Bundles** | The unit of installation (§12.4): a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. The transport uses this same format. |
-| **Guests** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
-| **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no capability imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
 | **Host** | The runtime outside installed bundles: shared JS plus platform adapters (§12.9). It admits bundles, confines execution, routes calls, and owns sockets, storage, entropy, the clock, and the node identity key. |
-| **Raw I/O** | Host-provided capabilities (§12.1): `link` sends and receives bytes over opaque link ids; `fs` gets, puts, sizes, lists, deletes, and stats bytes under opaque flat keys. The host enforces flood limits where it holds the descriptors. Peer identity is supplied by the transport. |
+| **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. The transport uses this same format. |
+| ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
+| ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no capability imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
 
 The operator chooses which authors may install code and which capabilities they may receive; the host enforces those grants at admission and at the guest seam. Application-level authorization and behaviour live in the bundles.
 
@@ -41,7 +40,7 @@ Three terms describe different responsibilities:
 | Term | Meaning here |
 | --- | --- |
 | **Host** | The full runtime that admits and runs bundles, including its shared implementation and platform adapters. Changing host code requires a rebuild. |
-| **Core** | The host facilities an app cannot supply for itself: raw sockets and storage, their flood limits, entropy, a clock, and access to the private node key. |
+| **Core** | The host facilities an app cannot supply for itself (§12.1): `link` sends and receives bytes over opaque link ids, and `fs` gets, puts, sizes, lists, deletes, and stats bytes under opaque flat keys — plus their flood limits, entropy, a clock, and access to the private node key. The host enforces the flood limits where it holds the descriptors, and peer identity is supplied by the transport. |
 | **Trust root** | The basis for admitting code: the host's manifest verifier and the operator's policy of trusted authors, capability grants, and version floors. The verifier must ship with the host to check the first bundle; policy is operator-controlled configuration. |
 
 The guest seam, execution limits, boot assembly and claim routing are host code without being core: an app could implement each for itself, but each is what would have to admit or confine its own replacement. The trusted base is wider still, since it also includes the execution engines and the platform adapters.
