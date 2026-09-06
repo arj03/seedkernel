@@ -104,18 +104,23 @@ tidying up error paths.
 
 The cost is that a refused connection occupies a socket until its deadline instead of being
 dropped on sight, which promotes the half-open budgets from defence in depth to the thing
-standing between a stranger and the node. Three measures bound this exposure:
+standing between a stranger and the node. Four measures bound this exposure:
 
 - **No asymmetric cryptography before proof.** The accepting side verifies the contact-secret
   proof before generating ephemeral keys or invoking the KEM.
+- **A proved msg1 is spent** (§9), so a recording cannot buy that work, or an answer, more
+  than once.
 - **Separate budgets for proven and unproven callers**, so a flood without the contact
   secret cannot crowd out those that have it.
-- **Evict the oldest rather than refuse the newest.** Refusing arrivals at a full budget
+- **Evict rather than refuse the newest.** Refusing arrivals at a full budget
   would let a flood block peers before they could send their proof. The oldest unverified connection is overwhelmingly
   likely to be a stranger making no progress, while a legitimate caller occupies that budget
   for one round trip — so an attacker must cycle the whole budget faster than a round trip
   rather than merely fill it once. The same argument applies one tier up, which is why the
-  verified budget evicts too.
+  verified budget evicts too. Past the door the question changes: every authenticated link
+  has proved the same thing, so that budget evicts the link that has been quiet longest
+  rather than the one admitted longest. Order of arrival there would say only who has been
+  useful longest.
 
 Constants and measured numbers: [RUNTIME](RUNTIME.md) §12.6.2 and
 `tests/transport-load.test.mjs`.
@@ -315,10 +320,13 @@ uses the same node address format and round-trip count described above.
 maps it once. Concealment defeats probing and flow attribution, not an observer who already
 knows where to look.
 
-**A recorded msg1 can be replayed.** Anyone who captures a valid msg1 can replay it and draw
-a msg2. They cannot open it — no ephemeral private key — so they learn only that something
-answered. Inherent to any design whose first message is not challenge-bound; Noise has it
-too.
+**A recorded msg1 can be replayed once.** Anyone who captures a valid msg1 can replay it and
+draw a msg2. They cannot open it — no ephemeral private key — so they learn only that
+something answered. A responder remembers the initiator's ephemeral key and stalls every
+later copy before promotion or asymmetric work, so the recording is worth one answer rather
+than one per copy sent. That memory is bounded and per-realm: a restart, or 4,096 further
+proved handshakes, makes an old recording good for one more. Closing it outright needs the
+first message to be challenge-bound, which costs a round trip; Noise has the same property.
 
 **The protocol is fingerprintable.** A cleartext `0x03` at offset 0 says "seedkernel". That
 identifies the protocol, not the peer, and hiding it would cost the self-describing format
@@ -344,10 +352,12 @@ that node. Only §3's deferral limits the *retroactive* damage.
 10. A graceful close asks the transport to flush. *(§12.6.1)*
 11. An unproven connection costs zero asymmetric operations.
 12. A member authenticates under a sustained flood, credentialled or not.
-13. The channel Ed25519 key is never an argument to `crypto_scalarmult`. Worth a grep test
+13. A proved msg1 is spent: a replay draws the same silence a wrong secret draws.
+14. A full authed budget sheds the quietest link, never one carrying traffic.
+15. The channel Ed25519 key is never an argument to `crypto_scalarmult`. Worth a grep test
     in CI — the invariant most likely to be lost to a convenient refactor.
 
-All but 13 are covered by `tests/transport-link.test.mjs` and `tests/transport-load.test.mjs`,
+All but 15 are covered by `tests/transport-link.test.mjs` and `tests/transport-load.test.mjs`,
 which pin them against the shipped transport bundle — through the real host stack, over an
 instrumented in-process channel — rather than against a library object a test could hold.
 

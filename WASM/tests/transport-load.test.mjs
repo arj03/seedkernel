@@ -10,7 +10,7 @@
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
-  ready, linkedPeers,
+  ready, linkedPeers, PROTO,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -235,6 +235,34 @@ await test("the budget bounds links PAST the handshake, not just into it", async
   note(`${AUTHED * 3} members authenticated against a ${AUTHED}-slot authed budget; ${held} link(s) held, ${everSaw} got in`);
   assert(everSaw === AUTHED * 3, `${AUTHED * 3 - everSaw} member(s) refused at the door — the authed tier must evict, not refuse`);
   assert(held <= AUTHED, `${held} authenticated links held against a budget of ${AUTHED}`);
+});
+
+await test("a full authed budget sheds the QUIETEST link, not the oldest", async () => {
+  // Everyone in the authed tier has proved the same thing, so admission order says nothing
+  // about which link is worth keeping. Evicting by it hands anyone who can complete a
+  // handshake a way to walk established peers off the node one fresh connection at a time —
+  // and the peer doing real work is the oldest one precisely because it is working.
+  const AUTHED = 2;
+  const fabric = new LoopbackChannels();
+  const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
+  const busy = keep(await member(fabric, s, "10.13.1.1"));
+  await ready(busy, 4000);
+  const quiet = keep(await member(fabric, s, "10.13.2.1"));
+  await ready(quiet, 4000);
+  // The busy link is also the OLDEST, which is what makes this a test of the policy rather
+  // than of the order two members happened to arrive in.
+  await busy.request(s.peerId, PROTO, Uint8Array.from([1]), 4000);
+
+  const late = keep(await member(fabric, s, "10.13.3.1"));
+  await ready(late, 4000);
+  await sleep(200);
+  const held = await linkedPeers(s);
+  note(`authed budget ${AUTHED}, held ${held.length}: busy=${held.includes(busy.peerId)} ` +
+       `quiet=${held.includes(quiet.peerId)} late=${held.includes(late.peerId)}`);
+  assert(held.includes(late.peerId), "the newcomer must still get in — the tier evicts, it does not refuse");
+  assert(held.includes(busy.peerId),
+    "A LINK CARRYING TRAFFIC WAS EVICTED for a newcomer — eviction must follow activity, not admission order");
+  assert(!held.includes(quiet.peerId), `${held.length} link(s) held against a budget of ${AUTHED}`);
 });
 
 await test("the per-source cap still bites under flood", async () => {

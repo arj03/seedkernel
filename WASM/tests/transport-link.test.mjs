@@ -328,6 +328,38 @@ await test("an exact-size invalid handshake latches before repeated KEM work", a
   assert(!(await aUp(st)) && !(await bUp(st)), "a latched invalid exchange must remain unauthenticated");
 });
 
+await test("a RECORDED msg1 replayed on a fresh connection draws nothing", async (keep) => {
+  // The contact-secret proof inside msg1 is bound to nothing about the connection carrying
+  // it, so anyone who records one can resend it. Honouring the copy would draw an answer
+  // from a node that is otherwise silent to strangers, promote the socket off the contended
+  // budget, and spend a DH and an encapsulation — as often as the recording is sent.
+  let bKem = 0;
+  const chans = wirePair();
+  const st = keep(await linked(chans, {}, {
+    onHostCall: (name) => { if (name === "mlkem") bKem++; },
+  }));
+  await until(async () => await bUp(st), 4000, "the genuine handshake");
+  const msg1 = Uint8Array.from(Buffer.from(chans[0].sent[0], "hex"));
+  assert(msg1.length === 1265, `expected msg1 first on A's wire, got ${msg1.length} bytes`);
+  const spentGenuinely = bKem;
+
+  // The recording, arriving on a connection of its own — an accept like any other.
+  const replay = wirePair({ addrA: "10.0.9.1", addrB: "10.0.9.2" });
+  st.B.factory.give(replay[1]);
+  for (let i = 0; i < 4; i++) replay[0].send(msg1);
+  await settle();
+  assert(replay[1].sent.length === 0,
+    `a replayed msg1 drew ${replay[1].sent.length} message(s); it must draw silence`);
+  assert(bKem === spentGenuinely,
+    `a replayed msg1 bought ${bKem - spentGenuinely} ML-KEM call(s) — the refusal must come first`);
+
+  // …and the silence belongs to the REPLAY, not to a node that has stopped accepting:
+  // a fresh dial, with an ephemeral of its own, still gets its answer.
+  const again = wirePair({ addrA: "10.0.9.3", addrB: "10.0.9.4" });
+  openPair(st.A, st.B, again);
+  await until(() => again[1].sent.length > 0, 4000, "the responder to answer a FRESH msg1");
+});
+
 await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
   // A node that speaks first is a directory service: one connect reads its identity
   // straight off the wire. A caller without the contact secret must get silence — nothing

@@ -429,6 +429,14 @@ class Link {
     if (this.idle !== null) { clearTimer(this.idle); this.idle = null; }
   }
 
+  /** Traffic in either direction: the idle clock's flag, and the limiter's eviction order,
+   *  which for an authenticated link is how recently it carried something rather than how
+   *  long ago it arrived. */
+  markTraffic() {
+    this.sawTraffic = true;
+    if (this.slot) this.slot.limiter.touch(this.slot);
+  }
+
   // Queue (pre-auth) or send (post-auth, as an AEAD record) a frame.
   send(frame) {
     if (this.closed) return;
@@ -446,7 +454,7 @@ class Link {
         this.abort();
         return;
       }
-      this.sawTraffic = true;
+      this.markTraffic();
       // Sealed and wired through the one work chain, so records leave in send order.
       this.outboundQueuedSlices++;
       this.outboundQueuedBytes += frame.length;
@@ -721,8 +729,15 @@ class Link {
       await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI),
       w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN));
     if (!probe.ok) { this.stall(); return; }
+    // The proof a msg1 carries is bound to nothing about the connection carrying it, so a
+    // recording replays. Each one is accepted ONCE — asked here, before the promotion and
+    // the asymmetric work a replay would otherwise buy for free (§12.6.2).
+    if (probeSeen(ephI)) { this.stall(); return; }
     // Proved: move off the contended budget before the expensive work.
     if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stallBusy(); return; }
+    // Spent only now: a msg1 turned away just above for OUR contention is not spent, and
+    // the caller may try again on this connection (stallBusy).
+    rememberProbe(ephI);
     this.armDeadline(handshakeTimeoutMs);
     await this.ensureKeys();
     const dh = await scalarmult(this.myEph.privateKey, ephI);
@@ -863,7 +878,7 @@ class Link {
     if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
     const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
     if (!r.ok) { this.abort(true); return; }
-    this.sawTraffic = true;
+    this.markTraffic();
     // Advance only on success — a failed decrypt must never move the counter.
     if (++this.recvCtr >= this.rekeyAfter) {
       this.recvKey = await this.ratchet(this.recvKey);

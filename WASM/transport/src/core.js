@@ -114,14 +114,17 @@ const linksById = new Map();
 // when a socket is accepted, moves to `verified` when a msg1 opens under the contact
 // secret, and to `authed` once the peer's identity is proved and admitted — HELD there
 // for the link's whole life. Each tier evicts its own stalest occupant when full, so a
-// newcomer that has proved more than the incumbents is never refused at the door.
+// newcomer that has proved more than the incumbents is never refused at the door. Stalest
+// means longest-waiting in the half-open tiers, where waiting is all an occupant does, and
+// longest-QUIET in `authed`, where the incumbents have all proved the same thing and the
+// one carrying nothing is the one worth losing (`touch`).
 // Per-source is not evictable and spans all three tiers.
 class LinkLimiter {
   constructor(maxUnverified, maxPerSource, maxVerified, maxAuthed) {
     this.maxPerSource = maxPerSource;
     this.max = { unverified: maxUnverified, verified: maxVerified, authed: maxAuthed };
     this.count = { unverified: 0, verified: 0, authed: 0 };
-    // One book per tier; insertion order is the eviction policy. A slot carries the id it
+    // One book per tier; book order is the eviction policy. A slot carries the id it
     // was booked under, so leaving a tier is a delete rather than a scan for itself — the
     // scan was O(n) per move, which is O(n²) across filling and promoting a full tier, and
     // unauthenticated inbound connections are what drive it.
@@ -146,6 +149,17 @@ class LinkLimiter {
 
   /** The identity is proved and admitted. The slot stays until the link dies. */
   hold(slot) { return this.move(slot, "authed"); }
+
+  /** Something crossed an authenticated link: re-book it at the tail. Eviction takes the
+   *  head, so this makes a full authed tier shed the link that has been quiet longest
+   *  instead of the one admitted longest — without it, anyone who can complete handshakes
+   *  walks established, busy peers off the node one fresh connection at a time. */
+  touch(slot) {
+    if (slot.released || slot.tier !== "authed") return;
+    this.books.authed.delete(slot.bookId);
+    slot.bookId = this.nextId++;
+    this.books.authed.set(slot.bookId, slot);
+  }
 
   move(slot, tier) {
     if (slot.released || slot.tier === tier) return true;
@@ -191,6 +205,21 @@ class LinkLimiter {
     if (n === undefined) return;
     if (n <= 1) this.perSource.delete(slot.source); else this.perSource.set(slot.source, n - 1);
   }
+}
+
+// A msg1 that opened under the contact secret, remembered by the initiator's ephemeral
+// key — fresh per link for any honest dialer, so a second sighting is a RECORDING being
+// replayed. Nothing in a msg1 binds it to the connection carrying it, so this memory is
+// what makes the proof single-use: one captured message would otherwise buy promotion out
+// of the contended tier, the DH and encapsulation behind it, and an answer from a node
+// otherwise silent to strangers, as often as it is sent. Only a PROVED msg1 is remembered,
+// so a stranger cannot flush it; the oldest goes at the cap, and a fresh realm starts empty.
+const MAX_SEEN_PROBES = 4096;
+const seenProbes = new Set();
+function probeSeen(ephI) { return seenProbes.has(toHex(ephI)); }
+function rememberProbe(ephI) {
+  if (seenProbes.size >= MAX_SEEN_PROBES) seenProbes.delete(seenProbes.values().next().value);
+  seenProbes.add(toHex(ephI));
 }
 
 // ── the routing core ──────────────────────────────────────────────────────────

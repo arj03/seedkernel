@@ -533,10 +533,21 @@ pre-authentication framer cap (`MAX_HANDSHAKE_FRAME_BYTES`). Measured behaviour 
   the moment its msg1 opens, and again when its identity is proved and admitted — where its
   slot is **held for the link's life**. Releasing it there would bound only who was getting
   in: past the door, anyone able to complete a handshake could hold links without limit.
-- **Every budget evicts the oldest; none refuses the newest.** Refusing lets a saturating
+- **Every budget evicts; none refuses the newest.** Refusing lets a saturating
   flood turn arriving peers away *at the door*, before they can prove anything — promotion
   cannot rescue a connection that was never accepted. This applies to the verified tier
   too: otherwise anyone holding the contact secret could saturate it and lock members out.
+  *What* is evicted differs by tier. The two half-open tiers shed their OLDEST occupant,
+  where waiting is all an occupant does. The authed tier sheds its QUIETEST: every link
+  there has proved the same thing, so admission order would let anyone able to complete
+  handshakes walk established, busy peers off the node one fresh connection at a time. A
+  record crossing an authenticated link re-books its slot at the tail of that book.
+- **A proved msg1 is spent.** Nothing in msg1 binds its contact-secret proof to the
+  connection carrying it, so a recording replays. The transport remembers the initiator's
+  ephemeral key — 4,096 of them, drop-oldest — and answers a second sighting with the
+  silence a wrong secret gets, before the promotion above and before the DH and
+  encapsulation behind it. Only a *proved* msg1 is remembered, so a stranger cannot flush
+  the memory, and a msg1 turned away for our own contention is not spent by the attempt.
 - **`MAX_HALF_OPEN_PER_SOURCE` (8) is not evictable.** One address at its own limit is
   refused outright, never allowed to push a different address out, so saturating the
   unverified budget needs 128 distinct sources. It spans all three tiers, so one address
