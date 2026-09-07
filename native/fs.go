@@ -38,27 +38,40 @@ func newNodeFs(dir string) (*nodeFs, error) {
 		return nil, err
 	}
 	f := &nodeFs{dir: dir}
-	f.used = f.scanUsed() // one O(N) walk at open; adjusted incrementally thereafter
+	used, err := f.scanUsed() // one O(N) walk at open; adjusted incrementally thereafter
+	if err != nil {
+		return nil, err
+	}
+	f.used = used
 	return f, nil
 }
 
 // scanUsed sums the size of every regular file in the data dir — the one full walk, at
 // open, to seed the cached counter. Reclaims temp files orphaned by an earlier crash.
-func (f *nodeFs) scanUsed() (used int64) {
-	entries, _ := os.ReadDir(f.dir)
+func (f *nodeFs) scanUsed() (used int64, err error) {
+	entries, err := os.ReadDir(f.dir)
+	if err != nil {
+		return 0, err
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		if n := e.Name(); strings.HasPrefix(n, fsTmpPrefix) {
-			os.Remove(filepath.Join(f.dir, n)) // temp write orphaned by an earlier crash; reclaim it
+			// Best effort: an orphan is not counted in `used` either way, so a reclaim the
+			// filesystem refuses costs disk, not correctness — not a reason to refuse the store.
+			os.Remove(filepath.Join(f.dir, n))
 			continue
 		}
-		if fi, err := e.Info(); err == nil {
+		fi, err := e.Info()
+		if err != nil {
+			return 0, err
+		}
+		if fi.Mode().IsRegular() {
 			used += fi.Size()
 		}
 	}
-	return used
+	return used, nil
 }
 
 // path is the one place a key becomes a filename, so it is also where the CLOSED store is
@@ -96,7 +109,7 @@ func (f *nodeFs) put(key string, b []byte) error {
 	// One O(1) stat for the old size, so `used` tracks the delta on an overwrite. New key
 	// ⇒ old = -1 ⇒ the whole write counts.
 	old := int64(-1)
-	if fi, err := os.Stat(p); err == nil {
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
 		old = fi.Size()
 	}
 	// Atomic: a crash mid-write must not leave a short block size() still reports as held.
@@ -187,7 +200,7 @@ func (f *nodeFs) delete(key string) bool {
 		return false
 	}
 	sz := int64(-1)
-	if fi, err := os.Stat(p); err == nil {
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
 		sz = fi.Size()
 	}
 	if os.Remove(p) != nil {

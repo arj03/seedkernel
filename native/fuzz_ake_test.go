@@ -136,6 +136,7 @@ const akeFuzzJS = `
     + " Link: Link,"
     + " newLimiter: () => new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed),"
     + " setOwnPk: (pk) => { ownPk = pk; },"
+    + " resetProbes: () => { seenProbes.clear(); },"
     + " drainDeferred: () => { for (const f of deferQueue.splice(0)) { try { f(); } catch (e) { /* gone */ } } },"
     // The two step labels, for the shaped probes below: they build a message the link will
     // OPEN, using the link's own kdf, and a label restated here would be a second copy of
@@ -204,6 +205,10 @@ const akeFuzzJS = `
     }
     drain();
     armedTimers.clear();
+    // Each probe is an independent deployment snapshot. Its entropy restarts below,
+    // so retaining replay history would reject its setup handshake as a previous case's
+    // msg1. Keep the real cache active across all connections WITHIN a probe.
+    A.resetProbes(); B.resetProbes();
     // Once per probe, and this is the one place that is true — so the entropy every
     // exchange below draws on starts at the same byte for the same input, however many
     // executions the fuzzer has already run in this process.
@@ -341,6 +346,25 @@ const akeFuzzJS = `
     take();   // an accept says nothing unprompted; this is empty, and asserted to be
     const r = await feed(l, streamAB, splitsAB);
     return report(l, r);
+  };
+
+  // Replay history survives a connection closing, but not an independent fuzz case.
+  globalThis.__akeReplay = async () => {
+    sweep(); reset();
+    const d = mkLink(A, true, null, undefined);
+    await settle(d);
+    const w1 = take();
+    if (w1.length !== 1) return fz({ bad: "no msg1 to replay" });
+    const first = mkLink(B, false, B.newLimiter(), "198.51.100.9");
+    await settle(first);
+    await feed(first, w1[0], new Uint8Array(0));
+    const w2 = take();
+    if (w2.length !== 1 || w2[0].length !== A.lens.m2) return fz({ bad: "fresh msg1 was refused" });
+    first.onChannelClosed();
+    drain(); reset();
+    const replay = mkLink(B, false, B.newLimiter(), "198.51.100.10");
+    await settle(replay);
+    return report(replay, await feed(replay, w1[0], new Uint8Array(0)));
   };
 
   // Both ends of one exchange, run FOR REAL to a given point, and the link the fuzzer then
@@ -1034,6 +1058,19 @@ func TestAkeIdentityProof(t *testing.T) {
 		if o.Delivered != 0 || len(o.Wire) != 0 {
 			t.Fatalf("%s: answered our own reflected identity with %v and %d frame(s) — a refusal here is silence",
 				c.what, o.Wire, o.Delivered)
+		}
+	}
+}
+
+func TestAkeReplayIsolation(t *testing.T) {
+	akeFuzzRealm(t)
+	// Repeating the same deterministic case must accept its fresh setup each time,
+	// while refusing that setup's replay on a second connection within the case.
+	for i := 0; i < 2; i++ {
+		o := akeRun(t, "__akeReplay")
+		if o.Threw != "" || !o.Stalled || o.Closed || o.Authed || o.NAuth != 0 ||
+			o.Delivered != 0 || len(o.Wire) != 0 || o.Closes != 0 {
+			t.Fatalf("case %d: replay was not silently refused: %+v", i, o)
 		}
 	}
 }

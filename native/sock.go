@@ -387,7 +387,9 @@ func (n *netHost) onClose(id int64) func() {
 // invoke calls a retained JS dispatcher and frees the argument values (JS copies
 // the bytes out, so the ArrayBuffer need not survive the call).
 func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
-	if _, err := n.qc.Invoke(fn, n.und, args...); err != nil {
+	res, err := n.qc.Invoke(fn, n.und, args...)
+	res.Free()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "netHost: dispatcher error:", err)
 	}
 	for _, a := range args {

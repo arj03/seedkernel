@@ -181,7 +181,7 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 	// copies are clamped to what the module reserved (§4.1) — writing past it would
 	// scribble whatever it keeps beyond scratch.
 	mem := w.mod.Memory()
-	if uint32(len(payload)) > w.size || mem == nil || !mem.Write(w.scratch, payload) {
+	if uint64(len(payload)) > uint64(w.size) || mem == nil || !mem.Write(w.scratch, payload) {
 		return nil
 	}
 	// The module instance is long-lived. Once the response has been copied out, erase both
@@ -239,6 +239,16 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 // reached from JS as bridge.buildModules. The transaction is here because this is the
 // side holding the half-built instances, which a rejected bundle must close itself.
 func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault uint32, bindDeadline time.Duration) error {
+	// The signed manifest already refuses a duplicate name (bundle.ts), so this is the
+	// backstop for a caller that did not come through one: the map below would keep the
+	// LAST instance under the name and drop the earlier one without closing it.
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("duplicate module name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
 	built := make(map[string]*boundModule, len(wasms))
 	for i, wasm := range wasms {
 		w, err := instantiateWasm(wasm, scratchDefault, bindDeadline)

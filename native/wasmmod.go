@@ -45,7 +45,7 @@ func newWasmModule(rt wazero.Runtime, name string, wasm []byte, widths map[strin
 			panic(fmt.Sprintf("%s: missing export %q", name, export))
 		}
 		r, err := f.Call(ctx)
-		if err != nil || r[0] != want {
+		if err != nil || len(r) != 1 || r[0] != want {
 			panic(fmt.Sprintf("%s: %s reported %v, expected %d", name, export, r, want))
 		}
 	}
@@ -63,14 +63,21 @@ func (m *wasmModule) reset() { m.top = m.heapBase }
 // alloc sub-allocates n 16-aligned bytes from the module's own heap, growing
 // linear memory if needed.
 func (m *wasmModule) alloc(n int) uint32 {
-	p := (m.top + 15) &^ 15
-	m.top = p + uint32(n)
-	if need := int64(m.top) - int64(m.mem.Size()); need > 0 {
-		if _, ok := m.mem.Grow(uint32(need/0x10000) + 1); !ok {
+	// Widen before alignment/addition so neither operation can wrap into live data.
+	p := (uint64(m.top) + 15) &^ 15
+	if n < 0 || p > uint64(^uint32(0)) || uint64(n) > uint64(^uint32(0))-p {
+		panic(fmt.Sprintf("%s: allocation out of range", m.name))
+	}
+	top := p + uint64(n)
+	// Size wraps at 4 GiB; the page count returned by Grow(0) does not.
+	pages, _ := m.mem.Grow(0)
+	if size := uint64(pages) * 0x10000; top > size {
+		if _, ok := m.mem.Grow(uint32((top - size + 0xffff) / 0x10000)); !ok {
 			panic(fmt.Sprintf("%s: out of memory", m.name))
 		}
 	}
-	return p
+	m.top = uint32(top)
+	return uint32(p)
 }
 
 // put is alloc plus a copy of b into the sub-allocation.

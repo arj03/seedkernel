@@ -103,7 +103,9 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 	delete(el.settleInstalled, c) // its __settle dies with the realm's runtime
 	for i, x := range el.extra {
 		if x.c == c {
-			el.extra = append(el.extra[:i], el.extra[i+1:]...)
+			copy(el.extra[i:], el.extra[i+1:])
+			el.extra[len(el.extra)-1] = pumpEntry{}
+			el.extra = el.extra[:len(el.extra)-1]
 			return
 		}
 	}
@@ -199,7 +201,9 @@ func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 
 // callJS invokes a retained JS callback with no arguments (timer / deferred work).
 func (el *eventLoop) callJS(cb *qjs.Value) {
-	if _, err := el.c.Invoke(cb, el.c.NewUndefined()); err != nil {
+	res, err := el.c.Invoke(cb, el.c.NewUndefined())
+	res.Free()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "eventLoop: callback error:", err)
 	}
 }

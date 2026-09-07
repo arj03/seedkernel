@@ -249,6 +249,9 @@ func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 }
 
 func (s *libsodium) signDetached(msg, sk []byte) []byte {
+	if len(sk) != 64 {
+		panic("crypto_sign_detached: secret key must be 64 bytes")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(len(msg)) + alignUp(len(sk)) + alignUp(64))
@@ -259,6 +262,11 @@ func (s *libsodium) signDetached(msg, sk []byte) []byte {
 }
 
 func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
+	// These wasm exports take pointers without lengths for fixed-width inputs.
+	// Reject before staging: a short input would read adjacent arena contents.
+	if len(sig) != 64 || len(pk) != 32 {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(len(sig)) + alignUp(len(msg)) + alignUp(len(pk)))
@@ -281,6 +289,9 @@ func (s *libsodium) signKeypair() (pk, sk []byte) {
 }
 
 func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
+	if len(seed) != 32 {
+		panic("crypto_sign_seed_keypair: seed must be 32 bytes")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(32) + alignUp(64) + alignUp(len(seed)))
@@ -296,6 +307,9 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 // ok=false on a low-order / all-zero result, which the handshake treats as failed —
 // mirroring libsodium-wrappers throwing there.
 func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
+	if len(n) != 32 || len(p) != 32 {
+		return nil, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(32) + alignUp(len(n)) + alignUp(len(p)))

@@ -166,15 +166,17 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		os.Stdout.Write(bytes)
+		if _, err := os.Stdout.Write(bytes); err != nil {
+			return nil, err
+		}
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("stdin", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// `--op`'s argument, read whole; cli.ts calls this lazily, so a serving node never
-		// waits on stdin. A read error answers the same as an empty pipe.
+		// waits on stdin. A read failure must not turn into an empty operation payload.
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			bytes = nil
+			return nil, err
 		}
 		return bytesAB(t, bytes), nil
 	}))

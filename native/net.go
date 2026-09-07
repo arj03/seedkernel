@@ -228,7 +228,8 @@ func (c *sockChannel) terminate(flush, notify bool) {
 		return
 	}
 	c.dead = true
-	if !flush {
+	// No writer will start after a pre-connect close, so there is nothing to flush.
+	if !flush || c.conn == nil {
 		c.queue, c.queued = nil, 0
 	}
 	conn := c.conn

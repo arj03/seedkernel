@@ -195,7 +195,7 @@ The transport driver holds link ids and listeners and exposes three events: `lin
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,564 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (426) and `native-polyfills.ts` (83), both TypeScript and riding in the shared bundle | 2,253 Go + 509 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (426) and `native-polyfills.ts` (83), both TypeScript and riding in the shared bundle | 2,296 Go + 509 TS |
 
 Each socket implementation reaches the driver as a `RawLink` through the `ChannelFactory` seam ([RUNTIME §12.1](docs/RUNTIME.md)). TCP length-prefixing and RFC 6455 belong to the transport bundle — 1,552 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, outside the host tables above.
 
