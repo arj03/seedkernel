@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,7 @@ const akeFuzzJS = `
   // deadline that actually fired would retire an exchange the fuzzer is still driving —
   // the timers are a different property (transport_test) and would only add flakiness.
   let wire = [], closes = 0, delivered = 0, authed = 0;
+  let initialWire = [];
   const armedTimers = new Map();
   const rawNet = {
     open: () => ({ linkId: 0, stream: true }),   // no route: this harness dials nothing
@@ -144,7 +147,7 @@ const akeFuzzJS = `
     + " labels: { m3: LABEL_M3, m4: LABEL_M4 },"
     + " lens: { m1: M1_LEN, m2: M2_LEN, m3: M3_LEN, m4: M4_LEN, cap: MAX_HANDSHAKE_FRAME_BYTES,"
     + "   frame: maxFrameBytes, suite: SUITE_LEN, eph: EPH_LEN, kemPk: KEM_PK_LEN,"
-    + "   nonce: NONCE_LEN, tag: TAG_LEN }"
+    + "   kemSk: KEM_SK_LEN, kemCt: KEM_CT_LEN, nonce: NONCE_LEN, tag: TAG_LEN }"
     + " };";
 
   // One node: its own identity, its own seam, its own copy of the guest program's module
@@ -247,7 +250,7 @@ const akeFuzzJS = `
   // Cleared here, which is exactly where the harness stops setting an exchange up and starts
   // feeding it the fuzzer's bytes — so the call log names what the INPUT reached, not what
   // building a session to feed it to costs.
-  const reset = () => { wire = []; closes = 0; delivered = 0; authed = 0; reached = []; };
+  const reset = () => { wire = []; initialWire = []; closes = 0; delivered = 0; authed = 0; reached = []; };
 
   // Cut the fuzzer's stream at the sizes it chose, each a big-endian uint32; every piece is
   // one platform-framed message. A byte apiece could not name the two widths that matter —
@@ -295,6 +298,7 @@ const akeFuzzJS = `
     threw: r.threw, fed: r.fed, maxFed: r.maxFed, wantClose: r.wantClose,
     authed: l.authed, nAuth: authed, delivered: delivered,
     wire: take().map((b) => b.length),
+    initialWire: initialWire,
     closes: closes, closed: l.closed, stalled: l.stalled,
     recvCtr: l.recvCtr, recvEpoch: l.recvEpoch, reached: reached.slice(),
   }, extra || {}));
@@ -306,10 +310,12 @@ const akeFuzzJS = `
   // them at the time gets it wrong in both directions: a write of the value already there
   // changes nothing, and two writes to one offset can put the original back while the count
   // says the message was corrupted.
-  const patchBytes = (buf, patch) => {
+  const patchBytes = (buf, patch, offsetBytes = 2) => {
     const before = buf.slice();
-    for (let i = 0; i + 2 < patch.length; i += 3) {
-      buf[(((patch[i] << 8) | patch[i + 1]) >>> 0) % buf.length] = patch[i + 2];
+    for (let i = 0; i + offsetBytes < patch.length; i += offsetBytes + 1) {
+      let at = 0;
+      for (let j = 0; j < offsetBytes; j++) at = at * 256 + patch[i + j];
+      buf[at % buf.length] = patch[i + offsetBytes];
     }
     let n = 0;
     for (let i = 0; i < buf.length; i++) if (buf[i] !== before[i]) n++;
@@ -343,7 +349,7 @@ const akeFuzzJS = `
     sweep(); reset();
     const l = mkLink(B, false, B.newLimiter(), "203.0.113.7");
     await settle(l);
-    take();   // an accept says nothing unprompted; this is empty, and asserted to be
+    initialWire = take().map((b) => b.length);
     const r = await feed(l, streamAB, splitsAB);
     return report(l, r);
   };
@@ -369,6 +375,7 @@ const akeFuzzJS = `
 
   // Both ends of one exchange, run FOR REAL to a given point, and the link the fuzzer then
   // plays against:
+  //   2 — an initiator holding its msg1, waiting for the responder's msg2
   //   3 — a responder holding a proved msg1, waiting for the initiator's identity
   //   4 — an initiator that named itself, waiting for the responder's
   //   5 — a finished session, and its record layer
@@ -384,6 +391,7 @@ const akeFuzzJS = `
     await r.onWire(w1[0]); await settle(r);
     const w2 = take();
     if (w2.length !== 1 || w2[0].length !== A.lens.m2) return { bad: "responder answered a real msg1 with " + w2.length + " message(s)" };
+    if (stage === 2) { reset(); return { l: d, d: d, r: r, msg1: w1[0], msg2: w2[0] }; }
     // Both ends every time: the one under test, and the one whose turn it is to speak —
     // which is the only thing that can sign an identity this link will accept.
     if (stage === 3) { reset(); return { l: r, d: d, r: r }; }
@@ -405,6 +413,14 @@ const akeFuzzJS = `
     if (p.bad) return fz({ bad: p.bad });
     const r = await feed(p.l, streamAB, splitsAB);
     return report(p.l, r);
+  };
+
+  // Deterministic setup material for the Go msg2 oracle. It derives the root and
+  // transcript itself and calls no Link verification or key-derivation helper.
+  globalThis.__akeMsg2Fixture = async () => {
+    const p = await pairTo(2);
+    if (p.bad) throw new Error(p.bad);
+    return cat(cat(cat(p.msg2, p.d.myEph.privateKey), p.d.myKem.privateKey), p.msg1);
   };
 
   // ── past the door ──────────────────────────────────────────────────────────
@@ -449,7 +465,7 @@ const akeFuzzJS = `
     reset();
     const l = mkLink(B, false, B.newLimiter(), "203.0.113.7");
     await settle(l);
-    take();
+    initialWire = take().map((b) => b.length);
     const r = await feed(l, msg, new Uint8Array(0));
     return report(l, r, { patched: patched });
   };
@@ -491,19 +507,73 @@ const akeFuzzJS = `
     return report(l, await feed(l, msg, new Uint8Array(0)));
   };
 
-  // A record this session really sealed, then corrupted at offsets the fuzzer chose. With
-  // nothing changed it is the accept path — the only place these targets exercise one.
-  globalThis.__fuzzAkeShapedRecord = async (bodyAB, patchAB) => {
-    const p = await pairTo(5);
-    if (p.bad) return fz({ bad: p.bad });
-    p.d.send(new Uint8Array(bodyAB));
+  // What a delivery actually CARRIED, rather than that there was one: a count alone passes
+  // a record that opened onto the wrong bytes, which is the whole of what the AEAD is for.
+  // "want" is set by the caller before each send, so one watcher covers a whole run.
+  const watchFrames = (l) => {
+    const inner = l.onFrame;
+    const seen = { n: 0, wrong: 0, want: null };
+    l.onFrame = (peerId, pt, peerPubkey) => {
+      inner(peerId, pt, peerPubkey);
+      seen.n++;
+      const w = seen.want;
+      if (!w || pt.length !== w.length || !pt.every((b, i) => b === w[i])) seen.wrong++;
+    };
+    return seen;
+  };
+
+  // One record, sealed by the end whose turn it is, taken off the wire it wrote it to.
+  const sealOne = async (p, body) => {
+    p.d.send(body.slice());
     await settle(p.d);
     const w = take();
-    if (w.length !== 1) return fz({ bad: "one send sealed " + w.length + " record(s)" });
-    const rec = w[0].slice();
-    const patched = patchBytes(rec, new Uint8Array(patchAB));
+    if (w.length !== 1) return { bad: "one send sealed " + w.length + " record(s)" };
+    return { rec: w[0].slice() };
+  };
+
+  // The lead records below are about the receive counter and the epoch, not about width, so
+  // they carry a token body — the fuzzer's bytes belong to the record under test.
+  const LEAD_BODY = new Uint8Array([0xa5]);
+
+  // A record this session really sealed, then corrupted at offsets the fuzzer chose. With
+  // nothing changed it is the accept path — the only place these targets exercise one.
+  //
+  // A lead of good records runs first, so the corruption lands on a session whose counters
+  // have already moved — and, with the ratchet interval shortened to the one the probe was
+  // handed, on one that has already ratcheted. The shipped interval is 1<<24 frames, which
+  // no fuzz execution could ever reach, so the receive path only ever built a nonce at 0. Both
+  // ends are moved together: an interval the two sides disagree on desyncs the session by
+  // design (transport-link states that separately), which is not what this probe asks about.
+  globalThis.__fuzzAkeShapedRecord = async (bodyAB, patchAB, lead, rekey) => {
+    const p = await pairTo(5);
+    if (p.bad) return fz({ bad: p.bad });
+    p.d.rekeyAfter = rekey;
+    p.l.rekeyAfter = rekey;
+    const seen = watchFrames(p.l);
+    seen.want = LEAD_BODY;
+    for (let i = 0; i < lead; i++) {
+      const s = await sealOne(p, LEAD_BODY);
+      if (s.bad) return fz({ bad: "lead record " + i + ": " + s.bad });
+      const f = await feed(p.l, s.rec, new Uint8Array(0));
+      if (f.threw) return fz({ bad: "lead record " + i + " threw: " + f.threw });
+      if (seen.n !== i + 1 || seen.wrong !== 0 || p.l.closed) {
+        return fz({ bad: "lead record " + i + " did not open onto the bytes it was sealed over" });
+      }
+    }
+    const body = new Uint8Array(bodyAB);
+    seen.want = body;
+    const s = await sealOne(p, body);
+    if (s.bad) return fz({ bad: s.bad });
+    // A record runs to maxFrameBytes, far past 64 KiB, so uint16 offsets could not name its
+    // tail or its AEAD tag at all; uint32 ones reach every byte of one.
+    const patched = patchBytes(s.rec, new Uint8Array(patchAB), 4);
+    const before = seen.n;
     reset();
-    return report(p.l, await feed(p.l, rec, new Uint8Array(0)), { patched: patched });
+    const r = await feed(p.l, s.rec, new Uint8Array(0));
+    return report(p.l, r, {
+      patched: patched,
+      plaintextMatches: seen.n === before + 1 && seen.wrong === 0,
+    });
   };
 }
 `
@@ -512,21 +582,23 @@ const akeFuzzJS = `
 // in. Write LENGTHS rather than bytes — a write's size is what the concealment property is
 // about, and the bytes themselves are the session's, not the fuzzer's to recognize.
 type akeOutcome struct {
-	Bad       string `json:"bad"`
-	Threw     string `json:"threw"`
-	Fed       int    `json:"fed"`
-	MaxFed    int    `json:"maxFed"`
-	WantClose bool   `json:"wantClose"`
-	Authed    bool   `json:"authed"`
-	NAuth     int    `json:"nAuth"`
-	Delivered int    `json:"delivered"`
-	Wire      []int  `json:"wire"`
-	Closes    int    `json:"closes"`
-	Closed    bool   `json:"closed"`
-	Stalled   bool   `json:"stalled"`
-	RecvCtr   int    `json:"recvCtr"`
-	RecvEpoch int    `json:"recvEpoch"`
-	Patched   int    `json:"patched"` // shaped probes: bytes the fuzzer actually changed
+	Bad              string `json:"bad"`
+	Threw            string `json:"threw"`
+	Fed              int    `json:"fed"`
+	MaxFed           int    `json:"maxFed"`
+	WantClose        bool   `json:"wantClose"`
+	Authed           bool   `json:"authed"`
+	NAuth            int    `json:"nAuth"`
+	Delivered        int    `json:"delivered"`
+	Wire             []int  `json:"wire"`
+	InitialWire      []int  `json:"initialWire"`
+	Closes           int    `json:"closes"`
+	Closed           bool   `json:"closed"`
+	Stalled          bool   `json:"stalled"`
+	RecvCtr          int    `json:"recvCtr"`
+	RecvEpoch        int    `json:"recvEpoch"`
+	Patched          int    `json:"patched"` // shaped probes: bytes the fuzzer actually changed
+	PlaintextMatches bool   `json:"plaintextMatches"`
 	// Host names this execution reached, for the mutator alone (fuzz_cov_test.go). No
 	// assertion reads it: what a link is ALLOWED to do is stated in the fields above, and a
 	// claim about which primitives it called on the way would pin the implementation rather
@@ -549,6 +621,8 @@ type akeLens struct {
 	Suite int `json:"suite"`
 	Eph   int `json:"eph"`
 	KemPk int `json:"kemPk"`
+	KemSk int `json:"kemSk"`
+	KemCt int `json:"kemCt"`
 	Nonce int `json:"nonce"`
 	Tag   int `json:"tag"`
 }
@@ -559,6 +633,10 @@ var akeSizes akeLens
 // handshake's own host names, and evaluates the AKE in its module scope. Fuzzing re-enters
 // a target thousands of times in one process, so none of this is per-iteration.
 func akeFuzzRealm(f testing.TB) {
+	akeFuzzRealmJS(f, akeFuzzJS)
+}
+
+func akeFuzzRealmJS(f testing.TB, probeJS string) {
 	f.Helper()
 	bootRealm(f)
 	if _, err := qc.Eval("fuzz-ake-modules.js", qjs.Code(akeModulesJS)); err != nil {
@@ -582,7 +660,7 @@ func akeFuzzRealm(f testing.TB) {
 			return bytesAB(t, callModuleRaw(w, req)), nil
 		}))
 	}
-	if _, err := qc.Eval("fuzz-ake.js", qjs.Code(akeFuzzJS)); err != nil {
+	if _, err := qc.Eval("fuzz-ake.js", qjs.Code(probeJS)); err != nil {
 		f.Fatal("transport AKE scope:", err)
 	}
 	out, err := callRealm("__akeLens", 20*time.Second)
@@ -669,6 +747,9 @@ func covMarkAke(o akeOutcome) {
 func silentUnderFire(t *testing.T, what string, o akeOutcome, stream, splits []byte) {
 	t.Helper()
 	covMarkAke(o)
+	if why := unpromptedWire(o); why != "" {
+		t.Fatalf("%s: %s", what, why)
+	}
 	if o.Threw != "" {
 		t.Fatalf("%s: threw out of onWire (%q) — stream %d bytes, splits %v: %x",
 			what, o.Threw, len(stream), head(splits), head(stream))
@@ -700,6 +781,112 @@ func silentUnderFire(t *testing.T, what string, o akeOutcome, stream, splits []b
 	}
 }
 
+// firstAkeMessage interprets only the wire input, without consulting Link's state.
+// A fresh link can answer only its first nonempty message: an invalid one stalls it,
+// and a valid one moves it to the next step. Zero splits carry no message.
+func firstAkeMessage(stream, splits []byte) []byte {
+	for i := 0; i+4 <= len(splits); i += 4 {
+		n := uint64(binary.BigEndian.Uint32(splits[i:]))
+		if n > 0 {
+			if n > uint64(len(stream)) {
+				n = uint64(len(stream))
+			}
+			return stream[:int(n)]
+		}
+	}
+	return stream
+}
+
+// The oracle restates suite 0x03's derivation over the harness's fixed secrets.
+// It deliberately does not call Link.probeKey/openZero or inspect its verdict.
+func akeReferenceHash(parts ...[]byte) []byte {
+	return sd.genericHash(32, bytes.Join(parts, nil))
+}
+
+func akeReferenceRoot() []byte {
+	return akeReferenceHash([]byte("seedkernel-channel-id-v1\x00"), bytes.Repeat([]byte{0x1a}, 32))
+}
+
+func akeMsg1ProvesContact(msg []byte) bool {
+	const header = 1 + 32 + 1184
+	if len(msg) != header+32+16 || msg[0] != 0x03 {
+		return false
+	}
+	context := akeReferenceHash(akeReferenceRoot(), msg[:header])
+	key := akeReferenceHash(bytes.Repeat([]byte{0xb7}, 32), context, []byte("seedkernel-c-probe-v1\x00"))
+	_, ok := sd.aeadDecrypt(msg[header:], make([]byte, 12), key)
+	return ok
+}
+
+// unpromptedWire names the one thing a probe's SETUP must never have produced: a write from
+// a link that has not yet been handed a byte. Two probes stand an accepting link up before
+// the input reaches it, and both record what it wrote in the meantime — so the check lives
+// here, once, rather than at the fuzz target and the oracle separately.
+func unpromptedWire(o akeOutcome) string {
+	if len(o.InitialWire) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("accepting link wrote %v before receiving any input", o.InitialWire)
+}
+
+func akeAcceptViolation(o akeOutcome, stream, splits []byte) string {
+	if why := unpromptedWire(o); why != "" {
+		return why
+	}
+	if len(o.Wire) == 0 {
+		return ""
+	}
+	if !akeMsg1ProvesContact(firstAkeMessage(stream, splits)) {
+		return fmt.Sprintf("answered an unproved msg1 with %v — the contact-secret proof must open before any reply", o.Wire)
+	}
+	if len(o.Wire) != 1 || o.Wire[0] != akeSizes.M2 {
+		return fmt.Sprintf("answered a proved msg1 with %v, want at most one %d-byte msg2", o.Wire, akeSizes.M2)
+	}
+	return ""
+}
+
+// Exercise the oracle against deliberately faulty copies of the bundled guest in
+// memory. Production files stay untouched; a missing proof gate and an unsolicited
+// correctly sized msg2 must both be detected by the same check the fuzz target uses.
+func TestAkeSilenceOracle(t *testing.T) {
+	for _, c := range []struct{ name, from, to, want string }{
+		{name: "real link"},
+		{name: "missing proof gate", from: "if (!probe.ok) { this.stall(); return; }", to: "", want: "unproved msg1"},
+		{name: "unsolicited msg2", from: "this.armDeadline(unverifiedTimeoutMs);",
+			to: "this.armDeadline(unverifiedTimeoutMs); await this.wire(new Uint8Array(M2_LEN));", want: "before receiving any input"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			js := akeFuzzJS
+			if c.from != "" {
+				js = strings.Replace(js, "src + RET", fmt.Sprintf("src.replace(%q, %q) + RET", c.from, c.to), 1)
+			}
+			akeFuzzRealmJS(t, js)
+			msg1, err := callRealm("__akeMsg1", 60*time.Second)
+			if err != nil || !akeMsg1ProvesContact(msg1) {
+				t.Fatalf("genuine msg1 failed the reference proof: %v", err)
+			}
+			// The public fields remain valid, so skipping the proof gate really does
+			// reach a msg2 instead of being masked by an unrelated DH/KEM refusal.
+			bad := bytes.Clone(msg1)
+			bad[len(bad)-1] ^= 1
+			for _, input := range [][]byte{bad, append(bytes.Clone(bad), msg1...)} {
+				splits := akeSplitsOf(len(bad))
+				o := akeRun(t, "__fuzzAkeAccept", qc.NewArrayBuffer(input), qc.NewArrayBuffer(splits))
+				why := akeAcceptViolation(o, input, splits)
+				if (c.want == "" && why != "") || (c.want != "" && !strings.Contains(why, c.want)) {
+					t.Fatalf("oracle returned %q, want %q; outcome %+v", why, c.want, o)
+				}
+			}
+			if c.want == "" {
+				o := akeRun(t, "__fuzzAkeAccept", qc.NewArrayBuffer(msg1), qc.NewArrayBuffer(nil))
+				if why := akeAcceptViolation(o, msg1, nil); why != "" || len(o.Wire) != 1 {
+					t.Fatalf("genuine msg1: %q, wrote %v", why, o.Wire)
+				}
+			}
+		})
+	}
+}
+
 // FuzzAkeAccept is the stranger's whole surface: an accepted socket, and bytes. Nothing
 // here holds the network key or the contact secret, which is the position every one of the
 // `maxHalfOpenUnverified` connections a node admits at once is in.
@@ -708,6 +895,9 @@ func FuzzAkeAccept(f *testing.F) {
 	msg1, err := callRealm("__akeMsg1", 60*time.Second)
 	if err != nil || len(msg1) != akeSizes.M1 {
 		f.Fatalf("could not capture a real msg1 for the corpus (%d bytes, want %d): %v", len(msg1), akeSizes.M1, err)
+	}
+	if !akeMsg1ProvesContact(msg1) {
+		f.Fatal("the independent contact-secret oracle refuses a genuine msg1")
 	}
 	// A message that OPENS, and the shapes around it: the mutator works outward from the
 	// one input that reaches the KEM and the identity proof.
@@ -727,6 +917,12 @@ func FuzzAkeAccept(f *testing.F) {
 	other[0] = 0x01
 	f.Add(other, akeSplitsOf())
 	f.Add(make([]byte, akeSizes.M1), akeSplitsOf())
+	// Valid public fields with a broken proof: removing the probe check must fail.
+	badProof := bytes.Clone(msg1)
+	badProof[len(badProof)-1] ^= 1
+	f.Add(badProof, akeSplitsOf())
+	// A valid proof later in the stream cannot authorize a reply to the first message.
+	f.Add(append(bytes.Clone(badProof), msg1...), akeSplitsOf(akeSizes.M1))
 	// The other widths, so a message that is the right size for the WRONG step is tried
 	// against a link that is not at that step.
 	f.Add(make([]byte, akeSizes.M2), akeSplitsOf())
@@ -745,18 +941,97 @@ func FuzzAkeAccept(f *testing.F) {
 		}
 		o := akeRun(t, "__fuzzAkeAccept", qc.NewArrayBuffer(stream), qc.NewArrayBuffer(splits))
 		silentUnderFire(t, "accept", o, stream, splits)
-		// An accepting link owes a stranger exactly one message, and only for a msg1 that
-		// opened under the contact secret: msg2, at its one width. A second write, or one
-		// of any other size, is the exchange leaking how far the sender got.
-		if len(o.Wire) > 1 {
-			t.Fatalf("accept: wrote %d messages (%v) before authenticating anyone — stream %d bytes, splits %v: %x",
-				len(o.Wire), o.Wire, len(stream), head(splits), head(stream))
+		if why := akeAcceptViolation(o, stream, splits); why != "" {
+			t.Fatalf("accept: %s — stream %d bytes, splits %v: %x", why, len(stream), head(splits), head(stream))
 		}
-		for _, n := range o.Wire {
-			if n != akeSizes.M2 {
-				t.Fatalf("accept: answered with a %d-byte message; the only thing owed here is msg2 (%d bytes) — stream %d bytes, splits %v: %x",
-					n, akeSizes.M2, len(stream), head(splits), head(stream))
-			}
+	})
+}
+
+// akeMsg2Oracle snapshots the deterministic initiator's secret keys once. The reference
+// verifier parses msg2 and derives its key in Go, using only the primitive KEM module
+// for decapsulation. Reusing that primitive tests the handshake's composition, not ML-KEM.
+func akeMsg2Oracle(t testing.TB) ([]byte, func(testing.TB, []byte) bool) {
+	t.Helper()
+	fixture, err := callRealm("__akeMsg2Fixture", 60*time.Second)
+	if err != nil {
+		t.Fatal("msg2 fixture:", err)
+	}
+	if len(fixture) != akeSizes.M2+akeSizes.Eph+akeSizes.KemSk+akeSizes.M1 {
+		t.Fatalf("msg2 fixture: unexpected width %d", len(fixture))
+	}
+	msg2 := fixture[:akeSizes.M2]
+	sk := fixture[akeSizes.M2 : akeSizes.M2+akeSizes.Eph]
+	kemEnd := akeSizes.M2 + akeSizes.Eph + akeSizes.KemSk
+	kemSK := fixture[akeSizes.M2+akeSizes.Eph : kemEnd]
+	transcript := akeReferenceHash(akeReferenceRoot(), fixture[kemEnd:])
+	proves := func(t testing.TB, msg []byte) bool {
+		t.Helper()
+		if len(msg) != akeSizes.M2 {
+			return false
+		}
+		ee, ok := sd.scalarmult(sk, msg[:akeSizes.Eph])
+		if !ok {
+			return false
+		}
+		ctEnd := akeSizes.Eph + akeSizes.KemCt
+		req := bytes.Join([][]byte{{2}, kemSK, msg[akeSizes.Eph:ctEnd]}, nil)
+		kem, err := callRealm("__mlkemRun", 20*time.Second, qc.NewArrayBuffer(req))
+		if err != nil || len(kem) != 33 || kem[0] != 1 {
+			t.Fatalf("msg2 oracle: decapsulation failed (%d bytes): %v", len(kem), err)
+		}
+		key := akeReferenceHash(ee, kem[1:], bytes.Repeat([]byte{0xb7}, 32), transcript, []byte("seedkernel-c-msg2-v1\x00"))
+		_, ok = sd.aeadDecrypt(msg[ctEnd:], make([]byte, 12), key)
+		return ok
+	}
+	if !proves(t, msg2) {
+		t.Fatal("the independent msg2 oracle refuses a genuine response")
+	}
+	return msg2, proves
+}
+
+// FuzzAkeMsg2 drives the initiator before it has accepted the responder's ephemeral
+// key or KEM ciphertext. A valid proof earns one msg3; an invalid one earns silence.
+func FuzzAkeMsg2(f *testing.F) {
+	akeFuzzRealm(f)
+	msg2, proves := akeMsg2Oracle(f)
+	f.Add(msg2, akeSplitsOf())
+	f.Add([]byte{}, akeSplitsOf())
+	f.Add(msg2[:len(msg2)-1], akeSplitsOf())
+	f.Add(append(bytes.Clone(msg2), 0), akeSplitsOf())
+	f.Add(make([]byte, akeSizes.Cap+1), akeSplitsOf())
+	f.Add(msg2, akeSplitsOf(akeSizes.M2/2))
+	f.Add(append(bytes.Clone(msg2), msg2...), akeSplitsOf(akeSizes.M2))
+	for _, at := range []int{0, akeSizes.Eph - 1, akeSizes.Eph, akeSizes.Eph + akeSizes.KemCt - 1,
+		akeSizes.Eph + akeSizes.KemCt, akeSizes.M2 - 1} {
+		bad := bytes.Clone(msg2)
+		bad[at] ^= 1
+		f.Add(bad, akeSplitsOf())
+	}
+	lowOrder := bytes.Clone(msg2)
+	clear(lowOrder[:akeSizes.Eph])
+	f.Add(lowOrder, akeSplitsOf())
+	// X25519 ignores this bit. A changed encoding is not necessarily a broken proof.
+	alias := bytes.Clone(msg2)
+	alias[akeSizes.Eph-1] ^= 0x80
+	f.Add(alias, akeSplitsOf())
+	badProof := bytes.Clone(msg2)
+	badProof[len(badProof)-1] ^= 1
+	f.Add(append(badProof, msg2...), akeSplitsOf(akeSizes.M2))
+
+	f.Fuzz(func(t *testing.T, stream, splits []byte) {
+		if len(stream) > 1<<18 {
+			t.Skip()
+		}
+		proved := proves(t, firstAkeMessage(stream, splits))
+		o := akeRun(t, "__fuzzAkeStage", qc.NewInt64(2), qc.NewArrayBuffer(stream), qc.NewArrayBuffer(splits))
+		silentUnderFire(t, "msg2 at an initiator", o, stream, splits)
+		want := 0
+		if proved {
+			want = 1
+		}
+		if len(o.Wire) != want || (want == 1 && o.Wire[0] != akeSizes.M3) {
+			t.Fatalf("msg2: proof=%v, wrote %v, want %d msg3 response(s) — stream %d bytes, splits %v: %x",
+				proved, o.Wire, want, len(stream), head(splits), head(stream))
 		}
 	})
 }
@@ -873,6 +1148,25 @@ func patchesOf(atValue ...int) []byte {
 	out := make([]byte, 0, len(atValue)/2*3)
 	for i := 0; i+1 < len(atValue); i += 2 {
 		out = append(out, byte(atValue[i]>>8), byte(atValue[i]), byte(atValue[i+1]))
+	}
+	return out
+}
+
+// The ratchet interval FuzzAkeShapedRecord runs its session at, passed into the probe so
+// the number lives in one place. The deployment's own is 1<<24 frames — a figure chosen so
+// a link never ratchets in practice, and one no fuzz execution could seal its way to — so
+// a probe that wants the epoch to move has to shorten the interval on both ends. Small
+// enough that a handful of records crosses several boundaries, since every one of them is
+// a real AEAD seal and a real open.
+const akeRecordRekey = 4
+
+// Record patches use uint32 offsets followed by a replacement byte. Handshake
+// patches retain their uint16 format; their fields fit within that range.
+func recordPatchesOf(atValue ...int) []byte {
+	out := make([]byte, 0, len(atValue)/2*5)
+	for i := 0; i+1 < len(atValue); i += 2 {
+		out = binary.BigEndian.AppendUint32(out, uint32(atValue[i]))
+		out = append(out, byte(atValue[i+1]))
 	}
 	return out
 }
@@ -1082,51 +1376,91 @@ func TestAkeReplayIsolation(t *testing.T) {
 // to everything.
 func FuzzAkeShapedRecord(f *testing.F) {
 	akeFuzzRealm(f)
-	// Untouched, at both ends of the size range: the accept path.
-	f.Add([]byte("hello"), []byte{})
-	f.Add(make([]byte, 1), []byte{})
-	f.Add(bytes.Repeat([]byte{7}, 4096), []byte{})
+	// Untouched: the accept path, including the mutation offset boundary.
+	f.Add([]byte("hello"), []byte{}, uint8(0))
+	f.Add(make([]byte, 1), []byte{}, uint8(0))
+	f.Add(bytes.Repeat([]byte{7}, 4096), []byte{}, uint8(0))
 	// The ciphertext's first byte, and a byte inside the tag that follows it.
-	f.Add([]byte("hello"), patchesOf(0, 0))
-	f.Add([]byte("hello"), patchesOf(20, 0))
-	f.Add(bytes.Repeat([]byte{7}, 4096), patchesOf(4095, 1))
+	f.Add([]byte("hello"), recordPatchesOf(0, 0), uint8(0))
+	f.Add([]byte("hello"), recordPatchesOf(20, 0), uint8(0))
+	f.Add(bytes.Repeat([]byte{7}, 4096), recordPatchesOf(4095, 1), uint8(0))
+	// Past a uint16 offset, at the boundary and beyond it: the tail and the tag of a record
+	// no 16-bit patch could name.
+	for _, size := range []int{65535, 65536, 65537, 1 << 18} {
+		if size > akeSizes.Frame-akeSizes.Tag {
+			continue
+		}
+		body := bytes.Repeat([]byte{7}, size)
+		f.Add(body, []byte{}, uint8(0))
+		// Two replacement values, because one of them may be the byte already there: which
+		// it is depends on the ciphertext this session produced, and the seed cannot know.
+		for _, at := range []int{size - 1, size, size + akeSizes.Tag - 1} {
+			f.Add(body, recordPatchesOf(at, 0), uint8(0))
+			f.Add(body, recordPatchesOf(at, 1), uint8(0))
+		}
+	}
+	// The same two outcomes with the session's counters already moved: mid-epoch, exactly on
+	// a ratchet boundary, and past one.
+	for _, lead := range []uint8{1, akeRecordRekey - 1, akeRecordRekey, akeRecordRekey + 1, 3 * akeRecordRekey} {
+		f.Add([]byte("hello"), []byte{}, lead)
+		f.Add([]byte("hello"), recordPatchesOf(0, 0), lead)
+		f.Add([]byte("hello"), recordPatchesOf(20, 0), lead)
+	}
 
-	f.Fuzz(func(t *testing.T, body, patch []byte) {
+	f.Fuzz(func(t *testing.T, body, patch []byte, lead uint8) {
 		// `send` refuses an empty frame (it is the end-of-stream marker) and one that would
 		// seal past the cap, and either would leave the probe with no record to corrupt.
 		if len(body) == 0 || len(body) > akeSizes.Frame-akeSizes.Tag || len(body) > 1<<18 {
 			t.Skip()
 		}
-		if len(patch) > 3*4096 {
+		if len(patch) > 5*4096 {
 			t.Skip()
 		}
-		o := akeRun(t, "__fuzzAkeShapedRecord", qc.NewArrayBuffer(body), qc.NewArrayBuffer(patch))
+		// Enough good records ahead of the fuzzer's to cross three ratchets, the longest lead
+		// putting the fuzzer's own record on the FIRST frame of a fourth epoch — the counter
+		// position a ratchet has just reset. Every one of them is a real seal and a real
+		// open, so this is the ceiling an execution can afford rather than a property
+		// boundary.
+		n := int(lead) % (3*akeRecordRekey + 1)
+		o := akeRun(t, "__fuzzAkeShapedRecord", qc.NewArrayBuffer(body), qc.NewArrayBuffer(patch),
+			qc.NewInt64(int64(n)), qc.NewInt64(akeRecordRekey))
 		covMarkAke(o)
+		// Where the lead alone left the receive side: the probe asserted every one of those
+		// records opened, so this is arithmetic rather than a second claim about them.
+		ctr, epoch := n%akeRecordRekey, n/akeRecordRekey
 		if o.Threw != "" {
-			t.Fatalf("shaped record: threw out of onWire (%q) — body %d bytes, patched %d",
-				o.Threw, len(body), o.Patched)
+			t.Fatalf("shaped record: threw out of onWire (%q) — body %d bytes, patched %d, after %d record(s)",
+				o.Threw, len(body), o.Patched, n)
 		}
 		if len(o.Wire) != 0 {
 			t.Fatalf("shaped record: answered a record with %v — a record is not a message this layer replies to", o.Wire)
 		}
 		if o.Patched == 0 {
 			// Untouched: this end sealed it, so the other end must open it — once, moving the
-			// counter once, leaving the link up.
-			if o.Delivered != 1 || o.RecvCtr != 1 || o.RecvEpoch != 0 || o.Closed {
-				t.Fatalf("shaped record: a record this session sealed was not accepted — delivered=%d recvCtr=%d recvEpoch=%d closed=%v, body %d bytes",
-					o.Delivered, o.RecvCtr, o.RecvEpoch, o.Closed, len(body))
+			// counter once (and the epoch, if that was the record the interval lands on),
+			// leaving the link up.
+			if o.Delivered != 1 || o.RecvCtr != (n+1)%akeRecordRekey || o.RecvEpoch != (n+1)/akeRecordRekey || o.Closed {
+				t.Fatalf("shaped record: a record this session sealed was not accepted — delivered=%d recvCtr=%d recvEpoch=%d closed=%v, want ctr=%d epoch=%d, body %d bytes after %d record(s)",
+					o.Delivered, o.RecvCtr, o.RecvEpoch, o.Closed,
+					(n+1)%akeRecordRekey, (n+1)/akeRecordRekey, len(body), n)
+			}
+			// And it opened onto what was sealed. Counting deliveries alone would pass a
+			// record whose plaintext came back corrupted.
+			if !o.PlaintextMatches {
+				t.Fatalf("shaped record: an accepted record delivered bytes that are not the %d-byte body it was sealed over (after %d record(s))",
+					len(body), n)
 			}
 			return
 		}
 		// One changed byte anywhere — nonce arithmetic, ciphertext or tag — and it does not
 		// open, the counter does not move, and the link is gone.
 		if o.Delivered != 0 || o.NAuth != 0 {
-			t.Fatalf("shaped record: a record corrupted in %d byte(s) was ACCEPTED (%d delivered) — body %d bytes: %x",
-				o.Patched, o.Delivered, len(body), head(patch))
+			t.Fatalf("shaped record: a record corrupted in %d byte(s) was ACCEPTED (%d delivered) — body %d bytes after %d record(s): %x",
+				o.Patched, o.Delivered, len(body), n, head(patch))
 		}
-		if o.RecvCtr != 0 || o.RecvEpoch != 0 {
-			t.Fatalf("shaped record: a failed open moved the receive counter to epoch %d ctr %d — patched %d byte(s)",
-				o.RecvEpoch, o.RecvCtr, o.Patched)
+		if o.RecvCtr != ctr || o.RecvEpoch != epoch {
+			t.Fatalf("shaped record: a failed open moved the receive counter to epoch %d ctr %d, want epoch %d ctr %d — patched %d byte(s)",
+				o.RecvEpoch, o.RecvCtr, epoch, ctr, o.Patched)
 		}
 		if !o.Closed {
 			t.Fatalf("shaped record: a record corrupted in %d byte(s) left the link up — a proved peer's stream cannot survive one",
