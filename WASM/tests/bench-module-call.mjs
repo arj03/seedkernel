@@ -45,7 +45,7 @@ async function timeWorker(table, reqs, iters) {
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < iters; i++) {
     const r = await table.call("ws", reqs[i % reqs.length]);
-    if (r === null || r.length === 0) throw new Error("ws: module error");
+    if (r.bytes === null || r.bytes.length === 0) throw new Error("ws: module error");
   }
   return Number(process.hrtime.bigint() - t0) / 1e6;
 }
