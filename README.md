@@ -1,8 +1,24 @@
 # Seed kernel: a sandboxed app runtime that grows from signed bundles
 
-*Every app is a confined JS guest over a library of restartable WASM transforms; code arrives only as a signed bundle, and untrusted code runs sandboxed anywhere from a browser tab to a single native binary.*
+Seedkernel runs signed apps in a sandbox — JavaScript, plus WebAssembly for the computation that needs it — across browsers, Node and a small native executable. It gives an app controlled access to storage and to authenticated, encrypted peer connections, and nothing it was not granted. Code arrives only as a signed bundle.
 
-**Build an app: [Writing bundles and clients](docs/CLIENT.md).** Start with a JS guest; WASM is optional. For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand — neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
+That suits three kinds of work:
+
+- **Hosting separately trusted extensions.** A product runs third-party logic in its own slot, where the operator decides which authors may install and what each may reach — without giving that logic the host's file system, sockets or process.
+- **Distributing app updates as signed bundles.** A release is one blob — manifest, guest and modules under hybrid author signatures — verified at admission, checked against a version floor, and installed by atomically replacing the slot. It travels over the same network as everything else, because what admits it is the signature and not the route.
+- **Building peer applications on a shared runtime.** [seed store](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
+
+**Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand — neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
+
+## What it costs
+
+- **More machinery than you need** for an ordinary web app, a single-purpose server, or anything whose author and operator are the same party. A process boundary or a container is the cheaper answer there.
+- **A guest is not a Node or browser environment.** It has ECMAScript intrinsics, four injected globals and one `host.call` seam — no Node APIs, no DOM, no `fetch`, no runtime package imports. Dependencies have to be bundled into flat guest source and must not want any of those. Execution is serialized per realm and bounded in heap and time, so bursty or long work has to fit the deployment's budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
+- **You still write everything above the runtime.** Authorization rules, data model and persistence design, recovery after a realm is discarded, user key management, and the whole UI. What Seedkernel saves you is the runtime and transport plumbing.
+
+## Status
+
+Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seed store](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles. There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Treat the security properties as design intent, not as verified.
 
 ## What runs today
 
