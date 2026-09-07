@@ -417,8 +417,9 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
   }
   if (env.length < OFF_JSON)
     return null;
-  const edPk = env.slice(OFF_ED_PK, OFF_ML_PK);
-  const mlPk = env.slice(OFF_ML_PK, OFF_ED_SIG);
+  // Only the keys outlive this call (`authorKeys`), so only they own their bytes — a Node Buffer's slice() aliases.
+  const edPk = new Uint8Array(env.subarray(OFF_ED_PK, OFF_ML_PK));
+  const mlPk = new Uint8Array(env.subarray(OFF_ML_PK, OFF_ED_SIG));
   const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
   const mlSig = env.slice(OFF_ML_SIG, OFF_JSON);
   const json = env.slice(OFF_JSON);
@@ -493,7 +494,7 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     // and a different bundle to one that keeps the first, from the same bytes.
     if (name in files)
       throw new Error(`bundle: two files named ${JSON.stringify(name)} in the blob`);
-    files[name] = blob.slice(off, off + dataLen);
+    files[name] = new Uint8Array(blob.subarray(off, off + dataLen));
     off += dataLen;
   }
   // The blob is the entries and nothing else. Same reason as the repeated name above: what

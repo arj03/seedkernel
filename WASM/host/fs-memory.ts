@@ -44,7 +44,8 @@ export class MemoryFs implements Fs {
     }
     // Checked before the copy, committed after it: a failed allocation leaves the old
     // value and the accounting intact.
-    const stored = bytes.slice();
+    // Buffer is a Uint8Array too, but its slice() aliases the caller's storage.
+    const stored = new Uint8Array(bytes);
     this.map.set(key, stored);
     this.used = nextUsed;
   }

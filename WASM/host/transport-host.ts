@@ -438,7 +438,7 @@ export class TransportHost {
         return;
       }
       // A custom RawLink may reuse its callback buffer, so what we hold owns its bytes.
-      try { held.push(bytes.slice()); }
+      try { held.push(new Uint8Array(bytes)); }
       catch {
         this.releaseInboundRead(bytes.length);
         failReadSide();

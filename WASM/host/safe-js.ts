@@ -41,7 +41,7 @@ function getModule(): Promise<QuickJSWASMModule> {
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
     ? (u8.buffer as ArrayBuffer)
-    : (u8.slice().buffer as ArrayBuffer);
+    : new Uint8Array(u8).buffer;
 }
 
 /** Guest execution-time accounting under the current invocation's handoff deadline (§12.3). */

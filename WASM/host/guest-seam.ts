@@ -350,7 +350,7 @@ export function appSigner(
  *  that format is a bundle update and never a kernel change. An absent network key is the
  *  public network's zero key, said explicitly (§12.6). */
 export function linkSignScope(key: Keypair, networkKey?: Uint8Array): SignScope {
-  return { domain: DOMAIN_LINK_SCOPE, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
+  return { domain: DOMAIN_LINK_SCOPE, scope: networkKey ? new Uint8Array(networkKey) : new Uint8Array(32), key };
 }
 /** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
  *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope ‖
@@ -429,7 +429,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return ZERO;
       }
     },
-    "node/identity": () => identity.publicKey.slice(),
+    "node/identity": () => new Uint8Array(identity.publicKey),
     "node/random": (payload) => {
       const n = readU32BE(payload, 0);
       if (n > MAX_RANDOM_BYTES)

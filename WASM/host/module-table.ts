@@ -377,7 +377,8 @@ export class ModuleTable implements PureModuleLoader {
     if (w.worker === null) await this.respawn(w);
     const worker = w.worker;
     if (!worker) return { bytes: null, ms: 0 };
-    const input = payload.slice();
+    // Own an exact-sized, transferable buffer even when the caller passed a Node Buffer.
+    const input = new Uint8Array(payload);
     // Held open for the duration of the call: an unbounded call arms no timer, and the
     // caller is awaiting an answer only this worker can give.
     worker.keepAlive(true);
