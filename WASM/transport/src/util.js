@@ -29,15 +29,16 @@ function writeU32BE(out, off, v) {
 function readU32BE(b, off) { return ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0; }
 
 const HEX = "0123456789abcdef";
+const HEX_BYTE = Array.from({ length: 256 }, (_, i) => HEX[i >> 4] + HEX[i & 15]);
 function toHex(b) {
   let s = "", i = 0;
-  // Peer ids cross this interpreter on every record. Format eight unsigned
-  // words per 32-byte id instead of concatenating 64 separate digits.
-  for (; i + 4 <= b.length; i += 4) {
-    const word = b[i] * 0x1000000 + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
-    s += word.toString(16).padStart(8, "0");
-  }
-  for (; i < b.length; i++) { s += HEX[b[i] >>> 4] + HEX[b[i] & 15]; }
+  // Peer ids cross this interpreter on every record. A table lookup per byte, four
+  // bytes per append: cheaper than formatting an unsigned word with toString(16) and
+  // padStart, and the unroll is what carries it — QuickJS pays per append, not per
+  // lookup, so the same table one byte at a time is slower than either.
+  for (; i + 4 <= b.length; i += 4)
+    s += HEX_BYTE[b[i]] + HEX_BYTE[b[i + 1]] + HEX_BYTE[b[i + 2]] + HEX_BYTE[b[i + 3]];
+  for (; i < b.length; i++) s += HEX_BYTE[b[i]];
   return s;
 }
 /** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range

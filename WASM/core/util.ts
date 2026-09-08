@@ -7,17 +7,17 @@ const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
-/** Four bytes per string operation, not one per byte: this formats every peer id, block
+/** A byte-to-digit-pair table, four bytes per append: this formats every peer id, block
  *  id and key the runtime prints, and the native shell runs it in QuickJS, where the
- *  per-append cost dominates. The multiply rather than `<< 24` keeps the high byte
- *  unsigned past 0x7fffffff, and padStart restores the leading zeros `toString` drops.
- *  The tail covers the 1-3 bytes of a length that is not a multiple of four. */
+ *  per-append cost dominates (the same table one byte at a time is the slowest of the
+ *  three shapes there). It replaced formatting a 32-bit word with toString(16) and
+ *  padStart, which the table beats on both engines. The tail covers the 1-3 bytes of a
+ *  length that is not a multiple of four (never taken by the 32-byte ids on the hot
+ *  path, but toHex is not restricted to them). */
 export function toHex(b: Uint8Array): string {
   let out = "", i = 0;
-  for (; i + 4 <= b.length; i += 4) {
-    const word = b[i] * 0x1000000 + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
-    out += word.toString(16).padStart(8, "0");
-  }
+  for (; i + 4 <= b.length; i += 4)
+    out += HEX_BYTE[b[i]] + HEX_BYTE[b[i + 1]] + HEX_BYTE[b[i + 2]] + HEX_BYTE[b[i + 3]];
   for (; i < b.length; i++) out += HEX_BYTE[b[i]];
   return out;
 }
