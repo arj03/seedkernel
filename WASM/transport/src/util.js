@@ -30,8 +30,14 @@ function readU32BE(b, off) { return ((b[off] << 24) | (b[off + 1] << 16) | (b[of
 
 const HEX = "0123456789abcdef";
 function toHex(b) {
-  let s = "";
-  for (let i = 0; i < b.length; i++) { s += HEX[b[i] >>> 4] + HEX[b[i] & 15]; }
+  let s = "", i = 0;
+  // Peer ids cross this interpreter on every record. Format eight unsigned
+  // words per 32-byte id instead of concatenating 64 separate digits.
+  for (; i + 4 <= b.length; i += 4) {
+    const word = b[i] * 0x1000000 + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
+    s += word.toString(16).padStart(8, "0");
+  }
+  for (; i < b.length; i++) { s += HEX[b[i] >>> 4] + HEX[b[i] & 15]; }
   return s;
 }
 /** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range

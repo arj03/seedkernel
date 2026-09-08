@@ -111,13 +111,6 @@ function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
   };
 }
 
-/** Stage the entrypoint argument as the realm global `__arg` (copy boundary). */
-function stageArg(ctx: QuickJSContext, payload: Uint8Array): void {
-  const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
-  ctx.setProp(ctx.global, "__arg", argHandle);
-  argHandle.dispose();
-}
-
 /** Take ownership of a result handle and copy its bytes out (copy boundary). The handle
  *  must go back even when the value is not an ArrayBuffer: an orphaned handle keeps its
  *  object on the runtime's GC list, which aborts the module at runtime free. */
@@ -130,8 +123,6 @@ function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
     handle.dispose();
   }
 }
-
-const invokeSrc = `__invoke(__arg)`;
 
 /** Release a settled `resolvePromise` result (a `DisposableResult` carrying a dup'd
  *  handle) that no invocation will ever consume. Best-effort: the handle may already
@@ -396,28 +387,35 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // spends settling later is charged to whichever window is open — which is whose turn
     // the guest code actually runs on.
     clock.reset(deadlineMs);
-    stageArg(ctx, payload);
-    // evalCode runs the entrypoint synchronously up to its first await; the completion value
+    // Call the preamble directly: parsing the same expression per message adds work to
+    // every wire chunk, and staging a global argument retains its bytes until the next call.
+    // callFunction runs the entrypoint synchronously up to its first await; the completion value
     // is either the bytes (sync entrypoint) or a pending guest promise (async entrypoint).
     // resolvePromise normalizes both to a native promise, but it settles only once the job
     // queue is pumped — hence resolvePromise → executePendingJobs → await, in that order
     // (awaiting before the first pump would stall a sync entrypoint). Awaits are then driven
     // by each deferred's own executePendingJobs on settle.
-    let evalResult: QuickJSHandle | undefined;
+    let callResult: QuickJSHandle | undefined;
     let settledNative: Promise<unknown> | undefined;
     causalContext.run(causalClock, () => {
       clock.begin(causalClock);
+      let entrypoint: QuickJSHandle | undefined;
+      let argument: QuickJSHandle | undefined;
       try {
-        evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc, "safe-js-invoke.js"));
-        settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
+        entrypoint = ctx.getProp(ctx.global, "__invoke");
+        argument = ctx.newArrayBuffer(toArrayBuffer(payload));
+        callResult = ctx.unwrapResult(ctx.callFunction(entrypoint, ctx.undefined, argument));
+        settledNative = ctx.resolvePromise(callResult) as Promise<unknown>;
         pumpJobs();
       } finally {
         // Closed before the await below: past this point the host is waiting on the seam,
         // which is not the guest's time to spend.
         clock.end();
-        // resolvePromise has consumed the value; the eval handle must go back even when
+        // resolvePromise has consumed the value; the result handle must go back even when
         // pumpJobs throws, or it aborts the module at runtime free.
-        evalResult?.dispose();
+        callResult?.dispose();
+        argument?.dispose();
+        entrypoint?.dispose();
       }
     });
     // Read before anything awaits, so no later invocation's `__invoke` can have cleared it.

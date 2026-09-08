@@ -7,10 +7,19 @@ const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
+/** Four bytes per string operation, not one per byte: this formats every peer id, block
+ *  id and key the runtime prints, and the native shell runs it in QuickJS, where the
+ *  per-append cost dominates. The multiply rather than `<< 24` keeps the high byte
+ *  unsigned past 0x7fffffff, and padStart restores the leading zeros `toString` drops.
+ *  The tail covers the 1-3 bytes of a length that is not a multiple of four. */
 export function toHex(b: Uint8Array): string {
-  const out = new Array<string>(b.length);
-  for (let i = 0; i < b.length; i++) out[i] = HEX_BYTE[b[i]];
-  return out.join("");
+  let out = "", i = 0;
+  for (; i + 4 <= b.length; i += 4) {
+    const word = b[i] * 0x1000000 + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
+    out += word.toString(16).padStart(8, "0");
+  }
+  for (; i < b.length; i++) out += HEX_BYTE[b[i]];
+  return out;
 }
 
 /** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range

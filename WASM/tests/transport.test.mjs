@@ -8,8 +8,30 @@ import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } fr
 import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
 import { parsePeerRef, parseDest, peersConfig } from "../build/host/peer-addr.js";
 import { testkit } from "./testkit.mjs";
+import { readFileSync } from "node:fs";
+import { toHex } from "../build/core/util.js";
+import { createSafeRealm } from "../build/host/safe-js.js";
 
 const { test, assert, summary } = testkit();
+
+await test("host and confined transport hex preserve unsigned words, padding, tails and views", async () => {
+  const source = readFileSync(new URL("../transport/src/util.js", import.meta.url), "utf8");
+  const realm = await createSafeRealm({
+    source: source + '\nfunction handle(b) { return Uint8Array.from(toHex(b), c => c.charCodeAt(0)); }',
+    hostCall: async () => new Uint8Array(),
+  });
+  try {
+    const data = Uint8Array.from({ length: 272 }, (_, i) => i & 255);
+    const cases = [new Uint8Array(33), new Uint8Array(35).fill(255), data];
+    for (let n = 0; n <= 67; n++) cases.push(data.subarray(n % 8, n % 8 + n));
+    for (const bytes of cases) {
+      const expected = Buffer.from(bytes).toString("hex");
+      assert(toHex(bytes) === expected, `host hex (${bytes.length} bytes, offset ${bytes.byteOffset})`);
+      const actual = new TextDecoder().decode(await realm.call(bytes));
+      assert(actual === expected, `guest hex (${bytes.length} bytes, offset ${bytes.byteOffset})`);
+    }
+  } finally { realm.dispose(); }
+});
 
 console.log("\nRFC 6455 module conformance (ws.wasm, a module of the transport bundle)\n");
 

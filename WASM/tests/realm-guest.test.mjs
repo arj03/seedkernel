@@ -1091,12 +1091,10 @@ async function testPreviousAbiRefused() {
 }
 
 async function testSafeRealmConcurrency() {
-  console.log("Test: concurrent call()s on one safe-js realm interleave without __arg clobber");
+  console.log("Test: concurrent call()s on one safe-js realm retain their own arguments");
 
-  // No Asyncify, so overlapping initiator calls are allowed to run concurrently. Each
-  // call stages __arg and consumes it synchronously (before the first await) during its
-  // evalCode, so a second call staging __arg can never corrupt the first's captured arg —
-  // no host-side serialization needed.
+  // Concurrent callers queue at the realm boundary. Each entry passes its own argument
+  // handle synchronously, before the first await, and retains those bytes while parked.
   const realm = await createSafeRealm({
     source: `async function handle(a) { return await host.call("echo", a); }`,
     hostCall: (_name, p) => sleep(10).then(() => p),
