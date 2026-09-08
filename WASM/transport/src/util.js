@@ -50,9 +50,11 @@ for (let i = 0; i < 16; i++) {
   NIBBLE["0123456789ABCDEF".charCodeAt(i)] = i + 1;
 }
 function fromHex(s) {
-  const out = new Uint8Array(s.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    const hi = NIBBLE[s.charCodeAt(i * 2)], lo = NIBBLE[s.charCodeAt(i * 2 + 1)];
+  const n = s.length / 2, out = new Uint8Array(n);
+  // Carry a cursor rather than multiplying the index by two per byte: QuickJS charges
+  // enough per arithmetic op for that to be worth ~15% on this interpreter.
+  for (let i = 0, j = 0; i < n; i++, j += 2) {
+    const hi = NIBBLE[s.charCodeAt(j)], lo = NIBBLE[s.charCodeAt(j + 1)];
     out[i] = hi && lo ? ((hi - 1) << 4) | (lo - 1) : 0;
   }
   return out;
