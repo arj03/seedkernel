@@ -4,18 +4,77 @@ package main
 // in ws.wasm's vectorized loop (assembly/ws/index.ts `maskRun`).
 //
 // The loop masks eight bytes at a time, then four, then the last 0..3 one at a time, so a
-// payload's length mod 8 chooses which of the three paths runs and how they hand over. A
-// byte-at-a-time loop had no such seams; this one does, and the fuzzer reaches them only by
-// chance. So the lengths below are walked exhaustively across the boundaries rather than
-// sampled, in both directions, against the spec-written oracle in fuzz_ws_test.go
-// (`refDecodeOne`) — which masks one byte at a time and is the second implementation this
-// asserts against.
+// payload's length mod 8 chooses which of the three paths runs and how they hand over. So
+// the lengths below are walked exhaustively across the boundaries, in both directions,
+// against a frame masked one byte at a time by hand.
 
 import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
+
+	"seedloader/qjs"
 )
+
+const (
+	// assembly/ws/abi.ts
+	wsOpEncode    = 1
+	wsOpDecodeOne = 2
+	wsFrame       = 1 // decodeOne's status for a whole frame
+)
+
+// wsModuleJS lifts ws.wasm out of the transport bundle the host already embeds, so the
+// module under test is always the one that ships in the signed bundle.
+const wsModuleJS = `
+globalThis.__wsModuleBytes = () => unpackBundle(transportBundleBytes())["ws.wasm"];
+`
+
+// wsModule stands the codec up on the module table's runtime. The scratch floor mirrors
+// core/wasm-limits.ts DEFAULT_SCRATCH_SIZE; ws.wasm exports its own larger `scratchSize`,
+// so this only has to be a floor it clears.
+func wsModule(t *testing.T) *boundModule {
+	t.Helper()
+	bootRealm(t)
+	if _, err := qc.Eval("ws-module.js", qjs.Code(wsModuleJS)); err != nil {
+		t.Fatal("ws module probe:", err)
+	}
+	wasm, err := callRealm("__wsModuleBytes", 20*time.Second)
+	if err != nil {
+		t.Fatal("ws.wasm out of the transport bundle:", err)
+	}
+	w, err := instantiateWasm(wasm, 128*1024, -1)
+	if err != nil {
+		t.Fatal("instantiate ws.wasm:", err)
+	}
+	t.Cleanup(func() { closeModule(w) })
+	return w
+}
+
+// wsCall stages one request and returns handle()'s answer, unclamped: a length past the
+// scratch is a finding here, not something to trim the way the host's callModule does.
+func wsCall(t *testing.T, w *boundModule, req []byte) []byte {
+	t.Helper()
+	mem := w.mod.Memory()
+	if uint32(len(req)) > w.size || !mem.Write(w.scratch, req) {
+		t.Fatalf("could not stage a %d-byte request in a %d-byte scratch", len(req), w.size)
+	}
+	// Zero what lies past the request, so an answer the module never wrote cannot be read
+	// back as the previous length's.
+	if tail, ok := mem.Read(w.scratch+uint32(len(req)), 64); ok {
+		clear(tail)
+	}
+	r, err := w.fn.Call(ctx, uint64(len(req)))
+	if err != nil {
+		t.Fatalf("ws.wasm trapped on a %d-byte request: %v", len(req), err)
+	}
+	n := int32(r[0])
+	if n < 0 || uint32(n) > w.size {
+		t.Fatalf("ws.wasm answered %d bytes from a %d-byte scratch", n, w.size)
+	}
+	out, _ := mem.Read(w.scratch, uint32(n))
+	return bytes.Clone(out)
+}
 
 // wsMaskKey is deliberately four DIFFERENT non-zero octets: a key with a repeat, or a zero
 // byte, would let a loop that mixes up its lane order still pass.
@@ -43,9 +102,8 @@ func wsMaskPayload(n int) []byte {
 	return p
 }
 
-// wsMaskedFrame builds one masked binary frame by hand, in the minimal length encoding the
-// oracle insists on. Hand-built rather than produced by the module, so a decode test is not
-// checking the encoder against itself.
+// wsMaskedFrame builds one masked binary frame by hand, one byte at a time, in the minimal
+// length encoding RFC 6455 §5.2 requires — so neither test checks the module against itself.
 func wsMaskedFrame(payload []byte) []byte {
 	var f []byte
 	n := len(payload)
@@ -65,71 +123,42 @@ func wsMaskedFrame(payload []byte) []byte {
 	return f
 }
 
-// TestWsMaskDecodeEveryTail decodes a masked frame at each length and checks the unmasked
-// payload against the oracle's. This is the SERVER side: every frame a browser edge sends is
-// masked, so it is the whole inbound data path.
+// TestWsMaskDecodeEveryTail decodes a masked frame at each length. This is the SERVER side:
+// every frame a browser edge sends is masked, so it is the whole inbound data path.
 func TestWsMaskDecodeEveryTail(t *testing.T) {
 	w := wsModule(t)
 	for _, n := range wsMaskLengths() {
 		payload := wsMaskPayload(n)
 		frame := wsMaskedFrame(payload)
-		req := append([]byte{wsOpDecodeOne, 1}, frame...)
-		got, out := wsCall(t, w, req)
-		want := refDecodeOne(true, frame)
-
-		if want.status != wsFrame {
-			t.Fatalf("len %d: the oracle refused a frame this test built (status %d)", n, want.status)
+		// [status][fin|opcode][consumed u32][payloadLen u32][payload]
+		out := wsCall(t, w, append([]byte{wsOpDecodeOne, 1}, frame...))
+		if len(out) < 10 || out[0] != wsFrame {
+			t.Fatalf("len %d: module answered %d bytes, want a frame", n, len(out))
 		}
-		if got < 10 || out[0] != wsFrame {
-			t.Fatalf("len %d: module answered %d bytes, status %d; want a frame", n, got, out[0])
+		if consumed := binary.BigEndian.Uint32(out[2:6]); int(consumed) != len(frame) {
+			t.Fatalf("len %d: consumed %d of a %d-byte frame", n, consumed, len(frame))
 		}
-		if consumed := binary.BigEndian.Uint32(out[2:6]); int(consumed) != want.consumed {
-			t.Fatalf("len %d: consumed %d, oracle says %d", n, consumed, want.consumed)
-		}
-		gotLen := binary.BigEndian.Uint32(out[6:10])
-		if int(gotLen) != n {
+		if gotLen := binary.BigEndian.Uint32(out[6:10]); int(gotLen) != n {
 			t.Fatalf("len %d: module reports payloadLen %d", n, gotLen)
 		}
-		if !bytes.Equal(out[10:10+gotLen], want.payload) {
-			t.Fatalf("len %d: unmasked payload differs from the oracle's at byte %d",
-				n, firstByteDiff(out[10:10+gotLen], want.payload))
-		}
-		// Against the ORIGINAL too, not only the oracle: the two agreeing on a wrong answer
-		// is the one thing a second implementation cannot rule out by itself.
-		if !bytes.Equal(out[10:10+gotLen], payload) {
-			t.Fatalf("len %d: unmasked payload is not what was masked", n)
+		if !bytes.Equal(out[10:], payload) {
+			t.Fatalf("len %d: unmasked payload differs at byte %d", n, firstByteDiff(out[10:], payload))
 		}
 	}
 }
 
-// TestWsMaskEncodeEveryTail masks on the way OUT — the client side — and reads the frame
-// back with the oracle. Same lengths, so both directions cross the same loop seams.
+// TestWsMaskEncodeEveryTail masks on the way OUT — the client side — and checks the frame
+// byte for byte against the hand-masked one. Same lengths, so both directions cross the
+// same loop seams.
 func TestWsMaskEncodeEveryTail(t *testing.T) {
 	w := wsModule(t)
 	for _, n := range wsMaskLengths() {
 		payload := wsMaskPayload(n)
 		req := append([]byte{wsOpEncode, 0x2, 1}, wsMaskKey[:]...)
-		req = append(req, payload...)
-		got, out := wsCall(t, w, req)
-		if got <= 0 {
-			t.Fatalf("len %d: encode answered %d bytes", n, got)
-		}
-		// The oracle reads what a server would: a masked frame it must unmask itself.
-		dec := refDecodeOne(true, out[:got])
-		if dec.status != wsFrame {
-			t.Fatalf("len %d: the oracle would not read the module's own frame (status %d)", n, dec.status)
-		}
-		if dec.consumed != int(got) {
-			t.Fatalf("len %d: frame is %d bytes, oracle consumed %d", n, got, dec.consumed)
-		}
-		if !bytes.Equal(dec.payload, payload) {
-			t.Fatalf("len %d: round-tripped payload differs at byte %d",
-				n, firstByteDiff(dec.payload, payload))
-		}
-		// A masked frame whose payload survived unchanged would mean the mask never ran.
-		// Only worth asserting where there is a byte the key cannot leave alone.
-		if n > 0 && bytes.Equal(out[len(out)-n:got], payload) {
-			t.Fatalf("len %d: the wire bytes are the plaintext — nothing was masked", n)
+		got := wsCall(t, w, append(req, payload...))
+		if want := wsMaskedFrame(payload); !bytes.Equal(got, want) {
+			t.Fatalf("len %d: %d-byte frame differs from the hand-masked %d-byte one at byte %d",
+				n, len(got), len(want), firstByteDiff(got, want))
 		}
 	}
 }

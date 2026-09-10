@@ -21,13 +21,6 @@ import (
 // embeds — the transport guest and ws.wasm. So a checkout whose npm build has not been
 // re-run tests a program that is no longer in the repository, with every suite green.
 //
-// The fuzz targets are where that costs the most, because they reach their subject THROUGH
-// the artifact on purpose: a bundle's own signed content is the thing worth fuzzing, and
-// lifting it out of the blob the host embeds is what makes the framers and the handshake
-// under test the ones that ship. The same indirection is what let FuzzByteParts spend a
-// corpus on a `findHeadEnd` that framing.js had already replaced with `WsFramer.scanHead`,
-// and pass.
-//
 // bundle-loader.mjs stamps the sources it generated from into the artifact
 // (scripts/source-stamp.mjs); this re-hashes them. The file list comes OUT of the artifact,
 // so nothing here restates the build's own set — a source added to the bundle is described
@@ -42,8 +35,8 @@ var shellStamp struct {
 }
 
 // requireFreshShell fails the caller when host-shell.gen.js was generated from sources that
-// have since changed. Once per process: fuzzing re-enters a target thousands of times, and
-// the tree does not move under a running worker.
+// have since changed. Once per process: every realm boot asks, and the tree does not move
+// under a running test binary.
 func requireFreshShell(tb testing.TB) {
 	tb.Helper()
 	shellStamp.Do(func() { shellStamp.err = shellSourceDrift() })

@@ -40,8 +40,7 @@ export function stampedSources(buildFiles) {
   const ws = readdirSync(join(wasmDir, "assembly", "ws"))
     .filter((f) => f.endsWith(".ts"))
     .map((f) => "assembly/ws/" + f);
-  // The guest config the bundle is SIGNED over: content of the artifact, not a build knob,
-  // and the caps every fuzz target reads back out of the manifest.
+  // The guest config the bundle is SIGNED over: content of the artifact, not a build knob.
   return [...new Set([...ts, ...guest, ...ws, "scripts/transport-config.mjs"])].sort();
 }
 

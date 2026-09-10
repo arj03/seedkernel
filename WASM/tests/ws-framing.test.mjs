@@ -1,9 +1,9 @@
 // ws-framing.test.mjs — unit tests for the RFC 6455 STATE MACHINE in transport/src/framing.js
 // (`WsFramer`): fragment reassembly, control-frame interleaving, the pre-auth frame cap,
 // and the read/write serialization `push`/`enqueue` provide over an async, per-frame module
-// call. fuzz_ws_test.go covers ws.wasm's stateless per-frame codec (one call in, one call
-// out); nothing there exercises state carried ACROSS calls, which is everything this file
-// is about.
+// call. transport.test.mjs covers ws.wasm's stateless per-frame codec (one call in, one
+// call out); nothing there exercises state carried ACROSS calls, which is everything this
+// file is about.
 //
 // `WsFramer` is guest code with no module boundary of its own — it shares a scope with
 // util.js (transport/src/util.js) and reads `host`, `N_WS`, `maxFrameBytes`, `randomBytes`
@@ -109,8 +109,7 @@ function concat(parts) {
 }
 
 /** A fresh, already-upgraded SERVER framer — the role that reads a stranger's masked
- *  frames, which is what fuzz_ws_test.go cannot exercise (it drives the codec once, not a
- *  live connection). */
+ *  frames over a live connection. */
 async function serverAfterUpgrade() {
   const { framer, outbox } = makeFramer(false);
   const enc = new TextEncoder();

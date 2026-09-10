@@ -360,6 +360,23 @@ await test("a RECORDED msg1 replayed on a fresh connection draws nothing", async
   await until(() => again[1].sent.length > 0, 4000, "the responder to answer a FRESH msg1");
 });
 
+await test("a node that dials ITSELF never authenticates: its own identity reflected is refused", async (keep) => {
+  // Both ends of this exchange hold the network key and the contact secret, so it gets all
+  // the way to a correctly signed identity — this node's own. Taking it would leave a node
+  // holding a session with itself, on a transcript anything that echoes its traffic can
+  // produce; the refusal is silence, like every other one a responder makes.
+  const st = keep(await upPair());
+  const self = wirePair({ addrA: "10.0.8.1", addrB: "10.0.8.2" });
+  st.A.factory.give(self[0], { weDialed: true, expectPeerId: st.A.peerId });
+  st.A.factory.give(self[1]);
+  // msg1, then msg3: the reflected identity really was put on the wire.
+  await until(() => self[0].sent.length >= 2, 4000, "the dialer to name itself in msg3");
+  await settle();
+  assert(self[1].sent.length === 1,
+    `the responder answered its own reflected identity (${self[1].sent.length} messages, want msg2 alone)`);
+  assert(!(await linkedTo(st.A, st.A.peerId)), "a node must never hold a link to itself");
+});
+
 await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
   // A node that speaks first is a directory service: one connect reads its identity
   // straight off the wire. A caller without the contact secret must get silence — nothing
