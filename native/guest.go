@@ -186,8 +186,10 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	budget time.Duration, maxHostCalls int, maxHostCallBytes int64) (*guestRealm, error) {
 	hostQc := loop.c
 	// The execution bound lives in the engine (qjs.Budget arms the interrupt handler), so
-	// an unbounded realm costs what a bounded one does.
-	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit))
+	// an unbounded realm costs what a bounded one does. WithoutHostObjects is the
+	// confinement half: no quickjs-libc modules or globals and no module loader, so the
+	// realm is ECMAScript intrinsics plus the host.call seam and nothing else (qjs.go).
+	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit), qjs.WithoutHostObjects())
 	if err != nil {
 		return nil, err
 	}

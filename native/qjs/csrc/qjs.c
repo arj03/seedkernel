@@ -1,5 +1,8 @@
 #include "qjs.h"
 
+/* The trusted host context: quickjs-libc's std/os/bjson modules and the globals
+   js_set_global_objs installs (print, console, os.setTimeout, …). Only the host realm
+   may have these — see New_QJSGuestContext for why the confined realm must not. */
 JSContext *New_QJSContext(JSRuntime *rt)
 {
   JSContext *ctx;
@@ -12,11 +15,23 @@ JSContext *New_QJSContext(JSRuntime *rt)
   return ctx;
 }
 
+/* A confined context: the engine's ECMAScript intrinsics and nothing else. quickjs-libc's
+   modules are never registered here, so `import("qjs:os")` cannot re-reach them, and
+   New_QJS leaves the runtime's module loader unset, so no module name can reach the host
+   filesystem either. The realm's whole reach is the `__host_call` seam guest.go installs;
+   without this split, a signed guest could os.sleep() the single event-loop thread past
+   every budget or std.exit() the node. */
+JSContext *New_QJSGuestContext(JSRuntime *rt)
+{
+  return JS_NewContext(rt);
+}
+
 QJSRuntime *New_QJS(
     size_t memory_limit,
     size_t max_stack_size,
     size_t max_execution_time,
-    size_t gc_threshold)
+    size_t gc_threshold,
+    int host_context)
 {
   JSRuntime *runtime;
   JSContext *ctx;
@@ -45,16 +60,25 @@ QJSRuntime *New_QJS(
   if (max_stack_size > 0)
     JS_SetMaxStackSize(runtime, max_stack_size);
 
-  /* setup the the worker context */
-  js_std_set_worker_new_context_func(New_QJSContext);
-  /* initialize the standard objects */
+  /* The libc runtime state every QJS_Eval needs: its trailing js_std_loop dereferences
+     this. Pure bookkeeping — lists and a runtime finalizer, nothing JS-visible — so both
+     realms get it; without it a confined eval blocks in the loop forever. */
   js_std_init_handlers(runtime);
-  /* loader for ES6 modules */
-  JS_SetModuleLoaderFunc(runtime, NULL, QJS_ModuleLoader, NULL);
+
+  /* The trusted host realm additionally gets quickjs-libc's worker-context factory, its
+     module loader and — through New_QJSContext — the std/os/bjson modules and globals. A
+     confined realm gets none of those, so nothing in it can name os/std or load a module. */
+  if (host_context)
+  {
+    /* setup the the worker context */
+    js_std_set_worker_new_context_func(New_QJSContext);
+    /* loader for ES6 modules */
+    JS_SetModuleLoaderFunc(runtime, NULL, QJS_ModuleLoader, NULL);
+  }
   /* exit on unhandled promise rejections */
   // JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
 
-  ctx = New_QJSContext(runtime);
+  ctx = host_context ? New_QJSContext(runtime) : New_QJSGuestContext(runtime);
   if (!ctx)
   {
     JS_FreeRuntime(runtime);
@@ -124,7 +148,7 @@ void initialize()
   size_t memory_limit = 0;
   size_t gc_threshold = 0;
   size_t max_stack_size = 0;
-  qjs = New_QJS(memory_limit, max_stack_size, 0, gc_threshold);
+  qjs = New_QJS(memory_limit, max_stack_size, 0, gc_threshold, 1);
 }
 
 /* ── execution deadline ──────────────────────────────────────────────────────

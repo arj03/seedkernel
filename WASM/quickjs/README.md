@@ -1,7 +1,7 @@
 # quickjs — in-repo quickjs-ng (emscripten) engine for the node/WASM loader
 
 The engine the node-side confined realms run on (`safe-js.ts`), compiled to
-emscripten WASM from the same quickjs-ng v0.16.1 source the native loader
+emscripten WASM from the same quickjs-ng v0.16.2 source the native loader
 builds (`native/qjs/build-qjs.sh`). It replaces the `@jitl/quickjs-ng-*`
 npm variants, which vendored quickjs-ng **0.12.1** — a different engine
 version than the native loader, which is exactly the drift this artifact
@@ -11,7 +11,7 @@ removes.
 
 - **`csrc/interface.c`** — the `QTS_*` ABI shim, forked from
   quickjs-emscripten v0.32.0's `c/interface.c` and **ours now**: it carries
-  the fix for the 0.16.1 `JS_NewArrayBuffer` signature
+  the fix for quickjs-ng's `JS_NewArrayBuffer` signature
   (`free_func` → `max_len` + `realloc_func`, the `realloc(ptr, 0)` free
   convention). Keeping the shim in-repo is what makes the blob reproducible.
 - **`csrc/0001-bellard-module-detection.patch`** — the bellard-style
@@ -42,7 +42,7 @@ Requires the Emscripten SDK (5.0.1) — `emcc` on PATH (e.g. `source
     cd WASM/quickjs
     ./build-quickjs-ng.sh
 
-The script fetches the quickjs-ng **v0.16.1** release amalgam (the same pin
+The script fetches the quickjs-ng **v0.16.2** release amalgam (the same pin
 `native/qjs/build-qjs.sh` compiles from), applies the patch, and installs
 over `dist/`. After a rebuild, re-run the suites:
 
@@ -52,8 +52,8 @@ over `dist/`. After a rebuild, re-run the suites:
 ## Why not the npm variants
 
 The published `@jitl/quickjs-ng-*` packages top out at 0.32.0, which vendors
-quickjs-ng 0.12.1; nothing on npm ships 0.16.1. The native loader already
-built its own 0.16.1 blob (`native/qjs/`), so the node side is the
+quickjs-ng 0.12.1; nothing on npm ships 0.16.2. The native loader already
+built its own 0.16.2 blob (`native/qjs/`), so the node side is the
 odd-one-out only because its engine came from npm. This artifact is that
 same owning-the-blob pattern applied to the emscripten build.
 

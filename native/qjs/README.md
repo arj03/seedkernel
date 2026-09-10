@@ -32,7 +32,7 @@ change to `csrc/` is not live until you run it; `go test ./...` from `native/` d
 every export the bridge uses and is the check that it worked.
 
 The JS platform's engine — `WASM/quickjs/` — is the emscripten build of the **same**
-quickjs-ng pin (v0.16.1, same SHA), so both targets run one engine version; move the
+quickjs-ng pin (v0.16.2, same SHA), so both targets run one engine version; move the
 pin in both build scripts together.
 
 Upstream: https://github.com/fastschema/qjs (MIT) · https://github.com/quickjs-ng/quickjs (MIT)
@@ -60,5 +60,10 @@ call is a plain synchronous Go→wasm call. The loader builds everything async *
 of this surface — a Go-owned event loop, timers, and blocking net — in `../loop.go`.
 A separate `Runtime` is created per realm: a trusted host realm (the sodium/fs/net
 shims + the shared installer/net/guest-seam JS) and a zero-authority confined
-guest realm whose only seam is `host.call`. The wasm links quickjs-libc (WASI);
-confinement hardening of that surface is future work.
+guest realm whose only seam is `host.call`. The wasm links quickjs-libc (WASI), so
+the confinement is a context split: the host realm gets the libc modules and globals
+(`New_QJSContext`), while a guest runtime is created with `WithoutHostObjects`
+(`New_QJSGuestContext`) — std/os/bjson are never registered, `js_set_global_objs`
+never runs, and no module loader is set, so `import("qjs:os")` cannot re-reach them
+and no module name can reach the filesystem. `guest_confinement_test.go` pins both
+halves.

@@ -93,12 +93,15 @@ int QJS_TakeInterrupted(void);
 int QJS_DeadlineHandler(JSRuntime *rt, void *opaque);
 
 JSContext *New_QJSContext(JSRuntime *rt);
+JSContext *New_QJSGuestContext(JSRuntime *rt);
 // QJSRuntime *New_QJS(QJSRuntimeOptions);
+// `host_context` 0 creates a confined context (no quickjs-libc modules, no module loader).
 QJSRuntime *New_QJS(
     size_t memory_limit,
     size_t max_stack_size,
     size_t max_execution_time,
-    size_t gc_threshold);
+    size_t gc_threshold,
+    int host_context);
 void QJS_UpdateStackTop(QJSRuntime *qjs);
 JSModuleDef *QJS_ModuleLoader(JSContext *ctx, const char *module_name, void *opaque);
 JSValue QJS_Load(JSContext *ctx, QJSEvalOptions opts);

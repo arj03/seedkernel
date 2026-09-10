@@ -24,12 +24,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 work="$here/.build"
 wasi_sdk="${WASI_SDK:-/opt/wasi-sdk}"
 
-# quickjs-ng v0.16.1. Moving this is a deliberate engine upgrade: re-run the Go suite,
+# quickjs-ng v0.16.2. Moving this is a deliberate engine upgrade: re-run the Go suite,
 # which drives every export the bridge uses. The node/WASM loader's emscripten build
 # (WASM/quickjs/build-quickjs-ng.sh) pins the SAME commit, so both engines stay one
 # version.
 quickjs_repo="https://github.com/quickjs-ng/quickjs"
-quickjs_pin="954dc53628e36891f93c359aa60895c2ae3dac6b"
+quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 
 [ -d "$wasi_sdk" ] || { echo "no wasi-sdk at $wasi_sdk (set WASI_SDK)" >&2; exit 1; }
 command -v wasm-opt >/dev/null || { echo "wasm-opt not found (install binaryen)" >&2; exit 1; }

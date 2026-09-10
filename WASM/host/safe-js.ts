@@ -15,7 +15,7 @@ import {
 // ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { errMessage } from "../core/util.js";
-// The in-repo quickjs-ng build (quickjs/): the same v0.16.1 the native loader compiles,
+// The in-repo quickjs-ng build (quickjs/): the same v0.16.2 the native loader compiles,
 // emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
 // Only the non-Asyncify (sync) flavour is needed — net is a real Promise resolved by the
 // host, not an Asyncify stack unwind. The cast bridges the ESM variant's typing gap.

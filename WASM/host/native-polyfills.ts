@@ -83,8 +83,8 @@ const POLYFILLS = `
   //
   // Everything here goes to STDERR through the bridge, because stdout is the operator's
   // channel — it carries \`bridge.log\` and, for --op, the app's raw response bytes. Guarded
-  // on the bridge, so only the HOST realm gets it; a confined guest keeps quickjs's
-  // discarding console, matching the JS target's realm holding no console at all.
+  // on the bridge, so only the HOST realm gets it; a confined guest has no console at all
+  // (qjs.WithoutHostObjects), matching the JS target's realm.
   if (typeof bridge !== "undefined" && typeof bridge.logErr === "function") {
     const show = (a) => {
       if (typeof a === "string") return a;

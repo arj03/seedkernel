@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuilds dist/emscripten-module.{wasm,mjs} — the emscripten quickjs-ng 0.16.1
+# Rebuilds dist/emscripten-module.{wasm,mjs} — the emscripten quickjs-ng 0.16.2
 # engine the node/WASM loader runs its confined realms on (safe-js.ts).
 #
 # ONE glue for both targets (`ENVIRONMENT=web,node`): the browser apps vendor
@@ -37,12 +37,12 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$here/.build"
 dist="$here/dist"
-version="v0.16.1"
+version="v0.16.2"
 
-# quickjs-ng v0.16.1 — the SAME pin the native loader builds
+# quickjs-ng v0.16.2 — the SAME pin the native loader builds
 # (native/qjs/build-qjs.sh). Moving this is a deliberate engine upgrade:
 # re-run the WASM and native suites, which drive every export the shim uses.
-quickjs_pin="954dc53628e36891f93c359aa60895c2ae3dac6b"
+quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 
 command -v emcc >/dev/null || { echo "no emcc on PATH (source emsdk_env.sh)" >&2; exit 1; }
 command -v unzip >/dev/null || { echo "unzip not found" >&2; exit 1; }

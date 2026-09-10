@@ -91,6 +91,7 @@ type Option func(*config)
 
 type config struct {
 	memoryLimit uint64 // bytes; 0 = engine default (unbounded)
+	confined    bool   // WithoutHostObjects; false = the trusted host realm
 }
 
 // WithMemoryLimit caps the runtime's total heap. An allocation past the cap fails
@@ -99,6 +100,17 @@ type config struct {
 // (guest.go), which mirrors safe-js.ts's setMemoryLimit on the node/browser target.
 func WithMemoryLimit(bytes uint64) Option {
 	return func(c *config) { c.memoryLimit = bytes }
+}
+
+// WithoutHostObjects creates a CONFINED runtime: quickjs-libc's std/os/bjson modules are
+// not registered and the globals js_set_global_objs installs (print, console, setTimeout,
+// navigator, gc, scriptArgs) are absent, and the runtime is given no module loader — so
+// guest code can neither name `os`/`std` nor reach them through `import()`. The trusted
+// host realm keeps them (the default). See New_QJSGuestContext (csrc/qjs.c) for what the
+// split closes: an admitted guest could otherwise os.sleep() the event loop past every
+// budget or std.exit() the process.
+func WithoutHostObjects() Option {
+	return func(c *config) { c.confined = true }
 }
 
 // Budget bounds the wall time of guest execution on this runtime until the returned
@@ -205,13 +217,18 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	rt.malloc = rt.mod.ExportedFunction("malloc")
 	rt.free = rt.mod.ExportedFunction("free")
 	rt.mem = rt.mod.Memory()
-	// New_QJS(memoryLimit, maxStackSize, maxExecutionTime, gcThreshold); 0 = default.
-	// maxStackSize is load-bearing: QuickJS's default limit (256 KiB) is larger than
-	// qjs.wasm's ~161 KiB shadow stack, so the overflow guard never trips and deep JS
-	// recursion runs the stack off the end of linear memory, trapping as an OOB crash
-	// instead of a catchable "stack overflow". Capping below the real stack makes the
-	// guard fire first — but only once the stack top is calibrated, below.
-	rt.qjs = rt.call("New_QJS", cfg.memoryLimit, maxStackSize, 0, 0)
+	// New_QJS(memoryLimit, maxStackSize, maxExecutionTime, gcThreshold, hostContext);
+	// `hostContext` 0 creates the confined context, 1 the trusted one. maxStackSize is
+	// load-bearing: QuickJS's default limit (256 KiB) is larger than qjs.wasm's ~161 KiB
+	// shadow stack, so the overflow guard never trips and deep JS recursion runs the stack
+	// off the end of linear memory, trapping as an OOB crash instead of a catchable
+	// "stack overflow". Capping below the real stack makes the guard fire first — but only
+	// once the stack top is calibrated, below.
+	hostContext := uint64(1)
+	if cfg.confined {
+		hostContext = 0
+	}
+	rt.qjs = rt.call("New_QJS", cfg.memoryLimit, maxStackSize, 0, 0, hostContext)
 	rt.ctxt = &Context{rt: rt, handle: rt.call("QJS_GetContext", rt.qjs)}
 	// Calibrate QuickJS's stack_top to the actual wasm shadow-SP, which JS_NewRuntime
 	// captured deep inside New_QJS. Recording it from this shallow entry — the depth every
