@@ -302,10 +302,15 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
 	// Guest top-level code is execution just like an entrypoint. Run it under one fresh
-	// budget so installation cannot be wedged before the shell receives a realm.
+	// budget so installation cannot be wedged before the shell receives a realm. The
+	// trailing `;void 0;` neutralizes the script's completion value: QJS_Eval awaits a
+	// global eval whose result is a Promise (csrc/eval.c), and a confined realm has no os
+	// poll loop, so js_std_await would spin inside C on a never-settling top-level promise
+	// — where the Budget interrupt, which only the interpreter consults, can never fire.
+	// The entrypoint's own promise is driven by __start/pump, not by eval.
 	g.consumed = 0
 	if _, err := g.within(func() (*qjs.Value, error) {
-		return g.qc.Eval("guest.js", qjs.Code(source))
+		return g.qc.Eval("guest.js", qjs.Code(source+"\n;void 0;"))
 	}); err != nil {
 		return fail(fmt.Errorf("guest source: %w", err))
 	}

@@ -67,3 +67,11 @@ the confinement is a context split: the host realm gets the libc modules and glo
 never runs, and no module loader is set, so `import("qjs:os")` cannot re-reach them
 and no module name can reach the filesystem. `guest_confinement_test.go` pins both
 halves.
+
+The WASI imports are confined by substitution rather than by the split: a confined
+runtime's `wasi_snapshot_preview1` module is built here
+(`instantiateConfinedWASI`) with every syscall the engine imports stubbed out —
+`poll_oneoff` and the path/fd family answer `ENOSYS`, the void `proc_exit` traps —
+except `clock_time_get`, which the engine's own clock reads. The real host module is
+linked only for the trusted realm. `confined_wasi_test.go` pins that neither
+construction nor any JS path reaches a stub.

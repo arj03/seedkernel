@@ -26,7 +26,11 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 		`)); err != nil {
 			t.Fatal("build seam:", err)
 		}
-		if _, err := callRealm(`createRealm({ source: __src, hostCall: __guestSeam, deadlineMs: 100 })`, 3*time.Second); err == nil {
+		// callRealm appends its own call parens, so the expression must be a function: an
+		// IIFE that awaits the realm. Passing createRealm({...}) directly would evaluate
+		// createRealm({...})() — a TypeError that made this test pass without ever running
+		// the source.
+		if _, err := callRealm(`(async () => { await createRealm({ source: __src, hostCall: __guestSeam, deadlineMs: 100 }); })`, 3*time.Second); err == nil {
 			t.Fatal("top-level guest loop unexpectedly completed")
 		}
 		return
@@ -42,6 +46,44 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("initialization budget probe failed: %v\n%s", err, out)
+	}
+}
+
+// A top-level pending promise is the other way signed guest source can wedge its host:
+// QJS_Eval awaits a global eval whose completion value is a Promise (csrc/eval.c), and a
+// confined realm has no os poll loop, so js_std_await spins inside C — where the Budget
+// interrupt never runs, because only the interpreter consults it. guest.go appends
+// `;void 0;` so the completion value is never a promise; without it this probe hangs the
+// child process instead of returning. Runs in a child for the same reason as the budget
+// probe above: a failed fix cannot be timed out from inside the wedged process.
+func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
+	const marker = "SEEDKERNEL_TEST_GUEST_PENDING_PROMISE"
+	if os.Getenv(marker) == "1" {
+		guestSeamRealm(t)
+		if _, err := qc.Eval("build.js", qjs.Code(`
+			globalThis.__id = sodium.crypto_sign_keypair();
+			__buildGuestSeam([], __id, null);
+			globalThis.__src = "new Promise(() => {})";
+		`)); err != nil {
+			t.Fatal("build seam:", err)
+		}
+		// The IIFE is required: callRealm appends its own call parens.
+		if _, err := callRealm(`(async () => { await createRealm({ source: __src, hostCall: __guestSeam, deadlineMs: 100 }); })`, 3*time.Second); err != nil {
+			t.Fatal("top-level pending promise rejected realm construction:", err)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestGuestRealmPendingPromiseSourceDoesNotWedge$", "-test.v")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("guest pending-promise source wedged its host process: %v\n%s", ctx.Err(), out)
+	}
+	if err != nil {
+		t.Fatalf("pending-promise probe failed: %v\n%s", err, out)
 	}
 }
 

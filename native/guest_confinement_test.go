@@ -7,6 +7,9 @@ package main
 // check. Without the split an admitted guest could `os.sleep()` the single event-loop
 // thread past every budget, `std.exit()` the process, or `import("qjs:os")` to re-reach
 // the modules after the globals were removed — all reproduced before the fix.
+//
+// The engine's WASI imports are confined separately, by substitution: see
+// instantiateConfinedWASI (native/qjs/qjs.go) and native/qjs/confined_wasi_test.go.
 
 import (
 	"strings"

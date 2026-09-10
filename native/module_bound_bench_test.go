@@ -155,9 +155,9 @@ func benchBoundRS(b *testing.B, decode bool) {
 func BenchmarkBoundRSEncode(b *testing.B) { benchBoundRS(b, false) }
 func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 
-// BenchmarkBoundCallOverhead prices the OTHER half of the bound: the per-call
-// `context.WithTimeout` that a finite guest deadline makes callModule build, where an
-// unbounded guest takes a no-op branch. The benchmarks
+// BenchmarkBoundCallOverhead prices the OTHER half of the bound: the shared deadline
+// (module.go moduleDeadline) that a finite guest deadline makes callModule arm and disarm
+// per call, where an unbounded guest takes a no-op branch. The benchmarks
 // above measure the compiled checks, which are billed per back-edge and so are
 // invisible on a call that barely loops; this one measures what every call pays no
 // matter how little it does, on the smallest real module there is (the forwarder,
@@ -169,11 +169,9 @@ func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 // controls. wazero spawns a watchdog goroutine and channel per call whenever the
 // runtime is armed, whatever context it is handed (internal/wasm module_instance.go
 // CloseModuleOnCanceledOrTimeout), so that cost is in both arms and is not what this
-// measures. Measured ~345 ns → ~950 ns, 6 → 11 allocs: a fixed ~600 ns that a bound
+// measures. Measured ~400 ns → ~480 ns, 6 → 6 allocs: a fixed ~80 ns that a bound
 // deployment pays per call, against ~30 µs for the hop the JS targets pay per call for
 // the same bound, and against ~400 µs for the RS calls it actually sits in front of.
-// If a genuinely chatty module ever lands, the fix is to stop rebuilding the timeout
-// per call rather than to give the bound up.
 func BenchmarkBoundCallOverhead(b *testing.B) {
 	ensureBooted(b)
 	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")

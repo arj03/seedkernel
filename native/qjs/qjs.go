@@ -90,8 +90,9 @@ func (r *registry) get(id uint64) goFunc {
 type Option func(*config)
 
 type config struct {
-	memoryLimit uint64 // bytes; 0 = engine default (unbounded)
-	confined    bool   // WithoutHostObjects; false = the trusted host realm
+	memoryLimit uint64       // bytes; 0 = engine default (unbounded)
+	confined    bool         // WithoutHostObjects; false = the trusted host realm
+	wasiProbe   func(string) // set by package tests only; records confined WASI import calls
 }
 
 // WithMemoryLimit caps the runtime's total heap. An allocation past the cap fails
@@ -108,7 +109,8 @@ func WithMemoryLimit(bytes uint64) Option {
 // guest code can neither name `os`/`std` nor reach them through `import()`. The trusted
 // host realm keeps them (the default). See New_QJSGuestContext (csrc/qjs.c) for what the
 // split closes: an admitted guest could otherwise os.sleep() the event loop past every
-// budget or std.exit() the process.
+// budget or std.exit() the process. Its WASI imports are stubbed too
+// (instantiateConfinedWASI).
 func WithoutHostObjects() Option {
 	return func(c *config) { c.confined = true }
 }
@@ -185,10 +187,6 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
-	if _, err := wasi.Instantiate(ctx, rt.wrt); err != nil {
-		return rt, fmt.Errorf("instantiate WASI: %w", err)
-	}
-
 	// The single host import the wasm needs: the JS→Go callback dispatcher. The C
 	// trampoline packs argv as [fnID, ctxID, isAsync, promise, ...realArgs].
 	if _, err := rt.wrt.NewHostModuleBuilder("env").
@@ -202,6 +200,16 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	code, err := rt.wrt.CompileModule(ctx, wasmBytes)
 	if err != nil {
 		return rt, fmt.Errorf("compile qjs.wasm: %w", err)
+	}
+
+	// WASI: the trusted realm links the real module, a confined one the stubs of
+	// instantiateConfinedWASI, which take their signatures from the compiled imports.
+	if cfg.confined {
+		if err := instantiateConfinedWASI(ctx, rt.wrt, cfg.wasiProbe, code.ImportedFunctions()); err != nil {
+			return rt, fmt.Errorf("instantiate confined WASI: %w", err)
+		}
+	} else if _, err := wasi.Instantiate(ctx, rt.wrt); err != nil {
+		return rt, fmt.Errorf("instantiate WASI: %w", err)
 	}
 
 	rt.mod, err = rt.wrt.InstantiateModule(ctx, code, wazero.
@@ -254,6 +262,92 @@ var (
 func sharedCache() wazero.CompilationCache {
 	cacheOnce.Do(func() { cache = wazero.NewCompilationCache() })
 	return cache
+}
+
+// ── confined WASI ─────────────────────────────────────────────────────────────
+
+// WASI preview1 errno values the confined stubs answer with. They are the spec's numbers
+// (ENOSYS 52, EINVAL 28, EFAULT 21), not the host OS's: a stub writes the result stack
+// directly, so it must not route through wazero's POSIX-to-WASI mapping.
+const (
+	wasiErrnoFault = 21
+	wasiErrnoInval = 28
+	wasiErrnoNosys = 52
+)
+
+// monotonicEpoch is the origin the confined realm's CLOCK_MONOTONIC reads from.
+var monotonicEpoch = time.Now()
+
+// instantiateConfinedWASI builds the wasi_snapshot_preview1 module a confined realm's
+// engine imports, with the host authorities removed: every syscall becomes a stub that
+// refuses, except clock_time_get, which stays real because the engine's own
+// clock reads it — js__hrtime_ns drives the Budget interrupt and performance.now, and
+// Date and the Math.random seed read the wall clock. The signatures come from the
+// compiled module's imports, so an import added by a future engine upgrade is stubbed by
+// construction rather than silently linked to the real host module.
+func instantiateConfinedWASI(ctx context.Context, r wazero.Runtime, probe func(string), imports []api.FunctionDefinition) error {
+	b := r.NewHostModuleBuilder(wasi.ModuleName)
+	for _, fn := range imports {
+		mod, name, ok := fn.Import()
+		if !ok || mod != wasi.ModuleName {
+			continue
+		}
+		b.NewFunctionBuilder().
+			WithGoModuleFunction(confinedWASIFunc(name, len(fn.ResultTypes()) > 0, probe), fn.ParamTypes(), fn.ResultTypes()).
+			Export(name)
+	}
+	_, err := b.Instantiate(ctx)
+	return err
+}
+
+// confinedWASIFunc is one confined-realm syscall, chosen once per import: clock_time_get
+// is implemented, every other import refuses with ENOSYS. A void import (proc_exit) panics
+// instead of returning, so an exit that somehow reached the host can never look like a
+// successful one. probe, when set, wraps the choice as the package tests' witness that no
+// JS path reaches a stub; production calls pay nothing for it.
+func confinedWASIFunc(name string, hasResult bool, probe func(string)) api.GoModuleFunc {
+	var fn api.GoModuleFunc
+	switch {
+	case name == "clock_time_get":
+		fn = confinedClockTimeGet
+	case !hasResult:
+		fn = func(context.Context, api.Module, []uint64) {
+			panic("qjs: confined realm called void WASI import " + name)
+		}
+	default:
+		fn = func(_ context.Context, _ api.Module, stack []uint64) { stack[0] = wasiErrnoNosys }
+	}
+	if probe == nil {
+		return fn
+	}
+	return func(ctx context.Context, mod api.Module, stack []uint64) {
+		probe(name)
+		fn(ctx, mod, stack)
+	}
+}
+
+// confinedClockTimeGet implements clock_time_get against Go's clocks: CLOCK_REALTIME (0)
+// from the wall clock, CLOCK_MONOTONIC (1) from a process-stable origin. js__hrtime_ns
+// aborts the engine on any failure, so a bad id is EINVAL and an unwritable result cell
+// EFAULT — never a success with untouched memory.
+func confinedClockTimeGet(_ context.Context, mod api.Module, stack []uint64) {
+	clockID := api.DecodeU32(stack[0])
+	out := api.DecodeU32(stack[2])
+	var ns uint64
+	switch clockID {
+	case 0: // CLOCK_REALTIME
+		ns = uint64(time.Now().UnixNano())
+	case 1: // CLOCK_MONOTONIC
+		ns = uint64(time.Since(monotonicEpoch).Nanoseconds())
+	default:
+		stack[0] = wasiErrnoInval
+		return
+	}
+	if !mod.Memory().WriteUint64Le(out, ns) {
+		stack[0] = wasiErrnoFault
+		return
+	}
+	stack[0] = 0
 }
 
 // Context returns the runtime's JS execution context.
