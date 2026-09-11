@@ -1362,9 +1362,9 @@ async function testCandidateRealmCannotActBeforeCommit() {
     )();
     assert(candidateLocal.custom === "kept",
       "a link slot keeps the load's ordinary installation-local config");
-    assert(candidateLocal.networkKey === "00".repeat(32) &&
+    assert(candidateLocal.networkKey === localConfig.networkKey &&
       candidateLocal.linkIdleTimeoutMs === 1 && candidateLocal.peerId === undefined,
-    "only the driver's one immutable node fact overrides a same-named LOCAL key");
+    "the host passes LOCAL unchanged even for a link slot");
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second privileged init path");
     assertEqual(candidates[0].refused.sort(),

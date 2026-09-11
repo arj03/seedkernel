@@ -533,7 +533,6 @@ async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime>
   const { shell, transport } = await bootShell({
     sodium, identity: cfg.identity, modules, fs,
     freshnessStore: new NativeFreshnessStore(storeDir),
-    networkKey: cfg.networkKey,
     // The sockets and the signed program that drives them, in one object.
     transport: {
       channels,

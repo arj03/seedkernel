@@ -132,7 +132,7 @@ export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, policyFromJson,
 export { scopedFs } from "./fs-view.js";
 
 /** This node's network, whole (§12.6). */
-export interface TransportOptions extends Omit<TransportHostOptions, "networkKey"> {
+export interface TransportOptions extends TransportHostOptions {
   /** The transport bundle to PIN — and, unless `load` is false, to load. Default: the
      *  artifact-shipped one. The pin's author is DERIVED from this blob, so passing different
      *  bytes is a deliberate transport replacement. */
@@ -182,15 +182,6 @@ export interface BootShellOptions {
      *  first realm. */
   createRealm?: RealmFactory;
   now?: () => number;
-  /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate;
-     *  absent ⇒ the public network. It reaches BOTH the transport driver and the signing
-     *  scope of the slot reaching `link` (`slotSignScope`).
-     *
-     *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
-     *  the only binding of a link occupant's signature to this node's network that the slot
-     *  occupant cannot choose. Drop it from the preimage and a transport on one network can
-     *  mint transcripts another's verifier accepts. */
-  networkKey?: Uint8Array;
   /** This node's DEFAULT guest execution and handoff budget per entrypoint invocation,
      *  in ms. Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables the local ceiling.
      *  A finite initiating caller still narrows an unbounded callee. The operator's number,
@@ -238,7 +229,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const now = opts.now ?? (() => Date.now());
   const net = opts.transport === false ? undefined : opts.transport;
   const netHost = net
-    ? new TransportHost(net, { networkKey: opts.networkKey })
+    ? new TransportHost(net)
     : null;
     // The author is DERIVED from the blob, never restated — the pin is the whole of "only
     // this author may be the network" (§12.5).
@@ -379,7 +370,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         localServices,
         // What node/sign signs under: this slot's ONE scope, derived at load —
         // an ordinary app's own `DOMAIN_guest ‖ author ‖ app`, the link slot's
-        // `DOMAIN_link_scope ‖ networkKey` (§12.2). The host chooses what the
+        // `DOMAIN_link_scope` (§12.2). The host chooses what the
         // name means; the seam prefixes and never parses, so no op signs raw
         // bytes.
         signScope: slot.signingScope,
@@ -413,8 +404,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // real undo because a candidate did nothing to undo. One rule over the whole
     // vocabulary and not a list of the names that bite, because the list is what goes
     // stale when a service is added. A top level still initializes — from `APP`/`LOCAL`
-    // and never off this seam, which is why a link occupant's node facts are folded
-    // into its installation-local config (§12.6) rather than read back through here.
+    // and never off this seam. The transport validates its configuration there and
+    // reads node/identity on its first post-commit invocation (§12.6).
     // The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
     return (name, payload, budget) => {
       if (!slot.active) {
@@ -434,14 +425,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const track = (call: Promise<Uint8Array>): Promise<Uint8Array> => {
     inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
     return call;
-  };
-    /** Add the host-owned network key to transport `LOCAL` (§12.10). */
-  const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
-    if (!table.hasLink(slot)) return localConfig;
-    const facts = netHost?.initialConfig();
-    if (!facts)
-      throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
-    return { ...localConfig, ...facts };
   };
   const doUninstall = (appKey: string) => {
     const slot = table.remove(appKey);
@@ -542,7 +525,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // discovering that at the first frame would leave the mark advanced for a
       // bundle that never ran a line.
       try {
-        await standRealm(slot, configFor(slot, localConfig), loadOpts);
+        if (table.hasLink(slot) && !netHost)
+          throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
+        await standRealm(slot, localConfig, loadOpts);
         // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
         // what makes the commit atomic: the gates below, the contest, the mark, and the
         // claim hand-over cannot be interleaved with another load or an uninstall.

@@ -50,16 +50,13 @@ export interface TransportNodeConfig {
   identity: Keypair;
   listen?: ListenAddress;
   wsListen?: ListenAddress;
-  /** Optional network key — which network this node belongs to (an isolation
-   *  boundary, not a gate; §12.6). Absent ⇒ the public network. */
-  networkKey?: Uint8Array;
   /** The signed transport bundle blob, defaulting to the artifact's own. This blob is
    *  what the node's transport author PIN is derived from, so it is how an operator runs
    *  a transport other than the shipped one; the policy must additionally grant that
    *  author the `link` privilege (never the plain `authors` list). A shell without an
    *  admitted transport bundle has no network. */
   transportBundle?: Uint8Array;
-  /** Transport `LOCAL` config, such as peers and `contactSecret` (§12.10). */
+  /** Transport `LOCAL` config, such as peers, `networkKey` and `contactSecret` (§12.10). */
   transportConfig?: JsonObject;
   /** Guest execution and handoff budget per entrypoint invocation, in ms (§12.3).
    *  It bounds guest compute, queue wait, host waits, and deferred answers. `Infinity`

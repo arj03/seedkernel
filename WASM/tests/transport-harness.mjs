@@ -247,6 +247,9 @@ export async function makeTransportHost(opts = {}) {
   };
   const transportConfig = {
     ...(opts.transportConfig ?? {}),
+    ...(opts.networkKey === undefined ? {} : {
+      networkKey: Buffer.from(opts.networkKey).toString("hex"),
+    }),
     ...(opts.contactSecret === undefined ? {} : {
       contactSecret: Buffer.from(opts.contactSecret).toString("hex"),
     }),
@@ -269,7 +272,6 @@ export async function makeTransportHost(opts = {}) {
     // No disk: nothing here declares `fs`, and the in-memory default would be a backend
     // these tests never meant to hand out.
     fs: false,
-    networkKey: opts.networkKey,
     transport,
     createRealm: async (o) => createSafeRealm(opts.onHostCall
       ? {

@@ -2,7 +2,7 @@
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
 
-import { toHex, fromHex, Fifo } from "../core/util.js";
+import { fromHex, Fifo } from "../core/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_FRAME_BYTES,
@@ -15,7 +15,6 @@ import {
 } from "../core/net-limits.js";
 import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
-import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
 import type { CausalClock } from "./realm-queue.js";
 import { OpArgs } from "./op-frame.js";
@@ -24,7 +23,6 @@ const EMPTY = new Uint8Array(0);
 
 /** Link id 0 means no route; its `stream` bit is ignored. */
 const NO_ROUTE = { linkId: 0, stream: false } as const;
-const ZERO32 = new Uint8Array(32);
 
 const ev = (name: LinkEvent) => new OpArgs(name);
 
@@ -42,8 +40,6 @@ export type TransportDeliver = (claim: string, attribution: Uint8Array, payload:
   deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
-  /** Network isolation key; absent selects the public network (§12.6.3). */
-  networkKey?: Uint8Array;
   /** Live raw links this driver will hold at once (default `DEFAULT_MAX_RAW_LINKS`).
  *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
  *  the host's own link table, not the occupant's link states. */
@@ -156,8 +152,7 @@ export class TransportHost {
   port = 0;
   wsPort = 0;
 
-  private readonly opts: Omit<TransportHostOptions, "networkKey">;
-  private readonly nodeFacts: Pick<TransportHostOptions, "networkKey">;
+  private readonly opts: TransportHostOptions;
   private readonly channels = new Map<number, RawLink>;
   private readonly outbound = new Map<number, LinkOutboundOwner>;
   private nextLinkId = 1;
@@ -172,12 +167,8 @@ export class TransportHost {
   private outboundSlices = 0;
   private outboundBytes = 0;
 
-  constructor(
-    opts: Omit<TransportHostOptions, "networkKey">,
-    nodeFacts: Pick<TransportHostOptions, "networkKey">,
-  ) {
+  constructor(opts: TransportHostOptions) {
     this.opts = opts;
-    this.nodeFacts = nodeFacts;
   }
 
   /** Wire `link/deliver` to current peer claims (§12.10). */
@@ -195,11 +186,6 @@ export class TransportHost {
     if (!this.call) return;
     this.call = null;
     this.reset();
-  }
-
-  /** Host-owned transport config (§12.10). */
-  initialConfig(): JsonObject {
-    return { networkKey: toHex(this.nodeFacts.networkKey ?? ZERO32) };
   }
 
   private reserveInboundRead(length: number): boolean {

@@ -88,11 +88,6 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
   const { shell: core, transport } = await bootShell({
     sodium: sodium as unknown as ShellSodium,
     identity: opts.identity,
-    // The node's network (§12.6): an isolation boundary, so it must reach BOTH the
-    // adapter bootShell constructs and the link slot's signing scope (what the
-    // link occupant's node/sign binds to). One field, one place — forwarding it to
-    // only one of the two would sign links under a network the node is not on.
-    networkKey: opts.networkKey,
     fs,
     freshnessStore: freshness,
     // The sockets and the signed program that drives them, in one object.
@@ -121,4 +116,3 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
     // (needed for no-network bootShell callers) is non-null at this boundary.
   return { shell, transport: transport! };
 }
-

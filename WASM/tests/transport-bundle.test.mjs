@@ -110,7 +110,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: {
-      config: { linkIdleTimeoutMs: 321, networkKey: "operator-cannot-replace-this" },
+      config: { linkIdleTimeoutMs: 321, networkKey: "7a".repeat(32) },
       bundle: transportBlob,
     },
     createRealm: async (o) => {
@@ -126,8 +126,8 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   )();
   assert(appConfig.connsPerPeer === TRANSPORT_APP_CONFIG.connsPerPeer,
     "transport defaults arrive from signed APP config");
-  assert(localConfig.linkIdleTimeoutMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.networkKey),
-    "bootShell transport.config reaches LOCAL while the host-owned node fact wins a collision");
+  assert(localConfig.linkIdleTimeoutMs === 321 && localConfig.networkKey === "7a".repeat(32),
+    "bootShell transport.config reaches LOCAL unchanged, including the network key");
   shell.close();
 }
 /** One request through a node's app handle to `to` — the path a deployment uses. */
@@ -295,6 +295,17 @@ assert(noConfigFailed && /maxFrameBytes|connsPerPeer|config/.test(noConfigMsg),
   `a transport signing no guest.config fails the load (${noConfigMsg})`);
 assert((await request(a.app, bId, new Uint8Array([9]))).length === 1,
   "…and the standing transport is untouched by the refusal");
+
+// Invalid network config must fail before replacing a working transport.
+for (const networkKey of [null, 32, [], "", "ab".repeat(31), "ab".repeat(33), "AB".repeat(32), "zz".repeat(32)]) {
+  let msg = "";
+  try {
+    await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys), { localConfig: { networkKey } });
+  } catch (e) { msg = e.message; }
+  assert(/config networkKey/.test(msg), `invalid network key fails the load (${msg})`);
+}
+assert((await request(a.app, bId, new Uint8Array([7]))).length === 1,
+  "invalid network config leaves the standing transport serving");
 
 // ── A cohort named wrong is a failed load, not a peer that looks down ────────────
 // The same rule one field over: a half-length peer key would key the guest's address book

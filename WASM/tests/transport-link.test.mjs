@@ -667,7 +667,7 @@ await test("SUBKEYS: one master seed, one derived identity, deterministic", asyn
   assert(!("channel" in a), "derivation returns the keypair directly");
 });
 
-await test("NETWORK KEY: two networks are structurally unable to reach each other", async (keep) => {
+await test("NETWORK KEY: honest transports on different networks cannot link", async (keep) => {
   // A boundary, not access control: the network key seeds the transcript, so every derived
   // key and signature preimage differs and the handshake dies at the first message. A
   // staging fleet and a production one can share addresses, configs and operators and
@@ -685,6 +685,10 @@ await test("NETWORK KEY: two networks are structurally unable to reach each othe
   const net = new Uint8Array(32).fill(1);
   const st2 = keep(await upPair(undefined, { networkKey: net }, { networkKey: net }));
   assert((await aUp(st2)) && (await bUp(st2)), "one network must still link normally");
+
+  const publicPair = keep(await upPair(undefined, {}, { networkKey: new Uint8Array(32) }));
+  assert((await aUp(publicPair)) && (await bUp(publicPair)),
+    "an absent network key selects the same public network as an explicit zero key");
 });
 
 await test("CONTACT SECRET: absent means OPEN — the node still conceals identities", async (keep) => {
@@ -1177,7 +1181,7 @@ await test("DRIVER BACKPRESSURE: one blocked read cannot fill the realm queue", 
   const blockedRead = new Promise((resolve) => { releaseRead = resolve; });
   let acceptedReads = 0;
   const factory = new InjectedChannels();
-  const driver = keep(new TransportHost({ channels: factory }, {}));
+  const driver = keep(new TransportHost({ channels: factory }));
   driver.activate((payload) => {
     const n = payload[0];
     const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
@@ -1219,7 +1223,7 @@ class UnpausableChannel {
 /** A driver whose `linkBytes` answer each test releases by hand, recording what it saw. */
 function heldReadDriver(keep) {
   const factory = new InjectedChannels();
-  const driver = keep(new TransportHost({ channels: factory }, {}));
+  const driver = keep(new TransportHost({ channels: factory }));
   const reads = [];
   let release = null;
   driver.activate((payload) => {
@@ -1339,7 +1343,7 @@ await test("DRIVER BACKPRESSURE: the inbound byte budget is shared by every link
 // is not what a bounded queue promises, and the socket must end up readable again.
 await test("DRIVER BACKPRESSURE: a hold answered synchronously drains whole", async (keep) => {
   const factory = new InjectedChannels();
-  const driver = keep(new TransportHost({ channels: factory }, {}));
+  const driver = keep(new TransportHost({ channels: factory }));
   let reads = 0;
   let releaseFirst;
   driver.activate((payload) => {
@@ -1397,7 +1401,6 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   const factory = new InjectedChannels();
   const driver = keep(new TransportHost(
     { channels: factory, onLinkClosed: (linkId, reason) => downs.push({ linkId, reason }) },
-    {},
   ));
   driver.activate(async (payload) => {
     const n = payload[0];

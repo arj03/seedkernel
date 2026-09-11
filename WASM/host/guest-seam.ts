@@ -15,7 +15,7 @@ export interface SignScope {
   /** Domain tag — `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the slot
      *  holding the raw-link resource. */
   domain: Uint8Array;
-  /** Scope bytes under the domain: `author ‖ app` for an app slot, the network key for
+  /** Scope bytes under the domain: `author ‖ app` for an app slot, empty for
      *  the link slot. */
   scope: Uint8Array;
   /** The keypair that signs. */
@@ -40,9 +40,8 @@ export interface SeamCalls {
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
  *  call that goes the other way — `deliver`, which hands the host a request this occupant
- *  decoded off those links. The node's immutable facts never pass this way — the host
- *  invoked the freshly stood slot once, with them, before the binding is published
- *  (shell-core.ts), and the mutable address book arrives as `addr` events. */
+ *  decoded off those links. Transport configuration arrives in `LOCAL`, identity through
+ *  `node/identity`, and address-book updates as `addr` events. */
 export interface RawNet {
   /** Open an opaque destination; id 0 means no route (§12.1). */
   open(dest: string): { linkId: number; stream: boolean };
@@ -107,7 +106,7 @@ export interface SeamGrants {
   localServices?: ReadonlySet<string>;
   /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
      *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
-     *  the link slot gets `DOMAIN_link_scope ‖ network_key`. The host always chooses
+     *  the link slot gets `DOMAIN_link_scope`. The host always chooses
      *  domain ‖ scope; the guest never supplies either. Without a scope both names are
      *  unavailable, because guest signing and scoped verification are never raw. */
   signScope?: SignScope;
@@ -344,24 +343,23 @@ export function appSigner(
     },
   };
 }
-/** The `link` capability's signing scope: `DOMAIN_link_scope ‖ networkKey`, signed by the
+/** The `link` capability's signing scope: `DOMAIN_link_scope`, signed by the
  *  node's identity key. The suffix is the slot occupant's business and the host does not
  *  look at it — the transport bundle tags its own handshake format inside it, so changing
- *  that format is a bundle update and never a kernel change. An absent network key is the
- *  public network's zero key, said explicitly (§12.6). */
-export function linkSignScope(key: Keypair, networkKey?: Uint8Array): SignScope {
-  return { domain: DOMAIN_LINK_SCOPE, scope: networkKey ? new Uint8Array(networkKey) : new Uint8Array(32), key };
+ *  that format is a bundle update and never a kernel change. Network separation belongs
+ *  to the transport's signed handshake content (§12.6). */
+export function linkSignScope(key: Keypair): SignScope {
+  return { domain: DOMAIN_LINK_SCOPE, scope: new Uint8Array(0), key };
 }
 /** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
- *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope ‖
- *  networkKey` for the slot reaching `link` — the network binding of the channel AUTH is a
- *  fact of the slot, not a second name. A function of admitted facts only: nothing local,
+ *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope`
+ *  for the slot reaching `link`. A function of admitted facts only: nothing local,
  *  and nothing from `protocols`, which move per version and would silently restate what
  *  signed records mean. */
-export function slotSignScope(node: { identity: Keypair; networkKey?: Uint8Array },
+export function slotSignScope(node: { identity: Keypair },
   author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
   return privileges.includes(PRIVILEGE_LINK)
-    ? linkSignScope(node.identity, node.networkKey)
+    ? linkSignScope(node.identity)
     : appSignScope(node.identity, author, app);
 }
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
@@ -404,7 +402,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // ── authorities: each reaches something no confined guest can hold ──────────
     // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope,
     // derived at load: an app slot's own `DOMAIN_guest ‖ author ‖ app`, the link
-    // slot's `DOMAIN_link_scope ‖ network_key`. The guest never picks a namespace.
+    // slot's `DOMAIN_link_scope`. The guest never picks a namespace.
     "node/sign": (payload) => {
       const s = grants.signScope;
       if (!s)

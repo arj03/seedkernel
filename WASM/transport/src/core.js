@@ -11,10 +11,16 @@
 
 let ownPk = null;                       // 32B node channel public key, once `ready` has run
 let ownId = "";                         // the same, hex
-const networkKey = fromHex(LOCAL.networkKey);
 const ZERO32 = new Uint8Array(32);
 
 const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
+
+// Network separation belongs to the transport's handshake, including its signed root.
+// Absent selects the public network; malformed explicit values fail the load.
+if (LOCAL.networkKey !== undefined && !hex32(LOCAL.networkKey)) {
+  throw new Error("transport: config networkKey must be 64 lowercase hex characters");
+}
+const networkKey = LOCAL.networkKey === undefined ? ZERO32 : fromHex(LOCAL.networkKey);
 
 // Inbound gate; zero means open. The host-only `contact` op rotates it at runtime (§12.6.3).
 let contactSecret = ZERO32;

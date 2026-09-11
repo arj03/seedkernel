@@ -27,7 +27,7 @@ export interface AppSlot {
   appScope: string;
   /** THE one scope this slot's `node/sign`/`node/verify` are wired to (`slotSignScope`,
    *  guest-seam.ts): the slot's own `DOMAIN_guest ‖ author ‖ app` when it is an ordinary
-   *  app, its `DOMAIN_link_scope ‖ networkKey` when it reaches `link` — a fact of the
+   *  app, its `DOMAIN_link_scope` when it reaches `link` — a fact of the
    *  slot, not a second name. */
   signingScope: SignScope;
   realm: Realm | null;

@@ -12,7 +12,7 @@ export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
  *  key oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
 /** Guest-seam SIGN for the slot holding the raw-link resource (§12.2, §12.6): that slot's
- *  signatures name one network and never an app's namespace. */
+ *  signatures stay in the link domain and never an app's namespace. */
 export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
 /** Subkey derivation (§12.9): its own domain so a derived seed never coincides with any
  *  other hash this system computes. */

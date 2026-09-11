@@ -189,6 +189,12 @@ the transcript root means every signature *preimage* differs too, so a signature
 on one network is not even a well-formed candidate on another, and a cross-network handshake
 fails at the first message rather than somewhere later and more confusingly.
 
+The network key is ordinary transport `LOCAL` config. The host applies only the constant
+`DOMAIN_link_scope` signing prefix; the transport binds the network through its signed
+root. Network separation therefore trusts the transport: a compromised occupant can ask
+the host to sign another network's transcript using the node's identity. The master seed
+and private signing key remain in the host.
+
 ### 6.3 Why the peer list runs after verification
 
 A filter on an unproven key that refuses visibly is a membership oracle: name any key, watch
@@ -207,8 +213,8 @@ relies on it for channel confidentiality, authentication and attribution.
 
 ## 7. Why one identity key, and not a key per purpose
 
-A node signs for two purposes with one key: the handshake, under `DOMAIN_link_scope ‖
-network_key` (with the transport's own `DOMAIN_channel ‖ transcript` inside), and an app's
+A node signs for two purposes with one key: the handshake, under `DOMAIN_link_scope`
+(with the transport's own `DOMAIN_channel ‖ root ‖ transcript ‖ id` inside), and an app's
 scoped records, under `DOMAIN_guest ‖ author ‖ app`
 ([RUNTIME](RUNTIME.md) §12.6.2b). Deriving a second keypair for the second purpose is the
 obvious hardening, and it is worth saying why it is not done.
@@ -346,7 +352,7 @@ that node. Only §3's deferral limits the *retroactive* damage.
 4. msg1 contains no identity, so a recording plus a later key seizure reveals none.
 5. The receiver's identity does not go out to a caller it then declines.
 6. Neither the contact secret nor the network key appears on the wire.
-7. Nodes on different network keys never link.
+7. Honest transports on different network keys never link.
 8. Subkey derivation is deterministic: a node rebuilds its identity from the seed alone.
 9. Only `close()` emits the end-of-stream record; every failure path is silent. *(§12.6.1)*
 10. A graceful close asks the transport to flush. *(§12.6.1)*

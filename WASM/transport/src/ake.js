@@ -188,7 +188,7 @@ async function kemDecaps(sk, ct) {
 function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
-/** Ask the host to sign under `DOMAIN_link_scope ‖ networkKey` with the node's channel
+/** Ask the host to sign under `DOMAIN_link_scope` with the node's channel
  *  key, which never enters this program. `node/sign` REJECTS when the authority is not
  *  reached, so the `{ok}` shape is a real status: catching here lets the caller abort the
  *  link rather than unwind out of a frame-delivery callback. */
@@ -688,8 +688,7 @@ class Link {
 
   async signIdentity(th) {
     // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
-    // it and prefixes this slot's network scope — which is why the network binding
-    // survives a transport that lies about its own root.
+    // it and prefixes the link domain. This transport binds its network through root.
     const r = await channelSign(this.root, th, ownPk);
     // The seam refused: our own misconfiguration, never the peer's doing, so it aborts —
     // a stall would claim this address went quiet, which is a different fact.

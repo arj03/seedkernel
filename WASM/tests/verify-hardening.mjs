@@ -959,7 +959,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
       listen: async () => ({ port: 0, wsPort: 0 }),
       close() {},
     };
-    const driver = new TransportHost({ channels, ...limits }, {});
+    const driver = new TransportHost({ channels, ...limits });
     driver.activate(() => Promise.resolve(new Uint8Array()));
     const raw = driver.rawNet();
     const { linkId } = raw.open("test");
@@ -1073,7 +1073,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
       close() {},
     },
     maxOutboundBytes: 6,
-  }, {});
+  });
   parentDriver.activate(() => Promise.resolve(new Uint8Array()));
   const parentRaw = parentDriver.rawNet();
   const firstLink = parentRaw.open("a").linkId;
