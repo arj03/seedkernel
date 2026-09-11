@@ -137,13 +137,13 @@ The authoring module also carries the lower-level signing and packing primitives
 
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
-| `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`denyAll`, `admitAll`, `authorAllowlist`, `allOf`, `policyFromJson`) are re-exported here too, so your `admit` comes from the same module | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) (consent and contact-secret rotation), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) (a whole node wrapped as a class) |
+| `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`denyAll`, `admitAll`, `authorAllowlist`, `policyFromJson`) are re-exported here too, so your `admit` comes from the same module | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) (consent and contact-secret rotation), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) (a whole node wrapped as a class) |
 | `./op-frame` | The shared `[opLen u8][op ascii][args …]` codec in `core/op-frame.ts`: `writeOp` for a host loopback, `readOp`/`callerOf` in a guest, and `OpArgs` for structured arguments (`u8`/`u32`/length-prefixed `blob`/`text` fields, built in one pass). The socket driver uses it to encode the kernel's raw-link event ABI; the event field layouts are specified in [RUNTIME §12.2](RUNTIME.md#122-the-guest-seam-the-guest-name-abi). Application and local-service bodies may use it as an optional convention; routing and timers keep those bodies opaque. A guest that cannot import takes the same codec as flat source from `./bundle-author`'s `guestOpFraming`, which stays out of this runtime module so a browser shell does not vendor a source emitter | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js), [seedchat `chat-app.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-app.js), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) |
 | `./shell-node` | The Node platform adapter: `bootNodeShell` wires `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell`, then hands back the shell and channel adapter. This is a Node convenience, not a second kernel assembly; a client that owns its platform wiring calls `bootShell` | [seedstore `shell-run.test.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/shell-run.test.mjs) |
 | `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. When networking is configured, `bootShell` uses this blob by default; import it to pass a replacement explicitly, hash it, or inspect it. `TRANSPORT_SERVICE` beside it is the local service id that blob claims (`"_net"`), which is what you hand `shell.call` to reach the running transport | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
 | `./guest-seam` | `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | [seedstore `manifest.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/manifest.ts) |
 
-For a conventional Node process, `bootNodeShell` is the shortest complete path. The policy lists ordinary app authors. The initial transport is selected explicitly at boot:
+For a conventional Node process, `bootNodeShell` is the shortest complete path. The policy lists ordinary app authors. This node has no network; `transport` options, as `bootShell` takes them, give it one:
 
 ```js
 import { readFile } from "node:fs/promises";
@@ -252,12 +252,12 @@ Identity scopes do not transfer: a new author has its own filesystem namespace, 
 
 The initial transport loads at boot. If the current link owner is uninstalled or replaced by an ordinary app, installing another transport requires booting a new node.
 
-`bootNodeShell` and the native node factory enable transport by default; pass `network: false` for a node without it. Their returned `transport` is then `null`. The CLI sets this choice explicitly: networking requires `--listen`, `--ws-listen`, or `--peers`, and `--transport` and `--contact-secret` are refused without one of them.
+`bootNodeShell` and the native loader's `standUp` take `bootShell`'s own `transport` option, so omitting it stands a node without a network, whose returned `transport` is then `null`; the platform supplies the socket adapter when the options name none. The CLI sets this choice explicitly: networking requires `--listen`, `--ws-listen`, or `--peers`, and `--transport` and `--contact-secret` are refused without one of them.
 
 **Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither adds a host capability, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified `(author, app)` and the signed claim lists `admit` is already handed:
 
 ```js
-import { allOf, policyFromJson } from "seedkernel-wasm/shell-core";
+import { policyFromJson } from "seedkernel-wasm/shell-core";
 import { appKeyFor } from "seedkernel-wasm/bundle";
 
 // Replace these placeholders with approved 64-character lowercase author ids.
@@ -285,10 +285,10 @@ const approvedClaims = (v) => {
 };
 
 // Pass as bootShell({ ...platformOptions, admit }).
-const admit = allOf(basePolicy, approvedClaims);
+const admit = async (v) => (await basePolicy(v)) && approvedClaims(v);
 ```
 
-Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. `allOf` applies these checks to ordinary app candidates, including an app trying to claim `_net`. Bundles requiring `link` bypass this predicate: explicit selection is the trust decision, so these maps cannot constrain a transport's claims. Revocation and freshness apply to both paths.
+Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`. Bundles requiring `link` bypass this predicate: explicit selection is the trust decision, so these maps cannot constrain a transport's claims. Revocation and freshness apply to both paths.
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 

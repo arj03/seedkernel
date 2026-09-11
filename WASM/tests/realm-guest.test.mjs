@@ -161,7 +161,7 @@ async function testPolicy() {
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
-  const { testHost, loadBundle, APP_CTX } = await import("./fixtures.mjs");
+  const { testHost, loadBundle } = await import("./fixtures.mjs");
   const tryLoad = async (policyJson, author, links) => {
     const host = testHost(new ModuleTable());
     const { blob } = authorBundle(sodium, author, {
@@ -171,7 +171,7 @@ async function testPolicy() {
     });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { await loadBundle(host, blob, admit, APP_CTX); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -184,7 +184,7 @@ async function testPolicy() {
 
   const goodHex = toHex(good.id);
   const empty = parsePolicy(JSON.stringify({ authors: [] }));
-  assert(!(await empty({ author: good.id }, APP_CTX)), "an empty author set denies every app");
+  assert(!(await empty({ author: good.id })), "an empty author set denies every app");
   for (const value of ["{ not json", "{}", "[]", "null",
     JSON.stringify({ authors: ["zz".repeat(32)] }),
     JSON.stringify({ authors: [123] }),

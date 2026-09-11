@@ -13,7 +13,7 @@ import (
 
 // Serving (README §12.8, §12.10): the protocol id off the wire is resolved to the
 // installed app whose manifest claims it, and that app answers. There is no native
-// dispatch, which is what these pin — they drive the real boot path (boot → bootNode →
+// dispatch, which is what these pin — they drive the real boot path (boot → standUp →
 // loadBundle → serve), so what runs is the shell's `dispatch`, the same function the
 // Node and browser shells use.
 
@@ -42,15 +42,17 @@ const echoGuestSource = `
 
 // requesterJS stands a second, bundle-less node up in the same realm — just a network
 // and a Transport — so a test can put a real request on a real socket. The node under
-// test is the one bootNode built; this is only the peer knocking on its door.
+// test is the one startNode stood; this is only the peer knocking on its door, under a
+// policy of its own that admits the probe app it asks through.
 const requesterJS = `
 "use strict";
-globalThis.startRequester = async function (holderId, port, contactSecretHex) {
+globalThis.startRequester = async function (holderId, port, contactSecretHex, policyJson) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
-  const node = await makeTransportNode({
+  const node = await standUp({
+    dir: __dir, identity: id, policyJson,
     // Contact policy is transport config (§12.6.3).
-    identity: id, transportConfig: { contactSecret: contactSecretHex },
+    transport: { config: { contactSecret: contactSecretHex } },
   });
   globalThis.__requesterNode = node;
   const net = node.transport;
@@ -87,20 +89,18 @@ globalThis.ask = async (sendArgs) => {
 
 // startRequester boots the second node, loads the probe app into it, and returns its
 // peer id. The app is what actually sends: there is no host-side request facade.
-func startRequester(t *testing.T, holderAuthorHex, holderID string, port int) string {
+func startRequester(t *testing.T, holderID string, port int) string {
 	t.Helper()
 	if _, err := qc.Eval("requester.js", qjs.Code(requesterJS)); err != nil {
 		t.Fatal("requester:", err)
 	}
-	if _, err := callRealm("startRequester", 5*time.Second,
-		qc.NewString(holderID), qc.NewInt32(int32(port)), qc.NewString(testContactSecretHex)); err != nil {
-		t.Fatal("startRequester:", err)
-	}
+	// The requester's own policy admits the probe app's author; the node under test keeps
+	// its own, and answers only what the holder's bundle claims.
 	sender := testAuthor(t)
-	// Widen the policy to admit the probe app's author too — the node under test still
-	// answers only what the holder's bundle claims; this is the requester's own key.
-	if err := applyPolicy(`{"authors":["` + holderAuthorHex + `","` + hex.EncodeToString(sender.id()) + `"]}`); err != nil {
-		t.Fatal("applyPolicy:", err)
+	if _, err := callRealm("startRequester", 5*time.Second,
+		qc.NewString(holderID), qc.NewInt32(int32(port)), qc.NewString(testContactSecretHex),
+		qc.NewString(authorsPolicy(sender.id()))); err != nil {
+		t.Fatal("startRequester:", err)
 	}
 	blob, err := os.ReadFile(writeProbeBundle(t, sender, "probe"))
 	if err != nil {
@@ -134,8 +134,7 @@ func loadedLine(app string, version int, appKey string, serves string) string {
 // its status once it is serving.
 func serveNode(t *testing.T, authorID []byte) nodeStatus {
 	t.Helper()
-	policy := `{"authors":["` + hex.EncodeToString(authorID) + `"]}`
-	return bootShell(t, t.TempDir(), policy, &hostPort{Host: "127.0.0.1", Port: 0})
+	return bootShell(t, t.TempDir(), authorsPolicy(authorID), &hostPort{Host: "127.0.0.1", Port: 0})
 }
 
 // A guest app serves its request side from its own confined realm: the shell resolves
@@ -154,7 +153,7 @@ func TestServeGuestApp(t *testing.T) {
 	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
 		t.Fatalf("bundle load: %s", status)
 	}
-	startRequester(t, hex.EncodeToString(author.id()), st.PeerID, st.Port)
+	startRequester(t, st.PeerID, st.Port)
 	key := []byte("greeting")
 	val := []byte("held by the cohort")
 	fsFrame := make([]byte, 4+len(key)+len(val)) // [klen u32][key][bytes]
@@ -197,7 +196,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, echoKey, "echoapp") {
 		t.Fatalf("echo bundle load: %s", status)
 	}
-	peerID := startRequester(t, hex.EncodeToString(author.id()), st.PeerID, st.Port)
+	peerID := startRequester(t, st.PeerID, st.Port)
 
 	// The module arm: the guest `handle` receives the input, forwards it through
 	// a bare-name module call, and the forwarder's echo makes both halves checkable — the

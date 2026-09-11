@@ -16,7 +16,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,8 +64,11 @@ func setupRS(tb testing.TB) {
 
 	const app = "rsbench"
 	author := testAuthor(tb)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
-		rsSetupErr = fmt.Errorf("applyPolicy: %w", err)
+	// The shared bench realm's node admits no app, so this bench stands its own, under a
+	// policy naming the author it just minted; the harness's loads and invocations reach it.
+	policy := authorsPolicy(author.id())
+	if _, err := startNode(nodeConfig{KeyHex: testKeyHex(tb), PolicyJSON: &policy}); err != nil {
+		rsSetupErr = fmt.Errorf("startNode: %w", err)
 		return
 	}
 	blob := signedModuleBundleBytes(tb, author, app, 1, rsBenchGuestSource, nil, "codec", codec)

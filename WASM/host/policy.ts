@@ -1,28 +1,17 @@
-// Admission predicate (§12.5): one pure function of (verified bundle, AdmissionContext),
-// asked once for an ordinary app between verifyBundle and slot construction. The host's
-// gates (revocation, freshness) run before it for every bundle, transport included, so no
-// posture can lose them, and are asked again at commit, where the facts they read may have
-// moved. Deny-all is the default for ordinary apps.
+// Admission predicate (§12.5): one pure function of the verified bundle, asked once for an
+// ordinary app between verifyBundle and slot construction. The host's gates (revocation,
+// freshness) run before it for every bundle, transport included, so no posture can lose
+// them, and are asked again at commit, where the facts they read may have moved. Deny-all
+// is the default for ordinary apps.
 
 
 import { toHex } from "../core/util.js";
-import { type VerifiedBundle } from "./bundle.js";
+import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
-/** Everything a gate needs, read by the shell and handed to the predicate — which is what
- *  makes the predicate pure and its order irrelevant. Both facts move: a `revoke` or
- *  another load can change them under a load already in flight. */
-export interface AdmissionContext {
-  /** The persisted `(author, app)` freshness high-water mark, or −Infinity if this
-   *  pair has never loaded on this host (README §12.4). */
-  highWater: number;
-  /** Has this host written this author key off (§12.5)? */
-  revoked: boolean;
-}
-
-/** The ONE admission seam. `(v, ctx) → bool | Promise<bool>`.
+/** The ONE admission seam. `(v) → bool | Promise<bool>`.
  *  Return `true` to admit, `false` to reject silently, or throw to reject with a
  *  reason — which is how a rejection stays distinguishable without a result type. */
-export type Admit = (v: VerifiedBundle, ctx: AdmissionContext) => boolean | Promise<boolean>;
+export type Admit = (v: VerifiedBundle) => boolean | Promise<boolean>;
 
 /** The default: nothing is admitted.
  *  A node with no configured predicate refuses every ordinary app install. */
@@ -33,13 +22,15 @@ export const admitAll: Admit = () => true;
 
 /** Revocation (§12.5) before the downgrade guard (§12.4), so a written-off key never reaches
  *  an interactive consent dialog. Equal versions reload, transport included. Sync and
- *  throwing: the loader asks it again in the commit window, which cannot await. */
-export function checkHostGates(v: VerifiedBundle, facts: AdmissionContext): void {
-  if (facts.revoked) {
+ *  throwing, and read off the store at the call: the loader asks it again in the commit
+ *  window, which cannot await, and a `revoke` or another load may have moved both facts. */
+export function checkHostGates(v: VerifiedBundle, store: FreshnessStore): void {
+  if (store.isRevoked(v.author)) {
     throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
   }
-  if (v.manifest.version < facts.highWater) {
-    throw new Error(`bundle: version ${v.manifest.version} is below the (author, app) freshness high-water mark ${facts.highWater} — downgrade refused`);
+  const highWater = store.get(v.author, v.manifest.app);
+  if (v.manifest.version < highWater) {
+    throw new Error(`bundle: version ${v.manifest.version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
   }
 }
 
@@ -47,14 +38,6 @@ export function checkHostGates(v: VerifiedBundle, facts: AdmissionContext): void
 export function authorAllowlist(authors: string[]): Admit {
   const set = new Set(authors.map((a) => a.toLowerCase()));
   return (v) => set.has(toHex(v.author));
-}
-
-/** Logical AND, short-circuiting. A throw keeps the refusal distinguishable. */
-export function allOf(...predicates: Admit[]): Admit {
-  return async (v, ctx) => {
-    for (const p of predicates) if (!(await p(v, ctx))) return false;
-    return true;
-  };
 }
 
 /** Parse the app-author policy, `{ "authors": ["<hex>"] }`. Link authorization comes from

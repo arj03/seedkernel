@@ -83,7 +83,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
-      }, transport: cfg.network === false ? null : { port, wsPort } };
+      }, transport: cfg.transport ? { port, wsPort } : null };
     },
   };
   return host;
@@ -124,7 +124,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
 for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1:0"], ["--peers", ""]]) {
   const host = fakeHost(["--key", join(work, "network.key"), ...flags]);
   await runCli(host);
-  ok(host.stood.network === (flags.length > 0), `network opt-in: ${JSON.stringify(flags)}`);
+  ok(Boolean(host.stood.transport) === (flags.length > 0), `network opt-in: ${JSON.stringify(flags)}`);
 }
 
 // The real Node adapter honors the CLI's switch, including its nullable transport result.
@@ -132,7 +132,7 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1
   const { bootNodeShell } = await imp("build/host/shell-node.js");
   for (const network of [false, true]) {
     const node = await bootNodeShell({
-      dir: mkdtempSync(join(work, "node-")), network,
+      dir: mkdtempSync(join(work, "node-")), transport: network ? {} : false,
       identity: sodium.crypto_sign_keypair(),
     });
     try {
@@ -206,7 +206,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
   writeFileSync(secretPath, good);
   const host = fakeHost(["--key", join(work, "c.key"), "--peers", "", "--contact-secret", secretPath]);
   await runCli(host);
-  ok(host.stood.transportConfig.contactSecret === good,
+  ok(host.stood.transport.config.contactSecret === good,
     "--contact-secret is read from the file it names, into the transport's own config");
 }
 {
@@ -259,7 +259,8 @@ for (const flag of ["--transport", "--contact-secret"]) {
   const host = fakeHost(["--key", join(work, "s1.key"), "--listen", "127.0.0.1:0"], { port: 7777 });
   const r = await runCli(host);
   ok(r.serving === true, "a bound port ⇒ serving");
-  ok(host.stood.listen.host === "127.0.0.1" && host.stood.listen.port === 0, "--listen is parsed as host:port");
+  ok(host.stood.transport.listen.host === "127.0.0.1" && host.stood.transport.listen.port === 0,
+    "--listen is parsed as host:port");
   ok(host.lines.includes("  tcp    listening on :7777"), "the console reports the port actually bound");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }

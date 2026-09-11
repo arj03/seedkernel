@@ -27,11 +27,11 @@ func TestExplicitReplacementAcrossAuthors(t *testing.T) {
 				return hex.EncodeToString(bytes)
 			}
 			expr := fmt.Sprintf(`(async () => {
-			  setPolicy(JSON.stringify({ authors: [%q, %q] }));
+			  const policyJson = JSON.stringify({ authors: [%q, %q] });
 			  const links = %v;
 			  const first = fromHex(%q), second = fromHex(%q);
-			  const n = await makeTransportNode({ identity: sodium.crypto_sign_keypair(),
-			    network: links, transportBundle: first });
+			  const n = await standUp({ dir: __dir, identity: sodium.crypto_sign_keypair(),
+			    policyJson, transport: links && { bundle: first } });
 			  try {
 			    let old;
 			    if (links) {

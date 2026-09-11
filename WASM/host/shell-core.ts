@@ -2,7 +2,7 @@
 // slot table and load order. Explicit replacement selects the owner to retire. Targets
 // displace platform members only (main.ts, native-shim.ts, seedchat, seedstore). Signed
 // bundles are the only way slots land (§12.4).
-import { denyAll, checkHostGates, type Admit, type AdmissionContext } from "./policy.js";
+import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
@@ -23,9 +23,6 @@ export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
  *  (ManifestVerifier) plus the remaining guest crypto ops (SeamCrypto). Core libsodium
  *  build satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
-
-/** Admission refused this verified bundle (§12.4). */
-export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
@@ -124,7 +121,7 @@ export interface AppHandle extends LoadedBundle {
 // Re-exported so a target reaches the admission constructors, and an app's fs view, from
 // the same module it gets bootShell from — how the pieces are split across files here is
 // not a client's problem. Pure-module builders remain target implementations, not shell API.
-export { denyAll, admitAll, authorAllowlist, allOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, policyFromJson, type Admit } from "./policy.js";
 export { scopedFs } from "./fs-view.js";
 
 /** This node's network, whole (§12.6). */
@@ -184,7 +181,9 @@ export interface BootShellOptions {
      *  a single load raises or lowers it for its own realm with
      *  `LoadBundleOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
   realmMemoryBytes?: number;
-  /** Optional node network. The options object is retained to preserve live accessors. */
+  /** This node's network (§12.6): the sockets and the signed transport that drives them.
+     *  Omitted or `false` is a node with no network. The options object is retained to
+     *  preserve live accessors. */
   transport?: TransportOptions | false;
 }
 
@@ -445,17 +444,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     if (!isJsonObject(localConfig))
       throw new Error("shell: localConfig must be a JSON object");
     const v = verifyBundle(sodium, blob);
-    const hostFacts = (): AdmissionContext => ({
-      highWater: freshnessStore.get(v.author, v.manifest.app),
-      revoked: freshnessStore.isRevoked(v.author),
-    });
-    checkHostGates(v, hostFacts());
+    checkHostGates(v, freshnessStore);
     // A candidate reaching `link` is not an app: whether it may take the binding is the
     // slot table's rule (boot selection or replacement of the holder), never consent.
     const links = reachesLink(v.manifest);
     if (bootTransport && !links) throw new Error('shell: the boot transport must require "link"');
-    if (!links && !(await appAdmit(v, hostFacts())))
-      throw new Error(ADMISSION_REJECTED);
+    if (!links && !(await appAdmit(v)))
+      throw new Error("bundle: rejected by admission predicate");
     const loaded: LoadedBundle = {
       manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
       guestSource: v.guestSource,
@@ -485,7 +480,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // Admission read these before the modules and the guest's top level ran, and both
       // move: a newer version can land meanwhile, and `revoke` can name this author. NOT
       // the operator's predicate — consent is not withdrawn by losing a race.
-      checkHostGates(v, hostFacts());
+      checkHostGates(v, freshnessStore);
       checkInstallation();
       // A mark that cannot be persisted throws, and the store has already rolled
       // itself back; the catch below disposes the candidate, so the running slot

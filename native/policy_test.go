@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -9,11 +8,9 @@ import (
 
 // With the bundle author allow-listed, the closed policy still loads the bundle.
 func TestPolicyAllowsBundleAuthor(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(author.id()), nil)
 	bundlePath, appKey := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  key "+appKey) {
 		t.Fatalf("policy-allowed bundle: %s", status)
@@ -22,10 +19,7 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 
 // A policy that omits the bundle author rejects it at the manifest-governance gate.
 func TestPolicyRejectsForeignAuthor(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
-	if err := applyPolicy(`{"authors":["` + strings.Repeat("ab", 32) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	bootShell(t, t.TempDir(), `{"authors":["`+strings.Repeat("ab", 32)+`"]}`, nil)
 	author := testAuthor(t)
 	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
@@ -35,12 +29,9 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 
 // Trusting an app author cannot appoint that author as the transport.
 func TestAppPolicyCannotInstallTransport(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
-	authorHex := hex.EncodeToString(author.id())
-	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
-		t.Fatal(err)
-	}
+	startShell(t, authorsPolicy(author.id()), nil)
 	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link"})
 	if status := loadBundle(linkBundle); !strings.Contains(status, "explicit replacement") {
 		t.Fatalf("app policy must not appoint a transport: %s", status)
@@ -54,10 +45,9 @@ func TestAppPolicyCannotInstallTransport(t *testing.T) {
 func TestTransportNetworkOptional(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	got := awaitOK(t, "transport without app policy", `(async () => {
-	  setPolicy(null);
 	  const identity = deriveNodeKey(sodium, sodium.randombytes_buf(32));
 	  for (const network of [false, true]) {
-	    const node = await makeTransportNode({ identity, network });
+	    const node = await standUp({ dir: __dir, identity, transport: network ? {} : false });
 	    try {
 	      if ((node.transport !== null) !== network) throw new Error("network adapter mismatch");
 	      if ((node.shell.resolve("_net") !== null) !== network) throw new Error("transport slot mismatch");
@@ -70,21 +60,14 @@ func TestTransportNetworkOptional(t *testing.T) {
 	}
 }
 
-// parsePolicy fails loudly on malformed config rather than silently widening trust.
+// parsePolicy fails loudly on malformed config rather than silently widening trust: a
+// node handed one does not stand up at all.
 func TestPolicyMalformed(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	for _, bad := range []string{`{}`, `[]`, `not json`, `{"authors":[123]}`, `{"authors":"x"}`, `{"authors":["zz"]}`, `{"authors":[],"grants":{"link":[]}}`} {
-		if err := applyPolicy(bad); err == nil {
-			t.Fatalf("applyPolicy(%q) = nil, want an error", bad)
+		if _, err := startNode(nodeConfig{KeyHex: testKeyHex(t), PolicyJSON: &bad}); err == nil {
+			t.Fatalf("a node stood up under policy %q, want an error", bad)
 		}
-	}
-	// A rejected policy must not leave the realm wider than it started: the boot default
-	// is deny-all, so nothing installs (README §14). Before, a realm whose policy failed
-	// to parse kept a permissive default and loaded any signed bundle.
-	author := testAuthor(t)
-	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
-		t.Fatalf("after rejected policies the realm must stay deny-all: %s", status)
 	}
 }
 
@@ -113,15 +96,13 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 // (§12.10), so B contesting the id A serves is refused by name — B's own identity is what
 // it may install under, never A's route.
 func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	authorA := testAuthor(t)
 	authorB := testAuthor(t)
 	// Both authors are allowed to install: this test is about the namespace, not the
 	// closed author set. A permissive policy is exactly the interesting case — even with
 	// nothing refusing anyone, neither author can reach the other's names.
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorA.id()) + `","` + hex.EncodeToString(authorB.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(authorA.id(), authorB.id()), nil)
 	keyA := appKeyFor(authorA.id(), "ownedapp")
 	keyB := appKeyFor(authorB.id(), "ownedapp")
 	if keyA == keyB {

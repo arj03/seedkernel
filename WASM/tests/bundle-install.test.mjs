@@ -22,7 +22,7 @@ import {
   verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE,
   signManifest, packBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
   checkHostGates, gHash, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
-  APP_CTX, loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
+  loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
   forwarderBytes, installMod, appKey, imp, root, bytesEqual, callerOf, readOp, writeOp,
   MemoryFs, NodeFs, enc,
 } from "./fixtures.mjs";
@@ -119,7 +119,7 @@ async function testDenyAllPolicyRejects() {
   // `policyFromJson(null)` is the boot default every target shares: a predicate
   // that returns false for every bundle. The absence of a decision is never permission.
   const admit = policyFromJson(null);
-  assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }, APP_CTX),
+  assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
     "deny-all predicate returns false for any VerifiedBundle");
 
   const { host } = await makeHost();
@@ -609,17 +609,14 @@ async function testSlotFreshness() {
     modules: [{ name: "fwd", wasm: forwarderBytes }],
     guestSource: GUEST_TEXT, guestRequires: [],
   }).blob;
-  // The load path as the shell composes it: the host's gates read the store into an
-  // `AdmissionContext` and answer once, installBundle lands the modules, and the mark is
-  // advanced last — after the guest stands, which is the shell's job and why the mark is
-  // written here rather than inside installBundle. The predicate never touches the store,
-  // so "who refuses a downgrade" is one place.
+  // The load path as the shell composes it: the host's gates read the store and answer
+  // once, installBundle lands the modules, and the mark is advanced last — after the guest
+  // stands, which is the shell's job and why the mark is written here rather than inside
+  // installBundle. The predicate never touches the store, so "who refuses a downgrade" is
+  // one place.
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
-    checkHostGates(v, {
-      highWater: freshness.get(v.author, v.manifest.app),
-      revoked: freshness.isRevoked(v.author),
-    });
+    checkHostGates(v, freshness);
     await installBundle(host, v);
     freshness.set(v.author, v.manifest.app, v.manifest.version);
   };

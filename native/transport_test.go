@@ -24,8 +24,8 @@ import (
 // nodes.
 //
 // The realm is the production one — boot() installs the primitives and evaluates the
-// shared bundle — so `makeTransportNode` is the factory the binary boots with, not a
-// harness assembling the stack a second way.
+// shared bundle — so `standUp` is the function the binary boots through, not a harness
+// assembling the stack a second way.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `wsListen: { host: "127.0.0.1", port: 0 },`)
@@ -38,11 +38,11 @@ func TestTwoNodeRequestResponseWS(t *testing.T) {
 func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 	bootRealm(t)
 	if _, err := qc.Eval("source-cap-harness.js", qjs.Code(`
-		setPolicy(JSON.stringify({ authors: [] }));
 		globalThis.__startSourceCapTest = async () => {
-		  globalThis.__sourceCapNode = await makeTransportNode({
+		  globalThis.__sourceCapNode = await standUp({
+		    dir: __dir,
 		    identity: sodium.crypto_sign_keypair(),
-		    listen: { host: "127.0.0.1", port: 0 },
+		    transport: { listen: { host: "127.0.0.1", port: 0 } },
 		  });
 		  return new Uint8Array(0);
 		};
@@ -99,9 +99,8 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 	}
 }
 
-// listenArgs is the `listen, wsListen` pair — makeTransportNode's transport config,
-// the second being the contact secret (§12.6). Both nodes here are open (no secret), so
-// the pair is what selects which transport A binds.
+// listenArgs is A's listener, inside its standUp transport: which listener it binds, and
+// so which codec the pair speaks. Both nodes here are open (no contact secret).
 func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	bootRealm(t)
 
@@ -115,18 +114,18 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		t.Fatal(err)
 	}
 	harness := fmt.Sprintf(`
-		// A node's network IS the transport bundle, so both ends are stood up by
-		// makeTransportNode — the factory bootNode uses — which boots the artifact's own
+		// A node's network IS the transport bundle, so both ends are stood up by standUp —
+		// the function the operator flow boots through — which boots the artifact's own
 		// transport. The policy names only the probe app's author.
-		setPolicy(JSON.stringify({ authors: [%q] }));
+		globalThis.__policy = JSON.stringify({ authors: [%q] });
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.startTest = async function () {
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();
 		  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
-		  const a = await makeTransportNode({ identity: idA, %s });
-		  const b = await makeTransportNode({ identity: idB });
+		  const a = await standUp({ dir: __dir, policyJson: __policy, identity: idA, transport: { %s } });
+		  const b = await standUp({ dir: __dir, policyJson: __policy, identity: idB, transport: {} });
 		  await a.transport.start();
 		  await a.shell.loadBundleBlob(__probe);
 		  const bApp = await b.shell.loadBundleBlob(__probe);

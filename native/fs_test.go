@@ -129,13 +129,13 @@ func TestFsExposedToRealm(t *testing.T) {
 }
 
 // A realm whose store has not been opened is CLOSED — not pointed at the process's
-// working directory. The shared CLI calls `openStore` on its way to standing a node up,
-// which leaves a window where `__fs` exists with no directory, and the honest answer there
-// is an empty store that refuses writes. The failure this pins is the quiet one: a nil
-// backend joining a key to no directory yields the key itself, scattering blocks into
-// whatever directory the binary started from.
+// working directory. `standUp` opens it on its way to standing a node up, which leaves a
+// window where `__fs` exists with no directory, and the honest answer there is an empty
+// store that refuses writes. The failure this pins is the quiet one: a nil backend
+// joining a key to no directory yields the key itself, scattering blocks into whatever
+// directory the binary started from.
 func TestFsClosedUntilOpened(t *testing.T) {
-	if err := boot(); err != nil { // deliberately no openStore
+	if err := boot(); err != nil { // deliberately no store opened
 		t.Fatal("boot:", err)
 	}
 	if _, err := qc.Eval("fs-closed-test.js", qjs.Code(`

@@ -14,19 +14,9 @@ import { FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
 import { NodeFs, writeFileAtomic } from "./fs-node.js";
 import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
-import { type ChannelFactory } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
 import { errMessage } from "../core/util.js";
 import type { NodeRuntime as CliNodeRuntime, NodeSetup } from "./cli.js";
-
-/** What booting a node on THIS platform takes: everything the operator flow already reads
- *  from flags (`NodeSetup`, cli.ts), plus the one seam only a caller inside the process can
- *  hand over. Extending rather than restating it is what keeps `standUp` a pass-through. */
-export interface NodeShellOptions extends NodeSetup {
-  /** The socket seam the transport driver dials and listens through. Defaults to
-     *  a NodeChannelFactory on listen/wsListen. */
-  channels?: ChannelFactory;
-}
 
 /** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
  *  `loadBundle` and a guaranteed `fs` (Node always has a filesystem). */
@@ -78,7 +68,7 @@ export class FileFreshnessStore extends FreshnessMarks {
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
  *  `bootShell` — which installs the selected transport bundle, the signed program that is
  *  the node's network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
-export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRuntime> {
+export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> {
   const sodium = await loadCrypto();
   // ── Node platform seam ─────────────────────────────────────────────────────
   const fs = new NodeFs(opts.dir);
@@ -90,13 +80,9 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
     identity: opts.identity,
     fs,
     freshnessStore: freshness,
-    // The sockets and the signed program that drives them, in one object.
-    transport: opts.network === false ? false : {
-      channels: opts.channels ?? new NodeChannelFactory(),
-      listen: opts.listen,
-      wsListen: opts.wsListen,
-      bundle: opts.transportBundle,
-      config: opts.transportConfig,
+    // The network as configured, over node:net unless the caller brings its own sockets.
+    transport: opts.transport && {
+      ...opts.transport, channels: opts.transport.channels ?? new NodeChannelFactory(),
     },
     admit: policyFromJson(opts.policyJson),
     guestDeadlineMs: opts.guestDeadlineMs,

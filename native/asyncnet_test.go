@@ -40,10 +40,11 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.bId = toHex(idB.publicKey);
 		// Both nodes boot the artifact's own transport, which needs no policy entry; the
 		// policy names only the app's author.
-		setPolicy(JSON.stringify({ authors: [%q] }));
+		globalThis.__policy = JSON.stringify({ authors: [%q] });
 		globalThis.__setup = (async () => {
-		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 } });
-		  const b = await makeTransportNode({ identity: idB });
+		  const a = await standUp({ dir: __dir, policyJson: __policy, identity: idA,
+		    transport: { listen: { host: "127.0.0.1", port: 0 } } });
+		  const b = await standUp({ dir: __dir, policyJson: __policy, identity: idB, transport: {} });
 		  globalThis.netA = a.transport;
 		  globalThis.netB = b.transport;
 		  globalThis.__nodeA = a;

@@ -225,13 +225,11 @@ const (
 // The whole point of the suite on this target: a hybrid-signed bundle loads, and its
 // module binds under the DERIVED author id — the key-set hash, never either key alone.
 func TestHybridManifestBundleLoads(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
+	startShell(t, authorsPolicy(a.id()), nil)
 
 	path, key := writeTestBundle(t, a, "pqapp", 1)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
 	if status := loadBundle(path); !strings.HasPrefix(status, "pqapp v1") {
 		t.Fatalf("hybrid bundle should load: %s", status)
 	}
@@ -253,11 +251,9 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 // strong as the weaker algorithm; a break in one half must reject valid bundles (an
 // operator's problem, recoverable) rather than admit forged ones.
 func TestHybridManifestBothSignaturesRequired(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(a.id()), nil)
 	mjson := manifestJSON(t, "pqtamper", 1, stubGuestSrc, nil)
 
 	for _, tc := range []struct {
@@ -285,12 +281,9 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 // for by writing a byte, so the loader answers "a suite I do not implement" — a
 // legibility failure, not a signature verdict.
 func TestGenesisManifestSuiteRefused(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `","` +
-		hex.EncodeToString(a.edPub) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(a.id(), a.edPub), nil)
 
 	// A well-formed genesis envelope: [0x01][ed_pk 32][ed_sig 64][json], signed over
 	// DOMAIN_manifest ‖ 0x01 ‖ json exactly as the retired suite specified.

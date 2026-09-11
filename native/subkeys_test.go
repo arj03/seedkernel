@@ -2,22 +2,22 @@ package main
 
 import "testing"
 
-// The native node's identity IS the key the shared code derives from the master seed
-// (deriveNodeKey, core/subkeys.ts, §12.6.2b), so the peer id it reports must be that
-// key's public half. Pins this target to the shared derivation rather than a raw keypair
-// of its own, and to ONE identity: the same key answers node/identity, signs guest records
-// and signs the handshake.
-func TestBootNodeDerivesIdentity(t *testing.T) {
+// The native node's identity is the key the shared code derives from the master seed
+// (deriveNodeKey, core/subkeys.ts, §12.6.2b), computed over THIS target's crypto — whose
+// BLAKE2b is native. The expected peer id is the JS target's answer for the same seed, so
+// a native derivation that drifted would stand up a node every other target names
+// differently.
+func TestNodeDerivesSharedIdentity(t *testing.T) {
 	bootRealm(t)
 	seedHex := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 	st, err := startNode(nodeConfig{KeyHex: seedHex, ContactSecretHex: testContactSecretHex})
 	if err != nil {
-		t.Fatal("bootNode:", err)
+		t.Fatal("startNode:", err)
 	}
-	derive := `deriveNodeKey(sodium, fromHex("` + seedHex + `"))`
-	channel := evalString(t, `toHex(`+derive+`.publicKey)`)
-	if st.PeerID != channel {
-		t.Fatalf("peer id = %s, want the derived key %s", st.PeerID, channel)
+	// deriveNodeKey over libsodium-wrappers (the Node target) for the seed above.
+	const want = "7167b875c908982c267a60468df52921a01a13c184f5b98368c0f5bdd1587b03"
+	if st.PeerID != want {
+		t.Fatalf("peer id = %s, want the shared derivation %s", st.PeerID, want)
 	}
 }
 

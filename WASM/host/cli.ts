@@ -8,12 +8,11 @@
 import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
-import type { ListenAddress } from "../core/socket-seam.js";
 import { OpArgs, writeOp } from "../core/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort, peersConfig } from "./peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
-import type { AppHandle, Shell } from "./shell-core.js";
+import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted. One value on every target, so
  *  the same command line runs the same node over the same store wherever it runs. */
@@ -39,39 +38,12 @@ export interface CliFiles {
   writeFile(path: string, bytes: Uint8Array, mode?: number): void;
 }
 
-/** What standing a node up takes wherever it runs: an identity, where it listens, and the
- *  signed transport program that is its network (§12.6). NOT the store or the gate on it —
- *  a target that opens those separately, before the transport bundle lands, takes this
- *  rather than the `NodeSetup` below. */
-export interface TransportNodeConfig {
-  /** This node's keypair (README §12.6) — the derived channel keypair, whose public
-   *  half is the peer id and the node's one identity (§12.9). */
-  identity: Keypair;
-  /** False disables networking. The CLI sets this from its network flags. */
-  network?: boolean;
-  listen?: ListenAddress;
-  wsListen?: ListenAddress;
-  /** The signed transport bundle blob, defaulting to the artifact's own: how an operator
-   *  selects a transport other than the shipped one. App-author policy does not
-   *  participate in this decision. A shell without a transport has no network. */
-  transportBundle?: Uint8Array;
-  /** Transport `LOCAL` config, such as peers, `networkKey` and `contactSecret` (§12.10). */
-  transportConfig?: JsonObject;
-  /** Guest execution and handoff budget per entrypoint invocation, in ms (§12.3).
-   *  It bounds guest compute, queue wait, host waits, and deferred answers. `Infinity`
-   *  disables the local ceiling; an initiating finite caller still narrows it. Threaded
-   *  through to the shell because a bound no target can set is a bound nobody has. */
-  guestDeadlineMs?: number;
-  /** QuickJS heap cap for the guest realm, in bytes (§12.3). Omitted ⇒ the shell's
-   *  default. Raise it for an app that streams large windows through the guest. */
-  realmMemoryBytes?: number;
-}
-
-/** What a node needs to exist, once the flags have been read: the above, plus the store
- *  and who may install on it. The targets build it from very different parts — `NodeFs` +
- *  `node:net` here, a wazero table + Go sockets there — which is why `standUp` is a
- *  member rather than code in this file. */
-export interface NodeSetup extends TransportNodeConfig {
+/** What a node needs to exist, once the flags have been read: the store and who may
+ *  install on it, plus the assembly's own options — identity, network and guest bounds —
+ *  exactly as `bootShell` takes them. The targets build the rest from very different parts
+ *  — `NodeFs` + `node:net` here, a wazero table + Go sockets there — which is why
+ *  `standUp` is a member rather than code in this file. */
+export interface NodeSetup extends Pick<BootShellOptions, "identity" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
   /** Directory backing the fs.* capability. */
   dir: string;
   /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
@@ -83,31 +55,6 @@ export interface NodeSetup extends TransportNodeConfig {
 export interface NodeRuntime {
   shell: Shell;
   transport: TransportHost | null;
-}
-
-/** This node's transport config, shared by the CLI and native assemblies (§12.6). */
-export function transportConfigFrom(
-  peerSpecs: readonly string[], contactSecret?: Uint8Array,
-): JsonObject | undefined {
-  const cfg: JsonObject = {};
-  if (peerSpecs.length > 0) cfg.peers = peersConfig(peerSpecs);
-  if (contactSecret !== undefined) cfg.contactSecret = toHex(contactSecret);
-  return Object.keys(cfg).length > 0 ? cfg : undefined;
-}
-
-/** Wait for the peers this node's transport was loaded with, or the deadline — a claim call
- *  on the id that bundle claims, the same door a co-resident guest uses. Exported because
- *  both targets' boots do this, so `ready` and its deadline are spelled once; the transport
- *  settles the op either way, so this bounds the boot rather than deciding anything.
- *
- *  `null` means nothing claims that id: a node with no transport, which is a legitimate
- *  configuration (§12.6) and a failure only once the operator asked for a cohort. */
-export function awaitCohort(shell: Pick<Shell, "call">, what: string): Promise<Uint8Array> {
-  const answer = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
-  if (!answer) {
-    throw new Error(`shell: ${what} — enable transport first`);
-  }
-  return answer;
 }
 
 /** The platform under the operator flow. */
@@ -259,36 +206,45 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     localConfig = parsed;
   }
 
-  // Cohort peers, parsed BEFORE the node stands up because they are now part of the
-  // transport's own configuration rather than something taught to a driver afterwards
-  // (§12.10). A malformed reference therefore fails before anything is listening.
+  // The transport's own configuration (§12.10): cohort peers — parsed BEFORE the node
+  // stands up, so a malformed reference fails before anything is listening — and the
+  // contact secret that gates this node's door.
   const peers = list(args.get("peers"));
+  const transportConfig: JsonObject = {};
+  if (peers.length > 0) transportConfig.peers = peersConfig(peers);
+  if (contactSecretPath !== undefined) {
+    transportConfig.contactSecret = toHex(loadHex32(host, contactSecretPath, "--contact-secret"));
+  }
 
   const { shell, transport: net } = await host.standUp({
     dir,
     policyJson,
     identity: key,
-    network,
-    listen: args.has("listen")
-      ? parseHostPort(args.get("listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
-      : undefined,
-    wsListen: args.has("ws-listen")
-      ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
-      : undefined,
-    transportConfig: transportConfigFrom(peers,
-      contactSecretPath === undefined ? undefined : loadHex32(host, contactSecretPath, "--contact-secret")),
+    // The network flags are what enable a network; the rest of these configure it.
+    transport: network ? {
+      listen: args.has("listen")
+        ? parseHostPort(args.get("listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
+        : undefined,
+      wsListen: args.has("ws-listen")
+        ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
+        : undefined,
+      bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
+      config: transportConfig,
+    } : false,
     // Guest resource bounds (§12.3), which only widen or tighten the shell's own
     // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
     // rather than reached by leaving a flag off.
     guestDeadlineMs: args.has("guest-timeout") ? (Number(args.get("guest-timeout")) || Infinity) : undefined,
     realmMemoryBytes: args.has("guest-memory") ? Number(args.get("guest-memory")) * 1024 * 1024 : undefined,
-    transportBundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
   });
-  // The addresses went in with the load above; what is left is to wait for the cohort.
-  // Best-effort: the op settles on its own deadline rather than rejecting, so a member that
-  // is not up yet delays the boot but never fails it.
+  // The addresses went in with the load above; what is left is to wait for the cohort, on
+  // the id the transport claims — the same door a co-resident guest uses. Best-effort: the
+  // op settles on its own deadline rather than rejecting, so a member that is not up yet
+  // delays the boot but never fails it. `null` is a transport claiming no such id.
   if (peers.length > 0) {
-    await awaitCohort(shell, "--peers given, but there is nothing to dial from");
+    const ready = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
+    if (!ready) throw new Error("shell: --peers given, but there is nothing to dial from — enable transport first");
+    await ready;
   }
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);

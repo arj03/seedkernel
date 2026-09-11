@@ -52,11 +52,6 @@ export type LinkEvent = (typeof LINK_EVENTS)[number];
 export type CapabilityName = {
   [S in ServiceName]: `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
 }[ServiceName];
-/** The full vocabulary, flattened to a runtime list for the dispatch-table completeness
- *  check (guest-seam.ts `HANDLER_KEYS`). */
-export const AUTHORITY_CALLS: readonly CapabilityName[] = (Object.keys(HOST_SERVICES) as ServiceName[]).flatMap(
-  (s) => (HOST_SERVICES[s].calls as readonly string[]).map((c) => `${s}/${c}` as CapabilityName),
-);
 /** Whether a name is a host SERVICE — the vocabulary a manifest's `guest.requires` may
  *  name. An own-property check, never a parse. */
 export function isService(name: string): name is ServiceName {

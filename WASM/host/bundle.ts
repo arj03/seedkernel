@@ -666,9 +666,6 @@ export function verifyBundle(sodium: ManifestVerifier, blob: Uint8Array): Verifi
 }
 /** Build a verified bundle's private modules, all or none (§3.1). Admission already ran. */
 export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundle): Promise<PureModules> {
-  if (v.modules.length > DEFAULT_MAX_BUNDLE_MODULES) {
-    throw new Error(`bundle: ${v.modules.length} modules exceeds the limit of ${DEFAULT_MAX_BUNDLE_MODULES}`);
-  }
   // The §4.3 per-module and aggregate bound — memory and tables both — read off the bytes
   // *before* instantiation, which is what allocates the declared initial memory and reserves
   // the declared tables, so a host-side check could only run after the damage. Every module

@@ -3,7 +3,7 @@
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, serviceOf, type HostTransformName, type CapabilityName } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, type HostTransformName, type CapabilityName } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
@@ -172,12 +172,6 @@ type CryptoName = `crypto/${HostTransformName}`;
  *  `[A-Za-z0-9_-]`, so they cannot spell one of these — that is what lets the dispatch tell
  *  host names and module names apart by the name alone. */
 type HandlerKey = CapabilityName | CryptoName;
-/** The same union as a runtime list, for the construction check below — the compiled-JS
- *  half of the one-file rule. */
-const HANDLER_KEYS: readonly string[] = [
-  ...AUTHORITY_CALLS,
-  ...HOST_TRANSFORM_NAMES.map((p) => `crypto/${p}`),
-];
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
@@ -289,10 +283,6 @@ globalThis.__invoke = (argBuf) => {
 // non-zero is a peer or a co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
-/** Method catalog, re-exported from core/domains.ts. A grant is a SERVICE name
- *  (`HOST_SERVICES`) or a local service id declared in `guest.requires`; `crypto/*` and
- *  the bundle's own modules are not. */
-export { AUTHORITY_CALLS } from "../core/domains.js";
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
  *  guest signs only within its own bundle's namespace; every node running the same bundle
@@ -507,28 +497,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
       return NONE;
     },
   } satisfies Record<HandlerKey, SeamHandler>);
-    // The one-file rule, checked at construction: every name here is a host method the
-    // loader knows or a primitive, and every name contains a `/` — the namespace invariant
-    // the dispatch relies on to tell a host method from a bundle's own module (a bare
-    // `"ping"` here would shadow every app's module of that name). The `satisfies` above is
-    // the compile-time half; this walk is the runtime half, which holds on the COMPILED JS
-    // the native target evaluates (§12.9).
-  for (const name of Object.keys(handlers)) {
-    if (!HANDLER_KEYS.includes(name)) {
-      throw new Error(`guest-seam: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no host transform (HOST_TRANSFORM_NAMES)`);
-    }
-    if (!name.includes("/")) {
-      throw new Error(`guest-seam: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
-    }
-  }
-  // Events are bare guest ops, not host-call names (§12.2).
-  for (const service of Object.values(HOST_SERVICES)) {
-    for (const event of ("events" in service ? service.events : []) as readonly string[]) {
-      if (event.includes("/")) {
-        throw new Error(`guest-seam: event name "${event}" has a "/" — an event is a bare op in the occupant's own envelope (§12.2), so this would spell a host-call name`);
-      }
-    }
-  }
   return handlers;
 }
 /** The one `host.call` a realm runs against: the gate in front of `hostCatalog`.

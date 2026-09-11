@@ -5,11 +5,9 @@
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
-import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup, type TransportNodeConfig } from "./cli.js";
+import { runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
-import {
-  bootShell, type AppHandle, type Shell, type ShellSodium,
-} from "./shell-core.js";
+import { bootShell, type ShellSodium } from "./shell-core.js";
 import { CausalContext, createDeadlineQueue, raceDeadline, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
@@ -20,7 +18,6 @@ import {
   TCP_LINGER_MS,
 } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
-import { deriveNodeKey } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import {
   DEFAULT_GUEST_DEADLINE_MS,
@@ -29,7 +26,7 @@ import {
   DEFAULT_REALM_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
-import { toHex, fromHex, errMessage } from "../core/util.js";
+import { errMessage } from "../core/util.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
  *  The answer is always `null`: every call parks, Go holds the guest's Promise under
@@ -306,34 +303,18 @@ const modules: PureModuleLoader = {
     };
   },
 };
-/** The data directory a store was opened on, or null for a realm that never opened one
- *  (the native tests' bare `makeTransportNode`, which needs no durable marks). It names
- *  the freshness file's location and nothing else. */
-let storeDir: string | null = null;
-/** Point the `fs.*` backend at a data directory and remember where its freshness marks
- *  belong. Called by `standUp` below once `--dir` has been read, and by the native test
- *  harness — the one place either learns where this node's disk is. */
-function openStore(dir: string): void {
-  __fs.open(dir);
-  storeDir = dir;
-}
 /** The freshness store over the Go file seam (§12.4). The marks live in a SIBLING of the
  *  data dir (`freshnessPathFor`, shared with the Node shell) so a `fs`-capable guest cannot
- *  reach its own mark. A realm with no store open keeps its marks in memory. */
+ *  reach its own mark. */
 class NativeFreshnessStore extends FreshnessMarks {
   path;
-  constructor(dir: string | null) {
-    const path = dir === null ? null : freshnessPathFor(dir);
-    let json: string | null = null;
-    if (path !== null) {
-      const raw = bridge.readFile(path);
-      if (raw !== null) json = utf8dec.decode(new Uint8Array(raw));
-    }
-    super(json);
+  constructor(dir: string) {
+    const path = freshnessPathFor(dir);
+    const raw = bridge.readFile(path);
+    super(raw === null ? null : utf8dec.decode(new Uint8Array(raw)));
     this.path = path;
   }
   override persist(json: string) {
-    if (this.path === null) return;
     // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
     // land", which is what rolls a revocation back and un-binds a load whose mark could
     // not be raised — swallowing it would report both as successes while the next boot
@@ -481,86 +462,23 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
  *  exception. */
 const utf8 = new TextEncoder();
 const utf8dec = new TextDecoder();
-let shell: Shell | null = null;
-/** The admission predicate in force (§12.5). It starts deny-all, so the absence of a
- *  decision is never permission (§14), and `--policy` replaces it at boot. The shell
- *  closes over this indirection rather than a fixed predicate, so trust can be narrowed or
- *  widened without restarting the node. */
-let admissionPolicy = policyFromJson(null);
-/** Point the realm at a policy config (§12.5). `null` restores the deny-all default;
- *  malformed JSON throws, so a typo fails loudly rather than silently widening trust. */
-function setPolicy(json: string | null): void {
-  admissionPolicy = policyFromJson(json);
-}
-/** The one shell, or a clear error if Go asked for something before booting one. */
-function theShell() {
-  if (!shell)
-    throw new Error("native: bootNode has not run");
-  return shell;
-}
-/** Stand a node up on this platform via the shared `bootShell` (§12.9). Config is an
- *  object so a positional drift against Go is a type error, and it is cli.ts's
- *  `TransportNodeConfig` so a field added for one target cannot go missing on this one.
- *  The store and its policy are not in it: on this target they are realm state, set
- *  before the boot rather than passed to it (`openStore`, `setPolicy`). */
-async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime> {
-  const { shell, transport } = await bootShell({
-    sodium, identity: cfg.identity, modules, fs,
-    freshnessStore: new NativeFreshnessStore(storeDir),
-    // The sockets and the signed program that drives them, in one object.
-    transport: cfg.network === false ? false : {
-      channels,
-      listen: cfg.listen,
-      wsListen: cfg.wsListen,
-      bundle: cfg.transportBundle,
-      config: cfg.transportConfig,
-    },
-    // The admission predicate in force (§12.5): the shell closes over this
-    // indirection rather than a fixed predicate, so trust can be narrowed or widened
-    // without restarting the node (`setPolicy`).
-    admit: (v, ctx) => admissionPolicy(v, ctx),
+/** Stand a node up on this platform via the shared `bootShell` (§12.9): the operator
+ *  flow's `standUp`, and what a native test calls to stand a node of its own. Config is
+ *  cli.ts's `NodeSetup`, so a field added for one target cannot go missing on this one.
+ *  Go's `fs.*` primitive serves ONE directory, so every node a test stands in one realm
+ *  shares `cfg.dir`. The policy is parsed first: a malformed one fails before anything is
+ *  opened. */
+async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
+  const admit = policyFromJson(cfg.policyJson);
+  __fs.open(cfg.dir);
+  return bootShell({
+    sodium, identity: cfg.identity, modules, fs, createRealm, admit,
+    freshnessStore: new NativeFreshnessStore(cfg.dir),
+    // The network as configured, over Go's sockets.
+    transport: cfg.transport && { ...cfg.transport, channels },
     guestDeadlineMs: cfg.guestDeadlineMs,
     realmMemoryBytes: cfg.realmMemoryBytes,
-    createRealm,
   });
-  return { shell, transport };
-}
-/** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
- *  Resolves once the listeners are bound and any cohort peers have been dialled, so
- *  Go can print the real ports. */
-async function bootNode(cfgJson: string): Promise<Uint8Array> {
-  const cfg = JSON.parse(cfgJson);
-  // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Derived
-  // HERE, by the shared subkey code the JS CLI runs, so this target's peer id is the key
-  // the JS shell would compute from the same seed. Go holds the seed and nothing else.
-  const key = deriveNodeKey(sodium, fromHex(cfg.keyHex));
-  setPolicy(cfg.policyJson);
-  // The cohort is parsed BEFORE the boot and goes in as the transport's own configuration:
-  // the address book is the transport guest's, so a peer list is something a transport is
-  // loaded WITH, not something taught to a driver afterwards (§12.10).
-  const peers: string[] = cfg.peers ?? [];
-  const s = await makeTransportNode({
-    identity: key,
-    listen: cfg.listen,
-    wsListen: cfg.wsListen,
-    // Contact policy is transport config (§12.6.3).
-    transportConfig: transportConfigFrom(
-      peers,
-      cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
-    ),
-  });
-  shell = s.shell;
-  const network = s.transport;
-  if (peers.length > 0) {
-    // The same diagnosis the operator flow gives `--peers`, through the same door.
-    // Best-effort: the op settles on its own deadline, so a member that is not up yet
-    // delays the boot but never fails it.
-    await awaitCohort(s.shell, "peers were configured, but there is nothing to dial from");
-  }
-  const status = {
-    peerId: toHex(key.publicKey), port: network?.port ?? 0, wsPort: network?.wsPort ?? 0,
-  };
-  return utf8.encode(JSON.stringify(status));
 }
 
 // ── the operator flow ────────────────────────────────────────────────────────
@@ -581,18 +499,7 @@ function nativeCliHost(): CliHost {
     stdout(bytes) { bridge.stdout(bytes); },
     stdin() { return new Uint8Array(bridge.stdin()); },
     sodium,
-    async standUp(cfg: NodeSetup) {
-      // Where this node's disk is, and who may install on it — both before the
-      // transport bundle lands, because its freshness mark belongs beside the store.
-      openStore(cfg.dir);
-      setPolicy(cfg.policyJson ?? null);
-      // NodeSetup EXTENDS TransportNodeConfig, so the rest of the config crosses
-      // unchanged — no field-by-field copy to fall out of step.
-      const stood = await makeTransportNode(cfg);
-      // One "the shell" per realm, whichever entry point stood it up.
-      shell = stood.shell;
-      return stood;
-    },
+    standUp,
   };
 }
 /** Run the operator flow. Go calls this with no arguments — every choice comes from the
@@ -603,14 +510,6 @@ async function runMain(): Promise<Uint8Array> {
   if (!serving) close();
   return utf8.encode(JSON.stringify({ serving }));
 }
-/** Node-like file convenience over the native platform's byte bridge. The returned
- *  handle remains with the caller; the platform keeps no key-to-handle registry. */
-async function loadBundleFile(path: string): Promise<AppHandle> {
-  const raw = bridge.readFile(path);
-  if (raw === null) throw new Error(`cannot read ${path}`);
-  return theShell().loadBundleBlob(new Uint8Array(raw));
-}
-
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): one pre-compiled
  *  `__start` wrapper, so an initiator call costs an Invoke rather than a parse. Not the
  *  guest ABI (that is `guestPreamble`) but this target's twin of what safe-js.ts does —
@@ -648,7 +547,7 @@ globalThis.__start = function (id, arg) {
 };
 `;
 
-// What Go reaches by name in the realm. `createRealm` and the transport helpers are here
-// for the native tests as much as for the boot above, so a test that stands up a guest or
-// a second node drives the very factories production does.
-export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, makeTransportNode, };
+// What Go reaches by name in the realm. `standUp` and `createRealm` are here for the
+// native tests as much as for the boot above, so a test that stands up a node or a guest
+// drives the very functions production does.
+export { runMain, standUp, createRealm, guestDriver, };

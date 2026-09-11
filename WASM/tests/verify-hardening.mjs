@@ -124,11 +124,6 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
       { mod: { name: "b" }, wasm: memModule(1, 600) },
     ],
   }), "module maxima are bounded in aggregate across one bundle");
-  await rejects(loadBundleModules(stub(undefined), {
-    modules: Array.from({ length: DEFAULT_MAX_BUNDLE_MODULES + 1 }, (_, i) => ({
-      mod: { name: `m${i}` }, wasm: memModule(0, 0),
-    })),
-  }), "a bundle cannot evade memory accounting with unbounded zero-memory modules");
   // Table elements join that aggregate at their own charge: 1.5M elements is 48 MiB, so one
   // such module lands and two do not.
   const tabled = rawModule(memSection(1, 1), tableSection(1, 1_500_000));

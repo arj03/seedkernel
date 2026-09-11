@@ -9,7 +9,7 @@
 // Which flags exist and what the node does with them is `cli.ts`, the same module the
 // native binary runs inside QuickJS.
 import { readFileSync } from "node:fs";
-import { runCli, type CliHost, type NodeSetup } from "./cli.js";
+import { runCli, type CliHost } from "./cli.js";
 import { bootNodeShell } from "./shell-node.js";
 import { writeFileAtomic } from "./fs-node.js";
 import { loadCrypto } from "./crypto-node.js";
@@ -40,12 +40,9 @@ async function nodeHost(): Promise<CliHost> {
       catch { return new Uint8Array(0); }
     },
     sodium,
-    async standUp(cfg: NodeSetup) {
-      // NodeShellOptions EXTENDS NodeSetup, so the config crosses unchanged — no
-      // field-by-field copy to fall out of step, and a new field reaches this platform
-      // by existing rather than by being remembered here.
-      return bootNodeShell(cfg);
-    },
+    // bootNodeShell takes the operator flow's NodeSetup itself, so the config crosses
+    // unchanged — a new field reaches this platform by existing, not by being remembered.
+    standUp: bootNodeShell,
   };
 }
 

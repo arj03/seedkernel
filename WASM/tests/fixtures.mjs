@@ -62,8 +62,8 @@ export const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), require
  *  half an identity. */
 export const testAuthor = () => makeAuthor(sodium);
 
-/** A NODE-platform node for one test: `bootNodeShell` (shell-node.ts) minus the channel
- *  adapter, which these tests do not drive. The disk-backed platform — NodeFs on a data
+/** A NODE-platform node for one test: `bootNodeShell` (shell-node.ts) with no network,
+ *  which these tests do not drive. The disk-backed platform — NodeFs on a data
  *  directory, a file-backed freshness store — is the point of reaching for it over
  *  {@link bootTestShell}, which stands a node with no disk. */
 export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
@@ -99,17 +99,12 @@ export async function bootTestShell({ transportAuthor, ...opts } = {}) {
   return shell;
 }
 
-/** The admission context a bundle with no history lands under: an ordinary app, never
- *  loaded here before, from a key nobody has written off. The shell reads these off its
- *  freshness store; a test composing the load by hand states them. */
-export const APP_CTX = { highWater: -Infinity, revoked: false };
-
 /** `verifyBundle` → `admit` → `installBundle` (§12.4), for the policy + integrity tests
- *  that own their own ModuleTable without a shell. `admit` is AWAITED — a composed
- *  policy answers with a Promise, and reading one as a verdict is fail-open. */
-export async function loadBundle(host, blob, admit, ctx = APP_CTX) {
+ *  that own their own ModuleTable without a shell. `admit` is AWAITED — a predicate may
+ *  answer with a Promise, and reading one as a verdict is fail-open. */
+export async function loadBundle(host, blob, admit) {
   const v = verifyBundle(sodium, blob);
-  if (!(await admit(v, ctx))) throw new Error("admit rejected");
+  if (!(await admit(v))) throw new Error("admit rejected");
   return installBundle(host, v);
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -51,11 +50,9 @@ func TestScratchRegion(t *testing.T) {
 // Modules are reached only by name (README §4, §12.4) — there is no dispatch seam to drive
 // one through — so echoing a payload back is the whole proof.
 func TestBundleModuleRuns(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(author.id()), nil)
 	bundlePath, appKey := writeTestBundle(t, author, "runapp", 1)
 	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  key "+appKey) {
 		t.Fatalf("bundle load: %s", status)
@@ -73,11 +70,9 @@ func TestBundleModuleRuns(t *testing.T) {
 // mistype into a node that boots clean and answers an empty body forever. The id's format
 // is checked at the load, so an unroutable claim is refused where it can be named.
 func TestManifestClaimIsTheRouting(t *testing.T) {
-	bootShell(t, t.TempDir(), "", nil)
+	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
+	startShell(t, authorsPolicy(author.id()), nil)
 	bundlePath, appKey := writeTestBundle(t, author, "claimapp", 1)
 	if status := loadBundle(bundlePath); status != loadedLine("claimapp", 1, appKey, "claimapp") {
 		t.Fatalf("the load must claim what the manifest declares: %s", status)

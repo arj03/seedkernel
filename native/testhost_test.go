@@ -1,7 +1,7 @@
 package main
 
 // The one way a test stands the loader up. Production has a single assembly path — boot()
-// installs the platform primitives and evaluates the shared bundle, bootNode() builds the
+// installs the platform primitives and evaluates the shared bundle, standUp() builds the
 // node and shell inside it — so the tests drive that path. A harness that assembled the
 // realm differently would be the second implementation this target exists not to have
 // (README §12.9).
@@ -22,8 +22,35 @@ import (
 const nativeHandleHarness = `
 (() => {
   const apps = new Map();
+  // The node startNode stood: the one a test's bundles load into and its invocations reach.
+  let node = null;
+  // The operator's choices as one JSON object, stood up through the same standUp the
+  // shared CLI's flow reaches, on this realm's data directory. The key is derived HERE,
+  // by the shared subkey code the CLI runs, so the peer id is the one --key would give.
+  globalThis.startNode = async (json) => {
+    const cfg = JSON.parse(json);
+    const identity = deriveNodeKey(sodium, fromHex(cfg.keyHex));
+    node = await standUp({
+      dir: __dir,
+      policyJson: cfg.policyJson ?? undefined,
+      identity,
+      transport: {
+        listen: cfg.listen,
+        wsListen: cfg.wsListen,
+        // Contact policy is transport config (§12.6.3).
+        config: cfg.contactSecretHex ? { contactSecret: cfg.contactSecretHex } : undefined,
+      },
+    });
+    return new TextEncoder().encode(JSON.stringify({
+      peerId: toHex(identity.publicKey),
+      port: node.transport?.port ?? 0,
+      wsPort: node.transport?.wsPort ?? 0,
+    }));
+  };
   globalThis.cliLoadBundle = async (path) => {
-    const app = await loadBundleFile(path);
+    const raw = bridge.readFile(path);
+    if (raw === null) throw new Error("native test: cannot read " + path);
+    const app = await node.shell.loadBundleBlob(new Uint8Array(raw));
     apps.set(app.key, app);
     return new TextEncoder().encode(loadedLine(app));
   };
@@ -124,11 +151,11 @@ func bootRealmIn(tb testing.TB, dir string) {
 	if _, err := qc.Eval("native-handle-harness.js", qjs.Code(nativeHandleHarness)); err != nil {
 		tb.Fatal("native handle harness:", err)
 	}
-	// Where this node's disk is, through the same `openStore` the operator flow calls
-	// once it has read --dir (host/native-shim.ts). Go's boot no longer knows about a
-	// data directory at all, so a harness that opened the store some other way would be
-	// testing a store production never opens.
-	evalString(tb, "openStore("+jsonString(dir)+")")
+	// This realm's data directory, which Go's boot knows nothing about. Opened through the
+	// platform's own `fs.open` for the tests that reach `fs` with no node standing, and
+	// kept as `__dir` for every `standUp` a test calls: the Go primitive serves one
+	// directory, so the nodes a realm stands share it (host/native-shim.ts).
+	evalString(tb, "__fs.open("+jsonString(dir)+"), globalThis.__dir = "+jsonString(dir))
 }
 
 // jsonString quotes a Go string as a JS string literal, for the few test helpers that
@@ -147,16 +174,15 @@ func jsonString(s string) string {
 // everything below that is the shared CLI's. A test needs finer joints than one call, so
 // it uses the same realm exports `runCli` does — never a second assembly of its own.
 
-// nodeConfig is what `bootNode` takes: the operator's choices as one JSON object. In
-// production the shared CLI builds this from the flags; here a test builds it directly
-// to stand a node up without a command line.
+// nodeConfig is what the harness's `startNode` takes: the operator's choices as one JSON
+// object. In production the shared CLI builds a node's setup from the flags; here a test
+// builds it directly to stand a node up without a command line.
 type nodeConfig struct {
 	PolicyJSON       *string   `json:"policyJson"`
 	KeyHex           string    `json:"keyHex"`
 	ContactSecretHex string    `json:"contactSecretHex"`
 	Listen           *hostPort `json:"listen,omitempty"`
 	WsListen         *hostPort `json:"wsListen,omitempty"`
-	Peers            []string  `json:"peers,omitempty"`
 }
 
 type hostPort struct {
@@ -173,14 +199,14 @@ type nodeStatus struct {
 }
 
 // startNode builds the node inside the realm and waits for its listeners to bind — the
-// same `bootNode` the shared CLI's `standUp` reaches, minus the command line.
+// same `standUp` the shared CLI's flow reaches, minus the command line.
 func startNode(cfg nodeConfig) (nodeStatus, error) {
 	var st nodeStatus
 	j, err := json.Marshal(cfg)
 	if err != nil {
 		return st, err
 	}
-	out, err := callRealm("bootNode", 30*time.Second, qc.NewString(string(j)))
+	out, err := callRealm("startNode", 30*time.Second, qc.NewString(string(j)))
 	if err != nil {
 		return st, err
 	}
@@ -231,21 +257,28 @@ func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	return value
 }
 
-// bootShell stands a whole node up exactly as the binary does — bootRealm, then
-// bootNode inside the realm (identity, network, bootShell over this platform).
-// `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
-// default (README §14). Returns what the realm reported: the peer id and the ports
-// actually bound.
+// bootShell stands a whole node up exactly as the binary does — a fresh realm on `dir`,
+// then startShell. Returns what the realm reported: the peer id and the ports actually
+// bound.
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
+	return startShell(tb, policyJSON, listen)
+}
+
+// startShell stands a node up in the realm already booted — standUp inside it (identity,
+// network, bootShell over this platform) — for a test whose policy names an author it
+// has to mint against that realm first. `listen` is nil for a node that only initiates;
+// policyJSON "" is the deny-all default (README §14).
+func startShell(tb testing.TB, policyJSON string, listen *hostPort) nodeStatus {
+	tb.Helper()
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON
 	}
 	st, err := startNode(cfg)
 	if err != nil {
-		tb.Fatal("bootNode:", err)
+		tb.Fatal("startNode:", err)
 	}
 	return st
 }
@@ -256,7 +289,7 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 const testContactSecretHex = "0303030303030303030303030303030303030303030303030303030303030303"
 
 // testKeyHex mints a node identity master seed: 32 bytes of entropy, hex — the same
-// 64 hex chars --key holds. bootNode derives the node's keypair from it inside the
+// 64 hex chars --key holds. startNode derives the node's keypair from it inside the
 // shared realm (deriveNodeKey, core/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
@@ -267,16 +300,17 @@ func testKeyHex(tb testing.TB) string {
 	return hex.EncodeToString(seed)
 }
 
-// applyPolicy narrows (or widens) the running node's admission predicate — the
-// operator's --policy, after the fact. "" is the deny-all default, not "no policy".
-func applyPolicy(policyJSON string) error {
-	arg := qc.NewString(policyJSON)
-	if policyJSON == "" {
-		arg.Free()
-		arg = qc.NewNull()
+// authorsPolicy is a --policy file admitting exactly these app authors (§12.5).
+func authorsPolicy(ids ...[]byte) string {
+	authors := make([]string, len(ids))
+	for i, id := range ids {
+		authors[i] = hex.EncodeToString(id)
 	}
-	_, err := callRealm("setPolicy", 5*time.Second, arg)
-	return err
+	j, err := json.Marshal(map[string][]string{"authors": authors})
+	if err != nil {
+		panic(err)
+	}
+	return string(j)
 }
 
 // testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience over the
