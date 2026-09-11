@@ -2,8 +2,7 @@
 // into them. Both books are projections of the installed manifests — nothing to persist or
 // keep in step — and every rule about what may be installed beside what lives here, so no
 // caller can set a claim past them.
-import { appKeyFor, privilegesOf, type LoadedBundle, type PureModules } from "./bundle.js";
-import { PRIVILEGE_LINK } from "../core/domains.js";
+import { appKeyFor, reachesLink, type LoadedBundle, type PureModules } from "./bundle.js";
 import { DEFAULT_MAX_APP_SLOTS } from "../core/wasm-limits.js";
 import type { Fs } from "../core/fs.js";
 import type { SignScope } from "./guest-seam.js";
@@ -57,7 +56,6 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
   const peer = new Map<string, AppSlot>();
   const local = new Map<string, AppSlot>();
   const keyOf = (slot: AppSlot): string => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
-  const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
   /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has ONE
    *  event sink, so two holders are not a composition — the second would take the node's
    *  sockets off the first, silently. A pure function of the signed manifest, so there is
@@ -80,6 +78,7 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     /** `<author hex>:<app>` (§12.4) — a slot's audit identity, and the key it installs under. */
     keyOf,
     hasLink,
+    get: (key: string): AppSlot | undefined => slots.find((slot) => keyOf(slot) === key),
     /** Every installed slot, in install order. */
     all: (): readonly AppSlot[] => slots,
     /** Who serves this claim, peer-reachable name first. */
@@ -93,35 +92,46 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
      *  holds, or that would exceed the slot cap (§12.10). Asked before candidate code runs
      *  and again in the commit window, because another load may take a free claim while
      *  this candidate is being built. Per BOOK: the same name under `protocols` and
-     *  `services` is two claims, not a contest. */
-    refuseConflicts(loaded: LoadedBundle, key: string): void {
+     *  `services` is two claims, not a contest. A replacement may take only the selected
+     *  predecessor's claims and must still target that exact live slot at commit.
+     *  `selected` is the boot's transport selection: the one way to take the raw-link
+     *  binding when nothing holds it. */
+    refuseConflicts(loaded: LoadedBundle, key: string, replacement?: AppSlot, selected = false): void {
+      if (replacement && !slots.includes(replacement))
+        throw new Error("shell: replacement target changed while the candidate was loading");
+      if (replacement && slots.some((slot) => keyOf(slot) === key && slot !== replacement))
+        throw new Error(`shell: replacement identity '${key}' is already installed`);
+      // The raw-link binding changes hands only by explicit selection (§12.5): a candidate
+      // reaching `link` must replace the slot holding it or, with no holder, be the boot's
+      // selected transport; and a plain load may not displace the holder, even with a
+      // version that drops `link`. Refused LOUDLY, because the alternative is a node that
+      // looks installed and is off the network. Asked before the claim contest, so a
+      // would-be transport claiming the holder's service id is told the rule it broke.
+      const holder = slots.find(hasLink);
+      if (holder && holder !== replacement && (reachesLink(loaded.manifest) || keyOf(holder) === key))
+        throw new Error(`shell: the transport changes only by explicit replacement of its own slot — use replaceBundle('${keyOf(holder)}', …)`);
+      if (!holder && !selected && reachesLink(loaded.manifest))
+        throw new Error(`shell: "link" is taken only by the boot's transport selection or explicit replacement of the current transport`);
       for (const [book, names, audience] of booksOf(loaded.manifest)) {
         for (const claim of names) {
           const incumbent = book.get(claim);
-          if (incumbent && keyOf(incumbent) !== key) {
+          if (incumbent && incumbent !== replacement && keyOf(incumbent) !== key) {
             throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(incumbent)}'`);
           }
         }
       }
-      // Refused rather than shadowed for the same reason a claim is, and LOUDLY because the
-      // alternative is a node that looks installed and is off the network: the incumbent
-      // keeps its claims and its realm, and only its sockets stop answering.
-      const incumbent = slots.find(hasLink);
-      if (incumbent && keyOf(incumbent) !== key && reachesLink(loaded.manifest)) {
-        throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(incumbent)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
-      }
       // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
       // install list nobody counts would leave each of those ceilings a floor rather than a
       // bound. A replacement takes the slot it already holds and is never refused here.
-      if (slots.length >= maxSlots && !slots.some((installed) => keyOf(installed) === key)) {
+      if (!replacement && slots.length >= maxSlots && !slots.some((installed) => keyOf(installed) === key)) {
         throw new Error(`shell: this node already holds its ${maxSlots} app slots — uninstall one before installing another`);
       }
     },
     /** Install `slot` under `key` and hand it every claim its manifest names. Returns the
      *  slot it displaced, claims already released and realm still standing — disposing that
      *  is the caller's, once it has torn down whatever else the slot held. */
-    commit(slot: AppSlot, key: string): AppSlot | undefined {
-      const at = slots.findIndex((installed) => keyOf(installed) === key);
+    commit(slot: AppSlot, key: string, replacement?: AppSlot): AppSlot | undefined {
+      const at = replacement ? slots.indexOf(replacement) : slots.findIndex((installed) => keyOf(installed) === key);
       const previous = at < 0 ? undefined : slots[at];
       if (previous) release(previous);
       if (at < 0) slots.push(slot);

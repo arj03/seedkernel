@@ -80,10 +80,9 @@ const netBenchGuestSource = `
 // in Go, and handed in as hex. benchPingN/benchFetchN/benchUploadN issue n sequential
 // requests over the one link, each as an `invoke` of the `send` op into B's app.
 //
-// The nodes are stood up by makeTransportNode — the factory bootNode uses — and the
-// policy has to admit the artifact's own transport author (for `link`) and the bench
-// app's author (for the app) before either node has a network at all: the shared bench
-// realm boots deny-all (ensureBooted).
+// The nodes are stood up by makeTransportNode — the factory bootNode uses — which boots
+// the artifact's own transport. The shared bench realm boots deny-all (ensureBooted), so
+// the policy admits the bench app's author.
 //
 // The three %q holes, in order: the app bundle hex, the app author's hex id, and the
 // protocol id B sends under.
@@ -93,8 +92,7 @@ const netBenchHarness = `
 	globalThis.aId = toHex(idA.publicKey);
 	globalThis.bId = toHex(idB.publicKey);
 	globalThis.__appBlob = fromHex(%q);
-	setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-	                           grants: { link: [embeddedTransportAuthor] } }));
+	setPolicy(JSON.stringify({ authors: [%q] }));
 	globalThis.__netSetup = (async () => {
 	  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 } });
 	  const b = await makeTransportNode({ identity: idB });

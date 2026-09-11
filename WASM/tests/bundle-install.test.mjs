@@ -1,8 +1,8 @@
 // bundle-install.test.mjs — bundle/manifest verify → admit → install (§12.4, §12.5,
 // §12.10): routing claims, fs, freshness, revocation, and in-place upgrade. Split out of
 // the former single-file run.mjs so this topic reads on its own; realm-guest.test.mjs
-// covers the guest seam and privilege derivation, crypto.test.mjs the manifest-suite and
-// ACVP vector suites.
+// covers the guest seam, bundle-replacement.test.mjs explicit slot replacement, and
+// crypto.test.mjs the manifest-suite and ACVP vector suites.
 //
 // Positive-path bundle fixtures go through `authorBundle` (host/bundle-author.ts), which
 // hashes, assembles, validates and signs in one call — the same path a real publisher
@@ -21,8 +21,8 @@ import {
   toHex, fromHex, concatBytes, writeU32BE, appKeyFor, hybridAuthorId, FreshnessMarks,
   verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE,
   signManifest, packBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
-  hostGates, gHash, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
-  APP_CTX, LINK_CTX, loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
+  checkHostGates, gHash, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
+  APP_CTX, loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
   forwarderBytes, installMod, appKey, imp, root, bytesEqual, callerOf, readOp, writeOp,
   MemoryFs, NodeFs, enc,
 } from "./fixtures.mjs";
@@ -208,7 +208,7 @@ async function testDerivedNamesKeepAuthorsApart() {
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { verifyManifest } = await imp("build/host/bundle.js");
-  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
+  const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
   const other = testAuthor();
@@ -231,16 +231,18 @@ async function testManifestClaimIsTheRouting() {
   try {
     shell = await bootTestShell({
       identity,
-      transport: { load: false },
+      transport: {},
       createRealm: async () => {
         realmBuilds++;
         return { call: async () => new Uint8Array(), dispose() {} };
       },
-      admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
+      admit: admitAll,
     });
   } finally {
     TransportHost.prototype.routeInbound = routeInbound;
   }
+  shell.uninstall(shell.resolve("_net"));
+  realmBuilds = 0;
   try {
     const key = appKey(author.id, "store");
     await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
@@ -614,8 +616,7 @@ async function testSlotFreshness() {
   // so "who refuses a downgrade" is one place.
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
-    await hostGates(v, {
-      privileges: ["link"],
+    checkHostGates(v, {
       highWater: freshness.get(v.author, v.manifest.app),
       revoked: freshness.isRevoked(v.author),
     });
@@ -1297,7 +1298,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     modules: [], guestSource: GUEST_TEXT, guestRequires: [],
   });
   class FlakyStore extends FreshnessMarks {
-    fail = true;
+    fail = false;
     persist() { if (this.fail) throw new Error("disk full"); }
   }
   const store = new FlakyStore();
@@ -1307,11 +1308,11 @@ async function testCandidateRealmCannotActBeforeCommit() {
   // only counts entries, and everything else — including every offside attempt — gets the
   // offside probing below, pushed into `candidates` in load order.
   let loadingNeighbor = false;
-  // A REAL socket-less driver (the browser-edge shape): a `link`-reaching bundle has
-  // nowhere to go on a shell with no raw-link driver, so without one this candidate never
-  // reaches the seam under test. The pin — this author's — is the other half of that.
+  // A REAL socket-less driver (the browser-edge shape) running a fixture transport: a
+  // `link` candidate is authorized only as the replacement of the current link owner, so
+  // without one this candidate never reaches the seam under test.
   const shell = await bootTestShell({
-    fs, freshnessStore: store, pinAuthor: author,
+    fs, freshnessStore: store, transportAuthor: author,
     createRealm: async ({ hostCall, source }) => {
       if (loadingNeighbor) {
         return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
@@ -1343,9 +1344,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
   try {
     // The neighbour goes in FIRST, so `_svc` is a claim held by a standing realm before the
     // candidate ever reaches for it: the refusal below is then the offside gate's, and not
-    // the absence of a claimant. Its own mark has to persist, so the store is let through
-    // for that one load and put back to failing afterwards.
-    store.fail = false;
+    // the absence of a claimant. The store starts healthy, because the boot transport's
+    // mark and the neighbour's own have to persist, and fails from here on.
     loadingNeighbor = true;
     await shell.loadBundleBlob(neighborBlob);
     loadingNeighbor = false;
@@ -1355,7 +1355,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
 
     let rejected = false;
     const localConfig = { custom: "kept", networkKey: "caller-value", linkIdleTimeoutMs: 1 };
-    try { await shell.loadBundleBlob(blob, { localConfig }); } catch { rejected = true; }
+    try { await shell.replaceBundle(shell.resolve("_fixture-transport"), blob, { localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
     const [, candidateLocal] = Function(
       candidates[0].source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
@@ -1366,7 +1366,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       candidateLocal.linkIdleTimeoutMs === 1 && candidateLocal.peerId === undefined,
     "the host passes LOCAL unchanged even for a link slot");
     assert(candidates[0].calls === 0,
-      "standing a link slot does not invoke a second privileged init path");
+      "standing a link slot does not invoke a second init path");
     assertEqual(candidates[0].refused.sort(),
       ["_svc", "crypto/blake2b-256", "fs/put", "fwd", "link/open", "node/identity"],
       "a candidate reaches nothing at all — not a write, another realm, a link, or a read");
@@ -1375,7 +1375,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
     store.fail = false;
-    await shell.loadBundleBlob(blob, { localConfig });
+    await shell.replaceBundle(shell.resolve("_fixture-transport"), blob, { localConfig });
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
     await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
     await candidates[1].hostCall("_svc", new Uint8Array());
@@ -1427,7 +1427,7 @@ async function testFailedRevokePersistRollsBack() {
 // running `timer` turns — re-arming more, and holding ~1.2 MB of engine per upgrade.
 async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("Test: an in-place upgrade disposes the realm and deadlines it replaces");
-  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
+  const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
   const key = appKey(author.id, "upgrade");
@@ -1472,7 +1472,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       realms.push(r);
       return r;
     },
-    admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
+    admit: admitAll,
   });
   try {
     const first = await shell.loadBundleBlob(blob(1));

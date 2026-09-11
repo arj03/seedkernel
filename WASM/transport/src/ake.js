@@ -222,7 +222,7 @@ function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([lin
 /** Hand ONE request this program decoded to the host's claim routing:
  *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
  *  (empty both for a claim no peer may reach and for a handler that failed — one fact at
- *  this boundary). Symmetric with an outbound `send` and under the same `link` privilege
+ *  this boundary). Symmetric with an outbound `send` and under the same `link` service
  *  as every other name here: it selects no link, and this program chose all three fields.
  *
  *  One request per call, so the payload simply runs to the end. It is the caller's job to

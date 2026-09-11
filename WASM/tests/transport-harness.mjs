@@ -212,14 +212,10 @@ export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
 
-/** The policy every harness node runs under: the transport author granted `link`, and
- *  whoever else is named trusted to load an ordinary app. Delivering what the link
- *  occupant decodes is `link/deliver`, one of that grant's own names, so there is no
- *  second grant to write here. */
-export function transportPolicy(authorHex, appAuthors = []) {
+/** The ordinary app-author policy used by harness nodes. The boot-selected transport needs no entry. */
+export function transportPolicy(appAuthors) {
   return policyFromJson(JSON.stringify({
-    authors: [authorHex, ...appAuthors],
-    grants: { link: [authorHex] },
+    authors: appAuthors,
   }));
 }
 
@@ -233,7 +229,7 @@ export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
   const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
-  const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
+  const policy = transportPolicy([appAuthorHex]);
   const transport = {
     channels: opts.channels,
     listen: opts.listen,
@@ -242,7 +238,6 @@ export async function makeTransportHost(opts = {}) {
     // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
     // own observation seam, and the only place a test can read WHY a link went down.
     onLinkClosed: opts.onLinkClosed,
-    load: false,
     bundle: opts.transportBlob ?? transportBlob,
   };
   const transportConfig = {
@@ -263,7 +258,7 @@ export async function makeTransportHost(opts = {}) {
     ...(opts.transportHalfOpen?.authed === undefined ? {} : { maxAuthedLinks: opts.transportHalfOpen.authed }),
     ...(opts.linkIdleTimeoutMs === undefined ? {} : { linkIdleTimeoutMs: opts.linkIdleTimeoutMs }),
   };
-  const blob = transport.bundle;
+  transport.config = transportConfig;
   const { shell, transport: driver } = await bootShell({
     sodium: opts.sodium ?? sodium,
     identity,
@@ -284,7 +279,6 @@ export async function makeTransportHost(opts = {}) {
       : o),
     admit: policy,
   });
-  await shell.loadBundleBlob(blob, { localConfig: transportConfig });
   // The node's own channel key, hex — off the identity this harness minted, not asked of
   // the driver: it is `toHex(identity.publicKey)`, which every caller of this factory
   // already holds, and the driver says nothing about peers any more (core/socket-seam.ts).

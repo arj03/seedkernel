@@ -147,8 +147,6 @@ async function linked(chans, aOpts = {}, bOpts = {}) {
   B.factory = bFactory;
   st.A = A;
   st.B = B;
-  await A.driver.start();
-  await B.driver.start();
   // A presents its OWN contact secret (aOpts.contactSecret, default CONTACT) on the dial;
   // B's factory hands over a plain accept.
   aFactory.give(chans[0], { weDialed: true, expectPeerId: B.peerId });
@@ -730,8 +728,6 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   A.factory = aFactory;
   B.factory = bFactory;
   keep(async () => { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } });
-  await A.driver.start();
-  await B.driver.start();
   // A spy for "the bundle was never re-loaded": the rotation below must not reach it.
   let loads = 0;
   const origLoad = B.shell.loadBundleBlob;
@@ -841,7 +837,6 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
     onLinkClosed: () => { closed = true; },
   });
   keep({ close() { try { A.shell.close(); } catch { /* down */ } } });
-  await A.driver.start();
   factory.give(chans[0], { weDialed: true, expectPeerId: A.peerId });
   await until(() => closed, 3000, "the deadline to close the link and notify");
   assert(!(await linkedTo(A, A.peerId)), "must not authenticate");

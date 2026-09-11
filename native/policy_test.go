@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 // With the bundle author allow-listed, the closed policy still loads the bundle.
@@ -32,75 +33,47 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
-// The `link/*` names carry a PRIVILEGE an operator grants separately (§12.5): a transport
-// sees all plaintext and holds the session keys, so "I trust this author's apps" must not
-// answer "may this author be my transport". The manifest has no role field, so
-// `guest.requires` alone decides which privileges are in play, and only in the strict
-// direction: naming any `link/*` puts `link` in the set, never takes it out.
-//
-// TWO independent things must agree before an author reaches `link`, and this proves both
-// halves refuse on their own. The operator's `grants` entry is one; the node's transport
-// AUTHOR PIN is the other — the assembly derives it from the transport blob this node
-// actually booted (`bootShell`, shell-core.ts), so the network can only ever be the
-// program the operator started the node with. A grant is therefore a veto an operator
-// holds over that blob's author, never a way to appoint a different one.
-//
-// Driven through the native loader, since `--policy` is an operator-facing surface here —
-// this is what proves it reaches that decision rather than a permissive default.
-func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
+// Trusting an app author cannot appoint that author as the transport.
+func TestAppPolicyCannotInstallTransport(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)
 	authorHex := hex.EncodeToString(author.id())
-
-	// On the plain author list and nothing else. The same load that lands this author's
-	// apps refuses their transport, and the refusal is admission — not a parse error, not
-	// a missing entrypoint: the requires named a privilege nobody was granted.
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
+		t.Fatal(err)
 	}
 	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link"})
-	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
-		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
-	}
-
-	// A privilege is ONE thing, so there is no partial claim to refuse and nothing that
-	// could fall through to the unprivileged base: the single `link` service is the whole
-	// claim, which is what the one-service bundle above already proves.
-
-	// The OTHER half: granting the privilege is still not enough. This node booted the
-	// artifact's own transport, so the pin names that author and no other — an operator
-	// who writes a grant for someone else has widened their own policy and changed
-	// nothing about who may be the network. Running a different transport means booting a
-	// different blob (`--transport-bundle`), which is what the pin is derived from.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
-	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
-		t.Fatalf("a grant must not appoint an author the transport pin does not name: %s", status)
+	if status := loadBundle(linkBundle); !strings.Contains(status, "explicit replacement") {
+		t.Fatalf("app policy must not appoint a transport: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)
-	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {
-		t.Fatalf("adding a grant must not disturb app admission: %s", status)
+	if status := loadBundle(appBundle); !strings.HasPrefix(status, "ordinary v1") {
+		t.Fatalf("app policy must still admit ordinary apps: %s", status)
 	}
+}
 
-	// A key the host does not know fails the boot — at the top level and under `grants`
-	// alike, which is the whole reason grants are named from the catalog: a misspelled
-	// key is a node that looks configured and holds nothing.
-	for _, bad := range []string{
-		`{"authors":["` + authorHex + `"],"grants":{"links":["` + authorHex + `"]}}`,
-		`{"authors":["` + authorHex + `"],"grants":{"socket":["` + authorHex + `"]}}`,
-		`{"authorss":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`,
-	} {
-		if err := applyPolicy(bad); err == nil {
-			t.Fatalf("applyPolicy(%s) must fail loudly", bad)
-		}
+func TestTransportNetworkOptional(t *testing.T) {
+	bootRealmIn(t, t.TempDir())
+	got := awaitOK(t, "transport without app policy", `(async () => {
+	  setPolicy(null);
+	  const identity = deriveNodeKey(sodium, sodium.randombytes_buf(32));
+	  for (const network of [false, true]) {
+	    const node = await makeTransportNode({ identity, network });
+	    try {
+	      if ((node.transport !== null) !== network) throw new Error("network adapter mismatch");
+	      if ((node.shell.resolve("_net") !== null) !== network) throw new Error("transport slot mismatch");
+	    } finally { node.shell.close(); }
+	  }
+	  return new Uint8Array([1]);
+	})()`, 10*time.Second)
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("network opt-in: %v", got)
 	}
 }
 
 // parsePolicy fails loudly on malformed config rather than silently widening trust.
 func TestPolicyMalformed(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	for _, bad := range []string{`{}`, `{"authors":[]}`, `[]`, `not json`, `{"authors":[123]}`, `{"authors":"x"}`} {
+	for _, bad := range []string{`{}`, `[]`, `not json`, `{"authors":[123]}`, `{"authors":"x"}`, `{"authors":["zz"]}`, `{"authors":[],"grants":{"link":[]}}`} {
 		if err := applyPolicy(bad); err == nil {
 			t.Fatalf("applyPolicy(%q) = nil, want an error", bad)
 		}
@@ -116,7 +89,7 @@ func TestPolicyMalformed(t *testing.T) {
 }
 
 // The whole point of the omitted-policy default: a node that was never given a policy
-// refuses every install rather than trusting any signed author (README §14). The JS
+// refuses every ordinary app install (README §14). The JS
 // shell has always done this (main.ts) — the native loader used to do the opposite.
 func TestNoPolicyDeniesInstalls(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)

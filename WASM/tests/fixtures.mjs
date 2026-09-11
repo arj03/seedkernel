@@ -46,7 +46,7 @@ export const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, Freshn
   verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 export const { signManifest, packBundle, guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
-export const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
+export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
 export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 export const gHash = (b) => bundleGenesisHash(sodium, b);
 
@@ -73,31 +73,28 @@ export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
  *  bundles here declare no `fs` cap, and handing them the in-memory backend would be a
  *  seam open the test never asked for.
  *
- *  `pinAuthor` is whose signature the TRANSPORT PIN admits (§12.5). The pin is derived
- *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` is
- *  refused before any predicate under test is consulted. What is handed over is a real
- *  signed bundle of that author's, because the pin is read off a signature rather than
- *  off a name; the socket-less driver beside it is the browser-edge shape (§12.6). */
-export async function bootTestShell({ pinAuthor, ...opts } = {}) {
+ *  `transportAuthor` boots a small signed link occupant for explicit replacement tests. */
+export async function bootTestShell({ transportAuthor, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
-  const pinned = pinAuthor ? {
-    transport: {
-      load: false,
-      bundle: packBundle({
-        [MANIFEST_FILE]: signManifest(sodium, pinAuthor,
-          { app: "pin", version: 1, modules: [], guest: GUEST() }),
-        [GUEST_FILE]: GUEST_BYTES,
-      }),
-    },
+  const fixtureSource = "function handle() { return new Uint8Array(); } // fixture transport";
+  const transport = transportAuthor ? {
+    transport: { bundle: authorBundle(sodium, transportAuthor, {
+      app: "fixture-transport", version: 1, modules: [], services: ["_fixture-transport"],
+      guestSource: fixtureSource, guestRequires: ["link"],
+    }).blob },
   } : {};
   const { shell } = await bootShell({
     sodium,
     modules: new JsModuleLoader(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    ...pinned,
+    ...transport,
     ...opts,
     identity,
+    ...(transportAuthor && opts.createRealm ? { createRealm: async (o) =>
+      o.source.endsWith(fixtureSource)
+        ? { call: async () => new Uint8Array(), dispose() {} }
+        : opts.createRealm(o) } : {}),
   });
   return shell;
 }
@@ -105,8 +102,7 @@ export async function bootTestShell({ pinAuthor, ...opts } = {}) {
 /** The admission context a bundle with no history lands under: an ordinary app, never
  *  loaded here before, from a key nobody has written off. The shell reads these off its
  *  freshness store; a test composing the load by hand states them. */
-export const APP_CTX = { privileges: [], highWater: -Infinity, revoked: false };
-export const LINK_CTX = { ...APP_CTX, privileges: ["link"] };
+export const APP_CTX = { highWater: -Infinity, revoked: false };
 
 /** `verifyBundle` → `admit` → `installBundle` (§12.4), for the policy + integrity tests
  *  that own their own ModuleTable without a shell. `admit` is AWAITED — a composed

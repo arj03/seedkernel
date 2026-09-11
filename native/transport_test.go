@@ -38,8 +38,7 @@ func TestTwoNodeRequestResponseWS(t *testing.T) {
 func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 	bootRealm(t)
 	if _, err := qc.Eval("source-cap-harness.js", qjs.Code(`
-		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
-		                           grants: { link: [embeddedTransportAuthor] } }));
+		setPolicy(JSON.stringify({ authors: [] }));
 		globalThis.__startSourceCapTest = async () => {
 		  globalThis.__sourceCapNode = await makeTransportNode({
 		    identity: sodium.crypto_sign_keypair(),
@@ -117,10 +116,9 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	}
 	harness := fmt.Sprintf(`
 		// A node's network IS the transport bundle, so both ends are stood up by
-		// makeTransportNode — the factory bootNode uses — and the policy has to admit
-		// the artifact's own transport author before either has a network at all.
-		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor] } }));
+		// makeTransportNode — the factory bootNode uses — which boots the artifact's own
+		// transport. The policy names only the probe app's author.
+		setPolicy(JSON.stringify({ authors: [%q] }));
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.startTest = async function () {

@@ -4,7 +4,7 @@
 // inside QuickJS, bundled with every module it imports into native/host-shell.gen.js by
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
-import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
+import { FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup, type TransportNodeConfig } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import {
@@ -30,9 +30,6 @@ import {
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
-// The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
-// program that is the node's network (§12.6).
-import { transportBundleBytes } from "./transport-bundle.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
  *  The answer is always `null`: every call parks, Go holds the guest's Promise under
@@ -142,8 +139,7 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
 }
 
 /** The one `sodium` this target has. Exported — and published as a global by the loader
- *  bundle — so the native tests drive the same wrapper production does. Built at module
- *  scope because `embeddedTransportAuthor` verifies a bundle with it below. */
+ *  bundle — so the native tests drive the same wrapper production does. */
 export const sodium: NativeSodium = wrapNativeSodium(__sodium);
 
 /** The `fs.*` primitive over Go's data directory (native/fs.go), declared with its real,
@@ -363,28 +359,6 @@ const channels: ChannelFactory = {
   // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
   close: () => { netCloseListeners(); },
 };
-/** The artifact-shipped transport bundle, as raw bytes (transport-bundle.js). */
-const embeddedTransport = (() => {
-  try {
-    return transportBundleBytes();
-  }
-  catch {
-    return null;
-  }
-})();
-/** Who signed the transport this artifact ships — hex, DERIVED from the blob rather than
- *  restated anywhere. It is the id an operator pins under `grants.link` in a policy file
- *  (§12.5). Empty if the artifact carries no transport. */
-const embeddedTransportAuthor = (() => {
-  if (!embeddedTransport)
-    return "";
-  try {
-    return toHex(verifyBundle(sodium, embeddedTransport).author);
-  }
-  catch {
-    return "";
-  }
-})();
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm driven by
  *  Go's event loop, implementing the same neutral `Realm` contract as safe-js.ts. The promise plumbing
  *  stays here rather than in Go: `nativeCall` closes over this realm, so a settled op routes
@@ -534,7 +508,7 @@ async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime>
     sodium, identity: cfg.identity, modules, fs,
     freshnessStore: new NativeFreshnessStore(storeDir),
     // The sockets and the signed program that drives them, in one object.
-    transport: {
+    transport: cfg.network === false ? false : {
       channels,
       listen: cfg.listen,
       wsListen: cfg.wsListen,
@@ -549,7 +523,7 @@ async function makeTransportNode(cfg: TransportNodeConfig): Promise<NodeRuntime>
     realmMemoryBytes: cfg.realmMemoryBytes,
     createRealm,
   });
-  return { shell, transport: transport! };
+  return { shell, transport };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so
@@ -584,7 +558,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     await awaitCohort(s.shell, "peers were configured, but there is nothing to dial from");
   }
   const status = {
-    peerId: toHex(key.publicKey), port: network.port, wsPort: network.wsPort,
+    peerId: toHex(key.publicKey), port: network?.port ?? 0, wsPort: network?.wsPort ?? 0,
   };
   return utf8.encode(JSON.stringify(status));
 }
@@ -609,8 +583,7 @@ function nativeCliHost(): CliHost {
     sodium,
     async standUp(cfg: NodeSetup) {
       // Where this node's disk is, and who may install on it — both before the
-      // transport bundle lands, because that load is governed by the policy and
-      // its freshness mark belongs beside the store.
+      // transport bundle lands, because its freshness mark belongs beside the store.
       openStore(cfg.dir);
       setPolicy(cfg.policyJson ?? null);
       // NodeSetup EXTENDS TransportNodeConfig, so the rest of the config crosses
@@ -678,4 +651,4 @@ globalThis.__start = function (id, arg) {
 // What Go reaches by name in the realm. `createRealm` and the transport helpers are here
 // for the native tests as much as for the boot above, so a test that stands up a guest or
 // a second node drives the very factories production does.
-export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, makeTransportNode, };

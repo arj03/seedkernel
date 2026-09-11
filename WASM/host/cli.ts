@@ -9,7 +9,6 @@ import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import type { ListenAddress } from "../core/socket-seam.js";
-import { PRIVILEGE_LINK } from "../core/domains.js";
 import { OpArgs, writeOp } from "../core/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort, peersConfig } from "./peer-addr.js";
@@ -24,7 +23,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 
 /** Every flag the shell accepts. An allowlist rather than a parse-and-ignore, because
  *  the failure an unknown flag would hide is silent: a mistyped `--polcy` would build a
- *  deny-all node that boots, serves, and installs nothing — which looks exactly like a
+ *  node that refuses ordinary apps — which looks exactly like a
  *  node whose policy is doing its job. The allowlist makes the typo say so. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
@@ -48,13 +47,13 @@ export interface TransportNodeConfig {
   /** This node's keypair (README §12.6) — the derived channel keypair, whose public
    *  half is the peer id and the node's one identity (§12.9). */
   identity: Keypair;
+  /** False disables networking. The CLI sets this from its network flags. */
+  network?: boolean;
   listen?: ListenAddress;
   wsListen?: ListenAddress;
-  /** The signed transport bundle blob, defaulting to the artifact's own. This blob is
-   *  what the node's transport author PIN is derived from, so it is how an operator runs
-   *  a transport other than the shipped one; the policy must additionally grant that
-   *  author the `link` privilege (never the plain `authors` list). A shell without an
-   *  admitted transport bundle has no network. */
+  /** The signed transport bundle blob, defaulting to the artifact's own: how an operator
+   *  selects a transport other than the shipped one. App-author policy does not
+   *  participate in this decision. A shell without a transport has no network. */
   transportBundle?: Uint8Array;
   /** Transport `LOCAL` config, such as peers, `networkKey` and `contactSecret` (§12.10). */
   transportConfig?: JsonObject;
@@ -76,14 +75,14 @@ export interface NodeSetup extends TransportNodeConfig {
   /** Directory backing the fs.* capability. */
   dir: string;
   /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
-   *  accepts no installs. */
+   *  accepts no ordinary app installs. */
   policyJson?: string;
 }
 
 /** Platform-owned channel integration kept beside the shell. */
 export interface NodeRuntime {
   shell: Shell;
-  transport: TransportHost;
+  transport: TransportHost | null;
 }
 
 /** This node's transport config, shared by the CLI and native assemblies (§12.6). */
@@ -106,7 +105,7 @@ export function transportConfigFrom(
 export function awaitCohort(shell: Pick<Shell, "call">, what: string): Promise<Uint8Array> {
   const answer = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
   if (!answer) {
-    throw new Error(`shell: ${what} — load a bundle granted the "${PRIVILEGE_LINK}" privilege first`);
+    throw new Error(`shell: ${what} — enable transport first`);
   }
   return answer;
 }
@@ -234,9 +233,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const dir = args.get("dir") ?? DEFAULT_DIR;
   const keyPath = args.get("key") ?? DEFAULT_KEY;
   const policyPath = args.get("policy");
-  // Omitting --policy is not "no policy" but deny-all: the shell resolves an absent
-  // policy to an empty author set, so the node boots and serves and nothing installs —
-  // including the --bundle below, whose manifest author must be listed too (§14).
+  // An absent policy denies ordinary app installs. It does not touch the network: the
+  // boot-selected transport needs no entry in this app-author set.
   const policyJson = policyPath === undefined
     ? undefined
     : utf8.decode(mustRead(host, policyPath, "--policy"));
@@ -245,6 +243,13 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const bundlePath = args.get("bundle");
   if (args.has("local-config") && bundlePath === undefined) {
     throw new Error("--local-config requires --bundle so the configuration has one app scope");
+  }
+  // Transport-only flags on a node with no network would be read and silently dropped.
+  const network = args.has("listen") || args.has("ws-listen") || args.has("peers");
+  for (const flag of ["transport", "contact-secret"]) {
+    if (args.has(flag) && !network) {
+      throw new Error(`--${flag} requires --listen, --ws-listen or --peers, which enable the network it configures`);
+    }
   }
   // Checked here, not at the load, so a malformed file fails before a node is listening.
   let localConfig: JsonObject | undefined;
@@ -263,6 +268,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     dir,
     policyJson,
     identity: key,
+    network,
     listen: args.has("listen")
       ? parseHostPort(args.get("listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
@@ -286,11 +292,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);
-  host.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
+  host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  if (net.port) host.log(`  tcp    listening on :${net.port}`);
-  if (net.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
+  if (net?.port) host.log(`  tcp    listening on :${net.port}`);
+  if (net?.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
 
   // Operator remedies (§12.5), deliberately BEFORE the bundle: a node booting with both
   // should never briefly install what it was told to refuse. --revoke is the whole remedy
@@ -340,7 +346,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   const close = () => shell.close();
-  if (!net.port && !net.wsPort) return { serving: false, close };
+  if (!net?.port && !net?.wsPort) return { serving: false, close };
   // A serving node with an app loaded also answers for the cohort: inbound requests route
   // by protocol id to whichever app claims it, answered from its own confined realm — no
   // app-specific host code, no second dispatch (§12.8, §12.10). Nothing to arm: the load

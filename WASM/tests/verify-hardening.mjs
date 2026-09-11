@@ -821,7 +821,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 {
   // A bound can be declared on every interface between the operator and the realm and be
   // passed by none of them, so this boots a node onto a stub realm factory and asserts the
-  // numbers arrive. No transport, so nothing here may reach a privilege.
+  // numbers arrive. No transport, so nothing here may reach `link`.
   const kp = testAuthor();
   const guestSrc = 'function handle() { return new Uint8Array([1]); }';
   const guestBytes = new TextEncoder().encode(guestSrc);

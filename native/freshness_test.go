@@ -140,7 +140,7 @@ func TestFreshnessReadFailuresFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			policy := withTransportAuthor(t, `{}`)
+			policy := `{"authors":[]}`
 			cfg := nodeConfig{PolicyJSON: &policy, KeyHex: testKeyHex(t), ContactSecretHex: testContactSecretHex}
 			if _, err := startNode(cfg); err == nil {
 				t.Fatalf("freshness %s was silently treated as an empty store", tc.name)

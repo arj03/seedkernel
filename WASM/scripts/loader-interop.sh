@@ -41,25 +41,13 @@ const { readFileSync } = await import('node:fs');
 const sodium = await loadCrypto();
 process.stdout.write(Buffer.from(verifyBundle(sodium, new Uint8Array(readFileSync(process.argv[1]))).author).toString('hex'));
 " "$BUNDLE")
-# The cohort's network is a SECOND bundle — the artifact-shipped transport
-# (host/transport-bundle.ts, §12.6), loaded by every node at boot — signed by the
-# transport author, which policy pins under `grants.link` (§12.5): "I trust this
-# author to be my transport" is a separate answer from "this author may install
-# apps". The app bundle's author rides the plain `authors` list.
-TRANSPORT_AUTHOR=$(cd "$SK" && node --input-type=module -e "
-const { verifyBundle } = await import('./build/host/bundle.js');
-const { loadCrypto } = await import('./build/host/crypto-node.js');
-const { TRANSPORT_BUNDLE_B64 } = await import('./build/host/transport-bundle.js');
-const sodium = await loadCrypto();
-process.stdout.write(Buffer.from(verifyBundle(sodium, Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, 'base64'))).author).toString('hex'));
-")
-
+# Each node explicitly loads the embedded transport at boot. Policy lists only the app author.
 WORK=$(mktemp -d)
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-echo "{\"authors\":[\"$AUTHOR\",\"$TRANSPORT_AUTHOR\"],\"grants\":{\"link\":[\"$TRANSPORT_AUTHOR\"]}}" > "$WORK/policy.json"
+echo "{\"authors\":[\"$AUTHOR\"]}" > "$WORK/policy.json"
 # The §14 byte budget is OPERATOR policy: it is deliberately absent from the signed
 # bundle, and the guest FAILS CLOSED at 0 rather than guessing a generous default. Every
 # node here — holders and initiators — therefore needs one, or the holders answer every

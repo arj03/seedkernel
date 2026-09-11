@@ -3,7 +3,7 @@
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, serviceOf, type HostTransformName, type CapabilityName } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
@@ -114,7 +114,7 @@ export interface SeamGrants {
      *  (`scopedFs`). Optional: a node that only initiates never reads it. */
   fs?: Fs;
   /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for a bundle
-     *  that reaches the `link` privilege, so nothing else can ever reach a descriptor
+     *  that requires the `link` service, so nothing else can ever reach a descriptor
      *  whatever is installed (§1, capability-by-non-wiring). */
   rawNet?: RawNet;
   /** The platform's event loop. `names` decides whether this realm may reach it. */
@@ -292,7 +292,7 @@ export const HOST_CALLER_ID = new Uint8Array(32);
 /** Method catalog, re-exported from core/domains.ts. A grant is a SERVICE name
  *  (`HOST_SERVICES`) or a local service id declared in `guest.requires`; `crypto/*` and
  *  the bundle's own modules are not. */
-export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";
+export { AUTHORITY_CALLS } from "../core/domains.js";
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
  *  guest signs only within its own bundle's namespace; every node running the same bundle
@@ -357,8 +357,8 @@ export function linkSignScope(key: Keypair): SignScope {
  *  and nothing from `protocols`, which move per version and would silently restate what
  *  signed records mean. */
 export function slotSignScope(node: { identity: Keypair },
-  author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
-  return privileges.includes(PRIVILEGE_LINK)
+  author: Uint8Array, app: string, links: boolean): SignScope {
+  return links
     ? linkSignScope(node.identity)
     : appSignScope(node.identity, author, app);
 }

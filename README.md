@@ -57,7 +57,7 @@ Three terms describe different responsibilities:
 | --- | --- |
 | **Host** | The full runtime that admits and runs bundles, including its shared implementation and platform adapters. Changing host code requires a rebuild. |
 | **Core** | The host facilities an app cannot supply for itself (§12.1): `link` sends and receives bytes over opaque link ids, and `fs` gets, puts, sizes, lists, deletes, and stats bytes under opaque flat keys — plus their flood limits, entropy, a clock, and access to the private node key. The host enforces the flood limits where it holds the descriptors, and peer identity is supplied by the transport. |
-| **Trust root** | The basis for admitting code: the host's manifest verifier and the operator's policy of trusted authors, capability grants, and version floors. The verifier must ship with the host to check the first bundle; policy is operator-controlled configuration. |
+| **Trust root** | The basis for admitting code: the host's manifest verifier and the operator's policy of trusted app authors, the selected transport author, and version floors. The verifier must ship with the host to check the first bundle; policy is operator-controlled configuration. |
 
 The guest seam, execution limits, boot assembly and claim routing are host code without being core: an app could implement each for itself, but each is what would have to admit or confine its own replacement. The trusted base is wider still, since it also includes the execution engines and the platform adapters.
 
@@ -84,11 +84,11 @@ Four things follow:
 
 The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle, admitted by the same loader as any other app. It is a **guest** rather than a WASM module for a structural reason: a §4 module is a synchronous transform with no capability imports and disposable state (§4.3), which an AKE carrying session keys across round trips cannot be. So the session state lives in the guest's own heap, keyed by a host-supplied link id, and the node key never enters it. Where computation *is* a bare transform it ships as one — RFC 6455 is `ws.wasm` and ML-KEM-768 is `mlkem768.wasm`, both no-capability modules of that same bundle.
 
-What this buys is that the **protocol** is replaceable without a fork: handshake, transcript, record framing and dial policy are all content, and a deployment that wants different ones boots that signed bundle as its transport and grants its author `link`, instead of patching the runtime. It can even be swapped under a running node: an update builds a complete replacement for its slot, then atomically replaces that slot, its ordinary service claim, and its raw-link binding. Nothing of the outgoing realm survives — not the live links, whose session keys are in its private memory (exactly what makes the transport confineable), and not the address book, which is the guest's own. So an upgrade is a **reconnect**, and the embedder names the peers again in the new load's config (§12.10). The node keeps its listeners, so it accepts throughout.
+What this buys is that the **protocol** is replaceable without a fork: handshake, transcript, record framing and dial policy are all content, and a deployment that wants different ones selects that signed bundle as its transport instead of patching the runtime. It can even be swapped under a running node: `replaceBundle(oldAppKey, blob)` builds a complete replacement for its selected slot, even across authors, then atomically replaces that slot, its ordinary service claim, and its raw-link binding. Nothing of the outgoing realm survives — not the live links, whose session keys are in its private memory (exactly what makes the transport confineable), and not the address book, which is the guest's own. So an upgrade is a **reconnect**, and the embedder names the peers again in the new load's config (§12.10). The node keeps its listeners, so it accepts throughout.
 
-Two things keep that safe. Policy is keyed on the **capability** rather than on a kind of bundle, so who may *be* the network is a decision the operator makes apart from who may ship an app (§12.5). The transport holds session keys and plaintext, so confinement does not protect those from the transport itself ([SECURITY §14](docs/SECURITY.md#14-security-considerations)). And a link speaks exactly one suite, named by a byte both ends fold into what they sign, so a mixed period is a rollout rather than a corruption and an in-path downgrade is a dead link (§12.6).
+Two things keep that safe. The initial transport is selected at boot, and live changes explicitly replace its current owner; ordinary app loading cannot acquire `link`. Who may *be* the network is a decision apart from who may ship an app (§12.5). The transport holds session keys and plaintext, so confinement does not protect those from the transport itself ([SECURITY §14](docs/SECURITY.md#14-security-considerations)). And a link speaks exactly one suite, named by a byte both ends fold into what they sign, so a mixed period is a rollout rather than a corruption and an in-path downgrade is a dead link (§12.6).
 
-**The first transport ships inside the host artifact,** because a node has no network until it has a transport (§12.6). What travels is the *next* one: a replacement arrives over the transport already running, like any other bundle, since what admits it is the manifest signature and not the route it took.
+**The first transport ships inside the host artifact,** because a node has no network until it has a transport (§12.6). What travels is the *next* one: a replacement arrives over the transport already running, like any other bundle, but its signature alone does not trigger installation: the caller explicitly selects which owner it replaces.
 
 ## The shape of it
 
@@ -175,16 +175,16 @@ The reference composition separates application logic, dispatch, transport, and 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle; each supplies its own platform adapters. The shared host set is the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. `WASM/core/` holds core contracts and fixed host vocabulary, including manifest constants; `WASM/host/` implements the surrounding runtime, and `WASM/transport/` builds the signed transport bundle. The directory names group source files; the tables below distinguish shared code from platform code (`npm run loc` in `WASM/` computes the figures).
 
-**Shared — compiled once, run by all three targets (2,613 LOC)**
+**Shared — compiled once, run by all three targets (2,565 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 510 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 468 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 320 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the timer table and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 725 |
-| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 386 |
-| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 248 |
-| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 424 |
+| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 379 |
+| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 255 |
+| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 418 |
 
 Sharing these rows keeps admission and confinement rules consistent across targets and avoids duplicating adapters and client codecs. Claim routing still follows each node's own installed set (§12.10); the operator decides which app owns each claim ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
 
@@ -195,7 +195,7 @@ The transport driver holds link ids and listeners and exposes three events: `lin
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,562 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (425) and `native-polyfills.ts` (83), both TypeScript and riding in the shared bundle | 2,296 Go + 508 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (406) and `native-polyfills.ts` (83), both TypeScript and riding in the shared bundle | 2,296 Go + 489 TS |
 
 Each socket implementation reaches the driver as a `RawLink` through the `ChannelFactory` seam ([RUNTIME §12.1](docs/RUNTIME.md)). TCP length-prefixing and RFC 6455 belong to the transport bundle — 1,558 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, outside the host tables above.
 

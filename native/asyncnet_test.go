@@ -38,11 +38,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.idB = sodium.crypto_sign_keypair();
 		globalThis.aId = toHex(idA.publicKey);
 		globalThis.bId = toHex(idB.publicKey);
-		// A node without an admitted transport bundle has no network at all, so the
-		// policy has to name the artifact's own transport author before either node
-		// stands up. The id is read from the realm, never restated.
-		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor] } }));
+		// Both nodes boot the artifact's own transport, which needs no policy entry; the
+		// policy names only the app's author.
+		setPolicy(JSON.stringify({ authors: [%q] }));
 		globalThis.__setup = (async () => {
 		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 } });
 		  const b = await makeTransportNode({ identity: idB });

@@ -76,8 +76,8 @@ export class FileFreshnessStore extends FreshnessMarks {
 // lazy safe-js import this platform wants (the engine is heavy, so it loads on the first
 // realm), and a second copy of it would be the drift the assembly exists to remove.
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
- *  `bootShell` — which admits the transport bundle, the signed program that is the node's
- *  network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
+ *  `bootShell` — which installs the selected transport bundle, the signed program that is
+ *  the node's network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
 export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRuntime> {
   const sodium = await loadCrypto();
   // ── Node platform seam ─────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
     fs,
     freshnessStore: freshness,
     // The sockets and the signed program that drives them, in one object.
-    transport: {
+    transport: opts.network === false ? false : {
       channels: opts.channels ?? new NodeChannelFactory(),
       listen: opts.listen,
       wsListen: opts.wsListen,
@@ -112,7 +112,5 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
       return core.loadBundleBlob(new Uint8Array(readFileSync(file)), loadOpts);
     },
   };
-    // This wrapper always supplies transport options above, so the core's nullable result
-    // (needed for no-network bootShell callers) is non-null at this boundary.
-  return { shell, transport: transport! };
+  return { shell, transport };
 }

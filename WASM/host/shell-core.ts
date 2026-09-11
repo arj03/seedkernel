@@ -1,10 +1,9 @@
 // Platform-neutral shell (§12.9). `bootShell` is THE assembly path — defaults, the
-// transport author pin, the slot table, the load order — and the only way to a Shell, so
-// there is no second constructor that could skip the pin. Targets displace platform members
-// only (main.ts, native-shim.ts, seedchat, seedstore). Signed bundles are the only way slots
-// land (§12.4).
-import { denyAll, allOf, hostGates, checkHostGates, type Admit, type AdmissionContext, type HostFacts } from "./policy.js";
-import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
+// slot table and load order. Explicit replacement selects the owner to retire. Targets
+// displace platform members only (main.ts, native-shim.ts, seedchat, seedstore). Signed
+// bundles are the only way slots land (§12.4).
+import { denyAll, checkHostGates, type Admit, type AdmissionContext } from "./policy.js";
+import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
@@ -13,7 +12,6 @@ import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -26,16 +24,8 @@ export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
  *  build satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
 
-/** The one reason a bundle load is refused without being an error worth reporting: the
- *  policy predicate said no (§12.4). Shared so the transport's installers can read it as
- *  "a node without a network", a deliberate configuration rather than a failure. */
+/** Admission refused this verified bundle (§12.4). */
 export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
-
-/** True iff a loadBundleBlob failure was the policy's refusal (see ADMISSION_REJECTED),
- *  whatever shape the thrown value took. */
-export function isAdmissionRejected(err: unknown): boolean {
-  return errMessage(err).includes(ADMISSION_REJECTED);
-}
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
@@ -88,11 +78,17 @@ export interface Shell {
   fs?: Fs;
   sodium: ShellSodium;
   /** Load a signed bundle blob: verify the manifest, run the admission predicate,
-     *  integrity-check + install the modules, stand the guest. Every bundle takes this same
-     *  §12.4 path. A load either leaves a running app behind or leaves nothing: the realm
-     *  is built here, so a guest that cannot compile fails the load rather than the first
-     *  frame, and the freshness mark is advanced last, once it has. */
+     *  integrity-check + install the modules, stand the guest. This method refuses link
+     *  bundles and cannot implicitly replace the transport. A load either leaves a running
+     *  app behind or leaves nothing: the realm is built here, so a guest that cannot
+     *  compile fails the load rather than the first frame, and the freshness mark is
+     *  advanced last, once it has. */
   loadBundleBlob(blob: Uint8Array, opts?: LoadBundleOptions): Promise<AppHandle>;
+  /** Atomically replace the selected slot, even across authors or app names. App
+     *  candidates still require admission. A link candidate is authorized only when
+     *  replacing the current link owner. A changed target or failed candidate leaves
+     *  the current installation untouched; identity scopes and history never transfer. */
+  replaceBundle(oldAppKey: string, blob: Uint8Array, opts?: LoadBundleOptions): Promise<AppHandle>;
   /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
      *  realm, private modules, timers and scopes as one unit. */
   uninstall(appKey: string): boolean;
@@ -119,7 +115,7 @@ export interface AppHandle extends LoadedBundle {
      *  (outside a running node), `scopedFs(raw, appScope)` (fs-view.ts) re-derives it. */
   appScope: string;
   /** Loopback invoke into this app's one `handle` entrypoint, bound to THE SLOT this
-     *  load stood. A replacement load stands a new slot under the same key, so a handle
+     *  load stood. A replacement stands a new slot, possibly under a different key. A handle
      *  taken before it keeps naming the version it was handed and rejects once that slot
      *  is disposed. The replacement load returns the new handle. */
   invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
@@ -128,25 +124,21 @@ export interface AppHandle extends LoadedBundle {
 // Re-exported so a target reaches the admission constructors, and an app's fs view, from
 // the same module it gets bootShell from — how the pieces are split across files here is
 // not a client's problem. Pure-module builders remain target implementations, not shell API.
-export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, allOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
 export { scopedFs } from "./fs-view.js";
 
 /** This node's network, whole (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
-  /** The transport bundle to PIN — and, unless `load` is false, to load. Default: the
-     *  artifact-shipped one. The pin's author is DERIVED from this blob, so passing different
-     *  bytes is a deliberate transport replacement. */
+  /** The signed transport to install at boot. Selecting these bytes authorizes link.
+     *  Defaults to the artifact-shipped bundle. Live changes use replaceBundle. */
   bundle?: Uint8Array;
-  /** Installation-local config for that load, through the ordinary `localConfig` path. */
+  /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
-  /** Whether the boot loads the pinned bundle. Default true; `false` leaves the load to
-     *  the caller, under the same pin. */
-  load?: boolean;
 }
 
 /** JS-target assembly options (§12.9). Every field but `sodium` and `identity` has a
- *  default; the pin and the load order are part of standing a node up, which is why there
- *  is one assembly path and no way to reach the shell around it. */
+ *  default; transport selection and the load order are part of standing a node up, which
+ *  is why there is one assembly path and no way to reach the shell around it. */
 export interface BootShellOptions {
   /** The crypto surface the shell needs — core libsodium with the ML-DSA-65 verifier
      *  mixed in (the one thing no target can default: main.ts loads it, a browser page
@@ -156,11 +148,9 @@ export interface BootShellOptions {
      *  identity every target reports through `node/identity`. The handshake and the seam's
      *  SIGN op both sign with it, under different domains and scopes. */
   identity: Keypair;
-  /** YOUR admission predicate (§12.5) — the one branch that is actually yours: an
-     *  operator's policy, a consent dialog, or `() => true` for "the bundle my operator
-     *  handed me IS the trust decision". The transport author pin is ANDed onto it here, and
-     *  the host's own gates (`hostGates`) below, so no posture can lose either. Consulted for
-     *  EVERY bundle, privileged ones included. Absent ⇒ deny-all. */
+  /** Admission for ordinary apps: an author policy, consent dialog, or `admitAll`.
+     *  Absent means deny-all for apps. Link is authorized by the selected boot transport
+     *  or explicit replacement of its current owner. Host gates apply to every bundle. */
   admit?: Admit;
   /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
      *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
@@ -209,9 +199,7 @@ export interface BootResult {
   transport: TransportHost | null;
 }
 
-/** Stand a node up: the platform parts, the transport author pin, the shell, and the load
- *  of the signed transport program that IS the node's network (§12.6). The one assembly
- *  path — a second way to a Shell would be one that skipped the pin. */
+/** Stand a node up and install the selected signed transport through the shared installer. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const sodium = opts.sodium;
   // The defaults are imported lazily: they are JS-target parts (a worker-backed module
@@ -231,32 +219,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const netHost = net
     ? new TransportHost(net)
     : null;
-    // The author is DERIVED from the blob, never restated — the pin is the whole of "only
-    // this author may be the network" (§12.5).
   const transportBlob = netHost ? (net!.bundle ?? transportBundleBytes()) : null;
-  let transportAuthorHex: string | null = null;
-  if (transportBlob) {
-    try {
-      transportAuthorHex = toHex(verifyBundle(sodium, transportBlob).author);
-    }
-    catch { /* malformed blob — the load below refuses it by name */ }
-  }
-  // THE admission predicate (§12.5): the host's own gates, then the caller's, then the
-  // transport pin. Composed HERE so no posture can lose a member — an `admitAll`, or a
-  // consent dialog that always says yes, must not shed revocation or the pin. The pin is a
-  // VETO, never an appointment: it can only refuse.
-  //
-  // FAIL-CLOSED on a privilege it does not know: `PRIVILEGES` is derived from the
-  // capability catalog, so a privileged name added there arrives here with no branch and
-  // is refused rather than waved through. A new privilege is taught to the assembly
-  // deliberately, in this one place.
-  const admit: Admit = allOf(hostGates, opts.admit ?? denyAll, (v, ctx) => {
-    if (ctx.privileges.length === 0) return true;
-    for (const priv of ctx.privileges) {
-      if (priv !== PRIVILEGE_LINK) return false;
-    }
-    return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
-  });
+  const appAdmit = opts.admit ?? denyAll;
+  let closed = false;
 
   // ── what this node holds (slot-table.ts) ────────────────────────────────────
   const table = createSlotTable();
@@ -288,7 +253,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // Banked against THIS slot's ceiling, not the node's default.
     DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, deadlineFor(load));
     const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
-    const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
+    const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, reachesLink(loaded.manifest));
     slot = {
       verifiedBundle: loaded,
       pureModules,
@@ -347,7 +312,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  (`grants`), and what this APP installed (`modules`). A bundle reaching `link` is
      *  wired with `rawNet`: without it a bundle is never handed a socket descriptor (§1,
      *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*` is an ordinary
-     *  `"app"` authority, so every realm gets a table. */
+     *  host service, so every realm gets a table. */
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
     const links = table.hasLink(slot);
@@ -473,6 +438,99 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // Inbound requests use current peer claims (§12.10).
   netHost?.routeInbound(deliverInbound);
 
+  // One transaction for app loads, explicit replacements, and the selected boot transport.
+  const installBundle = async (blob: Uint8Array, loadOpts: LoadBundleOptions = {},
+    replacement?: AppSlot, bootTransport = false): Promise<AppHandle> => {
+    const localConfig = loadOpts.localConfig ?? {};
+    if (!isJsonObject(localConfig))
+      throw new Error("shell: localConfig must be a JSON object");
+    const v = verifyBundle(sodium, blob);
+    const hostFacts = (): AdmissionContext => ({
+      highWater: freshnessStore.get(v.author, v.manifest.app),
+      revoked: freshnessStore.isRevoked(v.author),
+    });
+    checkHostGates(v, hostFacts());
+    // A candidate reaching `link` is not an app: whether it may take the binding is the
+    // slot table's rule (boot selection or replacement of the holder), never consent.
+    const links = reachesLink(v.manifest);
+    if (bootTransport && !links) throw new Error('shell: the boot transport must require "link"');
+    if (!links && !(await appAdmit(v, hostFacts())))
+      throw new Error(ADMISSION_REJECTED);
+    const loaded: LoadedBundle = {
+      manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
+      guestSource: v.guestSource,
+    };
+    const key = appKeyFor(loaded.author, loaded.manifest.app);
+    const checkInstallation = () => {
+      if (closed) throw new Error("shell: node is closed");
+      table.refuseConflicts(loaded, key, replacement, bootTransport);
+    };
+    // Refuse a conflict already standing BEFORE the candidate's modules or guest
+    // execute: a known loser is not worth a realm. The second check in the
+    // synchronous commit window remains necessary, since another load may take a
+    // free claim while this candidate is built.
+    checkInstallation();
+    const pureModules = await loadBundleModules(moduleLoader, v);
+    const slot = newSlot(loaded, pureModules, loadOpts);
+    // Stand the guest, before anything already standing is replaced. Every app is a
+    // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
+    // discovering that at the first frame would leave the mark advanced for a
+    // bundle that never ran a line.
+    try {
+      await standRealm(slot, localConfig, loadOpts);
+      // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
+      // what makes the commit atomic: the gates below, the contest, the mark, and the
+      // claim hand-over cannot be interleaved with another load or an uninstall.
+      //
+      // Admission read these before the modules and the guest's top level ran, and both
+      // move: a newer version can land meanwhile, and `revoke` can name this author. NOT
+      // the operator's predicate — consent is not withdrawn by losing a race.
+      checkHostGates(v, hostFacts());
+      checkInstallation();
+      // A mark that cannot be persisted throws, and the store has already rolled
+      // itself back; the catch below disposes the candidate, so the running slot
+      // is untouched.
+      freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
+    }
+    catch (err) {
+      disposeSlot(slot);
+      throw err;
+    }
+    const previous = table.commit(slot, key, replacement);
+    const replacingLinkOwner = previous !== undefined && table.hasLink(previous);
+    // The outgoing guest's link state went with its realm (§4.3), so the sockets it
+    // held are torn down here rather than left as channels nobody can speak for. So
+    // did its address book, which is why the incoming guest redials from the peers
+    // its own load named and not from anything retained here (§12.10). After the
+    // claim hand-over above, so `onClose` finds the channels already gone and queues
+    // no `linkClosed` at the new realm for links it never had. Only ever a free
+    // binding or the explicitly selected predecessor: conflicts were checked before
+    // commit. A replacement that DROPS `link` releases the binding the same way
+    // dropping a claim releases the claim.
+    if (table.hasLink(slot)) {
+      netHost?.activate((payload) => hostCallSlot(slot, payload));
+    } else if (replacingLinkOwner) {
+      netHost?.release();
+    }
+    // The mark and every claim/link binding have landed, so this slot's writes and
+    // cross-realm calls are now its own (`seamFor`).
+    slot.active = true;
+    disposeSlot(previous);
+    // The handle: the verified facts plus the bound slot — the key, the scoped fs
+    // view and the loopback invoke. One object, so a caller cannot derive half of
+    // it from the manifest and half from the shell and have the two disagree.
+    const handle: AppHandle = {
+      ...loaded,
+      key,
+      fs: slot.fsScope,
+      appScope: slot.appScope,
+      invoke: (payload, deadlineMs) => slot.active
+        ? track(hostCallSlot(slot, payload, deadlineMs))
+        : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
+    };
+    return handle;
+  };
+
   const shell: Shell = {
     resolve(name) {
       const slot = table.owner(name);
@@ -485,100 +543,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     },
     fs,
     sodium,
-    async loadBundleBlob(blob, loadOpts = {}) {
-      const localConfig = loadOpts.localConfig ?? {};
-      if (!isJsonObject(localConfig))
-        throw new Error("shell: localConfig must be a JSON object");
-      const v = verifyBundle(sodium, blob);
-      // What this bundle REACHES, read off the requires and nothing else (§12.5):
-      // there is no `role` field, because the requires are what the seam actually
-      // wires and so are the fact that must be right anyway. An author cannot shed a
-      // privilege by declaring one.
-      const privileges: Privilege[] = privilegesOf(v.manifest);
-      // ADMISSION — one predicate, one call, one answer (§12.5), a pure function of
-      // `(bundle, context)`, with the constraints' ordering stated once at
-      // construction. Nothing decides admission beside the predicate, which is what
-      // makes "nothing has landed" hold for the whole decision.
-      //
-      // A function, not a value: the commit window reads it again.
-      const hostFacts = (): HostFacts => ({
-        highWater: freshnessStore.get(v.author, v.manifest.app),
-        revoked: freshnessStore.isRevoked(v.author),
-      });
-      const ctx: AdmissionContext = { privileges, ...hostFacts() };
-      if (!(await admit(v, ctx)))
-        throw new Error(ADMISSION_REJECTED);
-      const loaded: LoadedBundle = {
-        manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
-        guestSource: v.guestSource,
-      };
-      const key = appKeyFor(loaded.author, loaded.manifest.app);
-      // Refuse a conflict already standing BEFORE the candidate's modules or guest
-      // execute: a known loser is not worth a realm. The second check in the
-      // synchronous commit window remains necessary, since another load may take a
-      // free claim while this candidate is built.
-      table.refuseConflicts(loaded, key);
-      const pureModules = await loadBundleModules(moduleLoader, v);
-      const slot = newSlot(loaded, pureModules, loadOpts);
-      // Stand the guest, before anything already standing is replaced. Every app is a
-      // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
-      // discovering that at the first frame would leave the mark advanced for a
-      // bundle that never ran a line.
-      try {
-        if (table.hasLink(slot) && !netHost)
-          throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
-        await standRealm(slot, localConfig, loadOpts);
-        // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
-        // what makes the commit atomic: the gates below, the contest, the mark, and the
-        // claim hand-over cannot be interleaved with another load or an uninstall.
-        //
-        // Admission read these before the modules and the guest's top level ran, and both
-        // move: a newer version can land meanwhile, and `revoke` can name this author. NOT
-        // the operator's predicate — consent is not withdrawn by losing a race.
-        checkHostGates(v, hostFacts());
-        table.refuseConflicts(loaded, key);
-        // A mark that cannot be persisted throws, and the store has already rolled
-        // itself back; the catch below disposes the candidate, so the running slot
-        // is untouched.
-        freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
-      }
-      catch (err) {
-        disposeSlot(slot);
-        throw err;
-      }
-      const previous = table.commit(slot, key);
-      const replacingLinkOwner = previous !== undefined && table.hasLink(previous);
-      // The outgoing guest's link state went with its realm (§4.3), so the sockets it
-      // held are torn down here rather than left as channels nobody can speak for. So
-      // did its address book, which is why the incoming guest redials from the peers
-      // its own load named and not from anything retained here (§12.10). After the
-      // claim hand-over above, so `onClose` finds the channels already gone and queues
-      // no `linkClosed` at the new realm for links it never had. Only ever a free
-      // binding or this identity's own: `refuseConflicts` turned any other candidate
-      // away, and a version that DROPS `link/*` releases the binding the same way
-      // dropping a claim releases the claim.
-      if (table.hasLink(slot)) {
-        netHost?.activate((payload) => hostCallSlot(slot, payload));
-      } else if (replacingLinkOwner) {
-        netHost?.release();
-      }
-      // The mark and every claim/link binding have landed, so this slot's writes and
-      // cross-realm calls are now its own (`seamFor`).
-      slot.active = true;
-      disposeSlot(previous);
-      // The handle: the verified facts plus the bound slot — the key, the scoped fs
-      // view and the loopback invoke. One object, so a caller cannot derive half of
-      // it from the manifest and half from the shell and have the two disagree.
-      const handle: AppHandle = {
-        ...loaded,
-        key,
-        fs: slot.fsScope,
-        appScope: slot.appScope,
-        invoke: (payload, deadlineMs) => slot.active
-          ? track(hostCallSlot(slot, payload, deadlineMs))
-          : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
-      };
-      return handle;
+    loadBundleBlob: (blob, loadOpts) => installBundle(blob, loadOpts),
+    async replaceBundle(oldAppKey, blob, loadOpts) {
+      const previous = table.get(oldAppKey);
+      if (!previous) throw new Error(`shell: replacement target '${oldAppKey}' is not installed`);
+      return installBundle(blob, loadOpts, previous);
     },
     uninstall: doUninstall,
     revoke(authorHex) {
@@ -597,6 +566,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return gone;
     },
     close() {
+      closed = true;
       netHost?.close();
       const dispose = () => {
         for (const slot of table.clear()) disposeSlot(slot);
@@ -605,20 +575,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     },
   };
 
-  // The transport bundle IS the node's network (§12.6), admitted through the ordinary
-  // load. A predicate that refuses its author leaves the node without one — a deliberate
-  // configuration, not an error. A boot that throws returns no handle, so whatever it
-  // stood up must not leak: one teardown, the shell's.
+  // The selected transport uses the ordinary verified install path. A failed boot
+  // returns no handle, so tear down any resources it stood up.
   try {
-    if (netHost && transportBlob && net!.load !== false) {
-      try {
-        await shell.loadBundleBlob(transportBlob,
-          net!.config === undefined ? undefined : { localConfig: net!.config });
-      }
-      catch (err) {
-        if (!isAdmissionRejected(err)) throw err;
-        console.warn('  no transport: the policy does not grant this bundle the "link" privilege');
-      }
+    if (netHost && transportBlob) {
+      await installBundle(transportBlob,
+        net!.config === undefined ? undefined : { localConfig: net!.config }, undefined, true);
       await netHost.start();
     }
     return { shell, transport: netHost };

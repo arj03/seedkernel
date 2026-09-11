@@ -137,32 +137,29 @@ The authoring module also carries the lower-level signing and packing primitives
 
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
-| `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`denyAll`, `admitAll`, `authorAllowlist`, `byPrivilege`, `allOf`, `policyFromJson`) are re-exported here too, so your `admit` comes from the same module | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) (consent and contact-secret rotation), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) (a whole node wrapped as a class) |
+| `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`denyAll`, `admitAll`, `authorAllowlist`, `allOf`, `policyFromJson`) are re-exported here too, so your `admit` comes from the same module | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) (consent and contact-secret rotation), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) (a whole node wrapped as a class) |
 | `./op-frame` | The shared `[opLen u8][op ascii][args …]` codec in `core/op-frame.ts`: `writeOp` for a host loopback, `readOp`/`callerOf` in a guest, and `OpArgs` for structured arguments (`u8`/`u32`/length-prefixed `blob`/`text` fields, built in one pass). The socket driver uses it to encode the kernel's raw-link event ABI; the event field layouts are specified in [RUNTIME §12.2](RUNTIME.md#122-the-guest-seam-the-guest-name-abi). Application and local-service bodies may use it as an optional convention; routing and timers keep those bodies opaque. A guest that cannot import takes the same codec as flat source from `./bundle-author`'s `guestOpFraming`, which stays out of this runtime module so a browser shell does not vendor a source emitter | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js), [seedchat `chat-app.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-app.js), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) |
 | `./shell-node` | The Node platform adapter: `bootNodeShell` wires `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell`, then hands back the shell and channel adapter. This is a Node convenience, not a second kernel assembly; a client that owns its platform wiring calls `bootShell` | [seedstore `shell-run.test.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/shell-run.test.mjs) |
-| `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. When networking is configured, `bootShell` uses this blob by default; import it to pass a replacement explicitly, derive the policy pin, hash it, or inspect it. `TRANSPORT_SERVICE` beside it is the local service id that blob claims (`"_net"`), which is what you hand `shell.call` to reach the running transport | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
+| `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. When networking is configured, `bootShell` uses this blob by default; import it to pass a replacement explicitly, hash it, or inspect it. `TRANSPORT_SERVICE` beside it is the local service id that blob claims (`"_net"`), which is what you hand `shell.call` to reach the running transport | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
 | `./guest-seam` | `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | [seedstore `manifest.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/manifest.ts) |
 
-For a conventional Node process, `bootNodeShell` is the shortest complete path. The policy must admit ordinary app authors under `authors` and the shipped transport author under `grants.link`:
+For a conventional Node process, `bootNodeShell` is the shortest complete path. The policy lists ordinary app authors. The initial transport is selected explicitly at boot:
 
 ```js
 import { readFile } from "node:fs/promises";
 import { loadCrypto, generateKeyPair } from "seedkernel-wasm";
 import { verifyBundle } from "seedkernel-wasm/bundle";
 import { bootNodeShell } from "seedkernel-wasm/shell-node";
-import { transportBundleBytes } from "seedkernel-wasm/transport-bundle";
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const sodium = await loadCrypto();
 const appBlob = new Uint8Array(await readFile("example.skb"));
-const transportBlob = transportBundleBytes();
 
 const runtime = await bootNodeShell({
   dir: "./data",
   identity: generateKeyPair(),
   policyJson: JSON.stringify({
     authors: [hex(verifyBundle(sodium, appBlob).author)],
-    grants: { link: [hex(verifyBundle(sodium, transportBlob).author)] },
   }),
 });
 
@@ -222,24 +219,40 @@ window.addEventListener("pagehide", () => shell.close(), { once: true });
 
 ## The assembly is an export
 
-`bootShell` (`./shell-core`) is the ONE node-assembly (§12.9), and entering it is how a client gets a node that is correct by construction. Every field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. One default is a decision rather than a convenience: `admit` absent is **deny-all** — the node boots but installs nothing, the transport bundle included, so a client that states no gate has no network. Browser and Node clients, the native loader, and seedstore's wrapper all enter through this assembly; they differ only in which defaults they displace.
+`bootShell` (`./shell-core`) is the ONE node-assembly (§12.9), and entering it is how a client gets a node that is correct by construction. Every field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. One default is a decision rather than a convenience: `admit` absent denies ordinary app installs. Enabling `transport` authorizes its selected boot blob independently of app policy. Browser and Node clients, the native loader, and seedstore's wrapper all enter through this assembly; they differ only in which defaults they displace.
 
-Transport behavior has three deliberate modes:
+Transport startup has two modes:
 
 | Configuration | Adapter | Transport bundle |
 | --- | --- | --- |
 | `transport` omitted or `false` | No `TransportHost`; `BootResult.transport` is `null` | Not loaded. The node has no network. |
-| `transport: { …options }` | `bootShell` constructs and returns the adapter, with identity available to the transport through `node/identity` | The shipped bundle—or `transport.bundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded with `transport.config` as that load's `localConfig`; listeners are then started. |
-| `transport: { …options, load: false }` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob(blob, { localConfig })`; this is seedchat's lazy-first-connect mode. The options object is retained, so a getter-backed member stays live — pass the object itself rather than a spread of it. |
+| `transport: { …options }` | `bootShell` constructs and returns the adapter, with identity available to the transport through `node/identity` | The shipped bundle—or `transport.bundle` when supplied—is explicitly selected and installed during boot, with revocation and freshness enforced. It is loaded with `transport.config` as that load's `localConfig`; listeners are then started. |
 
-Everything about the node's network is that one object: the socket-side members (`channels`, `listen`, `wsListen`, `maxRawLinks`, `onLinkClosed`) plus `bundle`, `config` and `load`. They are one decision — the blob whose author is *pinned* is the blob that gets *loaded*, under the configuration that load is given — so they are one field rather than four siblings that can disagree.
+The transport options carry the socket adapter, listeners, selected `bundle`, and initial `config`. The default blob is `transportBundleBytes()`. The options object is retained, so live accessors stay live. A selected transport must declare `link`; verification, revocation, freshness, and installation failures fail boot.
 
-`transport.bundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload. The transport's defaults are signed in its `guest.config`; `transport.config` is the automatic-load convenience for operator overrides and reaches the guest as `LOCAL`, exactly like any other one-bundle `localConfig`.
+Live changes use the same explicit owner replacement as ordinary apps:
 
-Two things it does *for* you, which is why you should not try to reproduce them:
+```js
+// oldChat.key is the handle returned when the chat app was installed.
+const chat = await shell.replaceBundle(oldChat.key, newChatBlob, { localConfig: chatConfig });
 
-- **The transport author pin is ANDed onto your predicate, never substituted for it.** The transport bundle is admitted under a pin derived from the blob itself, so "only this author may be the network" is the assembly's business, not something you can lose by forgetting it. Your `admit` still has to admit as well — a deny-all node has no network, and an operator keeps the power to refuse a transport author, because AND means both. Running a different transport means passing a different `transport.bundle`, which is what the pin is derived from.
-- **It is fail-closed on a privilege it does not know.** `PRIVILEGES` is derived from the capability catalog, so a privileged name added to `core/domains.ts` appears here as a privilege with no branch, and bundles reaching it are refused until the assembly is taught about it. That is what makes "privileged bundles are the pin's business" a safe thing for your consent dialog to assume.
+// Use the current transport's declared service id to find its owner.
+const oldTransportKey = shell.resolve(TRANSPORT_SERVICE);
+if (oldTransportKey === null) throw new Error("No transport is installed");
+const transportApp = await shell.replaceBundle(oldTransportKey, newTransportBlob, {
+  localConfig: transportConfig,
+});
+```
+
+The incoming author and app name may differ. App candidates still pass `admit`. Only replacement of the current link owner authorizes a candidate requiring `link`; ordinary `loadBundleBlob` refuses link bundles, including same-author transport updates.
+
+Replacement builds first, then commits the new claims and releases the predecessor. The exact selected slot must still be current at commit; concurrent replacement or uninstall causes failure. Unrelated claims and already-installed candidate identities remain protected. A failed candidate leaves the current owner running. A successful replacement invalidates its predecessor's invocation handles.
+
+Identity scopes do not transfer: a new author has its own filesystem namespace, app signing scope, and version history. Existing data remains under the old identity; migration is the application's responsibility. Transport replacement keeps node identity and listeners but closes old links and discards the old realm's session keys and address book. Supply the new transport's configuration again.
+
+The initial transport loads at boot. If the current link owner is uninstalled or replaced by an ordinary app, installing another transport requires booting a new node.
+
+`bootNodeShell` and the native node factory enable transport by default; pass `network: false` for a node without it. Their returned `transport` is then `null`. The CLI sets this choice explicitly: networking requires `--listen`, `--ws-listen`, or `--peers`, and `--transport` and `--contact-secret` are refused without one of them.
 
 **Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither adds a host capability, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified `(author, app)` and the signed claim lists `admit` is already handed:
 
@@ -253,7 +266,6 @@ const transportAuthor = "<approved transport author id in hex>";
 
 const basePolicy = policyFromJson(JSON.stringify({
   authors: [appAuthor],
-  grants: { link: [transportAuthor] },
 }));
 const protocolOwners = new Map([
   ["private-chat-v1", `${appAuthor}:private-chat`],
@@ -276,7 +288,7 @@ const approvedClaims = (v) => {
 const admit = allOf(basePolicy, approvedClaims);
 ```
 
-Keep the pins in operator-controlled configuration rather than reading them off the candidate, and name the approved bundles' actual app labels and service ids — `transport` and `_net` are the shipped transport's. The two maps are independent audiences, so a name needing protection in both is pinned in both, and a claim in neither is judged by `basePolicy` alone. `allOf` applies the check to every candidate, including one judged by a capability grant rather than `byPrivilege`'s `base`; the shell still supplies revocation, freshness and the transport author pin around whatever you compose.
+Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. `allOf` applies these checks to ordinary app candidates, including an app trying to claim `_net`. Bundles requiring `link` bypass this predicate: explicit selection is the trust decision, so these maps cannot constrain a transport's claims. Revocation and freshness apply to both paths.
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 

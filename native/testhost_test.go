@@ -205,37 +205,6 @@ func invokeBundle(appKey string, payload []byte) ([]byte, error) {
 	return callRealm("invokeApp", 30*time.Second, qc.NewString(appKey), qc.NewArrayBuffer(payload))
 }
 
-// bootShell stands a whole node up exactly as the binary does — bootRealm, then
-// bootNode inside the realm (identity, network, bootShell over this platform).
-// `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
-// default (README §14). Returns what the realm reported: the peer id and the ports
-// actually bound.
-// withTransportAuthor adds the artifact's own transport author to a policy's authors and
-// grants it `link`. A node whose policy does not admit a transport bundle has no
-// network at all — which is also what a deliberate deny-all looks like, so the two
-// must not be confused by accident in a test.
-func withTransportAuthor(tb testing.TB, policyJSON string) string {
-	tb.Helper()
-	author := evalString(tb, "embeddedTransportAuthor")
-	if author == "" {
-		return policyJSON
-	}
-	var p map[string]any
-	if policyJSON == "" {
-		p = map[string]any{}
-	} else if err := json.Unmarshal([]byte(policyJSON), &p); err != nil {
-		tb.Fatal("policy json:", err)
-	}
-	authors, _ := p["authors"].([]any)
-	p["authors"] = append(authors, author)
-	p["grants"] = map[string]any{"link": []string{author}}
-	out, err := json.Marshal(p)
-	if err != nil {
-		tb.Fatal("policy json:", err)
-	}
-	return string(out)
-}
-
 // evalString evaluates a JS expression in the host realm and returns it as a string.
 func evalString(tb testing.TB, expr string) string {
 	tb.Helper()
@@ -262,10 +231,14 @@ func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	return value
 }
 
+// bootShell stands a whole node up exactly as the binary does — bootRealm, then
+// bootNode inside the realm (identity, network, bootShell over this platform).
+// `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
+// default (README §14). Returns what the realm reported: the peer id and the ports
+// actually bound.
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
-	policyJSON = withTransportAuthor(tb, policyJSON)
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON

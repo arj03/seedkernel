@@ -23,7 +23,6 @@ const { ModuleTable } = await imp("build/host/module-table.js");
 const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = transportBundleBytes();
-const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 // The app that drives the transport: a request is an app calling the id the transport
 // claims, so a test that sends one has to be an app (tests/transport-harness.mjs).
 const { harnessAppBlob, appRequest, generatorRequest, addr, ready, linkedPeers } = await imp("tests/transport-harness.mjs");
@@ -36,14 +35,12 @@ const HOST = "127.0.0.1";
 async function makeNode(ws = false, extraConfig = {}) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
-    authors: [transportAuthor, appAuthorHex],
-    grants: { link: [transportAuthor] },
+    authors: [appAuthorHex],
   }));
   const transportOptions = {
     channels: new NodeChannelFactory(),
     listen: { host: HOST, port: 0 },
     ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
-    load: false,
     bundle: transportBlob,
   };
   const transportConfig = { ...extraConfig };
@@ -54,11 +51,10 @@ async function makeNode(ws = false, extraConfig = {}) {
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    transport: transportOptions,
+    transport: { ...transportOptions, config: transportConfig },
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
-  await shell.loadBundleBlob(transportBlob, { localConfig: transportConfig });
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
   // The node's own channel key, hex. Read off the identity this factory minted rather than
   // asked of the driver: it is the same `toHex(identity.publicKey)` every caller already
@@ -76,8 +72,6 @@ const a = await makeNode();
 const b = await makeNode();
 const aNet = a.transport, bNet = b.transport;
 
-await aNet.start();
-await bNet.start();
 assert(aNet.port > 0 && bNet.port > 0, "both nodes bound real TCP listeners");
 
 // Both nodes run the echo app, which also answers a GENERATOR request with a payload
@@ -121,8 +115,6 @@ console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle modu
 const c = await makeNode(true);
 const d = await makeNode(true);
 const cNet = c.transport, dNet = d.transport;
-await cNet.start();
-await dNet.start();
 assert(dNet.wsPort > 0, "the WS listener bound");
 
 // The `ws://` scheme is the whole difference: the destination string sends the host's
@@ -177,7 +169,6 @@ const stalling = createServer((sock) => {
 await new Promise((resolve) => stalling.listen(0, HOST, resolve));
 
 const e = await makeNode(false, { handshakeTimeoutMs: 500 });
-await e.transport.start();
 await addr(e, "00".repeat(32), `ws://${HOST}:${stalling.address().port}`);
 // Any send is enough to make the address book dial.
 appRequest(e.app, "00".repeat(32), new Uint8Array([1])).catch(() => {});

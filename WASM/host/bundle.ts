@@ -1,7 +1,7 @@
 // App bundle format (§12.4): signed manifest envelope + modules + guest.js.
 // Every name is derived; the manifest commits to every file hash.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, PRIVILEGES, HOST_SERVICES, isService, type Privilege, type ServiceName, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, } from "../core/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -33,8 +33,8 @@ export interface BundleGuest {
      *  own module names are not declarable, so the list an operator reads is the whole reach. */
   requires: string[];
   /** The local service ids this guest calls on a CO-RESIDENT guest (§12.10), over the
-     *  same `host.call`. Separate from `requires` because a host service is a privilege an
-     *  operator grants and a local id carries none. Also what tells a bare `host.call` from
+     *  same `host.call`. Separate from `requires` because a local service id carries no
+     *  host authority. Also what tells a bare `host.call` from
      *  one of this bundle's own modules, which is why it must not spell one. Absent ≡ none. */
   calls?: string[];
   /** The app's signed configuration, injected unchanged into the guest preamble as
@@ -179,16 +179,10 @@ export function appKeyFor(author: Uint8Array, app: string): string {
 export function genesisHash(sodium: ManifestVerifier, data: Uint8Array): Uint8Array {
   return sodium.crypto_generichash(32, data, null);
 }
-/** Which privileges (§12.5) a manifest's `requires` reach — the catalog values of the
- *  services it names (`HOST_SERVICES`), read off the table and never off a prefix parsed
- *  out of a name. Empty ⇒ an ordinary app; `guest.calls` carries no privilege and is not
- *  read here.
- *
- *  Not folded into `verifyManifest`: a manifest naming `link` is well-formed, and whether
- *  this node grants it is policy, decided where the policy is in hand (shell-core). */
-export function privilegesOf(manifest: BundleManifest): Privilege[] {
-  const reached = manifest.guest.requires.map((s) => HOST_SERVICES[s as ServiceName].privilege);
-  return PRIVILEGES.filter((p) => reached.includes(p));
+/** Whether the signed manifest requests the node's exclusive raw-link service.
+ *  Shared by admission, slot ownership, and signing-scope selection. */
+export function reachesLink(manifest: BundleManifest): boolean {
+  return manifest.guest.requires.includes("link");
 }
 /** The fs keyspace prefix for one app (§12.2). A hash of the app key rather than the key
  *  itself, because it must double as a *filename* component: both fs backends restrict keys
@@ -358,11 +352,11 @@ function isValidManifest(m: unknown): m is BundleManifest {
 export function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
   if (!isValidManifest(manifest))
     throw new Error("bundle: malformed manifest");
-    // `requires` is the HOST's, so its vocabulary is closed to SERVICES: each one is a
-    // privilege an operator grants. An unknown name — `crypto/*` and a finer method name
-    // (`fs/get`) included — is a refused manifest, not a grant that quietly reaches nothing
-    // at first use. Well-formedness only: whether this node grants `link` is the shell's
-    // call (§12.5).
+    // `requires` is the HOST's, so its vocabulary is closed to SERVICES: each names one
+    // host service. An unknown name — `crypto/*` and a finer method name (`fs/get`)
+    // included — is a refused manifest, not a grant that quietly reaches nothing at first
+    // use. Well-formedness only: whether this node authorizes `link` is the shell's call
+    // (§12.5).
   for (const r of manifest.guest.requires) {
     if (isService(r))
       continue;

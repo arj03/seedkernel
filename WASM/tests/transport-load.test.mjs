@@ -47,7 +47,6 @@ async function server(fabric, halfOpen, opts = {}) {
     channels: fabric.view(), listen: { host: "loopback", port: 0 },
     contactSecret: CONTACT, transportHalfOpen: halfOpen, ...opts,
   });
-  await n.driver.start();
   return n;
 }
 
@@ -191,7 +190,6 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     // driver the gated wrapper as a host-announced dial, exactly as a real factory would.
     const factory = new InjectedChannels();
     const a = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT }));
-    await a.driver.start();
     let wrote = 0;
     const raw = fabric.connect(`tcp://10.6.7.${i}:${s.driver.port}`);
     const gated = {

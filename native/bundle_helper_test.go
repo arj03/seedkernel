@@ -264,8 +264,8 @@ func isHostService(name string) bool {
 
 // appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
 // spellings carry no authority (§12.10) and the loader ties nothing to one, so a fixture
-// deriving `_net` from a `link/*` requires would only be borrowing the transport's claim
-// and testing the CLAIM contest wherever it meant to test the privilege. A claim has one
+// deriving `_net` from a `link` requires would only be borrowing the transport's claim
+// and testing the CLAIM contest wherever it meant to test `link`. A claim has one
 // active owner, so two fixtures must not derive the same id.
 func appProtocols(app string, _ []string) []string {
 	return []string{app}
@@ -305,8 +305,7 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		App: app,
 		// The protocol this fixture claims (§12.10): the load itself is what routes, so a
 		// test wanting a protocol answered says so in the manifest, never through a second
-		// call. Derived from the same `requires` that decide the privileges, so the two
-		// stay one fact here as they are in the loader.
+		// call.
 		Protocols: appProtocols(app, requires),
 		Version:   version,
 		Modules: []mod{{

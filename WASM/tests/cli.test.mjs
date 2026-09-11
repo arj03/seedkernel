@@ -83,7 +83,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
-      }, transport: { port, wsPort } };
+      }, transport: cfg.network === false ? null : { port, wsPort } };
     },
   };
   return host;
@@ -117,7 +117,29 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   ok(host.stood.dir === DEFAULT_DIR, `--dir defaults to ${DEFAULT_DIR}`);
   ok(DEFAULT_KEY === "./seedkernel.key", "--key defaults to ./seedkernel.key");
   ok(host.stood.policyJson === undefined, "an absent --policy is deny-all, not a policy");
-  ok(host.lines.includes("  policy (none — installs disabled)"), "and the console says so");
+  ok(host.lines.includes("  policy (none — app installs disabled)"), "and the console says so");
+}
+
+// Network activation is independent of policy and requires an explicit network flag.
+for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1:0"], ["--peers", ""]]) {
+  const host = fakeHost(["--key", join(work, "network.key"), ...flags]);
+  await runCli(host);
+  ok(host.stood.network === (flags.length > 0), `network opt-in: ${JSON.stringify(flags)}`);
+}
+
+// The real Node adapter honors the CLI's switch, including its nullable transport result.
+{
+  const { bootNodeShell } = await imp("build/host/shell-node.js");
+  for (const network of [false, true]) {
+    const node = await bootNodeShell({
+      dir: mkdtempSync(join(work, "node-")), network,
+      identity: sodium.crypto_sign_keypair(),
+    });
+    try {
+      ok((node.transport !== null) === network, `Node adapter network=${network}`);
+      ok((node.shell.resolve("_net") !== null) === network, `Node transport slot network=${network}, no policy`);
+    } finally { node.shell.close(); }
+  }
 }
 
 // The §12.3 guest bounds reach the shell: a bound the shell accepts but no target can set
@@ -167,13 +189,22 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   ok(msg.includes("requires --bundle") && host.stood === null,
     "--local-config without an app target is refused before a shell is stood up");
 }
+// Transport-only flags without a network flag would be read and dropped: nothing drives them.
+for (const flag of ["--transport", "--contact-secret"]) {
+  const host = fakeHost(["--key", join(work, "orphan.key"), flag, join(work, "absent")]);
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.includes(`${flag} requires`) && host.stood === null,
+    `${flag} without a network flag is refused before a shell is stood up`);
+}
 
 // --contact-secret names a FILE of hex, on every target. Passing the secret itself on the
-// command line would put it in `ps` output and shell history.
+// command line would put it in `ps` output and shell history. `--peers ""` enables the
+// network the secret configures, with no cohort to wait for.
 {
   const secretPath = join(work, "contact.hex");
   writeFileSync(secretPath, good);
-  const host = fakeHost(["--key", join(work, "c.key"), "--contact-secret", secretPath]);
+  const host = fakeHost(["--key", join(work, "c.key"), "--peers", "", "--contact-secret", secretPath]);
   await runCli(host);
   ok(host.stood.transportConfig.contactSecret === good,
     "--contact-secret is read from the file it names, into the transport's own config");
@@ -181,13 +212,13 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
 {
   const badPath = join(work, "bad.hex");
   writeFileSync(badPath, "not a secret");
-  const host = fakeHost(["--key", join(work, "c2.key"), "--contact-secret", badPath]);
+  const host = fakeHost(["--key", join(work, "c2.key"), "--peers", "", "--contact-secret", badPath]);
   let threw = false;
   try { await runCli(host); } catch { threw = true; }
   ok(threw, "a malformed contact secret fails at startup, where an operator can still be told");
 }
 {
-  const host = fakeHost(["--key", join(work, "c3.key"), "--contact-secret", join(work, "nope.hex")]);
+  const host = fakeHost(["--key", join(work, "c3.key"), "--peers", "", "--contact-secret", join(work, "nope.hex")]);
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
   ok(msg.includes("--contact-secret"), "an unreadable file names the flag, not the errno");

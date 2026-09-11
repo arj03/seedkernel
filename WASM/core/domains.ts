@@ -35,12 +35,11 @@ export const HOST_TRANSFORM_NAMES = [
 export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
 /** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant. */
 export const HOST_SERVICES = {
-  node: { privilege: "app", calls: ["sign", "verify", "identity", "random"] },
-  fs: { privilege: "app", calls: ["get", "put", "list", "delete", "size", "stat"] },
-  clock: { privilege: "app", calls: ["now"] },
-  timer: { privilege: "app", calls: ["arm", "clear"] },
+  node: { calls: ["sign", "verify", "identity", "random"] },
+  fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
+  clock: { calls: ["now"] },
+  timer: { calls: ["arm", "clear"] },
   link: {
-    privilege: "link",
     calls: ["open", "send", "close", "deliver"],
     events: ["linkOpen", "linkBytes", "linkClosed"],
   },
@@ -71,18 +70,6 @@ export function serviceOf(name: string): ServiceName | null {
   const svc = name.slice(0, i);
   return isService(svc) ? (svc as ServiceName) : null;
 }
-/** A PRIVILEGE — the unit an operator grants and a policy file is keyed on (policy.ts).
- *  Derived from the catalog rather than declared beside it, so the set an operator must
- *  say yes to cannot fall behind the table. */
-export type Privilege = Exclude<(typeof HOST_SERVICES)[ServiceName]["privilege"], "app">;
-export const PRIVILEGES: readonly Privilege[] = [
-  ...new Set(Object.values(HOST_SERVICES).map((s) => s.privilege).filter((p): p is Privilege => p !== "app")),
-];
-/** The link privilege (§12.6), named so the shell can wire the socket driver to whatever
- *  holds it. The link occupant is the attributer: `link/deliver` hands the host a request
- *  it decoded off its own links, under this one privilege and never a second — the call
- *  names no link, and all three of its arguments are the occupant's own to choose. */
-export const PRIVILEGE_LINK = "link" satisfies Privilege;
 // Manifest suite: first byte of the envelope, covered by the signature. Channel suite
 // lives in the transport bundle (ake.js), not here — §14.1.
 /** Hybrid Ed25519 + ML-DSA-65, both must verify. `0x01` retired, `0x03` next. */

@@ -1,6 +1,6 @@
-// realm-guest.test.mjs — the guest seam and realm lifecycle (§12.2, §12.3, §4.3): the
-// link-slot binding, privilege derivation from `guest.requires`, node/sign scoping,
-// safe-js confinement, realm serialization, seam gating, and module-call budgeting. Split
+// realm-guest.test.mjs — the guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy
+// parsing, node/sign scoping, safe-js confinement, realm serialization, seam gating, and
+// module-call budgeting. Split
 // out of the former single-file run.mjs; bundle-install.test.mjs covers the bundle/manifest
 // verify → admit → install lifecycle, crypto.test.mjs the manifest-suite and ACVP suites.
 //
@@ -23,46 +23,6 @@ import { bytesEqual } from "./bytes.mjs";
 
 const { ok, assertEqual, summary, sleep } = testkit({ verbose: false });
 const assert = ok;
-
-// ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
-// The driver has one event sink, so a second link-capable slot cannot be a composition: it
-// would take the node's sockets while the incumbent kept its claims and its realm, leaving
-// a node that looks installed and answers nothing. Refused instead, on the same rule as a
-// contested claim — and the incumbent's OWN next version still replaces it in place.
-async function testOneRawLinkOwner() {
-  console.log("Test: a second link-capable identity is refused the raw-link binding (§12.10)");
-  const { admitAll } = await imp("build/host/policy.js");
-
-  const author = testAuthor();
-  const blob = (app, version, requires) => authorBundle(sodium, author, {
-    app, version, modules: [], guestSource: GUEST_TEXT, guestRequires: requires,
-  }).blob;
-  // Both candidates are this author's, so the pin admits both and what refuses the
-  // second is the binding rule under test rather than an earlier gate.
-  const shell = await bootTestShell({
-    createRealm: async () => ({ async call() { return new Uint8Array(); }, dispose() { } }),
-    pinAuthor: author,
-    admit: admitAll,
-  });
-  try {
-    await shell.loadBundleBlob(blob("transport", 1, ["link"]));
-    // A link-capable bundle that claims nothing — the initiator shape. Same privilege, so
-    // the same binding, so it must not land quietly.
-    let refused = "";
-    try { await shell.loadBundleBlob(blob("dialer", 1, ["link"])); } catch (e) { refused = String(e); }
-    assert(/binding is already held by/.test(refused),
-      `a second link-capable identity is refused: ${refused || "no error"}`);
-    // A bundle reaching no `link` name is unaffected — the binding is the privilege's, not
-    // a global lock on loading.
-    await shell.loadBundleBlob(blob("app", 1, ["clock"]));
-    // The holder's own next version replaces it in place: an upgrade is not a contest.
-    await shell.loadBundleBlob(blob("transport", 2, ["link"]));
-    // And uninstalling the holder frees it for anyone.
-    shell.uninstall(appKey(author.id, "transport"));
-    await shell.loadBundleBlob(blob("dialer", 1, ["link"]));
-  } finally { shell.close(); }
-  console.log("  OK\n");
-}
 
 // ─── Test: guest-side fan-out over the cross-realm call (Promise.all) ────────────
 // Fan-out is not a host op: with real promises at the seam, a confined guest scatters a
@@ -201,7 +161,7 @@ async function testPolicy() {
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
-  const { testHost, loadBundle, LINK_CTX, APP_CTX } = await import("./fixtures.mjs");
+  const { testHost, loadBundle, APP_CTX } = await import("./fixtures.mjs");
   const tryLoad = async (policyJson, author, links) => {
     const host = testHost(new ModuleTable());
     const { blob } = authorBundle(sodium, author, {
@@ -211,7 +171,7 @@ async function testPolicy() {
     });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { await loadBundle(host, blob, admit, links ? LINK_CTX : APP_CTX); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit, APP_CTX); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -222,165 +182,49 @@ async function testPolicy() {
   const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.id)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
-  // ── the transport is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
-  // The `link` privilege carries raw links and network-scoped signing, so the ordinary
-  // author list must NOT admit one even for an author it already trusts with apps.
   const goodHex = toHex(good.id);
-  const appOnly = JSON.stringify({ authors: [goodHex] });
-  const withTransport = JSON.stringify({ authors: [goodHex], grants: { link: [goodHex] } });
-
-  const linkDenied = await tryLoad(appOnly, good, true);
-  assert(!linkDenied, "an author trusted for apps does NOT thereby hold `link`");
-  const linkAllowed = await tryLoad(withTransport, good, true);
-  assert(linkAllowed, "a grants.link entry admits that author to the transport");
-  const strangerLink = await tryLoad(withTransport, bad, true);
-  assert(!strangerLink, "an author outside the `link` grant is refused it");
-  const appStillOk = await tryLoad(withTransport, good, false);
-  assert(appStillOk, "adding a grant does not disturb ordinary app admission");
-
-  // The two answers are independent: a grant alone admits no unprivileged bundle.
-  const transportOnly = JSON.stringify({ grants: { link: [goodHex] } });
-  const appUnderTransportList = await tryLoad(transportOnly, good, false);
-  assert(!appUnderTransportList, "a `link` grant is not a licence to load — `authors` still decides that");
-
-  // ── parse validation ───────────────────────────────────────────────────
-  let threw = false;
-  try { parsePolicy("{ not json"); } catch { threw = true; }
-  assert(threw, "malformed policy JSON throws (fails the boot loudly)");
-  threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
-  assert(threw, "an empty author set is rejected");
-  threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { link: [] } })); } catch { threw = true; }
-  assert(threw, "an empty grant list is rejected (omit the key to grant none)");
-  // A key the host does not know is refused at the top level too, not just under `grants`:
-  // ignoring it is how a mistyped file boots looking configured and silently holds nothing.
-  threw = false;
-  try { parsePolicy(JSON.stringify({ authorss: [goodHex], grants: { link: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "a mistyped top-level key is refused rather than ignored");
-  // The privilege NAMES come from the catalog, which is the whole reason the key is a
-  // capability rather than free-form text.
-  threw = false;
-  try { parsePolicy(JSON.stringify({ grants: { links: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "a grant naming no privilege this host has is refused by name");
-  // `route` is gone: delivery is one of the `link` privilege's own names (`link/deliver`),
-  // and a policy file written for the separate grant is a file this host does not mean —
-  // refused at the boot rather than read as an empty grant.
-  threw = false;
-  try { parsePolicy(JSON.stringify({ grants: { route: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "`grants.route` is no longer a privilege key — refused by name, kept nobody");
-  threw = false;
-  try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
-  assert(threw, "a policy listing neither authors nor grants is refused");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: the requires decide which privileges are in play (§12.5) ────────
-// One install path, no `role` field: what a bundle must be granted is read off
-// `guest.requires` alone. The derivation cannot be pushed the wrong way — naming a
-// `link/*` name puts `link` in the set and nothing takes it out — so the most permissive
-// `authors` list expressible (`admitAll`) still buys an author no sockets; otherwise every
-// policy test above is a lock on an open door. Driven through the assembly, because the
-// derivation is the shell's — the policy tests above compose verifyBundle → admit →
-// installBundle by hand and would not see it.
-async function testRequiresPickThePrivileges() {
-  console.log("Test: guest.requires decides which privileges a bundle must be granted");
-  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
-
-  const author = testAuthor();
-  const blobWithRequires = (requires) => authorBundle(sodium, author, {
-    app: "mod", version: 1,
-    modules: [{ name: "fwd", wasm: forwarderBytes }],
-    // The transport claims the local service id it is reached by (§12.10); an ordinary
-    // app claims nothing here.
-    ...(requires.includes("link") ? { services: ["_net"] } : {}),
-    guestSource: GUEST_TEXT, guestRequires: requires,
-  }).blob;
-  // ONE predicate, with the capability set as an argument (`byPrivilege`) rather than a
-  // choice between predicates. The pin names this author, so every candidate reaches the
-  // predicate whose choice is being counted — a pin refusing first would zero every count.
-  const mkTestShell = (base, link) => bootTestShell({
-    createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
-    pinAuthor: author,
-    admit: byPrivilege({ base, grants: { link } }),
-  });
-  const load = async (shell, requires) => {
-    try { await shell.loadBundleBlob(blobWithRequires(requires)); return null; }
-    catch (e) { return String(e); }
-  };
-
-  // 1. Which predicate was ASKED, counted rather than inferred from the outcome: a
-  //    transport's outcome also depends on the driver standing, which the stub guest
-  //    cannot do.
-  {
-    let appAsked = 0, transportAsked = 0;
-    const shell = await mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
-    try {
-      await load(shell, ["fs", "clock"]);
-      assert(appAsked === 1 && transportAsked === 0, "a bundle reaching no privilege is governed by the base predicate");
-      appAsked = transportAsked = 0;
-      await load(shell, ["link"]);
-      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the `link/*` names is governed by the `link` grant alone");
-    } finally { shell.close(); }
+  const empty = parsePolicy(JSON.stringify({ authors: [] }));
+  assert(!(await empty({ author: good.id }, APP_CTX)), "an empty author set denies every app");
+  for (const value of ["{ not json", "{}", "[]", "null",
+    JSON.stringify({ authors: ["zz".repeat(32)] }),
+    JSON.stringify({ authors: [123] }),
+    JSON.stringify({ authorss: [goodHex] }),
+    JSON.stringify({ authors: [goodHex], grants: { link: [goodHex] } })]) {
+    let threw = false;
+    try { parsePolicy(value); } catch { threw = true; }
+    assert(threw, `invalid policy is refused: ${value}`);
   }
 
-  // 2. The direction that matters: admitAll for apps, denyAll for the transport. An
-  //    author trusted for every app there is still cannot land raw links.
-  {
-    const shell = await mkTestShell(admitAll, denyAll);
-    try {
-      const err = await load(shell, ["link"]);
-      assert(err !== null && /rejected by admission/.test(err),
-        "a permissive author list does not admit a bundle naming the `link/*` names");
-      assert(await load(shell, ["fs", "clock"]) === null, "the same shell still lands an ordinary app");
-    } finally { shell.close(); }
-  }
-
-  // 3. A privilege is ONE thing, so there are no halves to claim: `link` beside ordinary
-  //    app services is still governed by the `link` grant alone, never the base.
-  //    Otherwise a bundle could reach sockets while falling through to the unprivileged
-  //    list by mixing in an ordinary service.
-  {
-    const requires = ["fs", "link"];
-    let appAsked = 0, linkAsked = 0;
-    const shell = await mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
-    try {
-      await load(shell, requires);
-      assert(linkAsked === 1 && appAsked === 0,
-        `${JSON.stringify(requires)} reaches the \`link\` grant, not the base`);
-    } finally { shell.close(); }
-  }
   console.log("  OK\n");
 }
 
 // ─── Test: node/sign is the one sign name; its scope is the slot's — the app scope for ──
 // ─── an app slot, the link scope for the link slot, on EVERY load path ──────────────
 // `slotSignScope` is a function of admitted facts — the node's identity, the manifest and
-// the privileges it reaches — which is the whole reason it cannot drift. Driven through a
+// whether it requires link — which is the whole reason it cannot drift. Driven through a
 // real shell because the property is about the point where a signed manifest becomes a
 // realm, and because the path that could silently lose it is the in-place UPDATE: a
 // transport that re-scoped itself on upgrade would keep serving while every handshake
 // with an un-upgraded peer failed as an authentication error naming nothing.
 async function testSigningScopeFollowsSlot() {
   console.log("Test: node/sign is the slot's scope — app scope for an app, link scope for the link slot, on every load path");
-  const { byPrivilege, admitAll } = await imp("build/host/policy.js");
+  const { admitAll } = await imp("build/host/policy.js");
   const { slotSignScope } = await imp("build/host/guest-seam.js");
 
   const linkAuthor = testAuthor(), appAuthor = testAuthor();
   const identity = generateKeyPair();
   const linkScope = new Uint8Array(0);
   let seam;
-  // The pin is `linkAuthor`'s: it is the only author here whose bundle reaches `link`,
-  // and the app author's never does, so one pin covers both loads.
+  // `linkAuthor` signs the boot transport, so the link probe below lands by replacing it;
+  // the app author's bundle never reaches `link`.
   const shell = await bootTestShell({
     identity,
     createRealm: async ({ hostCall }) => {
       seam = hostCall;
       return { call: async () => new Uint8Array(), dispose() {} };
     },
-    pinAuthor: linkAuthor,
-    admit: byPrivilege({ base: admitAll, grants: { link: admitAll } }),
+    transportAuthor: linkAuthor,
+    admit: admitAll,
   });
   const blob = (author, app, version, requires) => authorBundle(sodium, author, {
     app, version, modules: [], guestSource: GUEST_TEXT, guestRequires: requires,
@@ -395,7 +239,7 @@ async function testSigningScopeFollowsSlot() {
   try {
     // The link slot's one scope is the LINK scope: the channel AUTH is a fact of the
     // slot, not a second name.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
+    await shell.replaceBundle(shell.resolve("_fixture-transport"), blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
       localConfig: { networkKey: "7a".repeat(32) },
     });
     const v1 = await seam("node/sign", msg);
@@ -407,7 +251,7 @@ async function testSigningScopeFollowsSlot() {
       "node/verify on the link slot checks under the same link scope");
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
+    await shell.replaceBundle(appKey(linkAuthor.id, "linkprobe"), blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
       localConfig: { networkKey: "7b".repeat(32) },
     });
     const v2 = await seam("node/sign", msg);
@@ -430,9 +274,9 @@ async function testSigningScopeFollowsSlot() {
 
     // The two arms are the one exported constructor, so a caller building a scope by hand
     // agrees with what the slot got.
-    assert(bytesEqual(slotSignScope({ identity }, linkAuthor.id, "linkprobe", ["link"]).scope, linkScope),
+    assert(bytesEqual(slotSignScope({ identity }, linkAuthor.id, "linkprobe", true).scope, linkScope),
       "slotSignScope gives the link slot the link scope");
-    assert(bytesEqual(slotSignScope({ identity }, appAuthor.id, "plainapp", []).scope,
+    assert(bytesEqual(slotSignScope({ identity }, appAuthor.id, "plainapp", false).scope,
       guestSignScope(appAuthor.id, "plainapp")), "slotSignScope gives an app slot author ‖ app");
   } finally { shell.close(); }
   console.log("  OK\n");
@@ -466,7 +310,7 @@ async function testGuestAbi() {
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
   // `requires` is the HOST's list and nothing else: a closed vocabulary of SERVICES
-  // (§12.2), since each one is a privilege an operator grants. A finer method name asks for
+  // (§12.2), since manifests declare services. A finer method name asks for
   // a grant finer than the seam can enforce — the seam gates a `host.call` by the method's
   // SERVICE — and a local service id belongs in the other list entirely. Both are refused,
   // each naming the fix.
@@ -1120,10 +964,8 @@ async function testSafeRealmConcurrency() {
 
 // ─── Run ────────────────────────────────────────────────────────────────
 
-await testOneRawLinkOwner();
 await testGuestSeam();
 await testPolicy();
-await testRequiresPickThePrivileges();
 await testSigningScopeFollowsSlot();
 await testGuestAbi();
 await testSafeJs();
