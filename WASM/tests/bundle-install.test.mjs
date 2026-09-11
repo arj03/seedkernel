@@ -1509,7 +1509,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
 // ─── Test: generated guest op-frame source is the canonical implementation ─────
 //
-// host/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
+// core/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
 // functions for import-free guests; the transport assembler injects the same fragment.
 // Exercise the emitted program at every boundary so serialization cannot change behavior.
 function testGeneratedOpFrame() {

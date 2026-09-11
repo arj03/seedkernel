@@ -211,9 +211,9 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   };
 }
 /** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
- *  kernel's whole inbound vocabulary is the entrypoint's argument `[caller 32][body …]`:
- *  attribution only. What follows the 32 bytes is the callee's own format; the kernel
- *  never reads it, so it never grows a language. */
+ *  entrypoint receives `[caller 32][body …]`. Application and local-service bodies use
+ *  the callee's format and remain opaque to routing. The socket driver constructs
+ *  raw-link event bodies using the kernel ABI in core/op-frame.ts (RUNTIME §12.2). */
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }

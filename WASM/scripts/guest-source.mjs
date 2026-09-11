@@ -20,7 +20,7 @@ export function guestSourcePaths() {
 /** The assembled guest program as text — the shape the manifest hashes; verification
  *  decodes the packed guest back to text, so text is the only shape that round-trips.
  *  `opFrameSource` comes from bundle-author.ts's `guestOpFraming`, which serializes the
- *  canonical host/op-frame.ts functions.
+ *  canonical core/op-frame.ts functions.
  *
  *  The result is normalized to LF because this text is SIGNED: the parts are checked out
  *  CRLF on Windows and LF elsewhere, so without this the same commit would sign different

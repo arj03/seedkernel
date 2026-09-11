@@ -1,11 +1,11 @@
-// Named-op envelope shared by clients and guest code. The kernel ABI ends at `[caller 32]`;
-// driver event names live in core/domains.ts (§12.2).
+// Named-op envelope for the kernel's raw-link event ABI and optional application framing.
+// Event names live in core/domains.ts; their byte layouts are documented in RUNTIME §12.2.
 // The three functions below are serialized by bundle-author.ts's `guestOpFraming` for
 // import-free guests, and the transport assembler injects that source before signing — so
 // they must reference nothing outside themselves, not even this file's imports. The type
 // system does not say so: run.mjs's `testGeneratedOpFrame` EXECUTES the emitted source, and
 // that is what catches a free variable — a new code path here needs a case there.
-import { writeU32BE, enc } from "../core/util.js";
+import { writeU32BE, enc } from "./util.js";
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched
  *  over the whole 32 bytes — an app key is grindable, so a prefix test is unsafe. */
@@ -18,7 +18,7 @@ export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Arr
   return { fromHost, caller, body: arg.subarray(32) };
 }
 
-/** Read the optional `[opLen u8][op ascii][args …]` client convention. */
+/** Read `[opLen u8][op ascii][args …]`: required for link events, optional for apps. */
 export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   const n = body.length > 0 ? body[0] : -1;
   if (n < 0 || body.length < 1 + n) throw new Error("op-frame: malformed op envelope");
@@ -27,7 +27,7 @@ export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   return { op, args: body.subarray(1 + n) };
 }
 
-/** Write the optional `[opLen u8][op ascii][args …]` client convention. */
+/** Write `[opLen u8][op ascii][args …]`: required for link events, optional for apps. */
 export function writeOp(op: string, args: Uint8Array): Uint8Array {
   if (op.length < 1 || op.length > 255)
     throw new Error(`op-frame: op name ${JSON.stringify(op)} must be 1..255 bytes`);

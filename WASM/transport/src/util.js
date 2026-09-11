@@ -144,6 +144,6 @@ Reader.prototype.blob = function () {
 };
 
 // ── the caller prefix and op envelope ───────────────────────────────────────
-// Injected from host/op-frame.ts by scripts/guest-source.mjs. Keeping a marker here makes
+// Injected from core/op-frame.ts by scripts/guest-source.mjs. Keeping a marker here makes
 // omission fail during assembly instead of producing a signed guest with missing globals.
 /* @seedkernel-op-frame */

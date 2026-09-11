@@ -50,7 +50,7 @@ const { createGuestSeam, HOST_CALLER_ID } = await imp("build/host/guest-seam.js"
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
+const { callerOf, readOp, writeOp } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { createActiveHostCallRegistry, createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 

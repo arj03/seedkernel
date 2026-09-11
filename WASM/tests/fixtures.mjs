@@ -32,7 +32,7 @@ export const { createGuestSeam, guestSignScope, appSignScope } = await imp("buil
 export const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 export const TEST_CALLS = { call: () => null };
-export const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
+export const { callerOf, readOp, writeOp } = await imp("build/core/op-frame.js");
 export const { MemoryFs } = await imp("build/host/fs-memory.js");
 export const enc = new TextEncoder();
 export const { NodeFs } = await imp("build/host/fs-node.js");

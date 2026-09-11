@@ -17,7 +17,7 @@ import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { type RawNet } from "./guest-seam.js";
 import type { CausalClock } from "./realm-queue.js";
-import { OpArgs } from "./op-frame.js";
+import { OpArgs } from "../core/op-frame.js";
 
 const EMPTY = new Uint8Array(0);
 
@@ -252,10 +252,9 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
   //
-  // `OpArgs` (op-frame.ts) is the TRANSPORT BUNDLE's framing, not a kernel ABI: the
-  // kernel's only obligation in front of it is the 32-byte caller id the shell adds
-  // (shell-core.ts `hostCallSlot`). Paired with this driver like the wire codec, so the
-  // two move in one artifact.
+  // `OpArgs` (core/op-frame.ts) encodes the kernel's raw-link event ABI (RUNTIME §12.2).
+  // The shell adds the 32-byte host caller id (shell-core.ts `hostCallSlot`); any
+  // replacement link occupant must understand this envelope and these event fields.
 
   /** Call the transport, with the shell's caller-id prefix added at the realm call.
    *

@@ -3,7 +3,7 @@
 // an author's accepted vocabulary cannot drift behind what a loader will accept.
 import { concatBytes, toHex, enc } from "../core/util.js";
 import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../core/domains.js";
-import { callerOf, readOp, writeOp } from "./op-frame.js";
+import { callerOf, readOp, writeOp } from "../core/op-frame.js";
 import {
   GUEST_FILE,
   MANIFEST_FILE,
@@ -178,7 +178,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
 export function guestOpFraming(): string {
   const src = [callerOf, readOp, writeOp].map((fn) => fn.toString()).join("\n");
   return `
-// op-frame: optional client framing; seedkernel reads none of these body bytes.
+// op-frame: kernel raw-link event ABI; optional framing for application bodies.
 ${src}
 `.replace(/\r\n/g, "\n");
 }

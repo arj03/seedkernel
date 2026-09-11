@@ -19,7 +19,7 @@ export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
-export const { OpArgs } = await imp("build/host/op-frame.js");
+export const { OpArgs } = await imp("build/core/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest returns from `linkClosed`
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary

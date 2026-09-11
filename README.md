@@ -183,8 +183,8 @@ All three targets share bundle admission, policy and routing, and run the same s
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 320 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the timer table and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 725 |
 | Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 386 |
-| Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/peer-addr.ts`, `host/op-frame.ts` | 318 |
-| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id and the host-call names | `core/*.ts` (7 files) | 354 |
+| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 248 |
+| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 424 |
 
 Sharing these rows keeps admission and confinement rules consistent across targets and avoids duplicating adapters and client codecs. Claim routing still follows each node's own installed set (§12.10); the operator decides which app owns each claim ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
 
