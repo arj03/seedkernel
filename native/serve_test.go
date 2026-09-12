@@ -71,7 +71,7 @@ globalThis.__requester = null;
 // The requester loads the probe app and asks through it: a request is an app calling
 // the id the transport claims, so there is nothing host-side to call instead.
 globalThis.loadIntoRequester = async (bytes) => {
-  globalThis.__requester = await __requesterNode.shell.loadBundleBlob(new Uint8Array(bytes));
+  globalThis.__requester = await __requesterNode.shell.install(new Uint8Array(bytes));
 };
 globalThis.ask = async (sendArgs) => {
   // The op is a NAME of the probe app's own vocabulary (the shell passes bytes unread;

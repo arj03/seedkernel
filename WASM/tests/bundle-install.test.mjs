@@ -245,7 +245,7 @@ async function testManifestClaimIsTheRouting() {
   realmBuilds = 0;
   try {
     const key = appKey(author.id, "store");
-    await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
+    await shell.install(blob(author, "store", 1, ["seedstore/v1"]));
     assertEqual(shell.resolve("seedstore/v1"), key,
       "the load claimed the manifest's protocol — no second operator action");
     assert(shell.resolve("store") === null,
@@ -254,12 +254,21 @@ async function testManifestClaimIsTheRouting() {
     // An app that claims nothing serves nothing: the initiator-only shape (§12.8), and
     // the reason the field is optional rather than a required empty list.
     const quiet = appKey(author.id, "quiet");
-    await shell.loadBundleBlob(blob(author, "quiet", 1, undefined));
+    await shell.install(blob(author, "quiet", 1, undefined));
     assertEqual(shell.routes().length, 1, "a bundle claiming nothing adds no route");
+
+    // An install that names no predecessor takes a FREE identity: this one is taken, and
+    // taking it over means saying so.
+    let taken = "";
+    try { await shell.install(blob(author, "store", 2, ["seedstore/v2"])); }
+    catch (e) { taken = String(e); }
+    assert(taken.includes("is already installed") && taken.includes("replaces"),
+      `an install onto a running identity is refused by name, got: ${taken || "no error"}`);
+    assertEqual(shell.resolve("seedstore/v1"), key, "…leaving the running version's claim untouched");
 
     // An update re-projects from the NEW manifest, so a claim that was dropped stops
     // being served — the table cannot outlive the manifest that put it there.
-    await shell.loadBundleBlob(blob(author, "store", 2, ["seedstore/v2"]));
+    await shell.install(blob(author, "store", 2, ["seedstore/v2"]), { replaces: key });
     assertEqual(shell.resolve("seedstore/v2"), key, "an update claims what the new manifest declares");
     assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
@@ -269,7 +278,7 @@ async function testManifestClaimIsTheRouting() {
     const rival = appKey(other.id, "store");
     const buildsBeforeConflict = realmBuilds;
     let conflict = "";
-    try { await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"])); }
+    try { await shell.install(blob(other, "store", 1, ["seedstore/v2"])); }
     catch (e) { conflict = String(e); }
     assert(conflict.includes("claim 'seedstore/v2' is already held"),
       `a contested claim is rejected by name, got: ${conflict || "no error"}`);
@@ -291,18 +300,18 @@ async function testManifestClaimIsTheRouting() {
     // uninstall gives one back.
     const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
     for (let i = 0; i < DEFAULT_MAX_APP_SLOTS; i++) {
-      await shell.loadBundleBlob(blob(author, `filler${i}`, 1, [`filler/${i}`]));
+      await shell.install(blob(author, `filler${i}`, 1, [`filler/${i}`]));
     }
     let overfull = "";
-    try { await shell.loadBundleBlob(blob(author, "one-too-many", 1, ["filler/x"])); }
+    try { await shell.install(blob(author, "one-too-many", 1, ["filler/x"])); }
     catch (e) { overfull = String(e); }
     assert(overfull.includes("app slots"), `a full node refuses another app, got: ${overfull || "no error"}`);
     assert(shell.resolve("filler/x") === null, "…and the refused candidate claimed nothing");
-    await shell.loadBundleBlob(blob(author, "filler0", 2, ["filler/0"]));
+    await shell.install(blob(author, "filler0", 2, ["filler/0"]), { replaces: appKey(author.id, "filler0") });
     assertEqual(shell.resolve("filler/0"), appKey(author.id, "filler0"),
       "a replacement takes the slot its own key already holds");
     shell.uninstall(appKey(author.id, "filler0"));
-    await shell.loadBundleBlob(blob(author, "one-too-many", 1, ["filler/x"]));
+    await shell.install(blob(author, "one-too-many", 1, ["filler/x"]));
     assertEqual(shell.resolve("filler/x"), appKey(author.id, "one-too-many"),
       "uninstalling gives the slot back");
     shell.uninstall(appKey(author.id, "one-too-many"));
@@ -348,7 +357,7 @@ async function testManifestClaimIsTheRouting() {
     {
       const pub = "reach/public", priv = "_reach-private";
       const reachKey = appKey(author.id, "reach");
-      await shell.loadBundleBlob(authorBundle(sodium, author, {
+      await shell.install(authorBundle(sodium, author, {
         app: "reach", version: 1, protocols: [pub], services: [priv],
         modules: [], guestSource: GUEST_TEXT, guestRequires: [],
       }).blob);
@@ -687,7 +696,7 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { mkdtempSync, rmSync, writeFileSync: wf, readFileSync: rf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
@@ -742,19 +751,21 @@ async function testBundle() {
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = await shell.loadBundle(bundlePath);
+    const loaded = await shell.installFile(bundlePath);
     assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
-    // set to 1 by the load above.
+    // set to 1 by the load above. Re-running this identity against the mark is an explicit
+    // replacement of the slot already standing, since a load only ever takes a free one.
     const remanifest = (version) => writeBundle({ ...manifest, version });
-    remanifest(1); await shell.loadBundle(bundlePath); // equal version reloads (an ordinary reboot)
-    remanifest(2); await shell.loadBundle(bundlePath); // newer version advances the mark to 2
+    const reload = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: loaded.key });
+    remanifest(1); await reload();                // equal version reinstalls (an ordinary reboot)
+    remanifest(2); await reload();                // newer version advances the mark to 2
     remanifest(1);                                // now a downgrade
     let downgradeRefused = false;
-    try { await shell.loadBundle(bundlePath); } catch { downgradeRefused = true; }
+    try { await reload(); } catch { downgradeRefused = true; }
     assert(downgradeRefused, "a version below the (author, app) high-water mark is refused as a downgrade");
-    remanifest(2); await shell.loadBundle(bundlePath);  // the mark held at 2, so v2 still loads
+    remanifest(2); await reload();                // the mark held at 2, so v2 still loads
     remanifest(1);                                // restore the original for the shell2 check below
 
     // a shell whose policy does NOT allow the author refuses the bundle
@@ -763,7 +774,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data2"), identity,
     });
     let refused = false;
-    try { await shell2.loadBundle(bundlePath); } catch { refused = true; }
+    try { await shell2.installFile(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a non-allowed author is refused");
   } finally {
     if (shell) shell.close();
@@ -905,7 +916,7 @@ async function testGuestBundleAndArchive() {
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = await shell.loadBundle(bundlePath);
+    const loaded = await shell.installFile(bundlePath);
     assertEqual(loaded.guestSource, GUEST_TEXT, "the shell yields the verified guest source");
   } finally {
     if (shell) shell.close();
@@ -922,7 +933,7 @@ async function testGuestBundleAndArchive() {
 // the known-good older bundle is refused as a downgrade and rollback is bricked (§12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { mkdtempSync, rmSync, writeFileSync: wf, readFileSync: rf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
@@ -955,22 +966,24 @@ async function testBundleCorruptNewerRollback() {
       dir: pjoin(dir, "_data"), identity,
     });
 
-    // 1. Good v4 loads and sets the mark to 4.
+    // 1. Good v4 loads and sets the mark to 4. Every step after it is an upgrade of THIS
+    //    slot, which is the shape a half-landed upgrade actually has.
     writeBundle(4);
-    await shell.loadBundle(bundlePath);
+    const v4 = await shell.installFile(bundlePath);
+    const upgrade = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: v4.key });
 
     // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
     //    match their declared hash. The load must throw on the content check.
     writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
-    try { await shell.loadBundle(bundlePath); } catch { v5Failed = true; }
+    try { await upgrade(); } catch { v5Failed = true; }
     assert(v5Failed, "a corrupt v5 bundle fails to load");
 
     // 3. Restore the good v4 bundle and reload. If the failed v5 load had advanced the
     //    mark to 5, this would now be refused as a downgrade. It must still load.
     writeBundle(4);
     let v4Reloaded = true;
-    try { await shell.loadBundle(bundlePath); } catch { v4Reloaded = false; }
+    try { await upgrade(); } catch { v4Reloaded = false; }
     assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
   } finally {
     if (shell) shell.close();
@@ -988,7 +1001,7 @@ async function testBundleCorruptNewerRollback() {
 // uninstall without closing the door, or close it with the code still running.
 async function testAuthorRevocation() {
   console.log("Test: revoking an author key refuses its bundles and tears down what it landed");
-  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { mkdtempSync, rmSync, writeFileSync: wf, readFileSync: rf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
@@ -1012,12 +1025,13 @@ async function testAuthorRevocation() {
 
     // 1. The author is trusted: v1 loads and binds.
     writeBundle(1);
-    await shell.loadBundle(bundlePath);
+    await shell.installFile(bundlePath);
 
     // 2. The key is stolen. Freshness does NOT stop it — v2 is strictly newer, so it
-    //    loads over the same name. This is the gap, asserted rather than assumed.
+    //    upgrades the same name with nothing to say the hand on the key changed. This is
+    //    the gap, asserted rather than assumed.
     writeBundle(2);
-    await shell.loadBundle(bundlePath);
+    await shell.install(new Uint8Array(rf(bundlePath)), { replaces: victimKey });
 
     // 3. Write the key off. Both halves must happen in the one call.
     const gone = shell.revoke(authorHex);
@@ -1028,7 +1042,7 @@ async function testAuthorRevocation() {
     //    and the author is still in the policy allowlist.
     writeBundle(3);
     let refused = false;
-    try { await shell.loadBundle(bundlePath); } catch { refused = true; }
+    try { await shell.installFile(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a revoked key is refused despite a higher version");
     assert(shell.uninstall(victimKey) === false, "nothing landed on the refused load");
 
@@ -1044,7 +1058,7 @@ async function testAuthorRevocation() {
         admit: () => { admitCalls++; return true; },
       });
       probe.revoke(authorHex);
-      try { await probe.loadBundleBlob(new Uint8Array(readFileSync(bundlePath))); } catch { /* expected */ }
+      try { await probe.install(new Uint8Array(readFileSync(bundlePath))); } catch { /* expected */ }
       assert(admitCalls === 0, "a revoked author never reaches the admission predicate");
       probe.close();
     }
@@ -1055,7 +1069,7 @@ async function testAuthorRevocation() {
     shell.close();
     shell = await boot({ policyJson, dir: dataDir, identity });
     let refusedAfterReboot = false;
-    try { await shell.loadBundle(bundlePath); } catch { refusedAfterReboot = true; }
+    try { await shell.installFile(bundlePath); } catch { refusedAfterReboot = true; }
     assert(refusedAfterReboot, "the revocation survives a reboot with the policy untouched");
 
     // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5.1) and
@@ -1067,7 +1081,7 @@ async function testAuthorRevocation() {
       policyJson: JSON.stringify({ authors: [authorHex, toHex(heir.id)] }),
       dir: dataDir, identity,
     });
-    await shell.loadBundle(bundlePath);
+    await shell.installFile(bundlePath);
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1246,7 +1260,7 @@ async function testPersistFailureRollsBack() {
   const broken = new FreshnessMarks(null, () => { throw new Error("disk full"); });
   const brokenShell = await shellOver(broken);
   let msg = "";
-  try { await brokenShell.loadBundleBlob(blob); } catch (e) { msg = e.message; }
+  try { await brokenShell.install(blob); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
   assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
   assert(brokenShell.uninstall(key) === false, "nothing was kept — no slot was committed");
@@ -1256,7 +1270,7 @@ async function testPersistFailureRollsBack() {
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
   const healthyShell = await shellOver(healthy);
-  await healthyShell.loadBundleBlob(blob);
+  await healthyShell.install(blob);
   assert(healthyShell.uninstall(key), "the retry lands");
   assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
   console.log("  OK\n");
@@ -1339,7 +1353,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     // the absence of a claimant. The store starts healthy, because the boot transport's
     // mark and the neighbour's own have to persist, and fails from here on.
     loadingNeighbor = true;
-    await shell.loadBundleBlob(neighborBlob);
+    await shell.install(neighborBlob);
     loadingNeighbor = false;
     flaky.fail = true;
     assertEqual(shell.resolve("_svc"), appKey(author.id, "svc-neighbor"),
@@ -1347,7 +1361,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
 
     let rejected = false;
     const localConfig = { custom: "kept", networkKey: "caller-value", linkIdleTimeoutMs: 1 };
-    try { await shell.replaceBundle(shell.resolve("_fixture-transport"), blob, { localConfig }); } catch { rejected = true; }
+    try { await shell.install(blob, { replaces: shell.resolve("_fixture-transport"), localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
     const [, candidateLocal] = Function(
       candidates[0].source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL];",
@@ -1367,7 +1381,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
     flaky.fail = false;
-    await shell.replaceBundle(shell.resolve("_fixture-transport"), blob, { localConfig });
+    await shell.install(blob, { replaces: shell.resolve("_fixture-transport"), localConfig });
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
     await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
     await candidates[1].hostCall("_svc", new Uint8Array());
@@ -1467,18 +1481,18 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
     admit: admitAll,
   });
   try {
-    const first = await shell.loadBundleBlob(blob(1));
+    const first = await shell.install(blob(1));
     await first.invoke(new Uint8Array());
     assertEqual(realms.length, 1, "the first slot stands one realm");
 
     failNextRealm = true;
     let failed = false;
-    try { await shell.loadBundleBlob(blob(2)); } catch { failed = true; }
+    try { await shell.install(blob(2), { replaces: key }); } catch { failed = true; }
     assert(failed, "a candidate whose guest cannot stand is refused");
     assert(!realms[0].disposed, "the failed candidate leaves the running realm intact");
     assertEqual(shell.resolve("upgrade/v1"), key, "…and leaves its claim intact");
 
-    const replacement = await shell.loadBundleBlob(blob(2));
+    const replacement = await shell.install(blob(2), { replaces: key });
     assert(realms[0].disposed, "the upgrade disposed the realm it replaced");
     let staleRejected = false;
     try { await first.invoke(new Uint8Array()); } catch { staleRejected = true; }
@@ -1539,7 +1553,8 @@ function testGeneratedOpFrame() {
 // ─── Test: the commit window re-asks the host's gates (§12.4, §12.5) ────────────
 //
 // Module construction, the guest's top level and a consent dialog all run between admission
-// and the commit, and the mark and the revocation set move in that window.
+// and the commit, and the mark, the revocation set and the installed identities all move in
+// that window.
 async function testCommitRevalidatesHostGates() {
   console.log("Test: a candidate is re-checked against freshness and revocation at commit");
 
@@ -1556,7 +1571,35 @@ async function testCommitRevalidatesHostGates() {
     dispose() { },
   });
 
-  // A v1 held in admission while v2 lands: fresh when admitted, a downgrade by commit.
+  // Two loads of one identity, overlapping. Installing is not replacing, so the one that
+  // arrives second is refused by name rather than quietly taking the slot the first is
+  // already running in — the case freshness cannot catch, since it refuses only a LOWER
+  // version and these are the same one.
+  {
+    let release, held = null;
+    const shell = await bootTestShell({
+      freshnessStore: new FreshnessMarks(), createRealm,
+      admit: async () => {
+        if (held === null) { held = new Promise((r) => { release = r; }); await held; }
+        return true;
+      },
+    });
+    try {
+      const slow = shell.install(blobAt(1));
+      const winner = await shell.install(blobAt(1));
+      release();
+      let refused = null;
+      try { await slow; } catch (e) { refused = e; }
+      assert(refused !== null && /already installed/.test(refused.message),
+        "the second load of one identity is refused, never silently handed the slot");
+      assertEqual((await winner.invoke(EMPTY))[0], 1, "…and the load that committed still answers");
+    } finally { shell.close(); }
+  }
+
+  // A v1 held in admission while v2 lands and is then uninstalled: fresh when admitted, a
+  // downgrade by commit. The uninstall is what lets v1 reach its own commit window at all,
+  // since a load never takes an identity another slot still holds — and it is the shape
+  // the case really has, an operator clearing an app out while a consent dialog is open.
   {
     const store = new FreshnessMarks();
     let release;
@@ -1566,15 +1609,16 @@ async function testCommitRevalidatesHostGates() {
       admit: async (v) => { if (v.manifest.version === 1) await held; return true; },
     });
     try {
-      const slow = shell.loadBundleBlob(blobAt(1));
-      const winner = await shell.loadBundleBlob(blobAt(2));
+      const slow = shell.install(blobAt(1));
+      const winner = await shell.install(blobAt(2));
+      assertEqual((await winner.invoke(EMPTY))[0], 2, "the newer slot is the one that stood");
+      assert(shell.uninstall(racerKey), "…and is removed before the held candidate resumes");
       release();
       let refused = null;
       try { await slow; } catch (e) { refused = e; }
       assert(refused !== null && /downgrade/.test(refused.message),
         "a candidate admitted before the newer version is refused at commit");
       assertEqual(store.get(author.id, "racer"), 2, "the mark still records the version that ran");
-      assertEqual((await winner.invoke(EMPTY))[0], 2, "the newer slot is the one still standing");
     } finally { shell.close(); }
   }
 
@@ -1588,7 +1632,7 @@ async function testCommitRevalidatesHostGates() {
       admit: async () => { await held; return true; },
     });
     try {
-      const pending = shell.loadBundleBlob(blobAt(1));
+      const pending = shell.install(blobAt(1));
       shell.revoke(toHex(author.id));
       release();
       let refused = null;

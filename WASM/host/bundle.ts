@@ -151,7 +151,7 @@ export interface VerifiedBundle {
   guestSource: string;
 }
 
-/** What the shell returns from `loadBundleBlob`: verified metadata and guest source,
+/** What the shell returns from `install`: verified metadata and guest source,
  *  without retaining the raw module bytes after the private instances are built. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 

@@ -29,6 +29,11 @@ const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
 const { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const TRANSPORT_SERVICE = "_net";
+// Every transport change below is one install naming the slot standing (§12.5) — the
+// node's current link owner, read off the claim rather than remembered, because a
+// successful change moves it.
+const reinstallTransport = (node, blob, opts) =>
+  node.shell.install(blob, { replaces: node.shell.resolve(TRANSPORT_SERVICE), ...opts });
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
 const { harnessAppBlob, appRequest, addr, ready, linkedPeers } = await imp("tests/transport-harness.mjs");
@@ -163,7 +168,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     },
     admit: policy,
   });
-  const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
+  const app = await shell.install(harnessAppBlob(appAuthor));
   // This node's channel key, hex. Off the identity minted here, not asked of the driver:
   // it is `toHex(identity.publicKey)`, which every caller already holds.
   const peerId = Buffer.from(identity.publicKey).toString("hex");
@@ -210,7 +215,7 @@ let publishCandidate;
 const publish = new Promise((resolve) => { publishCandidate = resolve; });
 a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; };
 const replacementKeys = makeAuthor(sodium);
-const upgrading = a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(2, replacementKeys));
+const upgrading = reinstallTransport(a, transportBundleAt(2, replacementKeys));
 await configured;
 // An address taught in the replacement window lands on whoever owns `_net` right NOW —
 // still the incumbent, since the candidate's realm stands but is unpublished. Nothing
@@ -251,7 +256,7 @@ assert(resp3.length === 3 && resp3[2] === 7, "B reaches A through the new guest,
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
 // and the transport answers to that mark like any other bundle (§12.4).
 let refused = false;
-try { await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(1, replacementKeys)); }
+try { await reinstallTransport(a, transportBundleAt(1, replacementKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version from the same author is refused after the upgrade");
 assert((await request(a.app, bId, new Uint8Array([4]))).length === 1,
@@ -263,12 +268,12 @@ assert((await request(a.app, bId, new Uint8Array([4]))).length === 1,
 // it had — rollback bricked by a failed upgrade. So the mark is the last step of the load.
 const brokenGuest = "const nope = ( ;";
 let v3Failed = false;
-try { await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(3, replacementKeys, brokenGuest)); }
+try { await reinstallTransport(a, transportBundleAt(3, replacementKeys, brokenGuest)); }
 catch { v3Failed = true; }
 assert(v3Failed, "a v3 whose guest cannot compile fails the load");
 
 let v2Reloaded = true;
-try { await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(2, replacementKeys)); }
+try { await reinstallTransport(a, transportBundleAt(2, replacementKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
 assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
@@ -286,7 +291,7 @@ assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
 // therefore validates its own config at realm evaluation, which is a failed load.
 let noConfigFailed = false;
 let noConfigMsg = "";
-try { await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(3, replacementKeys, undefined, null)); }
+try { await reinstallTransport(a, transportBundleAt(3, replacementKeys, undefined, null)); }
 catch (e) { noConfigFailed = true; noConfigMsg = e.message; }
 assert(noConfigFailed && /maxFrameBytes|connsPerPeer|config/.test(noConfigMsg),
   `a transport signing no guest.config fails the load (${noConfigMsg})`);
@@ -297,7 +302,7 @@ assert((await request(a.app, bId, new Uint8Array([9]))).length === 1,
 for (const networkKey of [null, 32, [], "", "ab".repeat(31), "ab".repeat(33), "AB".repeat(32), "zz".repeat(32)]) {
   let msg = "";
   try {
-    await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(3, replacementKeys), { localConfig: { networkKey } });
+    await reinstallTransport(a, transportBundleAt(3, replacementKeys), { localConfig: { networkKey } });
   } catch (e) { msg = e.message; }
   assert(/config networkKey/.test(msg), `invalid network key fails the load (${msg})`);
 }
@@ -311,7 +316,7 @@ assert((await request(a.app, bId, new Uint8Array([7]))).length === 1,
 // of `LOCAL.peers` where it reads it, and a load naming a cohort wrong fails outright.
 let badPeersMsg = "";
 try {
-  await a.shell.replaceBundle(a.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(3, replacementKeys), {
+  await reinstallTransport(a, transportBundleAt(3, replacementKeys), {
     localConfig: { peers: [{ peerId: "ab".repeat(20), dest: "tcp://loopback:1" }] },
   });
 } catch (e) { badPeersMsg = e.message; }
@@ -329,7 +334,7 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
 
   broken = true;
   let msg = "";
-  try { await c.shell.replaceBundle(c.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(2, transportKeys)); } catch (e) { msg = e.message; }
+  try { await reinstallTransport(c, transportBundleAt(2, transportKeys)); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), `a bundle whose mark cannot be written fails the load (got: ${msg})`);
   assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
   assert(c.shell.resolve(TRANSPORT_SERVICE)?.startsWith(transportAuthor),
@@ -340,7 +345,7 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
   // store that never got the first one.
   broken = false;
   let reloaded = true;
-  try { await c.shell.replaceBundle(c.shell.resolve(TRANSPORT_SERVICE), transportBundleAt(2, transportKeys)); } catch { reloaded = false; }
+  try { await reinstallTransport(c, transportBundleAt(2, transportKeys)); } catch { reloaded = false; }
   assert(reloaded, "the retry against a healthy store lands");
   assert(store.get(transportVerified.author, "transport") === 2, "…and the mark it persists is the one the failed load rolled back");
   c.shell.close();

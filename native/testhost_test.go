@@ -50,7 +50,7 @@ const nativeHandleHarness = `
   globalThis.cliLoadBundle = async (path) => {
     const raw = bridge.readFile(path);
     if (raw === null) throw new Error("native test: cannot read " + path);
-    const app = await node.shell.loadBundleBlob(new Uint8Array(raw));
+    const app = await node.shell.install(new Uint8Array(raw));
     apps.set(app.key, app);
     return new TextEncoder().encode(loadedLine(app));
   };

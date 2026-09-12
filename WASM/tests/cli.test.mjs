@@ -79,7 +79,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
         // The one door the operator flow reaches the network through. `null` is the whole
         // of "this node has no transport" as the CLI sees it.
         call: () => (linkAvailable ? Promise.resolve(new Uint8Array(0)) : null),
-        loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
+        install: async () => { throw new Error("no bundle in this test"); },
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
@@ -169,7 +169,7 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1
     "--key", join(work, "app.key"), "--bundle", bundlePath, "--local-config", configPath,
   ], {
     shell: {
-      loadBundleBlob: async (_blob, opts) => {
+      install: async (_blob, opts) => {
         loadOpts = opts;
         return { author, manifest: { app: "configured", version: 1 } };
       },
@@ -233,7 +233,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
     shell: {
       revoke: (hex) => { order.push("revoke:" + hex); return []; },
       uninstall: (k) => { order.push("uninstall:" + k); return false; },
-      loadBundleBlob: async () => { order.push("load"); throw new Error("stop here"); },
+      install: async () => { order.push("load"); throw new Error("stop here"); },
     },
   });
   let msg = "";

@@ -13,7 +13,7 @@ import type { RealmTimers } from "./realm-timers.js";
 export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array) => void;
 
 /** A slot's realm. Nullable for exactly the window between the holder being made and the
- *  factory resolving, inside one `loadBundleBlob` — a slot only enters the table with its
+ *  factory resolving, inside one `install` — a slot only enters the table with its
  *  realm standing, and teardown reads the settled handle synchronously, because the
  *  callers that dispose are deciding right then what the node holds. */
 export interface AppSlot {
@@ -88,58 +88,60 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     /** Every claim this node serves as `[claim, owner key]`, peer-reachable first. */
     routes: (): [string, string][] =>
       [...peer, ...local].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
-    /** Refuse a candidate that contests a claim or the raw-link binding another identity
-     *  holds, or that would exceed the slot cap (§12.10). Asked before candidate code runs
-     *  and again in the commit window, because another load may take a free claim while
-     *  this candidate is being built. Per BOOK: the same name under `protocols` and
-     *  `services` is two claims, not a contest. A replacement may take only the selected
-     *  predecessor's claims and must still target that exact live slot at commit.
-     *  `selected` is the boot's transport selection: the one way to take the raw-link
-     *  binding when nothing holds it. */
+    /** Refuse a candidate that contests the identity, a claim or the raw-link binding
+     *  another slot holds, or that would exceed the slot cap (§12.10). Asked before
+     *  candidate code runs and again in the commit window, because another load may take a
+     *  free claim while this candidate is being built. Per BOOK: the same name under
+     *  `protocols` and `services` is two claims, not a contest. A replacement may take the
+     *  selected predecessor's identity and claims, and must still target that exact live
+     *  slot at commit. `selected` is the boot's transport selection: the one way to take
+     *  the raw-link binding when nothing holds it. */
     refuseConflicts(loaded: LoadedBundle, key: string, replacement?: AppSlot, selected = false): void {
       if (replacement && !slots.includes(replacement))
         throw new Error("shell: replacement target changed while the candidate was loading");
-      if (replacement && slots.some((slot) => keyOf(slot) === key && slot !== replacement))
-        throw new Error(`shell: replacement identity '${key}' is already installed`);
+      // One slot per identity, and an install that names no predecessor takes a FREE one:
+      // an identity already here changes hands only through an install that says so. So a
+      // second install of a running app is refused rather than silently taking it over, and
+      // every rule below has exactly one incumbent to weigh — the named predecessor.
+      const installed = slots.find((slot) => keyOf(slot) === key);
+      if (installed && installed !== replacement)
+        throw new Error(`shell: '${key}' is already installed — install with { replaces: '${key}' } to take over its slot`);
       // The raw-link binding changes hands only by explicit selection (§12.5): a candidate
       // reaching `link` must replace the slot holding it or, with no holder, be the boot's
-      // selected transport; and a plain load may not displace the holder, even with a
-      // version that drops `link`. Refused LOUDLY, because the alternative is a node that
-      // looks installed and is off the network. Asked before the claim contest, so a
-      // would-be transport claiming the holder's service id is told the rule it broke.
+      // selected transport. Refused LOUDLY, because the alternative is a node that looks
+      // installed and is off the network. Asked before the claim contest, so a would-be
+      // transport claiming the holder's service id is told the rule it broke.
       const holder = slots.find(hasLink);
-      if (holder && holder !== replacement && (reachesLink(loaded.manifest) || keyOf(holder) === key))
-        throw new Error(`shell: the transport changes only by explicit replacement of its own slot — use replaceBundle('${keyOf(holder)}', …)`);
+      if (holder && holder !== replacement && reachesLink(loaded.manifest))
+        throw new Error(`shell: the transport changes hands only by an install replacing its slot — { replaces: '${keyOf(holder)}' }`);
       if (!holder && !selected && reachesLink(loaded.manifest))
-        throw new Error(`shell: "link" is taken only by the boot's transport selection or explicit replacement of the current transport`);
+        throw new Error(`shell: "link" is taken only by the boot's transport selection, or by an install replacing the current transport`);
       for (const [book, names, audience] of booksOf(loaded.manifest)) {
         for (const claim of names) {
-          const incumbent = book.get(claim);
-          if (incumbent && incumbent !== replacement && keyOf(incumbent) !== key) {
-            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(incumbent)}'`);
-          }
+          const claimant = book.get(claim);
+          if (claimant && claimant !== replacement)
+            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(claimant)}'`);
         }
       }
       // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
       // install list nobody counts would leave each of those ceilings a floor rather than a
       // bound. A replacement takes the slot it already holds and is never refused here.
-      if (!replacement && slots.length >= maxSlots && !slots.some((installed) => keyOf(installed) === key)) {
+      if (!replacement && slots.length >= maxSlots)
         throw new Error(`shell: this node already holds its ${maxSlots} app slots — uninstall one before installing another`);
-      }
     },
-    /** Install `slot` under `key` and hand it every claim its manifest names. Returns the
-     *  slot it displaced, claims already released and realm still standing — disposing that
-     *  is the caller's, once it has torn down whatever else the slot held. */
-    commit(slot: AppSlot, key: string, replacement?: AppSlot): AppSlot | undefined {
-      const at = replacement ? slots.indexOf(replacement) : slots.findIndex((installed) => keyOf(installed) === key);
-      const previous = at < 0 ? undefined : slots[at];
-      if (previous) release(previous);
-      if (at < 0) slots.push(slot);
-      else slots[at] = slot;
+    /** Install `slot` and hand it every claim its manifest names, taking the selected
+     *  predecessor's place in the list when there is one. Nothing comes back: the only slot
+     *  a commit can displace is the one the caller itself selected, so the caller already
+     *  holds what it has to tear down. */
+    commit(slot: AppSlot, replacement?: AppSlot): void {
+      if (replacement) {
+        release(replacement);
+        slots[slots.indexOf(replacement)] = slot;
+      }
+      else slots.push(slot);
       for (const [book, names] of booksOf(slot.verifiedBundle.manifest)) {
         for (const claim of names) book.set(claim, slot);
       }
-      return previous;
     },
     /** Drop the slot with this key and release its claims. */
     remove(appKey: string): AppSlot | undefined {

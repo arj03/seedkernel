@@ -127,8 +127,8 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const a = await standUp({ dir: __dir, policyJson: __policy, identity: idA, transport: { %s } });
 		  const b = await standUp({ dir: __dir, policyJson: __policy, identity: idB, transport: {} });
 		  await a.transport.start();
-		  await a.shell.loadBundleBlob(__probe);
-		  const bApp = await b.shell.loadBundleBlob(__probe);
+		  await a.shell.install(__probe);
+		  const bApp = await b.shell.install(__probe);
 		  teachAddr(b.shell, aId, "%s://127.0.0.1:" + a.transport.%s);
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][to blob][proto blob][payload blob]. The op NAME that

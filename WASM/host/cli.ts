@@ -274,7 +274,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     try {
       // The file named by --local-config belongs only to this explicit load. It never
       // reaches the transport bundle stood above or another app loaded into this shell.
-      loaded = await shell.loadBundleBlob(
+      loaded = await shell.install(
         mustRead(host, bundlePath, "--bundle"),
         localConfig === undefined ? undefined : { localConfig },
       );

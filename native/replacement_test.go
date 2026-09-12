@@ -37,13 +37,13 @@ func TestExplicitReplacementAcrossAuthors(t *testing.T) {
 			    if (links) {
 			      const key = n.shell.resolve("service");
 			      let refused = false;
-			      try { await n.shell.loadBundleBlob(second); } catch { refused = true; }
+			      try { await n.shell.install(second); } catch { refused = true; }
 			      if (!refused) throw new Error("ordinary load acquired link");
 			      old = { key };
 			    } else {
-			      old = await n.shell.loadBundleBlob(first);
+			      old = await n.shell.install(first);
 			    }
-			    const next = await n.shell.replaceBundle(old.key, second);
+			    const next = await n.shell.install(second, { replaces: old.key });
 			    if (next.key === old.key || n.shell.resolve("service") !== next.key)
 			      throw new Error("replacement did not transfer the claim");
 			    if (n.shell.uninstall(old.key)) throw new Error("old identity survived");

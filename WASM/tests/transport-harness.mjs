@@ -292,7 +292,7 @@ export async function makeTransportHost(opts = {}) {
   const peerId = Buffer.from(identity.publicKey).toString("hex");
   const node = { shell, driver, identity, appAuthor, peerId };
   if (opts.app === false) return node;
-  const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
+  const app = await shell.install(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
 
   const enc = new TextEncoder();
   const call = (to, proto, payload, deadlineMs, noReply) => {

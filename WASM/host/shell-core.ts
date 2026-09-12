@@ -24,12 +24,19 @@ export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
  *  build satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
 
-/** Configuration supplied by this installation for one particular bundle load. Kept
+/** Configuration supplied by this installation for one particular install. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
  *  shell, which may host unrelated apps at once. The guest receives it as `LOCAL` and owns
  *  any validation or precedence between the two values. The realm bounds ride here for the
  *  same reason, one level down: the operator's numbers ABOUT ONE APP. */
-export interface LoadBundleOptions {
+export interface InstallOptions {
+  /** The slot this install RETIRES, by its audit identity (`AppHandle.key`) — the whole
+     *  difference between the two shapes an install has. Absent, the candidate must land on
+     *  a FREE identity and an occupied one is refused. Present, it must name a live slot,
+     *  which the candidate takes over atomically — across authors and app names, and it is
+     *  the only way to take `link`. Named, never inferred from the candidate's own
+     *  identity, so nothing is displaced that the caller did not choose. */
+  replaces?: string;
   localConfig?: JsonObject;
   /** QuickJS heap limit for THIS load's realm, in bytes. Omitted ⇒ the shell's
      *  `realmMemoryBytes`, and failing that `DEFAULT_REALM_MEMORY_BYTES`. What a target
@@ -74,18 +81,17 @@ export interface Shell {
      *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
   fs?: Fs;
   sodium: ShellSodium;
-  /** Load a signed bundle blob: verify the manifest, run the admission predicate,
-     *  integrity-check + install the modules, stand the guest. This method refuses link
-     *  bundles and cannot implicitly replace the transport. A load either leaves a running
-     *  app behind or leaves nothing: the realm is built here, so a guest that cannot
-     *  compile fails the load rather than the first frame, and the freshness mark is
-     *  advanced last, once it has. */
-  loadBundleBlob(blob: Uint8Array, opts?: LoadBundleOptions): Promise<AppHandle>;
-  /** Atomically replace the selected slot, even across authors or app names. App
-     *  candidates still require admission. A link candidate is authorized only when
-     *  replacing the current link owner. A changed target or failed candidate leaves
-     *  the current installation untouched; identity scopes and history never transfer. */
-  replaceBundle(oldAppKey: string, blob: Uint8Array, opts?: LoadBundleOptions): Promise<AppHandle>;
+  /** Install a signed bundle blob: verify the manifest, run the admission predicate,
+     *  integrity-check + install the modules, stand the guest, commit the slot. THE one way
+     *  a bundle enters this node, and `opts.replaces` is the only thing that varies — a
+     *  free identity when absent, the named slot retired atomically when present. App
+     *  candidates require admission either way; a candidate reaching `link` is authorized
+     *  only by replacing the current link owner. An install either leaves a running app
+     *  behind or leaves nothing: the realm is built here, so a guest that cannot compile
+     *  fails the install rather than the first frame, the freshness mark is advanced last,
+     *  and a failed candidate leaves the slot it named exactly as it was. Identity scopes
+     *  and history never transfer across a replacement. */
+  install(blob: Uint8Array, opts?: InstallOptions): Promise<AppHandle>;
   /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
      *  realm, private modules, timers and scopes as one unit. */
   uninstall(appKey: string): boolean;
@@ -127,7 +133,7 @@ export { scopedFs } from "./fs-view.js";
 /** This node's network, whole (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
   /** The signed transport to install at boot. Selecting these bytes authorizes link.
-     *  Defaults to the artifact-shipped bundle. Live changes use replaceBundle. */
+     *  Defaults to the artifact-shipped bundle. Live changes install over it by name. */
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
@@ -179,7 +185,7 @@ export interface BootShellOptions {
   /** This node's DEFAULT QuickJS heap limit for a guest realm, in bytes. Omitted ⇒
      *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI `--guest-memory`);
      *  a single load raises or lowers it for its own realm with
-     *  `LoadBundleOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
+     *  `InstallOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
   realmMemoryBytes?: number;
   /** This node's network (§12.6): the sockets and the signed transport that drives them.
      *  Omitted or `false` is a node with no network. The options object is retained to
@@ -232,13 +238,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   /** This load's per-invocation ceiling: this load's number, else the node's, else the
      *  shared one (§12.3). One place, because two owners are measured against it — the realm
      *  `standRealm` stands, and the clock its timer table banks one invocation of. */
-  const deadlineFor = (load: LoadBundleOptions): number =>
+  const deadlineFor = (load: InstallOptions): number =>
     load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
     /** An empty slot for `loaded`, with its timer table already pointed at the realm the
      *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
      *  which is the correct reading anyway: the realm a deadline re-enters is the one
      *  standing when it fires (a transport handover replaces it while the slot stays). */
-  const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: LoadBundleOptions): AppSlot => {
+  const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions): AppSlot => {
     let slot: AppSlot;
     const timers = createRealmTimers((body, causalClock) =>
     // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
@@ -285,7 +291,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  and the freshness write both succeed. Both bounds resolve per load: this load's
      *  number, else the node's default, else the shared one — never the author's, since a
      *  bundle cannot ask for more of the host than the operator gave it. */
-  const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: LoadBundleOptions): Promise<void> => {
+  const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: InstallOptions): Promise<void> => {
     const b = slot.verifiedBundle;
     // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
     // already refused any non-object).
@@ -437,12 +443,20 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // Inbound requests use current peer claims (§12.10).
   netHost?.routeInbound(deliverInbound);
 
-  // One transaction for app loads, explicit replacements, and the selected boot transport.
-  const installBundle = async (blob: Uint8Array, loadOpts: LoadBundleOptions = {},
-    replacement?: AppSlot, bootTransport = false): Promise<AppHandle> => {
-    const localConfig = loadOpts.localConfig ?? {};
+  // One transaction for every install: a free identity, a named replacement, and the
+  // selected boot transport are the same sequence with a different target.
+  const installBundle = async (blob: Uint8Array, opts: InstallOptions = {},
+    bootTransport = false): Promise<AppHandle> => {
+    const localConfig = opts.localConfig ?? {};
     if (!isJsonObject(localConfig))
       throw new Error("shell: localConfig must be a JSON object");
+    // The slot being retired, resolved to the exact live slot HERE, before any of the
+    // candidate's code runs — the table then checks that same slot is still the one
+    // installed when the commit lands, so a target that changed underneath fails rather
+    // than silently retiring whatever took its place.
+    const replacement = opts.replaces === undefined ? undefined : table.get(opts.replaces);
+    if (opts.replaces !== undefined && replacement === undefined)
+      throw new Error(`shell: '${opts.replaces}' is not installed, so there is nothing for this bundle to replace`);
     const v = verifyBundle(sodium, blob);
     checkHostGates(v, freshnessStore);
     // A candidate reaching `link` is not an app: whether it may take the binding is the
@@ -466,13 +480,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // free claim while this candidate is built.
     checkInstallation();
     const pureModules = await loadBundleModules(moduleLoader, v);
-    const slot = newSlot(loaded, pureModules, loadOpts);
+    const slot = newSlot(loaded, pureModules, opts);
     // Stand the guest, before anything already standing is replaced. Every app is a
     // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
     // discovering that at the first frame would leave the mark advanced for a
     // bundle that never ran a line.
     try {
-      await standRealm(slot, localConfig, loadOpts);
+      await standRealm(slot, localConfig, opts);
       // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
       // what makes the commit atomic: the gates below, the contest, the mark, and the
       // claim hand-over cannot be interleaved with another load or an uninstall.
@@ -491,8 +505,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       disposeSlot(slot);
       throw err;
     }
-    const previous = table.commit(slot, key, replacement);
-    const replacingLinkOwner = previous !== undefined && table.hasLink(previous);
+    table.commit(slot, replacement);
     // The outgoing guest's link state went with its realm (§4.3), so the sockets it
     // held are torn down here rather than left as channels nobody can speak for. So
     // did its address book, which is why the incoming guest redials from the peers
@@ -504,13 +517,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // dropping a claim releases the claim.
     if (table.hasLink(slot)) {
       netHost?.activate((payload) => hostCallSlot(slot, payload));
-    } else if (replacingLinkOwner) {
+    } else if (replacement && table.hasLink(replacement)) {
       netHost?.release();
     }
     // The mark and every claim/link binding have landed, so this slot's writes and
     // cross-realm calls are now its own (`seamFor`).
     slot.active = true;
-    disposeSlot(previous);
+    disposeSlot(replacement);
     // The handle: the verified facts plus the bound slot — the key, the scoped fs
     // view and the loopback invoke. One object, so a caller cannot derive half of
     // it from the manifest and half from the shell and have the two disagree.
@@ -538,12 +551,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     },
     fs,
     sodium,
-    loadBundleBlob: (blob, loadOpts) => installBundle(blob, loadOpts),
-    async replaceBundle(oldAppKey, blob, loadOpts) {
-      const previous = table.get(oldAppKey);
-      if (!previous) throw new Error(`shell: replacement target '${oldAppKey}' is not installed`);
-      return installBundle(blob, loadOpts, previous);
-    },
+    install: (blob, opts) => installBundle(blob, opts),
     uninstall: doUninstall,
     revoke(authorHex) {
       const hex = authorHex.toLowerCase();
@@ -575,7 +583,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   try {
     if (netHost && transportBlob) {
       await installBundle(transportBlob,
-        net!.config === undefined ? undefined : { localConfig: net!.config }, undefined, true);
+        net!.config === undefined ? undefined : { localConfig: net!.config }, true);
       await netHost.start();
     }
     return { shell, transport: netHost };

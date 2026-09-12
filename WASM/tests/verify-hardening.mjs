@@ -837,9 +837,13 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     guestDeadlineMs: 1234,
     realmMemoryBytes: 7 * 1024 * 1024,
   });
-  const probe = await shell.loadBundleBlob(blob, {
+  const probe = await shell.install(blob, {
     localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
   });
+  // Every load after this one is an upgrade of this same slot — a load only ever takes a
+  // FREE identity — and a replacement carries per-load config and bounds exactly as a
+  // first install does, which is the whole subject below.
+  const reload = (loadOpts) => shell.install(blob, { ...loadOpts, replaces: probe.key });
   await probe.invoke(new Uint8Array());
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
@@ -859,7 +863,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     "JSON config preserves an own __proto__ key as data");
 
   // A second load receives no residue from the first load's LOCAL value.
-  await shell.loadBundleBlob(blob);
+  await reload();
   const [appAgain, localAgain] = valuesFrom(seen[1].source);
   ok(appAgain.mode === "signed" && Object.keys(localAgain).length === 0,
     "local config is scoped to one load, not retained by the shell for another app or reload");
@@ -869,17 +873,17 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // …and a load that names them OVERRIDES the shell's, which is the point of their being
   // per load: one shell hosts unrelated apps, and the heap a storage guest needs is not the
   // heap the transport bundle beside it should be handed.
-  await shell.loadBundleBlob(blob, { realmMemoryBytes: 9 * 1024 * 1024, guestDeadlineMs: 77 });
+  await reload({ realmMemoryBytes: 9 * 1024 * 1024, guestDeadlineMs: 77 });
   ok(seen.at(-1)?.memoryLimitBytes === 9 * 1024 * 1024, "a load's own realmMemoryBytes overrides the shell's");
   ok(seen.at(-1)?.deadlineMs === 77, "a load's own guestDeadlineMs overrides the shell's");
   const cyclic = {}; cyclic.self = cyclic;
-  await rejects(shell.loadBundleBlob(blob, { localConfig: cyclic }),
+  await rejects(reload({ localConfig: cyclic }),
     "a non-JSON local value is refused instead of being silently changed during injection");
   // Both channels are OBJECTS. A guest reads config by name, so a scalar or array would
   // make every `LOCAL.x` read `undefined` at run time rather than fail at the load.
-  await rejects(shell.loadBundleBlob(blob, { localConfig: [1, 2] }),
+  await rejects(reload({ localConfig: [1, 2] }),
     "a JSON array is refused as local config — a guest reads config by name");
-  await rejects(shell.loadBundleBlob(blob, { localConfig: 7 }),
+  await rejects(reload({ localConfig: 7 }),
     "a JSON scalar is refused as local config");
   // The same rule on the signed side, enforced by the manifest's structural check: an
   // author who signs a scalar `config` gets a refused bundle, not a guest reading undefined.
@@ -892,7 +896,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
       [MANIFEST_FILE]: signManifest(sodium, kp, scalarManifest),
       [GUEST_FILE]: guestBytes,
     });
-    await rejects(shell.loadBundleBlob(scalarBlob),
+    await rejects(shell.install(scalarBlob),
       "a signed guest.config that is not a JSON object is a refused manifest");
   }
 
@@ -917,7 +921,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     },
     admit: admitAll,
   });
-  const bareProbe = await bare.loadBundleBlob(blob);
+  const bareProbe = await bare.install(blob);
   await bareProbe.invoke(new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
@@ -1178,7 +1182,7 @@ ${guestOpFraming()}
   })).shell;
 
   const shell = await newShell();
-  const ticker = await shell.loadBundleBlob(mkBlob(["timer"]));
+  const ticker = await shell.install(mkBlob(["timer"]));
   // The op frame is this app's own format (its `handle` reads it); the invoke below
   // passes bytes the shell never interprets. Same `writeOp` the guest's inlined block
   // reads back, from the one definition of it.
@@ -1202,7 +1206,7 @@ ${guestOpFraming()}
   // The gate is still the manifest: a bundle that did not declare `timer` is refused by
   // NAME at the seam, not handed a table because the shell has one to give.
   const ungated = await newShell();
-  const ungatedApp = await ungated.loadBundleBlob(mkBlob([]));
+  const ungatedApp = await ungated.install(mkBlob([]));
   let refused = false;
   try { await ungatedApp.invoke(opInput("arm", new Uint8Array([1, 1]))); } catch { refused = true; }
   ok(refused, "an undeclared timer service is refused at the seam, wired backend or not");
@@ -1232,7 +1236,7 @@ ${guestOpFraming()}
     },
     admit: admitAll,
   });
-  const stubApp = await stub.loadBundleBlob(mkBlob(["timer"]));
+  const stubApp = await stub.install(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   const pending = new Uint8Array(8 + opInput("timer", new Uint8Array([0, 0, 0, 1])).length);

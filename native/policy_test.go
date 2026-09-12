@@ -33,7 +33,7 @@ func TestAppPolicyCannotInstallTransport(t *testing.T) {
 	author := testAuthor(t)
 	startShell(t, authorsPolicy(author.id()), nil)
 	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link"})
-	if status := loadBundle(linkBundle); !strings.Contains(status, "explicit replacement") {
+	if status := loadBundle(linkBundle); !strings.Contains(status, "an install replacing") {
 		t.Fatalf("app policy must not appoint a transport: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)

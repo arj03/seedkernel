@@ -65,9 +65,12 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 		t.Fatalf("v2 after reboot: expected a downgrade refusal, got: %s (mark did not survive the reboot)", status)
 	}
 	// An equal-version reload (v3) and a newer version (v4) both pass; v4 advances the mark.
+	// Each gets its own boot: a load only ever takes a FREE slot, and this is the reboot
+	// path — an in-place upgrade is the explicit replacement of the slot standing.
 	if status := load(3); !strings.HasPrefix(status, "testapp v3") {
 		t.Fatalf("v3 after reboot: %s", status)
 	}
+	reboot()
 	if status := load(4); !strings.HasPrefix(status, "testapp v4") {
 		t.Fatalf("v4 after reboot: %s", status)
 	}

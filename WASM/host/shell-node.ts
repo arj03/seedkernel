@@ -13,19 +13,20 @@ import { policyFromJson } from "./policy.js";
 import { FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
 import { NodeFs, writeFileAtomic } from "./fs-node.js";
-import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
+import { bootShell, type AppHandle, type InstallOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
 import { type Fs } from "../core/fs.js";
 import { errMessage } from "../core/util.js";
 import type { NodeRuntime as CliNodeRuntime, NodeSetup } from "./cli.js";
 
 /** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
- *  `loadBundle` and a guaranteed `fs` (Node always has a filesystem). */
+ *  `installFile` and a guaranteed `fs` (Node always has a filesystem). */
 export interface NodeShell extends CoreShell {
   fs: Fs;
-  /** Load a signed bundle *file*: read it from disk then delegate to
-     *  loadBundleBlob (§12.4). This is the Node convenience wrapper;
-     *  cross-platform callers use loadBundleBlob directly. */
-  loadBundle(file: string, opts?: LoadBundleOptions): Promise<AppHandle>;
+  /** Install a signed bundle *file*: read it from disk then delegate to `install`
+     *  (§12.4), `opts.replaces` included — a file on disk is as ordinary a source for a
+     *  replacement as for a first install. This is the Node convenience wrapper;
+     *  cross-platform callers hold the bytes and use `install` directly. */
+  installFile(file: string, opts?: InstallOptions): Promise<AppHandle>;
 }
 
 /** The CLI's runtime pair, narrowed to this platform's shell — one declaration of the
@@ -59,7 +60,7 @@ export function fileFreshnessStore(path: string): FreshnessMarks {
 // realm), and a second copy of it would be the drift the assembly exists to remove.
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
  *  `bootShell` — which installs the selected transport bundle, the signed program that is
- *  the node's network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
+ *  the node's network (§12.6) — then wrap the core shell with the file-backed `installFile`. */
 export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> {
   const sodium = await loadCrypto();
   // ── Node platform seam ─────────────────────────────────────────────────────
@@ -80,14 +81,14 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
     guestDeadlineMs: opts.guestDeadlineMs,
     realmMemoryBytes: opts.realmMemoryBytes,
   });
-    // ── Node wrapper: add file-backed loadBundle ────────────────────────────────
+    // ── Node wrapper: add file-backed installFile ───────────────────────────────
   const shell: NodeShell = {
     ...core,
     // This platform always supplies an fs (Node always has a filesystem), so the
     // optional seam member is non-null here.
     fs: core.fs!,
-    async loadBundle(file, loadOpts) {
-      return core.loadBundleBlob(new Uint8Array(readFileSync(file)), loadOpts);
+    async installFile(file, opts) {
+      return core.install(new Uint8Array(readFileSync(file)), opts);
     },
   };
   return { shell, transport };

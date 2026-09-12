@@ -94,7 +94,7 @@ async function main() {
 // The artifact-shipped transport bundle (§12.6), signed by the seed transport author
 //   ${toHex(author)}
 // under the hybrid suite 0x02 (Ed25519 + ML-DSA-65, §14.1). Boot explicitly
-// selects this transport; live changes use replaceBundle on its current slot.
+// selects this transport; live changes install over it by naming its current slot.
 // A rebuild with a different key selects a new author. The ML-DSA half derives
 // from the same seed, so one key file holds the whole identity.
 import { fromBase64 } from "../core/util.js";

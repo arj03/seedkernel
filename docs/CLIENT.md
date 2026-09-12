@@ -86,7 +86,7 @@ const { shell } = await bootShell({
   admit: authorAllowlist([Buffer.from(author).toString("hex")]),
 });
 try {
-  const app = await shell.loadBundleBlob(blob);
+  const app = await shell.install(blob);
   for (let i = 0; i < 2; i++) {
     const answer = await app.invoke(new Uint8Array());
     console.log(new DataView(answer.buffer, answer.byteOffset, answer.byteLength).getUint32(0));
@@ -104,7 +104,7 @@ This counter wraps at 2³² and keeps its state only in the guest heap. Reloadin
 
 Keep a private 32-byte author seed across releases and pass it to `hybridAuthorKeysFromSeed`; it determines the author id consumers pin. Increase `version` for each release of the same `(author, app)`. Run `authorBundle` in your offline build and save its `blob` as a `.skb` file, for example `await writeFile("example.skb", blob)` using `node:fs/promises`. The deployed host needs the bundle and the approved author id; it does not need the author seed. Keep a stable node identity and persistent freshness storage when running a lasting node (see §2).
 
-`authorBundle` hashes the guest and modules, validates the manifest, signs, and packs the result. `shell.loadBundleBlob` verifies the bytes, applies admission policy, and builds the running slot. Signing does not prove that your guest compiles or that its WASM meets the runtime ABI: exercise a load and invocation before publishing. Use `verifyBundle` when inspecting a blob outside a running shell.
+`authorBundle` hashes the guest and modules, validates the manifest, signs, and packs the result. `shell.install` verifies the bytes, applies admission policy, and builds the running slot. Signing does not prove that your guest compiles or that its WASM meets the runtime ABI: exercise an install and invocation before publishing. Use `verifyBundle` when inspecting a blob outside a running shell.
 
 ### Add only the interfaces your app needs
 
@@ -164,7 +164,7 @@ const runtime = await bootNodeShell({
 });
 
 try {
-  const app = await runtime.shell.loadBundleBlob(appBlob);
+  const app = await runtime.shell.install(appBlob);
   const answer = await app.invoke(new Uint8Array());
   console.log(answer);
 } finally {
@@ -212,7 +212,7 @@ const { shell } = await bootShell({
 // Add `transport` options to enable networking; see the transport modes below.
 const response = await fetch("./example.skb");
 const fetchedBundleBytes = new Uint8Array(await response.arrayBuffer());
-const app = await shell.loadBundleBlob(fetchedBundleBytes);
+const app = await shell.install(fetchedBundleBytes);
 const answer = await app.invoke(new Uint8Array());
 window.addEventListener("pagehide", () => shell.close(), { once: true });
 ```
@@ -230,21 +230,32 @@ Transport startup has two modes:
 
 The transport options carry the socket adapter, listeners, selected `bundle`, and initial `config`. The default blob is `transportBundleBytes()`. The options object is retained, so live accessors stay live. A selected transport must declare `link`; verification, revocation, freshness, and installation failures fail boot.
 
-Live changes use the same explicit owner replacement as ordinary apps:
+Live changes are the same `install`, naming the slot they retire — ordinary apps and the transport alike:
 
 ```js
 // oldChat.key is the handle returned when the chat app was installed.
-const chat = await shell.replaceBundle(oldChat.key, newChatBlob, { localConfig: chatConfig });
+const chat = await shell.install(newChatBlob, { replaces: oldChat.key, localConfig: chatConfig });
 
 // Use the current transport's declared service id to find its owner.
 const oldTransportKey = shell.resolve(TRANSPORT_SERVICE);
 if (oldTransportKey === null) throw new Error("No transport is installed");
-const transportApp = await shell.replaceBundle(oldTransportKey, newTransportBlob, {
+const transportApp = await shell.install(newTransportBlob, {
+  replaces: oldTransportKey,
   localConfig: transportConfig,
 });
 ```
 
-The incoming author and app name may differ. App candidates still pass `admit`. Only replacement of the current link owner authorizes a candidate requiring `link`; ordinary `loadBundleBlob` refuses link bundles, including same-author transport updates.
+An installer that may be seeing either — a first install or an upgrade — decides with one field, since the app key is a fact of the signed manifest and so is known before the install:
+
+```js
+import { appKeyFor, verifyBundle } from "seedkernel-wasm/bundle";
+
+const v = verifyBundle(sodium, blob);
+const key = appKeyFor(v.author, v.manifest.app);   // the key the shell will install under
+await shell.install(blob, { replaces: installedKeys.has(key) ? key : undefined });
+```
+
+The incoming author and app name may differ from the slot being retired. App candidates still pass `admit`. Naming a slot is the only way to displace one: an install without `replaces` refuses an identity already installed, so an app's own next version names its slot too. Only replacing the current link owner authorizes a candidate requiring `link`.
 
 Replacement builds first, then commits the new claims and releases the predecessor. The exact selected slot must still be current at commit; concurrent replacement or uninstall causes failure. Unrelated claims and already-installed candidate identities remain protected. A failed candidate leaves the current owner running. A successful replacement invalidates its predecessor's invocation handles.
 
@@ -292,9 +303,9 @@ Keep the claim pins in operator-controlled configuration and name the approved b
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
-`loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None becomes signed bundle content. For every app, including the transport, `localConfig` becomes `LOCAL` unchanged. The transport's `networkKey` is ordinary `LOCAL` config: 64 lowercase hex characters when supplied, with absence selecting the public network's zero key. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network. The transport reads identity through `node/identity`. Its contact secret is ordinary `LOCAL` config: `contactSecret` is 64 lowercase hex, absence means open, and the `contact` op rotates it at runtime.
+`install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None becomes signed bundle content. For every app, including the transport, `localConfig` becomes `LOCAL` unchanged. The transport's `networkKey` is ordinary `LOCAL` config: 64 lowercase hex characters when supplied, with absence selecting the public network's zero key. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network. The transport reads identity through `node/identity`. Its contact secret is ordinary `LOCAL` config: `contactSecret` is 64 lowercase hex, absence means open, and the `contact` op rotates it at runtime.
 
-The handle's `invoke` is bound to the slot this load stood. On an upgrade, a replacement load stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the load they intend to drive.
+The handle's `invoke` is bound to the slot this install stood. On an upgrade, the replacing install stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the install they intend to drive.
 
 ## Reaching a claim from the host
 

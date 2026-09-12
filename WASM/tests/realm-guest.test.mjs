@@ -239,7 +239,8 @@ async function testSigningScopeFollowsSlot() {
   try {
     // The link slot's one scope is the LINK scope: the channel AUTH is a fact of the
     // slot, not a second name.
-    await shell.replaceBundle(shell.resolve("_fixture-transport"), blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
+    await shell.install(blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
+      replaces: shell.resolve("_fixture-transport"),
       localConfig: { networkKey: "7a".repeat(32) },
     });
     const v1 = await seam("node/sign", msg);
@@ -251,7 +252,8 @@ async function testSigningScopeFollowsSlot() {
       "node/verify on the link slot checks under the same link scope");
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
-    await shell.replaceBundle(appKey(linkAuthor.id, "linkprobe"), blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
+    await shell.install(blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
+      replaces: appKey(linkAuthor.id, "linkprobe"),
       localConfig: { networkKey: "7b".repeat(32) },
     });
     const v2 = await seam("node/sign", msg);
@@ -262,7 +264,7 @@ async function testSigningScopeFollowsSlot() {
     // And the other arm, on a shell that already has a link occupant: an ordinary app
     // signs under its own scope, and there is only one pair of sign names — nothing under
     // a second name to reach.
-    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node"]));
+    await shell.install(blob(appAuthor, "plainapp", 1, ["node"]));
     const app = await seam("node/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
       "an ordinary app's node/sign signs under DOMAIN_guest ‖ author ‖ app");

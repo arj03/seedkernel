@@ -55,7 +55,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
-  const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
+  const app = await shell.install(harnessAppBlob(appAuthor));
   // The node's own channel key, hex. Read off the identity this factory minted rather than
   // asked of the driver: it is the same `toHex(identity.publicKey)` every caller already
   // holds, and the driver has nothing to say about peers any more (core/socket-seam.ts).

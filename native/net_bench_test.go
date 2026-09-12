@@ -101,8 +101,8 @@ const netBenchHarness = `
 	  globalThis.netB = b.transport;
 	  // A claims the protocol so inbound frames route to its guest; B holds the same app
 	  // because the request goes out THROUGH it.
-	  await a.shell.loadBundleBlob(__appBlob);
-	  const bApp = await b.shell.loadBundleBlob(__appBlob);
+	  await a.shell.install(__appBlob);
+	  const bApp = await b.shell.install(__appBlob);
 
 	  // The transport's 'send' op argument order (transport/src/core.js):
 	  // [noReply u8][to blob][proto blob][payload blob].

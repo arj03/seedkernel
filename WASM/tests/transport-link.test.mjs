@@ -736,8 +736,8 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   keep(async () => { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } });
   // A spy for "the bundle was never re-loaded": the rotation below must not reach it.
   let loads = 0;
-  const origLoad = B.shell.loadBundleBlob;
-  B.shell.loadBundleBlob = async (blob, opts) => { loads++; return origLoad(blob, opts); };
+  const origLoad = B.shell.install;
+  B.shell.install = async (blob, opts) => { loads++; return origLoad(blob, opts); };
 
   // The boot-time secret opens the door on both sides.
   const c1 = wirePair();
@@ -1088,7 +1088,7 @@ await test("a decrypt failure does not advance the receive counter", async (keep
 // Dispatch is one claim → slot map, with no second table an embedder's own name could
 // occupy — but the one thing a table never gave an embedder is a view of what its own app
 // just answered: a peer-inbound frame's reply is consumed by the wire on the way back out.
-// `LoadBundleOptions.onInbound` is that one seam — scoped to the load that named it, not
+// `InstallOptions.onInbound` is that one seam — scoped to the load that named it, not
 // the shell, so there is no table, no owner and no name to contest.
 await test("a peer-inbound answer reaches the loader through onInbound", async (keep) => {
   const st = keep(await upPair());
@@ -1107,7 +1107,7 @@ await test("a peer-inbound answer reaches the loader through onInbound", async (
     modules: [], guestSource, guestRequires: [],
   });
   const seen = [];
-  const watcher = await st.B.shell.loadBundleBlob(blob, {
+  const watcher = await st.B.shell.install(blob, {
     onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
   });
 
