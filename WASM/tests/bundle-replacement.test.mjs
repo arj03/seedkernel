@@ -95,18 +95,19 @@ await test("a replacement cannot take unrelated claims or merge two installed id
 });
 
 await test("construction and persist failures retain the previous owner and candidate history", async () => {
-  class Store extends FreshnessMarks { fail = false; persist() { if (this.fail) throw new Error("disk full"); } }
-  const store = new Store(), n = await node({ store });
+  const flaky = { fail: false };
+  const store = new FreshnessMarks(null, () => { if (flaky.fail) throw new Error("disk full"); });
+  const n = await node({ store });
   try {
     const old = await n.shell.loadBundleBlob(bundle(alice, "chat", 1, { services: ["chat"] }));
     await assert.rejects(n.shell.replaceBundle(old.key, bundle(bob, "chat", 1, { guestSource: "function {" })));
-    store.fail = true;
+    flaky.fail = true;
     await assert.rejects(n.shell.replaceBundle(old.key, bundle(bob, "chat", 1, { services: ["chat"] })), /disk full/);
     assert.equal(store.get(bob.id, "chat"), -Infinity);
     assert.equal(n.shell.resolve("chat"), old.key);
     assert.equal(n.records[0].disposed, false);
     assert.equal(n.records[1].disposed, true);
-    store.fail = false;
+    flaky.fail = false;
     await n.shell.replaceBundle(old.key, bundle(bob, "chat", 1, { services: ["chat"] }));
   } finally { n.shell.close(); }
 });

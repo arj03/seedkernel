@@ -19,7 +19,7 @@ import (
 // dial/accept/promote/deliver path and the correlation/timeout layer, none of it Go logic.
 //
 // Only the WebSocket transport is exercised here, which drives the full WS path: the raw
-// Go byte stream (sock.go), the shared net-frame WsChannel and the RFC 6455 codec. The TCP
+// Go byte stream (sock.go), the shared net-frame MessageChannel and the RFC 6455 codec. The TCP
 // twin is asyncnet_test, and scripts/loader-interop.sh covers both against real node/bun
 // nodes.
 //

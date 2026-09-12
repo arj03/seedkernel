@@ -1088,7 +1088,8 @@ async function testPreRevocationStoreIsRefused() {
 
   let msg = "";
   try { new FreshnessMarks(JSON.stringify({ [key]: 7 })); } catch (e) { msg = e.message; }
-  assert(msg.includes("predates author revocation"), "the old bare-map format throws with a migration message");
+  assert(msg.includes('expected both "marks" and "revoked" fields'),
+    `the old bare-map format is refused for the fields it lacks (got: ${msg})`);
 
   // The current format round-trips, marks and revocations both.
   const cur = new FreshnessMarks(JSON.stringify({ marks: { [key]: 7 }, revoked: ["bb".repeat(32)] }));
@@ -1162,22 +1163,22 @@ async function testWrongTypedStoreIsRefused() {
   // The Node adapter distinguishes a missing first-boot file from malformed or unreadable
   // state. A directory at the file path is a portable read failure that cannot be mistaken
   // for ENOENT.
-  const { FileFreshnessStore } = await imp("build/host/shell-node.js");
+  const { fileFreshnessStore } = await imp("build/host/shell-node.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-freshness-read-"));
   const path = pjoin(dir, "marks.json");
   try {
-    new FileFreshnessStore(path); // genuine absence
+    fileFreshnessStore(path); // genuine absence
     writeFileSync(path, "not json");
     let malformed = false;
-    try { new FileFreshnessStore(path); } catch { malformed = true; }
+    try { fileFreshnessStore(path); } catch { malformed = true; }
     assert(malformed, "Node refuses a malformed freshness file");
     rmSync(path);
     mkdirSync(path);
     let unreadable = false;
-    try { new FileFreshnessStore(path); } catch { unreadable = true; }
+    try { fileFreshnessStore(path); } catch { unreadable = true; }
     assert(unreadable, "Node refuses freshness read errors other than file-not-found");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1231,10 +1232,6 @@ async function testPersistFailureRollsBack() {
   });
   const key = appKey(author.id, "persist");
 
-  // A store whose durable write always fails, as a full disk would.
-  class BrokenStore extends FreshnessMarks {
-    persist() { throw new Error("disk full"); }
-  }
   // Driven through the shell, since the shell is what advances the mark — last, after the
   // guest stands, so the write it rolls back is one that was about to record a version
   // that really ran.
@@ -1245,7 +1242,8 @@ async function testPersistFailureRollsBack() {
     admit: admitAll,
   });
 
-  const broken = new BrokenStore();
+  // A store whose durable write always fails, as a full disk would.
+  const broken = new FreshnessMarks(null, () => { throw new Error("disk full"); });
   const brokenShell = await shellOver(broken);
   let msg = "";
   try { await brokenShell.loadBundleBlob(blob); } catch (e) { msg = e.message; }
@@ -1294,11 +1292,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
     app: "svc-neighbor", version: 1, services: ["_svc"],
     modules: [], guestSource: GUEST_TEXT, guestRequires: [],
   });
-  class FlakyStore extends FreshnessMarks {
-    fail = false;
-    persist() { if (this.fail) throw new Error("disk full"); }
-  }
-  const store = new FlakyStore();
+  const flaky = { fail: false };
+  const store = new FreshnessMarks(null, () => { if (flaky.fail) throw new Error("disk full"); });
   const candidates = [];
   // Set only while `neighborBlob` is the one loading, so the ONE factory both bundles
   // share can tell which realm it is being asked to stand: the neighbour gets a stub that
@@ -1346,7 +1341,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     loadingNeighbor = true;
     await shell.loadBundleBlob(neighborBlob);
     loadingNeighbor = false;
-    store.fail = true;
+    flaky.fail = true;
     assertEqual(shell.resolve("_svc"), appKey(author.id, "svc-neighbor"),
       "the neighbour holds the claim the candidate is about to reach for");
 
@@ -1371,7 +1366,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
-    store.fail = false;
+    flaky.fail = false;
     await shell.replaceBundle(shell.resolve("_fixture-transport"), blob, { localConfig });
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
     await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
@@ -1396,10 +1391,10 @@ async function testFailedRevokePersistRollsBack() {
 
   let broken = true;
   const written = [];
-  class FlakyStore extends FreshnessMarks {
-    persist(json) { if (broken) throw new Error("disk full"); written.push(json); }
-  }
-  const store = new FlakyStore();
+  const store = new FreshnessMarks(null, (json) => {
+    if (broken) throw new Error("disk full");
+    written.push(json);
+  });
   let msg = "";
   try { store.revoke(author); } catch (e) { msg = e.message; }
   assert(msg.includes("NOT revoked"), `a failed revoke says so plainly (got: ${msg})`);

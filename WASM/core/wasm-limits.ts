@@ -70,11 +70,9 @@ export const DEFAULT_MAX_APP_SLOTS = 8;
  *  host-created roots and is therefore not a node-wide CPU total. */
 export const SELF_INITIATED_CLOCK_DIVISOR = 2 * DEFAULT_MAX_APP_SLOTS;
 
-/** Default ceiling on a module's declared footprint — linear memory AND the tables it
- *  declares, which are host memory bought with a declaration just as pages are. Applied at
- *  the shared admission path (§3) against the tighter of this and the target loader's own
- *  ceiling (`PureModuleLoader.maxModuleMemoryBytes`), so a host may hold its isolates to
- *  less and none can be looser about what a bundle may land. */
+/** Ceiling on a module's declared footprint — linear memory AND the tables it declares,
+ *  which are host memory bought with a declaration just as pages are. Applied at the shared
+ *  admission path (§3), so every target holds its isolates to the same number. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 /** Metadata bound for one signed bundle. Aggregate module memory normally binds first, but

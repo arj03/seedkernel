@@ -37,14 +37,29 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 // the event already names the link). The ONE thing the host cannot work out for itself:
 // it sees a descriptor close, while farewell vs. defensive abort vs. cut stream is a fact
 // only the end holding the session keys ever had.
+//
+// It is a LOCAL fact and never goes on the wire, which is what lets the pre-auth cases be
+// told apart without weakening §12.6.2: what a refused peer observes is still silence
+// followed by a socket close, identical to every other refusal and to a port that is not
+// listening. The peer learns nothing; our own operator learns which of the two questions
+// they are looking at.
+//
+// WHERE THIS ENDS UP, so it does not read as a value nobody consumes: the driver prints
+// every non-routine one on stderr (`host/transport-host.ts` `logLinkDown`), which is the
+// only thing that tells an embedder wiring nothing at all — seedstore's p2p CLI boots
+// `bootShell` itself — that its links are failing and from which address. That file mirrors
+// these names in `REASON_NAMES` for the line; a code added here and not there prints as a
+// bare number. `tests/transport-link.test.mjs` pins each value by name.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
-  REASON_LOCAL = 4, REASON_TRUNCATED = 5;
+  REASON_LOCAL = 4, REASON_TRUNCATED = 5, REASON_REFUSED = 6, REASON_TIMEOUT = 7,
+  REASON_DROPPED = 8;
 
 function reasonCode(link) {
   const r = link.closeReason;
   return r === "handshake" ? REASON_HANDSHAKE : r === "clean" ? REASON_CLEAN
     : r === "aborted" ? REASON_ABORTED : r === "local" ? REASON_LOCAL
-    : r === "truncated" ? REASON_TRUNCATED : REASON_OPEN;
+    : r === "truncated" ? REASON_TRUNCATED : r === "refused" ? REASON_REFUSED
+    : r === "timeout" ? REASON_TIMEOUT : r === "dropped" ? REASON_DROPPED : REASON_OPEN;
 }
 
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
@@ -308,11 +323,15 @@ class Link {
     this.closed = false;
     this.stalled = false;
     this.notified = false;
-    // How this link ended, for `closeReason`: whether WE tore it down, and whether the
-    // teardown was defensive (a peer did something wrong) rather than merely our own
-    // decision. Both are set once, on the way down, and read once by `linkClosed`.
+    // How this link ended, for `closeReason`: whether WE tore it down, whether the teardown
+    // was defensive (a peer did something wrong) rather than merely our own decision, and
+    // whether a deadline is what retired it. Each is set once, on the way down, and read
+    // once by `closeReason` — one read is the whole point, not a sign of dead state: these
+    // three booleans ARE the diagnosis the driver prints, and dropping any of them collapses
+    // two different operator problems into one code (see REASON_* above).
     this.closedLocally = false;
     this.aborted = false;
+    this.timedOut = false;
     this.slot = null;
     this.deadline = null;
     this.idle = null;         // the post-auth idle clock (armIdle)
@@ -399,7 +418,14 @@ class Link {
   armDeadline(ms) {
     this.clearDeadline();
     if (ms > 0) {
-      this.deadline = armTimer(ms, () => { if (!this.authed) this.abort(); });
+      this.deadline = armTimer(ms, () => {
+        if (this.authed) return;
+        // Distinguishable from every other pre-auth teardown: "nobody finished the
+        // handshake in time" is an address, a firewall or a silent peer, while a defensive
+        // abort is a peer that answered with something wrong. Different things to go fix.
+        this.timedOut = true;
+        this.abort();
+      });
     }
   }
 
@@ -531,16 +557,41 @@ class Link {
     });
   }
 
-  /** Why this link ended, as the occupant alone can say it. `handshake` is a link that
-   *  never got there; `clean` is the peer's own end-of-stream record; `aborted` is a
-   *  teardown a peer PROVOKED (a forged record, a refused identity, an over-cap frame);
-   *  `local` is our own deliberate shutdown; `truncated` is a stream that just stopped.
-   *  The split matters: defining a truncation as `authed && !peerSaidGoodbye` would flag
-   *  every deliberate close we make, and an attacker who could induce a farewell could
-   *  make an arbitrary cut look like a clean shutdown to the far end. */
+  /** Why this link ended, as the occupant alone can say it. Read by `reasonCode`, returned
+   *  from `linkClosed`, printed by the driver — the node's one answer to "is it me, them, or
+   *  the network?" when the other end is another machine.
+   *
+   *  A link that never authenticated splits four ways, because "I cannot reach them", "they
+   *  answered with something wrong" and "they went quiet" are different problems with
+   *  different fixes: `dropped` is the socket going away under an unfinished handshake —
+   *  connection refused, host unreachable, or the far end hanging up, the ordinary shape of
+   *  "the other machine is not there" and the one an operator hits first; `refused` is a
+   *  teardown the peer PROVOKED (a bad contact-secret probe, a malformed or over-cap
+   *  handshake frame, a signature that did not verify, an identity the admit lint rejects);
+   *  `timeout` is our handshake deadline firing on a socket that stayed open and silent — a
+   *  firewall swallowing packets, or a peer that stalled mid-exchange; and `handshake` is
+   *  what is left, which is ours rather than theirs (a half-open budget evicting us, a local
+   *  crypto failure).
+   *
+   *  Past authentication: `clean` is the peer's own end-of-stream record; `aborted` is a
+   *  teardown a peer PROVOKED (a forged record, an over-cap frame); `local` is our own
+   *  deliberate shutdown (the idle clock, epoch exhaustion, our outbound queue); `truncated`
+   *  is a stream that just stopped. That split matters for a second reason: defining a
+   *  truncation as `authed && !peerSaidGoodbye` would flag every deliberate close we make,
+   *  and an attacker who could induce a farewell could make an arbitrary cut look like a
+   *  clean shutdown to the far end. */
   get closeReason() {
     if (!this.closed) return "open";
-    if (!this.authed) return "handshake";
+    if (!this.authed) {
+      if (this.aborted) return "refused";
+      if (this.timedOut) return "timeout";
+      // Nothing of ours closed it, so the socket died on its own: refused, unreachable, or
+      // hung up. Same test as `truncated` below, which is the post-auth form of it — and
+      // the commonest line an operator sees, verified against the real loader binary
+      // (`--peers <id>@127.0.0.1:9` prints `link 1 down: dropped`).
+      if (!this.closedLocally) return "dropped";
+      return "handshake";
+    }
     if (this.peerSaidGoodbye) return "clean";
     if (this.aborted) return "aborted";
     if (this.closedLocally) return "local";

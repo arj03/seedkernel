@@ -13,7 +13,7 @@ import type { ChannelFactory, ListenAddress, RawLink } from "../core/socket-seam
 import { MessageChannel } from "./net-channel.js";
 import { parseDest } from "./peer-addr.js";
 
-/** The minimal structural view of the platform WebSocket that WsChannel uses — so
+/** The minimal structural view of the platform WebSocket this factory dials — so
  *  this module type-checks without committing to a DOM lib and accepts any
  *  conforming implementation (the browser global, Bun's, or a test double). */
 export interface WsLike {
@@ -26,13 +26,6 @@ export interface WsLike {
   close(): void;
   addEventListener(type: "open" | "close" | "error", cb: () => void): void;
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
-}
-
-// A WebSocket delivers whole binary messages in order, so this is a thin adapter over
-// MessageChannel (net-channel.ts) — including its pre-open send buffer, which the transport
-// needs because it emits its HELLO the instant a link is constructed.
-export class WsChannel extends MessageChannel {
-  constructor(ws: WsLike) { super(ws); }
 }
 
 export interface WsNetworkOptions {
@@ -56,7 +49,10 @@ export class WsNetwork implements ChannelFactory {
   connect(dest: string): RawLink | null {
     const d = parseDest(dest);
     if (!d || d.scheme === "tcp") return null;
-    return new WsChannel(this.mkWs(`${d.scheme}://${d.host}:${d.port}${d.path ?? ""}`));
+    // A WebSocket delivers whole binary messages in order, so `MessageChannel`
+    // (net-channel.ts) is the adapter unchanged — including its pre-open send buffer, which
+    // the transport needs because it emits its HELLO the instant a link is constructed.
+    return new MessageChannel(this.mkWs(`${d.scheme}://${d.host}:${d.port}${d.path ?? ""}`));
   }
 
   /** A browser binds nothing: every inbound link here is dialed by the far end at us as

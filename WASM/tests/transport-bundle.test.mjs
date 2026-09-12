@@ -323,10 +323,7 @@ assert((await request(a.app, bId, new Uint8Array([3]))).length === 1,
 console.log("  an `_net` claimant whose mark cannot be persisted fails the load…");
 {
   let broken = false;
-  class FlakyStore extends FreshnessMarks {
-    persist(json) { if (broken) throw new Error("disk full"); super.persist(json); }
-  }
-  const store = new FlakyStore();
+  const store = new FreshnessMarks(null, () => { if (broken) throw new Error("disk full"); });
   const c = await makeNode(fabric.view(), undefined, store);
   assert(c.shell.resolve(TRANSPORT_SERVICE) !== null, "the node stands its transport claimant up normally");
 

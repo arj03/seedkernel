@@ -100,25 +100,21 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   throws(() => checkModuleLimits(importedTableModule(), 64 * 1024 * 1024),
     "an imported table is refused like an imported memory (§4.2)");
 
-  // The ceiling is applied ONCE, by the shared load path, against the tighter of the shared
-  // default and the ceiling the target's loader declares (bundle.ts `loadBundleModules`) —
-  // so a loader may hold itself to less than a bundle may land, and none can be looser.
-  // A stub loader is the whole fixture: under test is the composition, not an isolate.
-  const stub = (maxModuleMemoryBytes) => ({
-    maxModuleMemoryBytes,
+  // The ceiling is applied ONCE, by the shared load path (bundle.ts `loadBundleModules`),
+  // to every target alike. A stub loader is the whole fixture: under test is that path, not
+  // an isolate.
+  const stub = () => ({
     build: async () => ({ call: async () => ({ bytes: null, ms: 0 }), dispose() { } }),
   });
   const bundleOf = (wasm) => ({ modules: [{ mod: { name: "m" }, wasm }] });
-  ok(await loadBundleModules(stub(undefined), bundleOf(withMax)) !== null,
-    "a loader declaring no ceiling of its own gets the shared one");
-  await rejects(loadBundleModules(stub(undefined), bundleOf(noMax)),
+  ok(await loadBundleModules(stub(), bundleOf(withMax)) !== null,
+    "a module inside the shared ceiling loads");
+  await rejects(loadBundleModules(stub(), bundleOf(noMax)),
     "an unbounded module is refused on the load path, whatever a loader would have built");
-  await rejects(loadBundleModules(stub(1024 * 1024), bundleOf(withMax)),
-    "a loader's TIGHTER ceiling is the one the load path applies");
-  // 128 MiB declared against a loader that would allow 1 GiB: the shared ceiling still wins.
-  await rejects(loadBundleModules(stub(1 << 30), bundleOf(memModule(1, 2048))),
-    "a loader's LOOSER ceiling cannot raise what a bundle may land");
-  await rejects(loadBundleModules(stub(undefined), {
+  // 128 MiB declared against a 64 MiB ceiling.
+  await rejects(loadBundleModules(stub(), bundleOf(memModule(1, 2048))),
+    "a module above the shared ceiling is refused whatever the loader would have built");
+  await rejects(loadBundleModules(stub(), {
     modules: [
       { mod: { name: "a" }, wasm: memModule(1, 600) },
       { mod: { name: "b" }, wasm: memModule(1, 600) },
@@ -127,9 +123,9 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   // Table elements join that aggregate at their own charge: 1.5M elements is 48 MiB, so one
   // such module lands and two do not.
   const tabled = rawModule(memSection(1, 1), tableSection(1, 1_500_000));
-  ok(await loadBundleModules(stub(undefined), bundleOf(tabled)) !== null,
+  ok(await loadBundleModules(stub(), bundleOf(tabled)) !== null,
     "a module whose table fits the budget loads");
-  await rejects(loadBundleModules(stub(undefined), {
+  await rejects(loadBundleModules(stub(), {
     modules: [{ mod: { name: "a" }, wasm: tabled }, { mod: { name: "b" }, wasm: tabled }],
   }), "declared tables are bounded in aggregate across one bundle");
 
@@ -138,10 +134,6 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   const echoed = await loaded.call("ok", new Uint8Array());
   ok(echoed instanceof Object && echoed.bytes instanceof Uint8Array && typeof echoed.ms === "number",
     "ModuleTable builds a bounded module set (call resolves { bytes, ms })");
-  ok(host.maxModuleMemoryBytes === 64 * 1024 * 1024,
-    "a table declares the shared ceiling through the loader seam by default");
-  ok(new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 }).maxModuleMemoryBytes === 1024 * 1024,
-    "the budget is configurable per host, and declared rather than applied");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was. The host's guarantee, so a caller does nothing to earn it.

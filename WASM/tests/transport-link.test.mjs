@@ -13,6 +13,7 @@ import {
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/core/net-limits.js";
+import { REASON_NAMES } from "../build/host/transport-host.js";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
 // The RawLink shape (core/socket-seam.ts) plus the hooks these tests need: every byte
@@ -437,6 +438,11 @@ await test("FRAME CAP: an unauthenticated peer cannot declare a large frame", as
   await settle();
   assert(st.b.closed, "an over-cap pre-auth declaration must tear the link down");
   assert(!(await bUp(st)), "and it must never have authenticated");
+  // REFUSED, not the catch-all: the peer sent something wrong, which is a different thing
+  // to go fix than a handshake nobody answered. The distinction is LOCAL — what the caller
+  // observes is still silence and a closed socket, exactly like a wrong contact secret.
+  assert(st.b.reason === CLOSE_REASON.REFUSED,
+    `a peer-provoked pre-auth teardown should read REFUSED, got ${st.b.reason}`);
 });
 
 await test("FRAME CAP: authentication raises it, before anything can arrive under it", async (keep) => {
@@ -823,23 +829,90 @@ await test("LEAK FIX: a link that closes itself mid-handshake still reports down
     { identity: id, transportConfig: { handshakeTimeoutMs: 80 } },
     { identity: id, transportConfig: { handshakeTimeoutMs: 80 } }));
   await until(() => st.a.closed, 3000, "the self-close MUST reach onLinkClosed (this is the leak)");
-  assert(st.a.reason === CLOSE_REASON.HANDSHAKE, `a link that never authenticated should read HANDSHAKE, got ${st.a.reason}`);
+  // Nobody ever answered, so the deadline is what retired it: TIMEOUT, not a peer that sent
+  // something wrong. The two are the operator's actual fork in the road.
+  assert(st.a.reason === CLOSE_REASON.TIMEOUT, `a stalled handshake should read TIMEOUT, got ${st.a.reason}`);
   assert(!(await aUp(st)) && !(await bUp(st)), "a node must not link to itself");
 });
 
 await test("handshake deadline closes a link that never speaks", async (keep) => {
   const chans = wirePair(); // no peer link opened: nothing ever replies
   const factory = new InjectedChannels();
-  let closed = false;
+  let reason = null;
   const A = await makeTransportHost({
     channels: factory, contactSecret: CONTACT,
     transportConfig: { handshakeTimeoutMs: 60 },
-    onLinkClosed: () => { closed = true; },
+    onLinkClosed: (_id, r) => { reason = r; },
   });
   keep({ close() { try { A.shell.close(); } catch { /* down */ } } });
   factory.give(chans[0], { weDialed: true, expectPeerId: A.peerId });
-  await until(() => closed, 3000, "the deadline to close the link and notify");
+  await until(() => reason !== null, 3000, "the deadline to close the link and notify");
+  assert(reason === CLOSE_REASON.TIMEOUT,
+    `a peer that never speaks is a TIMEOUT — the one an operator chases an address for — got ${reason}`);
   assert(!(await linkedTo(A, A.peerId)), "must not authenticate");
+});
+
+await test("DIAGNOSTIC: a socket that dies mid-handshake reads DROPPED, not the catch-all", async (keep) => {
+  // The shape of "the other machine is not there" — a refused connect, an unreachable host,
+  // a far end that hangs up before authenticating. Verified against the real loader binary:
+  // `--peers <id>@127.0.0.1:9` prints exactly this. It must NOT read as `handshake`, which
+  // is the residual bucket for OUR OWN failures (a half-open budget evicting us), nor as
+  // `timeout`, which means the socket stayed open and went quiet.
+  const chans = wirePair();
+  let reason = null;
+  const st = keep(await linked(chans, { onLinkClosed: (_id, r) => { reason = r; } }));
+  await until(() => chans[0].sent.length > 0, 4000, "msg1 on the wire");
+  chans[0].kill(); // the socket goes away with the handshake unfinished
+  await until(() => reason !== null, 3000, "the dead socket to report down");
+  assert(reason === CLOSE_REASON.DROPPED,
+    `a socket lost mid-handshake should read DROPPED, got ${REASON_NAMES[reason]}`);
+  assert(!(await aUp(st)), "and nothing may be linked");
+});
+
+await test("DIAGNOSTIC: the host's reason names cover every code the guest can return", async () => {
+  // The one drift this arrangement can suffer: a reason added to the transport guest and
+  // not to the driver's name table degrades silently to `down: reason 8`. The guest is a
+  // signed blob the host cannot introspect, so the two lists are compared at their SOURCE —
+  // which is enough, because both ship from this repo together.
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../transport/src/ake.js", import.meta.url), "utf8");
+  const declared = [...src.matchAll(/REASON_([A-Z]+)\s*=\s*(\d+)/g)]
+    .map(([, name, code]) => ({ name: name.toLowerCase(), code: Number(code) }));
+  assert(declared.length >= 8, `expected to find the REASON_* table in ake.js, got ${declared.length}`);
+  for (const { name, code } of declared) {
+    assert(REASON_NAMES[code] === name,
+      `ake.js REASON_${name.toUpperCase()} = ${code}, but the driver prints ` +
+      `${JSON.stringify(REASON_NAMES[code])} — add it to REASON_NAMES (transport-host.ts)`);
+  }
+  // And the harness's own copy, which every reason assertion in this file reads.
+  for (const { name, code } of declared) {
+    assert(CLOSE_REASON[name.toUpperCase()] === code,
+      `CLOSE_REASON.${name.toUpperCase()} is stale against ake.js (expected ${code})`);
+  }
+});
+
+await test("DIAGNOSTIC: the driver prints a failing link and stays quiet about a healthy one", async (keep) => {
+  // The reason byte's whole point on a real deployment: an embedder that wired nothing —
+  // seedstore's p2p CLI boots `bootShell` itself and never touches `onLinkClosed` — still
+  // learns that its links are failing, and which address they were failing from. A healthy
+  // node must print nothing, or the signal is worthless.
+  const lines = [];
+  const realError = console.error;
+  console.error = (...a) => { lines.push(a.join(" ")); };
+  try {
+    const chans = wirePair({ stream: true });
+    const st = keep(await linked(chans, { suppressLinkLog: false }, { suppressLinkLog: false }));
+    await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
+    assert(lines.length === 0, `a healthy handshake printed ${JSON.stringify(lines)}`);
+
+    // Cut A's socket under a live link: TRUNCATED at A, which is anomalous and must print.
+    chans[0].kill();
+    await until(() => lines.length > 0, 3000, "the cut link to be reported");
+    assert(/^\[transport\] link \d+ from 10\.0\.0\.1 down: truncated$/.test(lines[0]),
+      `the line must name the link, the address and the reason, got ${JSON.stringify(lines[0])}`);
+  } finally {
+    console.error = realError;
+  }
 });
 
 await test("rekey: the ratchet keeps frames flowing across an epoch boundary", async (keep) => {
@@ -1440,7 +1513,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   await settle();
   assert(downs.length === 1, "a backend callback racing a host-driven close must not report down twice");
 
-  // 3) Not every RawLink is a BufferedChannel. The driver is the final containment
+  // 3) Not every RawLink is a MessageChannel. The driver is the final containment
   // boundary: a backend send that throws after emitting bytes must be failed and removed,
   // never left available for another write that would follow a truncated LENGTH frame.
   const cChannel = new ThrowingChannel();

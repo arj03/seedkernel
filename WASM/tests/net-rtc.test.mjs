@@ -293,7 +293,7 @@ await test("RtcChannel fails closed when a chunked write throws after a prefix",
   assert(writes === 2, `the throwing second chunk must stop the write, got ${writes} attempts`);
   assert(closes === 1 && failed === 1, "a partial RTC write must close and fail the channel exactly once");
   // A dead channel's send() throws rather than silently dropping the write (net-channel.ts
-  // BufferedChannel), so the caller — TransportHost's own outbound owner in production —
+  // MessageChannel), so the caller — TransportHost's own outbound owner in production —
   // learns immediately rather than believing an admitted write actually left.
   let refused = false;
   try { channel.send(Uint8Array.of(9)); } catch { refused = true; }

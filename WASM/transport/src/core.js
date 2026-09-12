@@ -516,9 +516,10 @@ entry("linkBytes", async (r) => {
 });
 
 /** The socket is gone. The return is the one-byte reason (`reasonCode`, ake.js) — a fact
- *  only this program ever held, since it is the end with the session keys. It carries no
- *  link id: the event names the link, so a return cannot speak about another socket, and a
- *  link already reported is off `linksById` and answers nothing a second time. */
+ *  only this program ever held, since it is the end with the session keys, and the driver
+ *  prints the non-routine ones so a node that cannot reach its cohort says why. It carries
+ *  no link id: the event names the link, so a return cannot speak about another socket, and
+ *  a link already reported is off `linksById` and answers nothing a second time. */
 entry("linkClosed", (r) => {
   const linkId = r.u32();
   const link = linksById.get(linkId);

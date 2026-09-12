@@ -24,7 +24,10 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest returns from `linkClosed`
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
  *  lives with the occupant and here, where the tests assert it. */
-export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
+export const CLOSE_REASON = {
+  OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5, REFUSED: 6, TIMEOUT: 7,
+  DROPPED: 8,
+};
 
 /** A `ChannelFactory` that hands the driver channels the TEST built, so a test keeps the
  *  instrumented object it is asserting on (`wirePair`'s recorder, tamperer and backlog).
@@ -238,6 +241,10 @@ export async function makeTransportHost(opts = {}) {
     // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
     // own observation seam, and the only place a test can read WHY a link went down.
     onLinkClosed: opts.onLinkClosed,
+    // Most of this suite tears links down on purpose, so the driver's diagnostic would bury
+    // the actual output. Off by default HERE only; the line itself is pinned by its own
+    // test, which opts back in.
+    suppressLinkLog: opts.suppressLinkLog ?? true,
     bundle: opts.transportBlob ?? transportBlob,
   };
   const transportConfig = {

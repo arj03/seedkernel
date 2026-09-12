@@ -4,7 +4,6 @@
 
 import {
   DEFAULT_GUEST_DEADLINE_MS,
-  DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
 import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
@@ -12,14 +11,6 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 // ─── module routing ─────────────────────────────────────────────────────
 
 export interface ModuleTableOptions {
-  /** Ceiling on each module and on the bundle's aggregate declared maximum memory and
-   *  tables. A module above it — or one declaring no maximum at all, for either — is
-   *  refused at load (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
-   *  this table to something tighter than a bundle may land.
-   *
-   *  The table DECLARES it (`PureModuleLoader.maxModuleMemoryBytes`) and `loadBundleModules`
-   *  applies it, taking the tighter of the two — see the seam in bundle.ts. */
-  maxModuleMemoryBytes?: number;
   /** Bound on one module invocation — one call, and one worker load at install — in ms,
    *  for a call that carries no deadline of its own; a call from a GUEST carries that
    *  guest's remaining execution segment instead (§4.3). Defaults to the shared guest
@@ -207,12 +198,6 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
 
 export class ModuleTable implements PureModuleLoader {
 
-  /** The §4.3 memory ceiling this table holds itself to, declared through the
-   *  `PureModuleLoader` seam for the shared load path to compose (bundle.ts
-   *  `loadBundleModules`). Public, and not applied here: that is what keeps one walk of
-   *  each module's sections on the one path both targets share. */
-  readonly maxModuleMemoryBytes: number;
-
   /** The default module-call bound (ModuleTableOptions.deadlineMs). */
   private readonly deadlineMs: number;
 
@@ -221,7 +206,6 @@ export class ModuleTable implements PureModuleLoader {
   private callSeq = 0;
 
   constructor(opts: ModuleTableOptions = {}) {
-    this.maxModuleMemoryBytes = opts.maxModuleMemoryBytes ?? DEFAULT_MAX_MODULE_MEMORY_BYTES;
     this.deadlineMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   }
 

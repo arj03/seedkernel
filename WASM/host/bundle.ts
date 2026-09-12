@@ -132,15 +132,6 @@ export interface PureModules {
  *  over an opaque Go-owned slot. */
 export interface PureModuleLoader {
   build(mods: { name: string; wasm: Uint8Array }[]): PureModules | Promise<PureModules>;
-  /** Optional ceiling on each module and on their aggregate declared footprint — linear
-     *  memory and tables — this target holds its isolates to (§4.3), in bytes.
-     *  Absent ⇒ `DEFAULT_MAX_MODULE_MEMORY_BYTES`.
-     *
-     *  Declared here rather than applied: `loadBundleModules` takes the tighter of this and
-     *  the shared ceiling, so "a target may hold itself to less, none may be looser" is a
-     *  property of the composition, and each module's sections are walked once on the one
-     *  path both targets share. */
-  maxModuleMemoryBytes?: number;
 }
 
 export interface VerifiedBundle {
@@ -508,17 +499,16 @@ export function freshnessPathFor(dir: string): string {
   return dir.replace(/[/\\]+$/, "") + ".freshness.json";
 }
 /** The freshness *arithmetic*: the `(author, app)` key, the monotonic never-rewind rule, the
- *  revocation set and the `{ marks, revoked }` serialization (§12.4). Target-independent, so
- *  each target subclasses it with its own persistence seam (`persist`). On its own this is
- *  an in-memory store. */
+ *  revocation set and the `{ marks, revoked }` serialization (§12.4). Target-independent: a
+ *  target hands in its own `persist`, and with none this is an in-memory store. */
 export class FreshnessMarks {
   private readonly marks = new Map<string, number>();
   /** Author keys written off (§12.5), as lowercase hex. */
   private readonly revoked = new Set<string>();
-  /** Seed from `{ marks, revoked }`. Absent input = first boot: start empty, which is
-     *  "unrevoked" — so a target's `persist` must be atomic. Bare pre-revocation maps throw
-     *  rather than reading as empty (would discard every downgrade guard). */
-  constructor(json?: string | null) {
+  /** Seed from `{ marks, revoked }`, and write the serialized state durably through
+     *  `persist`. Absent input = first boot: start empty, which is "unrevoked" — so a
+     *  target's `persist` must be atomic, and must throw if the write did not land. */
+  constructor(json?: string | null, private readonly persist: (json: string) => void = () => { }) {
     if (json !== undefined && json !== null) {
       let parsed: unknown;
       try {
@@ -532,11 +522,6 @@ export class FreshnessMarks {
         throw new Error("freshness store: corrupt file — root must be an object with marks and revoked fields");
       }
       const raw = parsed as Record<string, unknown>;
-      if (raw.marks === undefined && raw.revoked === undefined && Object.keys(raw).length > 0) {
-        throw new Error("freshness store: this file predates author revocation (§12.5) and holds only high-water marks. " +
-                    'Reading it as-is would silently drop every downgrade guard. Migrate it to {"marks":{…},"revoked":[]} ' +
-                    "or delete it to start from no marks.");
-      }
       if (raw.marks === undefined || raw.revoked === undefined) {
         throw new Error('freshness store: corrupt file — expected both "marks" and "revoked" fields. ' +
                     "Delete it to start from no marks.");
@@ -575,9 +560,6 @@ export class FreshnessMarks {
       marks[k] = v;
     return JSON.stringify({ marks, revoked: [...this.revoked] });
   }
-  /** Write the serialized state durably. In-memory here; a target overrides it with an
-     *  atomic-write seam so a crash cannot replace valid guard state with a corrupt file. */
-  persist(_json: string): void { }
   key(author: Uint8Array, app: string): string { return appKeyFor(author, app); }
   get(author: Uint8Array, app: string): number {
     const v = this.marks.get(this.key(author, app));
@@ -669,12 +651,9 @@ export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundl
   // The §4.3 per-module and aggregate bound — memory and tables both — read off the bytes
   // *before* instantiation, which is what allocates the declared initial memory and reserves
   // the declared tables, so a host-side check could only run after the damage. Every module
-  // is checked before any is handed down.
-  //
-  // The number is the tighter of what a bundle may land and what this loader holds its own
-  // isolates to (`PureModuleLoader.maxModuleMemoryBytes`), composed here because this is
-  // the only call site: no second place for the rule to be got wrong.
-  const maxBytes = Math.min(DEFAULT_MAX_MODULE_MEMORY_BYTES, host.maxModuleMemoryBytes ?? Infinity);
+  // is checked before any is handed down. One number for every target, applied at this one
+  // call site: no second place for the rule to be got wrong.
+  const maxBytes = DEFAULT_MAX_MODULE_MEMORY_BYTES;
   let bundleBytes = 0;
   for (const { wasm } of v.modules) {
     bundleBytes += moduleFootprintBytes(checkModuleLimits(wasm, maxBytes));

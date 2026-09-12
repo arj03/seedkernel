@@ -305,22 +305,17 @@ const modules: PureModuleLoader = {
 };
 /** The freshness store over the Go file seam (§12.4). The marks live in a SIBLING of the
  *  data dir (`freshnessPathFor`, shared with the Node shell) so a `fs`-capable guest cannot
- *  reach its own mark. */
-class NativeFreshnessStore extends FreshnessMarks {
-  path;
-  constructor(dir: string) {
-    const path = freshnessPathFor(dir);
-    const raw = bridge.readFile(path);
-    super(raw === null ? null : utf8dec.decode(new Uint8Array(raw)));
-    this.path = path;
-  }
-  override persist(json: string) {
-    // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
-    // land", which is what rolls a revocation back and un-binds a load whose mark could
-    // not be raised — swallowing it would report both as successes while the next boot
-    // re-admits the revoked author. 0600, a node's own downgrade guard.
-    bridge.writeFile(this.path, utf8.encode(json), 0o600);
-  }
+ *  reach its own mark. The write throws on purpose: `FreshnessMarks` reads that as "the
+ *  write did not land", which is what rolls a revocation back and un-binds a load whose mark
+ *  could not be raised — swallowing it would report both as successes while the next boot
+ *  re-admits the revoked author. 0600, a node's own downgrade guard. */
+function nativeFreshnessStore(dir: string): FreshnessMarks {
+  const path = freshnessPathFor(dir);
+  const raw = bridge.readFile(path);
+  return new FreshnessMarks(
+    raw === null ? null : utf8dec.decode(new Uint8Array(raw)),
+    (json) => bridge.writeFile(path, utf8.encode(json), 0o600),
+  );
 }
 /** This target's socket seam: the transport driver's ChannelFactory over Go's sockets,
  *  producing RawLinks identically to the node:net factory, so the transport bundle's link
@@ -473,7 +468,7 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
   __fs.open(cfg.dir);
   return bootShell({
     sodium, identity: cfg.identity, modules, fs, createRealm, admit,
-    freshnessStore: new NativeFreshnessStore(cfg.dir),
+    freshnessStore: nativeFreshnessStore(cfg.dir),
     // The network as configured, over Go's sockets.
     transport: cfg.transport && { ...cfg.transport, channels },
     guestDeadlineMs: cfg.guestDeadlineMs,

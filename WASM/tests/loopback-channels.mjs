@@ -7,7 +7,7 @@ import { parseDest } from "../build/host/peer-addr.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
  *  mirroring a real socket; closing one end fires the other's onClose — the close
- *  semantics of BufferedChannel's fail() path on a real channel. */
+ *  semantics of MessageChannel's fail() path on a real channel. */
 class LoopbackChannel {
   // `send` preserves message boundaries, so `stream` stays absent.
   peer = null;
@@ -44,7 +44,7 @@ class LoopbackChannel {
     queueMicrotask(() => { if (p && !p.dead) p.cls?.(); });
   }
   /** The far end went away / this end failed: notify our own onClose (the
-   *  BufferedChannel.fail() path — how a socket reports being cut). */
+   *  MessageChannel.fail() path — how a socket reports being cut). */
   kill() {
     if (this.dead) return;
     this.dead = true;
