@@ -103,10 +103,6 @@ let router = null;
 let reqres = null;
 let core = null;
 
-// Timers this module asked the host to arm — host events carry the id back.
-let nextTimerId = 1;
-const timers = new Map();
-
 // Deferred teardowns (see Link constructor): flushed after the current event.
 const deferQueue = [];
 
@@ -115,6 +111,50 @@ const deferQueue = [];
 // WHY the link went. Bounded — ids are never reused, and the driver answers every link with
 // exactly one `linkClosed`, which drains the entry.
 const linksById = new Map();
+
+// ── deadlines ───────────────────────────────────────────────────────────────────
+// A zero-authority realm has no clock, so a deadline here is a count of the host's one wake
+// (§12.3). Each wake is a tick, and every link, open correlation and `ready` waiter holds the
+// tick it ends on — no timer per deadline, one walk per tick (`onWake`). A tick is 100 ms, or
+// the shortest configured timeout when that is shorter.
+const tickMs = Math.max(1, Math.ceil(Math.min(100,
+  ...[linkIdleTimeoutMs, requestTimeoutMs, handshakeTimeoutMs, unverifiedTimeoutMs].filter((ms) => ms > 0))));
+let tick = 0;
+let waking = false;   // the wake is armed
+let wakeOwed = false; // its arm was refused, so the next event asks again
+
+/** The tick by which `ms` has surely passed. A tick already under way counts for nothing, so
+ *  a deadline runs up to two ticks long and never short. */
+function dueTick(ms) {
+  const due = tick + Math.max(1, Math.ceil(ms / tickMs)) + (waking ? 1 : 0);
+  wake();
+  return due;
+}
+
+/** Arm the wake unless it is armed. It is never cleared, so every wake that arrives is a tick. */
+function wake() {
+  if (waking) return;
+  waking = true;
+  wakeOwed = false;
+  try { void host.call(N_TIMER_ARM, args([tickMs, 0], [])).catch(wakeRefused); } catch { wakeRefused(); }
+}
+
+/** Refused by this realm's host-call budget, which frees up on its own. Failing the deadlines
+ *  over it would close every link at once, so they stand until an event re-arms (`dispatch`). */
+function wakeRefused() {
+  waking = false;
+  wakeOwed = true;
+}
+
+/** One tick: retire what is due, and arm again while anything still waits. */
+function onWake() {
+  waking = false;
+  tick++;
+  let waiting = reqres.onTick();
+  if (core.checkReady()) waiting = true;
+  for (const link of linksById.values()) if (link.onTick()) waiting = true;
+  if (waiting) wake();
+}
 
 // The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
 // when a socket is accepted, moves to `verified` when a msg1 opens under the contact
@@ -235,7 +275,7 @@ class Core {
     this.connecting = new Map(); // peerId → Link[] (outbound, pre-auth)
     this.inbound = new Set();    // accepted, pre-auth
     this.addrs = new Map();      // peerId → { dest, secret } — this program's address book
-    this.readyWaiters = [];      // [{check, d, timer}] — one per in-flight ready()
+    this.readyWaiters = [];      // [{check, d, due}] — one per in-flight ready()
     this.dialing = new Map();    // peerId → in-flight dial, so concurrent senders share one
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
@@ -358,32 +398,23 @@ class Core {
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
     // A LIST, not a slot: two callers may wait at once, each with its own deferred.
-    const w = { check: allUp, d, timer: 0 };
-    w.timer = armTimer(timeoutMs, () => {
-      this.dropWaiter(w);
-      // Settles either way: the caller asked to WAIT for the cohort, not to be told
-      // whether it arrived — one that cares reads `peers`.
-      d.settle(EMPTY);
-    });
-    this.readyWaiters.push(w);
+    this.readyWaiters.push({ check: allUp, d, due: dueTick(timeoutMs) });
   }
 
-  dropWaiter(w) {
-    const i = this.readyWaiters.indexOf(w);
-    if (i >= 0) this.readyWaiters.splice(i, 1);
-  }
-
+  /** Settle each waiter whose cohort is up or whose deadline tick has come. Either way: the
+   *  caller asked to WAIT for the cohort, not to be told whether it arrived — one that cares
+   *  reads `peers`. Run on each up edge and each tick; answers whether any still wait. */
   checkReady() {
     for (const w of [...this.readyWaiters]) {
-      if (!w.check()) continue;
-      clearTimer(w.timer);
-      this.dropWaiter(w);
+      if (!w.check() && tick < w.due) continue;
+      this.readyWaiters.splice(this.readyWaiters.indexOf(w), 1);
       w.d.settle(EMPTY);
     }
+    return this.readyWaiters.length > 0;
   }
 
   close() {
-    for (const w of this.readyWaiters.splice(0)) { clearTimer(w.timer); w.d.settle(EMPTY); }
+    for (const w of this.readyWaiters.splice(0)) w.d.settle(EMPTY);
     const pending = [];
     for (const arr of this.connecting.values()) for (const l of arr) pending.push(l);
     for (const l of this.inbound) pending.push(l);
@@ -396,16 +427,15 @@ class Core {
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
 //
-// Reached as an app is: `handle([caller 32][body …])`, body always an op envelope
+// Reached as an app is: `handle([caller 32][body …])`, body an op envelope
 // `[opLen u8][op][args]` (util.js `readOp`) — this bundle's envelope, which is how an
-// app's `send` and the host's own events (a fired deadline included) land on one
-// entrypoint. For a deadline this bundle supplies the complete `timer` envelope when it
-// arms the host table; the kernel stores and returns those bytes opaquely. The op is a
-// NAME, not a tag byte — an unimplemented op fails loud.
+// app's `send` and the host's own events land on one entrypoint. The op is a NAME, not a
+// tag byte — an unimplemented op fails loud. The one body without a name is the host's
+// wake: four bytes, shorter than any envelope (`onWake`).
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
 //   the HOST  32 zero bytes — the platform's events: sockets opening, bytes
-//              arriving, an address, a fired deadline, and the operator's `ready`/`peers`.
+//              arriving, an address, a wake, and the operator's `ready`/`peers`.
 //   an APP    its app key, exactly as an inbound frame carries the authenticated
 //              sender's key. `send` is the only op an app may name.
 //
@@ -451,7 +481,7 @@ function start() {
     router.sink = (from, frame, fromPk) => reqres.onFrame(from, frame, fromPk);
     // The cohort edges stay in this heap; the host reads them with the `peers` op.
     router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-    router.onPeerDown = (peerId) => { connected.delete(peerId); };
+    router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };
     for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
   })();
   // Avoid an unhandled rejection if the realm is disposed mid-setup.
@@ -469,6 +499,8 @@ function handle(argBytes) {
 function dispatch(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   try {
+    if (wakeOwed) wake();
+    if (fromHost && body.length === 4) { onWake(); return NOTHING; }
     const { op, args } = readOp(body);
     const r = new Reader(args);
     const fn = ops[op];
@@ -528,11 +560,6 @@ entry("linkClosed", (r) => {
   linksById.delete(linkId);
   return Uint8Array.of(link.closeReason);
 });
-
-/** A fired deadline (§12.2): the shell's per-realm timer table re-entering this realm as
- *  an ordinary host loopback, body `[id u32]`. HOST-ONLY — an app naming it could fire
- *  an id it never armed. */
-entry("timer", (r) => fireTimer(r.u32()));
 
 /** App-facing send: deferred because the peer's response is another invocation of this
  *  realm. Its deadline is kernel handoff state, not a field in this content protocol. */

@@ -239,6 +239,40 @@ await test("a silent peer's correlation is retired on the transport's own timeou
   assert(await aUp(st), "retiring one correlation does not close its healthy link");
 });
 
+await test("peer loss settles a pending request even with its retention timeout disabled", async (keep) => {
+  const st = keep(await upPair(undefined, { transportConfig: { requestTimeoutMs: 0 } }));
+  st.chans[1].hold();
+  const pending = st.A.request(st.B.peerId, PROTO, Uint8Array.of(7), 2000)
+    .then(() => "resolved", () => "failed");
+  await until(() => st.chans[1].held.length > 0, 1000, "response held on the wire");
+  st.chans[0].kill();
+  const result = await Promise.race([pending, settle(500).then(() => "still pending")]);
+  assert(result === "failed", `peer-down must settle before the caller deadline: ${result}`);
+});
+
+await test("a refused wake fails nothing, and the next event arms it again", async (keep) => {
+  // The wake is a host call, so this realm's call budget can refuse it. That frees up on its
+  // own: every deadline must stand and every link stay up until a later event re-arms.
+  let refusing = false, refused = 0;
+  const st = keep(await upPair(undefined, {
+    transportConfig: { requestTimeoutMs: 100 },
+    onHostCall: (name) => { if (refusing && name === "timer/arm") { refused++; throw new Error("wake refused"); } },
+  }));
+  st.chans[1].hold();
+  refusing = true;
+  const t0 = Date.now();
+  const pending = st.A.request(st.B.peerId, PROTO, Uint8Array.of(7), 3000)
+    .then(() => "resolved", () => Date.now() - t0);
+  await until(() => refused > 0, 2000, "the wake to be refused");
+  await settle(150);
+  assert(await aUp(st), "a refused wake must not close an authenticated link");
+  refusing = false;
+  await aUp(st); // any event asks for the wake again
+  const retired = await pending;
+  assert(typeof retired === "number" && retired < 2000,
+    `the correlation still retires on the transport's timeout, not the caller's (${retired}ms)`);
+});
+
 await test("the handoff deadline includes time in the outbound socket queue", async (keep) => {
   // The deadline belongs to the initiating call, so transport content cannot extend it by
   // observing that bytes are still draining. `trackBacklog` proves the timeout happens

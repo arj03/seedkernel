@@ -63,16 +63,12 @@ export interface RawNet {
   deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
-/** The platform's event loop, as the one thing a zero-authority realm cannot do for
- *  itself: there is no `setTimeout` in a fresh QuickJS context. `id` is the guest's own, so
- *  the host keeps no name of its own for a deadline. The implementer bounds how many
- *  deadlines a guest may hold at once — the table of live timers is its memory to spend. */
+/** One replaceable wake. The four-byte tag is opaque guest content, returned after
+ *  HOST_CALLER_ID. Content multiplexes deadlines inside its own confined heap. */
 export interface HostTimers {
-  /** Arm (or re-arm) `id` to return `payload` to the guest as an ordinary host
-     *  loopback in `ms`. The payload is the guest's own format and remains opaque to the
-     *  host. Refuse, by throwing, past the implementation's live-timer bound. */
-  arm(id: number, ms: number, payload: Uint8Array): void;
-  clear(id: number): void;
+  arm(ms: number, tag: Uint8Array): void;
+  /** Cancel the armed wake; a notification already in flight cannot be retracted. */
+  clear(): void;
 }
 
 /** Per-NODE facts every realm on this host shares. Nothing here is a grant — a realm
@@ -487,13 +483,13 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     },
     // ── timers: the platform's event loop ─────────────────────────────────────
     "timer/arm": (payload) => {
-      // The live-timer cap is the BACKEND's, not here: the table is its memory to
-      // spend.
-      timers.arm(readU32BE(payload, 0), readU32BE(payload, 4), payload.subarray(8));
+      if (payload.byteLength !== 8) throw new Error("guest: timer/arm requires [ms u32][tag 4]");
+      timers.arm(readU32BE(payload, 0), payload.subarray(4));
       return NONE;
     },
     "timer/clear": (payload) => {
-      timers.clear(readU32BE(payload, 0));
+      if (payload.byteLength !== 0) throw new Error("guest: timer/clear requires an empty body");
+      timers.clear();
       return NONE;
     },
   } satisfies Record<HandlerKey, SeamHandler>);

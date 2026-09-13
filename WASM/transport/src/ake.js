@@ -21,7 +21,6 @@ const N_LINK_CLOSE = "link/close";
 const N_LINK_DELIVER = "link/deliver";
 
 const N_TIMER_ARM = "timer/arm";
-const N_TIMER_CLEAR = "timer/clear";
 
 const P_HASH = "crypto/blake2b-256";
 const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
@@ -247,32 +246,6 @@ function admits(peerBytes) {
   return admitPeers.has(toHex(peerBytes));
 }
 
-// ── timers ────────────────────────────────────────────────────────────────────
-
-// `timer/arm` is the host's table and the host's cap (DEFAULT_MAX_LIVE_TIMERS). The arm
-// lands on a later microtask now, so the id returns immediately and a REFUSAL (the cap)
-// drops the entry instead of throwing to the armer — the tables stay honest, and the
-// deadline that never fires reads as a stall to whichever clock armed it.
-function armTimer(ms, fn) {
-  const id = nextTimerId++;
-  timers.set(id, fn);
-  // The kernel stores and returns the tail opaquely. This transport owns the event's
-  // `timer` name and framing just as it owns every other byte after the caller id.
-  void host.call(N_TIMER_ARM, args(
-    [id, Math.max(1, Math.floor(ms))], [], writeOp("timer", argU32(id)),
-  )).catch(() => {
-    timers.delete(id);
-  });
-  return id;
-}
-function clearTimer(id) {
-  if (timers.delete(id)) void host.call(N_TIMER_CLEAR, args([id], [])).catch(() => {});
-}
-function fireTimer(id) {
-  const fn = timers.get(id);
-  if (fn) { timers.delete(id); fn(); }
-}
-
 // ── the link ─────────────────────────────────────────────────────────────────
 
 // One host-managed channel, addressed by the host-supplied link id. All session state
@@ -325,9 +298,8 @@ class Link {
     this.aborted = false;
     this.timedOut = false;
     this.slot = null;
-    this.deadline = null;
-    this.idle = null;         // the post-auth idle clock (armIdle)
-    this.sawTraffic = false;  // whether anything crossed since it last ticked
+    this.due = 0;             // the tick the handshake deadline or the idle window ends on
+    this.sawTraffic = false;  // whether anything crossed since the idle window opened
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -358,7 +330,7 @@ class Link {
     //
     // Everything here runs async now, so the constructor's old try/catch becomes the
     // boot chain's rejection arm — same deferred teardown the refused slot takes: the
-    // slot first and on its own, then the timer table, then the notify-on-later-turn.
+    // slot first and on its own, then the deadline, then the notify-on-later-turn.
     const networkKeyBytes = spec.networkKey || networkKey;
     // RECOVERED, like every later link in the chain: a raw rejecting `work` would silently
     // skip whatever `enqueue` put behind it, and the deadline's own abort is exactly that.
@@ -373,7 +345,7 @@ class Link {
       }
     })().catch(() => {
       this.releaseSlot();
-      try { this.teardown(); } catch { /* the host has evidently lost the timer anyway */ }
+      try { this.teardown(); } catch { /* already torn down */ }
       this.deferTeardown();
     });
   }
@@ -407,44 +379,42 @@ class Link {
     if (this.weDialed && !this.myKem) this.myKem = await kemKeypair(await randomBytes(64));
   }
 
+  /** The pre-auth deadline, 0 disabling it; authentication hands it over to `armIdle`. */
   armDeadline(ms) {
-    this.clearDeadline();
-    if (ms > 0) {
-      this.deadline = armTimer(ms, () => {
-        if (this.authed) return;
-        // Distinguishable from every other pre-auth teardown: "nobody finished the
-        // handshake in time" is an address, a firewall or a silent peer, while a defensive
-        // abort is a peer that answered with something wrong. Different things to go fix.
-        this.timedOut = true;
-        this.abort();
-      });
-    }
-  }
-
-  clearDeadline() {
-    if (this.deadline !== null) { clearTimer(this.deadline); this.deadline = null; }
+    this.due = ms > 0 ? dueTick(ms) : 0;
   }
 
   /** The post-auth idle clock, which the handshake deadline hands over to: a peer that
    *  opens links and goes quiet is the cheapest way to spend our budget of sockets and
    *  slots. Retired with the authenticated goodbye.
    *
-   *  Two ticks rather than a timestamp: a zero-authority realm has no clock, so "idle"
-   *  is "a whole window passed with nothing seen" — the effective window is one to two
+   *  Windows rather than a timestamp: a zero-authority realm has no clock, so "idle" is
+   *  "a whole window passed with nothing seen" — the effective window is one to two
    *  `linkIdleTimeoutMs`. */
   armIdle() {
-    if (linkIdleTimeoutMs <= 0) return;
     this.sawTraffic = false;
-    this.idle = armTimer(linkIdleTimeoutMs, () => {
-      this.idle = null;
-      if (this.closed || !this.authed) return;
-      if (!this.sawTraffic) { this.close(); return; }
-      this.armIdle();
-    });
+    this.due = linkIdleTimeoutMs > 0 ? dueTick(linkIdleTimeoutMs) : 0;
   }
 
-  clearIdle() {
-    if (this.idle !== null) { clearTimer(this.idle); this.idle = null; }
+  /** One tick (core.js `onWake`). Past `due`, a link still handshaking has timed out, and an
+   *  authenticated one closes unless its window carried traffic. Answers whether it still
+   *  waits on a later tick. */
+  onTick() {
+    if (this.due === 0 || tick < this.due) return this.due !== 0;
+    this.due = 0;
+    if (this.closed) return false;
+    if (!this.authed) {
+      // Distinguishable from every other pre-auth teardown: "nobody finished the
+      // handshake in time" is an address, a firewall or a silent peer, while a defensive
+      // abort is a peer that answered with something wrong. Different things to go fix.
+      this.timedOut = true;
+      this.abort();
+    } else if (this.sawTraffic) {
+      this.armIdle();
+    } else {
+      this.close();
+    }
+    return this.due !== 0;
   }
 
   /** Traffic in either direction: the idle clock's flag, and the limiter's eviction order,
@@ -669,8 +639,8 @@ class Link {
   stall() {
     if (this.stalled) return;
     this.stalled = true;
-    // The timer and half-open slot remain live: silence must still cost the sender a slot
-    // until the normal deadline. Private handshake material has no further use, though.
+    // The deadline and the half-open slot stay live: silence must still cost the sender a
+    // slot until that deadline. Private handshake material has no further use, though.
     this.clearEphemeral();
   }
 
@@ -685,8 +655,7 @@ class Link {
     // The slot is NOT released — it moves to the authed tier and is held until the link
     // dies, so the budget bounds how many peers may be IN rather than how many got in.
     if (this.slot && !this.slot.limiter.hold(this.slot)) { this.abort(); return; }
-    this.clearDeadline();
-    this.armIdle();
+    this.armIdle(); // in place of the handshake deadline
     // A known, admitted identity may send full-size frames; a platform-framed link has
     // no framer to raise — for it, `authed` is what raises the cap, in onWire.
     if (this.framer) this.framer.raiseCap();
@@ -959,8 +928,7 @@ class Link {
 
   teardown() {
     this.severWire();
-    this.clearDeadline();
-    this.clearIdle();
+    this.due = 0;
     this.releaseSlot();
     this.queue.length = 0;
     this.queueHead = 0;

@@ -175,16 +175,16 @@ The reference composition separates application logic, dispatch, transport, and 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle; each supplies its own platform adapters. The shared host set is the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. `WASM/core/` holds core contracts and fixed host vocabulary, including manifest constants; `WASM/host/` implements the surrounding runtime, and `WASM/transport/` builds the signed transport bundle. The directory names group source files; the tables below distinguish shared code from platform code (`npm run loc` in `WASM/` computes the figures).
 
-**Shared — compiled once, run by all three targets (2,441 LOC)**
+**Shared — compiled once, run by all three targets (2,422 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 383 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 333 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the timer table and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 705 |
+| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 688 |
 | Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 369 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 236 |
-| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 415 |
+| Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 413 |
 
 Sharing these rows keeps admission and confinement rules consistent across targets and avoids duplicating adapters and client codecs. Claim routing still follows each node's own installed set (§12.10); the operator decides which app owns each claim ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
 
@@ -197,7 +197,7 @@ The transport driver holds link ids and listeners and exposes three events: `lin
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,493 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (336) and `native-polyfills.ts` (83), both TypeScript and riding in the shared bundle | 2,292 Go + 419 TS |
 
-Each socket implementation reaches the driver as a `RawLink` through the `ChannelFactory` seam ([RUNTIME §12.1](docs/RUNTIME.md)). TCP length-prefixing and RFC 6455 belong to the transport bundle — 1,563 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, outside the host tables above.
+Each socket implementation reaches the driver as a `RawLink` through the `ChannelFactory` seam ([RUNTIME §12.1](docs/RUNTIME.md)). TCP length-prefixing and RFC 6455 belong to the transport bundle — 1,557 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, outside the host tables above.
 
 The host artifact carries `libsodium.wasm` and `mldsa65.wasm` for its cryptographic operations, including manifest suite `0x02` verification. `mlkem768.wasm` is byte-identical across targets too, but arrives inside the signed transport bundle and uses the ordinary private-module loader. The Go platform embeds the two host WASM artifacts and drives them over wazero, while its event loop runs the shared JS host in QuickJS. Manifest admission, routing, and policy logic stay in the shared implementation.
 

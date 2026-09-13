@@ -11,7 +11,7 @@ import { type Fs } from "../core/fs.js";
 import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -237,10 +237,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   let inFlight = Promise.resolve();
   /** This load's per-invocation ceiling: this load's number, else the node's, else the
      *  shared one (§12.3). One place, because two owners are measured against it — the realm
-     *  `standRealm` stands, and the clock its timer table banks one invocation of. */
+     *  `standRealm` stands, and the clock its realm wake banks one invocation of. */
   const deadlineFor = (load: InstallOptions): number =>
     load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
-    /** An empty slot for `loaded`, with its timer table already pointed at the realm the
+    /** An empty slot for `loaded`, with its realm wake already pointed at the realm the
      *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
      *  which is the correct reading anyway: the realm a deadline re-enters is the one
      *  standing when it fires (a transport handover replaces it while the slot stays). */
@@ -251,12 +251,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // event the host delivers, not a host authority, and `body` arrives pre-framed. A
     // throw has no caller left to reject — the arming call returned turns ago — so it
     // is reported and swallowed. The promise is RETURNED, not discarded: that is what
-    // ends the table's custody of these bytes (realm-timers.ts).
+    // allows the next due wake to enter (realm-timers.ts).
       slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
     // Banked against THIS slot's ceiling, not the node's default.
-    DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, deadlineFor(load));
+    deadlineFor(load));
     const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
     const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, reachesLink(loaded.manifest));
     slot = {

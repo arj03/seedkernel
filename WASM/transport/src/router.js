@@ -95,8 +95,9 @@ const REQ_HEAD_LEN = 1 + 4 + 1;
 
 class ReqRes {
   constructor() {
-    this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
-    this.timers = new Map();    // corr → the retention bound on that entry
+    // corr → {to, d, due} — d is the deferred answering the app, due the tick its retention
+    // bound ends on (0: none)
+    this.pending = new Map();
     this.nextCorr = 1;
   }
 
@@ -106,8 +107,6 @@ class ReqRes {
     const p = this.pending.get(corr);
     if (!p) return;
     this.pending.delete(corr);
-    const t = this.timers.get(corr);
-    if (t) { clearTimer(t); this.timers.delete(corr); }
     if (ok) p.d.settle(concatBytes([Uint8Array.from([1]), payload]));
     else p.d.settle(Uint8Array.from([0]));
   }
@@ -137,15 +136,9 @@ class ReqRes {
     if (this.nextCorr > 0xffffffff) this.nextCorr = 1;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
-      this.pending.set(corr, { to, d });
+      this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueTick(requestTimeoutMs) : 0 });
     }
     this.sendFrame(to, frame);
-    if (!noReply && requestTimeoutMs > 0) {
-      this.timers.set(corr, armTimer(requestTimeoutMs, () => {
-        this.timers.delete(corr);
-        this.finish(corr, false, EMPTY);
-      }));
-    }
   }
 
   buildReq(corr, noReply, proto, payload) {
@@ -215,9 +208,25 @@ class ReqRes {
     this.sendFrame(from, frame);
   }
 
+  peerDown(peerId) {
+    for (const [corr, p] of this.pending) {
+      if (p.to === peerId) this.finish(corr, false, EMPTY);
+    }
+  }
+
+  /** One tick (core.js `onWake`): retire the correlations whose retention bound has come.
+   *  Every bound is the same length, so `pending` is in due order and the walk stops at the
+   *  first still waiting. Answers whether one is. */
+  onTick() {
+    if (requestTimeoutMs <= 0) return false;
+    for (const [corr, p] of this.pending) {
+      if (tick < p.due) return true;
+      this.finish(corr, false, EMPTY);
+    }
+    return false;
+  }
+
   close() {
-    for (const t of this.timers.values()) clearTimer(t);
-    this.timers.clear();
     // Settle rather than drop: every one of these is an app parked on a `_net` call.
     for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
     this.pending.clear();

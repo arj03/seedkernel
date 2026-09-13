@@ -29,15 +29,6 @@ export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
  *  frees the host thread. */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
-/** How many deadlines one guest realm may hold at once (§12.3), enforced per realm by the
- *  shell's one timer table per realm. Kept deliberately modest: each deadline is host-side
- *  state, not memory charged to the confined heap. */
-export const DEFAULT_MAX_LIVE_TIMERS = 1 << 10;
-
-/** Aggregate bytes of opaque timer bodies retained outside one guest's confined heap.
- *  `timer/arm` copies each body before retaining it, so reusing one in-realm buffer cannot
- *  multiply host memory without meeting this per-realm ceiling. */
-export const DEFAULT_MAX_TIMER_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
 /** Unresolved `host.call`s one realm may hold at once. Every call crosses a copy boundary
  *  and retains host-side promise state, so fire-and-forget calls need their own count bound

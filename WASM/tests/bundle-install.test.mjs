@@ -1373,19 +1373,12 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   // firing inside that window is a legitimate turn of the guest that armed it.
   const realms = [];
   let failNextRealm = false;
-  const arm = (id, ms) => {
-    const event = writeOp("timer", Uint8Array.from([id >>> 24, id >>> 16, id >>> 8, id]));
-    const p = new Uint8Array(8 + event.length);
-    writeU32BE(p, 0, id); writeU32BE(p, 4, ms); p.set(event, 8);
+  const arm = (tag, ms) => {
+    const p = new Uint8Array(8);
+    writeU32BE(p, 0, ms); writeU32BE(p, 4, tag);
     return p;
   };
-  // A fired deadline and an ordinary loopback invoke arrive with the SAME (zero) caller
-  // id now, so what tells them apart is the op name in the body, not a caller byte —
-  // `invoke` above sends an empty body, which has no op to read at all.
-  const opNameOf = (p) => {
-    if (p.length <= 32) return null;
-    try { return readOp(p.subarray(32)).op; } catch { return null; }
-  };
+  // Wake bodies are four-byte tags; ordinary invoke below uses an empty body.
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
@@ -1393,7 +1386,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       // refuses everything until its installation commits (§3.1), which is the same
       // reason a real guest defers its setup to its first invocation.
       const r = { calls: [], disposed: false, call: async (p) => {
-        r.calls.push(opNameOf(p) === "timer" ? "timer" : "invoke");
+        r.calls.push(p.length === 36 ? "timer" : "invoke");
         if (!r.armed) { r.armed = true; await o.hostCall("timer/arm", arm(1, 200)); }
         return new Uint8Array();
       }, dispose() { r.disposed = true; } };

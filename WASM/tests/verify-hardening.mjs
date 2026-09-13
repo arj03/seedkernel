@@ -20,7 +20,7 @@ const sodium = _sodium;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readModuleLimits, checkModuleLimits, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
-  DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_MAX_APP_SLOTS, DEFAULT_GUEST_DEADLINE_MS,
+  DEFAULT_MAX_APP_SLOTS, DEFAULT_GUEST_DEADLINE_MS,
   SELF_INITIATED_CLOCK_DIVISOR,
   DEFAULT_REALM_MEMORY_BYTES, DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_MEMORY_FS_MAX_BYTES }
@@ -427,7 +427,7 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
   // declaring its own constant.
   const perRealm = DEFAULT_REALM_MEMORY_BYTES  // §12.3 — one confined guest heap
     + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES  // copied host-call inputs and their answers
-    + DEFAULT_MAX_TIMER_PAYLOAD_BYTES          // copied timer bodies
+    + 2 * (HOST_CALLER_ID.length + 4)           // one armed and one in-flight wake
     + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3 — one bundle's aggregate module memory
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
     + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, over every link
@@ -612,48 +612,39 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
 
 }
 
-console.log("\n§12.3 — timer count and copied payload bytes are bounded per realm");
+console.log("\nOne replaceable wake and one in-flight notification per realm");
 {
-  const countBound = createRealmTimers(() => {}, 2, 100);
-  countBound.arm(1, 60_000, new Uint8Array(1));
-  countBound.arm(2, 60_000, new Uint8Array(1));
-  throws(() => countBound.arm(3, 60_000, new Uint8Array(1)), "a third live id is refused at a two-timer cap");
-  countBound.clearAll();
-
-  // What the table retains is the realm-entry buffer, so the caller-id prefix is part of
-  // every charge — read from the seam rather than restated, since a hand-copied 32 here
-  // would pass while the real accounting drifted.
-  const frame = HOST_CALLER_ID.length;
-  let fired = 0;
-  const byteBound = createRealmTimers(() => { fired++; }, 10, 2 * frame + 8);
-  byteBound.arm(1, 60_000, new Uint8Array(6));
-  throws(() => byteBound.arm(2, 60_000, new Uint8Array(3)), "aggregate copied timer bodies cannot cross their byte cap");
-  byteBound.arm(1, 60_000, new Uint8Array(8));
-  byteBound.clear(1);
-  byteBound.arm(2, 1, new Uint8Array(8));
+  const fired = [];
+  const wake = createRealmTimers((body) => { fired.push([...body]); });
+  const tag = Uint8Array.of(1, 2, 3, 4);
+  wake.arm(1, tag);
+  tag.fill(9);
   await sleep(20);
-  ok(fired === 1, "a timer fires once under the byte cap");
-  byteBound.arm(3, 60_000, new Uint8Array(8));
-  byteBound.clearAll();
-  byteBound.arm(4, 60_000, new Uint8Array(8));
-  byteBound.clearAll();
-  ok(true, "clear, fire, and disposal release timer payload accounting");
-
-  // Firing hands the body to a realm that borrows it (realm-queue.ts counts depth only),
-  // so custody MOVES rather than ending: the deadline is not a release event, the answer
-  // is. Otherwise the moment a realm is busiest — fired bodies queued behind it — is the
-  // moment they are charged to nobody.
-  let releaseFired;
-  const inFlight = createRealmTimers(
-    () => new Promise((resolve) => { releaseFired = resolve; }), 10, 2 * frame + 8);
-  inFlight.arm(1, 1, new Uint8Array(8));
+  ok(fired.length === 1 && fired[0].slice(-4).join() === "1,2,3,4", "wake copies its fixed opaque tag");
+  for (let i = 0; i < 2000; i++) wake.arm(10, Uint8Array.of(0, 0, 0, i & 255));
+  throws(() => wake.arm(0, new Uint8Array(5)), "oversize tag is refused without replacing the wake");
+  throws(() => wake.arm(0x80000000, new Uint8Array(4)), "delay overflow is refused rather than firing immediately");
+  await sleep(30);
+  ok(fired.length === 2 && fired[1].at(-1) === (1999 & 255), "replacement retains only the latest wake, with no timer-count cap");
+  wake.arm(1, tag); wake.clear();
   await sleep(20);
-  throws(() => inFlight.arm(2, 60_000, new Uint8Array(8)),
-    "a fired body stays charged while the realm still holds it");
+  ok(fired.length === 2, "clear cancels the armed wake");
+  wake.clearAll();
+  throws(() => wake.arm(0, tag), "disposal permanently closes the wake");
+
+  let releaseFired, calls = 0;
+  const inFlight = createRealmTimers(() => {
+    calls++;
+    if (calls === 1) return new Promise((resolve) => { releaseFired = resolve; });
+  });
+  inFlight.arm(0, tag);
+  await sleep(20);
+  for (let i = 0; i < 2000; i++) inFlight.arm(0, tag);
+  await sleep(20);
+  ok(calls === 1, "a deferred wake cannot accumulate in-flight notifications");
   releaseFired();
   await sleep(20);
-  inFlight.arm(2, 60_000, new Uint8Array(8));
-  ok(true, "and is released once the invocation it was handed to settles");
+  ok(calls === 2, "only the latest due successor enters after settlement");
   inFlight.clearAll();
 }
 
@@ -669,14 +660,14 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     let table;
     table = createRealmTimers((_body, causalClock) => {
       fires += 1;
-      table.arm(1, 0, new Uint8Array(1));
+      table.arm(0, new Uint8Array(4));
       // Stand in for the realm's execution report. Burn real time too, so divisor 1 is
       // the control where execution spend and concurrent credit accrual cancel exactly.
       const started = performance.now();
       while (performance.now() - started < occupyMs) { /* guest is computing */ }
       causalClock.charge(performance.now() - started);
-    }, 10, 4096, budgetMs, clockDivisor);
-    table.arm(1, 0, new Uint8Array(1));
+    }, budgetMs, clockDivisor);
+    table.arm(0, new Uint8Array(4));
     await sleep(spinForMs);
     table.clearAll();
     return fires;
@@ -689,20 +680,15 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   ok(paced * occupyMs <= spinForMs / 4 + 2 * budgetMs,
     `a spinning guest stays inside its share of the clock (${paced} × ${occupyMs}ms in ${spinForMs}ms)`);
 
-  // Metered on the clock the fires occupy and never on how many there are, so the transport's
-  // own shape — a cheap deadline per link, all coming due at once — meets none of it. Pacing
-  // THAT would be a regression rather than a bound.
+  // Replacement is cheap and leaves just one pending host wake.
   let cheap = 0;
   const honest = createRealmTimers(() => { cheap += 1; });
-  for (let id = 0; id < 64; id++) honest.arm(id, 0, new Uint8Array(1));
+  for (let id = 0; id < 64; id++) honest.arm(0, new Uint8Array(4));
   await sleep(60);
-  ok(cheap === 64, `64 deadlines that cost nothing all fire at once (${cheap})`);
+  ok(cheap === 1, `64 replacements produce one cheap wake (${cheap})`);
   honest.clearAll();
 
-  // Waiting is not execution. Start below an empty bank, then keep the first fire parked
-  // longer than recovery takes. Its successor must become admissible WHILE the first is
-  // still awaiting; charging dispatch-to-settlement wall time would keep it slipped until
-  // the wait ended and then make it buy the same credit a second time.
+  // A successor waits for settlement, but I/O wait still earns execution credit.
   let waitingFires = 0;
   let releaseWait;
   const waiting = createRealmTimers((_body, causalClock) => {
@@ -710,14 +696,15 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     if (waitingFires !== 1) return;
     causalClock.charge(2 * budgetMs); // clamps the bank to -budgetMs
     return new Promise((resolve) => { releaseWait = resolve; });
-  }, 10, 4096, budgetMs, 4);
-  waiting.arm(1, 0, new Uint8Array(1));
+  }, budgetMs, 4);
+  waiting.arm(0, new Uint8Array(4));
   await sleep(20);
-  waiting.arm(2, 0, new Uint8Array(1));
+  waiting.arm(0, new Uint8Array(4));
   await sleep(220); // -40 -> +1 earns in 164 ms at a divisor of 4
-  ok(waitingFires === 2,
-    "a timer root earns clock credit while its entrypoint is parked on I/O");
+  ok(waitingFires === 1, "a due successor waits for the in-flight wake to settle");
   releaseWait();
+  await sleep(20);
+  ok(waitingFires === 2, "clock credit earned during I/O admits the successor promptly after settlement");
   waiting.clearAll();
 
   // Host compute is execution too, and it is the half no guest segment is open to see: a
@@ -790,11 +777,11 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   const rooted = createRealmTimers((body, causalClock) => {
     rootedFires += 1;
     return caller.call(body, undefined, causalClock);
-  }, 10, 4096, budgetMs, 4);
+  }, budgetMs, 4);
   const charged = new Promise((resolve) => { moduleCharged = resolve; });
-  rooted.arm(1, 0, new Uint8Array(1));
+  rooted.arm(0, new Uint8Array(4));
   await charged;
-  rooted.arm(2, 0, new Uint8Array(1));
+  rooted.arm(0, new Uint8Array(4));
   await sleep(30);
   ok(rootedFires === 1,
     "fire-and-forget work remains charged through an await and a cross-realm call");
@@ -1136,22 +1123,17 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    // handle reads [caller 32][body]: ONE entrypoint, and the body is this app's own
-    // op framing ([opLen u8][op][args]), supplied by this test app. When arming a
-    // deadline the app gives the host its complete future loopback body; the host stores
-    // and returns those bytes opaquely after the same zero caller id used by invoke.
+    // Four-byte host bodies are wake tags; other inputs use this app's op framing.
 ${guestOpFraming()}
     function handle(arg) {
       const { body } = callerOf(arg);
+      if (body.length === 4) { fired.push(body[3]); return new Uint8Array(0); }
       const { op, args: p } = readOp(body);
-      if (op === "timer") { fired.push((p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]) >>> 0); return new Uint8Array(0); }
       if (op === "arm") {
-        const event = writeOp("timer", u32x2(p[0], 0).slice(0, 4));
-        const request = new Uint8Array(8 + event.length);
-        request.set(u32x2(p[0], p[1])); request.set(event, 8);
-        host.call("timer/arm", request); return new Uint8Array(0);
+        const request = u32x2(p[1], p[0]);
+        return host.call("timer/arm", request).then(() => new Uint8Array(0));
       }
-      if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
+      if (op === "clear") { return host.call("timer/clear", new Uint8Array(0)).then(() => new Uint8Array(0)); }
       if (op === "fired") return new Uint8Array(fired);
       return new Uint8Array(0);
     }
@@ -1186,13 +1168,13 @@ ${guestOpFraming()}
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
   // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
-  // it back: the id is the GUEST's throughout, so the host keeps no second name for it.
+  // it back: the tag is opaque content, not a host-side timer id.
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("clear", new Uint8Array([9])));
   await sleep(80);
   const after = await ticker.invoke(opInput("fired"));
-  ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
+  ok(after.length === 1, `a cleared wake does not fire, and repeated arms replace it (got [${[...after]}])`);
   shell.close();
 
   // The gate is still the manifest: a bundle that did not declare `timer` is refused by
@@ -1218,9 +1200,7 @@ ${guestOpFraming()}
       armed = o.hostCall;
       return {
         call: async (p) => {
-          let op = "";
-          try { op = readOp(p.subarray(32)).op; } catch { /* empty body — not an op call */ }
-          entries.push(op === "timer" ? "timer" : "invoke");
+          entries.push(p.length === 36 ? "timer" : "invoke");
           return new Uint8Array();
         },
         dispose() {},
@@ -1231,9 +1211,7 @@ ${guestOpFraming()}
   const stubApp = await stub.install(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
-  const pending = new Uint8Array(8 + opInput("timer", new Uint8Array([0, 0, 0, 1])).length);
-  pending.set(new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
-  pending.set(opInput("timer", new Uint8Array([0, 0, 0, 1])), 8);
+  const pending = new Uint8Array([0, 0, 0, 5, 0, 0, 0, 1]);
   await armed("timer/arm", pending);
   ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
