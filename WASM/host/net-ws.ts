@@ -10,35 +10,21 @@
 // The WebSocket global is touched only inside `connect` (or an injected factory), so
 // importing it where WebSocket is absent is safe.
 import type { ChannelFactory, ListenAddress, RawLink } from "../core/socket-seam.js";
-import { MessageChannel } from "./net-channel.js";
+import { MessageChannel, type MessageTransport } from "./net-channel.js";
 import { parseDest } from "./peer-addr.js";
 
-/** The minimal structural view of the platform WebSocket this factory dials — so
- *  this module type-checks without committing to a DOM lib and accepts any
- *  conforming implementation (the browser global, Bun's, or a test double). */
-export interface WsLike {
-  binaryType: string;
-  /** Bytes queued but not yet on the wire — the host owner's custody signal
-   *  (socket-seam.ts `RawLink.buffered`). Optional: not every WebSocket-shaped
-   *  object in a test double reports it. */
-  bufferedAmount?: number;
-  send(data: Uint8Array): void;
-  close(): void;
-  addEventListener(type: "open" | "close" | "error", cb: () => void): void;
-  addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
-}
-
 export interface WsNetworkOptions {
-  /** Open a WebSocket to `url`. Defaults to the platform global. */
-  webSocketFactory?: (url: string) => WsLike;
+  /** Open a WebSocket to `url`. Defaults to the platform global; any object meeting
+   *  `MessageTransport` (Bun's WebSocket, a test double) is accepted. */
+  webSocketFactory?: (url: string) => MessageTransport;
 }
 
 export class WsNetwork implements ChannelFactory {
-  private readonly mkWs: (url: string) => WsLike;
+  private readonly mkWs: (url: string) => MessageTransport;
 
   constructor(opts: WsNetworkOptions = {}) {
     this.mkWs = opts.webSocketFactory
-      ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => WsLike }).WebSocket(url));
+      ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => MessageTransport }).WebSocket(url));
   }
 
   /** A destination is already a URL a browser `WebSocket` takes — `wss://` is how a

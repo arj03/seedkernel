@@ -54,14 +54,6 @@ const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 
   REASON_LOCAL = 4, REASON_TRUNCATED = 5, REASON_REFUSED = 6, REASON_TIMEOUT = 7,
   REASON_DROPPED = 8;
 
-function reasonCode(link) {
-  const r = link.closeReason;
-  return r === "handshake" ? REASON_HANDSHAKE : r === "clean" ? REASON_CLEAN
-    : r === "aborted" ? REASON_ABORTED : r === "local" ? REASON_LOCAL
-    : r === "truncated" ? REASON_TRUNCATED : r === "refused" ? REASON_REFUSED
-    : r === "timeout" ? REASON_TIMEOUT : r === "dropped" ? REASON_DROPPED : REASON_OPEN;
-}
-
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
 
 const SUITE_CHANNEL_CONCEALED = 0x03;
@@ -557,7 +549,7 @@ class Link {
     });
   }
 
-  /** Why this link ended, as the occupant alone can say it. Read by `reasonCode`, returned
+  /** Why this link ended, as the occupant alone can say it. A REASON_* code returned
    *  from `linkClosed`, printed by the driver — the node's one answer to "is it me, them, or
    *  the network?" when the other end is another machine.
    *
@@ -581,21 +573,21 @@ class Link {
    *  and an attacker who could induce a farewell could make an arbitrary cut look like a
    *  clean shutdown to the far end. */
   get closeReason() {
-    if (!this.closed) return "open";
+    if (!this.closed) return REASON_OPEN;
     if (!this.authed) {
-      if (this.aborted) return "refused";
-      if (this.timedOut) return "timeout";
+      if (this.aborted) return REASON_REFUSED;
+      if (this.timedOut) return REASON_TIMEOUT;
       // Nothing of ours closed it, so the socket died on its own: refused, unreachable, or
       // hung up. Same test as `truncated` below, which is the post-auth form of it — and
       // the commonest line an operator sees, verified against the real loader binary
       // (`--peers <id>@127.0.0.1:9` prints `link 1 down: dropped`).
-      if (!this.closedLocally) return "dropped";
-      return "handshake";
+      if (!this.closedLocally) return REASON_DROPPED;
+      return REASON_HANDSHAKE;
     }
-    if (this.peerSaidGoodbye) return "clean";
-    if (this.aborted) return "aborted";
-    if (this.closedLocally) return "local";
-    return "truncated";
+    if (this.peerSaidGoodbye) return REASON_CLEAN;
+    if (this.aborted) return REASON_ABORTED;
+    if (this.closedLocally) return REASON_LOCAL;
+    return REASON_TRUNCATED;
   }
 
   // ── handshake ───────────────────────────────────────────────────────────────

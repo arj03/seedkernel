@@ -48,12 +48,9 @@ declare const bridge: {
   /** Write a whole file atomically (temp + rename). `mode` is a POSIX permission bit
    *  set, or 0 to leave the platform default. */
   writeFile(path: string, bytes: Uint8Array, mode: number): void;
-  /** One operator line on stderr — stdout is the data channel (`stdout` below), which an
-   *  operator line would corrupt. */
+  /** One operator or console diagnostic line on stderr — stdout is the data channel
+   *  (`stdout` below), which a log line would corrupt. */
   log(line: string): void;
-  /** One diagnostic line on stderr — where every `console.*` in this realm goes
-   *  (native-polyfills.ts). */
-  logErr(line: string): void;
   /** Raw bytes on stdout — `--op` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */

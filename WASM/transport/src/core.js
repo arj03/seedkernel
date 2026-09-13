@@ -515,7 +515,7 @@ entry("linkBytes", async (r) => {
   return NOTHING;
 });
 
-/** The socket is gone. The return is the one-byte reason (`reasonCode`, ake.js) — a fact
+/** The socket is gone. The return is the one-byte reason (`closeReason`, ake.js) — a fact
  *  only this program ever held, since it is the end with the session keys, and the driver
  *  prints the non-routine ones so a node that cannot reach its cohort says why. It carries
  *  no link id: the event names the link, so a return cannot speak about another socket, and
@@ -526,7 +526,7 @@ entry("linkClosed", (r) => {
   if (!link) return NOTHING;
   link.onChannelClosed();
   linksById.delete(linkId);
-  return Uint8Array.of(reasonCode(link));
+  return Uint8Array.of(link.closeReason);
 });
 
 /** A fired deadline (§12.2): the shell's per-realm timer table re-entering this realm as

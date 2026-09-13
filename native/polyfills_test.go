@@ -14,7 +14,7 @@ import (
 // leaves disconnected, so shared host code's `console.log` went nowhere and its
 // `console.error` threw a TypeError — which made a transport wedged inside a `.catch`
 // handler invisible twice over. host/native-polyfills.ts replaces console over
-// `bridge.logErr`.
+// `bridge.log`.
 //
 // Asserted on stderr rather than on the bridge function, because *which* stream it lands
 // on is the property: stdout carries `--op`'s raw response bytes, which a diagnostic

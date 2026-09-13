@@ -11,10 +11,11 @@ export interface MessageTransport {
      *  (socket-seam.ts `RawLink.buffered`). Optional: not every transport-shaped
      *  object in a test double reports it. */
   bufferedAmount?: number;
-  /** The send accepted by every real transport here (DOM WebSocket and
-     *  RTCDataChannel both take any of these shapes; an off-browser data channel
-     *  may accept only a Uint8Array, which is what this class always sends). */
-  send(data: string | ArrayBufferView | ArrayBuffer | Blob): void;
+  /** This class only ever sends bytes, so that is the whole requirement: a DOM
+     *  WebSocket or RTCDataChannel accepts more, an off-browser data channel may not.
+     *  A view rather than `Uint8Array`, because the DOM lib types RTCDataChannel's as
+     *  `ArrayBufferView<ArrayBuffer>`, which a `Uint8Array<ArrayBufferLike>` misses. */
+  send(data: ArrayBufferView): void;
   close(): void;
   addEventListener(type: "open" | "close" | "error", cb: () => void): void;
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
@@ -111,12 +112,7 @@ export class MessageChannel {
   protected fail(): void {
     if (this.dead)
       return;
-    this.dead = true;
-    this.dropPending();
-    try {
-      this.t.close();
-    }
-    catch { /* already gone */ }
+    this.close();
     this.onCls?.();
   }
 }

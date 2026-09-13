@@ -81,11 +81,11 @@ const POLYFILLS = `
   // leaves disconnected: console.log was discarded and console.error threw a TypeError
   // *inside* the handler that reports a wedged transport guest.
   //
-  // Everything here goes to STDERR through the bridge, because stdout is the operator's
-  // channel — it carries \`bridge.log\` and, for --op, the app's raw response bytes. Guarded
+  // Everything here goes to STDERR through \`bridge.log\`, because stdout carries the
+  // app's raw response bytes for --op. Guarded
   // on the bridge, so only the HOST realm gets it; a confined guest has no console at all
   // (qjs.WithoutHostObjects), matching the JS target's realm.
-  if (typeof bridge !== "undefined" && typeof bridge.logErr === "function") {
+  if (typeof bridge !== "undefined" && typeof bridge.log === "function") {
     const show = (a) => {
       if (typeof a === "string") return a;
       // Message first: quickjs's \`stack\` is the frames ALONE, so printing it by itself
@@ -100,7 +100,7 @@ const POLYFILLS = `
     const emit = (args) => {
       let line = "";
       for (let i = 0; i < args.length; i++) line += (i ? " " : "") + show(args[i]);
-      bridge.logErr(line);
+      bridge.log(line);
     };
     const sink = function () { emit(arguments); };
     globalThis.console = {

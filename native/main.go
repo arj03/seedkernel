@@ -151,13 +151,8 @@ func exposeBridge(qc *qjs.Context) {
 	}))
 	b.SetPropertyStr("log", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// The realm's console.log writes to a WASI stdout wazero leaves disconnected, so
-		// operator output returns via stderr — stdout is `--op`'s raw data channel.
-		fmt.Fprintln(os.Stderr, t.Args()[0].String())
-		return t.Context().NewUndefined(), nil
-	}))
-	b.SetPropertyStr("logErr", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		// Diagnostics — every `console.*` in the host realm (host/native-polyfills.ts).
-		// Stderr for the same reason as `log` above.
+		// operator output and console diagnostics return via stderr — stdout is `--op`'s
+		// raw data channel.
 		fmt.Fprintln(os.Stderr, t.Args()[0].String())
 		return t.Context().NewUndefined(), nil
 	}))
