@@ -746,7 +746,7 @@ async function testModuleCallBound() {
   console.log("Test: a spinning module is killed at its deadline and respawned (§4.3)");
 
   const { ModuleTable } = await imp("build/host/module-table.js");
-  const { SPIN_WASM } = await import("./fixtures/spin-wasm.mjs");
+  const { SPIN_WASM, SPIN_OR_ECHO_WASM } = await import("./fixtures/spin-wasm.mjs");
   const { testHost } = await import("./fixtures.mjs");
   const { publicKey: pk } = generateKeyPair();
   const spinKey = appKey(pk, "spin");
@@ -754,7 +754,7 @@ async function testModuleCallBound() {
   // The default table bound is generous; a bounded host is the deployment's number. The
   // call's OWN deadline is what a guest's call carries — the guest's remaining segment.
   const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
-  await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_OR_ECHO_WASM }]);
   assert(host.isBound(spinKey, "spin"), "the spinning module binds (its memory is bounded at admission)");
 
   // The host thread is never blocked: timers keep firing while the module spins in its
@@ -774,32 +774,29 @@ async function testModuleCallBound() {
   assert(spent >= 100 && spent < 3000, `it is killed near its bound, not eventually (${spent}ms)`);
   assert(heartbeats > 0, "the host thread was alive the whole time the module spun");
 
-  // A fresh instance serves the next call: the kill terminated the old worker and a
-  // respawn stands a new one in, statics gone.
-  await host.bindAll(spinKey, [{ name: "spin", wasm: forwarderBytes }]);
-  const echo = await host.callModule(spinKey, "spin", new Uint8Array([9]), 1000);
-  assertEqual([...echo], [9], "a module called again after a kill-and-respawn still runs");
+  // A fresh instance serves the next call to the SAME module: the kill terminated the old
+  // worker, and that call loads a new one, statics gone. No rebind — a rebind builds a new
+  // set and would never touch the killed module.
+  const echo = await host.callModule(spinKey, "spin", new Uint8Array([0, 9]), 1000);
+  assertEqual([...echo], [0, 9], "the killed module answers on a fresh worker");
 
   // Two calls to the SAME module cannot run at once: the table keeps one in flight per
   // module (§3, "one transform at a time"), so a spinner burns one core for one bound.
   const host2 = testHost(new ModuleTable());
-  await host2.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  await host2.bindAll(spinKey, [{ name: "spin", wasm: SPIN_OR_ECHO_WASM }]);
   const t1 = Date.now();
   const [a, b] = await Promise.all([
-    host2.callModule(spinKey, "spin", new Uint8Array(), 80),
-    host2.callModule(spinKey, "spin", new Uint8Array(), 80),
+    host2.callModule(spinKey, "spin", new Uint8Array([1]), 80),
+    host2.callModule(spinKey, "spin", new Uint8Array([1]), 80),
   ]);
   const serial = Date.now() - t1;
   assert(a === null && b === null,
     "both spins answered like traps, at their own deadlines");
   assert(serial >= 140 && serial < 5000, `the two calls ran one after the other (${serial}ms)`);
-  // …and the module still answers after two kills in a row, on ONE worker: the respawn a
-  // kill starts and the respawn the queued call would start are the same load
-  // (`ModuleTable.respawn`), and two loads per kill would leak an idle never-terminated
-  // worker (invisible: an unref'd worker is absent from `getActiveResourcesInfo`).
-  await host2.bindAll(spinKey, [{ name: "spin", wasm: forwarderBytes }]);
-  const after = await host2.callModule(spinKey, "spin", new Uint8Array([3]), 1000);
-  assertEqual([...after], [3], "the module answers on its one respawned worker after two kills");
+  // …and the same module still answers after two kills in a row: the queued call loaded
+  // the worker the second spin ran on, and the next call loads another.
+  const after = await host2.callModule(spinKey, "spin", new Uint8Array([0, 3]), 1000);
+  assertEqual([...after], [0, 3], "the module answers on a fresh worker after two kills");
   host2.removeApp(spinKey);
 
   // An unbounded call is an operator's explicit opt-out: Infinity disables the bound,

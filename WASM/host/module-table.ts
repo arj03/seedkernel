@@ -25,12 +25,8 @@ export interface ModuleTableOptions {
 interface WasmModuleRef {
   /** The verified bytes, retained for the respawn after a kill (§4.3). */
   wasm: Uint8Array;
-  /** The live worker, or null while a killed module respawns. */
+  /** The live worker, or null after a kill or crash — the next call loads a fresh one. */
   worker: ModuleWorker | null;
-  /** The respawn in progress, shared so concurrent callers wait on one. Every respawn is
-   *  recorded here, including the one a deadline kill starts — a second load started in
-   *  that window would stand up an orphan isolate, still spinning. */
-  spawning: Promise<void> | null;
   /** Set once the ref leaves the table (`teardown`). A load in flight then must kill what
    *  it spawned rather than adopt it onto a ref nothing holds. */
   dead: boolean;
@@ -40,15 +36,22 @@ interface WasmModuleRef {
   /** The module's scratch region, read off the worker's instance at load, so an oversized
    *  payload is refused without a worker round-trip. */
   scratchSize: number;
-  /** Calls awaiting their worker's answer, by the id this host minted. */
-  pending: Map<number, (r: ModuleResult) => void>;
+  /** The call awaiting its worker's answer. Calls chain on `tail`, so there is at most one. */
+  pending: ((r: ModuleResult) => void) | null;
+}
+
+/** Settle the call in flight on `ref`, if there is one. */
+function answer(ref: WasmModuleRef, r: ModuleResult): void {
+  const settle = ref.pending;
+  ref.pending = null;
+  settle?.(r);
 }
 
 /** One worker message, the whole protocol between the table and a module worker. */
 type WorkerMsg =
   | { type: "ready"; scratchSize: number }
   | { type: "loadError"; message: string }
-  | { type: "result"; id: number; bytes: ArrayBuffer | null; ms: number };
+  | { type: "result"; bytes: ArrayBuffer | null; ms: number };
 
 /** A worker port as the table uses it — the subset the two platforms' workers share
  *  (Node `worker_threads` and the browser's dedicated `Worker`). */
@@ -133,7 +136,7 @@ port.onmessage = (e) => {
       try { new Uint8Array(memory.buffer, scratch, wipeLen).fill(0); } catch { /* trapped/grown memory */ }
     }
     const ms = performance.now() - t0;
-    port.postMessage({ type: "result", id: m.id, bytes, ms }, bytes === null ? [] : [bytes]);
+    port.postMessage({ type: "result", bytes, ms }, bytes === null ? [] : [bytes]);
   }
 };
 `;
@@ -201,10 +204,6 @@ export class ModuleTable implements PureModuleLoader {
   /** The default module-call bound (ModuleTableOptions.deadlineMs). */
   private readonly deadlineMs: number;
 
-  /** Ids for calls in flight to this table's workers — one stream, so no two calls share
-   *  an id and a worker's answer correlates with the call that asked. */
-  private callSeq = 0;
-
   constructor(opts: ModuleTableOptions = {}) {
     this.deadlineMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   }
@@ -247,11 +246,10 @@ export class ModuleTable implements PureModuleLoader {
     const ref: WasmModuleRef = {
       wasm: wasmBytes,
       worker: null,
-      spawning: null,
       dead: false,
       tail: Promise.resolve(),
       scratchSize: 0,
-      pending: new Map(),
+      pending: null,
     };
     await this.load(ref);
     return ref;
@@ -260,7 +258,7 @@ export class ModuleTable implements PureModuleLoader {
   /** Bring `ref`'s worker up: spawn, load, wait for `ready` — or fail. Bounded like a call,
    *  because instantiation RUNS the start section, so an unbounded load is a wedged node at
    *  install. */
-  private async load(ref: WasmModuleRef): Promise<void> {
+  private async load(ref: WasmModuleRef): Promise<ModuleWorker> {
     const worker = await spawnWorker(moduleWorkerSrc());
     // The ref may have left its set while this was spawning. Adopting the worker now would
     // leave it unreachable, unkillable, and still running whatever it was given.
@@ -281,14 +279,12 @@ export class ModuleTable implements PureModuleLoader {
         }, this.deadlineMs);
       }
       // One handler for both phases: load and calls are strictly sequential per module (a
-      // call reaches a worker only after `ready`, and a respawn holds the queue).
+      // call reaches a worker only after `ready`, and a reload runs inside the queued call).
       worker.onMessage((m) => {
         if (m.type === "result") {
-          const settle = ref.pending.get(m.id);
-          if (settle) {
-            ref.pending.delete(m.id);
-            settle({ bytes: m.bytes === null ? null : new Uint8Array(m.bytes), ms: m.ms });
-          }
+          // Only the current worker answers the call in flight: a killed or crashed worker
+          // can still deliver a late reply, which must not settle the call that followed.
+          if (ref.worker === worker) answer(ref, { bytes: m.bytes === null ? null : new Uint8Array(m.bytes), ms: m.ms });
           return;
         }
         if (!loading) return;
@@ -322,13 +318,13 @@ export class ModuleTable implements PureModuleLoader {
     if (ref.dead) { ref.worker = null; worker.kill(); throw new Error("table: module was released while it loaded"); }
     // After the load settles, an engine crash — not a wasm trap, which the worker catches
     // and reports as a null result — fails the in-flight call with the same empty answer
-    // and leaves the module to respawn.
+    // and leaves the next call to load a fresh worker.
     worker.onError(() => {
       if (ref.worker !== worker) return;
-      for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
-      ref.pending.clear();
       ref.worker = null;
+      answer(ref, { bytes: null, ms: 0 });
     });
+    return worker;
   }
 
   // ─── public API ──────────────────────────────────────────────────────
@@ -353,74 +349,50 @@ export class ModuleTable implements PureModuleLoader {
   }
 
   /** Run one call on a module's worker, under `bound`. Never rejects: every failure — a
-   *  dead worker, a respawn that could not stand up, a worker killed at the deadline — is
+   *  dead worker, a reload that could not stand up, a worker killed at the deadline — is
    *  the same empty answer a trap produces, so nothing downstream changes. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
-    // The previous call may have killed the worker; run on the fresh instance the kill
-    // asked for, whose statics are gone — which is the point.
-    if (w.worker === null) await this.respawn(w);
-    const worker = w.worker;
-    if (!worker) return { bytes: null, ms: 0 };
+    // A kill or crash left no worker: load a fresh instance, whose statics are gone — which
+    // is the point. Calls chain on `tail`, so this is the module's only load in flight. A
+    // failed load killed what it spawned; the module answers empty and the next call retries.
+    const worker = w.worker ?? await this.load(w).catch(() => null);
+    if (worker === null) { w.worker = null; return { bytes: null, ms: 0 }; }
     // Own an exact-sized, transferable buffer even when the caller passed a Node Buffer.
     const input = new Uint8Array(payload);
     // Held open for the duration of the call: an unbounded call arms no timer, and the
     // caller is awaiting an answer only this worker can give.
     worker.keepAlive(true);
     return new Promise<ModuleResult>((resolve) => {
-      const id = ++this.callSeq;
       let timer: ReturnType<typeof setTimeout> | null = null;
-      w.pending.set(id, (r) => {
+      w.pending = (r) => {
         if (timer !== null) clearTimeout(timer);
         worker.keepAlive(false);
         resolve(r);
-      });
+      };
       if (Number.isFinite(bound)) {
         timer = setTimeout(() => {
           // The module did not return within its bound. Kill the isolate — the engine's one
-          // interrupt, which works even mid-loop — answer empty, and respawn. It burned the
-          // full bound, so THAT is what the caller's segment is billed: a guest looping on a
-          // wedged module must exhaust its budget rather than spin forever free.
-          w.pending.delete(id);
-          resolve({ bytes: null, ms: bound });
-          if (w.worker === worker) {
-            w.worker = null;
-            worker.kill();
-            // Recorded as THE respawn, not started loose: the call queued behind this one
-            // resumes before the new worker has spawned, and a second load started there
-            // would orphan an isolate running the code the kill was for.
-            void this.respawn(w);
-          }
+          // interrupt, which works even mid-loop — answer empty, and leave the next call to
+          // load a fresh one. It burned the full bound, so THAT is what the caller's segment
+          // is billed: a guest looping on a wedged module must exhaust its budget rather than
+          // spin forever free. Every other path that retires this worker settles the call
+          // first, which clears this timer, so the worker is still the module's own.
+          answer(w, { bytes: null, ms: bound });
+          w.worker = null;
+          worker.kill();
         }, bound);
       }
-      worker.post({ type: "call", id, payload: input.buffer }, [input.buffer]);
+      worker.post({ type: "call", payload: input.buffer }, [input.buffer]);
     });
   }
 
-  /** Stand a killed module's worker back up — once, however many callers ask. The
-   *  promise is parked on the ref so the deadline path and the next call share one
-   *  load; it never rejects, because a module that cannot be respawned is simply a
-   *  module whose calls answer empty until it is unbound. */
-  private respawn(w: WasmModuleRef): Promise<void> {
-    if (w.spawning === null) {
-      // A load that failed leaves no usable worker behind (every failure path inside it
-      // kills what it spawned), so the ref goes back to "no worker" and the next call asks
-      // again.
-      const done: Promise<void> = this.load(w)
-        .catch(() => { w.worker = null; })
-        .then(() => { if (w.spawning === done) w.spawning = null; });
-      w.spawning = done;
-    }
-    return w.spawning;
-  }
-
-  /** Kill a module's worker and settle everything waiting on it as empty — the module is
+  /** Kill a module's worker and settle the call waiting on it as empty — the module is
    *  gone, and no caller may hang on a promise nothing can settle. */
   private teardown(ref: WasmModuleRef): void {
-    // Marked first: a respawn may be mid-flight, and the load that finishes after this
-    // returns has to kill what it spawned rather than adopt it onto a departed ref.
+    // Marked first: a load may be mid-flight, and when it finishes after this returns it
+    // has to kill what it spawned rather than adopt it onto a departed ref.
     ref.dead = true;
-    for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
-    ref.pending.clear();
+    answer(ref, { bytes: null, ms: 0 });
     ref.worker?.kill();
     ref.worker = null;
   }

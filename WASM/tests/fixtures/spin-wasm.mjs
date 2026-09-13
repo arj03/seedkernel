@@ -15,3 +15,14 @@ export const SPIN_WASM = new Uint8Array([
   0x0a, 0x0a, 0x01, 0x08,                         // code: 1 body, 8 bytes
   0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x00, 0x0b, // locals 0; loop { br 0 } end; unreachable; end
 ]);
+
+// The same module, except `handle` spins only when the payload's first byte is nonzero and
+// otherwise echoes the payload — so one instance can be killed and then prove, on its next
+// call, that a fresh worker answers.
+export const SPIN_OR_ECHO_WASM = new Uint8Array([
+  ...SPIN_WASM.slice(0, -12),                     // everything before the code section
+  0x0a, 0x13, 0x01, 0x11,                         // code: 1 body, 17 bytes
+  0x00, 0x41, 0x08, 0x2d, 0x00, 0x00,             // locals 0; i32.load8_u (i32.const 8)
+  0x04, 0x40, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b, // if { loop { br 0 } end } end
+  0x20, 0x00, 0x0b,                               // local.get 0; end
+]);
