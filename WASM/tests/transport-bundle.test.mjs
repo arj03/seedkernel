@@ -44,7 +44,7 @@ const currentTransportGuest = readGuestSource(guestOpFraming());
 const { ok, summary } = testkit();
 // Report-style: a failed check is logged and counted, and the suite keeps going.
 const assert = ok;
-assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signManifest", "packBundle", "authorBundle"]
+assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signBundle", "encodeBundleBody", "authorBundle"]
   .every((name) => !(name in bundleApi)), "the runtime bundle entry point has no authoring surface");
 // Read out of the artifact rather than restated: a hard-coded author is drift waiting
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
@@ -52,10 +52,10 @@ const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
 assert(transportVerified.guestSource === currentTransportGuest,
   "the shipped transport contains the canonical generated op-frame source");
-// The guest text is what the manifest hashes, and the parts are checked out CRLF on
+// The guest text is part of the signed body, and the parts are checked out CRLF on
 // Windows and LF elsewhere — so the assembler normalizes, or the same commit signs
 // different bytes depending on who built it.
-assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its manifest hash is the same on every platform");
+assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its signed bytes are the same on every platform");
 assert(JSON.stringify(transportVerified.manifest.guest.config) === JSON.stringify(TRANSPORT_APP_CONFIG),
   "the shipped transport manifest signs the guest's complete default configuration");
 // The artifact is PQ-signed (§14.1): one hybrid suite, and the id policy pins is a key-set

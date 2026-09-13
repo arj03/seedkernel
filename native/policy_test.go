@@ -127,7 +127,7 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	// B's bundle declares the same app name under a claim of its own, and installs too —
 	// beside A, never over it.
 	bundleB := writeBundleFile(t, "ownedapp",
-		manifestEnvelope(t, authorB, claimManifest(t, "ownedapp", "ownedapp-b")), stubGuestSrc)
+		bundleEnvelope(t, authorB, claimManifest(t, "ownedapp", "ownedapp-b"), stubGuestSrc, forwarderWasm))
 	if status := loadBundle(bundleB); status != loadedLine("ownedapp", 1, keyB, "ownedapp-b") {
 		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}

@@ -27,7 +27,7 @@ const (
 // wsModuleJS lifts ws.wasm out of the transport bundle the host already embeds, so the
 // module under test is always the one that ships in the signed bundle.
 const wsModuleJS = `
-globalThis.__wsModuleBytes = () => unpackBundle(transportBundleBytes())["ws.wasm"];
+globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).modules.find(({ mod }) => mod.name === "ws").wasm;
 `
 
 // wsModule stands the codec up on the module table's runtime. The scratch floor mirrors

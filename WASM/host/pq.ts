@@ -53,7 +53,7 @@ interface MlDsaExports {
 
 /** Instantiate mldsa65.wasm. Async because browsers refuse synchronous compilation over
  *  4 KB on the main thread — but only the *load* is: every operation below is synchronous,
- *  which is what lets `verifyManifest` stay synchronous (§12.4). */
+ *  which is what lets `verifyBundle` stay synchronous (§12.4). */
 export async function loadMlDsa65(wasm: BufferSource): Promise<MlDsa65Signer> {
   const { instance } = await WebAssembly.instantiate(wasm, {});
   return createMlDsa65(instance);
@@ -152,7 +152,7 @@ function randomBytes(n: number): Uint8Array {
 }
 
 /** Mix ML-DSA-65 into a libsodium instance, once at boot. Consumers downstream see a
- *  `sodium` that knows the method, which is how `verifyManifest` discovers whether this
+ *  `sodium` that knows the method, which is how `verifyBundle` discovers whether this
  *  host can accept suite `0x02`. */
 export function withMlDsa65<T extends object>(sodium: T, mldsa: MlDsa65Signer): T & MlDsa65Signer {
   return Object.assign(sodium, mldsa);

@@ -1,3 +1,4 @@
+import { signTestBundle, verifyTestBundle } from "./bundle-fixtures.mjs";
 // Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and seam
 // gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each block is a
 // tight loop over one seam; run.mjs covers the same ground end-to-end. Run after `npm run build`.
@@ -31,9 +32,9 @@ const { MAX_QUEUED_SIGNAL_BYTES, MAX_QUEUED_SIGNALS, MAX_UNESTABLISHED_PEERS,
   MAX_PENDING_ICE_BYTES, MAX_SDP_BYTES }
   = await imp("build/host/net-rtc.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { appKeyFor, appScopeFor, genesisHash, verifyManifest, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
+const { appKeyFor, appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
-const { signManifest, packBundle, guestOpFraming } = await imp("build/host/bundle-author.js");
+const { guestOpFraming } = await imp("build/host/bundle-author.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
 // is signed and verified with both halves of the author's key set (§12.4), so a bare
 // libsodium cannot sign one.
@@ -191,22 +192,22 @@ console.log("\n§12.2 — fs is scoped per app key");
 console.log("\n§12.4 — every app is a guest, modules are its library");
 {
   const kp = testAuthor();
-  const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp, m));
+  const verify = (m) => verifyTestBundle(sodium, signTestBundle(sodium, kp, m));
   // Refused BY NAME, like an unimplemented ABI: this is what a bundle written against the
   // retired module-only format produces, so its author has to learn the rule rather than
   // read "malformed manifest".
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
-  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", requires: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [], guest: { requires: [] } }) !== null,
     "a guest may declare no modules at all");
-  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", requires: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [{ name: "a" }, { name: "b" }], guest: { requires: [] } }) !== null,
     "a guest may declare multiple modules within the admission cap");
-  const tooMany = Array.from({ length: DEFAULT_MAX_BUNDLE_MODULES + 1 }, (_, i) => ({ name: `m${i}`, hash: "aa" }));
-  ok(refusal({ app: "x", version: 1, modules: tooMany, guest: { hash: "aa", requires: [] } }).includes("malformed manifest"),
-    "the manifest module-count cap is enforced before file extraction");
+  const tooMany = Array.from({ length: DEFAULT_MAX_BUNDLE_MODULES + 1 }, (_, i) => ({ name: `m${i}` }));
+  ok(refusal({ app: "x", version: 1, modules: tooMany, guest: { requires: [] } }).includes("malformed manifest"),
+    "the manifest module-count cap is enforced before module extraction");
   for (const version of [-1, Number.MAX_SAFE_INTEGER + 1]) {
-    ok(refusal({ app: "x", version, modules: [], guest: { hash: "aa", requires: [] } }).includes("malformed manifest"),
+    ok(refusal({ app: "x", version, modules: [], guest: { requires: [] } }).includes("malformed manifest"),
       `version ${version} is refused before it can poison freshness state`);
   }
 }
@@ -816,14 +817,11 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const manifest = {
     app: "probe", version: 1, modules: [],
     guest: {
-      hash: toHex(genesisHash(sodium, guestBytes)), requires: [],
+      requires: [],
       config: signedConfig,
     },
   };
-  const blob = packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, kp, manifest),
-    [GUEST_FILE]: guestBytes,
-  });
+  const blob = signTestBundle(sodium, kp, manifest, guestBytes);
 
   const seen = [];
   const { shell } = await bootShell({
@@ -892,10 +890,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
       ...manifest,
       guest: { ...manifest.guest, config: "not-an-object" },
     };
-    const scalarBlob = packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, kp, scalarManifest),
-      [GUEST_FILE]: guestBytes,
-    });
+    const scalarBlob = signTestBundle(sodium, kp, scalarManifest, guestBytes);
     await rejects(shell.install(scalarBlob),
       "a signed guest.config that is not a JSON object is a refused manifest");
   }
@@ -1165,12 +1160,9 @@ ${guestOpFraming()}
   const mkBlob = (requires) => {
     const manifest = {
       app: "ticker", version: 1, modules: [],
-      guest: { hash: toHex(genesisHash(sodium, guestBytes)), requires },
+      guest: { requires },
     };
-    return packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, kp, manifest),
-      [GUEST_FILE]: guestBytes,
-    });
+    return signTestBundle(sodium, kp, manifest, guestBytes);
   };
   // `fs: false` said rather than omitted: these bundles declare no `fs` cap, and the
   // in-memory default would hand this node a backend it is not meant to have.

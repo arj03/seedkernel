@@ -42,23 +42,22 @@ export { bytesEqual } from "./bytes.mjs";
 
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
-export const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMarks,
-  verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
+export const { appKeyFor, hybridAuthorId, FreshnessMarks,
+  verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
-export const { signManifest, packBundle, guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
+export const { guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
 export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
-export const gHash = (b) => bundleGenesisHash(sodium, b);
 
 // Every app is a guest (§12.4), so every bundle a test builds declares one. The stub
 // used by tests that do not exercise the guest is the same minimal program throughout.
 export const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 export const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
-export const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), requires: [], ...extra });
+export const GUEST = (extra = {}) => ({ requires: [], ...extra });
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
  *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins, app
- *  keys, freshness marks) and hand the whole object to `signManifest`, so none can pin
+ *  keys, freshness marks) and hand the whole object to `signTestBundle`, so none can pin
  *  half an identity. */
 export const testAuthor = () => makeAuthor(sodium);
 
@@ -161,3 +160,5 @@ export async function installMod(host, appKey, module, wasm) {
 // derivation, not a mirror, so a test can name a table entry without packing a whole
 // bundle and still land where the loader would put it.
 export const appKey = (authorPk, app) => appKeyFor(authorPk, app);
+
+export { signTestBundle, verifyTestBundle } from "./bundle-fixtures.mjs";

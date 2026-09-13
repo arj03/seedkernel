@@ -11,9 +11,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
 import {
-  sodium, root, toHex, concatBytes, hybridAuthorId, verifyManifest, verifyBundle,
-  signManifest, packBundle, authorBundle, testAuthor, appKey, testHost, installBundle,
-  moduleFile, MANIFEST_FILE, GUEST_FILE, GUEST_TEXT, GUEST_BYTES, forwarderBytes,
+  sodium, root, toHex, concatBytes, hybridAuthorId, verifyTestBundle, verifyBundle,
+  signTestBundle, authorBundle, testAuthor, appKey, testHost, installBundle,
+  GUEST_TEXT, GUEST_BYTES, forwarderBytes,
   JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN,
 } from "./fixtures.mjs";
 
@@ -35,8 +35,8 @@ async function testManifestSuiteByte() {
   console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
   const author = testAuthor();
   // One module: this test is about the suite byte, not the module count.
-  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", requires: [] } };
-  const env = signManifest(sodium, author, manifest);
+  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } };
+  const env = signTestBundle(sodium, author, manifest);
 
   // Layout: the suite byte leads, and the author's Ed25519 key follows it (not at
   // offset 0). The rest of the envelope is testHybridManifestSuite's subject.
@@ -45,7 +45,7 @@ async function testManifestSuiteByte() {
 
   // 1. Untouched, it verifies and returns the author id + manifest.
   {
-    const v = verifyManifest(sodium, env);
+    const v = verifyTestBundle(sodium, env);
     assert(v !== null, "an untouched manifest verifies");
     assertEqual(toHex(v.author), toHex(author.id), "the derived author id round-trips");
     assertEqual(v.manifest.app, "suite-probe", "the manifest round-trips");
@@ -58,7 +58,7 @@ async function testManifestSuiteByte() {
   for (const suite of [0x01, 0x7f]) {
     const bad = env.slice(); bad[0] = suite;
     let msg = "";
-    try { verifyManifest(sodium, bad); } catch (e) { msg = String(e.message); }
+    try { verifyTestBundle(sodium, bad); } catch (e) { msg = String(e.message); }
     assert(msg.includes("unsupported manifest suite"),
       `suite 0x${suite.toString(16)} reports itself (got: ${msg || "no throw"})`);
     assert(!msg.includes("signature"), "an unimplemented suite is not reported as a signature failure");
@@ -73,7 +73,7 @@ async function testManifestSuiteByte() {
     const sig = sodium.crypto_sign_detached(pre, author.ed.privateKey);
     const legacyEnv = concatBytes([Uint8Array.of(0x01), author.ed.publicKey, sig, json]);
     let msg = "";
-    try { verifyManifest(sodium, legacyEnv); } catch (e) { msg = String(e.message); }
+    try { verifyTestBundle(sodium, legacyEnv); } catch (e) { msg = String(e.message); }
     assert(msg.includes("unsupported manifest suite 0x01"),
       `a well-formed genesis-suite envelope is refused by suite (got: ${msg || "no throw"})`);
   }
@@ -83,7 +83,7 @@ async function testManifestSuiteByte() {
   {
     const forged = env.slice();
     forged[33] ^= 0x01; // flip a byte of the ML-DSA public key → must not verify
-    assert(verifyManifest(sodium, forged) === null, "a tampered envelope does not verify");
+    assert(verifyTestBundle(sodium, forged) === null, "a tampered envelope does not verify");
   }
 
   console.log("  OK\n");
@@ -243,24 +243,32 @@ async function testHybridManifestSuite() {
   const keys = testAuthor();
   const ed = keys.ed, pq = keys.mlDsa;
   // One module: this test is about the envelope, not the module count.
-  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", requires: [] } };
-  const env = signManifest(sodium, keys, manifest);
+  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } };
+  const env = signTestBundle(sodium, keys, manifest);
 
-  // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
+  // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][body]`. Both keys
   //    lead, so a verifier reads the whole key set before either signature.
   const OFF_ML_PK = 33, OFF_ED_SIG = OFF_ML_PK + ML_DSA65_PK_LEN;
-  const OFF_ML_SIG = OFF_ED_SIG + 64, OFF_JSON = OFF_ML_SIG + ML_DSA65_SIG_LEN;
+  const OFF_ML_SIG = OFF_ED_SIG + 64, OFF_BODY = OFF_ML_SIG + ML_DSA65_SIG_LEN;
   assertEqual(env[0], 0x02, "the envelope opens with the hybrid manifest suite id");
   assertEqual(toHex(env.slice(1, 33)), toHex(ed.publicKey), "the Ed25519 key follows the suite byte");
   assertEqual(toHex(env.slice(OFF_ML_PK, OFF_ED_SIG)), toHex(pq.publicKey), "the ML-DSA key follows it");
-  assertEqual(new TextDecoder().decode(env.slice(OFF_JSON)), JSON.stringify(manifest),
-    "the manifest JSON is carried verbatim after both signatures");
+  assertEqual(new TextDecoder().decode(env.slice(OFF_BODY + 4, OFF_BODY + 4 + new DataView(env.buffer).getUint32(OFF_BODY, false))), JSON.stringify(manifest),
+    "the manifest JSON is carried verbatim as the first body field");
+
+  const bodyHash = sodium.crypto_generichash(32, env.subarray(OFF_BODY));
+  const signedInput = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"),
+    Uint8Array.of(0x02), ed.publicKey, pq.publicKey, bodyHash]);
+  assert(sodium.crypto_sign_verify_detached(env.subarray(OFF_ED_SIG, OFF_ML_SIG), signedInput, ed.publicKey),
+    "Ed25519 signs the independently constructed body-hash preimage");
+  assert(sodium.ml_dsa65_verify_detached(env.subarray(OFF_ML_SIG, OFF_BODY), signedInput, pq.publicKey),
+    "ML-DSA signs the same body-hash preimage");
 
   // 2. Untouched, it verifies — and the author id is the hash over BOTH keys, never
   //    either one (§12.4). That is what hybrid signing rests on: an attacker who breaks
   //    one algorithm cannot reach this identity while choosing the other half's key.
   {
-    const v = verifyManifest(sodium, env);
+    const v = verifyTestBundle(sodium, env);
     assert(v !== null, "an untouched hybrid manifest verifies");
     assertEqual(toHex(v.author), toHex(hybridAuthorId(sodium, ed.publicKey, pq.publicKey)),
       "the author id is the derived key-set hash");
@@ -274,9 +282,9 @@ async function testHybridManifestSuite() {
   //    manifest. "Either verifies" would be exactly as strong as the weaker algorithm.
   {
     const badEd = env.slice(); badEd[OFF_ED_SIG] ^= 0x01;
-    assert(verifyManifest(sodium, badEd) === null, "a broken Ed25519 half fails the manifest");
+    assert(verifyTestBundle(sodium, badEd) === null, "a broken Ed25519 half fails the manifest");
     const badMl = env.slice(); badMl[OFF_ML_SIG] ^= 0x01;
-    assert(verifyManifest(sodium, badMl) === null, "a broken ML-DSA half fails the manifest");
+    assert(verifyTestBundle(sodium, badMl) === null, "a broken ML-DSA half fails the manifest");
   }
 
   // 4. The splice a hybrid format has to survive: swap in a different Ed25519 key with a
@@ -286,17 +294,17 @@ async function testHybridManifestSuite() {
   {
     const { generateKeyPair } = await import("./fixtures.mjs");
     const attacker = generateKeyPair();
-    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const body = env.slice(OFF_BODY);
     const pre = concatBytes([
       new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x02),
-      attacker.publicKey, pq.publicKey, json,
+      attacker.publicKey, pq.publicKey, sodium.crypto_generichash(32, body),
     ]);
     const spliced = concatBytes([
       Uint8Array.of(0x02), attacker.publicKey, pq.publicKey,
       sodium.crypto_sign_detached(pre, attacker.privateKey),
-      env.slice(OFF_ML_SIG, OFF_JSON), json,
+      env.slice(OFF_ML_SIG, OFF_BODY), body,
     ]);
-    assert(verifyManifest(sodium, spliced) === null,
+    assert(verifyTestBundle(sodium, spliced) === null,
       "an Ed25519 key swap invalidates the untouched ML-DSA half");
   }
 
@@ -309,7 +317,7 @@ async function testHybridManifestSuite() {
       crypto_generichash: (...a) => sodium.crypto_generichash(...a),
     };
     let msg = "";
-    try { verifyManifest(classicalOnly, env); } catch (e) { msg = String(e.message); }
+    try { verifyTestBundle(classicalOnly, env); } catch (e) { msg = String(e.message); }
     assert(msg.includes("unsupported manifest suite 0x02"),
       `a host without ML-DSA refuses 0x02 (got: ${msg || "no throw"})`);
     assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");

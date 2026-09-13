@@ -267,10 +267,10 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 		// than only the one made under it.
 		{"the ML-DSA public key", offHybridMlPk},
 	} {
-		menv := manifestEnvelope(t, a, mjson)
+		menv := bundleEnvelope(t, a, mjson, stubGuestSrc, forwarderWasm)
 		menv[tc.at] ^= 0x01
-		path := writeBundleFile(t, "pqtamper", menv, stubGuestSrc)
-		if status := loadBundle(path); !strings.Contains(status, "manifest signature invalid") {
+		path := writeBundleFile(t, "pqtamper", menv)
+		if status := loadBundle(path); !strings.Contains(status, "signature invalid") {
 			t.Fatalf("tampering with %s must fail the manifest, got: %s", tc.what, status)
 		}
 	}
@@ -290,7 +290,7 @@ func TestGenesisManifestSuiteRefused(t *testing.T) {
 	mjson := manifestJSON(t, "genesis", 1, stubGuestSrc, nil)
 	pre := append(append(domainManifest(), 0x01), mjson...)
 	menv := append(append(append([]byte{0x01}, a.edPub...), ed25519.Sign(a.edPriv, pre)...), mjson...)
-	path := writeBundleFile(t, "genesis", menv, stubGuestSrc)
+	path := writeBundleFile(t, "genesis", menv)
 
 	if status := loadBundle(path); !strings.Contains(status, "unsupported manifest suite") {
 		t.Fatalf("a genesis-suite bundle must be refused by suite, got: %s", status)

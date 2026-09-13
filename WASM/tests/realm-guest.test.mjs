@@ -5,7 +5,7 @@
 // verify → admit → install lifecycle, crypto.test.mjs the manifest-suite and ACVP suites.
 //
 // Positive-path bundle fixtures go through `authorBundle` (host/bundle-author.ts) rather
-// than hand-rolled `signManifest` + `packBundle` — see bundle-install.test.mjs's header for
+// than hand-rolled `signTestBundle` — see bundle-install.test.mjs's header for
 // why a handful of cases keep the manual form instead.
 
 import { readFileSync } from "node:fs";
@@ -13,8 +13,8 @@ import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
 import {
   sodium, generateKeyPair, JsModuleLoader, root,
-  toHex, concatBytes, appKeyFor, verifyManifest,
-  signManifest, packBundle, authorBundle, gHash, GUEST_TEXT, GUEST_BYTES, GUEST,
+  toHex, concatBytes, appKeyFor, verifyTestBundle,
+  signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
   testAuthor, bootTestShell, appKey, imp, MemoryFs,
   createGuestSeam, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_TIMERS, TEST_CALLS,
   createSafeRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
@@ -290,24 +290,21 @@ async function testGuestAbi() {
   console.log("Test: the seam needs no version word — it is async all the way down");
 
   const author = testAuthor();
-  const guestText = "function handle() { return new Uint8Array([1]); }";
-  const guestBytes = new TextEncoder().encode(guestText);
-  const mk = (guest) => signManifest(sodium, author,
+  const mk = (guest) => signTestBundle(sodium, author,
     { app: "abi", version: 1, modules: [], guest });
-  const hash = toHex(gHash(guestBytes));
 
-  // A guest declares only its hash and its requires. There is no `abi` field left to
+  // A guest declares its required services. There is no `abi` field left to
   // get wrong or forget — the one failure the version existed to refuse (a name read
   // on the wrong side of a sync/async line) is structurally impossible when every
   // name answers a Promise.
-  const verified = verifyManifest(sodium, mk({ hash, requires: [] }));
+  const verified = verifyTestBundle(sodium, mk({ requires: [] }));
   assert(verified !== null, "a manifest with no seam version verifies");
   assert(!("abi" in verified.manifest.guest), "the verified manifest carries no abi field");
 
   // Every bundle declares a guest (§12.4), and a manifest without one is refused BY NAME:
   // it is what a bundle written against the retired module-only format produces.
   let noGuest = "";
-  try { verifyManifest(sodium, signManifest(sodium, author,
+  try { verifyTestBundle(sodium, signTestBundle(sodium, author,
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
@@ -318,13 +315,13 @@ async function testGuestAbi() {
   // each naming the fix.
   {
     let refused = "";
-    try { verifyManifest(sodium, mk({ hash, requires: ["fs/get"] })); }
+    try { verifyTestBundle(sodium, mk({ requires: ["fs/get"] })); }
     catch (e) { refused = e.message; }
     assert(refused.includes('declare the SERVICE "fs"'),
       `a manifest requiring the method "fs/get" is refused, naming the service to declare instead (got: ${refused})`);
 
     let local = "";
-    try { verifyManifest(sodium, mk({ hash, requires: ["_backup"] })); }
+    try { verifyTestBundle(sodium, mk({ requires: ["_backup"] })); }
     catch (e) { local = e.message; }
     assert(local.includes("guest.calls"),
       `a local service id in guest.requires is refused, naming the list it belongs in (got: ${local})`);
@@ -332,7 +329,7 @@ async function testGuestAbi() {
   // …and the SERVICE, by exact name, is what a manifest may require — the guest still
   // calls the finer-grained method; being undeclarable at that granularity is not being
   // unavailable.
-  assert(verifyManifest(sodium, mk({ hash, requires: ["fs"] })) !== null,
+  assert(verifyTestBundle(sodium, mk({ requires: ["fs"] })) !== null,
     "a service, by exact name, is what a manifest may require");
 
   // A called id colliding with this bundle's OWN module name is refused: the seam's
@@ -340,19 +337,19 @@ async function testGuestAbi() {
   // collision would silently shadow the module (guest-seam.ts). A called id spelled like a
   // host method is refused for the mirror reason.
   {
-    const withModule = (calls) => signManifest(sodium, author, {
+    const withModule = (calls) => signTestBundle(sodium, author, {
       app: "abi", version: 1,
-      modules: [{ name: "codec", hash: "aa" }],
-      guest: { hash, requires: [], calls },
+      modules: [{ name: "codec" }],
+      guest: { requires: [], calls },
     });
     let refused = "";
-    try { verifyManifest(sodium, withModule(["codec"])); } catch (e) { refused = e.message; }
+    try { verifyTestBundle(sodium, withModule(["codec"])); } catch (e) { refused = e.message; }
     assert(refused.includes("codec") && refused.includes("module"),
       `a called local service id colliding with this bundle's own module name is refused (got: ${refused})`);
-    assert(verifyManifest(sodium, withModule([])) !== null,
+    assert(verifyTestBundle(sodium, withModule([])) !== null,
       "…and the same module name is fine when nothing calls a service by it too");
     let shadow = "";
-    try { verifyManifest(sodium, withModule(["fs/get"])); } catch (e) { shadow = e.message; }
+    try { verifyTestBundle(sodium, withModule(["fs/get"])); } catch (e) { shadow = e.message; }
     assert(shadow.includes('"fs" service'),
       `a called id spelled like a host method is refused (got: ${shadow})`);
   }
@@ -360,7 +357,7 @@ async function testGuestAbi() {
   // Any OTHER bare or slashed name is a legitimate LOCAL service id (§12.10): the
   // vocabulary is open on that half, since whether anything actually claims it is answered
   // at the call, never at the manifest.
-  assert(verifyManifest(sodium, mk({ hash, requires: [], calls: ["_backup", "reporting/v2"] })) !== null,
+  assert(verifyTestBundle(sodium, mk({ requires: [], calls: ["_backup", "reporting/v2"] })) !== null,
     "an arbitrary called local service id verifies; nothing claiming it yet is not a manifest error");
 
   console.log("  OK\n");
@@ -679,7 +676,7 @@ async function testSeamGating() {
   assert(threw, "node/random over the cap is refused");
 
   // The vocabulary is closed at LOAD, not at first use: an unknown name in a manifest is
-  // a refused bundle (verifyManifest), and the seam answers "no such name" besides.
+  // a refused bundle (verifyTestBundle), and the seam answers "no such name" besides.
   threw = false;
   try { await open("transform/do", U()); } catch { threw = true; }
   assert(threw, "`transform` is gone from the vocabulary — a manifest naming it is refused");

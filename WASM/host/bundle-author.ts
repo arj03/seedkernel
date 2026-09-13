@@ -1,16 +1,12 @@
 // Offline app-bundle authoring (§12.4). Runtime shells import only bundle.ts, which has no
 // signing or packing surface; this module depends on the verifier's manifest validation so
 // an author's accepted vocabulary cannot drift behind what a loader will accept.
-import { concatBytes, toHex, enc } from "../core/util.js";
+import { concatBytes, enc } from "../core/util.js";
 import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../core/domains.js";
 import { callerOf, readOp, writeOp } from "../core/op-frame.js";
 import {
-  GUEST_FILE,
-  MANIFEST_FILE,
-  genesisHash,
   hybridAuthorId,
-  manifestSigningInput,
-  moduleFile,
+  bundleSigningInput,
   validateManifest,
   type BundleGuest,
   type BundleManifest,
@@ -22,7 +18,7 @@ import {
 /** The surface *signing* a manifest needs — the build-side of the format. */
 export interface ManifestCrypto extends ManifestVerifier {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
-  /** The PQ half of the signature; `signManifest` throws without it. */
+  /** The PQ half of the signature; `signBundle` throws without it. */
   ml_dsa65_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
 }
 
@@ -67,53 +63,37 @@ export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Ar
   };
 }
 
-/** Sign a manifest into its envelope (§12.4). Both signatures are over the same preimage, so
- *  there is no ordering to get wrong. Throws without an ML-DSA signer: there is no second
- *  envelope to fall back to, so a build that cannot produce the PQ half fails at the build. */
-export function signManifest(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest): Uint8Array {
-  if (!sodium.ml_dsa65_sign_detached) {
-    throw new Error("bundle: no ML-DSA-65 signer — cannot sign a manifest");
-  }
-  const json = encodeManifest(m);
-  const pre = manifestSigningInput(keys.ed.publicKey, keys.mlDsa.publicKey, json);
-  const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
-  const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
-  return concatBytes([
-    Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), keys.ed.publicKey, keys.mlDsa.publicKey,
-    edSig, mlSig, json,
-  ]);
-}
-
-/** Serialize a set of named bundle files into one bundle blob (bundle.ts container format). */
-export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
-  const names = Object.keys(files);
-  if (names.length > 0xffff) {
-    throw new Error(`bundle: too many files (${names.length} > 65535)`);
-  }
-  const header = new Uint8Array(6);
-  header.set([0x53, 0x4b, 0x42, 0x31], 0); // "SKB1"
-  new DataView(header.buffer).setUint16(4, names.length, false);
-  const parts: Uint8Array[] = [header];
-  for (const name of names) {
-    const nameBytes = enc.encode(name);
-    if (nameBytes.length > 0xffff) {
-      throw new Error(`bundle: filename too long (${nameBytes.length} bytes > 65535): ${name}`);
-    }
-    const data = files[name];
-    if (data.length > 0xffffffff) {
-      throw new Error(`bundle: file data too large (${data.length} bytes > 0xffffffff): ${name}`);
-    }
-    const rec = new Uint8Array(2 + nameBytes.length + 4);
-    const dv = new DataView(rec.buffer);
-    dv.setUint16(0, nameBytes.length, false);
-    rec.set(nameBytes, 2);
-    dv.setUint32(2 + nameBytes.length, data.length, false);
-    parts.push(rec, data);
+/** Frame the signed body: manifest, guest, modules in manifest order. Every length is
+ *  a u32 big-endian byte count and is covered by both signatures. */
+export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+  const parts: Uint8Array[] = [];
+  for (const bytes of [encodeManifest(m), guest, ...modules]) {
+    if (bytes.length > 0xffffffff) throw new Error("bundle: body field exceeds u32 length");
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, bytes.length, false);
+    parts.push(length, bytes);
   }
   return concatBytes(parts);
 }
 
-/** The raw materials for a new signed bundle — hashes are derived, never supplied. */
+/** Sign the whole bundle. Low-level writer for tests as well as authorBundle; validation
+ *  belongs to authorBundle so tests can sign malformed manifests and body layouts. */
+export function signBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest,
+  guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+  if (!sodium.ml_dsa65_sign_detached) {
+    throw new Error("bundle: no ML-DSA-65 signer — cannot sign a bundle");
+  }
+  const body = encodeBundleBody(m, guest, modules);
+  const pre = bundleSigningInput(sodium, keys.ed.publicKey, keys.mlDsa.publicKey, body);
+  const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
+  const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
+  return concatBytes([
+    Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), keys.ed.publicKey, keys.mlDsa.publicKey,
+    edSig, mlSig, body,
+  ]);
+}
+
+/** The raw materials for a new signed bundle. */
 export interface UnsignedBundle {
   app: string;
   /** Monotonic per-(author, app) freshness mark (§12.4) — the caller's to bump. */
@@ -137,14 +117,11 @@ export interface AuthoredBundle {
   author: Uint8Array;
 }
 
-/** Hash, assemble, validate with the verifier's checks, sign and pack a bundle. */
+/** Assemble, validate with the verifier's checks, and sign the entire bundle. */
 export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, input: UnsignedBundle): AuthoredBundle {
-  const modules: BundleModule[] = input.modules.map(({ name, wasm }) => ({
-    name, hash: toHex(genesisHash(sodium, wasm)),
-  }));
+  const modules: BundleModule[] = input.modules.map(({ name }) => ({ name }));
   const guestBytes = enc.encode(input.guestSource);
   const guest: BundleGuest = {
-    hash: toHex(genesisHash(sodium, guestBytes)),
     requires: input.guestRequires,
     ...(input.guestCalls !== undefined ? { calls: input.guestCalls } : {}),
     ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
@@ -158,11 +135,8 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     guest,
   };
   validateManifest(manifest);
-  const env = signManifest(sodium, keys, manifest);
-  const files: Record<string, Uint8Array> = { [MANIFEST_FILE]: env, [GUEST_FILE]: guestBytes };
-  for (const { name, wasm } of input.modules) files[moduleFile(name)] = wasm;
   return {
-    blob: packBundle(files),
+    blob: signBundle(sodium, keys, manifest, guestBytes, input.modules.map(({ wasm }) => wasm)),
     manifest,
     author: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey),
   };

@@ -1,16 +1,11 @@
-// App bundle format (§12.4): signed manifest envelope + modules + guest.js.
-// Every name is derived; the manifest commits to every file hash.
+// App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, } from "../core/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
-  /** Logical name: the file `<name>.wasm` and the key the guest addresses it by through
-     *  `host.call`. Unique within a manifest; `NAME_RE` keeps it from spelling a host method
-     *  (§12.2). */
+  /** The logical key the guest addresses through `host.call`; unique in the manifest. */
   name: string;
-  /** genesisHash(wasm) hex — content integrity for the module bytes (§12.4). */
-  hash: string;
 }
 
 /** A value representable by the manifest's signed JSON encoding. App configuration is
@@ -24,8 +19,6 @@ export interface JsonObject {
  *  top level because both are the guest's alone: WASM modules carry no authority and read
  *  no config. */
 export interface BundleGuest {
-  /** genesisHash(utf8(source)) hex of `guest.js`. */
-  hash: string;
   /** Exactly the host SERVICES this guest is granted (`HOST_SERVICES`) — what it calls on
      *  the HOST. Closed at load: a service this host does not grant is a refused manifest, not
      *  a requirement that quietly grants nothing at first use. A method name (`fs/get`) is
@@ -71,7 +64,7 @@ export interface ManifestVerifier {
   /** The genesis hash — content integrity, and the author id (`hybridAuthorId`). */
   crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
   /** ML-DSA-65 verify (FIPS 204), the PQ half of the manifest suite (§14.1). The suite is
-     *  hybrid, so a host without it cannot check any manifest at all — `verifyManifest` refuses
+     *  hybrid, so a host without it cannot check any manifest at all — `verifyBundle` refuses
      *  rather than falling back to the Ed25519 half alone. */
   ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
 }
@@ -80,16 +73,6 @@ export interface ManifestVerifier {
 export interface ManifestAuthorKeys {
   ed: Uint8Array;
   mlDsa: Uint8Array;
-}
-
-/** What a verified envelope yields. `author` is the 32-byte derived key-set id
- *  (`hybridAuthorId`), the one identity everything downstream reads; `authorKeys` is for
- *  the caller that cares *which keys* signed — a shell showing an operator what it is being
- *  asked to admit. */
-export interface VerifiedManifest {
-  author: Uint8Array;
-  authorKeys: ManifestAuthorKeys;
-  manifest: BundleManifest;
 }
 
 /** The persisted bundle-freshness high-water mark per `(author, app)` (§12.4), plus the set
@@ -155,12 +138,6 @@ export interface VerifiedBundle {
  *  without retaining the raw module bytes after the private instances are built. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
-/** The manifest envelope's name inside the container. */
-export const MANIFEST_FILE = "manifest.bundle";
-/** The guest program's name inside the container (§12.4 — fixed, never declared). */
-export const GUEST_FILE = "guest.js";
-/** A module's name inside the container, derived from its logical name. */
-export function moduleFile(name: string): string { return name + ".wasm"; }
 /** App identity `"<author hex>:<app>"` (§12.4) — freshness, scope, uninstall/revoke. */
 export function appKeyFor(author: Uint8Array, app: string): string {
   return toHex(author) + ":" + app;
@@ -200,8 +177,8 @@ const OFF_ED_PK = SUITE_LEN;
 const OFF_ML_PK = OFF_ED_PK + PK_LEN;
 const OFF_ED_SIG = OFF_ML_PK + ML_DSA_PK_LEN;
 const OFF_ML_SIG = OFF_ED_SIG + SIG_LEN;
-const OFF_JSON = OFF_ML_SIG + ML_DSA_SIG_LEN;
-/** Module names double as filenames and as the guest's module keys, so they are held to an
+const OFF_BODY = OFF_ML_SIG + ML_DSA_SIG_LEN;
+/** Module names are the guest's module keys, so they are held to an
  *  unambiguous charset — and, since one `host.call` name is either a host method or a bare
  *  name, to a first character that cannot start one: a `/` would spell a host method. A
  *  collision with a name in `guest.calls` is checked by the call site (`validateManifest`),
@@ -214,10 +191,9 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  *  on the wire (`protocols`) or name a local call graph edge, so the whitespace, control and
  *  lookalike characters an operator could not tell apart are out. */
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
-/** Signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. Both keys sign, and
- *  each commits to the other, so the pair cannot be taken apart. */
-export function manifestSigningInput(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
-  return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, json]);
+/** Both keys sign `DOMAIN_manifest ‖ suite ‖ keys ‖ BLAKE2b-256(body)`. */
+export function bundleSigningInput(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array, body: Uint8Array): Uint8Array {
+  return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, genesisHash(sodium, body)]);
 }
 /** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. The whole key
  *  set, so the id is unreachable without both private keys. */
@@ -309,23 +285,17 @@ function isValidManifest(m: unknown): m is BundleManifest {
     const mm = mod;
     if (typeof mm.name !== "string" || !NAME_RE.test(mm.name))
       return false;
-    if (enc.encode(mm.name + ".wasm").length > 0xffff)
-      return false;
-    if (typeof mm.hash !== "string")
-      return false;
     if (seen.has(mm.name))
       return false;
     seen.add(mm.name);
   }
-  // A manifest that *omits* `guest` entirely is caught by name in verifyManifest; this is
+  // A manifest that *omits* `guest` entirely is caught by name in verifyBundle; this is
   // the shape check for one that declared a broken guest.
   if (o.guest === undefined)
     return false;
   {
     const g = o.guest as Record<string, unknown>;
     if (typeof g !== "object" || g === null || Array.isArray(g))
-      return false;
-    if (typeof g.hash !== "string")
       return false;
     if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string"))
       return false;
@@ -336,7 +306,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
   }
   return true;
 }
-/** The checks `verifyManifest` runs after a signature verifies and `authorBundle` runs
+/** The checks `verifyBundle` runs after a signature verifies and `authorBundle` runs
  *  *before* signing — one copy, so what a verifier refuses is exactly what an author refuses
  *  to sign. Shape and vocabulary only; whether *this* node grants a well-formed authority
  *  name is policy (§12.5). */
@@ -376,14 +346,12 @@ export function validateManifest(manifest: unknown): asserts manifest is BundleM
     }
   }
 }
-/** Verify a manifest envelope; returns the author id + parsed manifest, or null if a
- *  signature is bad. Throws when the body is validly signed but not parseable JSON of the
- *  expected shape — a signed-but-broken manifest is fail-loud, not an untrusted input to
- *  drop — and on a suite this host cannot check at all, which is a legibility failure rather
- *  than a verdict. */
-export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): VerifiedManifest | null {
+/** Authenticate the entire bundle before parsing its body. The body is a sequence of
+ *  u32 big-endian length-prefixed byte strings: manifest JSON, guest UTF-8, then one WASM
+ *  per manifest module. Returned bytes own their storage, including for Buffer inputs. */
+export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): VerifiedBundle {
   if (env.length < SUITE_LEN)
-    return null;
+    throw new Error("bundle: signature invalid");
     // Suite before offsets: another suite's keys and signatures are other widths, so parsing
     // first would read its bytes at this suite's positions. A legibility failure ("this
     // bundle wants a host I am not"), not an authenticity verdict, so it throws rather than
@@ -400,23 +368,36 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
   if (!sodium.ml_dsa65_verify_detached) {
     throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
   }
-  if (env.length < OFF_JSON)
-    return null;
+  if (env.length < OFF_BODY)
+    throw new Error("bundle: signature invalid");
   // Only the keys outlive this call (`authorKeys`), so only they own their bytes — a Node Buffer's slice() aliases.
   const edPk = new Uint8Array(env.subarray(OFF_ED_PK, OFF_ML_PK));
   const mlPk = new Uint8Array(env.subarray(OFF_ML_PK, OFF_ED_SIG));
   const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
-  const mlSig = env.slice(OFF_ML_SIG, OFF_JSON);
-  const json = env.slice(OFF_JSON);
-  const pre = manifestSigningInput(edPk, mlPk, json);
+  const mlSig = env.slice(OFF_ML_SIG, OFF_BODY);
+  const body = env.subarray(OFF_BODY);
+  const pre = bundleSigningInput(sodium, edPk, mlPk, body);
   // Both, always: a break in either half then rejects valid bundles (recoverable) instead
   // of admitting forged ones (not).
   if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk))
-    return null;
+    throw new Error("bundle: signature invalid");
   if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk))
-    return null;
+    throw new Error("bundle: signature invalid");
   const author = hybridAuthorId(sodium, edPk, mlPk);
   const authorKeys = { ed: edPk, mlDsa: mlPk };
+  // Lengths and JSON are interpreted only after both signatures authenticate the body.
+  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  let off = 0;
+  const read = () => {
+    if (off + 4 > body.length) throw new Error("bundle: truncated body");
+    const length = dv.getUint32(off, false);
+    off += 4;
+    if (length > body.length - off) throw new Error("bundle: truncated body");
+    const bytes = body.subarray(off, off + length);
+    off += length;
+    return bytes;
+  };
+  const json = read();
   let parsed;
   try {
     parsed = JSON.parse(dec.decode(json));
@@ -433,62 +414,10 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
   // The same vocabulary the author checks before signing (`validateManifest`, shared with
   // `authorBundle`): one copy, so the author's checks cannot fall behind the verifier's.
   validateManifest(parsed);
-  return { author, authorKeys, manifest: parsed };
-}
-/** True if `bytes` content hashes to the declared genesisHash hex (integrity). */
-export function contentMatches(bytes: Uint8Array, declaredHex: string, genesisHash: (b: Uint8Array) => Uint8Array): boolean {
-  return toHex(genesisHash(bytes)) === declaredHex.toLowerCase();
-}
-// ── The container (§12.4) ────────────────────────────────────────────────────
-//
-// Pure *framing*, not a signed format of its own: the manifest envelope inside carries the
-// author's signature and its module hashes protect the bytes. Layout, integers big-endian:
-//
-//   "SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
-const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
-/** Parse a bundle blob back into its `{ file: bytes }` map. Throws on a mis-magicked,
- *  truncated or self-contradicting blob — fail-loud, like a malformed manifest. */
-export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
-  if (blob.length < 6 || !ARCHIVE_MAGIC.every((b, i) => blob[i] === b)) {
-    throw new Error("bundle: not a bundle blob");
-  }
-  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  const count = dv.getUint16(4, false);
-  // A NULL prototype, because the container is read before anything is verified and its
-  // names are the sender's: `files[name] = …` on an object literal reads "__proto__" as
-  // the prototype slot rather than as an entry, so that one name would both vanish from
-  // the map and re-point it at bytes the sender chose.
-  const files: Record<string, Uint8Array> = Object.create(null) as Record<string, Uint8Array>;
-  let off = 6;
-  for (let i = 0; i < count; i++) {
-    if (off + 2 > blob.length)
-      throw new Error("bundle: truncated blob");
-    const nameLen = dv.getUint16(off, false);
-    off += 2;
-    if (off + nameLen + 4 > blob.length)
-      throw new Error("bundle: truncated blob");
-    const name = dec.decode(blob.subarray(off, off + nameLen));
-    off += nameLen;
-    const dataLen = dv.getUint32(off, false);
-    off += 4;
-    if (off + dataLen > blob.length)
-      throw new Error("bundle: truncated blob");
-    // One name, one file. A repeat would let the later entry shadow the earlier one, and
-    // the container is the one part of the format no signature covers — so a blob
-    // carrying two `manifest.bundle`s would be one bundle to a reader that keeps the last
-    // and a different bundle to one that keeps the first, from the same bytes.
-    if (name in files)
-      throw new Error(`bundle: two files named ${JSON.stringify(name)} in the blob`);
-    files[name] = new Uint8Array(blob.subarray(off, off + dataLen));
-    off += dataLen;
-  }
-  // The blob is the entries and nothing else. Same reason as the repeated name above: what
-  // is left over is covered by no signature, so bytes after the last file would make one
-  // bundle out of unboundedly many byte strings — and the blob's own hash is the identity
-  // a denylist, a freshness mark and an operator's pin are all keyed by (§12.4).
-  if (off !== blob.length)
-    throw new Error(`bundle: ${blob.length - off} trailing bytes after the last file`);
-  return files;
+  const guestSource = dec.decode(read());
+  const modules = parsed.modules.map((mod) => ({ mod, wasm: new Uint8Array(read()) }));
+  if (off !== body.length) throw new Error("bundle: trailing bytes in body");
+  return { author, authorKeys, manifest: parsed, guestSource, modules };
 }
 /** Where a data directory's freshness marks live: a *sibling* of the directory, never a file
  *  inside it — an `fs`-capable guest writes files inside the dir, so a mark kept there would
@@ -608,43 +537,6 @@ export class FreshnessMarks {
                 "Fix the store and revoke again.", { cause: e });
     }
   }
-}
-/** Authenticate and integrity-check a bundle blob (§12.4): verify the manifest signature,
- *  then hash every module and the guest against what it commits to. Throws on anything that
- *  does not check out. Takes no host and no policy, so "nothing has landed" is a property of
- *  the type. */
-export function verifyBundle(sodium: ManifestVerifier, blob: Uint8Array): VerifiedBundle {
-  const files = unpackBundle(blob);
-  const env = files[MANIFEST_FILE];
-  if (!env)
-    throw new Error("bundle: no manifest in the blob");
-  const v = verifyManifest(sodium, env);
-  if (!v)
-    throw new Error("bundle: manifest signature invalid");
-  const read = (file: string) => {
-    const b = files[file];
-    if (!b)
-      throw new Error(`bundle: missing file ${file}`);
-    return b;
-  };
-  const result = {
-    author: v.author,
-    authorKeys: v.authorKeys,
-    manifest: v.manifest,
-    modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
-    guestSource: dec.decode(read(GUEST_FILE)),
-  };
-    // The manifest hashes are the definitive declaration of what the author authorized, so a
-    // verified signature over unchecked hashes is not yet a verified bundle.
-  for (const { mod, wasm } of result.modules) {
-    if (!contentMatches(wasm, mod.hash, (b) => genesisHash(sodium, b))) {
-      throw new Error(`bundle: ${mod.name} content hash mismatch`);
-    }
-  }
-  if (!contentMatches(enc.encode(result.guestSource), v.manifest.guest.hash, (b) => genesisHash(sodium, b))) {
-    throw new Error("bundle: guest content hash mismatch");
-  }
-  return result;
 }
 /** Build a verified bundle's private modules, all or none (§3.1). Admission already ran. */
 export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundle): Promise<PureModules> {

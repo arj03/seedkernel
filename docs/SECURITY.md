@@ -26,7 +26,7 @@ That is the entire steady-state pipeline: one AEAD open, one routing lookup, one
 **The two places cryptography does run, both off this path:**
 
 - **Once per link** — the AKE handshake (§12.6). That is what made `_from` trustworthy in step 1; every frame afterward rides its session keys.
-- **Once per install** — admitting the chat bundle (§12.4) verified both halves of the author's hybrid Ed25519 + ML-DSA-65 manifest signature over the guest and module hashes. A relayed `OFFER` (§11) re-runs exactly that check on the receiving node, which is why a *bundle* authenticates against its original author across any number of relays while a chat *message* authenticates only its single hop. An app that needs the message to survive relaying — a feed or forum — reintroduces a per-message signature and a backlink chain itself (§5.1); that is a different app from chat.
+- **Once per install** — admitting the chat bundle (§12.4) verified both halves of the author's hybrid Ed25519 + ML-DSA-65 bundle signature over the complete body's BLAKE2b-256 hash. A relayed `OFFER` (§11) re-runs exactly that check on the receiving node, which is why a *bundle* authenticates against its original author across any number of relays while a chat *message* authenticates only its single hop. An app that needs the message to survive relaying — a feed or forum — reintroduces a per-message signature and a backlink chain itself (§5.1); that is a different app from chat.
 
 ---
 

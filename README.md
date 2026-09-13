@@ -175,11 +175,11 @@ The reference composition separates application logic, dispatch, transport, and 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle; each supplies its own platform adapters. The shared host set is the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. `WASM/core/` holds core contracts and fixed host vocabulary, including manifest constants; `WASM/host/` implements the surrounding runtime, and `WASM/transport/` builds the signed transport bundle. The directory names group source files; the tables below distinguish shared code from platform code (`npm run loc` in `WASM/` computes the figures).
 
-**Shared — compiled once, run by all three targets (2,507 LOC)**
+**Shared — compiled once, run by all three targets (2,441 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 449 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 383 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 333 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the timer table and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 705 |
 | Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 369 |

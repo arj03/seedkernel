@@ -32,8 +32,7 @@ var forwarderWasm []byte
 // The manifest signing vocabulary these test bundles are written against, READ OUT OF THE
 // SHARED BUNDLE (core/domains.ts) rather than restated here.
 //
-// That is the line between the two kinds of duplication in this file: `packBundle` and
-// `manifestEnvelope` are deliberate second *implementations* fed to the shared reader, so
+// That is the line between the two kinds of duplication in this file: `bundleEnvelope` is a deliberate second *implementation* fed to the shared reader, so
 // a drift between them is the point. A constant has nothing to disagree with — a copy can
 // only be right or stale, and a stale one silently stops testing what it names.
 type manifestVocab struct {
@@ -129,24 +128,6 @@ func testSigner(t testing.TB) *mldsaSigner {
 	return signerCache
 }
 
-// packBundle serializes named files into the one bundle container (README §12.4):
-//
-//	"SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
-//
-// A deliberate second implementation of the writer, fed to the shared JS reader.
-func packBundle(files [][2]any) []byte {
-	out := append([]byte("SKB1"), 0, 0)
-	binary.BigEndian.PutUint16(out[4:], uint16(len(files)))
-	for _, f := range files {
-		n, d := []byte(f[0].(string)), f[1].([]byte)
-		out = binary.BigEndian.AppendUint16(out, uint16(len(n)))
-		out = append(out, n...)
-		out = binary.BigEndian.AppendUint32(out, uint32(len(d)))
-		out = append(out, d...)
-	}
-	return out
-}
-
 // appKeyFor asks the realm for the §5.1 app key, so a test can predict which table entry a
 // bundle's modules land under. The shared `appKeyFor` (bundle.ts) itself, not a Go
 // restatement: one computed here would agree with the table by coincidence and keep
@@ -202,30 +183,27 @@ func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc s
 	return signBundleJSON(t, a, app, manifestJSON(t, app, version, guestSrc, requires), guestSrc)
 }
 
-// signBundleJSON wraps a finished manifest body in the manifest envelope and packs it.
+// signBundleJSON signs a complete body and writes the bundle.
 func signBundleJSON(t testing.TB, a authorKeys, app string, mjson []byte, guestSrc string) (string, string) {
 	t.Helper()
-	return writeBundleFile(t, app, manifestEnvelope(t, a, mjson), guestSrc), appKeyFor(a.id(), app)
+	return writeBundleFile(t, app, bundleEnvelope(t, a, mjson, guestSrc, forwarderWasm)), appKeyFor(a.id(), app)
 }
 
-// manifestEnvelope signs a manifest body under the one manifest suite:
-//
-//	[suite 1][ed_pk 32][ml_dsa_pk 1952][ed_sig 64][ml_dsa_sig 3309][json]
-//
-// Both signatures are over DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ json, so each
-// commits to the other's key and the pair cannot be taken apart. The domain prefix is
-// signed but not stored, the suite byte both, so a verifier reads the byte giving it the
-// field widths and then checks a signature committing to that byte (§14.1).
-//
-// A deliberate second implementation of the writer, fed to the shared JS reader.
-func manifestEnvelope(t testing.TB, a authorKeys, mjson []byte) []byte {
+// bundleEnvelope independently frames and signs the whole bundle, for the shared JS reader.
+// Both keys sign DOMAIN_manifest || suite || keys || BLAKE2b-256(body).
+func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, modules ...[]byte) []byte {
 	t.Helper()
+	var body []byte
+	parts := append([][]byte{mjson, []byte(guestSrc)}, modules...)
+	for _, part := range parts {
+		body = binary.BigEndian.AppendUint32(body, uint32(len(part)))
+		body = append(body, part...)
+	}
 	pre := append(domainManifest(), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), mjson...)
-
-	menv := append([]byte{manifestSuite()}, a.edPub...)
-	menv = append(append(menv, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
-	return append(append(menv, testSigner(t).signDetached(t, pre, a.mlSk)...), mjson...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), sd.genericHash(32, body)...)
+	env := append([]byte{manifestSuite()}, a.edPub...)
+	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
+	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)
 }
 
 // claimManifest builds a manifest body claiming exactly the given protocol ids — the one
@@ -238,10 +216,9 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 		"version":   1,
 		"protocols": protocols,
 		"modules": []map[string]string{{
-			"name": "fwd", "hash": hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
+			"name": "fwd",
 		}},
 		"guest": map[string]any{
-			"hash":     hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
 			"requires": []string{},
 		},
 	})
@@ -286,12 +263,10 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 
 	type mod struct {
 		Name string `json:"name"`
-		Hash string `json:"hash"`
 	}
 	// requires + calls + config live inside `guest` (§12.4), so "no authority" is an empty
 	// `requires` list rather than an absent object.
 	type guest struct {
-		Hash     string   `json:"hash"`
 		Requires []string `json:"requires"`
 		Calls    []string `json:"calls,omitempty"`
 	}
@@ -309,11 +284,9 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		Protocols: appProtocols(app, requires),
 		Version:   version,
 		Modules: []mod{{
-			Name: moduleName, Hash: hex.EncodeToString(sd.genericHash(32, moduleBytes)),
+			Name: moduleName,
 		}},
-		Guest: guest{
-			Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
-		},
+		Guest: guest{},
 	}
 	// One fixture argument, split into the two signed lists by the question the loader also
 	// asks: is this a host service?
@@ -334,30 +307,11 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 	return mjson
 }
 
-// bundleBytes packs the ordinary forwarder fixture.
-func bundleBytes(menv []byte, guestSrc string) []byte {
-	return bundleBytesForModule(menv, guestSrc, "fwd", forwarderWasm)
-}
-
-// bundleBytesForModule packs a finished manifest envelope, one private module and the
-// guest into the container. Suite-agnostic on purpose: the envelope is opaque bytes to
-// the container, so signature-suite changes do not move the packing format (§12.4).
-func bundleBytesForModule(menv []byte, guestSrc, moduleName string, moduleBytes []byte) []byte {
-	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
-	return packBundle([][2]any{
-		{"manifest.bundle", menv},
-		{moduleName + ".wasm", moduleBytes},
-		{"guest.js", []byte(guestSrc)},
-	})
-}
-
-// writeBundleFile is bundleBytes on disk, in a fresh temp dir — what the tests that go in
-// through `cliLoadBundle` (a path) need. The benches take the bytes instead: they hand the
-// blob to a shell they already hold, so a file would only be a detour.
-func writeBundleFile(t testing.TB, app string, menv []byte, guestSrc string) string {
+// writeBundleFile writes the signed blob to a fresh temporary directory.
+func writeBundleFile(t testing.TB, app string, blob []byte) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), app+".skb")
-	if err := os.WriteFile(path, bundleBytes(menv, guestSrc), 0o644); err != nil {
+	if err := os.WriteFile(path, blob, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -367,7 +321,7 @@ func writeBundleFile(t testing.TB, app string, menv []byte, guestSrc string) str
 // path: the same manifest, the same envelope, packed and handed back.
 func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) []byte {
 	t.Helper()
-	return bundleBytes(manifestEnvelope(t, a, manifestJSON(t, app, version, guestSrc, requires)), guestSrc)
+	return bundleEnvelope(t, a, manifestJSON(t, app, version, guestSrc, requires), guestSrc, forwarderWasm)
 }
 
 // signedModuleBundleBytes is the custom-module twin used by benchmarks whose real module
@@ -375,7 +329,7 @@ func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, gues
 func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
 	t.Helper()
 	mjson := manifestJSONForModule(t, app, version, guestSrc, requires, moduleName, moduleBytes)
-	return bundleBytesForModule(manifestEnvelope(t, a, mjson), guestSrc, moduleName, moduleBytes)
+	return bundleEnvelope(t, a, mjson, guestSrc, moduleBytes)
 }
 
 // ── the probe app: how a native test puts a request on the wire ───────────────

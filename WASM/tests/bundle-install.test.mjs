@@ -5,12 +5,12 @@
 // crypto.test.mjs the manifest-suite and ACVP vector suites.
 //
 // Positive-path bundle fixtures go through `authorBundle` (host/bundle-author.ts), which
-// hashes, assembles, validates and signs in one call — the same path a real publisher
+// assembles, validates and signs in one call — the same path a real publisher
 // uses. A handful of tests build a manifest or envelope by hand instead, because what they
-// assert on is deliberately malformed or corrupted: a wrong hash, duplicate module names,
-// a corrupted archive, a tampered envelope byte. `authorBundle` calls `validateManifest`
+// assert on is deliberately malformed or corrupted: duplicate module names,
+// a corrupted body, a tampered envelope byte. `authorBundle` calls `validateManifest`
 // internally and cannot produce any of those on purpose, so those cases keep
-// `signManifest`/`packBundle` directly.
+// `signTestBundle` directly.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -19,9 +19,9 @@ import { testkit } from "./testkit.mjs";
 import {
   sodium, generateKeyPair, JsModuleLoader, bootShell, bootNodeShell, TransportHost,
   toHex, fromHex, concatBytes, writeU32BE, appKeyFor, hybridAuthorId, FreshnessMarks,
-  verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE,
-  signManifest, packBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
-  checkHostGates, gHash, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
+  verifyTestBundle, verifyBundle, loadBundleModules,
+  signTestBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
+  checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
   forwarderBytes, installMod, appKey, imp, root, bytesEqual, callerOf, readOp, writeOp,
   MemoryFs, NodeFs, enc,
@@ -83,33 +83,48 @@ async function testInstallRejectsUntrustedAuthor() {
   console.log("  OK\n");
 }
 
-async function testManifestHashIsEnforced() {
-  console.log("Test: verifyBundle enforces the manifest's module hash (§5.1)");
-
+async function testWholeBundleIsSigned() {
+  console.log("Test: both signatures cover the manifest, guest, module order and framing");
   const author = testAuthor();
-  // A manifest that declares the CORRECT hash — loadBundle should accept it.
-  const manifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-    guest: GUEST() };
-  const manifestEnv = signManifest(sodium, author, manifest);
-  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
-
-  // verifyBundle (now the single verify step) must accept a hash-matched module.
+  const wasm = [forwarderBytes, Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0)];
+  const { blob, manifest } = authorBundle(sodium, author, {
+    app: "demo", version: 1,
+    modules: [{ name: "second", wasm: wasm[0] }, { name: "first", wasm: wasm[1] }],
+    guestSource: GUEST_TEXT, guestRequires: [],
+  });
   const v = verifyBundle(sodium, blob);
-  assert(bytesEqual(v.author, author.id), "matched hash verifies");
-
-  // A manifest that declares the CORRECT hash — loadBundle should accept it.
-
-  // A manifest that declares a WRONG hash — verifyBundle must throw.
-  const badManifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(new Uint8Array([1, 2, 3]))) }],
-    guest: GUEST() };
-  const badEnv = signManifest(sodium, author, badManifest);
-  const badBlob = packBundle({ [MANIFEST_FILE]: badEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
-  let threw = false;
-  try { verifyBundle(sodium, badBlob); } catch { threw = true; }
-  assert(threw, "verifyBundle throws when a module hash does not match the bytes");
-
+  assert(bytesEqual(v.modules[0].wasm, wasm[0]) && v.modules[0].mod.name === "second",
+    "modules retain manifest order, regardless of logical names");
+  assert(!("hash" in v.manifest.guest) && v.manifest.modules.every(m => !("hash" in m)),
+    "the signed manifest contains no per-file hashes");
+  const bodyOffset = 1 + 32 + 1952 + 64 + 3309;
+  const manifestLength = enc.encode(JSON.stringify(manifest)).length;
+  const guestOffset = bodyOffset + 4 + manifestLength;
+  const moduleOffset = guestOffset + 4 + GUEST_BYTES.length;
+  const refuses = (bytes, why, expected = "signature invalid") => {
+    let message = "";
+    try { verifyBundle(sodium, bytes); } catch (e) { message = e.message; }
+    assert(message.includes(expected), why + ": " + message);
+  };
+  for (const offset of [bodyOffset, bodyOffset + 4, guestOffset, guestOffset + 4, moduleOffset, moduleOffset + 4]) {
+    const bad = blob.slice(); bad[offset] ^= 1;
+    refuses(bad, "tampering with any body field or length fails authentication");
+  }
+  refuses(blob.slice(0, -1), "truncation fails authentication");
+  refuses(concatBytes([blob, Uint8Array.of(0)]), "appending bytes fails authentication");
+  const reordered = signTestBundle(sodium, author, manifest, GUEST_BYTES, wasm.toReversed());
+  const swapped = blob.slice(); swapped.set(reordered.subarray(bodyOffset), bodyOffset);
+  refuses(swapped, "reordering modules without resigning fails authentication");
+  // Signed but inconsistent layouts are rejected after authentication.
+  refuses(signTestBundle(sodium, author, manifest, GUEST_BYTES, [wasm[0]]),
+    "missing signed module is rejected", "truncated body");
+  refuses(signTestBundle(sodium, author, manifest, GUEST_BYTES, [...wasm, wasm[0]]),
+    "extra signed module is rejected", "trailing bytes");
+  // Neither keys nor module bytes retain aliases to caller-owned Node Buffers.
+  const buffer = Buffer.from(blob), owned = verifyBundle(sodium, buffer);
+  buffer.fill(0);
+  assert(bytesEqual(owned.modules[0].wasm, wasm[0]) && bytesEqual(owned.authorKeys.ed, author.ed.publicKey),
+    "verified bytes own their storage");
   console.log("  OK\n");
 }
 
@@ -140,13 +155,13 @@ async function testDenyAllPolicyRejects() {
 // ─── Test: a non-instantiable module fails the whole load (§12.4) ───
 
 async function testBundleRefusesNonModule() {
-  console.log("Test: a hash-correct file that isn't a valid module fails the whole bundle");
+  console.log("Test: a signed WASM payload that isn't a valid module fails the whole bundle");
 
   const author = testAuthor();
   const { host } = await makeHost();
 
   // Two modules the author genuinely signed: the real forwarder, and arbitrary bytes that
-  // hash-match their manifest entry but will not instantiate. With a two-phase install, a
+  // are signed but will not instantiate. With a two-phase install, a
   // module failing phase 1 must fail the whole load — nothing lands.
   const notAModule = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
   const { blob } = authorBundle(sodium, author, {
@@ -207,7 +222,6 @@ async function testDerivedNamesKeepAuthorsApart() {
 // claims atomically, and a different bundle cannot silently displace it.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
-  const { verifyManifest } = await imp("build/host/bundle.js");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -323,7 +337,7 @@ async function testManifestClaimIsTheRouting() {
     for (const bad of [["bad id"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
       let threw = false;
       try {
-        verifyManifest(sodium, signManifest(sodium, author,
+        verifyTestBundle(sodium, signTestBundle(sodium, author,
           { app: "bad", version: 1, protocols: bad, modules: [], guest: GUEST() }));
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
@@ -331,21 +345,21 @@ async function testManifestClaimIsTheRouting() {
     // No spelling is reserved to the kernel: a `_`-led name is legal in either claim
     // list, and it is the LIST — never the spelling — that decides who may reach it.
     for (const claim of ["_offer", "_host", "_net", "plain"]) {
-      verifyManifest(sodium, signManifest(sodium, author,
+      verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "reserved", version: 1, protocols: [claim], modules: [], guest: GUEST() }));
-      verifyManifest(sodium, signManifest(sodium, author,
+      verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "reserved", version: 1, services: [claim], modules: [], guest: GUEST() }));
     }
     // Two maps, so uniqueness is PER LIST. A name in both is not ambiguous — it says
     // "reachable by a peer AND by a co-resident guest", which is a thing a bundle may mean
     // and the two maps express without a rule. A duplicate WITHIN one list still is.
     {
-      assert(verifyManifest(sodium, signManifest(sodium, author,
+      assert(verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "dual", version: 1, protocols: ["both"], services: ["both"], modules: [], guest: GUEST() })) !== null,
       "a name claimed in BOTH `protocols` and `services` is two reaches, not a conflict");
       let threw = false;
       try {
-        verifyManifest(sodium, signManifest(sodium, author,
+        verifyTestBundle(sodium, signTestBundle(sodium, author,
           { app: "dup", version: 1, protocols: ["twice", "twice"], modules: [], guest: GUEST() }));
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, "a name claimed twice in the SAME list is still refused");
@@ -709,41 +723,36 @@ async function testBundle() {
     // A minimal one-module bundle (forwarder.wasm) plus a guest stub. Modules install
     // straight from the manifest (§12.4) under the app key the loader DERIVES from the
     // signed `(author, app)` pair, each at its own logical name — so the manifest declares
-    // no bind name and names no file: they are `<name>.wasm` and `guest.js`.
+    // no bind name or filename: module bytes follow the guest in manifest order.
     const { host: h } = await makeHost();
     const testKey = appKey(author.id, "test");
     const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
-      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+      modules: [{ name: "codec" }],
       // requires + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
-        hash: toHex(gHash(new TextEncoder().encode(guestText))),
         requires: [],
       },
     };
-    const writeBundle = (m) => wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author, m),
-      [moduleFile("codec")]: forwarderBytes,
-      [GUEST_FILE]: new TextEncoder().encode(guestText),
-    }));
+    const writeBundle = (m) => wf(bundlePath, signTestBundle(sodium, author, m, enc.encode(guestText), [forwarderBytes]));
     writeBundle(manifest);
 
     // sign / verify / tamper
-    const env = signManifest(sodium, author, manifest);
-    assert(verifyManifest(sodium, env) !== null, "a well-formed manifest verifies");
+    const env = signTestBundle(sodium, author, manifest);
+    assert(verifyTestBundle(sodium, env) !== null, "a well-formed manifest verifies");
     const tampered = env.slice(); tampered[tampered.length - 1] ^= 1;
-    assert(verifyManifest(sodium, tampered) === null, "a tampered manifest fails verification");
+    assert(verifyTestBundle(sodium, tampered) === null, "a tampered manifest fails verification");
 
-    // A manifest whose module names collide is ambiguous (the name keys both the
-    // container and the guest's module map), so it is refused even though it is
+    // A manifest whose module names collide is ambiguous (the name keys the
+    // guest's module map), so it is refused even though it is
     // validly signed (§12.4).
-    const dupEnv = signManifest(sodium, author, {
+    const dupEnv = signTestBundle(sodium, author, {
       ...manifest,
       modules: [manifest.modules[0], { ...manifest.modules[0] }],
     });
     let dupRefused = false;
-    try { verifyManifest(sodium, dupEnv); } catch { dupRefused = true; }
+    try { verifyTestBundle(sodium, dupEnv); } catch { dupRefused = true; }
     assert(dupRefused, "a manifest with duplicate module names is refused as malformed");
 
     // booted shell, policy allows the author → bundle loads + module installs
@@ -790,10 +799,8 @@ async function testBundle() {
 // round-trips), a bundle blob round-tripping as one value, and `verifyBundle`
 // authenticating + integrity-checking WITHOUT a host or policy — the seam the browser
 // shell peeks a received Offer through before asking for consent.
-async function testGuestBundleAndArchive() {
+async function testGuestBundle() {
   console.log("Test: every app is a guest — bundle blob + verify/install split");
-  const { unpackBundle }
-    = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -809,79 +816,18 @@ async function testGuestBundleAndArchive() {
     // A manifest with NO `guest` field is refused: every app is a guest (§12.4).
     let noGuest = "";
     try {
-      verifyManifest(sodium, signManifest(sodium, author,
-        { app: "demo", version: 1, modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }] }));
+      verifyTestBundle(sodium, signTestBundle(sodium, author,
+        { app: "demo", version: 1, modules: [{ name: "demo" }] }));
     } catch (e) { noGuest = e.message; }
     assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
     const manifest = {
       app: "demo", version: 1,
-      modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }],
+      modules: [{ name: "demo" }],
       guest: GUEST(),
     };
-    const manifestEnv = signManifest(sodium, author, manifest);
-    assert(verifyManifest(sodium, manifestEnv) !== null, "a manifest with a guest verifies");
-
-    // Blob round-trip: a bundle IS one blob, and this is what an Offer carries over a
-    // data channel and what the loader reads from disk — one format, one path.
-    const packed = packBundle({
-      [MANIFEST_FILE]: manifestEnv,
-      [moduleFile("demo")]: forwarderBytes,
-      [GUEST_FILE]: GUEST_BYTES,
-    });
-    const files = unpackBundle(packed);
-    assert(bytesEqual(files[MANIFEST_FILE], manifestEnv), "packed manifest round-trips");
-    assert(bytesEqual(files[moduleFile("demo")], forwarderBytes), "packed module round-trips");
-    let badArchive = false;
-    try { unpackBundle(new Uint8Array([1, 2, 3])); } catch { badArchive = true; }
-    assert(badArchive, "a non-bundle blob is rejected fail-loud");
-
-    // The container's three self-consistency rules, stated by name. It is the one part of
-    // a bundle no signature covers — the manifest signs its own contents, not the blob
-    // that carries it — so a reader's good manners are all that stand between "one blob,
-    // one bundle" and a blob that is two bundles depending on who reads it. Hand-built,
-    // because these are things a `Record` cannot say.
-    const containerOf = (entries) => {
-      const header = new Uint8Array(6);
-      header.set([0x53, 0x4b, 0x42, 0x31], 0); // "SKB1"
-      new DataView(header.buffer).setUint16(4, entries.length, false);
-      const parts = [header];
-      for (const [name, data] of entries) {
-        const nameBytes = enc.encode(name);
-        const rec = new Uint8Array(2 + nameBytes.length + 4);
-        const dv = new DataView(rec.buffer);
-        dv.setUint16(0, nameBytes.length, false);
-        rec.set(nameBytes, 2);
-        dv.setUint32(2 + nameBytes.length, data.length, false);
-        parts.push(rec, data);
-      }
-      return concatBytes(parts);
-    };
-    const refuses = (blob, why) => {
-      let threw = false;
-      try { unpackBundle(blob); } catch { threw = true; }
-      assert(threw, why);
-    };
-    // Two entries under one name: only the LAST manifest.bundle is the one whose signature
-    // gets checked, so a reader that keeps the first and one that keeps the last make two
-    // different bundles out of these same bytes.
-    refuses(containerOf([[MANIFEST_FILE, enc.encode("first")], [MANIFEST_FILE, enc.encode("second")]]),
-      "two files under one name are refused");
-    // Bytes past the last declared file: the blob's hash is the identity a denylist, a
-    // freshness mark and an operator's pin are all keyed by (§12.4), and this would give
-    // one bundle unboundedly many of them.
-    refuses(concatBytes([containerOf([["a", enc.encode("x")]]), new Uint8Array([0])]),
-      "trailing bytes after the last file are refused");
-    // A count that under-declares what follows says the same thing a different way.
-    refuses(concatBytes([containerOf([]), enc.encode("junk")]),
-      "a count that under-declares the entries is refused");
-    // `__proto__` is a file name like any other. On an object literal it is the prototype
-    // slot instead, so that one entry would vanish from the map AND re-point it at bytes
-    // the sender chose — before anything has been verified.
-    const withProto = unpackBundle(containerOf([["__proto__", enc.encode("x")], [GUEST_FILE, enc.encode("y")]]));
-    assert(Object.getPrototypeOf(withProto) === null, "the unpacked map has no prototype to poison");
-    assert(bytesEqual(withProto["__proto__"], enc.encode("x")), "__proto__ arrives as an ordinary entry");
-    assertEqual(Object.keys(withProto).length, 2, "a __proto__ entry costs the map nothing");
+    const packed = signTestBundle(sodium, author, manifest, GUEST_BYTES, [forwarderBytes]);
+    assert(bytesEqual(verifyBundle(sodium, packed).modules[0].wasm, forwarderBytes), "module bytes round-trip");
 
     // The verify half on its own: no host, no policy, no freshness — the browser
     // shell's peek path. It authenticates and yields every verified byte.
@@ -889,27 +835,6 @@ async function testGuestBundleAndArchive() {
     assert(bytesEqual(v.author, author.id), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
     assertEqual(v.guestSource, GUEST_TEXT, "verifyBundle yields the verified guest source");
-    // Corrupting a module must fail integrity even though the manifest still verifies.
-    const corrupt = packBundle({
-      [MANIFEST_FILE]: manifestEnv,
-      [moduleFile("demo")]: forwarderBytes.slice(0, forwarderBytes.length - 1),
-      [GUEST_FILE]: GUEST_BYTES,
-    });
-    let integrityFailed = false;
-    try { verifyBundle(sodium, corrupt); }
-    catch { integrityFailed = true; }
-    assert(integrityFailed, "a module that does not match its declared hash fails integrity");
-    // Corrupting the guest fails the same way — the guest is signed content too.
-    const corruptGuest = packBundle({
-      [MANIFEST_FILE]: manifestEnv,
-      [moduleFile("demo")]: forwarderBytes,
-      [GUEST_FILE]: GUEST_BYTES.slice(0, GUEST_BYTES.length - 1),
-    });
-    let guestIntegrityFailed = false;
-    try { verifyBundle(sodium, corruptGuest); }
-    catch { guestIntegrityFailed = true; }
-    assert(guestIntegrityFailed, "a guest that does not match its declared hash fails integrity");
-
     // Load the bundle through the shared §12.4 loader.
     wf(bundlePath, packed);
     shell = await boot({
@@ -947,19 +872,16 @@ async function testBundleCorruptNewerRollback() {
     const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = (version) => ({
       app: "rollback", version,
-      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+      modules: [{ name: "codec" }],
       guest: {
-        hash: toHex(gHash(new TextEncoder().encode(guestText))),
         requires: [],
       },
     });
-    // `wasm` is the module's actual bytes — passed corrupt below to model a
-    // half-written upgrade whose manifest is nonetheless intact and signed.
-    const writeBundle = (version, wasm = forwarderBytes) => wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author, manifest(version)),
-      [moduleFile("codec")]: wasm,
-      [GUEST_FILE]: new TextEncoder().encode(guestText),
-    }));
+    const writeBundle = (version, wasm = forwarderBytes) => {
+      const blob = signTestBundle(sodium, author, manifest(version), enc.encode(guestText), [forwarderBytes]);
+      // Model a partially written bundle by truncating after signing.
+      wf(bundlePath, blob.slice(0, blob.length - (forwarderBytes.length - wasm.length)));
+    };
 
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
@@ -973,7 +895,7 @@ async function testBundleCorruptNewerRollback() {
     const upgrade = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: v4.key });
 
     // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
-    //    match their declared hash. The load must throw on the content check.
+    //    match the signed body. The load must throw on signature verification.
     writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
     try { await upgrade(); } catch { v5Failed = true; }
@@ -1208,11 +1130,11 @@ async function testWrongTypedStoreIsRefused() {
 async function testAppNameLengthRefused() {
   console.log("Test: an over-long app name is refused at load, not at first use");
   const author = testAuthor();
-  const mk = (app, extra = {}) => signManifest(sodium, author,
+  const mk = (app, extra = {}) => signTestBundle(sodium, author,
     { app, version: 1, modules: [], guest: GUEST(), ...extra });
 
   // At the limit, everything works — 255 bytes is exactly what the scope can carry.
-  assert(verifyManifest(sodium, mk("a".repeat(255))) !== null,
+  assert(verifyTestBundle(sodium, mk("a".repeat(255))) !== null,
     "a 255-byte app name verifies");
 
   for (const [what, env] of [
@@ -1221,7 +1143,7 @@ async function testAppNameLengthRefused() {
     ["a 200-char (600-byte) UTF-8 app name", mk("\u{1f600}".repeat(200))],
   ]) {
     let threw = false;
-    try { verifyManifest(sodium, env); } catch { threw = true; }
+    try { verifyTestBundle(sodium, env); } catch { threw = true; }
     assert(threw, `${what} is refused as malformed`);
   }
   console.log("  OK\n");
@@ -1650,7 +1572,7 @@ async function testCommitRevalidatesHostGates() {
 
 await testFullLifecycle();
 await testInstallRejectsUntrustedAuthor();
-await testManifestHashIsEnforced();
+await testWholeBundleIsSigned();
 await testDenyAllPolicyRejects();
 testGeneratedOpFrame();
 await testBundleRefusesNonModule();
@@ -1662,7 +1584,7 @@ await testFsKeyRule();
 await testSlotFreshness();
 await testShellBoot();
 await testBundle();
-await testGuestBundleAndArchive();
+await testGuestBundle();
 await testBundleCorruptNewerRollback();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();

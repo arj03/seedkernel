@@ -25,8 +25,9 @@ const wsHeadJS = `
 "use strict";
 {
   const blob = transportBundleBytes();
-  const src = new TextDecoder().decode(unpackBundle(blob)["guest.js"]);
-  const APP = verifyBundle(sodium, blob).manifest.guest.config;
+  const bundle = verifyBundle(sodium, blob);
+  const src = bundle.guestSource;
+  const APP = bundle.manifest.guest.config;
   const LOCAL = { networkKey: "00".repeat(32), peers: [], admitPeers: [] };
   const host = { call: (name) => { throw new Error("ws head probe: the framer called " + name); } };
   const F = new Function("APP", "LOCAL", "host", src +
