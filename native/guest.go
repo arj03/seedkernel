@@ -57,10 +57,6 @@ type guestRealm struct {
 	// End of the currently-running segment. The host-call bridge reads this while guest
 	// code is on the stack so a module inherits the caller's live remainder.
 	segmentDeadline time.Time
-	// dead is set when a budget kill terminated the wasm module: wazero closes the module
-	// rather than unwinding one call, so the realm cannot be reused — recovery is a fresh
-	// realm, and later calls are refused rather than panicking on a freed handle.
-	dead bool
 
 	// Whether this realm may hold a queued job. ONLY guest code queues one here — every
 	// path that reaches g.qc with anything to run goes through `within` — and Pump drains
@@ -450,19 +446,12 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 	return v, err
 }
 
-// markDead ends the realm's life and settles every call it still owes (settleAll).
-// Returns err so callers can `return nil, g.markDead(...)`.
-func (g *guestRealm) markDead(err error) error {
-	g.dead = true
-	g.settleAll(err.Error())
-	return err
-}
-
 // settleAll rejects every in-flight initiator call with msg, releasing the callbacks: a
-// realm dying with continuations outstanding must not leave callers hanging forever —
-// worse than an error, since they cannot retry or observe anything went wrong (safe-js
-// needs no equivalent; its interrupt throws inside the guest). Callbacks are HOST-realm
-// values, so reporting works once the guest runtime is gone.
+// realm stopped mid-flight — interrupted at its deadline, or closed — with continuations
+// outstanding must not leave callers hanging forever, worse than an error since they
+// cannot retry or observe anything went wrong. safe-js.ts does the same with
+// failInvocations. Callbacks are HOST-realm values, so reporting works once the guest
+// runtime is gone.
 func (g *guestRealm) settleAll(msg string) {
 	settled := false
 	for id, c := range g.calls {
@@ -484,7 +473,7 @@ func (g *guestRealm) settleAll(msg string) {
 // spinning on its own generates no I/O, so without the nudge the caller waits out its
 // whole timeout.
 func (g *guestRealm) pump() {
-	if g.rt == nil || g.dead || !g.rt.Alive() || !g.jobsPending {
+	if g.rt == nil || !g.jobsPending {
 		return
 	}
 	if _, err := g.within(func() (*qjs.Value, error) {
@@ -499,16 +488,12 @@ func (g *guestRealm) pump() {
 	g.jobsPending = false
 }
 
-// checkAlive refuses a realm a budget kill already terminated. Callers must ask BEFORE
-// allocating in the guest runtime: NewString/NewArrayBuffer on a closed module panics, so
-// a check inside within() would come one allocation too late.
+// checkAlive refuses a realm close() or discard() already tore down. Callers must ask
+// BEFORE allocating in the guest runtime: NewString/NewArrayBuffer on a freed runtime
+// panics, so a check inside within() would come one allocation too late.
 func (g *guestRealm) checkAlive() error {
 	if g.rt == nil {
-		// Closed, not killed: close() already settled what it owed, so this only refuses.
 		return errors.New("guest realm closed")
-	}
-	if g.dead || !g.rt.Alive() {
-		return g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
 	}
 	return nil
 }

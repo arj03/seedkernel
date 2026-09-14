@@ -338,10 +338,9 @@ const channels: ChannelFactory = {
  *  to the realm that parked it structurally, and Go needs no promise primitive of its own.
  *
  *  `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers and
- *  not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds. The
- *  native realm does NOT enforce it through QuickJS — New_QJS's maxExecutionTime is inert in
- *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
- *  kill fatal to the realm rather than a catchable JS error. */
+ *  not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds.
+ *  guest.go enforces it with QuickJS's own interrupt handler (`qjs.Runtime.Budget`), the
+ *  mechanism safe-js.ts uses, so an overrun throws inside the guest and the realm survives. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
   // This realm's wall-clock custody (§12.3): one wake for the host calls it has not
   // answered, one for the invocations waiting to enter it — never merged, and both
