@@ -141,23 +141,23 @@ for (const { file, re } of inlineChecks) {
   }
 }
 
-// Prose figures (not cells): matched on the words either side, so the number is the only
-// thing rewritten. The shared total lives in the heading; the guest figure is summed
-// from guest-source.mjs.
+// Prose figures (not cells): match only the number, using the heading or source path
+// to identify it. The transport count does not depend on the surrounding sentence.
+// The shared total lives in the heading; the guest figure is summed from guest-source.mjs.
 const proseFigures = [
-  ["shared total (heading)", /(all three targets \()[\d,]+( LOC\))/, sharedTotal],
-  ["transport/src/*.js", /(transport bundle — )[\d,]+( lines of `transport\/src\/\*\.js`)/,
+  ["shared total (heading)", /(?<=all three targets \()[\d,]+(?= LOC\))/, sharedTotal],
+  ["transport/src/*.js", /[\d,]+(?= lines of `transport\/src\/\*\.js`)/,
     sum(guestSourcePaths())],
 ];
 for (const [label, re, n] of proseFigures) {
   const m = readme.match(re);
   if (!m) { console.error(`  MISSING  no README figure matches ${label}`); drift++; continue; }
-  const want = `${m[1]}${fmt(n)}${m[2]}`;
+  const want = fmt(n);
   if (m[0] === want) {
     console.log(`  ok       ${String(n).padStart(5)}  ${label}`);
   } else {
     drift++;
-    console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(n).padStart(5)}  ${label}   README says ${m[0].match(/[\d,]+/)[0]}`);
+    console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(n).padStart(5)}  ${label}   README says ${m[0]}`);
     readme = readme.replace(re, want);
   }
 }
