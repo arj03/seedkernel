@@ -99,6 +99,9 @@ class ReqRes {
     // bound ends on (0: none)
     this.pending = new Map();
     this.nextCorr = 1;
+    // peerId → the weight of that peer's requests waiting on `link/deliver`, and their sum
+    this.delivering = new Map();
+    this.deliveringWeight = 0;
   }
 
   /** Settle an outstanding request and drop its bookkeeping. `ok` false ⇒ `payload` is
@@ -113,6 +116,24 @@ class ReqRes {
 
   attach(sendFrame) {
     this.sendFrame = sendFrame;
+  }
+
+  /** Whether `from` may put one more request, `weight` wide, on `link/deliver` (core.js
+   *  `deliveryWindow`). A peer with none waiting may take any room left; one already waiting
+   *  leaves a max-size request's room to a peer that is not, and stops at an equal share
+   *  among the peers waiting — so no peer's pipeline can refuse another's. */
+  admits(from, weight) {
+    const mine = this.delivering.get(from) || 0;
+    if (mine === 0) return this.deliveringWeight + weight <= deliveryWindow;
+    return this.deliveringWeight + weight <= deliveryWindow - maxRequestWeight
+      && mine + weight <= deliveryWindow / this.delivering.size;
+  }
+
+  /** Count one of `from`'s requests onto the window, or off it with a negative `weight`. */
+  hold(from, weight) {
+    const mine = (this.delivering.get(from) || 0) + weight;
+    if (mine > 0) this.delivering.set(from, mine); else this.delivering.delete(from);
+    this.deliveringWeight += weight;
   }
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
@@ -187,11 +208,17 @@ class ReqRes {
       // plaintext, and `from` is who the record layer proved wrote it — `fromPubkey` is
       // that same proof in bytes, handed down from the link rather than decoded from the
       // hex, which is per-request work on identity neither end ever re-derives.
-      netLinkDeliver(proto, fromPubkey, payload).then(
-        (answer) => this.respond(corr, noReply, from, answer),
+      //
+      // Past the window, a request is refused the way an unclaimed one is: answered empty.
+      const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
+      if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
+      const answer = netLinkDeliver(proto, fromPubkey, payload);
+      this.hold(from, weight);
+      answer.then(
+        (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); },
         // Only the seam itself can reject — a refused claim and a handler that threw
         // both answer empty. A realm on its way down owes no response.
-        () => {},
+        () => this.hold(from, -weight),
       );
     }
   }

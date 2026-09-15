@@ -76,6 +76,15 @@ const maxFrameBytes = policy("maxFrameBytes");
 // cannot see it. Give it the same eight-frame byte window and tiny-write count ceiling.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
 const maxOutboundQueueSlices = 4096;
+// A request handed to `link/deliver` holds one of this realm's host calls and its bytes until
+// its claimant answers. Every record open, seal and teardown draws on that same budget (HOST),
+// and one it refuses takes a link down with it, so waiting requests stay below the budget by
+// room for a max-size record open and its plaintext. Each weighs its bytes plus the budget's
+// bytes per call, which bounds both of its ceilings in one sum (router.js `admits`); the
+// widest is a whole frame plus the attribution its delivery adds.
+const callWeight = HOST.maxOutstandingHostCallBytes / HOST.maxOutstandingHostCalls;
+const maxRequestWeight = maxFrameBytes + PK_LEN + callWeight;
+const deliveryWindow = HOST.maxOutstandingHostCallBytes - 2 * maxRequestWeight;
 const maxPreAuthQueueSlices = Math.max(1, policy("maxPreAuthQueueSlices"));
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");

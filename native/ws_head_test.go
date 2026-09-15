@@ -27,11 +27,13 @@ const wsHeadJS = `
   const blob = transportBundleBytes();
   const bundle = verifyBundle(sodium, blob);
   const src = bundle.guestSource;
+  // The whole preamble the program reads at load; the framer never spends the HOST budget.
+  const HOST = { maxOutstandingHostCalls: 256, maxOutstandingHostCallBytes: 16 * 1024 * 1024 };
   const APP = bundle.manifest.guest.config;
   const LOCAL = { networkKey: "00".repeat(32), peers: [], admitPeers: [] };
   const host = { call: (name) => { throw new Error("ws head probe: the framer called " + name); } };
-  const F = new Function("APP", "LOCAL", "host", src +
-    "\nreturn { WsFramer, MAX_WS_HANDSHAKE };")(APP, LOCAL, host);
+  const F = new Function("HOST", "APP", "LOCAL", "host", src +
+    "\nreturn { WsFramer, MAX_WS_HANDSHAKE };")(HOST, APP, LOCAL, host);
   globalThis.__wsHead = async (chunk) => {
     const head = new Uint8Array(F.MAX_WS_HANDSHAKE - 1).fill(0x41);
     const framer = new F.WsFramer(() => Promise.resolve(), false, "");

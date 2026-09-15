@@ -10,7 +10,7 @@
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
-  ready, linkedPeers, PROTO,
+  ready, linkedPeers, PROTO, TransportHost,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -308,6 +308,51 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
   const after = silentDial(fabric, s.driver.port, "10.12.0.1");
   await sleep(200);
   assert(!after.closed, "a released raw link must free its slot for the next connection");
+});
+
+await test("one peer's pipeline cannot spend the host calls every other link needs", async () => {
+  // A request handed to `link/deliver` holds one of the transport's host calls until its
+  // claimant answers, and the next record on ANY link needs one too. The worst claimant never
+  // answers, so this one holds everything it is handed: a peer flooding it must be refused
+  // past its share — answered empty at once — while another peer's request still arrives.
+  const fabric = new LoopbackChannels();
+  const held = [];
+  let answering = false;
+  const routeInbound = TransportHost.prototype.routeInbound;
+  TransportHost.prototype.routeInbound = function () {
+    return routeInbound.call(this, (_claim, attribution, payload) => (answering
+      ? Promise.resolve(payload.slice())
+      : new Promise((resolve) => { held.push({ from: Buffer.from(attribution).toString("hex"), resolve }); })));
+  };
+  let closed = 0;
+  let s;
+  try {
+    s = keep(await server(fabric, undefined, { app: false, onLinkClosed: () => { closed++; } }));
+  } finally {
+    TransportHost.prototype.routeInbound = routeInbound;
+  }
+  const flooder = keep(await member(fabric, s, "10.20.0.1"));
+  const other = keep(await member(fabric, s, "10.21.0.1"));
+  await ready(flooder, 4000);
+  await ready(other, 4000);
+
+  const FLOOD = 300; // past the kernel's per-realm call ceiling
+  for (let i = 0; i < FLOOD; i++) await flooder.sendNoReply(s.peerId, PROTO, Uint8Array.of(i & 255));
+  const refused = await flooder.request(s.peerId, PROTO, Uint8Array.of(1), 3000);
+  const flooded = held.filter((d) => d.from === flooder.peerId).length;
+  note(`${FLOOD} pipelined requests at a claimant that never answers: ${flooded} delivered`);
+  assert(flooded > 0 && flooded < FLOOD, `the flood must be windowed, got ${flooded} of ${FLOOD} delivered`);
+  assert(refused.length === 0, "a request past the peer's share is answered empty, not left to its deadline");
+
+  await other.sendNoReply(s.peerId, PROTO, Uint8Array.of(2));
+  await until(() => held.some((d) => d.from === other.peerId), 2000, "the other peer's request to be delivered");
+  assert((await linkedPeers(s)).length === 2 && closed === 0, "neither link may be lost to the flood");
+
+  // Answers give the room back: the flooder is served again.
+  answering = true;
+  for (const d of held.splice(0)) d.resolve(new Uint8Array(0));
+  const echoed = await flooder.request(s.peerId, PROTO, Uint8Array.of(3), 3000);
+  assert(echoed.length === 1 && echoed[0] === 3, "an answered delivery must give its room back");
 });
 
 await test("an unverified connection is dropped on the SHORT deadline", async () => {
