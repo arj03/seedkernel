@@ -958,6 +958,86 @@ async function testSafeRealmConcurrency() {
   console.log("  OK\n");
 }
 
+// ─── Test: a deferred invocation keeps its own deadline ─────────────────────────────
+//
+// `__deferred` hands the realm to the next entry and nothing else: it "transfers queue
+// occupancy, never time custody" (§12.3). A host call that settles after another invocation
+// has entered therefore resumes under — and can only fail — the invocation that made it. A
+// realm keeping one clock for whoever entered last lends a parked invocation that entry's
+// remainder, fails every parked caller when one overruns, and bills a module's burn to the
+// wrong one. native/guest_test.go holds the native realm to case 1; case 2 is JS-only, since
+// a native module runs inside the segment that called it.
+async function testDeferredKeepsItsDeadline() {
+  console.log("Test: a deferred invocation resumes under its own deadline, not a later entry's (§12.3)");
+
+  // `park` waits until the test settles it by tag; `remaining` records the remainder it was handed.
+  const parkingRealm = async (source, deadlineMs) => {
+    const parked = new Map();
+    const remaining = new Map();
+    const realm = await createSafeRealm({
+      source,
+      deadlineMs,
+      hostCall: (name, tag, budget) => {
+        if (name === "remaining") { remaining.set(tag[0], budget.remainingMs); return tag; }
+        return new Promise((resolve, reject) => parked.set(tag[0], { resolve, reject, budget }));
+      },
+    });
+    const bothParked = async () => { while (parked.size < 2) await sleep(0); };
+    return { realm, parked, remaining, bothParked };
+  };
+  const outcome = (call) => call.then(() => "answered", (err) => err.message);
+
+  // 1. Invocation 1 (1 s) parks, then 2 (the realm's 5 s) enters and parks behind it. 1 is
+  //    resumed by a rejection and 2 by an answer, so both settlement paths are covered.
+  {
+    const { realm, parked, remaining, bothParked } = await parkingRealm(`async function handle(tag) {
+      globalThis.__deferred = true;
+      try { await host.call("park", tag); } catch {}
+      await host.call("remaining", tag);
+      if (tag[0] === 1) for (;;) {}
+      return tag;
+    }`, 5000);
+    try {
+      const short = outcome(realm.call(Uint8Array.of(1), 1000));
+      const long = outcome(realm.call(Uint8Array.of(2)));
+      await bothParked();
+      parked.get(1).reject(new Error("refused"));
+      assert(await short !== "answered", "the resumed spin is interrupted");
+      assert(remaining.get(1) <= 1000,
+        `invocation 1 resumed under its own 1 s, not the later entry's 5 s (${remaining.get(1)} ms left)`);
+      parked.get(2).resolve(EMPTY);
+      assertEqual(await long, "answered", "the interrupt failed only the invocation it resumed");
+      assert(remaining.get(2) > 1000, `invocation 2 kept its own remainder (${remaining.get(2)} ms left)`);
+    } finally {
+      realm.dispose();
+    }
+  }
+
+  // 2. A module's burn is billed to the invocation whose call it was (§4.3), even when the
+  //    bill lands while another holds the realm: a whole allowance exhausts 1, never 2.
+  {
+    const { realm, parked, bothParked } = await parkingRealm(`async function handle(tag) {
+      globalThis.__deferred = true;
+      await host.call("park", tag);
+      return await host.call("remaining", tag);
+    }`, 1000);
+    try {
+      const billed = outcome(realm.call(Uint8Array.of(1)));
+      const other = outcome(realm.call(Uint8Array.of(2)));
+      await bothParked();
+      parked.get(1).budget.charge(1000);
+      parked.get(2).resolve(EMPTY);
+      assertEqual(await other, "answered", "another invocation's bill left this one's budget alone");
+      parked.get(1).resolve(EMPTY);
+      assert(await billed !== "answered", "the bill exhausted the invocation it was charged to");
+    } finally {
+      realm.dispose();
+    }
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testGuestSeam();
@@ -972,5 +1052,6 @@ await testModuleCallBound();
 await testModuleCallChargedToGuestBudget();
 await testPreviousAbiRefused();
 await testSafeRealmConcurrency();
+await testDeferredKeepsItsDeadline();
 
 summary("Results");

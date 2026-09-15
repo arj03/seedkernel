@@ -45,15 +45,13 @@ type guestRealm struct {
 	// holds the host-realm resolve/reject of the Promise the shim handed the shell.
 	calls map[int64]*initiatorCall
 
-	// Execution budget (README §12.3), mirroring safe-js.ts's ExecClock. `consumed` counts
-	// segments where guest code holds the thread; the separate caller-owned wall deadline
-	// continues across host waits, realm queueing and deferred answers.
-	budget   time.Duration
-	consumed time.Duration
-	// The current invocation is additionally narrowed by the caller-owned wall deadline.
-	// A zero invocationDeadline is the explicit unbounded case.
-	invocationBudget   time.Duration
-	invocationDeadline time.Time
+	// Execution budget (README §12.3), mirroring safe-js.ts's ExecClock: the configured
+	// ceiling, and the clock of the invocation whose code holds the thread, or last did.
+	// `consumed` counts segments where guest code holds the thread; the separate
+	// caller-owned wall deadline continues across host waits, realm queueing and deferred
+	// answers.
+	budget time.Duration
+	*invocationClock
 	// End of the currently-running segment. The host-call bridge reads this while guest
 	// code is on the stack so a module inherits the caller's live remainder.
 	segmentDeadline time.Time
@@ -71,6 +69,19 @@ type guestRealm struct {
 	// native registry: it rejects before the guest-to-Go payload copy and retains custody
 	// through delivery.
 	hostCalls hostCallLedger
+	// Each parked host call retains its invocation's accounting record. Several
+	// calls from one invocation share its spend, including after another entry.
+	hostCallBudgets map[int64]*invocationClock
+}
+
+// invocationClock is one entrypoint invocation's execution budget. A deferred invocation
+// outlives its entry, so each host call keeps the clock it was made under and settleNet
+// resumes on it: the continuation runs under, and can only fail, that invocation.
+type invocationClock struct {
+	id                 int64 // the initiator call an overrun fails
+	consumed           time.Duration
+	invocationBudget   time.Duration
+	invocationDeadline time.Time // zero means unbounded
 }
 
 type initiatorCall struct{ onDone, onFail *qjs.Value }
@@ -193,7 +204,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
 		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		hostCalls: newHostCallLedger(maxHostCalls, maxHostCallBytes),
-		budget:    budget, invocationBudget: budget,
+		budget:    budget, invocationClock: &invocationClock{invocationBudget: budget},
+		hostCallBudgets: map[int64]*invocationClock{},
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -261,6 +273,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 			return nil, err
 		}
 		res.Free() // always the JS_NULL immediate: the call parked
+		g.hostCallBudgets[callID] = g.invocationClock
 		// The settlement arrives as a HOST-realm microtask after pumpAll already drained
 		// el.c this round, and a holder answering from local fs generates no I/O of its
 		// own — so without a nudge nothing wakes the loop.
@@ -354,9 +367,7 @@ func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, d
 	}
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
 	argV := g.qc.NewArrayBuffer(payload)
-	g.consumed = 0 // one top-level entrypoint invocation, one budget
-	g.invocationBudget = g.budget
-	g.invocationDeadline = time.Time{}
+	g.invocationClock = &invocationClock{id: id, invocationBudget: g.budget}
 	if deadlineMs >= 0 {
 		remaining := time.Duration(deadlineMs) * time.Millisecond
 		if remaining <= 0 {
@@ -439,19 +450,28 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 	// closes that gap. `consumed` deliberately stays blown so jobs the interrupted frame
 	// left behind stop at their first check; the next entrypoint starts fresh (see call).
 	budgetErr := fmt.Errorf("guest realm: invocation deadline of %s exceeded", g.invocationBudget)
-	g.settleAll(budgetErr.Error())
+	g.failInvocation(budgetErr.Error())
 	if err == nil {
 		err = budgetErr
 	}
 	return v, err
 }
 
+// failInvocation rejects the initiator call whose clock is running: the engine stopped its
+// frame, so nothing inside the realm will settle it. Only that one — a deferred invocation
+// still parked on a host call keeps its own clock, and its caller.
+func (g *guestRealm) failInvocation(msg string) {
+	if c := g.takeCall(g.invocationClock.id); c != nil {
+		defer c.free()
+		g.reportCall(c.onFail, g.hostQc.NewString(msg))
+	}
+}
+
 // settleAll rejects every in-flight initiator call with msg, releasing the callbacks: a
-// realm stopped mid-flight — interrupted at its deadline, or closed — with continuations
-// outstanding must not leave callers hanging forever, worse than an error since they
-// cannot retry or observe anything went wrong. safe-js.ts does the same with
-// failInvocations. Callbacks are HOST-realm values, so reporting works once the guest
-// runtime is gone.
+// closed realm with continuations outstanding must not leave callers hanging forever,
+// worse than an error since they cannot retry or observe anything went wrong. safe-js.ts
+// does the same with failInvocations. Callbacks are HOST-realm values, so reporting works
+// once the guest runtime is gone.
 func (g *guestRealm) settleAll(msg string) {
 	settled := false
 	for id, c := range g.calls {
@@ -498,9 +518,6 @@ func (g *guestRealm) checkAlive() error {
 	return nil
 }
 
-// There is no nested-budget case: the shim's per-realm queue leaves exactly one budget
-// window open at a time, so resetting `consumed` per call is the whole of the accounting.
-
 // settleNet resolves or rejects the guest Promise parked under callID when the host
 // realm's Transport promise settles (`bytes` fulfils, `msg` rejects), then drains the
 // awaiting continuation before returning its execution time to the bridge.
@@ -509,9 +526,14 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Dura
 		return 0
 	}
 	defer g.hostCalls.release(callID)
+	defer delete(g.hostCallBudgets, callID)
 	if g.checkAlive() != nil {
 		return 0 // the realm the continuation belonged to no longer exists
 	}
+	// Restore the original absolute deadline and accumulated spend before either
+	// resolving or rejecting the promise. A later entry must not lend it time or
+	// interrupt it with that entry's shorter deadline.
+	g.invocationClock = g.hostCallBudgets[callID]
 	before := g.consumed
 	var res *qjs.Value
 	var err error
@@ -539,7 +561,7 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Dura
 		// (see within), and anything else is a fault contained to one guest's
 		// `__netResolve`; killing the realm would brick it until the bundle reloads.
 		if g.checkAlive() == nil {
-			g.settleAll(fmt.Sprintf("guest realm failed delivering a net result: %v", err))
+			g.failInvocation(fmt.Sprintf("guest realm failed delivering a net result: %v", err))
 		}
 	}
 	// `__netResolve` queues the awaiting continuation. Run it now rather than in the
@@ -593,6 +615,7 @@ func (g *guestRealm) close() {
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 	g.settleAll("guest realm closed")
 	g.hostCalls.releaseAll() // the custody every parked call holds ends here (hostcalls.go)
+	clear(g.hostCallBudgets)
 	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil

@@ -337,8 +337,8 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls.live))
 	}
 	g.settleNet(liveID, []byte{}, "")
-	if len(g.hostCalls.live) != 0 {
-		t.Fatalf("live settlement left parked call count at %d", len(g.hostCalls.live))
+	if len(g.hostCalls.live) != 0 || len(g.hostCallBudgets) != 0 {
+		t.Fatalf("live settlement left %d parked calls and %d invocation clocks", len(g.hostCalls.live), len(g.hostCallBudgets))
 	}
 }
 
@@ -369,8 +369,9 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	if _, err := qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)); err != nil {
 		t.Fatal("dispose:", err)
 	}
-	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 {
-		t.Fatalf("close left %d parked calls and %d bytes charged", len(g.hostCalls.live), g.hostCalls.bytes)
+	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 || len(g.hostCallBudgets) != 0 {
+		t.Fatalf("close left %d parked calls, %d bytes charged and %d invocation clocks",
+			len(g.hostCalls.live), g.hostCalls.bytes, len(g.hostCallBudgets))
 	}
 }
 
@@ -620,6 +621,62 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	}
 	if d := time.Since(start); d > 20*time.Second {
 		t.Fatalf("caller stranded for %s rather than settled with an error", d)
+	}
+}
+
+// A deferred invocation hands the realm to the next entry and nothing else: `__deferred`
+// "transfers queue occupancy, never time custody" (README §12.3). A host call that settles
+// after another invocation has entered must resume under — and can only fail — the
+// invocation that made it; otherwise it borrows the later entry's remainder, and one
+// overrun fails every parked caller. realm-guest.test.mjs (testDeferredKeepsItsDeadline)
+// holds safe-js.ts to the same scenario.
+func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
+	guestSeamRealm(t)
+	// `park` waits until the harness settles it by tag; `remaining` records the remainder
+	// guest.go handed it.
+	if _, err := qc.Eval("parking-seam.js", qjs.Code(`
+		globalThis.__parked = new Map();
+		globalThis.__remaining = new Map();
+		globalThis.__guestSeam = (name, tag, budget) => {
+		  if (name === "remaining") {
+		    __remaining.set(tag[0], budget.remainingMs);
+		    return Promise.resolve(tag);
+		  }
+		  return new Promise((resolve, reject) => __parked.set(tag[0], { resolve, reject }));
+		};
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		async function handle(tag) {
+		  globalThis.__deferred = true;
+		  try { await host.call("park", tag); } catch {}
+		  await host.call("remaining", tag);
+		  if (tag[0] === 1) for (;;) {}
+		  return tag;
+		}
+	`, 5000)
+	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+
+	// Invocation 1 (1 s) parks, then 2 (the realm's 5 s) enters and parks behind it. 1 is
+	// resumed by a rejection and 2 by an answer, so both settlement paths are covered.
+	if _, err := callRealm(`(async () => {
+		const outcome = (call) => call.then(() => "answered", (e) => e.message);
+		const short = outcome(__realm.call(Uint8Array.of(1), 1000));
+		const long = outcome(__realm.call(Uint8Array.of(2)));
+		while (__parked.size < 2) await new Promise((r) => setTimeout(r, 0));
+		__parked.get(1).reject(new Error("refused"));
+		if (await short === "answered") throw new Error("the resumed spin was not interrupted");
+		if (!(__remaining.get(1) <= 1000))
+		  throw new Error("invocation 1 resumed under the later entry's deadline: " + __remaining.get(1) + " ms left");
+		__parked.get(2).resolve(new Uint8Array());
+		const survivor = await long;
+		if (survivor !== "answered") throw new Error("the interrupt failed invocation 2 too: " + survivor);
+		if (!(__remaining.get(2) > 1000))
+		  throw new Error("invocation 2 lost its own remainder: " + __remaining.get(2) + " ms left");
+		return new Uint8Array();
+	})`, 10*time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 

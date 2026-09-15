@@ -44,14 +44,26 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : new Uint8Array(u8).buffer;
 }
 
+/** One entrypoint invocation's execution record. A deferred invocation outlives its entry,
+ *  so each host call keeps the record it was made under and resumes on it (§12.3). */
+interface InvocationBudget {
+  budgetMs: number;
+  wallDeadline: number;
+  consumedMs: number;
+  /** Fails this invocation while its answer is pending. */
+  reject?: (err: Error) => void;
+}
+
 /** Guest execution-time accounting under the current invocation's handoff deadline (§12.3). */
 interface ExecClock {
   /** Guest code is about to run. */
-  begin(causalClock?: CausalClock): void;
+  begin(budget: InvocationBudget, causalClock?: CausalClock): void;
   /** Guest code has returned control to the host. */
   end(): void;
   /** Start one invocation, narrowed by the handoff remainder that admitted it. */
-  reset(deadlineMs?: number): void;
+  create(deadlineMs?: number): InvocationBudget;
+  /** The invocation whose code holds the thread, or last did. */
+  readonly current: InvocationBudget;
   /** The guest's remaining execution segment, in ms — read at the moment a call is made,
    *  and carried as a module call's deadline, so a module runs under the budget of the
    *  segment that called it (§4.3). Infinity for an unbounded realm. */
@@ -63,16 +75,14 @@ interface ExecClock {
    *  guest fanning out to N workers burns N ms of CPU per ms of its own wait. Summing the
    *  measured burns is what holds that sum inside the window the invocation was admitted
    *  under, instead of multiplying it by however many modules the bundle ships. */
-  charge(ms: number): void;
+  charge(budget: InvocationBudget, ms: number): void;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
 function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
   ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES);
   const configuredMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
-  let budgetMs = configuredMs;
-  let wallDeadline = Infinity;
-  let consumedMs = 0;
+  let active: InvocationBudget;
   let segmentStart = 0;
   let segmentClock: CausalClock | undefined;
   let running = false;
@@ -81,33 +91,39 @@ function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
   ctx.runtime.setInterruptHandler(() => {
     if (!running) return false;
     const now = monotonicMs();
-    return consumedMs + (now - segmentStart) > budgetMs || now >= wallDeadline;
+    return active.consumedMs + (now - segmentStart) > active.budgetMs || now >= active.wallDeadline;
   });
   return {
-    begin(causalClock) { segmentStart = monotonicMs(); segmentClock = causalClock; running = true; },
+    begin(budget, causalClock) {
+      active = budget;
+      segmentStart = monotonicMs(); segmentClock = causalClock; running = true;
+    },
+    get current() { return active; },
     end() {
       if (!running) return;
       const elapsed = monotonicMs() - segmentStart;
-      consumedMs += elapsed;
+      active.consumedMs += elapsed;
       running = false;
       const owner = segmentClock;
       segmentClock = undefined;
       owner?.charge(elapsed);
     },
-    reset(deadlineMs = configuredMs) {
+    create(deadlineMs = configuredMs) {
       if (deadlineMs !== Infinity && (!Number.isFinite(deadlineMs) || deadlineMs < 0)) {
         throw new Error("guest: invalid invocation handoff deadline");
       }
-      budgetMs = Math.min(configuredMs, deadlineMs);
-      wallDeadline = deadlineMs === Infinity ? Infinity : monotonicMs() + deadlineMs;
-      consumedMs = 0;
+      return {
+        budgetMs: Math.min(configuredMs, deadlineMs),
+        wallDeadline: deadlineMs === Infinity ? Infinity : monotonicMs() + deadlineMs,
+        consumedMs: 0,
+      };
     },
     remaining() {
       const now = monotonicMs();
-      const spent = consumedMs + (running ? now - segmentStart : 0);
-      return Math.max(0, Math.min(budgetMs - spent, wallDeadline - now));
+      const spent = active.consumedMs + (running ? now - segmentStart : 0);
+      return Math.max(0, Math.min(active.budgetMs - spent, active.wallDeadline - now));
     },
-    charge(ms) { if (ms > 0) consumedMs += ms; },
+    charge(budget, ms) { if (ms > 0) budget.consumedMs += ms; },
   };
 }
 
@@ -225,7 +241,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   // is settled from *inside* the realm, so anything that stops the realm mid-flight — a
   // budget interrupt during a continuation, or dispose() while a call is parked or deferred
   // — leaves it permanently pending. A bound that turns a runaway or silent guest into a
-  // hung host is not much of a bound, so the realm fails them explicitly.
+  // hung host is not much of a bound, so the realm fails them explicitly — dispose() all of
+  // them through this set, an interrupted continuation only its own (`InvocationBudget.reject`).
   const liveInvocations = new Set<(err: Error) => void>();
   const failInvocations = (err: Error): void => {
     for (const reject of liveInvocations) reject(err);
@@ -235,7 +252,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
   // preamble's half of the contract), then pump so the awaiting continuation runs.
   const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle,
-    causalClock?: CausalClock): void => {
+    invocationBudget: InvocationBudget, causalClock?: CausalClock): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
     // The continuation of a parked `await` is guest code, so it runs on the guest's budget.
@@ -243,7 +260,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // call can be interrupted mid-flight by the budget, and a runtime freed with live handles
     // aborts the whole wasm module at dispose() time.
     causalContext.run(causalClock, () => {
-      clock.begin(causalClock);
+      clock.begin(invocationBudget, causalClock);
       try {
         const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
         res.dispose();
@@ -251,7 +268,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       } catch (err) {
         // The guest was interrupted while resuming, so nothing inside the realm will ever
         // settle the caller's promise: fail it here, or `call()` hangs forever.
-        failInvocations(err instanceof Error ? err : new Error(String(err)));
+        invocationBudget.reject?.(err instanceof Error ? err : new Error(String(err)));
       } finally {
         clock.end();
         id.dispose();
@@ -273,9 +290,12 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
     const causalClock = causalContext.current;
+    // Retain the invocation's shared accounting record, not a snapshot of its
+    // remainder: concurrent calls must charge the same accumulated spend.
+    const invocationBudget = clock.current;
     const budget: CallBudget = {
       remainingMs: clock.remaining(),
-      charge: (ms) => { clock.charge(ms); causalClock?.charge(ms); },
+      charge: (ms) => { clock.charge(invocationBudget, ms); causalClock?.charge(ms); },
       causalClock,
     };
     if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
@@ -310,10 +330,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
           // Request and response coexist while copying the result into the guest. Reserve
           // that overlap and keep the call live through guest-side settlement.
           activeCall.reserve(bytes.byteLength);
-          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), causalClock);
+          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), invocationBudget, causalClock);
         } catch (err) {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)), causalClock);
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
           }
         } finally {
           activeCall.release();
@@ -322,7 +342,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       (err) => {
         try {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)), causalClock);
+            settleNet("__netReject", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
           }
         } finally {
           activeCall.release();
@@ -340,8 +360,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   // Construction is the first path guest code runs on, so it gets the same fresh budget
   // as an entrypoint. Without this guard, a signed top-level `for (;;) {}` wedges the host
   // before installation can either commit or fail.
-  clock.reset();
-  clock.begin();
+  clock.begin(clock.create());
   try {
     ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
   } catch (err) {
@@ -382,11 +401,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
    *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
    *  the moment the synchronous segment ends, which is before the answer exists. */
   const invoke = (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock): Invocation => {
-    // Safe unconditionally because the queue guarantees nothing else is RUNNING. A deferred
-    // entrypoint has already ended its segment by the time the next one resets, so what it
-    // spends settling later is charged to whichever window is open — which is whose turn
-    // the guest code actually runs on.
-    clock.reset(deadlineMs);
+    // A deferred invocation keeps this record through every host-call settlement.
+    // A later entry gets its own allowance and cannot replace the parked one's.
+    const invocationBudget = clock.create(deadlineMs);
     // Call the preamble directly: parsing the same expression per message adds work to
     // every wire chunk, and staging a global argument retains its bytes until the next call.
     // callFunction runs the entrypoint synchronously up to its first await; the completion value
@@ -398,7 +415,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     let callResult: QuickJSHandle | undefined;
     let settledNative: Promise<unknown> | undefined;
     causalContext.run(causalClock, () => {
-      clock.begin(causalClock);
+      clock.begin(invocationBudget, causalClock);
       let entrypoint: QuickJSHandle | undefined;
       let argument: QuickJSHandle | undefined;
       try {
@@ -424,6 +441,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     const result = (async () => {
       let rejectThis!: (err: Error) => void;
       const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
+      invocationBudget.reject = rejectThis;
       cancel = (reason) => rejectThis(reason);
       liveInvocations.add(rejectThis);
       let consumed = false;
@@ -433,6 +451,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         return takeBytes(ctx, ctx.unwrapResult(settled as never));
       } finally {
         liveInvocations.delete(rejectThis);
+        invocationBudget.reject = undefined;
         // An invocation that lost the race to failAll has no consumer for the settled
         // result, so if the guest promise still settles afterwards its dup'd handle would be
         // orphaned and abort the module at runtime free. Release it when it lands.
