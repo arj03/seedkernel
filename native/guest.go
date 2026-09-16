@@ -3,7 +3,7 @@
 // sodium / fs / net. Its single seam is host.call(name, bytes), funnelled into the host
 // realm's guest seam (a JS function retained here); nothing in this file knows what a
 // name means. The seam is async all the way down: __host_call always answers null, the
-// preamble parks a Promise that settleNet resolves — a suspended guest is just heap
+// preamble parks a Promise that settleHostCall resolves — a suspended guest is just heap
 // state. Exposed to the shell as `createRealm`.
 package main
 
@@ -22,7 +22,7 @@ import (
 
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. Each has
-	// its own guest seam, which is why net-settle routing is per realm rather than one
+	// its own guest seam, which is why host-call settlement is per realm rather than one
 	// global hook. The map mints the handles too, so a caller has no id to reuse or forge
 	// and one realm can never quietly displace another.
 	realms   = map[int64]*guestRealm{}
@@ -38,8 +38,8 @@ type guestRealm struct {
 	hostCall *qjs.Value // retained host-realm seam — this app's whole authority
 	start    *qjs.Value // guest-realm __start — the one way in
 
-	netResolve *qjs.Value // guest-realm __netResolve (a net op fulfilled)
-	netReject  *qjs.Value // guest-realm __netReject (a net op failed)
+	resolveHostCall *qjs.Value // guest-realm __resolveHostCall (a host call fulfilled)
+	rejectHostCall  *qjs.Value // guest-realm __rejectHostCall (a host call failed)
 
 	// calls are initiator calls in flight, keyed by an id the guest carries back. Each
 	// holds the host-realm resolve/reject of the Promise the shim handed the shell.
@@ -75,8 +75,9 @@ type guestRealm struct {
 }
 
 // invocationClock is one entrypoint invocation's execution budget. A deferred invocation
-// outlives its entry, so each host call keeps the clock it was made under and settleNet
-// resumes on it: the continuation runs under, and can only fail, that invocation.
+// outlives its entry, so each host call keeps the clock it was made under and
+// settleHostCall resumes on it: the continuation runs under, and can only fail, that
+// invocation.
 type invocationClock struct {
 	id                 int64 // the initiator call an overrun fails
 	consumed           time.Duration
@@ -150,7 +151,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		return nil, nil
 	}))
 	b.SetPropertyStr("realmSettle", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		// A settlement for a disposed realm is a no-op: the Transport promise behind it
+		// A settlement for a disposed realm is a no-op: the host-call promise behind it
 		// outlives an uninstall.
 		g := realms[t.Args()[0].Int64()]
 		if g == nil {
@@ -161,20 +162,20 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 			return t.Context().NewInt64(0), nil
 		}
 		if t.Args()[2].IsNull() || t.Args()[2].IsUndefined() {
-			return t.Context().NewInt64(g.settleNet(callID, nil, t.Args()[3].String()).Nanoseconds()), nil
+			return t.Context().NewInt64(g.settleHostCall(callID, nil, t.Args()[3].String()).Nanoseconds()), nil
 		}
 		resultBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
 		if err != nil {
-			return t.Context().NewInt64(g.settleNet(callID, nil, "net result not bytes").Nanoseconds()), nil
+			return t.Context().NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
 		}
 		if err := g.hostCalls.reserve(callID, resultBytes); err != nil {
-			return t.Context().NewInt64(g.settleNet(callID, nil, err.Error()).Nanoseconds()), nil
+			return t.Context().NewInt64(g.settleHostCall(callID, nil, err.Error()).Nanoseconds()), nil
 		}
 		bytes, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
-			return t.Context().NewInt64(g.settleNet(callID, nil, "net result not bytes").Nanoseconds()), nil
+			return t.Context().NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
 		}
-		return t.Context().NewInt64(g.settleNet(callID, bytes, "").Nanoseconds()), nil
+		return t.Context().NewInt64(g.settleHostCall(callID, bytes, "").Nanoseconds()), nil
 	}))
 	b.SetPropertyStr("realmDispose", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
@@ -326,8 +327,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	// Retained once — the holder path runs per inbound request, so re-resolving per call is
 	// needless churn. Guest-realm values, freed by rt.Close().
 	g.start = g.qc.Global().GetPropertyStr("__start")
-	g.netResolve = g.qc.Global().GetPropertyStr("__netResolve")
-	g.netReject = g.qc.Global().GetPropertyStr("__netReject")
+	g.resolveHostCall = g.qc.Global().GetPropertyStr("__resolveHostCall")
+	g.rejectHostCall = g.qc.Global().GetPropertyStr("__rejectHostCall")
 	return g, nil
 }
 
@@ -349,10 +350,10 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 	return v.String()
 }
 
-// call invokes the realm's one handle entrypoint as the *initiator*: it may await net, so
-// onDone/onFail settle the shim's Promise when the entrypoint's own promise settles. It
-// reports synchronously whether the entrypoint DEFERRED its answer, which tells the shim's
-// queue the realm is free again even though nothing has settled.
+// call invokes the realm's one handle entrypoint as the *initiator*: it may await host
+// calls, so onDone/onFail settle the shim's Promise when the entrypoint's own promise
+// settles. It reports synchronously whether the entrypoint DEFERRED its answer, which tells
+// the shim's queue the realm is free again even though nothing has settled.
 func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) (bool, time.Duration) {
 	// Neither refusal below retains the callback past the report, so both pass it BORROWED:
 	// a Dup here would be a reference nothing is left to release.
@@ -487,8 +488,8 @@ func (g *guestRealm) settleAll(msg string) {
 
 // pump drains this realm's job queue under its execution budget. The loop calls it
 // instead of Context.Pump because a queued job IS guest code: the continuation after
-// `await Promise.resolve()` never passes through settleNet, so a bare Pump would run it
-// outside every guard — one await would buy an unbounded loop. A pump that FAILS wakes
+// `await Promise.resolve()` never passes through settleHostCall, so a bare Pump would run
+// it outside every guard — one await would buy an unbounded loop. A pump that FAILS wakes
 // the loop: the rejection it queues is more work after this round drained, and a guest
 // spinning on its own generates no I/O, so without the nudge the caller waits out its
 // whole timeout.
@@ -518,10 +519,10 @@ func (g *guestRealm) checkAlive() error {
 	return nil
 }
 
-// settleNet resolves or rejects the guest Promise parked under callID when the host
-// realm's Transport promise settles (`bytes` fulfils, `msg` rejects), then drains the
-// awaiting continuation before returning its execution time to the bridge.
-func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Duration {
+// settleHostCall resolves or rejects the guest Promise parked under callID when the host
+// realm's seam promise settles (`bytes` fulfils, `msg` rejects), then drains the awaiting
+// continuation before returning its execution time to the bridge.
+func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string) time.Duration {
 	if !g.hostCalls.has(callID) {
 		return 0
 	}
@@ -538,17 +539,17 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Dura
 	var res *qjs.Value
 	var err error
 	if bytes != nil {
-		// new Uint8Array(ab) inside __netResolve retains the ArrayBuffer, so freeing our
+		// new Uint8Array(ab) inside __resolveHostCall retains the ArrayBuffer, so freeing our
 		// handle after the call leaves the guest's copy alive.
 		ab := g.qc.NewArrayBuffer(bytes)
 		res, err = g.within(func() (*qjs.Value, error) {
-			return g.qc.Invoke(g.netResolve, g.qc.NewUndefined(), g.qc.NewInt64(callID), ab)
+			return g.qc.Invoke(g.resolveHostCall, g.qc.NewUndefined(), g.qc.NewInt64(callID), ab)
 		})
 		ab.Free()
 	} else {
 		msgV := g.qc.NewString(msg)
 		res, err = g.within(func() (*qjs.Value, error) {
-			return g.qc.Invoke(g.netReject, g.qc.NewUndefined(), g.qc.NewInt64(callID), msgV)
+			return g.qc.Invoke(g.rejectHostCall, g.qc.NewUndefined(), g.qc.NewInt64(callID), msgV)
 		})
 		msgV.Free()
 	}
@@ -559,12 +560,12 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) time.Dura
 		// The continuation failed: nobody may be left waiting on a reply that is not
 		// coming — but the realm must NOT end. An overrun is already an ordinary error
 		// (see within), and anything else is a fault contained to one guest's
-		// `__netResolve`; killing the realm would brick it until the bundle reloads.
+		// `__resolveHostCall`; killing the realm would brick it until the bundle reloads.
 		if g.checkAlive() == nil {
-			g.failInvocation(fmt.Sprintf("guest realm failed delivering a net result: %v", err))
+			g.failInvocation(fmt.Sprintf("guest realm failed delivering a host call result: %v", err))
 		}
 	}
-	// `__netResolve` queues the awaiting continuation. Run it now rather than in the
+	// `__resolveHostCall` queues the awaiting continuation. Run it now rather than in the
 	// loop's anonymous guest pump, so bridge.realmSettle can report its execution to the
 	// same causal root and any host.call it creates inherits that root synchronously.
 	g.pump()

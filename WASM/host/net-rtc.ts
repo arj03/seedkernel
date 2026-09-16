@@ -48,10 +48,9 @@ export interface PeerEntry {
   establishmentTimer: ReturnType<typeof setTimeout> | null;
 }
 
-
 export interface Signaling {
   /** Carry one opaque encoded negotiation message. A relay adapter transports this
-     *  string verbatim; it never owns or interprets JavaScript message objects. */
+   *  string verbatim; it never owns or interprets JavaScript message objects. */
   send(message: string): void;
   onMessage(cb: (message: string) => void): void;
   close(): void;
@@ -79,7 +78,7 @@ type SignalMsg = HelloSignal | SdpSignal | IceSignal;
 /** Copy the platform description into the private signaling vocabulary. */
 function sessionDescription(value: RTCSessionDescriptionInit | null): SdpSignal["sdp"] | undefined {
   if (!value || (value.type !== "offer" && value.type !== "answer")
-        || typeof value.sdp !== "string") return undefined;
+    || typeof value.sdp !== "string") return undefined;
   return { type: value.type, sdp: value.sdp };
 }
 
@@ -88,8 +87,8 @@ function sessionDescription(value: RTCSessionDescriptionInit | null): SdpSignal[
  *  measure untrusted signaling input and never understates its host-memory cost. */
 function iceCandidateBytes(candidate: RTCIceCandidateInit): number {
   return utf16Bytes(candidate.candidate)
-        + utf16Bytes(candidate.sdpMid)
-        + utf16Bytes(candidate.usernameFragment);
+    + utf16Bytes(candidate.sdpMid)
+    + utf16Bytes(candidate.usernameFragment);
 }
 
 function utf16Bytes(value: string | null | undefined): number {
@@ -125,8 +124,7 @@ function encodeSignal(msg: SignalMsg): string {
 
 /** Decode one private negotiation frame at the untrusted signaling boundary. */
 function signalMsg(wire: string): SignalMsg | undefined {
-  if (typeof wire !== "string" || wire.length > MAX_SIGNAL_CHARS)
-    return undefined;
+  if (typeof wire !== "string" || wire.length > MAX_SIGNAL_CHARS) return undefined;
   const parts = wire.split("\0");
   if (parts.length < 3) return undefined;
   const [tag, from, directed] = parts;
@@ -142,7 +140,7 @@ function signalMsg(wire: string): SignalMsg | undefined {
   if (tag !== "i" || parts.length !== 7) return undefined;
   const line = parts[5] === "" ? undefined : Number(parts[5]);
   if (line !== undefined && (!Number.isInteger(line) || line < 0 || line > 0xffff
-        || String(line) !== parts[5])) return undefined;
+    || String(line) !== parts[5])) return undefined;
   const candidate: IceSignal["candidate"] = { candidate: parts[3] };
   if (parts[4] !== "") candidate.sdpMid = parts[4];
   if (line !== undefined) candidate.sdpMLineIndex = line;
@@ -153,20 +151,20 @@ function signalMsg(wire: string): SignalMsg | undefined {
 
 export interface RtcNetworkOptions {
   /** This node's own channel public key, hex — the negotiation needs it for the
-     *  polite/impolite tie-break and for its own `hello`s. Cannot come from a driver: this
-     *  factory is constructed BEFORE the driver, since `bootShell` builds the
-     *  `TransportHost` from `transport.channels`. */
+   *  polite/impolite tie-break and for its own `hello`s. Cannot come from a driver: this
+   *  factory is constructed BEFORE the driver, since `bootShell` builds the
+   *  `TransportHost` from `transport.channels`. */
   peerId: string;
   signaling: Signaling;
   /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
   rtcConfig?: RTCConfiguration;
   /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
-     *  Node/Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
-     *  W3C surface used here) so this exact stack runs off-browser. */
+   *  Node/Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
+   *  W3C surface used here) so this exact stack runs off-browser. */
   peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
   /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
-     *  admits every peer to the rendezvous; the in-channel peer lint (the
-     *  driver's, run on a signature-verified id) is separate and always on. */
+   *  admits every peer to the rendezvous; the in-channel peer lint (the
+   *  driver's, run on a signature-verified id) is separate and always on. */
   admitPeer?: (peerId: string) => boolean;
 }
 
@@ -175,6 +173,7 @@ export interface RtcNetworkOptions {
 // restores record boundaries, so storage can coalesce several blocks per encrypted record
 // without asking WebRTC to carry that record as one message.
 export const RTC_CHUNK_BYTES = 48 * 1024;
+
 export class RtcChannel extends MessageChannel {
   /** Exposes chunked RTC messages as a byte stream, preserving large writes. */
   readonly stream = true;
@@ -185,6 +184,7 @@ export class RtcChannel extends MessageChannel {
     }
   }
 }
+
 // Cap on speculative peer entries the relay can force us to allocate by spamming `hello`s
 // with arbitrary `from` values. An entry stops being speculative once its peer connection
 // establishes (PeerEntry.established) — that cost a real DTLS/ICE handshake, not just a
@@ -215,14 +215,15 @@ export const MAX_QUEUED_SIGNALS = 256;
  *  rendezvous queues — a fleet's worth of few-KiB offers and answers — so the pairing bites
  *  only on the shape nobody sends honestly. Overflow drops the newcomer, as the count does. */
 export const MAX_QUEUED_SIGNAL_BYTES = 4 * 1024 * 1024;
+
 export class RtcNetwork implements ChannelFactory {
-  opts;
+  opts: RtcNetworkOptions;
   private readonly ownId: string;
   private onAccept: ((channel: RawLink, arrival?: Arrival) => void) | null = null;
   readonly peers = new Map<string, PeerEntry>(); // all (pre- and post-establish)
   private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
   /** One ordered lane for the signaling state machine. Promise-returning WebRTC methods
-     *  may yield, but a later SDP/ICE message must not overtake the operation in flight. */
+   *  may yield, but a later SDP/ICE message must not overtake the operation in flight. */
   private signalTail: Promise<void> = Promise.resolve();
   /** Peer entries that have not yet established, the number `admitNewPeer` bounds.
    *  Held rather than counted: `peers` also holds every ESTABLISHED peer, which is
@@ -244,8 +245,8 @@ export class RtcNetwork implements ChannelFactory {
   }
   // ── ChannelFactory interface ─────────────────────────────────────────────────
   /** A browser binds no port; every RTC link arrives through signaling. `connect` is
-     *  deliberately absent (socket-seam.ts `ChannelFactory`): RTC peers come from
-     *  signaling, never from an address. */
+   *  deliberately absent (socket-seam.ts `ChannelFactory`): RTC peers come from
+   *  signaling, never from an address. */
   async listen(
     _tcp: ListenAddress | undefined,
     _ws: ListenAddress | undefined,
@@ -256,29 +257,27 @@ export class RtcNetwork implements ChannelFactory {
   }
   // ── Network interface ────────────────────────────────────────────────────────
   /** Announce ourselves into the room so present peers begin the WebRTC dance.
-     *  Call once after registering the sink (or constructing a StorageNode/Transport
-     *  over this network). */
+   *  Call once after registering the sink (or constructing a StorageNode/Transport
+   *  over this network). */
   join(): void { this.sendSignal({ type: "hello", from: this.ownId }); }
   /** Tear down every connection and the signaling channel. The transport's links
-     *  die with their channels. */
+   *  die with their channels. */
   close(): void {
-    if (this.closed)
-      return;
+    if (this.closed) return;
     this.closed = true;
     for (const peerId of [...this.peers.keys()]) this.forget(peerId);
     this.opts.signaling.close();
   }
   // ── per-peer connection (perfect negotiation) ───────────────────────────────────
   /** Whether a NEW (not yet established) peer entry may be created. The relay can force
-     *  speculative entries by naming arbitrary peers in hellos AND in offers, so every path
-     *  that would CREATE one answers to the same cap. */
+   *  speculative entries by naming arbitrary peers in hellos AND in offers, so every path
+   *  that would CREATE one answers to the same cap. */
   private admitNewPeer(): boolean {
     return this.unestablished < MAX_UNESTABLISHED_PEERS;
   }
   ensurePeer(peerId: string): PeerEntry {
     const existing = this.peers.get(peerId);
-    if (existing)
-      return existing;
+    if (existing) return existing;
     const pc = this.makePc(this.opts.rtcConfig);
     const e: PeerEntry = {
       pc, linked: false, established: false, polite: this.ownId > peerId,
@@ -296,34 +295,34 @@ export class RtcNetwork implements ChannelFactory {
     (e.establishmentTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
     pc.addEventListener("icecandidate", (ev) => {
       const c = ev.candidate?.toJSON();
-      if (this.peers.get(peerId) === e && typeof c?.candidate === "string")
+      if (this.peers.get(peerId) === e && typeof c?.candidate === "string") {
         this.sendSignal({ type: "ice", from: this.ownId, to: peerId, candidate: {
           candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex,
           usernameFragment: c.usernameFragment,
         } });
+      }
     });
     pc.addEventListener("negotiationneeded", async () => {
       // Single entry point for offers — fires when the impolite side creates the
       // data channel. Implicit setLocalDescription() picks offer vs answer.
       try {
-        if (this.peers.get(peerId) !== e)
-          return;
+        if (this.peers.get(peerId) !== e) return;
         e.makingOffer = true;
         await pc.setLocalDescription();
         const sdp = sessionDescription(pc.localDescription);
-        if (this.peers.get(peerId) === e && sdp)
+        if (this.peers.get(peerId) === e && sdp) {
           this.sendSignal({ type: "sdp", from: this.ownId, to: peerId, sdp });
-      }
-      catch { /* renegotiation failed; ICE restart / next hello recovers */ }
-      finally {
+        }
+      } catch {
+        /* renegotiation failed; ICE restart / next hello recovers */
+      } finally {
         e.makingOffer = false;
       }
     });
     // The polite side receives the channel the impolite side opened.
     pc.addEventListener("datachannel", (ev) => this.bindLink(peerId, e, ev.channel, /*weDialed*/ false));
     pc.addEventListener("connectionstatechange", () => {
-      if (this.peers.get(peerId) !== e)
-        return;
+      if (this.peers.get(peerId) !== e) return;
       const s = pc.connectionState;
       if (s === "connected") {
         // A completed DTLS/ICE connection is no longer a speculative entry the
@@ -337,17 +336,14 @@ export class RtcNetwork implements ChannelFactory {
           e.established = true;
           this.unestablished--;
         }
-      }
-      else if (s === "disconnected") {
+      } else if (s === "disconnected") {
         // A transient path failure (network blip, NAT rebind): restartIce()
         // schedules negotiationneeded with fresh credentials and the link recovers
         // without a teardown. Only "failed"/"closed" are terminal.
         try {
           pc.restartIce();
-        }
-        catch { /* nothing to restart */ }
-      }
-      else if (s === "failed" || s === "closed") {
+        } catch { /* nothing to restart */ }
+      } else if (s === "failed" || s === "closed") {
         this.forget(peerId, e);
       }
     });
@@ -357,25 +353,24 @@ export class RtcNetwork implements ChannelFactory {
   // it via ondatachannel. Exactly one channel per pair, so there is no double-
   // connect to resolve (unlike TCP's dial race).
   dialChannel(peerId: string, e: PeerEntry) {
-    if (e.polite || e.linked)
-      return;
+    if (e.polite || e.linked) return;
     this.bindLink(peerId, e, e.pc.createDataChannel("seedkernel", { ordered: true }), /*weDialed*/ true);
   }
   /** Hand the data channel to the driver as a RawLink. The link's fate — whether it
-     *  authenticates, and when it dies — is entirely the transport guest's from here; what
-     *  this file still owns is the CHANNEL, so it watches the one event that says the
-     *  channel is gone.
-     *
-     *  That watch is what reaps a LINKED entry: the transport above tears an
-     *  unauthenticated link down on its own deadline (`unverifiedTimeoutMs`), the driver
-     *  closes the channel, and the entry goes with it. It says nothing about an entry that
-     *  never got a channel — the polite side never opens one, so a peer that completes
-     *  DTLS/ICE and then stays silent arms no watch here at all. That case is the
-     *  entry's own `establishmentTimer`, which is why it survives establishment.
-     *
-     *  A channel with nowhere to go is not bound at all: the driver has not started its
-     *  listeners yet, so the negotiation must be free to hand this peer over again rather
-     *  than sit marked `linked` forever. */
+   *  authenticates, and when it dies — is entirely the transport guest's from here; what
+   *  this file still owns is the CHANNEL, so it watches the one event that says the
+   *  channel is gone.
+   *
+   *  That watch is what reaps a LINKED entry: the transport above tears an
+   *  unauthenticated link down on its own deadline (`unverifiedTimeoutMs`), the driver
+   *  closes the channel, and the entry goes with it. It says nothing about an entry that
+   *  never got a channel — the polite side never opens one, so a peer that completes
+   *  DTLS/ICE and then stays silent arms no watch here at all. That case is the
+   *  entry's own `establishmentTimer`, which is why it survives establishment.
+   *
+   *  A channel with nowhere to go is not bound at all: the driver has not started its
+   *  listeners yet, so the negotiation must be free to hand this peer over again rather
+   *  than sit marked `linked` forever. */
   bindLink(peerId: string, e: PeerEntry, dc: RTCDataChannel, weDialed: boolean) {
     // A late event from a replaced connection, or a renegotiation that presents a
     // second channel, must not leak a live SCTP stream or bind it to the new entry.
@@ -398,10 +393,8 @@ export class RtcNetwork implements ChannelFactory {
   }
   forget(peerId: string, expected?: PeerEntry) {
     const e = this.peers.get(peerId);
-    if (!e || (expected && e !== expected))
-      return;
-    if (!e.established)
-      this.unestablished--;
+    if (!e || (expected && e !== expected)) return;
+    if (!e.established) this.unestablished--;
     if (e.establishmentTimer !== null) {
       clearTimeout(e.establishmentTimer);
       e.establishmentTimer = null;
@@ -410,31 +403,27 @@ export class RtcNetwork implements ChannelFactory {
     e.pendingIceBytes = 0;
     try {
       e.pc.close();
-    }
-    catch { /* ignore */ }
+    } catch { /* ignore */ }
     this.peers.delete(peerId);
   }
   // ── signaling handlers: hello / sdp / ice (perfect negotiation) ───────────────
   private sendSignal(msg: SignalMsg): void {
-    if (!this.closed)
-      this.opts.signaling.send(encodeSignal(msg));
+    if (!this.closed) this.opts.signaling.send(encodeSignal(msg));
   }
   /** Append one inbound message to the signaling lane, bounded by `MAX_QUEUED_SIGNALS`:
-     *  a lane is a queue, and a queue nobody counts is the hole this whole layer closes.
-     *  Returning this promise is useful to synchronous/test adapters; production adapters
-     *  may ignore it. Keep a recovered tail so one unexpected rejection cannot permanently
-     *  poison the lane. */
+   *  a lane is a queue, and a queue nobody counts is the hole this whole layer closes.
+   *  Returning this promise is useful to synchronous/test adapters; production adapters
+   *  may ignore it. Keep a recovered tail so one unexpected rejection cannot permanently
+   *  poison the lane. */
   private enqueueSignal(wire: string): Promise<void> {
     // Decode synchronously so an adapter-owned string is never captured by
     // the promise lane while an earlier WebRTC operation is still in flight.
     let msg: SignalMsg | undefined;
     try { msg = signalMsg(wire); }
     catch { return Promise.resolve(); }
-    if (!msg || this.closed || this.queuedSignals >= MAX_QUEUED_SIGNALS)
-      return Promise.resolve();
+    if (!msg || this.closed || this.queuedSignals >= MAX_QUEUED_SIGNALS) return Promise.resolve();
     const bytes = signalBytes(msg);
-    if (bytes > MAX_QUEUED_SIGNAL_BYTES - this.queuedSignalBytes)
-      return Promise.resolve();
+    if (bytes > MAX_QUEUED_SIGNAL_BYTES - this.queuedSignalBytes) return Promise.resolve();
     this.queuedSignals++;
     this.queuedSignalBytes += bytes;
     const run = this.signalTail.then(() => {
@@ -448,18 +437,13 @@ export class RtcNetwork implements ChannelFactory {
   /** Act on one already-decoded signal. Decoding happens once, at the boundary above. */
   private async onSignal(msg: SignalMsg) {
     try {
-      if (this.closed || msg.from === this.ownId || (msg.to && msg.to !== this.ownId))
-        return;
-      if (this.opts.admitPeer && !this.opts.admitPeer(msg.from))
-        return; // ignore peers outside the signaling allowlist
-      if (msg.type === "hello")
-        await this.onHello(msg);
-      else if (msg.type === "sdp")
-        await this.onSdp(msg);
-      else if (msg.type === "ice")
-        await this.onIce(msg);
-    }
-    catch { /* a malformed signal must not crash the network */ }
+      if (this.closed || msg.from === this.ownId || (msg.to && msg.to !== this.ownId)) return;
+      // Ignore peers outside the signaling allowlist.
+      if (this.opts.admitPeer && !this.opts.admitPeer(msg.from)) return;
+      if (msg.type === "hello") await this.onHello(msg);
+      else if (msg.type === "sdp") await this.onSdp(msg);
+      else if (msg.type === "ice") await this.onIce(msg);
+    } catch { /* a malformed signal must not crash the network */ }
   }
   private async onHello(msg: HelloSignal) {
     const broadcast = !msg.to;
@@ -467,18 +451,15 @@ export class RtcNetwork implements ChannelFactory {
     // hello means the peer reloaded, so replace it.
     if (broadcast) {
       const existing = this.peers.get(msg.from);
-      if (existing && !existing.established)
-        this.forget(msg.from);
+      if (existing && !existing.established) this.forget(msg.from);
     }
     // The cap is on CREATION, whatever shape the hello took: a directed hello
     // names us too, so it can spam a slot just as well as a broadcast one.
-    if (!this.peers.has(msg.from) && !this.admitNewPeer())
-      return;
+    if (!this.peers.has(msg.from) && !this.admitNewPeer()) return;
     const e = this.ensurePeer(msg.from);
     // Reply to a broadcast once (directed), so the peer learns we're here; never
     // reply to a directed hello, or the two bounce forever.
-    if (broadcast)
-      this.sendSignal({ type: "hello", from: this.ownId, to: msg.from });
+    if (broadcast) this.sendSignal({ type: "hello", from: this.ownId, to: msg.from });
     this.dialChannel(msg.from, e); // impolite side opens the channel
   }
   private async onSdp(msg: SdpSignal) {
@@ -488,36 +469,32 @@ export class RtcNetwork implements ChannelFactory {
     const e = msg.sdp.type === "offer"
       ? (this.peers.get(msg.from) ?? (this.admitNewPeer() ? this.ensurePeer(msg.from) : undefined))
       : this.peers.get(msg.from);
-    if (!e)
-      return;
+    if (!e) return;
     // Glare: an offer arriving while we are also offering (or mid-renegotiation) is
     // a collision. The polite side yields (setRemoteDescription rolls back its own
     // offer implicitly); the impolite side ignores the incoming one.
     const collision = msg.sdp.type === "offer" && (e.makingOffer || e.pc.signalingState !== "stable");
-    if (!e.polite && collision)
-      return;
+    if (!e.polite && collision) return;
     await e.pc.setRemoteDescription(msg.sdp);
-    if (this.closed || this.peers.get(msg.from) !== e)
-      return;
+    if (this.closed || this.peers.get(msg.from) !== e) return;
     await this.drainIce(msg.from, e);
-    if (this.closed || this.peers.get(msg.from) !== e)
-      return;
+    if (this.closed || this.peers.get(msg.from) !== e) return;
     if (msg.sdp.type === "offer") {
       await e.pc.setLocalDescription();
       const sdp = sessionDescription(e.pc.localDescription);
-      if (this.peers.get(msg.from) === e && sdp)
+      if (this.peers.get(msg.from) === e && sdp) {
         this.sendSignal({ type: "sdp", from: this.ownId, to: msg.from, sdp });
+      }
     }
   }
   private async onIce(msg: IceSignal) {
     const e = this.peers.get(msg.from);
-    if (!e || !msg.candidate)
-      return;
+    if (!e || !msg.candidate) return;
     // One queue for both phases: before SDP it waits, after SDP the lane below drains
     // it — so a direct caller cannot enter addIceCandidate outside the meter.
     const candidateBytes = iceCandidateBytes(msg.candidate);
     if (e.pendingIce.size >= MAX_PENDING_ICE_CANDIDATES
-            || candidateBytes > MAX_PENDING_ICE_BYTES - e.pendingIceBytes) {
+      || candidateBytes > MAX_PENDING_ICE_BYTES - e.pendingIceBytes) {
       // The sender has made this negotiation unusable; tear it down instead of
       // retaining an ever-growing pre-description or post-description backlog.
       this.forget(msg.from, e);
@@ -525,22 +502,20 @@ export class RtcNetwork implements ChannelFactory {
     }
     e.pendingIce.push(msg.candidate);
     e.pendingIceBytes += candidateBytes;
-    if (e.pc.remoteDescription)
-      await this.drainIce(msg.from, e);
+    if (e.pc.remoteDescription) await this.drainIce(msg.from, e);
   }
   /** Feed the queue to WebRTC oldest first, the candidate at index zero staying charged
-     *  while the platform owns the in-flight promise. No lane of its own: every caller
-     *  reaches here from `onSignal`, which the signaling lane already runs one at a time,
-     *  so a second drain cannot begin while this one is between candidates. */
+   *  while the platform owns the in-flight promise. No lane of its own: every caller
+   *  reaches here from `onSignal`, which the signaling lane already runs one at a time,
+   *  so a second drain cannot begin while this one is between candidates. */
   private async drainIce(peerId: string, e: PeerEntry): Promise<void> {
     while (!this.closed && this.peers.get(peerId) === e
-            && e.pc.remoteDescription && e.pendingIce.size > 0) {
+      && e.pc.remoteDescription && e.pendingIce.size > 0) {
       const candidate = e.pendingIce.peek()!;
       const candidateBytes = iceCandidateBytes(candidate);
       try {
         await e.pc.addIceCandidate(candidate);
-      }
-      catch { /* stale after rollback, or rejected by the platform */ }
+      } catch { /* stale after rollback, or rejected by the platform */ }
       // forget() may have cleared the queue while the platform operation yielded.
       if (e.pendingIce.peek() === candidate) {
         e.pendingIce.shift();

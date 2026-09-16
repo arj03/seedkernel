@@ -77,14 +77,6 @@ class Router {
     if (pool.length === 0) { this.links.delete(pid); this.rr.delete(pid); this.onPeerDown(pid); }
     return true;
   }
-
-  closeAll() {
-    const all = [];
-    for (const pool of this.links.values()) for (const l of pool) all.push(l);
-    this.links.clear();
-    this.rr.clear();
-    for (const l of all) l.close();
-  }
 }
 
 // ── the request/response layer ────────────────────────────────────────────────
@@ -104,14 +96,14 @@ class ReqRes {
     this.deliveringWeight = 0;
   }
 
-  /** Settle an outstanding request and drop its bookkeeping. `ok` false ⇒ `payload` is
-   *  a utf8 failure message, which becomes the rejection the calling app sees. */
-  finish(corr, ok, payload) {
+  /** Settle an outstanding request and drop its bookkeeping: `[1][payload]` for the peer's
+   *  response, `[0]` when `payload` is null — the peer went down, or the correlation's
+   *  retention bound ran out. */
+  finish(corr, payload) {
     const p = this.pending.get(corr);
     if (!p) return;
     this.pending.delete(corr);
-    if (ok) p.d.settle(concatBytes([Uint8Array.from([1]), payload]));
-    else p.d.settle(Uint8Array.from([0]));
+    p.d.settle(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
   }
 
   attach(sendFrame) {
@@ -187,40 +179,38 @@ class ReqRes {
       if (!p || p.to !== from) return; // response bound to the peer it went to
       // finish copies into the answer synchronously; an intermediate payload copy adds
       // no ownership boundary. netLinkDeliver below likewise assembles its own buffer.
-      this.finish(corr, true, frame.subarray(5));
+      this.finish(corr, frame.subarray(5));
       return;
     }
-    if ((kind & 1) === 0) {
-      if (frame.length < 6) return; // no room for the protocol-id length byte
-      const idLen = frame[5];
-      if (frame.length < 6 + idLen) return;
-      const proto = frame.subarray(6, 6 + idLen);
-      const payload = frame.subarray(6 + idLen);
-      // One request out to the host's claim routing, answered in the continuation — the
-      // mirror image of `request` above. FIRED, never awaited: the answer is another turn
-      // of this realm, so the event that decoded this frame must return first. Nothing is
-      // filed against the correlation, because `corr`, `noReply` and the AUTHENTICATED
-      // sender are all held right here until the answer lands — so a corr collision
-      // between two peers cannot answer one with the other's response, and a noReply
-      // request needs no bookkeeping to be dropped by `respond`.
-      //
-      // This program is the link occupant, so it is the one that attributes: it saw the
-      // plaintext, and `from` is who the record layer proved wrote it — `fromPubkey` is
-      // that same proof in bytes, handed down from the link rather than decoded from the
-      // hex, which is per-request work on identity neither end ever re-derives.
-      //
-      // Past the window, a request is refused the way an unclaimed one is: answered empty.
-      const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
-      if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
-      const answer = netLinkDeliver(proto, fromPubkey, payload);
-      this.hold(from, weight);
-      answer.then(
-        (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); },
-        // Only the seam itself can reject — a refused claim and a handler that threw
-        // both answer empty. A realm on its way down owes no response.
-        () => this.hold(from, -weight),
-      );
-    }
+    if (frame.length < 6) return; // no room for the protocol-id length byte
+    const idLen = frame[5];
+    if (frame.length < 6 + idLen) return;
+    const proto = frame.subarray(6, 6 + idLen);
+    const payload = frame.subarray(6 + idLen);
+    // One request out to the host's claim routing, answered in the continuation — the
+    // mirror image of `request` above. FIRED, never awaited: the answer is another turn
+    // of this realm, so the event that decoded this frame must return first. Nothing is
+    // filed against the correlation, because `corr`, `noReply` and the AUTHENTICATED
+    // sender are all held right here until the answer lands — so a corr collision
+    // between two peers cannot answer one with the other's response, and a noReply
+    // request needs no bookkeeping to be dropped by `respond`.
+    //
+    // This program is the link occupant, so it is the one that attributes: it saw the
+    // plaintext, and `from` is who the record layer proved wrote it — `fromPubkey` is
+    // that same proof in bytes, handed down from the link rather than decoded from the
+    // hex, which is per-request work on identity neither end ever re-derives.
+    //
+    // Past the window, a request is refused the way an unclaimed one is: answered empty.
+    const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
+    if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
+    const answer = netLinkDeliver(proto, fromPubkey, payload);
+    this.hold(from, weight);
+    answer.then(
+      (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); },
+      // Only the seam itself can reject — a refused claim and a handler that threw
+      // both answer empty. A realm on its way down owes no response.
+      () => this.hold(from, -weight),
+    );
   }
 
   // The response to a delivered request, addressed back to `from`. noReply ran the
@@ -237,7 +227,7 @@ class ReqRes {
 
   peerDown(peerId) {
     for (const [corr, p] of this.pending) {
-      if (p.to === peerId) this.finish(corr, false, EMPTY);
+      if (p.to === peerId) this.finish(corr, null);
     }
   }
 
@@ -248,14 +238,8 @@ class ReqRes {
     if (requestTimeoutMs <= 0) return false;
     for (const [corr, p] of this.pending) {
       if (tick < p.due) return true;
-      this.finish(corr, false, EMPTY);
+      this.finish(corr, null);
     }
     return false;
-  }
-
-  close() {
-    // Settle rather than drop: every one of these is an app parked on a `_net` call.
-    for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
-    this.pending.clear();
   }
 }

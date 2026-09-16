@@ -8,7 +8,7 @@ import { FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundl
 import { runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
-import { CausalContext, createDeadlineQueue, raceDeadline, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -283,17 +283,13 @@ const modules: PureModuleLoader = {
         // the wall clock around it IS the module's own compute — nothing sits queued
         // behind earlier calls (the native target serializes per slot in Go). Return
         // it as `ms` so the seam bills actual work, matching the JS worker's report.
-        // `performance` is a JS-target global; the quickjs-ng host realm has Date.
-        const clock = (typeof performance === "object" && typeof performance.now === "function")
-          ? () => performance.now()
-          : () => Date.now();
-        const t0 = clock();
+        const t0 = monotonicMs();
         const bound = deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS
           : (deadlineMs === Infinity ? -1 : deadlineMs);
         const r = bridge.callModule(slot, module, payload, bound);
         return Promise.resolve({
           bytes: r === null ? null : new Uint8Array(r),
-          ms: clock() - t0,
+          ms: monotonicMs() - t0,
         });
       },
       dispose() { bridge.disposeModules(slot); },

@@ -39,12 +39,12 @@ function nodeRawStream(socket: Socket): RawLink {
         socket.end();
         const t = setTimeout(() => socket.destroy(), TCP_LINGER_MS);
         t.unref?.();
-      }
-      catch { socket.destroy(); }
+      } catch { socket.destroy(); }
     },
     buffered: () => socket.writableLength,
   };
 }
+
 function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     // Detached below, because `reject` on a settled promise is silent AND `once`
@@ -64,13 +64,14 @@ function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
     });
   });
 }
+
 // The node:net ChannelFactory: every socket the transport driver opens or accepts is
 // created here, behind the RawLink shape.
 export class NodeChannelFactory {
   private tcpServer: TcpServer | null = null;
   private wsServer: TcpServer | null = null;
   /** Takes no crypto: the WebSocket client key and the frame masks are the transport
-     *  bundle's, which reaches entropy through `node/random` like any other authority. */
+   *  bundle's, which reaches entropy through `node/random` like any other authority. */
   constructor() {}
   /** Dial TCP-backed destinations; `wss://` is unsupported because this factory has no TLS. */
   connect(dest: string): RawLink | null {
@@ -78,10 +79,11 @@ export class NodeChannelFactory {
     if (!d || d.scheme === "wss") return null;
     return nodeRawStream(tcpConnect(d.port, d.host));
   }
-  async listen(tcp: ListenAddress | undefined, ws: ListenAddress | undefined, onAccept: (channel: RawLink, arrival?: Arrival) => void): Promise<{
-    port: number;
-    wsPort: number;
-  }> {
+  async listen(
+    tcp: ListenAddress | undefined,
+    ws: ListenAddress | undefined,
+    onAccept: (channel: RawLink, arrival?: Arrival) => void,
+  ): Promise<{ port: number; wsPort: number }> {
     let port = 0, wsPort = 0;
     const tasks: Promise<void>[] = [];
     if (tcp) {

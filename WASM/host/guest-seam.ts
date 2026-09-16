@@ -13,10 +13,10 @@ import type { Keypair } from "../core/subkeys.js";
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
 export interface SignScope {
   /** Domain tag — `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the slot
-     *  holding the raw-link resource. */
+   *  holding the raw-link resource. */
   domain: Uint8Array;
   /** Scope bytes under the domain: `author ‖ app` for an app slot, empty for
-     *  the link slot. */
+   *  the link slot. */
   scope: Uint8Array;
   /** The keypair that signs. */
   key: Keypair;
@@ -46,20 +46,20 @@ export interface RawNet {
   /** Open an opaque destination; id 0 means no route (§12.1). */
   open(dest: string): { linkId: number; stream: boolean };
   /** Write whole bytes to a link. Silently dropped if the link is already gone —
-     *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
+   *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
   send(linkId: number, bytes: Uint8Array): void;
   /** Tear a link down. `graceful` asks the channel to flush already-written bytes
-     *  first (socket-seam.ts `RawLink.close`). */
+   *  first (socket-seam.ts `RawLink.close`). */
   close(linkId: number, graceful: boolean): void;
   /** Route one request this occupant decoded off its links: `(claim, attribution,
-     *  payload)`, answered with the claimant's bytes. No new authority — the call names no
-     *  link, and all three arguments are already the caller's own to choose, so it is worth
-     *  exactly what holding the sockets is worth (§12.10). Both a claim no peer may reach
-     *  and a handler that failed answer EMPTY: refusal and silence are one fact here.
-     *
-     *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
-     *  frame, since a realm serializes its invocations. The caller must therefore fire this
-     *  and return from its event rather than await it inside one. */
+   *  payload)`, answered with the claimant's bytes. No new authority — the call names no
+   *  link, and all three arguments are already the caller's own to choose, so it is worth
+   *  exactly what holding the sockets is worth (§12.10). Both a claim no peer may reach
+   *  and a handler that failed answer EMPTY: refusal and silence are one fact here.
+   *
+   *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
+   *  frame, since a realm serializes its invocations. The caller must therefore fire this
+   *  and return from its event rather than await it inside one. */
   deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
@@ -76,7 +76,7 @@ export interface HostTimers {
 export interface SeamPlatform {
   sodium: SeamCrypto;
   /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key SIGN
-     *  uses is `grants.signScope.key`, chosen by the slot — not this. */
+   *  uses is `grants.signScope.key`, chosen by the slot — not this. */
   identity: Keypair;
   /** Wall clock (ms), defaulted by the shell before constructing a seam. */
   now: () => number;
@@ -91,33 +91,33 @@ export interface SeamPlatform {
  *  confusing failure. */
 export interface SeamGrants {
   /** EXACTLY the manifest's declared `guest.requires` (§12.2) — the host SERVICES this
-     *  realm is granted, as signed. A `host.call` naming a host method is refused unless the
-     *  method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
-     *  declared local service pass regardless. */
+   *  realm is granted, as signed. A `host.call` naming a host method is refused unless the
+   *  method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
+   *  declared local service pass regardless. */
   names: Iterable<string>;
   /** EXACTLY the manifest's declared `guest.calls` (§12.10) — the local service ids this
-     *  realm may reach on a co-resident guest, as signed. What tells a bare `host.call` name
-     *  from one of this bundle's own modules: declared here, it is a cross-realm call;
-     *  otherwise a module. */
+   *  realm may reach on a co-resident guest, as signed. What tells a bare `host.call` name
+   *  from one of this bundle's own modules: declared here, it is a cross-realm call;
+   *  otherwise a module. */
   localServices?: ReadonlySet<string>;
   /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
-     *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
-     *  the link slot gets `DOMAIN_link_scope`. The host always chooses
-     *  domain ‖ scope; the guest never supplies either. Without a scope both names are
-     *  unavailable, because guest signing and scoped verification are never raw. */
+   *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
+   *  the link slot gets `DOMAIN_link_scope`. The host always chooses
+   *  domain ‖ scope; the guest never supplies either. Without a scope both names are
+   *  unavailable, because guest signing and scoped verification are never raw. */
   signScope?: SignScope;
   /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
-     *  (`scopedFs`). Optional: a node that only initiates never reads it. */
+   *  (`scopedFs`). Optional: a node that only initiates never reads it. */
   fs?: Fs;
   /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for a bundle
-     *  that requires the `link` service, so nothing else can ever reach a descriptor
-     *  whatever is installed (§1, capability-by-non-wiring). */
+   *  that requires the `link` service, so nothing else can ever reach a descriptor
+   *  whatever is installed (§1, capability-by-non-wiring). */
   rawNet?: RawNet;
   /** The platform's event loop. `names` decides whether this realm may reach it. */
   timers: HostTimers;
   /** The cross-realm call: how a name in `localServices` is answered. Wired for every
-     *  realm — reaching one is a grant like any other, and the signed list above decides who
-     *  holds it. */
+   *  realm — reaching one is a grant like any other, and the signed list above decides who
+   *  holds it. */
   calls: SeamCalls;
 }
 
@@ -127,7 +127,7 @@ export interface SeamGrants {
 export interface SeamModules {
   names: ReadonlySet<string>;
   /** Reach one of this app's modules by bare name. Async like every seam call;
-     *  `deadlineMs` is the calling guest's remaining segment, never guest-supplied. */
+   *  `deadlineMs` is the calling guest's remaining segment, never guest-supplied. */
   call: (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult>;
 }
 
@@ -146,7 +146,7 @@ export interface CallBudget {
   /** Bill `ms` of host-side CPU to that segment. */
   charge(ms: number): void;
   /** The self-initiated root this call descends from, if any. Propagated across realm
-     * calls so the root pays for execution in every callee, never for time awaiting it. */
+   *  calls so the root pays for execution in every callee, never for time awaiting it. */
   causalClock?: CausalClock;
 }
 
@@ -156,11 +156,13 @@ export interface CallBudget {
 export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array>;
 
 export { HOST_TRANSFORM_NAMES } from "../core/domains.js";
+
 /** The `crypto/` members of the legacy host transform table, as a template literal over
  *  `HOST_TRANSFORM_NAMES`, so
  *  the vocabulary a manifest is checked against and the table the seam dispatches through
  *  cannot drift. */
 type CryptoName = `crypto/${HostTransformName}`;
+
 /** The keys the dispatch table must cover, typed so a name added to the vocabulary without
  *  a handler is a compile error, and so is a handler whose name the loader would refuse.
  *
@@ -168,10 +170,12 @@ type CryptoName = `crypto/${HostTransformName}`;
  *  `[A-Za-z0-9_-]`, so they cannot spell one of these — that is what lets the dispatch tell
  *  host names and module names apart by the name alone. */
 type HandlerKey = CapabilityName | CryptoName;
+
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
 type SeamHandler = (payload: Uint8Array, budget?: CallBudget) => Uint8Array | Promise<Uint8Array>;
+
 /** Residual host-transform table (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
@@ -184,8 +188,7 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
       try {
         const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, a.subarray(44), null, a.subarray(0, 12), a.subarray(12, 44));
         return concatBytes([ONE, pt]);
-      }
-      catch {
+      } catch {
         return ZERO;
       }
     },
@@ -193,13 +196,13 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     "crypto/x25519/dh": (a) => {
       try {
         return concatBytes([ONE, sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))]);
-      }
-      catch {
+      } catch {
         return ZERO;
       }
     },
   };
 }
+
 /** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
  *  entrypoint receives `[caller 32][body …]`. Application and local-service bodies use
  *  the callee's format and remain opaque to routing. The socket driver constructs
@@ -207,17 +210,18 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }
+
 const GUEST_PREAMBLE = `
 "use strict";
 let __callSeq = 0;
 const __pending = Object.create(null);
-globalThis.__netResolve = (callId, bytes) => {
+globalThis.__resolveHostCall = (callId, bytes) => {
   const p = __pending[callId];
   if (!p) return;
   delete __pending[callId];
   p.resolve(new Uint8Array(bytes));
 };
-globalThis.__netReject = (callId, msg) => {
+globalThis.__rejectHostCall = (callId, msg) => {
   const p = __pending[callId];
   if (!p) return;
   delete __pending[callId];
@@ -270,6 +274,7 @@ globalThis.__invoke = (argBuf) => {
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
+
 // ── the attribution prefix, host side ────────────────────────────────────────
 //
 // The ONLY bytes the host puts in front of a callee's format: one 32-byte id, unforgeable
@@ -279,29 +284,32 @@ globalThis.__invoke = (argBuf) => {
 // non-zero is a peer or a co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
+
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
  *  guest signs only within its own bundle's namespace; every node running the same bundle
  *  derives the same bytes, which is what makes scoped signatures portable across a cohort. */
 export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
   const appBytes = enc.encode(app);
-  if (appBytes.length > 255)
-    throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
+  if (appBytes.length > 255) throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
   const out = new Uint8Array(author.length + 1 + appBytes.length);
   out.set(author, 0);
   out[author.length] = appBytes.length;
   out.set(appBytes, author.length + 1);
   return out;
 }
+
 /** An ordinary app's signing scope: `DOMAIN_guest ‖ author ‖ app`. Two bundles derive
  *  disjoint scopes. */
 export function appSignScope(key: Keypair, author: Uint8Array, app: string): SignScope {
   return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
+
 /** The one scoped-signature transcript: `domain ‖ scope ‖ message`. */
 function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message: Uint8Array): Uint8Array {
   return concatBytes([scope.domain, scope.scope, message]);
 }
+
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). Same scope as `appSignScope`. */
 export function appSigner(
   sodium: SeamCrypto,
@@ -310,8 +318,8 @@ export function appSigner(
 ): {
   sign(msg: Uint8Array): Uint8Array;
   /** False on a signature that does not verify under `(scope, pk)`; a `sig` or `pk` of
-     *  the wrong shape ALSO reads false (the seam's `node/verify` refuses a mis-framed
-     *  payload by throwing; a caller-facing verifier has no caller left to explain to). */
+   *  the wrong shape ALSO reads false (the seam's `node/verify` refuses a mis-framed
+   *  payload by throwing; a caller-facing verifier has no caller left to explain to). */
   verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
   const scope = appSignScope(key, author, app);
@@ -322,13 +330,13 @@ export function appSigner(
     verify(pk, sig, msg) {
       try {
         return sodium.crypto_sign_verify_detached(sig, scopedSigningInput(scope, msg), pk);
-      }
-      catch {
+      } catch {
         return false;
       }
     },
   };
 }
+
 /** The `link` capability's signing scope: `DOMAIN_link_scope`, signed by the
  *  node's identity key. The suffix is the slot occupant's business and the host does not
  *  look at it — the transport bundle tags its own handshake format inside it, so changing
@@ -337,6 +345,7 @@ export function appSigner(
 export function linkSignScope(key: Keypair): SignScope {
   return { domain: DOMAIN_LINK_SCOPE, scope: new Uint8Array(0), key };
 }
+
 /** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
  *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope`
  *  for the slot reaching `link`. A function of admitted facts only: nothing local,
@@ -348,6 +357,7 @@ export function slotSignScope(node: { identity: Keypair },
     ? linkSignScope(node.identity)
     : appSignScope(node.identity, author, app);
 }
+
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
 // does not cover host allocations the guest requests, so the seam caps them itself.
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
@@ -357,25 +367,25 @@ const NONE = new Uint8Array(0);
 /** `grants.localServices`'s default: a realm whose manifest named no `guest.calls` reaches
  *  no local service, not every bare name. */
 const EMPTY_SET: ReadonlySet<string> = new Set();
+
 function u64be(value: number): Uint8Array {
   const out = new Uint8Array(8);
   writeU32BE(out, 0, Math.floor(value / 0x100000000));
   writeU32BE(out, 4, value >>> 0);
   return out;
 }
+
 /** The host half of the catalog (§12.2): keys of this table are the host names a
  *  guest may call. `crypto/*` is ungated; everything else is an authority. */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
   const { sodium, identity } = platform;
   const now = platform.now;
   const fs = () => {
-    if (!grants.fs)
-      throw new Error("guest-seam: fs.* used but no fs backend wired");
+    if (!grants.fs) throw new Error("guest-seam: fs.* used but no fs backend wired");
     return grants.fs;
   };
   const rawNet = () => {
-    if (!grants.rawNet)
-      throw new Error("guest-seam: link.* used but no raw net is wired");
+    if (!grants.rawNet) throw new Error("guest-seam: link.* used but no raw net is wired");
     return grants.rawNet;
   };
   const timers = grants.timers;
@@ -391,8 +401,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // slot's `DOMAIN_link_scope`. The guest never picks a namespace.
     "node/sign": (payload) => {
       const s = grants.signScope;
-      if (!s)
-        throw new Error("guest-seam: node/sign needs a slot-derived scope (signing is never raw)");
+      if (!s) throw new Error("guest-seam: node/sign needs a slot-derived scope (signing is never raw)");
       return sodium.crypto_sign_detached(scopedSigningInput(s, payload), s.key.privateKey);
     },
     // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the caller
@@ -402,31 +411,31 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // bound is exactly the fixed prefix.
     "node/verify": (payload) => {
       const s = grants.signScope;
-      if (!s)
+      if (!s) {
         throw new Error("guest-seam: node/verify needs a slot-derived scope (verification is never raw)");
-      if (payload.length < 96)
-        throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
-      try {
-        return sodium.crypto_sign_verify_detached(payload.slice(32, 96), scopedSigningInput(s, payload.slice(96)), payload.slice(0, 32)) ? ONE : ZERO;
       }
-      catch {
+      if (payload.length < 96) throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
+      try {
+        return sodium.crypto_sign_verify_detached(payload.subarray(32, 96), scopedSigningInput(s, payload.subarray(96)), payload.subarray(0, 32)) ? ONE : ZERO;
+      } catch {
         return ZERO;
       }
     },
     "node/identity": () => new Uint8Array(identity.publicKey),
     "node/random": (payload) => {
       const n = readU32BE(payload, 0);
-      if (n > MAX_RANDOM_BYTES)
-        throw new Error("guest-seam: node/random size over cap");
+      if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: node/random size over cap");
       return sodium.randombytes_buf(n);
     },
     // ── fs: raw bytes under an opaque key. Every one round-trips, so each returns a
     // Promise the guest awaits — the seam is what is async, not the backend (§12.1).
     "fs/get": (payload) => fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
+    // Views rather than copies, here and in `link/send`: the payload is already this call's
+    // own copy, and every backend copies or writes what it is handed.
     "fs/put": (payload) => {
       const klen = readU32BE(payload, 0);
-      const key = dec.decode(payload.slice(4, 4 + klen));
-      return fs().put(key, payload.slice(4 + klen)).then(() => NONE);
+      const key = dec.decode(payload.subarray(4, 4 + klen));
+      return fs().put(key, payload.subarray(4 + klen)).then(() => NONE);
     },
     "fs/list": (payload) => {
       const prefix = payload.length ? dec.decode(payload) : undefined;
@@ -463,7 +472,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
       return out;
     },
     "link/send": (payload) => {
-      rawNet().send(readU32BE(payload, 0), payload.slice(4));
+      rawNet().send(readU32BE(payload, 0), payload.subarray(4));
       return NONE;
     },
     "link/close": (payload) => {
@@ -495,6 +504,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
   } satisfies Record<HandlerKey, SeamHandler>);
   return handlers;
 }
+
 /** The one `host.call` a realm runs against: the gate in front of `hostCatalog`.
  *  Every name ANSWERS a Promise — the one shape a guest can read, so "forgetting the
  *  await" is wrong for all of them alike and there is no line to version. Failures keep
@@ -524,11 +534,11 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // on a later turn, never inside this guest's frame; an id nothing claims is refused
     // by name rather than parked on a promise no one will settle.
     if (localServices.has(name)) {
-      if (budget !== undefined && budget.remainingMs <= 0)
+      if (budget !== undefined && budget.remainingMs <= 0) {
         throw new Error("guest-seam: execution budget exhausted before " + name);
+      }
       const answer = grants.calls.call(name, payload, budget?.remainingMs, budget?.causalClock);
-      if (!answer)
-        throw new Error("guest-seam: no realm claims " + name);
+      if (!answer) throw new Error("guest-seam: no realm claims " + name);
       return answer;
     }
     // A `/` says a host method: the table lookup IS the dispatch, gated by the
@@ -543,8 +553,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         throw new Error("guest-seam: " + name + " not declared by the bundle manifest guest.requires");
       }
       const fn = handlers[name];
-      if (!fn)
-        throw new Error("guest-seam: no such name " + name);
+      if (!fn) throw new Error("guest-seam: no such name " + name);
       // Flattened so the caller reads ONE shape: a handler that answered inline
       // (every crypto name, clock, link, timer) resolves in a microtask exactly like
       // a round-tripping one. An inline THROW propagates synchronously, on purpose —
@@ -563,8 +572,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       // peer- and host-initiated work — which is every seam call the transport makes
       // on the frame path, and the reason this measurement costs that path nothing.
       const owner = budget?.causalClock;
-      if (owner === undefined)
-        return Promise.resolve(fn(payload, budget));
+      if (owner === undefined) return Promise.resolve(fn(payload, budget));
       const at = monotonicMs();
       try {
         return Promise.resolve(fn(payload, budget));
@@ -576,12 +584,14 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // slot wired this value directly, so no name can reach another app. Ungated like
     // `crypto/*`. A name the app never installed is a typo, refused by name; a module
     // that runs and fails is a different event, and rejects like any other (§12.2).
-    if (!modules.names.has(name))
+    if (!modules.names.has(name)) {
       throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
+    }
     // Module call charged to caller's segment (§4.3). Refuse if nothing left —
     // realm interrupt alone cannot catch a guest that only awaits.
-    if (budget !== undefined && budget.remainingMs <= 0)
+    if (budget !== undefined && budget.remainingMs <= 0) {
       throw new Error("guest-seam: execution budget exhausted before " + name);
+    }
     return modules.call(name, payload, budget?.remainingMs).then(({ bytes, ms }) => {
       // Bill the module's OWN processing time (measured on the worker that ran
       // it), never the issue-to-settle wall clock — a burst of fire-and-forget
@@ -590,8 +600,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       budget?.charge(ms);
       // Null is the table's failure, empty is a module that said nothing (§12.2).
       // Folding them together would make every caller guess failure from a length.
-      if (bytes === null)
-        throw new Error("guest-seam: module " + name + " failed");
+      if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
       return bytes;
     });
   };

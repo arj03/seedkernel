@@ -1,6 +1,6 @@
 // Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus one injected
-// `__host_call`. Every call parks and settles via `__netResolve`/`__netReject` in the
-// shared preamble — not quickjs-emscripten's `newPromise()`, so this host and the
+// `__host_call`. Every call parks and settles via `__resolveHostCall`/`__rejectHostCall`
+// in the shared preamble — not quickjs-emscripten's `newPromise()`, so this host and the
 // native loader share one guest seam contract. Invocations are serialized
 // (realm-queue.ts).
 
@@ -25,7 +25,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 >;
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
-// `__host_call` / `__netResolve` contract this file implements.
+// `__host_call` / `__resolveHostCall` contract this file implements.
 import { guestPreamble, type CallBudget } from "./guest-seam.js";
 import {
   CausalContext, createActiveHostCallRegistry, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
@@ -249,9 +249,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     liveInvocations.clear();
   };
 
-  // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
-  // preamble's half of the contract), then pump so the awaiting continuation runs.
-  const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle,
+  // Settle a parked host.call by calling the guest's own __resolveHostCall/__rejectHostCall
+  // (the preamble's half of the contract), then pump so the awaiting continuation runs.
+  const settleHostCall = (fn: "__resolveHostCall" | "__rejectHostCall", callId: number, arg: QuickJSHandle,
     invocationBudget: InvocationBudget, causalClock?: CausalClock): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
@@ -330,10 +330,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
           // Request and response coexist while copying the result into the guest. Reserve
           // that overlap and keep the call live through guest-side settlement.
           activeCall.reserve(bytes.byteLength);
-          settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), invocationBudget, causalClock);
+          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), invocationBudget, causalClock);
         } catch (err) {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
           }
         } finally {
           activeCall.release();
@@ -342,7 +342,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       (err) => {
         try {
           if (!disposed && ctx.alive) {
-            settleNet("__netReject", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
           }
         } finally {
           activeCall.release();
@@ -383,8 +383,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     clock.end();
   }
 
-  /** Did the entrypoint that just ran hand its answer over to a later turn (the
-   *  preamble's `defer()`)? Read once, immediately after the synchronous segment, and
+  /** Did the entrypoint that just ran hand its answer over to a later turn (the guest set
+   *  `__deferred`)? Read once, immediately after the synchronous segment, and
    *  cleared by `__invoke` rather than here — so the flag describes exactly the
    *  invocation that just ran. */
   const wasDeferred = (): boolean => {

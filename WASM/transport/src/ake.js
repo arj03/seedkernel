@@ -1,4 +1,4 @@
-// Transport bundle guest: AKE, record layer, link router, request/response (§12.6).
+// Transport bundle guest: the host-call helpers and the link — handshake and record layer (§12.6).
 
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
@@ -14,8 +14,6 @@ const N_MLKEM = "mlkem";
 const N_LINK_OPEN = "link/open";
 const N_LINK_SEND = "link/send";
 const N_LINK_CLOSE = "link/close";
-// A READ of a link's unsent backlog — the only way this program can tell a slow
-// exchange from a stalled one, since everything else it sees is its own bookkeeping.
 // The one link name that carries something IN rather than out: a request this program
 // decoded off a link, handed to the host's claim routing.
 const N_LINK_DELIVER = "link/deliver";
@@ -84,7 +82,7 @@ const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 // changes the handshake format: the host supplies only the opaque scope. (§12.6.2b)
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
-// Per-suite policy constants, keyed by the suite byte; the host never reads them.
+// This suite's policy constants; the host never reads them.
 const REJECT_AFTER_EPOCHS = 1 << 16; // ratchets per direction before the link retires
 const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-oldest)
 
@@ -331,11 +329,10 @@ class Link {
     // Everything here runs async now, so the constructor's old try/catch becomes the
     // boot chain's rejection arm — same deferred teardown the refused slot takes: the
     // slot first and on its own, then the deadline, then the notify-on-later-turn.
-    const networkKeyBytes = spec.networkKey || networkKey;
     // RECOVERED, like every later link in the chain: a raw rejecting `work` would silently
     // skip whatever `enqueue` put behind it, and the deadline's own abort is exactly that.
     this.work = (async () => {
-      this.root = await hash(DOMAIN_CHANNEL, networkKeyBytes);
+      this.root = await hash(DOMAIN_CHANNEL, networkKey);
       if (this.weDialed) {
         await this.ensureKeys();
         this.armDeadline(handshakeTimeoutMs);

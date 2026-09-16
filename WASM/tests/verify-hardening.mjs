@@ -1,7 +1,8 @@
 import { signTestBundle, verifyTestBundle } from "./bundle-fixtures.mjs";
 // Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and seam
 // gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each block is a
-// tight loop over one seam; run.mjs covers the same ground end-to-end. Run after `npm run build`.
+// tight loop over one seam; the *.test.mjs suites cover the same ground end-to-end. Run
+// after `npm run build`.
 
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";

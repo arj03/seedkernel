@@ -4,9 +4,10 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "strict": true,
-    // A subclass that means to replace a base method must say so: `FreshnessMarks.persist`
-    // has a no-op base, so a renamed base would leave both stores silently not persisting
-    // and the next boot re-admitting a revoked author (§12.4).
+    // A subclass that means to replace a base method must say so, so renaming the base is a
+    // compile error rather than a dead override: `RtcChannel.write` splits what
+    // `MessageChannel.write` sends whole, and without it every large RTC write would exceed
+    // the data channel's message ceiling.
     "noImplicitOverride": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

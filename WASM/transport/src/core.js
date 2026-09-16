@@ -421,17 +421,6 @@ class Core {
     }
     return this.readyWaiters.length > 0;
   }
-
-  close() {
-    for (const w of this.readyWaiters.splice(0)) w.d.settle(EMPTY);
-    const pending = [];
-    for (const arr of this.connecting.values()) for (const l of arr) pending.push(l);
-    for (const l of this.inbound) pending.push(l);
-    this.connecting.clear();
-    this.inbound.clear();
-    router.closeAll();
-    for (const l of pending) l.close();
-  }
 }
 
 // ── the one entrypoint ────────────────────────────────────────────────────────

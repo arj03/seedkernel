@@ -25,9 +25,9 @@ type eventLoop struct {
 	stopped bool
 
 	// extra contexts pumped alongside el.c — a confined guest realm sharing this loop, so
-	// a net result settling on the host realm can resume the guest. A guest realm's pump
-	// runs under its execution budget (guestRealm.pump), since a plain `await` continuation
-	// is guest code like any other.
+	// a host-call result settling on the host realm can resume the guest. A guest realm's
+	// pump runs under its execution budget (guestRealm.pump), since a plain `await`
+	// continuation is guest code like any other.
 	extra []pumpEntry
 
 	// awaitIn installs one persistent __settle per context routing into the in-flight
@@ -210,8 +210,8 @@ func (el *eventLoop) callJS(cb *qjs.Value) {
 
 // step drives one turn of the loop: fire every due timer (pumping every realm after each),
 // drain ready microtasks, then block until a posted task or the next timer — and process
-// it. Every realm advances on every pump, which is how a net result settling on the host
-// realm resumes a suspended guest.
+// it. Every realm advances on every pump, which is how a host-call result settling on the
+// host realm resumes a suspended guest.
 func (el *eventLoop) step() {
 	// Fire every due timer, pumping after each so its reactions run before the next.
 	for len(el.timers) > 0 && !el.timers[0].deadline.After(time.Now()) {

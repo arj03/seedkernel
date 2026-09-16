@@ -8,13 +8,13 @@
 export interface MessageTransport {
   binaryType: string;
   /** Bytes queued but not yet on the wire — the host owner's custody signal
-     *  (socket-seam.ts `RawLink.buffered`). Optional: not every transport-shaped
-     *  object in a test double reports it. */
+   *  (socket-seam.ts `RawLink.buffered`). Optional: not every transport-shaped
+   *  object in a test double reports it. */
   bufferedAmount?: number;
   /** This class only ever sends bytes, so that is the whole requirement: a DOM
-     *  WebSocket or RTCDataChannel accepts more, an off-browser data channel may not.
-     *  A view rather than `Uint8Array`, because the DOM lib types RTCDataChannel's as
-     *  `ArrayBufferView<ArrayBuffer>`, which a `Uint8Array<ArrayBufferLike>` misses. */
+   *  WebSocket or RTCDataChannel accepts more, an off-browser data channel may not.
+   *  A view rather than `Uint8Array`, because the DOM lib types RTCDataChannel's as
+   *  `ArrayBufferView<ArrayBuffer>`, which a `Uint8Array<ArrayBufferLike>` misses. */
   send(data: ArrayBufferView): void;
   close(): void;
   addEventListener(type: "open" | "close" | "error", cb: () => void): void;
@@ -36,41 +36,37 @@ export class MessageChannel {
   constructor(private readonly t: MessageTransport) {
     t.binaryType = "arraybuffer";
     t.addEventListener("message", (ev) => {
-      if (typeof ev.data !== "string" && !this.dead)
-        this.onMsg?.(new Uint8Array(ev.data as ArrayBuffer));
+      if (typeof ev.data !== "string" && !this.dead) this.onMsg?.(new Uint8Array(ev.data as ArrayBuffer));
     });
     t.addEventListener("open", () => this.open());
     t.addEventListener("close", () => this.fail());
     t.addEventListener("error", () => this.fail());
   }
   /** Written-but-not-yet-on-the-wire bytes: the pre-open queue plus the platform
-     *  transport's own send backlog. Feeds the host's outbound custody owner
-     *  (socket-seam.ts). */
+   *  transport's own send backlog. Feeds the host's outbound custody owner
+   *  (socket-seam.ts). */
   buffered(): number { return this.pendingBytes + (this.t.bufferedAmount ?? 0); }
   send(bytes: Uint8Array): void {
-    if (this.dead)
-      throw new Error("socket: link is closed");
+    if (this.dead) throw new Error("socket: link is closed");
     if (this.opened) {
       try {
         this.write(bytes);
-      }
-      catch {
+      } catch {
         // A message may have been split into several physical writes. Once any
         // write fails, the byte stream cannot safely continue after that prefix.
         this.fail();
       }
-    }
-    else {
+    } else {
       this.pending.push(bytes);
       this.pendingBytes += bytes.length;
     }
   }
   /** One physical write. Overridable so a transport with a message-size ceiling
-     *  (RtcChannel) can split it while everything above still sees whole writes. */
+   *  (RtcChannel) can split it while everything above still sees whole writes. */
   protected write(bytes: Uint8Array): void { this.t.send(bytes); }
   /** Release the pre-open queue. Every path out of the buffering state ends here or in
-     *  `open()`, so a channel that dies before it opened does not hold its backlog until
-     *  the object itself is dropped. */
+   *  `open()`, so a channel that dies before it opened does not hold its backlog until
+   *  the object itself is dropped. */
   private dropPending(): void {
     this.pending.length = 0;
     this.pendingBytes = 0;
@@ -78,40 +74,34 @@ export class MessageChannel {
   onData(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
   onClose(cb: () => void): void { this.onCls = cb; }
   close(_graceful = false): void {
-    if (this.dead)
-      return;
+    if (this.dead) return;
     this.dead = true;
     this.dropPending();
     // Both real transports drain their queued frames before going away, so a graceful
     // stop needs nothing extra here.
     try {
       this.t.close();
-    }
-    catch { /* already gone */ }
+    } catch { /* already gone */ }
   }
   /** The transport became writable — drain the pre-open buffer. Idempotent, so a
-     *  transport writable from birth (a socket that buffers its own writes) calls it
-     *  straight from its ctor. */
+   *  transport writable from birth (a socket that buffers its own writes) calls it
+   *  straight from its ctor. */
   protected open(): void {
-    if (this.opened)
-      return;
+    if (this.opened) return;
     this.opened = true;
     try {
-      for (const b of this.pending)
-        this.write(b);
-    }
-    catch {
+      for (const b of this.pending) this.write(b);
+    } catch {
       this.fail();
       return;
     }
     this.dropPending();
   }
   /** The transport failed/closed: mark dead and notify onClose once. `close()` sets `dead`
-     *  first, so a deliberate close never re-enters here — but a failure on a live channel
-     *  must reach onClose, or the link is never forgotten and the peer is blackholed. */
+   *  first, so a deliberate close never re-enters here — but a failure on a live channel
+   *  must reach onClose, or the link is never forgotten and the peer is blackholed. */
   protected fail(): void {
-    if (this.dead)
-      return;
+    if (this.dead) return;
     this.close();
     this.onCls?.();
   }

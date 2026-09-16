@@ -332,11 +332,11 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		liveID = id
 	}
 
-	g.settleNet(liveID+1000, []byte{}, "")
+	g.settleHostCall(liveID+1000, []byte{}, "")
 	if len(g.hostCalls.live) != 1 {
 		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls.live))
 	}
-	g.settleNet(liveID, []byte{}, "")
+	g.settleHostCall(liveID, []byte{}, "")
 	if len(g.hostCalls.live) != 0 || len(g.hostCallBudgets) != 0 {
 		t.Fatalf("live settlement left %d parked calls and %d invocation clocks", len(g.hostCalls.live), len(g.hostCallBudgets))
 	}
@@ -554,9 +554,9 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 
 // A realm killed mid-flight must SETTLE the calls it still owes, not strand them.
 //
-// The dangerous shape is an entrypoint that parks on net and then burns its budget in the
-// continuation: the kill lands inside settleNet, after the initiator's promise reached the
-// shell but before anything settled it. safe-js has no equivalent problem (its interrupt
+// The dangerous shape is an entrypoint that parks on a host call and then burns its budget
+// in the continuation: the kill lands inside settleHostCall, after the initiator's promise
+// reached the shell but before anything settled it. safe-js has no equivalent problem (its interrupt
 // throws and the guest's promise rejects), so a native realm that merely stopped answering
 // would hang the node rather than fail it — strictly worse, since the caller cannot retry,
 // time out, or tell anything went wrong.
@@ -594,9 +594,9 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 }
 
 // The budget also covers continuations the realm pump drains directly. A plain `await`
-// (no host.call) resumes through that pump rather than settleNet, which was once outside
-// every guard the realm had: one `await Promise.resolve()` bought an unbounded loop,
-// since only the segment before the await was budgeted.
+// (no host.call) resumes through that pump rather than settleHostCall, which was once
+// outside every guard the realm had: one `await Promise.resolve()` bought an unbounded
+// loop, since only the segment before the await was budgeted.
 //
 // Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
 // the loop must be driven by whoever is waiting on it.
@@ -610,7 +610,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	}
 	newTestRealmBudget(t, "{}", `
 		async function handle() {
-		  await Promise.resolve();   // resumes via the realm pump, not settleNet
+		  await Promise.resolve();   // resumes via the realm pump, not settleHostCall
 			for (;;) {}
 		}
 	`, 300)

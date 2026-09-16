@@ -1,8 +1,9 @@
 // The shipped host tree (§10.2). `build/` keeps its doc comments for debugging;
-// `build-min/` is what a browser vendors, and over half its gzipped bytes would be those
-// comments — so this is a second `tsc` pass with `removeComments`, nothing more. Letting
-// the compiler strip them is what keeps a hand-written lexer, which cannot tell a regex
-// literal from a division, out of the build. One `npm run build` produces both trees.
+// `build-min/` is what a browser vendors: a second `tsc` pass over only what the browser
+// entry points reach (tsconfig.min.json), with `removeComments`, since over half the
+// gzipped bytes would be those comments. Letting the compiler strip them is what keeps a
+// hand-written lexer, which cannot tell a regex literal from a division, out of the build.
+// One `npm run build` produces both trees.
 
 import { readFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { gzipSync } from "node:zlib";
@@ -31,10 +32,6 @@ execFileSync(
   [join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.min.json"],
   { cwd: root, stdio: "inherit" },
 );
-
-// Offline authoring is a package entry point from build/host, but build-min is the runtime
-// tree staged into browser shells. Keeping the signer out here makes that boundary physical.
-rmSync(join(outDir, "host", "bundle-author.js"), { force: true });
 
 const files = walk(outDir);
 let gzIn = 0, gzOut = 0;

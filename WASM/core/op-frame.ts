@@ -3,8 +3,9 @@
 // The three functions below are serialized by bundle-author.ts's `guestOpFraming` for
 // import-free guests, and the transport assembler injects that source before signing — so
 // they must reference nothing outside themselves, not even this file's imports. The type
-// system does not say so: run.mjs's `testGeneratedOpFrame` EXECUTES the emitted source, and
-// that is what catches a free variable — a new code path here needs a case there.
+// system does not say so: `testGeneratedOpFrame` (tests/bundle-install.test.mjs) EXECUTES
+// the emitted source, and that is what catches a free variable — a new code path here needs
+// a case there.
 import { writeU32BE, enc } from "./util.js";
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched

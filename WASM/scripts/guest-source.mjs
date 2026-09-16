@@ -22,11 +22,11 @@ export function guestSourcePaths() {
  *  `opFrameSource` comes from bundle-author.ts's `guestOpFraming`, which serializes the
  *  canonical core/op-frame.ts functions.
  *
- *  The result is normalized to LF because this text is SIGNED: the parts are checked out
- *  CRLF on Windows and LF elsewhere, so without this the same commit would sign different
- *  bytes on different machines. Only comments hold a raw newline here — a template
- *  literal's would be normalized by the JS parser anyway — so it cannot change what the
- *  program does. */
+ *  The result is normalized to LF because this text is SIGNED: `.gitattributes` checks the
+ *  parts out LF, but the build reads the working tree, where an editor can still save CRLF,
+ *  and the same commit must sign the same bytes on every machine. Only comments hold a raw
+ *  newline here — a template literal's would be normalized by the JS parser anyway — so it
+ *  cannot change what the program does. */
 export function readGuestSource(opFrameSource) {
   if (typeof opFrameSource !== "string" || opFrameSource.trim().length === 0) {
     throw new Error("guest source: canonical op-frame source is required");

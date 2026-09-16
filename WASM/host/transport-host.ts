@@ -1,7 +1,6 @@
 // Socket driver: owns links and listeners; protocol and peer state stay in the signed guest
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
-
 import { fromHex, Fifo } from "../core/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
@@ -65,31 +64,31 @@ export type TransportDeliver = (claim: string, attribution: Uint8Array, payload:
 
 export interface TransportHostOptions {
   /** Live raw links this driver will hold at once (default `DEFAULT_MAX_RAW_LINKS`).
- *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
- *  the host's own link table, not the occupant's link states. */
+   *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
+   *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
   /** Aggregate write custody across every link in this driver. */
   maxOutboundBytes?: number;
   maxOutboundSlices?: number;
   /** The socket seam: dialing and listening live here, and so does every judgement about
- *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
- *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
- *  and its `link/open` calls answer "no route". */
+   *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
+   *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
+   *  and its `link/open` calls answer "no route". */
   channels?: ChannelFactory;
   listen?: ListenAddress;
   wsListen?: ListenAddress;
   /** One link went down, with the occupant's one-byte reason (transport/src/ake.js
- *  `REASON_*`) — a peer that never finished the handshake, a defensive teardown, a clean
- *  farewell, a cut stream. NODE-level and observation only: nothing here can change what the
- *  occupant does, and an app that wants the peer set asks the transport for it.
- *
- *  DELIBERATELY has no caller in this repo's own shells, and that is not a reason to delete
- *  it. It is how `tests/transport-link.test.mjs` pins what each reason MEANS — every
- *  `CLOSE_REASON` assertion in that file reads this callback, and without it those
- *  properties can only be checked through the in-process channel pair, which pins nothing
- *  for the case the reason exists for (the other end being another machine). It is also the
- *  escape hatch for a host that needs the fact programmatically rather than on stderr.
- *  Routine debugging needs neither: `logLinkDown` already prints the anomalous ones. */
+   *  `REASON_*`) — a peer that never finished the handshake, a defensive teardown, a clean
+   *  farewell, a cut stream. NODE-level and observation only: nothing here can change what the
+   *  occupant does, and an app that wants the peer set asks the transport for it.
+   *
+   *  DELIBERATELY has no caller in this repo's own shells, and that is not a reason to delete
+   *  it. It is how `tests/transport-link.test.mjs` pins what each reason MEANS — every
+   *  `CLOSE_REASON` assertion in that file reads this callback, and without it those
+   *  properties can only be checked through the in-process channel pair, which pins nothing
+   *  for the case the reason exists for (the other end being another machine). It is also the
+   *  escape hatch for a host that needs the fact programmatically rather than on stderr.
+   *  Routine debugging needs neither: `logLinkDown` already prints the anomalous ones. */
   onLinkClosed?: (linkId: number, reason: number) => void;
   /** Silence the link-down diagnostic. For a node whose teardown churn is normal and
    *  expected — a relay — or a test that would otherwise print a page of deliberate

@@ -23,9 +23,9 @@ import type { NodeRuntime as CliNodeRuntime, NodeSetup } from "./cli.js";
 export interface NodeShell extends CoreShell {
   fs: Fs;
   /** Install a signed bundle *file*: read it from disk then delegate to `install`
-     *  (§12.4), `opts.replaces` included — a file on disk is as ordinary a source for a
-     *  replacement as for a first install. This is the Node convenience wrapper;
-     *  cross-platform callers hold the bytes and use `install` directly. */
+   *  (§12.4), `opts.replaces` included — a file on disk is as ordinary a source for a
+   *  replacement as for a first install. This is the Node convenience wrapper;
+   *  cross-platform callers hold the bytes and use `install` directly. */
   installFile(file: string, opts?: InstallOptions): Promise<AppHandle>;
 }
 
@@ -45,8 +45,7 @@ export function fileFreshnessStore(path: string): FreshnessMarks {
   let json = null;
   try {
     json = readFileSync(path, "utf8");
-  }
-  catch (e) {
+  } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
       throw new Error(`freshness store: cannot read ${path}: ${errMessage(e)}`, { cause: e });
@@ -55,6 +54,7 @@ export function fileFreshnessStore(path: string): FreshnessMarks {
   }
   return new FreshnessMarks(json, (out) => writeFileAtomic(path, out));
 }
+
 // The realm factory (§12.3) is deliberately not stated here: bootShell's default IS the
 // lazy safe-js import this platform wants (the engine is heavy, so it loads on the first
 // realm), and a second copy of it would be the drift the assembly exists to remove.
@@ -81,7 +81,7 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
     guestDeadlineMs: opts.guestDeadlineMs,
     realmMemoryBytes: opts.realmMemoryBytes,
   });
-    // ── Node wrapper: add file-backed installFile ───────────────────────────────
+  // ── Node wrapper: add file-backed installFile ───────────────────────────────────
   const shell: NodeShell = {
     ...core,
     // This platform always supplies an fs (Node always has a filesystem), so the

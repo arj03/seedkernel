@@ -31,75 +31,75 @@ export type ShellSodium = ManifestVerifier & SeamCrypto;
  *  same reason, one level down: the operator's numbers ABOUT ONE APP. */
 export interface InstallOptions {
   /** The slot this install RETIRES, by its audit identity (`AppHandle.key`) — the whole
-     *  difference between the two shapes an install has. Absent, the candidate must land on
-     *  a FREE identity and an occupied one is refused. Present, it must name a live slot,
-     *  which the candidate takes over atomically — across authors and app names, and it is
-     *  the only way to take `link`. Named, never inferred from the candidate's own
-     *  identity, so nothing is displaced that the caller did not choose. */
+   *  difference between the two shapes an install has. Absent, the candidate must land on
+   *  a FREE identity and an occupied one is refused. Present, it must name a live slot,
+   *  which the candidate takes over atomically — across authors and app names, and it is
+   *  the only way to take `link`. Named, never inferred from the candidate's own
+   *  identity, so nothing is displaced that the caller did not choose. */
   replaces?: string;
   localConfig?: JsonObject;
   /** QuickJS heap limit for THIS load's realm, in bytes. Omitted ⇒ the shell's
-     *  `realmMemoryBytes`, and failing that `DEFAULT_REALM_MEMORY_BYTES`. What a target
-     *  streaming large windows through one guest raises (seedstore's storage bundle). A
-     *  replacement load carries its own: a version installed without one is held to the
-     *  node's default rather than inheriting the outgoing realm's. */
+   *  `realmMemoryBytes`, and failing that `DEFAULT_REALM_MEMORY_BYTES`. What a target
+   *  streaming large windows through one guest raises (seedstore's storage bundle). A
+   *  replacement load carries its own: a version installed without one is held to the
+   *  node's default rather than inheriting the outgoing realm's. */
   realmMemoryBytes?: number;
   /** Budget of guest execution time per entrypoint invocation for THIS load, in ms.
-     *  Omitted ⇒ the shell's `guestDeadlineMs`, and failing that
-     *  `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
+   *  Omitted ⇒ the shell's `guestDeadlineMs`, and failing that
+   *  `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
   guestDeadlineMs?: number;
   /** Observe this slot's own answer to a PEER-inbound frame, after it resolves
-     *  (`deliverInbound`). The one gap left once dispatch is a single claim → slot map: the
-     *  link occupant consumes that answer on its way back out to the wire, so an embedder
-     *  whose own mounted app must paint what it just answered has no other path to those
-     *  bytes.
-     *  Scoped to THIS load rather than the shell; a replacement load carries its own.
-     *  Observation only: it cannot change what the caller receives, it is never consulted
-     *  for a host loopback `invoke` or a cross-realm call, and a throw from it is swallowed. */
+   *  (`deliverInbound`). The one gap left once dispatch is a single claim → slot map: the
+   *  link occupant consumes that answer on its way back out to the wire, so an embedder
+   *  whose own mounted app must paint what it just answered has no other path to those
+   *  bytes.
+   *  Scoped to THIS load rather than the shell; a replacement load carries its own.
+   *  Observation only: it cannot change what the caller receives, it is never consulted
+   *  for a host loopback `invoke` or a cross-realm call, and a throw from it is swallowed. */
   onInbound?: InboundObserver;
 }
 
 export interface Shell {
   /** Which app serves this claim, or null (§12.10) — a peer-reachable `protocols` name
-     *  first, then a locally reachable `services` one. A read of the projection the
-     *  installed manifests define; there is nothing to write here. The one owner kind is a
-     *  bundle slot. */
+   *  first, then a locally reachable `services` one. A read of the projection the
+   *  installed manifests define; there is nothing to write here. The one owner kind is a
+   *  bundle slot. */
   resolve(claim: string): string | null;
   /** Every claim this node serves, as `[claim, owner]` — what an operator's console line
-     *  or a shell's UI lists, peer-reachable names first. A snapshot, not the live maps. */
+   *  or a shell's UI lists, peer-reachable names first. A snapshot, not the live maps. */
   routes(): [string, string][];
   /** Call the realm claiming this LOCAL service id, with the host's caller id; `null`
-     *  when nothing claims it. The host half of the routing a co-resident guest reaches
-     *  through `host.call`, so it resolves `services` and never `protocols`.
-     *
-     *  The third door into a realm, and the three have distinct audiences: `AppHandle.invoke`
-     *  is slot-bound, this is local reach, `link/deliver` is peer reach. An embedder or the
-     *  CLI composes the op frame (op-frame.ts) — this is how the node's own transport is
-     *  asked to wait for a cohort, list peers, or learn an address. */
+   *  when nothing claims it. The host half of the routing a co-resident guest reaches
+   *  through `host.call`, so it resolves `services` and never `protocols`.
+   *
+   *  The third door into a realm, and the three have distinct audiences: `AppHandle.invoke`
+   *  is slot-bound, this is local reach, `link/deliver` is peer reach. An embedder or the
+   *  CLI composes the op frame (op-frame.ts) — this is how the node's own transport is
+   *  asked to wait for a cohort, list peers, or learn an address. */
   call(serviceId: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
   /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
-     *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
+   *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
   fs?: Fs;
   sodium: ShellSodium;
   /** Install a signed bundle blob: verify the manifest, run the admission predicate,
-     *  integrity-check + install the modules, stand the guest, commit the slot. THE one way
-     *  a bundle enters this node, and `opts.replaces` is the only thing that varies — a
-     *  free identity when absent, the named slot retired atomically when present. App
-     *  candidates require admission either way; a candidate reaching `link` is authorized
-     *  only by replacing the current link owner. An install either leaves a running app
-     *  behind or leaves nothing: the realm is built here, so a guest that cannot compile
-     *  fails the install rather than the first frame, the freshness mark is advanced last,
-     *  and a failed candidate leaves the slot it named exactly as it was. Identity scopes
-     *  and history never transfer across a replacement. */
+   *  integrity-check + install the modules, stand the guest, commit the slot. THE one way
+   *  a bundle enters this node, and `opts.replaces` is the only thing that varies — a
+   *  free identity when absent, the named slot retired atomically when present. App
+   *  candidates require admission either way; a candidate reaching `link` is authorized
+   *  only by replacing the current link owner. An install either leaves a running app
+   *  behind or leaves nothing: the realm is built here, so a guest that cannot compile
+   *  fails the install rather than the first frame, the freshness mark is advanced last,
+   *  and a failed candidate leaves the slot it named exactly as it was. Identity scopes
+   *  and history never transfer across a replacement. */
   install(blob: Uint8Array, opts?: InstallOptions): Promise<AppHandle>;
   /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
-     *  realm, private modules, timers and scopes as one unit. */
+   *  realm, private modules, timers and scopes as one unit. */
   uninstall(appKey: string): boolean;
   /** Write off an author key: refuse everything it signs from now on, and uninstall every
-     *  app of its already running. Returns the app keys torn down. One call because the
-     *  halves are useless apart: uninstalling alone leaves the thief's next bundle landing
-     *  on the same derived names, refusing alone leaves the compromised code running.
-     *  Permanent and host-local — recovery is a new author key, not an un-revoke. */
+   *  app of its already running. Returns the app keys torn down. One call because the
+   *  halves are useless apart: uninstalling alone leaves the thief's next bundle landing
+   *  on the same derived names, refusing alone leaves the compromised code running.
+   *  Permanent and host-local — recovery is a new author key, not an un-revoke. */
   revoke(authorHex: string): string[];
   close(): void;
 }
@@ -107,20 +107,20 @@ export interface Shell {
 /** What a load returns: verified facts plus a slot-bound handle (§12.4). */
 export interface AppHandle extends LoadedBundle {
   /** `<author hex>:<app>` (§12.4) — the slot's audit identity, the freshness key and
-     *  what `uninstall`/`revoke` address. */
+   *  what `uninstall`/`revoke` address. */
   key: string;
   /** This app's fs keyspace view (§12.2): `scopedFs(backend, appScope)` already applied
-     *  by the shell, so reads/writes/lists over this handle can only reach this app's
-     *  keys. Absent on a shell with no fs. */
+   *  by the shell, so reads/writes/lists over this handle can only reach this app's
+   *  keys. Absent on a shell with no fs. */
   fs?: Fs;
   /** The fs keyspace prefix this app's view is scoped under — the derivation the shell
-     *  computed (`appScopeFor`, bundle.ts). For a caller reading the raw backend cold
-     *  (outside a running node), `scopedFs(raw, appScope)` (fs-view.ts) re-derives it. */
+   *  computed (`appScopeFor`, bundle.ts). For a caller reading the raw backend cold
+   *  (outside a running node), `scopedFs(raw, appScope)` (fs-view.ts) re-derives it. */
   appScope: string;
   /** Loopback invoke into this app's one `handle` entrypoint, bound to THE SLOT this
-     *  load stood. A replacement stands a new slot, possibly under a different key. A handle
-     *  taken before it keeps naming the version it was handed and rejects once that slot
-     *  is disposed. The replacement load returns the new handle. */
+   *  load stood. A replacement stands a new slot, possibly under a different key. A handle
+   *  taken before it keeps naming the version it was handed and rejects once that slot
+   *  is disposed. The replacement load returns the new handle. */
   invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
 }
 
@@ -133,7 +133,7 @@ export { scopedFs } from "./fs-view.js";
 /** This node's network, whole (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
   /** The signed transport to install at boot. Selecting these bytes authorizes link.
-     *  Defaults to the artifact-shipped bundle. Live changes install over it by name. */
+   *  Defaults to the artifact-shipped bundle. Live changes install over it by name. */
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
@@ -144,52 +144,52 @@ export interface TransportOptions extends TransportHostOptions {
  *  is why there is one assembly path and no way to reach the shell around it. */
 export interface BootShellOptions {
   /** The crypto surface the shell needs — core libsodium with the ML-DSA-65 verifier
-     *  mixed in (the one thing no target can default: main.ts loads it, a browser page
-     *  readies it). */
+   *  mixed in (the one thing no target can default: main.ts loads it, a browser page
+   *  readies it). */
   sodium: ShellSodium;
   /** The node's keypair (§12.9): its public half is this node's peer id and the one
-     *  identity every target reports through `node/identity`. The handshake and the seam's
-     *  SIGN op both sign with it, under different domains and scopes. */
+   *  identity every target reports through `node/identity`. The handshake and the seam's
+   *  SIGN op both sign with it, under different domains and scopes. */
   identity: Keypair;
   /** Admission for ordinary apps: an author policy, consent dialog, or `admitAll`.
-     *  Absent means deny-all for apps. Link is authorized by the selected boot transport
-     *  or explicit replacement of its current owner. Host gates apply to every bundle. */
+   *  Absent means deny-all for apps. Link is authorized by the selected boot transport
+   *  or explicit replacement of its current owner. Host gates apply to every bundle. */
   admit?: Admit;
   /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
-     *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
-     *
-     *  `false` is "a node with no disk" (§12.2): no backend wired at all, so a bundle
-     *  declaring the `fs` cap has its first `fs/*` call throw by name rather than resolve
-     *  to a pretend store. Said rather than omitted, because omitting is what asks for the
-     *  in-memory default. */
+   *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
+   *
+   *  `false` is "a node with no disk" (§12.2): no backend wired at all, so a bundle
+   *  declaring the `fs` cap has its first `fs/*` call throw by name rather than resolve
+   *  to a pretend store. Said rather than omitted, because omitting is what asks for the
+   *  in-memory default. */
   fs?: Fs | false;
   /** The persisted bundle-freshness store (§12.4). Default: `FreshnessMarks`,
-     *  in-memory. */
+   *  in-memory. */
   freshnessStore?: FreshnessStore;
   /** The target-specific builder for a bundle's private pure modules (§4). Default:
-     *  `ModuleTable`, the JS worker-backed builder; the native loader passes its Go-backed
-     *  one. */
+   *  `ModuleTable`, the JS worker-backed builder; the native loader passes its Go-backed
+   *  one. */
   modules?: PureModuleLoader;
   /** The confined realm factory (§12.3) — every app is a guest, so there is always one.
-     *  Default: the lazy safe-js import, since the QuickJS engine is heavy and loads on the
-     *  first realm. */
+   *  Default: the lazy safe-js import, since the QuickJS engine is heavy and loads on the
+   *  first realm. */
   createRealm?: RealmFactory;
   now?: () => number;
   /** This node's DEFAULT guest execution and handoff budget per entrypoint invocation,
-     *  in ms. Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables the local ceiling.
-     *  A finite initiating caller still narrows an unbounded callee. The operator's number,
-     *  not the author's: unlike
-     *  the module memory ceiling (§4.3), how long this node spends on one message is a
-     *  property of the deployment. */
+   *  in ms. Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables the local ceiling.
+   *  A finite initiating caller still narrows an unbounded callee. The operator's number,
+   *  not the author's: unlike
+   *  the module memory ceiling (§4.3), how long this node spends on one message is a
+   *  property of the deployment. */
   guestDeadlineMs?: number;
   /** This node's DEFAULT QuickJS heap limit for a guest realm, in bytes. Omitted ⇒
-     *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI `--guest-memory`);
-     *  a single load raises or lowers it for its own realm with
-     *  `InstallOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
+   *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI `--guest-memory`);
+   *  a single load raises or lowers it for its own realm with
+   *  `InstallOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
   realmMemoryBytes?: number;
   /** This node's network (§12.6): the sockets and the signed transport that drives them.
-     *  Omitted or `false` is a node with no network. The options object is retained to
-     *  preserve live accessors. */
+   *  Omitted or `false` is a node with no network. The options object is retained to
+   *  preserve live accessors. */
   transport?: TransportOptions | false;
 }
 
@@ -199,8 +199,8 @@ export interface BootShellOptions {
 export interface BootResult {
   shell: Shell;
   /** The channel adapter. Null ONLY on a node with no network (`transport` absent or
-     *  `false`). The fs backend is not here: it is `shell.fs`, whether the caller passed one
-     *  or took the default. */
+   *  `false`). The fs backend is not here: it is `shell.fs`, whether the caller passed one
+   *  or took the default. */
   transport: TransportHost | null;
 }
 
@@ -217,46 +217,40 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const fs = backend ? validatedFs(backend) : undefined;
   const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
   const createRealm = opts.createRealm
-        ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
+    ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
   const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
   const now = opts.now ?? (() => Date.now());
   const net = opts.transport === false ? undefined : opts.transport;
-  const netHost = net
-    ? new TransportHost(net)
-    : null;
+  const netHost = net ? new TransportHost(net) : null;
   const transportBlob = netHost ? (net!.bundle ?? transportBundleBytes()) : null;
   const appAdmit = opts.admit ?? denyAll;
   let closed = false;
 
   // ── what this node holds (slot-table.ts) ────────────────────────────────────
   const table = createSlotTable();
-  // The tail of every host-initiated call into a realm. close() defers realm disposal onto
-  // this, so a call parked mid-await (a repair pass on an unreachable peer, an operator
-  // waiting for a cohort) is never resumed into a freed realm — a QuickJS
-  // use-after-free (§12.3).
-  let inFlight = Promise.resolve();
   /** This load's per-invocation ceiling: this load's number, else the node's, else the
-     *  shared one (§12.3). One place, because two owners are measured against it — the realm
-     *  `standRealm` stands, and the clock its realm wake banks one invocation of. */
+   *  shared one (§12.3). One place, because two owners are measured against it — the realm
+   *  `standRealm` stands, and the clock its realm wake banks one invocation of. */
   const deadlineFor = (load: InstallOptions): number =>
     load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
-    /** An empty slot for `loaded`, with its realm wake already pointed at the realm the
-     *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
-     *  which is the correct reading anyway: the realm a deadline re-enters is the one
-     *  standing when it fires (a transport handover replaces it while the slot stays). */
+  /** An empty slot for `loaded`, with its realm wake already pointed at the realm the
+   *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
+   *  which is the correct reading anyway: the realm a deadline re-enters is the one
+   *  standing when it fires (a transport handover replaces it while the slot stays). */
   const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions): AppSlot => {
     let slot: AppSlot;
-    const timers = createRealmTimers((body, causalClock) =>
-    // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
-    // event the host delivers, not a host authority, and `body` arrives pre-framed. A
-    // throw has no caller left to reject — the arming call returned turns ago — so it
-    // is reported and swallowed. The promise is RETURNED, not discarded: that is what
-    // allows the next due wake to enter (realm-timers.ts).
-      slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
+    const timers = createRealmTimers(
+      // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
+      // event the host delivers, not a host authority, and `body` arrives pre-framed. A
+      // throw has no caller left to reject — the arming call returned turns ago — so it
+      // is reported and swallowed. The promise is RETURNED, not discarded: that is what
+      // allows the next due wake to enter (realm-timers.ts).
+      (body, causalClock) => slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
-    // Banked against THIS slot's ceiling, not the node's default.
-    deadlineFor(load));
+      // Banked against THIS slot's ceiling, not the node's default.
+      deadlineFor(load),
+    );
     const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
     const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, reachesLink(loaded.manifest));
     slot = {
@@ -272,25 +266,25 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     };
     return slot;
   };
-    /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
+  /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
   const disposeSlot = (slot: AppSlot | null | undefined) => {
     if (slot) slot.active = false;
     slot?.timers.clearAll();
     slot?.realm?.dispose();
     slot?.pureModules.dispose();
   };
-    /** Reify a JSON value through JSON.parse rather than as an object literal. Besides
-     *  keeping strings safely quoted inside source, this preserves JSON's treatment of a
-     *  key named `__proto__` as ordinary data instead of invoking object-literal prototype
-     *  syntax. */
+  /** Reify a JSON value through JSON.parse rather than as an object literal. Besides
+   *  keeping strings safely quoted inside source, this preserves JSON's treatment of a
+   *  key named `__proto__` as ordinary data instead of invoking object-literal prototype
+   *  syntax. */
   const jsonPreamble = (name: string, value: JsonObject): string => {
     const json = JSON.stringify(value);
     return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
   };
-    /** Stand one candidate realm. It stays out of the slot table until this
-     *  and the freshness write both succeed. Both bounds resolve per load: this load's
-     *  number, else the node's default, else the shared one — never the author's, since a
-     *  bundle cannot ask for more of the host than the operator gave it. */
+  /** Stand one candidate realm. It stays out of the slot table until this
+   *  and the freshness write both succeed. Both bounds resolve per load: this load's
+   *  number, else the node's default, else the shared one — never the author's, since a
+   *  bundle cannot ask for more of the host than the operator gave it. */
   const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: InstallOptions): Promise<void> => {
     const b = slot.verifiedBundle;
     // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
@@ -306,18 +300,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     };
     slot.realm = await createRealm({
       source: jsonPreamble("HOST", hostBudgets) + jsonPreamble("APP", appConfig)
-                + jsonPreamble("LOCAL", localConfig) + b.guestSource,
+        + jsonPreamble("LOCAL", localConfig) + b.guestSource,
       hostCall: seamFor(slot),
       memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
       deadlineMs: deadlineFor(load),
     });
   };
-    /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
-     *  as the three things that own it: what this NODE is, what this REALM may reach
-     *  (`grants`), and what this APP installed (`modules`). A bundle reaching `link` is
-     *  wired with `rawNet`: without it a bundle is never handed a socket descriptor (§1,
-     *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*` is an ordinary
-     *  host service, so every realm gets a table. */
+  /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
+   *  as the three things that own it: what this NODE is, what this REALM may reach
+   *  (`grants`), and what this APP installed (`modules`). A bundle reaching `link` is
+   *  wired with `rawNet`: without it a bundle is never handed a socket descriptor (§1,
+   *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*` is an ordinary
+   *  host service, so every realm gets a table. */
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
     const links = table.hasLink(slot);
@@ -384,18 +378,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return fullSeam(name, payload, budget);
     };
   };
-    /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
-     *  prefix, never the guest's own spelling. The null arm is reachable only from guest
-     *  top-level code while its candidate realm is still being constructed. */
+  /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
+   *  prefix, never the guest's own spelling. The null arm is reachable only from guest
+   *  top-level code while its candidate realm is still being constructed. */
   const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => slot.realm
     ? slot.realm.call(input, deadlineMs, causalClock)
     : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
-    /** Chain a host-initiated call onto `inFlight`, so `close()` waits for it rather than
-     *  freeing the realm out from under it (§12.3). */
-  const track = (call: Promise<Uint8Array>): Promise<Uint8Array> => {
-    inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
-    return call;
-  };
   const doUninstall = (appKey: string) => {
     const slot = table.remove(appKey);
     if (!slot) return false;
@@ -403,24 +391,24 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     disposeSlot(slot);
     return true;
   };
-    /** Frame `[attribution ‖ payload]` and enter a slot's guest — the one shape every door
-     *  into a realm arrives as: a host event (the host's own zero caller id), a cross-realm
-     *  call, and a peer-inbound frame. */
+  /** Frame `[attribution ‖ payload]` and enter a slot's guest — the one shape every door
+   *  into a realm arrives as: a host event (the host's own zero caller id), a cross-realm
+   *  call, and a peer-inbound frame. */
   const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array,
     deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
     callSlot(slot, concatBytes([attribution, payload]), deadlineMs, causalClock);
-    /** An event the HOST writes into a slot (loopback and socket events). */
+  /** An event the HOST writes into a slot (loopback and socket events). */
   const hostCallSlot = (slot: AppSlot, body: Uint8Array, deadlineMs?: number): Promise<Uint8Array> =>
     callFramed(slot, HOST_CALLER_ID, body, deadlineMs);
-    /** Hand a request to a claimant, or answer `null` when nothing claims it — an answer,
-     *  rather than a promise no one will settle. */
+  /** Hand a request to a claimant, or answer `null` when nothing claims it — an answer,
+   *  rather than a promise no one will settle. */
   const callClaimant = (slot: AppSlot | undefined, attribution: Uint8Array,
     payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null =>
     slot ? callFramed(slot, attribution, payload, deadlineMs, causalClock) : null;
-    /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
-     *  on the PEER book, so a `services` claim is unreachable by a peer by construction
-     *  rather than by a second test against the slot's manifest. The resolved answer also
-     *  goes to the slot's `onInbound`, if its load named one. */
+  /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
+   *  on the PEER book, so a `services` claim is unreachable by a peer by construction
+   *  rather than by a second test against the slot's manifest. The resolved answer also
+   *  goes to the slot's `onInbound`, if its load named one. */
   const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array,
     deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
     const slot = table.peerClaimant(claim);
@@ -436,11 +424,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       answer.then((bytes) => {
         try { onInbound(claim, attribution, bytes); }
         catch (err) { console.error(`[shell] the loader's onInbound threw: ${errMessage(err)}`); }
-      }, () => { });
+      }, () => {});
     }
     return answer;
   };
-    // Inbound requests use current peer claims (§12.10).
+  // Inbound requests use current peer claims (§12.10).
   netHost?.routeInbound(deliverInbound);
 
   // One transaction for every install: a free identity, a named replacement, and the
@@ -448,23 +436,22 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const installBundle = async (blob: Uint8Array, opts: InstallOptions = {},
     bootTransport = false): Promise<AppHandle> => {
     const localConfig = opts.localConfig ?? {};
-    if (!isJsonObject(localConfig))
-      throw new Error("shell: localConfig must be a JSON object");
+    if (!isJsonObject(localConfig)) throw new Error("shell: localConfig must be a JSON object");
     // The slot being retired, resolved to the exact live slot HERE, before any of the
     // candidate's code runs — the table then checks that same slot is still the one
     // installed when the commit lands, so a target that changed underneath fails rather
     // than silently retiring whatever took its place.
     const replacement = opts.replaces === undefined ? undefined : table.get(opts.replaces);
-    if (opts.replaces !== undefined && replacement === undefined)
+    if (opts.replaces !== undefined && replacement === undefined) {
       throw new Error(`shell: '${opts.replaces}' is not installed, so there is nothing for this bundle to replace`);
+    }
     const v = verifyBundle(sodium, blob);
     checkHostGates(v, freshnessStore);
     // A candidate reaching `link` is not an app: whether it may take the binding is the
     // slot table's rule (boot selection or replacement of the holder), never consent.
     const links = reachesLink(v.manifest);
     if (bootTransport && !links) throw new Error('shell: the boot transport must require "link"');
-    if (!links && !(await appAdmit(v)))
-      throw new Error("bundle: rejected by admission predicate");
+    if (!links && !(await appAdmit(v))) throw new Error("bundle: rejected by admission predicate");
     const loaded: LoadedBundle = {
       manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
       guestSource: v.guestSource,
@@ -500,8 +487,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // itself back; the catch below disposes the candidate, so the running slot
       // is untouched.
       freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
-    }
-    catch (err) {
+    } catch (err) {
       disposeSlot(slot);
       throw err;
     }
@@ -533,7 +519,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       fs: slot.fsScope,
       appScope: slot.appScope,
       invoke: (payload, deadlineMs) => slot.active
-        ? track(hostCallSlot(slot, payload, deadlineMs))
+        ? hostCallSlot(slot, payload, deadlineMs)
         : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
     };
     return handle;
@@ -545,10 +531,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return slot ? table.keyOf(slot) : null;
     },
     routes: table.routes,
-    call: (serviceId, payload, deadlineMs) => {
-      const answer = callClaimant(table.localClaimant(serviceId), HOST_CALLER_ID, payload, deadlineMs);
-      return answer && track(answer);
-    },
+    call: (serviceId, payload, deadlineMs) =>
+      callClaimant(table.localClaimant(serviceId), HOST_CALLER_ID, payload, deadlineMs),
     fs,
     sodium,
     install: (blob, opts) => installBundle(blob, opts),
@@ -568,13 +552,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       for (const appKey of gone) doUninstall(appKey);
       return gone;
     },
+    // Disposal is immediate, as for an uninstall: a realm fails whatever is parked in it
+    // before its engine is freed (§12.3), so no call resumes into a freed realm.
     close() {
       closed = true;
       netHost?.close();
-      const dispose = () => {
-        for (const slot of table.clear()) disposeSlot(slot);
-      };
-      inFlight.then(dispose, dispose);
+      for (const slot of table.clear()) disposeSlot(slot);
     },
   };
 
@@ -587,8 +570,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       await netHost.start();
     }
     return { shell, transport: netHost };
-  }
-  catch (err) {
+  } catch (err) {
     shell.close();
     throw err;
   }

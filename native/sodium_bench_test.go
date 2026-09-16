@@ -1,11 +1,9 @@
 package main
 
 // Perf benchmarks for the Go loader's crypto primitives, to compare runtime-to-runtime
-// against node. Ed25519 verify and XChaCha20 run on loader/wasm/libsodium.wasm under
-// wazero — the same wasm node runs under V8; BLAKE2b is native Go (see sodium.go). The
-// node counterparts that time the same primitives are the "plain Ed25519" line of
-// WASM/tests/run.mjs (testPerf10k) and seedstore's WASM/tests/bench.mjs (which times
-// BLAKE2b + XChaCha20 alongside its Reed–Solomon throughput).
+// against node. Ed25519 verify runs on native/wasm/libsodium.wasm under wazero — the same
+// wasm node runs under V8; BLAKE2b is native Go (see sodium.go). The node counterpart for
+// BLAKE2b is the block-ids line of seedstore's WASM/tests/bench.mjs.
 //
 //	go test -run x -bench BenchmarkSodium -benchmem ./...
 

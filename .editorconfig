@@ -1,5 +1,5 @@
-# Line endings are deliberately absent: `.gitattributes` owns them, and a Windows checkout
-# is meant to hold CRLF while the index holds LF.
+# Line endings are deliberately absent: `.gitattributes` owns them (LF in the index and in
+# every checkout).
 root = true
 
 [*]
