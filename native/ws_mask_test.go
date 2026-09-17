@@ -13,8 +13,6 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 const (
@@ -36,7 +34,7 @@ globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).
 func wsModule(t *testing.T) *boundModule {
 	t.Helper()
 	bootRealm(t)
-	if _, err := qc.Eval("ws-module.js", qjs.Code(wsModuleJS)); err != nil {
+	if _, err := qc.Eval("ws-module.js", wsModuleJS); err != nil {
 		t.Fatal("ws module probe:", err)
 	}
 	wasm, err := callRealm("__wsModuleBytes", 20*time.Second)

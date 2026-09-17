@@ -347,6 +347,13 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
+// argBytes reads the i-th call argument as bytes; an argument that is not bytes yields
+// nil, which the handlers below treat as absent.
+func argBytes(args []*qjs.Value, i int) []byte {
+	b, _ := args[i].Bytes()
+	return b
+}
+
 // exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and the
 // whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the shared
 // code consumes is `wrapNativeSodium` in host/native-shim.ts, where it is typechecked
@@ -356,52 +363,52 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 
-	o.SetPropertyStr("crypto_generichash", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_generichash", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// crypto_generichash(hashLength, message, key?): the native blake2b shim computes
 		// only the UNKEYED hash, so a key arg would be silently dropped — a plain hash
 		// where libsodium computes a MAC.
-		if len(t.Args()) > 2 && !t.Args()[2].IsNull() && !t.Args()[2].IsUndefined() {
-			if k, _ := qjs.JsTypedArrayToGo(t.Args()[2]); len(k) > 0 {
+		if len(args) > 2 && !args[2].IsNull() && !args[2].IsUndefined() {
+			if k, _ := args[2].Bytes(); len(k) > 0 {
 				return nil, fmt.Errorf("crypto_generichash: keyed hashing not supported by the native blake2b shim")
 			}
 		}
-		return bytesAB(t, s.genericHash(int(t.Args()[0].Int32()), argBytes(t, 1))), nil
+		return qc.NewArrayBuffer(s.genericHash(int(args[0].Int32()), argBytes(args, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return bytesAB(t, s.signDetached(argBytes(t, 0), argBytes(t, 1))), nil
+	o.SetPropertyStr("crypto_sign_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewArrayBuffer(s.signDetached(argBytes(args, 0), argBytes(args, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_verify_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(s.verifyDetached(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
+	o.SetPropertyStr("crypto_sign_verify_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewBool(s.verifyDetached(argBytes(args, 0), argBytes(args, 1), argBytes(args, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_scalarmult", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		q, ok := s.scalarmult(argBytes(t, 0), argBytes(t, 1))
+	o.SetPropertyStr("crypto_scalarmult", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		q, ok := s.scalarmult(argBytes(args, 0), argBytes(args, 1))
 		if !ok {
-			return t.Context().NewNull(), nil
+			return qc.NewNull(), nil
 		}
-		return bytesAB(t, q), nil
+		return qc.NewArrayBuffer(q), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return bytesAB(t, s.aeadEncrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewArrayBuffer(s.aeadEncrypt(argBytes(args, 0), argBytes(args, 1), argBytes(args, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		pt, ok := s.aeadDecrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		pt, ok := s.aeadDecrypt(argBytes(args, 0), argBytes(args, 1), argBytes(args, 2))
 		if !ok {
-			return t.Context().NewNull(), nil
+			return qc.NewNull(), nil
 		}
-		return bytesAB(t, pt), nil
+		return qc.NewArrayBuffer(pt), nil
 	}))
-	o.SetPropertyStr("crypto_sign_keypair", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_keypair", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		pk, skv := s.signKeypair()
-		return keypairObj(t.Context(), pk, skv), nil
+		return keypairObj(qc, pk, skv), nil
 	}))
-	o.SetPropertyStr("crypto_sign_seed_keypair", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		pk, skv := s.signSeedKeypair(argBytes(t, 0))
-		return keypairObj(t.Context(), pk, skv), nil
+	o.SetPropertyStr("crypto_sign_seed_keypair", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		pk, skv := s.signSeedKeypair(argBytes(args, 0))
+		return keypairObj(qc, pk, skv), nil
 	}))
-	o.SetPropertyStr("randombytes_buf", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		b := make([]byte, t.Args()[0].Int32())
+	o.SetPropertyStr("randombytes_buf", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		b := make([]byte, args[0].Int32())
 		crand.Read(b)
-		return bytesAB(t, b), nil
+		return qc.NewArrayBuffer(b), nil
 	}))
 	// The PQ half of the manifest suite hangs off the same object. It is part of the host
 	// trust root because it verifies the bundles that deliver everything else.

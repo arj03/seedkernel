@@ -30,12 +30,11 @@ type eventLoop struct {
 	// continuation is guest code like any other.
 	extra []pumpEntry
 
-	// awaitIn installs one persistent __settle per context routing into the in-flight
-	// await's onSettle; a fresh function per await would leak (no unregister).
-	settleInstalled map[*qjs.Context]bool
-	onSettle        func(kind int, bytes []byte, msg string)
+	// onSettle is the in-flight await's result sink, which install()'s persistent __settle
+	// routes into; a fresh resolver per await would leak (no unregister).
+	onSettle func(kind int, bytes []byte, msg string)
 
-	// awaitGen tags each awaitIn run and is the token its wrapped promise settles with.
+	// awaitGen tags each await run and is the token its wrapped promise settles with.
 	// Both of the ways a finished run can reach back into the next one read it: a safety
 	// timer that already fired (Stop cannot unschedule an AfterFunc mid-flight), and the
 	// abandoned promise of a timed-out await, which resolves into a __settle that is still
@@ -48,7 +47,7 @@ type eventLoop struct {
 
 	// err is a host-realm drain that failed: a job that threw, or a rejection nothing
 	// handled (qjs.TrackRejections) — what ends a Node process. It stops the loop, and
-	// whoever ran the loop reports it: awaitIn to its caller, main by exiting.
+	// whoever ran the loop reports it: await to its caller, main by exiting.
 	err error
 }
 
@@ -79,7 +78,7 @@ func (h *timerHeap) Pop() any {
 // newEventLoop binds a loop to a QuickJS context and installs the setTimeout/clearTimeout
 // surface the shared JS expects, which only a Go-owned loop can back.
 func newEventLoop(c *qjs.Context) *eventLoop {
-	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), settleInstalled: map[*qjs.Context]bool{}}
+	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256)}
 	el.install()
 	return el
 }
@@ -93,19 +92,15 @@ type pumpEntry struct {
 
 // addContext registers another QuickJS context to be pumped alongside el.c, so a promise
 // reaction in that realm runs as part of this loop. A guest realm uses native Promises
-// only, so it needs no separate loop — just its job queue drained. pump nil means bare
-// Context.Pump; a guest realm passes its budget-guarded one.
+// only, so it needs no separate loop — just its job queue drained, through the
+// budget-guarded pump it hands over: a queued job is guest code (guestRealm.pump).
 func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
-	if pump == nil {
-		pump = func() { _ = c.Pump() }
-	}
 	el.extra = append(el.extra, pumpEntry{c: c, pump: pump})
 }
 
 // removeContext drops a context registered with addContext, so pumpAll stops touching it
 // once its realm is closed. A no-op for a context that was never added.
 func (el *eventLoop) removeContext(c *qjs.Context) {
-	delete(el.settleInstalled, c) // its __settle dies with the realm's runtime
 	for i, x := range el.extra {
 		if x.c == c {
 			copy(el.extra[i:], el.extra[i+1:])
@@ -133,22 +128,7 @@ func (el *eventLoop) pumpAll() {
 
 func (el *eventLoop) install() {
 	g := el.c.Global()
-	// A monotonic clock, beside the timers that answer to it. The kernel's handoff deadlines
-	// are distances between two readings (host/realm-queue.ts), which Date cannot supply:
-	// a clock step backwards would fire every live deadline at once and a step forwards
-	// would silently extend them. The epoch is this process, which is all a distance needs.
-	// FRACTIONAL milliseconds, as Node and the browsers answer: deadlines are stated in whole
-	// ones, but the seam meters host compute by the distance across one synchronous handler
-	// (host/guest-seam.ts), and truncating each of those to zero would make an ed25519
-	// verify — or a re-arm loop built out of them — free against the causal clock (§12.3).
-	epoch := time.Now()
-	perf := el.c.NewObject()
-	perf.SetPropertyStr("now", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewFloat64(float64(time.Since(epoch).Nanoseconds()) / 1e6), nil
-	}))
-	g.SetPropertyStr("performance", perf)
-	g.SetPropertyStr("setTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		args := t.Args()
+	g.SetPropertyStr("setTimeout", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		var ms int64
 		if len(args) >= 2 {
 			ms = args[1].Int64()
@@ -161,18 +141,39 @@ func (el *eventLoop) install() {
 		tm := &jsTimer{id: id, deadline: time.Now().Add(time.Duration(ms) * time.Millisecond), cb: args[0].Dup()}
 		heap.Push(&el.timers, tm)
 		el.byID[id] = tm
-		return t.Context().NewInt64(id), nil
+		return qc.NewInt64(id), nil
 	}))
-	g.SetPropertyStr("clearTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if tm, ok := el.byID[t.Args()[0].Int64()]; ok {
+	g.SetPropertyStr("clearTimeout", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if tm, ok := el.byID[args[0].Int64()]; ok {
 			heap.Remove(&el.timers, tm.index)
 			delete(el.byID, tm.id)
 			tm.cb.Free()
 		}
 		return nil, nil
 	}))
-	// queueMicrotask is not loop state but a missing Web global, so it lives with the rest
-	// of them in host/native-polyfills.ts.
+	// __settle is what an await's wrapped promise calls, carrying as its first argument the
+	// awaitGen it was written under, and it routes into el.onSettle. A settle with no await
+	// in flight is ignored, and so is one bearing any other token: the resolver outlives the
+	// await that wrote it, so a timed-out call whose promise lands during a later await must
+	// not settle that one.
+	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if el.onSettle == nil || args[0].Int64() != el.awaitGen {
+			return nil, nil
+		}
+		var bytes []byte
+		var msg string
+		if b, e := args[2].Bytes(); e == nil {
+			bytes = b
+		} else {
+			msg = args[2].String()
+		}
+		el.onSettle(int(args[1].Int64()), bytes, msg)
+		return nil, nil
+	}))
+	// The realm's other loop-adjacent globals are the engine's own: quickjs-ng defines
+	// queueMicrotask, and a performance.now over the monotonic clock its WASI import answers
+	// — sub-millisecond, which TestHostClockIsSubMillisecond pins and explains. Only the
+	// timers need a Go-owned loop behind them.
 }
 
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
@@ -254,7 +255,7 @@ func (el *eventLoop) step() {
 	// Drain whatever else is already queued, pumping after each: a burst of posted socket
 	// frames lands in this one turn instead of one per step(), and a result that raced
 	// <-wait (select picks at random when both are ready) is processed now rather than
-	// causing awaitIn to report a false timeout.
+	// causing await to report a false timeout.
 	for {
 		if el.stopped {
 			return
@@ -293,49 +294,15 @@ func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func(
 	return safety.Stop
 }
 
-// await evaluates an async JS expression in the loop's primary context (el.c) and
-// drives the loop until it settles. See awaitIn.
+// await evaluates an async JS expression in the host realm and drives the whole loop until
+// it settles: kind 0 (fulfilled, with the resolved bytes) or kind 1 (rejected, with the
+// error string), with timeout as a safety net. Every realm is pumped meanwhile, which is
+// how a guest suspended on a host call resumes. Sequential awaits are isolated by awaitGen;
+// nesting is not, since el.onSettle is a single shared slot and a nested await would orphan
+// the outer one. The loader never nests it (a guest's net call settles through guest.go's
+// own callbacks, which don't touch onSettle).
 func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
-	return el.awaitIn(el.c, callExpr, timeout)
-}
-
-// ensureSettle lazily installs context c's persistent __settle resolver — the hook
-// awaitIn's wrapped promise calls, carrying as its first argument the awaitGen it was
-// written under — routing into el.onSettle. A settle with no await in flight is ignored,
-// and so is one bearing any other token: the resolver outlives the await that wrote it, so
-// a timed-out call whose promise lands during a later await must not settle that one.
-func (el *eventLoop) ensureSettle(c *qjs.Context) {
-	if el.settleInstalled[c] {
-		return
-	}
-	c.Global().SetPropertyStr("__settle", c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		a := t.Args()
-		if el.onSettle == nil || len(a) < 3 || a[0].Int64() != el.awaitGen {
-			return nil, nil
-		}
-		var bytes []byte
-		var msg string
-		if b, e := qjs.JsTypedArrayToGo(a[2]); e == nil {
-			bytes = b
-		} else {
-			msg = a[2].String()
-		}
-		el.onSettle(int(a[1].Int64()), bytes, msg)
-		return nil, nil
-	}))
-	el.settleInstalled[c] = true
-}
-
-// awaitIn evaluates an async JS expression in context c and drives the whole loop until it
-// settles: kind 0 (fulfilled, with the resolved bytes) or kind 1 (rejected, with the
-// error string), with timeout as a safety net. c may be the host realm or a guest realm —
-// either way every realm is pumped. Sequential awaits are isolated by awaitGen; nesting is
-// not, since el.onSettle is a single shared slot and a nested awaitIn would orphan the
-// outer await. The loader never nests it (a guest's net call settles through guest.go's own
-// callbacks, which don't touch onSettle).
-func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1
-	el.ensureSettle(c)
 	el.awaitGen++
 	gen := strconv.FormatInt(el.awaitGen, 10)
 	el.onSettle = func(k int, bytes []byte, m string) {
@@ -351,7 +318,7 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 		`(v) => __settle(` + gen + `, 0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
 		`(e) => __settle(` + gen + `, 1, String(e && e.message || e))); })();`
 	el.stopped = false
-	if _, err = c.Eval("<await>", qjs.Code(wrap)); err != nil {
+	if _, err = el.c.Eval("<await>", wrap); err != nil {
 		return
 	}
 	if timeout > 0 {

@@ -25,8 +25,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // sec size-prefixes one wasm section. Sizes are computed rather than hand-counted so a
@@ -136,12 +134,12 @@ func TestModuleCallBound(t *testing.T) {
 	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot refused: %v", err)
 	}
-	if _, err := qc.Eval("module-deadline-bridge.js", qjs.Code(`
+	if _, err := qc.Eval("module-deadline-bridge.js", `
 		globalThis.__callBoundModule = (slot, name, deadlineMs) => {
 		  const out = bridge.callModule(slot, name, new Uint8Array(0), deadlineMs);
 		  return out === null ? new Uint8Array(0) : new Uint8Array(out);
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("bridge harness:", err)
 	}
 	// The healthy module on the same app works before and after the kill: the bound

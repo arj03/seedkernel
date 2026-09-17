@@ -71,12 +71,6 @@ const POLYFILLS = `
     };
   }
 
-  // queueMicrotask — the transport driver's deliver path answers on a LATER turn, so
-  // that no op re-enters a live guest frame. Without it the turn boundary is gone.
-  if (typeof globalThis.queueMicrotask === "undefined") {
-    globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
-  }
-
   // console — quickjs-ng defines none, and shared host code logs through one, not least
   // from the handler that reports a wedged transport guest.
   //
@@ -115,8 +109,8 @@ const POLYFILLS = `
 (0, eval)(POLYFILLS);
 
 /** The same text for the confined realm — fetched by Go the way `guestPreamble` and
- *  `guestDriver` are (native/guest.go). A guest gets the encoders and the microtask queue;
- *  the console branch no-ops there, since a confined realm holds no bridge. */
+ *  `guestDriver` are (native/guest.go). A guest gets the encoders; the console branch
+ *  no-ops there, since a confined realm holds no bridge. */
 export function nativePolyfills(): string {
   return POLYFILLS;
 }

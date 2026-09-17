@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 func TestNodeFsRoundTrip(t *testing.T) {
@@ -98,7 +96,7 @@ func TestNodeFsNoEscape(t *testing.T) {
 // host/native-shim.ts, which this drives rather than a copy of.
 func TestFsExposedToRealm(t *testing.T) {
 	bootRealm(t) // opens a store on a fresh temp dir, the way --dir does
-	if _, err := qc.Eval("fs-realm-test.js", qjs.Code(`
+	if _, err := qc.Eval("fs-realm-test.js", `
 		const enc = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 		const dec = (b) => { let s = ""; for (const x of b) s += String.fromCharCode(x); return s; };
 		globalThis.__fsProbe = async () => {
@@ -114,7 +112,7 @@ func TestFsExposedToRealm(t *testing.T) {
 				String((await fs.stat()).used),
 			].join("|"));
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatalf("eval: %v", err)
 	}
 	got, err := callRealm("__fsProbe", 5*time.Second)
@@ -138,7 +136,7 @@ func TestFsClosedUntilOpened(t *testing.T) {
 	if err := boot(); err != nil { // deliberately no store opened
 		t.Fatal("boot:", err)
 	}
-	if _, err := qc.Eval("fs-closed-test.js", qjs.Code(`
+	if _, err := qc.Eval("fs-closed-test.js", `
 		globalThis.__fsClosedProbe = () => {
 			let put = "accepted";
 			try { __fs.put("blk", new Uint8Array([1])); } catch (e) { put = "refused"; }
@@ -151,7 +149,7 @@ func TestFsClosedUntilOpened(t *testing.T) {
 				put,
 			].join("|");
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatalf("eval: %v", err)
 	}
 	const want = `null|-1|""|false|0|refused`

@@ -23,8 +23,6 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // blockBytes is the §27 block size every fs bench moves per op.
@@ -97,11 +95,11 @@ func setupFsJS(b *testing.B) {
 	ensureBooted(b)
 	// Do not re-point the process-wide realm at b.TempDir(): Go removes that directory
 	// when this benchmark ends, while later benchmarks still use the same store.
-	if _, err := qc.Eval("fs-bench-setup.js", qjs.Code(`
+	if _, err := qc.Eval("fs-bench-setup.js", `
 		globalThis.__benchBlock = new Uint8Array(65536); __benchBlock.fill(0x5a);
 		globalThis.__benchPut = async (n) => { for (let i = 0; i < n; i++) await fs.put("benchblk", __benchBlock); return new Uint8Array(0); };
 		globalThis.__benchGet = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await fs.get("benchblk"); if (r && r.length) acc ^= r[0]; } return new Uint8Array([acc & 255]); };
-	`)); err != nil {
+	`); err != nil {
 		b.Fatal(err)
 	}
 	awaitOK(b, "seed put", `__benchPut(1)`, 8*time.Second)

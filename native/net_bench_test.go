@@ -23,8 +23,6 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // benchProto is the protocol id the bench app claims, and the id B addresses A by. An
@@ -164,7 +162,7 @@ func setupNetBench(b *testing.B) {
 	// eval of the harness would redeclare its top-level consts and fail as a SyntaxError.
 	// Asking the realm what it already holds keeps this correct however the benchmarks are
 	// ordered or filtered — a Go-side "did I do this" flag would drift from the realm.
-	v, err := qc.Eval("net-bench-installed.js", qjs.Code(`typeof benchPingN`))
+	v, err := qc.Eval("net-bench-installed.js", `typeof benchPingN`)
 	if err != nil {
 		b.Fatal("harness probe:", err)
 	}
@@ -178,7 +176,7 @@ func setupNetBench(b *testing.B) {
 			hex.EncodeToString(blob),
 			hex.EncodeToString(author.id()),
 			benchProto)
-		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(src)); err != nil {
+		if _, err := qc.Eval("net-bench-harness.js", src); err != nil {
 			b.Fatal("harness:", err)
 		}
 		awaitOK(b, "__netSetup", `__netSetup`, 8*time.Second)

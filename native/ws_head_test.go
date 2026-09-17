@@ -4,8 +4,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // ── what a stranger's upgrade head costs this realm ──────────────────────────
@@ -50,7 +48,7 @@ const wsHeadJS = `
 func wsHeadRealm(tb testing.TB) {
 	tb.Helper()
 	bootRealm(tb)
-	if _, err := qc.Eval("ws-head.js", qjs.Code(wsHeadJS)); err != nil {
+	if _, err := qc.Eval("ws-head.js", wsHeadJS); err != nil {
 		tb.Fatal("transport guest scope:", err)
 	}
 }

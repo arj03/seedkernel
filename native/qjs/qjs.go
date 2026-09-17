@@ -27,10 +27,11 @@ import (
 //go:embed qjs.wasm
 var wasmBytes []byte
 
-// goFunc is a Go function exposed to JS via (*Context).Function. It indexes the arguments
-// it requires straight out of This.Args: a call short of one panics, and callGo answers
-// the panic as a JS exception.
-type goFunc = func(*This) (*Value, error)
+// goFunc is a Go function exposed to JS via (*Context).Function, called with the context
+// that created it and the call's arguments. It indexes the arguments it requires straight
+// out of that slice: a call short of one panics, and callGo answers the panic as a JS
+// exception.
+type goFunc = func(*Context, []*Value) (*Value, error)
 
 // Runtime owns one engine: the wazero runtime, the instantiated qjs module, and the QuickJS
 // runtime and context inside it. Single-threaded: the loader drives every realm from one
@@ -411,8 +412,10 @@ func (r *Runtime) readString(packed uint64) string {
 }
 
 // callGo is the env.callGo host import: a JS call to the Go function registered under id.
-// The arguments are borrowed handles, valid only for the call.
-func (r *Runtime) callGo(_ context.Context, _ api.Module, _ uint32, thisVal uint64, argc, argv, id uint32) (rs uint64) {
+// The arguments are borrowed handles, valid only for the call. The JS `this` crosses in the
+// import's signature and is dropped here: no callback has ever read one, and wrapping it
+// would allocate a *Value on every JS→Go call.
+func (r *Runtime) callGo(_ context.Context, _ api.Module, _ uint32, _ uint64, argc, argv, id uint32) (rs uint64) {
 	c := r.ctxt
 	// Deferred before any arg processing, so a panic below (a malformed argv, a panicking
 	// callback) surfaces as a catchable JS exception rather than a wasm trap killing the node.
@@ -428,7 +431,7 @@ func (r *Runtime) callGo(_ context.Context, _ api.Module, _ uint32, thisVal uint
 		h, _ := r.mem.ReadUint64Le(argv + uint32(i)*8)
 		args[i] = c.value(h)
 	}
-	res, err := fn(&This{Value: c.value(thisVal), context: c, args: args})
+	res, err := fn(c, args)
 	if err != nil {
 		return c.throwError(err)
 	}

@@ -23,11 +23,10 @@ func TestQjsPumpModel(t *testing.T) {
 	defer rt.Close()
 	c := rt.Context()
 
-	if _, err := c.Eval("setup.js", qjs.Code(`
+	if _, err := c.Eval("setup.js", `
 		globalThis.__flag = 0;
-		globalThis.queueMicrotask = (f) => { Promise.resolve().then(f); };
 		globalThis.kick = () => { queueMicrotask(() => { globalThis.__flag = 1; }); };
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("setup:", err)
 	}
 
@@ -43,7 +42,9 @@ func TestQjsPumpModel(t *testing.T) {
 	}
 	flagAfterPump := c.Global().GetPropertyStr("__flag").Int32()
 
-	t.Logf("flag after Invoke=%d, after Pump=%d", flagAfterInvoke, flagAfterPump)
+	if flagAfterInvoke != 0 {
+		t.Fatalf("Invoke ran the queued microtask (flag=%d); the loop cannot decide when guest jobs run", flagAfterInvoke)
+	}
 	if flagAfterPump != 1 {
 		t.Fatalf("Pump did not drain the queued microtask (flag=%d); the Go-driven loop is not viable", flagAfterPump)
 	}
@@ -104,7 +105,7 @@ func TestHostClockIsSubMillisecond(t *testing.T) {
 }
 
 // TestAwaitIgnoresStaleSettle covers the one way a finished await can still reach into the
-// next one. __settle is installed per context and outlives the await that wrote it, and the
+// next one. __settle is installed once and outlives the await that wrote it, and the
 // loop's timer heap is shared across awaits — so the promise of a timed-out call can resolve
 // during a *later* await and, before awaitGen tokens, would settle that await with the
 // previous call's result. The first await here abandons a 300ms promise after 60ms; the

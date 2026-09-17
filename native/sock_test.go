@@ -1,9 +1,9 @@
 package main
 
-// sock_test.go — the direct tests for sockChannel (net.go/sock.go): the queue
-// limit, the close-vs-fail split, and the dial lifecycle. Until these existed the
-// channel was only exercised end-to-end through the transport tests, which can't
-// reach the outbound queue ceilings, a deliberate close mid-flush, or the dial races.
+// sock_test.go — the direct tests for sockChannel (net.go/sock.go): the outbound queue
+// and its custody accounting, the close-vs-fail split, and the dial lifecycle. Until these
+// existed the channel was only exercised end-to-end through the transport tests, which
+// can't reach a deliberate close mid-flush or the dial races.
 //
 // net.Pipe gives each test a real net.Conn with deadlines but no ports: a channel
 // wraps one end and the test plays the peer on the other.
@@ -347,7 +347,7 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 // the listener keeps serving, so the node recovers as live channels drain rather than
 // going deaf.
 func TestNetHostAcceptCeiling(t *testing.T) {
-	n := &netHost{chans: map[int64]rawChannel{}, maxLiveChannels: 2}
+	n := &netHost{chans: map[int64]*sockChannel{}, maxLiveChannels: 2}
 	for i := 0; i < n.maxLiveChannels; i++ {
 		id, ok := n.allocInbound()
 		if !ok {
@@ -504,7 +504,7 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 // Teardown means no loop, so close() must refuse it rather than leave the goroutine parked
 // for the life of the process.
 func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
-	n := &netHost{chans: map[int64]rawChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	n := &netHost{chans: map[int64]*sockChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
 	if !n.reserveInboundRead(4) {
 		t.Fatal("failed to occupy the test allowance")
 	}

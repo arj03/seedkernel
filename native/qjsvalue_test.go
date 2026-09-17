@@ -1,19 +1,17 @@
 package main
 
-// JsTypedArrayToGo is the JS→Go byte seam every subsystem crosses (fs.put, __net.send,
+// Value.Bytes is the JS→Go byte seam every subsystem crosses (fs.put, __net.send,
 // sodium args, guest-seam payloads). The view path must copy exactly the view's window —
 // O(view), not O(backing buffer) — and leave the source intact for re-reads.
 
 import (
 	"bytes"
 	"testing"
-
-	"seedloader/qjs"
 )
 
-func TestJsTypedArrayToGoViews(t *testing.T) {
+func TestValueBytesViews(t *testing.T) {
 	bootRealm(t)
-	v, err := qc.Eval("typedarray-view-test.js", qjs.Code(`
+	v, err := qc.Eval("typedarray-view-test.js", `
 		(() => {
 			const buf = new ArrayBuffer(64);
 			const full = new Uint8Array(buf);
@@ -29,7 +27,7 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 				fake: { buffer: buf, byteOffset: 0, byteLength: 4 },
 			};
 		})();
-	`))
+	`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +36,7 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 	read := func(name string) ([]byte, error) {
 		p := v.GetPropertyStr(name)
 		defer p.Free()
-		return qjs.JsTypedArrayToGo(p)
+		return p.Bytes()
 	}
 	want := func(name string, exp []byte) {
 		t.Helper()
@@ -72,9 +70,9 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 
 // A view's window is the engine's own: its accessors are not consulted, so redefining them
 // neither changes what is copied nor runs any JS.
-func TestJsTypedArrayToGoIgnoresAccessors(t *testing.T) {
+func TestValueBytesIgnoresAccessors(t *testing.T) {
 	bootRealm(t)
-	v, err := qc.Eval("accessor-test.js", qjs.Code(`
+	v, err := qc.Eval("accessor-test.js", `
 		(() => {
 			globalThis.__touched = 0;
 			const view = new Uint8Array([1, 2, 3, 4]).subarray(1, 3);
@@ -83,16 +81,16 @@ func TestJsTypedArrayToGoIgnoresAccessors(t *testing.T) {
 			}
 			return view;
 		})()
-	`))
+	`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer v.Free()
-	if n, err := qjs.JsTypedArrayByteLength(v); err != nil || n != 2 {
-		t.Fatalf("JsTypedArrayByteLength = %d, %v; want 2", n, err)
+	if n, err := v.ByteLength(); err != nil || n != 2 {
+		t.Fatalf("ByteLength = %d, %v; want 2", n, err)
 	}
-	if b, err := qjs.JsTypedArrayToGo(v); err != nil || !bytes.Equal(b, []byte{2, 3}) {
-		t.Fatalf("JsTypedArrayToGo = %v, %v; want [2 3]", b, err)
+	if b, err := v.Bytes(); err != nil || !bytes.Equal(b, []byte{2, 3}) {
+		t.Fatalf("Bytes = %v, %v; want [2 3]", b, err)
 	}
 	if got := evalString(t, `String(globalThis.__touched)`); got != "0" {
 		t.Fatalf("the bridge ran %s accessor(s) while reading the view", got)
@@ -102,7 +100,7 @@ func TestJsTypedArrayToGoIgnoresAccessors(t *testing.T) {
 // The bytes arrive from untrusted code on the guest seam, and an object that merely carries
 // view-shaped properties — odd values, throwing getters — is refused without leaving the
 // engine's error for the next call to inherit.
-func TestJsTypedArrayToGoHostileProperties(t *testing.T) {
+func TestValueBytesHostileProperties(t *testing.T) {
 	bootRealm(t)
 	for _, tc := range []struct{ name, src string }{
 		{"symbol offset", `({ buffer: new ArrayBuffer(8), byteOffset: Symbol("x"), byteLength: 4 })`},
@@ -110,19 +108,19 @@ func TestJsTypedArrayToGoHostileProperties(t *testing.T) {
 		{"throwing buffer", `({ get buffer() { throw new Error("nope"); } })`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			v, err := qc.Eval("hostile-view-test.js", qjs.Code("("+tc.src+")"))
+			v, err := qc.Eval("hostile-view-test.js", "("+tc.src+")")
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer v.Free()
-			if b, err := qjs.JsTypedArrayToGo(v); err == nil {
-				t.Fatalf("JsTypedArrayToGo accepted it, returning %v", b)
+			if b, err := v.Bytes(); err == nil {
+				t.Fatalf("Bytes accepted it, returning %v", b)
 			}
-			if n, err := qjs.JsTypedArrayByteLength(v); err == nil {
-				t.Fatalf("JsTypedArrayByteLength accepted it, returning %d", n)
+			if n, err := v.ByteLength(); err == nil {
+				t.Fatalf("ByteLength accepted it, returning %d", n)
 			}
 			// The realm is still usable: the refusal took the exception with it.
-			r, err := qc.Eval("after-hostile-view.js", qjs.Code(`1 + 1`))
+			r, err := qc.Eval("after-hostile-view.js", `1 + 1`)
 			if err != nil {
 				t.Fatalf("the refusal poisoned the next call: %v", err)
 			}

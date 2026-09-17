@@ -24,8 +24,8 @@ the Go build, and a change to `csrc/` is not live until you run it; `go test ./.
 from `native/` drives every export the bridge uses and is the check that it worked.
 
 The JS platform's engine — `WASM/quickjs/` — is the emscripten build of the **same**
-quickjs-ng pin (v0.16.2, same SHA), so both targets run one engine version; move the
-pin in both build scripts together.
+quickjs-ng commit, so both targets run one engine version; move the pin in both build
+scripts together.
 
 Upstream: https://github.com/quickjs-ng/quickjs (MIT)
 

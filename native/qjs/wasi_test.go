@@ -41,7 +41,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 	only("construction", "clock_time_get", "random_get")
 
 	// Prove a JS call reaches the witness before trusting a quiet one.
-	if _, err := c.Eval("clock.js", Code("Date.now()")); err != nil {
+	if _, err := c.Eval("clock.js", "Date.now()"); err != nil {
 		t.Fatal("Date.now:", err)
 	}
 	if len(reached) == 0 {
@@ -70,7 +70,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 		`JSON.parse("[".repeat(100000) + "]".repeat(100000))`,
 		`new Array(2e7).fill(0)`,
 	} {
-		if v, err := c.Eval("wasi-probe.js", Code(src)); err == nil && v != nil {
+		if v, err := c.Eval("wasi-probe.js", src); err == nil && v != nil {
 			v.Free()
 		}
 		_ = c.Pump()
@@ -100,11 +100,11 @@ func TestStackOverflowThrows(t *testing.T) {
 					t.Fatalf("the engine trapped instead of throwing: %v", r)
 				}
 			}()
-			if _, err := c.Eval("overflow.js", Code(tc.src)); err == nil ||
+			if _, err := c.Eval("overflow.js", tc.src); err == nil ||
 				!strings.Contains(err.Error(), "RangeError: Maximum call stack size exceeded") {
 				t.Fatalf("got %v, want the engine's stack overflow RangeError", err)
 			}
-			v, err := c.Eval("after.js", Code(`1 + 1`))
+			v, err := c.Eval("after.js", `1 + 1`)
 			if err != nil {
 				t.Fatalf("the runtime is unusable after the overflow: %v", err)
 			}

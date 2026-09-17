@@ -1,5 +1,5 @@
-// guest.go — the confined guest realm (README §12.3 / §12.8): a second, zero-authority
-// QuickJS runtime holding only ECMAScript intrinsics, so the guest cannot even name
+// guest.go — the confined guest realm (README §12.3 / §12.8): one zero-authority QuickJS
+// runtime per app, holding only ECMAScript intrinsics, so the guest cannot even name
 // sodium / fs / net. Its single seam is host.call(name, bytes), funnelled into the host
 // realm's guest seam (a JS function retained here); nothing in this file knows what a
 // name means. The seam is async all the way down: __host_call always answers null, the
@@ -91,44 +91,44 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 // realm, call into it, settle a parked op, dispose. This is the whole of Go's involvement
 // with a guest — no guest seam, no preamble assembly, no bundle facts, no dispatch.
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
-	b.SetPropertyStr("createRealm", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		mem := uint64(t.Args()[2].Int64())
+	b.SetPropertyStr("createRealm", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		mem := uint64(args[2].Int64())
 		if mem == 0 {
 			// A 0 is a caller that forgot, and an unbounded realm is a confinement hole.
 			return nil, errors.New("createRealm: no memory limit supplied (the shim resolves the shared default)")
 		}
 		// A negative value is the shim's encoding of Infinity — no budget, said explicitly.
 		budget := time.Duration(0)
-		if ms := t.Args()[3].Int64(); ms > 0 {
+		if ms := args[3].Int64(); ms > 0 {
 			budget = time.Duration(ms) * time.Millisecond
 		}
-		maxHostCalls := int(t.Args()[4].Int64())
-		maxHostCallBytes := t.Args()[5].Int64()
+		maxHostCalls := int(args[4].Int64())
+		maxHostCallBytes := args[5].Int64()
 		if maxHostCalls <= 0 || maxHostCallBytes <= 0 {
 			return nil, errors.New("createRealm: no outstanding host-call limits supplied")
 		}
 		realmSeq++
 		id := realmSeq
-		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget,
+		g, err := newGuestRealm(el, args[0].String(), args[1], mem, budget,
 			maxHostCalls, maxHostCallBytes)
 		if err != nil {
 			return nil, err
 		}
 		realms[id] = g
-		return t.Context().NewInt64(id), nil
+		return qc.NewInt64(id), nil
 	}))
-	b.SetPropertyStr("realmCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		g := realms[t.Args()[0].Int64()]
+	b.SetPropertyStr("realmCall", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		g := realms[args[0].Int64()]
 		if g == nil {
 			return nil, fmt.Errorf("realmCall: no such realm")
 		}
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		payload, err := args[1].Bytes()
 		if err != nil {
 			return nil, err
 		}
-		callID := t.Args()[2].Int64()
-		deadlineMs := t.Args()[5].Int64()
-		deferred, elapsed := g.call(callID, payload, t.Args()[3], t.Args()[4], deadlineMs)
+		callID := args[2].Int64()
+		deadlineMs := args[5].Int64()
+		deferred, elapsed := g.call(callID, payload, args[3], args[4], deadlineMs)
 		// Two facts, one number, because this is the dispatch path and an object would cost
 		// an allocation and two interned property writes per invocation. Nanoseconds, not
 		// milliseconds: the timer meter is a rate bound, so rounding every short turn down
@@ -138,47 +138,47 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if deferred {
 			report |= 1
 		}
-		return t.Context().NewInt64(report), nil
+		return qc.NewInt64(report), nil
 	}))
-	b.SetPropertyStr("realmCancel", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		g := realms[t.Args()[0].Int64()]
+	b.SetPropertyStr("realmCancel", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		g := realms[args[0].Int64()]
 		if g == nil {
 			return nil, nil
 		}
-		if c := g.takeCall(t.Args()[1].Int64()); c != nil {
+		if c := g.takeCall(args[1].Int64()); c != nil {
 			c.free()
 		}
 		return nil, nil
 	}))
-	b.SetPropertyStr("realmSettle", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmSettle", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// A settlement for a disposed realm is a no-op: the host-call promise behind it
 		// outlives an uninstall.
-		g := realms[t.Args()[0].Int64()]
+		g := realms[args[0].Int64()]
 		if g == nil {
-			return t.Context().NewInt64(0), nil
+			return qc.NewInt64(0), nil
 		}
-		callID := t.Args()[1].Int64()
+		callID := args[1].Int64()
 		if !g.hostCalls.has(callID) {
-			return t.Context().NewInt64(0), nil
+			return qc.NewInt64(0), nil
 		}
-		if t.Args()[2].IsNull() || t.Args()[2].IsUndefined() {
-			return t.Context().NewInt64(g.settleHostCall(callID, nil, t.Args()[3].String()).Nanoseconds()), nil
+		if args[2].IsNull() || args[2].IsUndefined() {
+			return qc.NewInt64(g.settleHostCall(callID, nil, args[3].String()).Nanoseconds()), nil
 		}
-		resultBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
+		resultBytes, err := args[2].ByteLength()
 		if err != nil {
-			return t.Context().NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
 		}
 		if err := g.hostCalls.reserve(callID, resultBytes); err != nil {
-			return t.Context().NewInt64(g.settleHostCall(callID, nil, err.Error()).Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, err.Error()).Nanoseconds()), nil
 		}
-		bytes, err := qjs.JsTypedArrayToGo(t.Args()[2])
+		bytes, err := args[2].Bytes()
 		if err != nil {
-			return t.Context().NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
 		}
-		return t.Context().NewInt64(g.settleHostCall(callID, bytes, "").Nanoseconds()), nil
+		return qc.NewInt64(g.settleHostCall(callID, bytes, "").Nanoseconds()), nil
 	}))
-	b.SetPropertyStr("realmDispose", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		id := t.Args()[0].Int64()
+	b.SetPropertyStr("realmDispose", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		id := args[0].Int64()
 		if g := realms[id]; g != nil {
 			delete(realms, id)
 			g.close()
@@ -211,15 +211,15 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		g.close()
 		return nil, err
 	}
-	// The Web globals quickjs-ng lacks (TextEncoder, the microtask queue), fetched
-	// from the host realm so both realms polyfill from ONE text (host/native-polyfills.ts);
-	// first, because everything after may use them.
-	if _, err := g.qc.Eval("polyfills.js", qjs.Code(hostFnString(hostQc, "nativePolyfills"))); err != nil {
+	// The Web globals quickjs-ng lacks (the text encoders), fetched from the host realm so
+	// both realms polyfill from ONE text (host/native-polyfills.ts); first, because
+	// everything after may use them.
+	if _, err := g.qc.Eval("polyfills.js", hostFnString(hostQc, "nativePolyfills")); err != nil {
 		return fail(fmt.Errorf("polyfills: %w", err))
 	}
 	// The driver's __start wrapper, fetched the same way (native-shim.ts `guestDriver`):
 	// shared TS rather than a Go string TypeScript never saw.
-	if _, err := g.qc.Eval("guest-driver.js", qjs.Code(hostFnString(hostQc, "guestDriver"))); err != nil {
+	if _, err := g.qc.Eval("guest-driver.js", hostFnString(hostQc, "guestDriver")); err != nil {
 		return fail(fmt.Errorf("guest driver: %w", err))
 	}
 	// The guest shares the host loop rather than owning one: it just needs its job queue
@@ -230,20 +230,20 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	// host-realm guest seam: every call parks — the shim answers null — and the preamble's
 	// Promise under callId is settled by realmSettle when the seam's promise lands. The
 	// fourth host argument is this segment's live module deadline; -1 means unbounded.
-	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		name := t.Args()[0].String()
-		callID := t.Args()[1].Int64()
+	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		name := args[0].String()
+		callID := args[1].Int64()
 		// Asking the source its width is an engine query, not the copy; admit id, count
 		// and that width together before the copy itself (hostcalls.go). No JS runs
 		// between the two reads, so the copy is exactly the width admitted.
-		payloadBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
+		payloadBytes, err := args[2].ByteLength()
 		if err != nil {
 			return nil, err
 		}
 		if err := g.hostCalls.admit(callID, payloadBytes); err != nil {
 			return nil, err
 		}
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
+		payload, err := args[2].Bytes()
 		if err != nil {
 			g.hostCalls.release(callID)
 			return nil, err
@@ -275,18 +275,18 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		// el.c this round, and a holder answering from local fs generates no I/O of its
 		// own — so without a nudge nothing wakes the loop.
 		g.loop.wake()
-		return t.Context().NewNull(), nil
+		return qc.NewNull(), nil
 	}))
 
 	// An initiator call's two outcomes, reported by __start once the entrypoint's promise
 	// settles, into the host-realm callbacks the shim registered.
-	g.qc.Global().SetPropertyStr("__callDone", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		c := g.takeCall(t.Args()[0].Int64())
+	g.qc.Global().SetPropertyStr("__callDone", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		c := g.takeCall(args[0].Int64())
 		if c == nil {
 			return nil, nil
 		}
 		defer c.free()
-		out, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		out, err := args[1].Bytes()
 		if err != nil {
 			g.reportCall(c.onFail, hostQc.NewString("guest: entrypoint result is not bytes"))
 			return nil, nil
@@ -294,17 +294,17 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		g.reportCall(c.onDone, hostQc.NewArrayBuffer(out))
 		return nil, nil
 	}))
-	g.qc.Global().SetPropertyStr("__callFail", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		c := g.takeCall(t.Args()[0].Int64())
+	g.qc.Global().SetPropertyStr("__callFail", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		c := g.takeCall(args[0].Int64())
 		if c == nil {
 			return nil, nil
 		}
 		defer c.free()
-		g.reportCall(c.onFail, hostQc.NewString(t.Args()[1].String()))
+		g.reportCall(c.onFail, hostQc.NewString(args[1].String()))
 		return nil, nil
 	}))
 
-	if _, err := g.qc.Eval("guest-preamble.js", qjs.Code(hostFnString(hostQc, "guestPreamble"))); err != nil {
+	if _, err := g.qc.Eval("guest-preamble.js", hostFnString(hostQc, "guestPreamble")); err != nil {
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
 	// Guest top-level code is execution just like an entrypoint. Run it under one fresh
@@ -314,7 +314,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	// they do on the JS target.
 	g.consumed = 0
 	done, err := g.within(func() (*qjs.Value, error) {
-		return g.qc.Eval("guest.js", qjs.Code(source))
+		return g.qc.Eval("guest.js", source)
 	})
 	if err != nil {
 		return fail(fmt.Errorf("guest source: %w", err))

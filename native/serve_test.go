@@ -7,8 +7,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // Serving (README §12.8, §12.10): the protocol id off the wire is resolved to the
@@ -91,7 +89,7 @@ globalThis.ask = async (sendArgs) => {
 // peer id. The app is what actually sends: there is no host-side request facade.
 func startRequester(t *testing.T, holderID string, port int) string {
 	t.Helper()
-	if _, err := qc.Eval("requester.js", qjs.Code(requesterJS)); err != nil {
+	if _, err := qc.Eval("requester.js", requesterJS); err != nil {
 		t.Fatal("requester:", err)
 	}
 	// The requester's own policy admits the probe app's author; the node under test keeps

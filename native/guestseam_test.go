@@ -34,14 +34,14 @@ func TestGuestSeamOps(t *testing.T) {
 	// not link), plus an identity from sodium. The signing scope binds node/sign and
 	// node/verify to a bundle namespace (README §12.2) — a real node derives it from the
 	// manifest's (author, app); here it is a throwaway pair.
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__other = sodium.crypto_sign_keypair();
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
 		// the key that signs, all three.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		__buildGuestSeam(["node", "fs", "clock"], __id, null, __scope);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 
@@ -64,7 +64,7 @@ func TestGuestSeamOps(t *testing.T) {
 		return err
 	}
 
-	// The node pubkey. JsTypedArrayToGo copies on read and leaves __id.publicKey intact
+	// The node pubkey. Value.Bytes copies on read and leaves __id.publicKey intact
 	// for the seam's own use, so it can be read directly.
 	pk := jsBytes(t, qc, `__id.publicKey`)
 
@@ -167,7 +167,7 @@ func TestGuestSeamOps(t *testing.T) {
 	// gate can be what refuses it: the same seam narrowed to `clock` alone answers no
 	// fs name. A refusal at the GATE — an undeclared service, still a throw at the call
 	// site (guest-seam.ts) — reaches the test as callRealm's error.
-	if _, err := qc.Eval("narrow.js", qjs.Code(`__buildGuestSeam(["clock"], __id, null, __scope);`)); err != nil {
+	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["clock"], __id, null, __scope);`); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
 	if err := refused(nameFsPut, make([]byte, 8)); err == nil {
@@ -181,11 +181,11 @@ func TestGuestSeamOps(t *testing.T) {
 // jsBytes evaluates a JS expression that yields a Uint8Array and returns its bytes.
 func jsBytes(t *testing.T, qc *qjs.Context, expr string) []byte {
 	t.Helper()
-	v, err := qc.Eval("<jsBytes>", qjs.Code(expr))
+	v, err := qc.Eval("<jsBytes>", expr)
 	if err != nil {
 		t.Fatalf("eval %q: %v", expr, err)
 	}
-	b, err := qjs.JsTypedArrayToGo(v)
+	b, err := v.Bytes()
 	if err != nil {
 		t.Fatalf("bytes of %q: %v", expr, err)
 	}

@@ -1,4 +1,4 @@
-// net.go — the Go target's TCP socket primitive: a raw byte duplex (rawChannel), with no
+// net.go — the Go target's TCP socket primitive: a raw byte duplex (sockChannel), with no
 // message boundaries of its own. This is the only networking in Go; the wire codec, the
 // PeerLink handshake and routing are the transport bundle's guest program (transport/src)
 // running in QuickJS over this via __net (sock.go).
@@ -39,20 +39,12 @@ func dialTCP(addr string) (net.Conn, error) {
 
 // ───────────────────────── RawLink: a byte duplex ──────────────────────────────
 
-// rawChannel delivers bytes as they arrive (core/socket-seam.ts RawLink): one delivery is
+// sockChannel delivers bytes as they arrive (core/socket-seam.ts RawLink): one delivery is
 // an arbitrary slice of the stream and implies no boundary, which the transport bundle's
 // framer imposes on the far side of __net. A channel owns one socket, one read goroutine
 // and one writer goroutine. send only queues — safe from any goroutine — and takes
 // ownership of its slice. onMsg borrows the read buffer only for the call; the native
 // host reserves its shared staging allowance before making any retained copy.
-type rawChannel interface {
-	send(bytes []byte)
-	buffered() int
-	resume()
-	close(graceful bool)
-}
-
-// ── sockChannel: the connection core ───────────────────────────────────────────
 //
 // Writes never run on the caller's goroutine: the caller is the event-loop goroutine
 // (sock.go N.send), which owns ALL QuickJS execution, so a peer that stops draining must
@@ -116,7 +108,7 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), c
 }
 
 // send queues bytes for the writer goroutine and returns immediately, never touching the
-// socket. It takes ownership of bytes (sock.go hands over a fresh JsTypedArrayToGo copy),
+// socket. It takes ownership of bytes (sock.go hands over a fresh Value.Bytes copy),
 // so nothing is copied here. A send on a dead channel is dropped silently, like a
 // node:net write after destroy. It answers nothing: what one link may hold is the driver's
 // per-link owner (host/transport-host.ts `LinkOutboundOwner`), which charges every write

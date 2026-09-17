@@ -1,8 +1,8 @@
 // The native loader's platform seam (§12.9): Go supplies primitives — pure modules over
-// wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm — and this file
-// adapts them to the interfaces `bootShell` consumes, then hands them to it. Go runs it
-// inside QuickJS, bundled with every module it imports into native/host-shell.gen.js by
-// scripts/bundle-loader.mjs.
+// wazero, libsodium, an `fs` directory, TCP sockets, a confined QuickJS realm per app — and
+// this file adapts them to the interfaces `bootShell` consumes, then hands them to it. Go
+// runs it inside QuickJS, bundled with every module it imports into
+// native/host-shell.gen.js by scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
@@ -497,7 +497,7 @@ async function runMain(): Promise<Uint8Array> {
   if (!serving) close();
   return utf8.encode(JSON.stringify({ serving }));
 }
-/** The confined realm's own plumbing (native/guest.go `guestDriverJS`): one pre-compiled
+/** The confined realm's own plumbing, fetched by native/guest.go: one pre-compiled
  *  `__start` wrapper, so an initiator call costs an Invoke rather than a parse. Not the
  *  guest ABI (that is `guestPreamble`) but this target's twin of what safe-js.ts does —
  *  fetched by Go rather than restated as a Go string TypeScript never saw. */

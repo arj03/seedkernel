@@ -31,7 +31,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := qc.Eval("setup.js", qjs.Code(fmt.Sprintf(`
+	if _, err := qc.Eval("setup.js", fmt.Sprintf(`
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.idA = sodium.crypto_sign_keypair();
@@ -69,7 +69,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		    return globalThis.__nodeBApp.invoke(framed);
 		  } }, undefined, ["_net"]);
 		})();
-	`, hex.EncodeToString(sender.id())))); err != nil {
+	`, hex.EncodeToString(sender.id()))); err != nil {
 		t.Fatal("setup:", err)
 	}
 	if _, err := callRealm("loadProbe", 5*time.Second, qc.NewArrayBuffer(probeBlob)); err != nil {
@@ -137,7 +137,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 // mustEvalString evaluates a JS expression yielding a string and returns it.
 func mustEvalString(t *testing.T, qc *qjs.Context, expr string) string {
 	t.Helper()
-	v, err := qc.Eval("<evalString>", qjs.Code(expr))
+	v, err := qc.Eval("<evalString>", expr)
 	if err != nil {
 		t.Fatalf("eval %q: %v", expr, err)
 	}

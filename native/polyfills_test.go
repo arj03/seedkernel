@@ -5,8 +5,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"seedloader/qjs"
 )
 
 // TestHostConsoleReachesStderr covers a platform facility the engine lacks: quickjs-ng
@@ -21,9 +19,9 @@ func TestHostConsoleReachesStderr(t *testing.T) {
 	bootRealm(t)
 	for _, method := range []string{"log", "error", "warn", "info", "debug"} {
 		out := captureStderr(t, func() {
-			if _, err := qc.Eval("console.js", qjs.Code(
+			if _, err := qc.Eval("console.js",
 				`console.`+method+`("[transport] guest error in deliver: ", new Error("boom"), 7)`,
-			)); err != nil {
+			); err != nil {
 				t.Fatalf("console.%s threw: %v", method, err)
 			}
 		})

@@ -1,8 +1,8 @@
 // seedkernel native shell. The shell itself — verify/admit/install, the guest seam, and
 // the operator flow (host/cli.ts) — is the shared host TS, embedded as host-shell.gen.js
 // and run in QuickJS (README §12.9). The Go layer is only the bridge: module table (§3),
-// crypto, fs, sockets, the second QuickJS realm (guest.go). Pure Go, no cgo → one static
-// binary.
+// crypto, fs, sockets, the confined QuickJS realm an app runs in (guest.go). Pure Go, no
+// cgo → one static binary.
 package main
 
 import (
@@ -71,7 +71,7 @@ func boot() error {
 	exposeFs(qc)
 	nh = exposeNet(qc, el)
 	exposeBridge(qc)
-	done, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS))
+	done, err := qc.Eval("host-shell.gen.js", hostShellJS)
 	if err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
 	}
@@ -120,63 +120,63 @@ func exposeBridge(qc *qjs.Context) {
 	// ── the operator's world (host/cli.ts) ──
 	// Files, arguments and stdout: which files get read and what gets printed is the
 	// shared CLI's, the same module the Node shell runs.
-	b.SetPropertyStr("argv", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// JSON rather than a joined string: an argument may contain any byte, including
 		// whatever separator a join would pick.
 		j, err := json.Marshal(os.Args[1:])
 		if err != nil {
 			return nil, err
 		}
-		return t.Context().NewString(string(j)), nil
+		return qc.NewString(string(j)), nil
 	}))
-	b.SetPropertyStr("readFile", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		fb, err := os.ReadFile(t.Args()[0].String())
+	b.SetPropertyStr("readFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		fb, err := os.ReadFile(args[0].String())
 		if err != nil {
 			// Only absence maps to null. Permission errors, directories and I/O failures
 			// must remain visible to guard-bearing callers such as the freshness store.
 			if errors.Is(err, os.ErrNotExist) {
-				return t.Context().NewNull(), nil
+				return qc.NewNull(), nil
 			}
 			return nil, err
 		}
-		return t.Context().NewArrayBuffer(fb), nil
+		return qc.NewArrayBuffer(fb), nil
 	}))
-	b.SetPropertyStr("writeFile", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		bytes, err := qjs.JsTypedArrayToGo(t.Args()[1])
+	b.SetPropertyStr("writeFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		bytes, err := args[1].Bytes()
 		if err != nil {
 			return nil, err
 		}
 		// Atomic for every caller: a truncated freshness file must never replace the last
 		// readable guard state (and is refused on read if one exists out of band).
-		if err := writeFileAtomic(t.Args()[0].String(), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
+		if err := writeFileAtomic(args[0].String(), bytes, ".seedkernel-", os.FileMode(args[2].Int64())); err != nil {
 			return nil, err
 		}
-		return t.Context().NewUndefined(), nil
+		return qc.NewUndefined(), nil
 	}))
-	b.SetPropertyStr("log", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// The realm's console is this, by way of host/native-polyfills.ts — the engine has
 		// none — and it writes to stderr, because stdout is `--op`'s raw data channel.
-		fmt.Fprintln(os.Stderr, t.Args()[0].String())
-		return t.Context().NewUndefined(), nil
+		fmt.Fprintln(os.Stderr, args[0].String())
+		return qc.NewUndefined(), nil
 	}))
-	b.SetPropertyStr("stdout", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		bytes, err := qjs.JsTypedArrayToGo(t.Args()[0])
+	b.SetPropertyStr("stdout", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		bytes, err := args[0].Bytes()
 		if err != nil {
 			return nil, err
 		}
 		if _, err := os.Stdout.Write(bytes); err != nil {
 			return nil, err
 		}
-		return t.Context().NewUndefined(), nil
+		return qc.NewUndefined(), nil
 	}))
-	b.SetPropertyStr("stdin", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// `--op`'s argument, read whole; cli.ts calls this lazily, so a serving node never
 		// waits on stdin. A read failure must not turn into an empty operation payload.
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return nil, err
 		}
-		return bytesAB(t, bytes), nil
+		return qc.NewArrayBuffer(bytes), nil
 	}))
 
 	installRealmBridge(qc, b) // the confined realm (§12.3) — guest.go
@@ -211,7 +211,7 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 			qc.Global().SetPropertyStr(slot, undef)
 		}
 	}()
-	kind, value, msg, err := el.awaitIn(qc, expr+")", timeout)
+	kind, value, msg, err := el.await(expr+")", timeout)
 	if err != nil {
 		return nil, err
 	}

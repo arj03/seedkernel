@@ -12,8 +12,6 @@ import (
 	"testing"
 
 	"github.com/tetratelabs/wazero"
-
-	"seedloader/qjs"
 )
 
 // forwarderWasm is a minimal pure-transform module (WASM/tests/fixtures/forwarder: exports
@@ -144,7 +142,7 @@ func realmString(expr string) string {
 	if qc == nil {
 		panic("realmString: the realm has not booted")
 	}
-	v, err := qc.Eval("<realmString>", qjs.Code(expr))
+	v, err := qc.Eval("<realmString>", expr)
 	if err != nil {
 		panic("realmString(" + expr + "): " + err.Error())
 	}

@@ -3,8 +3,6 @@ package main
 import (
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // A guest that chains fs ops must keep advancing with NOTHING else driving the loop —
@@ -20,10 +18,10 @@ import (
 // timers, just a chain of fs awaits.
 func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam(["fs"], __id, null);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 

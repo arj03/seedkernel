@@ -29,7 +29,7 @@ type netHost struct {
 	und *qjs.Value // a reusable `undefined` for the `this` of dispatcher calls
 
 	mu        sync.Mutex
-	chans     map[int64]rawChannel
+	chans     map[int64]*sockChannel
 	nextID    int64
 	listeners []net.Listener // bound listeners, closed on network teardown
 	// Torn down with the realm that owned it (close): a reader parked on the staging
@@ -58,14 +58,14 @@ type netHost struct {
 // objects, and the dispatchers Go's reader goroutines route through, are typed TS in
 // host/native-shim.ts.
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
-	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]rawChannel{}}
+	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]*sockChannel{}}
 	o := qc.NewObject()
 
-	o.SetPropertyStr("install", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		maxLive := int(t.Args()[0].Int64())
-		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
-		maxInboundBytes := int(t.Args()[2].Int64())
-		maxInboundSlices := int(t.Args()[3].Int64())
+	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		maxLive := int(args[0].Int64())
+		grace := time.Duration(args[1].Int64()) * time.Millisecond
+		maxInboundBytes := int(args[2].Int64())
+		maxInboundSlices := int(args[3].Int64())
 		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
 			return nil, errors.New("net: invalid socket limits")
 		}
@@ -79,60 +79,60 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		n.closeGrace = grace
 		n.maxInboundReadBytes = maxInboundBytes
 		n.maxInboundReadSlices = maxInboundSlices
-		return t.Context().NewUndefined(), nil
+		return qc.NewUndefined(), nil
 	}))
 
 	// One socket kind: a raw byte duplex. Which codec runs over it is the transport
 	// bundle's business, never Go's.
-	o.SetPropertyStr("connect", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
-		return t.Context().NewInt64(n.dial(addr)), nil
+	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		addr := net.JoinHostPort(args[0].String(), strconv.Itoa(int(args[1].Int32())))
+		return qc.NewInt64(n.dial(addr)), nil
 	}))
-	o.SetPropertyStr("listen", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()))
+	o.SetPropertyStr("listen", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		bound, err := n.listen(args[0].String(), int(args[1].Int32()))
 		if err != nil {
-			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
+			return qc.NewInt32(-1), nil // -1: the shim throws on a failed bind
 		}
-		return t.Context().NewInt32(int32(bound)), nil
+		return qc.NewInt32(int32(bound)), nil
 	}))
 	// No answer: admission is the driver's per-link owner (host/transport-host.ts), which
 	// has already charged these bytes against this socket's `buffered()`. A send for a
 	// channel that is gone is dropped, exactly as one on a dead channel is.
-	o.SetPropertyStr("send", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if ch := n.get(t.Args()[0].Int64()); ch != nil {
-			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without another. It
+	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
+			// b is a fresh copy (Value.Bytes), so send takes ownership without another. It
 			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
-			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
+			if b, err := args[1].Bytes(); err == nil {
 				ch.send(b)
 			}
 		}
 		return nil, nil
 	}))
-	o.SetPropertyStr("buffered", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if ch := n.get(t.Args()[0].Int64()); ch != nil {
-			return t.Context().NewInt64(int64(ch.buffered())), nil
+	o.SetPropertyStr("buffered", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
+			return qc.NewInt64(int64(ch.buffered())), nil
 		}
-		return t.Context().NewInt64(0), nil
+		return qc.NewInt64(0), nil
 	}))
-	o.SetPropertyStr("resume", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if ch := n.get(t.Args()[0].Int64()); ch != nil {
+	o.SetPropertyStr("resume", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
 			ch.resume()
 		}
 		return nil, nil
 	}))
-	o.SetPropertyStr("closeListeners", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("closeListeners", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		n.closeListeners()
 		return nil, nil
 	}))
-	o.SetPropertyStr("close", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// A deliberate close() sets dead WITHOUT firing onClose, so the readLoop error
 		// chasing it never runs the onClose registry-drop. Dropping the entry here keeps
 		// every local close (each rejected handshake, each duplicate dial) from leaking its
 		// n.chans slot — attacker-triggerable memory exhaustion; the JS shim deletes from
 		// its own Map for the same reason.
-		id := t.Args()[0].Int64()
+		id := args[0].Int64()
 		if ch := n.get(id); ch != nil {
-			graceful := len(t.Args()) >= 2 && t.Args()[1].Int32() != 0
+			graceful := len(args) >= 2 && args[1].Int32() != 0
 			ch.close(graceful)
 			n.mu.Lock()
 			delete(n.chans, id)
@@ -160,7 +160,7 @@ func (n *netHost) retain() error {
 	return nil
 }
 
-func (n *netHost) get(id int64) rawChannel {
+func (n *netHost) get(id int64) *sockChannel {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.chans[id]
@@ -309,7 +309,7 @@ func (n *netHost) close() {
 	n.closeListeners()
 	n.mu.Lock()
 	chans := n.chans
-	n.chans = map[int64]rawChannel{}
+	n.chans = map[int64]*sockChannel{}
 	n.mu.Unlock()
 	// Before releasing the parked readers, so one that wakes finds its channel already dead
 	// and its fail() a no-op rather than a notification into the dying realm.
@@ -324,7 +324,7 @@ func (n *netHost) close() {
 
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
-func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
+func (n *netHost) wrapInbound(id int64, conn net.Conn) (*sockChannel, func()) {
 	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return c, func() { go c.readLoop() }
 }

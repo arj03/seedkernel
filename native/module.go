@@ -325,9 +325,9 @@ func instantiateWasm(wasm []byte, scratchDefault uint32, bindDeadline time.Durat
 func installModuleBridge(qc *qjs.Context, b *qjs.Value) {
 	// One transactional build of an opaque slot's module set. The §4.1 scratch default
 	// arrives from the shared host rather than Go owning a copy of it.
-	b.SetPropertyStr("buildModules", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		slot := t.Args()[0].String()
-		mods := t.Args()[1]
+	b.SetPropertyStr("buildModules", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		slot := args[0].String()
+		mods := args[1]
 		lenv := mods.GetPropertyStr("length")
 		n := int(lenv.Int64())
 		lenv.Free()
@@ -339,7 +339,7 @@ func installModuleBridge(qc *qjs.Context, b *qjs.Value) {
 			names[i] = nv.String()
 			nv.Free()
 			wv := m.GetPropertyStr("wasm")
-			wb, err := qjs.JsTypedArrayToGo(wv)
+			wb, err := wv.Bytes()
 			wv.Free()
 			m.Free()
 			if err != nil {
@@ -347,25 +347,25 @@ func installModuleBridge(qc *qjs.Context, b *qjs.Value) {
 			}
 			wasms[i] = wb
 		}
-		bindDeadline := time.Duration(t.Args()[3].Int64()) * time.Millisecond
-		if err := buildModuleSlot(slot, names, wasms, uint32(t.Args()[2].Int64()), bindDeadline); err != nil {
+		bindDeadline := time.Duration(args[3].Int64()) * time.Millisecond
+		if err := buildModuleSlot(slot, names, wasms, uint32(args[2].Int64()), bindDeadline); err != nil {
 			return nil, err
 		}
-		return t.Context().NewNull(), nil
+		return qc.NewNull(), nil
 	}))
-	b.SetPropertyStr("callModule", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		pl, err := qjs.JsTypedArrayToGo(t.Args()[2])
+	b.SetPropertyStr("callModule", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		pl, err := args[2].Bytes()
 		if err != nil {
-			return t.Context().NewNull(), nil
+			return qc.NewNull(), nil
 		}
-		deadline := time.Duration(t.Args()[3].Int64()) * time.Millisecond
-		resp := callModule(t.Args()[0].String(), t.Args()[1].String(), pl, deadline)
+		deadline := time.Duration(args[3].Int64()) * time.Millisecond
+		resp := callModule(args[0].String(), args[1].String(), pl, deadline)
 		if resp == nil {
-			return t.Context().NewNull(), nil
+			return qc.NewNull(), nil
 		}
-		return t.Context().NewArrayBuffer(resp), nil
+		return qc.NewArrayBuffer(resp), nil
 	}))
-	b.SetPropertyStr("disposeModules", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewInt64(int64(disposeModuleSlot(t.Args()[0].String()))), nil
+	b.SetPropertyStr("disposeModules", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewInt64(int64(disposeModuleSlot(args[0].String()))), nil
 	}))
 }

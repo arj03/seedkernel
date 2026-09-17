@@ -30,7 +30,7 @@ func requireUndefined(t *testing.T, c *qjs.Context, names []string) {
 	for i, name := range names {
 		probes[i] = "typeof " + name
 	}
-	v, err := c.Eval("libc-globals.js", qjs.Code("["+strings.Join(probes, ",")+"].join(',')"))
+	v, err := c.Eval("libc-globals.js", "["+strings.Join(probes, ",")+"].join(',')")
 	if err != nil {
 		t.Fatal("eval:", err)
 	}
@@ -55,8 +55,8 @@ func TestRuntimesHaveNoLibcGlobals(t *testing.T) {
 
 func TestConfinedRealmCannotImportLibcModules(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("confinement-seam.js", qjs.Code(
-		`globalThis.__guestSeam = async () => new Uint8Array();`)); err != nil {
+	if _, err := qc.Eval("confinement-seam.js",
+		`globalThis.__guestSeam = async () => new Uint8Array();`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -72,7 +72,7 @@ func TestConfinedRealmCannotImportLibcModules(t *testing.T) {
 		  return new TextEncoder().encode(JSON.stringify(report));
 		}
 	`, 5000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	out, err := realmCall("confinement", nil)
 	if err != nil {
 		t.Fatal("realmCall:", err)

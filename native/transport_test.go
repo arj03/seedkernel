@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // Routing and transport run as the transport bundle's guest program inside QuickJS, over
@@ -37,7 +35,7 @@ func TestTwoNodeRequestResponseWS(t *testing.T) {
 // open. If the Go callback or native-shim drops the address, all nine remain admitted.
 func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 	bootRealm(t)
-	if _, err := qc.Eval("source-cap-harness.js", qjs.Code(`
+	if _, err := qc.Eval("source-cap-harness.js", `
 		globalThis.__startSourceCapTest = async () => {
 		  globalThis.__sourceCapNode = await standUp({
 		    dir: __dir,
@@ -50,7 +48,7 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 		  __sourceCapNode.shell.close();
 		  return new Uint8Array(0);
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("harness:", err)
 	}
 	if _, err := callRealm("__startSourceCapTest", 10*time.Second); err != nil {
@@ -157,7 +155,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  return r.slice(1);
 		};
 	`, senderHex, listenArgs, transport, portField)
-	if _, err := qc.Eval("transport-harness.js", qjs.Code(harness)); err != nil {
+	if _, err := qc.Eval("transport-harness.js", harness); err != nil {
 		t.Fatal("harness:", err)
 	}
 	if _, err := callRealm("loadProbe", 5*time.Second, qc.NewArrayBuffer(probeBlob)); err != nil {

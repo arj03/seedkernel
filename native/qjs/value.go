@@ -20,13 +20,6 @@ type Value struct {
 	raw uint64
 }
 
-// This is the receiver passed to a Go callback: the JS `this` plus the call args.
-type This struct {
-	*Value
-	context *Context
-	args    []*Value
-}
-
 func (c *Context) value(raw uint64) *Value { return &Value{c: c, raw: raw} }
 
 // callV dispatches a wasm export and wraps the i64 result as a *Value.
@@ -68,9 +61,6 @@ func (v *Value) Dup() *Value {
 	}
 	return v.c.callV("QJS_DupValue", v.c.handle, v.raw)
 }
-
-func (t *This) Context() *Context { return t.context }
-func (t *This) Args() []*Value    { return t.args }
 
 // ── Context constructors ──────────────────────────────────────────────────────
 
@@ -118,7 +108,7 @@ func (c *Context) NewString(s string) *Value {
 func (c *Context) NewArrayBuffer(b []byte) *Value {
 	v := c.callV("QJS_NewArrayBuffer", c.handle, uint64(len(b)))
 	if len(b) > 0 {
-		if addr, _, ok := v.bytes(); ok {
+		if addr, _, ok := v.window(); ok {
 			c.rt.mem.Write(addr, b)
 		}
 	}
@@ -173,10 +163,10 @@ func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
 
 // ── bytes ─────────────────────────────────────────────────────────────────────
 
-// bytes resolves an ArrayBuffer or a TypedArray to the storage it covers (QJS_GetBytes).
+// window resolves an ArrayBuffer or a TypedArray to the storage it covers (QJS_GetBytes).
 // ok=false leaves the engine's TypeError pending. The window is live memory, valid only
 // until JS next runs.
-func (v *Value) bytes() (addr, size uint32, ok bool) {
+func (v *Value) window() (addr, size uint32, ok bool) {
 	packed := v.c.rt.call("QJS_GetBytes", v.c.handle, v.raw)
 	if packed == math.MaxUint64 {
 		return 0, 0, false
@@ -184,20 +174,20 @@ func (v *Value) bytes() (addr, size uint32, ok bool) {
 	return uint32(packed >> 32), uint32(packed), true
 }
 
-// JsTypedArrayToGo returns the bytes of an ArrayBuffer or a TypedArray as an independent Go
-// copy — for a view, just its window. The shape comes from the engine's own slots, never
-// from properties, so no JS runs and nothing a caller defined on the object is believed;
+// Bytes returns the bytes of an ArrayBuffer or a TypedArray as an independent Go copy —
+// for a view, just its window. The shape comes from the engine's own slots, never from
+// properties, so no JS runs and nothing a caller defined on the object is believed;
 // anything else (a DataView, an object that only looks like a view, a detached buffer) is
-// refused, and the engine's error is taken so the next call does not inherit it. The source
-// is left intact, so the same value can be read any number of times.
-func JsTypedArrayToGo(input *Value) ([]byte, error) {
-	addr, size, ok := input.bytes()
+// refused, and the engine's error is taken so the next call does not inherit it. The value
+// is left intact, so it can be read any number of times.
+func (v *Value) Bytes() ([]byte, error) {
+	addr, size, ok := v.window()
 	if !ok {
-		return nil, notBytes(input.c)
+		return nil, notBytes(v.c)
 	}
 	out := make([]byte, size)
 	if size > 0 {
-		buf, ok := input.c.rt.mem.Read(addr, size)
+		buf, ok := v.c.rt.mem.Read(addr, size)
 		if !ok {
 			return nil, errors.New("qjs: byte window outside wasm memory")
 		}
@@ -206,12 +196,12 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	return out, nil
 }
 
-// JsTypedArrayByteLength answers the width JsTypedArrayToGo would copy, without copying it:
-// resource gates admit against it before the copy.
-func JsTypedArrayByteLength(input *Value) (int64, error) {
-	_, size, ok := input.bytes()
+// ByteLength answers the width Bytes would copy, without copying it: resource gates admit
+// against it before the copy.
+func (v *Value) ByteLength() (int64, error) {
+	_, size, ok := v.window()
 	if !ok {
-		return 0, notBytes(input.c)
+		return 0, notBytes(v.c)
 	}
 	return int64(size), nil
 }
@@ -296,33 +286,17 @@ func (c *Context) normalize(v *Value) (*Value, error) {
 
 // ── eval ──────────────────────────────────────────────────────────────────────
 
-// EvalOptionFunc configures an Eval call.
-type EvalOptionFunc func(*evalOptions)
-
-type evalOptions struct {
-	code string
-}
-
-// Code sets the JS source to evaluate.
-func Code(src string) EvalOptionFunc {
-	return func(o *evalOptions) { o.code = src }
-}
-
-// Eval evaluates strict global code (provided via Code) under the given filename, and
-// answers its completion value as it stands: a promise is returned, not awaited, and the
-// jobs the code queued wait for Pump.
-func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
-	var o evalOptions
-	for _, fn := range opts {
-		fn(&o)
-	}
+// Eval evaluates src as strict global code under the given filename, and answers its
+// completion value as it stands: a promise is returned, not awaited, and the jobs the code
+// queued wait for Pump.
+func (c *Context) Eval(file, src string) (*Value, error) {
 	filePtr := c.rt.writeCStr(file)
 	defer c.rt.freeAt(filePtr)
 	// NUL-terminated because JS_Eval requires it, with the length passed alongside, so a
 	// NUL inside the source is source like any other byte.
-	codePtr := c.rt.writeCStr(o.code)
+	codePtr := c.rt.writeCStr(src)
 	defer c.rt.freeAt(codePtr)
-	return c.normalize(c.callV("QJS_Eval", c.handle, codePtr, uint64(len(o.code)), filePtr))
+	return c.normalize(c.callV("QJS_Eval", c.handle, codePtr, uint64(len(src)), filePtr))
 }
 
 // Pump runs the job queue (microtasks and settled-promise reactions) to completion and

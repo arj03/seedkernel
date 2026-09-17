@@ -13,8 +13,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // The old Shell.invoke-by-key shape survives only as a TEST adapter for Go assertions
@@ -148,7 +146,7 @@ func bootRealmIn(tb testing.TB, dir string) {
 		_ = os.Remove(ownedRealmDir + ".freshness.json")
 		ownedRealmDir = ""
 	}
-	if _, err := qc.Eval("native-handle-harness.js", qjs.Code(nativeHandleHarness)); err != nil {
+	if _, err := qc.Eval("native-handle-harness.js", nativeHandleHarness); err != nil {
 		tb.Fatal("native handle harness:", err)
 	}
 	// This realm's data directory, which Go's boot knows nothing about. Opened through the
@@ -234,7 +232,7 @@ func invokeBundle(appKey string, payload []byte) ([]byte, error) {
 // evalString evaluates a JS expression in the host realm and returns it as a string.
 func evalString(tb testing.TB, expr string) string {
 	tb.Helper()
-	v, err := qc.Eval("<evalString>", qjs.Code(expr))
+	v, err := qc.Eval("<evalString>", expr)
 	if err != nil {
 		tb.Fatal("eval:", err)
 	}
@@ -356,7 +354,7 @@ globalThis.__callSeamAwait = __callSeam;
 func guestSeamRealm(tb testing.TB) {
 	tb.Helper()
 	bootRealm(tb)
-	if _, err := qc.Eval("test-guest-seam.js", qjs.Code(testGuestSeamJS)); err != nil {
+	if _, err := qc.Eval("test-guest-seam.js", testGuestSeamJS); err != nil {
 		tb.Fatal("test guest-seam:", err)
 	}
 }
@@ -419,9 +417,9 @@ func realmCall(entry string, payload []byte) ([]byte, error) {
 // for the process's life.
 func TestCallRealmReleasesStagedArgs(t *testing.T) {
 	bootRealm(t)
-	if _, err := qc.Eval("probe.js", qjs.Code(`
+	if _, err := qc.Eval("probe.js", `
 		globalThis.__probe = function () { return new Uint8Array(0); };
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("probe:", err)
 	}
 	if _, err := callRealm("__probe", 5*time.Second, qc.NewString("a"), qc.NewString("b")); err != nil {

@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"seedloader/qjs"
 )
 
 // Initialization regressions run in a child process: without the source-evaluation guard,
@@ -19,11 +17,11 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 	const marker = "SEEDKERNEL_TEST_GUEST_INIT_BUDGET"
 	if os.Getenv(marker) == "1" {
 		guestSeamRealm(t)
-		if _, err := qc.Eval("build.js", qjs.Code(`
+		if _, err := qc.Eval("build.js", `
 			globalThis.__id = sodium.crypto_sign_keypair();
 			__buildGuestSeam([], __id, null);
 			globalThis.__src = "for (;;) {}";
-		`)); err != nil {
+		`); err != nil {
 			t.Fatal("build seam:", err)
 		}
 		// callRealm appends its own call parens, so the expression must be a function: an
@@ -58,11 +56,11 @@ func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 	const marker = "SEEDKERNEL_TEST_GUEST_PENDING_PROMISE"
 	if os.Getenv(marker) == "1" {
 		guestSeamRealm(t)
-		if _, err := qc.Eval("build.js", qjs.Code(`
+		if _, err := qc.Eval("build.js", `
 			globalThis.__id = sodium.crypto_sign_keypair();
 			__buildGuestSeam([], __id, null);
 			globalThis.__src = "new Promise(() => {})";
-		`)); err != nil {
+		`); err != nil {
 			t.Fatal("build seam:", err)
 		}
 		// The IIFE is required: callRealm appends its own call parens.
@@ -88,10 +86,10 @@ func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 func TestGuestRealmFailedConstructionClearsHostDeadlines(t *testing.T) {
 	bootRealm(t)
 	before := len(el.timers)
-	if _, err := qc.Eval("failed-realm-fixture.js", qjs.Code(`
+	if _, err := qc.Eval("failed-realm-fixture.js", `
 		globalThis.__failedRealmSource = 'host.call("park", new Uint8Array()); throw new Error("init failed")';
 		globalThis.__neverAnswer = () => new Promise(() => {});
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build failed-realm fixture:", err)
 	}
 	if _, err := callRealm(`createRealm({ source: __failedRealmSource,
@@ -105,11 +103,11 @@ func TestGuestRealmFailedConstructionClearsHostDeadlines(t *testing.T) {
 
 func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		// A host operation that never settles retains every copied request unless the realm
 		// refuses new calls at its shared per-realm limit.
 		globalThis.__guestSeam = () => new Promise(() => {});
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -118,7 +116,7 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if _, err := realmCall("flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host calls")
 	}
@@ -126,13 +124,13 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 
 func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__heldHostCalls = 0;
 		globalThis.__guestSeam = () => {
 		  __heldHostCalls++;
 		  return new Promise(() => {});
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -142,7 +140,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if _, err := realmCall("byte flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host-call payload bytes")
 	}
@@ -153,13 +151,13 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 
 func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__heldHostCalls = 0;
 		globalThis.__guestSeam = () => {
 		  __heldHostCalls++;
 		  return new Promise(() => {});
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -169,7 +167,7 @@ func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if _, err := realmCall("ordinary flood", nil); err == nil {
 		t.Fatal("an ordinary call name bypassed the universal host-call byte cap")
 	}
@@ -180,13 +178,13 @@ func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 
 func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__heldHostCalls = 0;
 		globalThis.__guestSeam = () => {
 		  __heldHostCalls++;
 		  return new Promise(() => {});
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -196,7 +194,7 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if _, err := realmCall("duplicate", nil); err == nil {
 		t.Fatal("a duplicate live host-call id was accepted")
 	}
@@ -211,7 +209,7 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
 	bootRealm(t)
 	const mk = `bridge.createRealm("function handle(){ return new Uint8Array(); }", () => {}, 67108864, 1000, 10, 1048576)`
-	if _, err := qc.Eval("mk.js", qjs.Code(`globalThis.__realmIds = [`+mk+`, `+mk+`];`)); err != nil {
+	if _, err := qc.Eval("mk.js", `globalThis.__realmIds = [`+mk+`, `+mk+`];`); err != nil {
 		t.Fatalf("create realms: %v", err)
 	}
 	if got := evalString(t, "String(__realmIds[0] > 0 && __realmIds[1] > __realmIds[0])"); got != "true" {
@@ -224,7 +222,7 @@ func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
 // The seam then hands exactly that value to this slot's private module call.
 func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("module-budget-seam.js", qjs.Code(`
+	if _, err := qc.Eval("module-budget-seam.js", `
 		globalThis.__seenModuleDeadline = -1;
 		const __budgetIdentity = sodium.crypto_sign_keypair();
 		globalThis.__guestSeam = createGuestSeam({
@@ -238,13 +236,13 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 		    },
 		  },
 		});
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
 		function handle() { return host.call("probe", new Uint8Array()); }
 	`, 250)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if got, err := realmCall("probe", nil); err != nil || !bytes.Equal(got, []byte{9}) {
 		t.Fatalf("module probe = %v, err = %v", got, err)
 	}
@@ -260,10 +258,10 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 // the causal clock while the settled host call's continuation is drained.
 func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("causal-clock-seam.js", qjs.Code(`
+	if _, err := qc.Eval("causal-clock-seam.js", `
 		globalThis.__guestSeam = () => new Promise((resolve) =>
 		  setTimeout(() => resolve(new Uint8Array()), 150));
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -272,13 +270,13 @@ func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 		  return new Uint8Array([7]);
 		}
 	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
-	if _, err := qc.Eval("causal-clock-call.js", qjs.Code(`
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
+	if _, err := qc.Eval("causal-clock-call.js", `
 		globalThis.__causalMs = 0;
 		globalThis.__causalSegments = 0;
 		globalThis.__causalClock = { charge(ms) { __causalMs += ms; __causalSegments++; } };
 		globalThis.__meteredRealmCall = (op, arg) => __realmCall(op, arg, __causalClock);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("install causal clock:", err)
 	}
 	started := time.Now()
@@ -302,9 +300,9 @@ func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 
 func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build-seam.js", qjs.Code(`
+	if _, err := qc.Eval("build-seam.js", `
 		globalThis.__guestSeam = () => new Promise(() => {});
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealm(t, "{}", `
@@ -313,7 +311,7 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		  return new Uint8Array();
 		}
 	`)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 
 	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which stands the host realm up
 	// fresh (host-shell.gen.js re-evaluates, resetting native-shim.ts's own realm-id
@@ -346,9 +344,9 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 // process-wide pool on any backend that never answers, with nothing left to release it.
 func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("park-close-seam.js", qjs.Code(`
+	if _, err := qc.Eval("park-close-seam.js", `
 		globalThis.__guestSeam = () => new Promise(() => {});
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealm(t, "{}", `
@@ -364,7 +362,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	if len(g.hostCalls.live) != 1 || g.hostCalls.bytes != 3 {
 		t.Fatalf("parked call not charged: %d calls, %d bytes", len(g.hostCalls.live), g.hostCalls.bytes)
 	}
-	if _, err := qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)); err != nil {
+	if _, err := qc.Eval("dispose.js", `__realm.dispose()`); err != nil {
 		t.Fatal("dispose:", err)
 	}
 	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 || len(g.hostCallBudgets) != 0 {
@@ -422,10 +420,10 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	guestSeamRealm(t)
 
 	// Host realm: build the guest seam granting fs/put + fs/get (no net).
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam(["fs"], __id, null);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealm(t, "{}", storeGuestSource)
@@ -472,10 +470,10 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 func TestGuestRealmHeapCapped(t *testing.T) {
 	guestSeamRealm(t)
 
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	// Twice the shared 64 MiB default (core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
@@ -515,10 +513,10 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 func TestGuestRealmExecutionBudget(t *testing.T) {
 	guestSeamRealm(t)
 
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -563,12 +561,12 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 
 	// A stub claimant is enough: a cross-realm call only needs a promise that settles on
 	// the loop, and using one keeps the kill (not a socket) as the only variable.
-	if _, err := qc.Eval("setup.js", qjs.Code(`
+	if _, err := qc.Eval("setup.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
 		__buildGuestSeam([], __id,
 			{ call: async () => new Uint8Array([9]) }, undefined, ["_net"]);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("setup:", err)
 	}
 
@@ -600,10 +598,10 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 // the loop must be driven by whoever is waiting on it.
 func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -632,7 +630,7 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	// `park` waits until the harness settles it by tag; `remaining` records the remainder
 	// guest.go handed it.
-	if _, err := qc.Eval("parking-seam.js", qjs.Code(`
+	if _, err := qc.Eval("parking-seam.js", `
 		globalThis.__parked = new Map();
 		globalThis.__remaining = new Map();
 		globalThis.__guestSeam = (name, tag, budget) => {
@@ -642,7 +640,7 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 		  }
 		  return new Promise((resolve, reject) => __parked.set(tag[0], { resolve, reject }));
 		};
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
@@ -654,7 +652,7 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 		  return tag;
 		}
 	`, 5000)
-	defer func() { _, _ = qc.Eval("dispose.js", qjs.Code(`__realm.dispose()`)) }()
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 
 	// Invocation 1 (1 s) parks, then 2 (the realm's 5 s) enters and parks behind it. 1 is
 	// resumed by a rejection and 2 by an answer, so both settlement paths are covered.
@@ -686,12 +684,12 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 // callers for this reason; close() has to as well.
 func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
-	if _, err := qc.Eval("setup.js", qjs.Code(`
+	if _, err := qc.Eval("setup.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
 		__buildGuestSeam([], __id,
 			{ call: () => new Promise(() => {}) }, undefined, ["_net"]);
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("setup:", err)
 	}
 	// The transport never settles, so the guest parks forever and the realm is closed
@@ -714,12 +712,12 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		}
 	`, 0)
 
-	if _, err := qc.Eval("close.js", qjs.Code(`
+	if _, err := qc.Eval("close.js", `
 		__realm.call(new Uint8Array(0)).then(
 			() => { globalThis.__outcome = "resolved"; },
 			(e) => { globalThis.__outcome = "rejected: " + (e && e.message || e); });
 		__realm.dispose();
-	`)); err != nil {
+	`); err != nil {
 		t.Fatal("close:", err)
 	}
 	// One bounded await is enough to drive the loop; the rejection must arrive in it.
