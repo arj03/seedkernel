@@ -31,7 +31,7 @@ var hostShellJS string
 
 var (
 	ctx = context.Background()
-	// rtCore is the TCB's own runtime (libsodium, ML-DSA, ML-KEM), deliberately not armed:
+	// rtCore is the TCB's own runtime (libsodium, ML-DSA), deliberately not armed:
 	// a wedged libsodium is a host bug, not a confinement breach.
 	rtCore wazero.Runtime
 	qc     *qjs.Context

@@ -125,10 +125,12 @@ func (c *Context) NewArrayBuffer(b []byte) *Value {
 	return v
 }
 
-// Function wraps a Go func as a JS function: an engine function carrying the id the Go
-// func is registered under, which env.callGo resolves.
+// Function wraps a Go func as a JS function: an engine function carrying the Go func's
+// index in the runtime's funcs, which env.callGo resolves.
 func (c *Context) Function(fn goFunc) *Value {
-	return c.callV("QJS_NewFunction", c.handle, c.rt.reg.register(fn))
+	id := len(c.rt.funcs)
+	c.rt.funcs = append(c.rt.funcs, fn)
+	return c.callV("QJS_NewFunction", c.handle, uint64(id))
 }
 
 // ── Value properties / conversions ────────────────────────────────────────────

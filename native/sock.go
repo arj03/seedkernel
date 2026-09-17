@@ -62,9 +62,6 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 4 {
-			return nil, errors.New("net: no socket limits supplied")
-		}
 		maxLive := int(t.Args()[0].Int64())
 		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
 		maxInboundBytes := int(t.Args()[2].Int64())
@@ -88,19 +85,13 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	// One socket kind: a raw byte duplex. Which codec runs over it is the transport
 	// bundle's business, never Go's.
 	o.SetPropertyStr("connect", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 2 {
-			return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
-		}
 		addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
 		return t.Context().NewInt64(n.dial(addr)), nil
 	}))
 	o.SetPropertyStr("listen", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 2 {
-			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
-		}
 		bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()))
 		if err != nil {
-			return t.Context().NewInt32(-1), nil
+			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
 		}
 		return t.Context().NewInt32(int32(bound)), nil
 	}))
@@ -108,9 +99,6 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	// has already charged these bytes against this socket's `buffered()`. A send for a
 	// channel that is gone is dropped, exactly as one on a dead channel is.
 	o.SetPropertyStr("send", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 2 {
-			return nil, nil
-		}
 		if ch := n.get(t.Args()[0].Int64()); ch != nil {
 			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without another. It
 			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
@@ -121,19 +109,14 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		return nil, nil
 	}))
 	o.SetPropertyStr("buffered", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 1 {
-			return t.Context().NewInt64(0), nil
-		}
 		if ch := n.get(t.Args()[0].Int64()); ch != nil {
 			return t.Context().NewInt64(int64(ch.buffered())), nil
 		}
 		return t.Context().NewInt64(0), nil
 	}))
 	o.SetPropertyStr("resume", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) >= 1 {
-			if ch := n.get(t.Args()[0].Int64()); ch != nil {
-				ch.resume()
-			}
+		if ch := n.get(t.Args()[0].Int64()); ch != nil {
+			ch.resume()
 		}
 		return nil, nil
 	}))
@@ -142,9 +125,6 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		return nil, nil
 	}))
 	o.SetPropertyStr("close", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 1 {
-			return nil, nil
-		}
 		// A deliberate close() sets dead WITHOUT firing onClose, so the readLoop error
 		// chasing it never runs the onClose registry-drop. Dropping the entry here keeps
 		// every local close (each rejected handshake, each duplicate dial) from leaking its

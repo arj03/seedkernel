@@ -149,9 +149,6 @@ func (el *eventLoop) install() {
 	g.SetPropertyStr("performance", perf)
 	g.SetPropertyStr("setTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
 		args := t.Args()
-		if len(args) < 1 {
-			return t.Context().NewInt64(0), nil
-		}
 		var ms int64
 		if len(args) >= 2 {
 			ms = args[1].Int64()
@@ -167,9 +164,6 @@ func (el *eventLoop) install() {
 		return t.Context().NewInt64(id), nil
 	}))
 	g.SetPropertyStr("clearTimeout", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if len(t.Args()) < 1 {
-			return nil, nil
-		}
 		if tm, ok := el.byID[t.Args()[0].Int64()]; ok {
 			heap.Remove(&el.timers, tm.index)
 			delete(el.byID, tm.id)

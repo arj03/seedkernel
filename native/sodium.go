@@ -240,12 +240,8 @@ func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 	if outLen != 32 {
 		panic(fmt.Sprintf("genericHash: native blake2b is 32-byte-only in this build, got %d", outLen))
 	}
-	h, err := blake2b.New(outLen, nil)
-	if err != nil {
-		panic(fmt.Sprintf("blake2b.New(%d): %v", outLen, err))
-	}
-	h.Write(msg)
-	return h.Sum(nil)
+	sum := blake2b.Sum256(msg)
+	return sum[:]
 }
 
 func (s *libsodium) signDetached(msg, sk []byte) []byte {

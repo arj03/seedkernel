@@ -2,14 +2,12 @@
 # Regenerate from WASM/: `npm run build:loader`.
 *.gen.js
 
-# WASM artifacts built from this repo's source and copied in by
-# `npm run build:loader` (ws from assembly/, libsodium from the upstream npm
-# dist). qjs/qjs.wasm is NOT ignored — it is checked in, built from qjs/csrc/
-# by qjs/build-qjs.sh, so a clone needs no wasi-sdk to build the loader.
-/wasm/ws.wasm
+# WASM artifacts copied in by `npm run build:loader` (WASM/scripts/copy-loader-wasm.mjs):
+# libsodium from the upstream npm dist, ML-DSA-65 built from the mldsa-native submodule.
+# qjs/qjs.wasm is NOT ignored — it is checked in, built from qjs/csrc/ by
+# qjs/build-qjs.sh, so a clone needs no wasi-sdk to build the loader.
 /wasm/libsodium.wasm
 /wasm/mldsa65.wasm
-/wasm/mlkem768.wasm
 
 # Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
 /seedloader

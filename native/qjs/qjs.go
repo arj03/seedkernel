@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -28,7 +27,9 @@ import (
 //go:embed qjs.wasm
 var wasmBytes []byte
 
-// goFunc is a Go function exposed to JS via (*Context).Function.
+// goFunc is a Go function exposed to JS via (*Context).Function. It indexes the arguments
+// it requires straight out of This.Args: a call short of one panics, and callGo answers
+// the panic as a JS exception.
 type goFunc = func(*This) (*Value, error)
 
 // Runtime owns one engine: the wazero runtime, the instantiated qjs module, and the QuickJS
@@ -42,7 +43,7 @@ type Runtime struct {
 	free    api.Function
 	mem     api.Memory
 	ctxt    *Context
-	reg     *registry
+	funcs   []goFunc           // exposed Go funcs, indexed by callback id; see Function
 	fnPools map[string]*fnPool // per-name free list of resolved exports; see call
 }
 
@@ -51,30 +52,6 @@ type Runtime struct {
 // every engine call — and a *Value operation is one — hashed the name four times. Through
 // the pointer it is one lookup, and the pop and the push mutate in place.
 type fnPool struct{ free []api.Function }
-
-// registry maps callback ids to Go funcs for the env.callGo dispatcher.
-type registry struct {
-	mu   sync.RWMutex
-	next uint64
-	m    map[uint64]goFunc
-}
-
-func newRegistry() *registry { return &registry{m: map[uint64]goFunc{}} }
-
-func (r *registry) register(fn goFunc) uint64 {
-	id := atomic.AddUint64(&r.next, 1)
-	r.mu.Lock()
-	r.m[id] = fn
-	r.mu.Unlock()
-	return id
-}
-
-func (r *registry) get(id uint64) goFunc {
-	r.mu.RLock()
-	fn := r.m[id]
-	r.mu.RUnlock()
-	return fn
-}
 
 // Option configures a Runtime at creation, for what QuickJS takes only when it creates the
 // runtime.
@@ -153,7 +130,7 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		o(&cfg)
 	}
 	ctx := context.Background()
-	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPools: map[string]*fnPool{}}
+	rt = &Runtime{ctx: ctx, fnPools: map[string]*fnPool{}}
 
 	// On any failure after the wazero runtime is created but before the module is live,
 	// close it: the runtime holds this instance's compiled machine code.
@@ -445,10 +422,7 @@ func (r *Runtime) callGo(_ context.Context, _ api.Module, _ uint32, thisVal uint
 		}
 	}()
 
-	fn := r.reg.get(uint64(id))
-	if fn == nil {
-		return c.throwError(fmt.Errorf("qjs: unknown callback id %d", id))
-	}
+	fn := r.funcs[id]
 	args := make([]*Value, argc)
 	for i := range args {
 		h, _ := r.mem.ReadUint64Le(argv + uint32(i)*8)
