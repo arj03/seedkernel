@@ -131,3 +131,41 @@ func TestValueBytesHostileProperties(t *testing.T) {
 		})
 	}
 }
+
+// A conversion that cannot succeed must take its own exception. Every entry point on a
+// context assumes a clean one, and all three conversions are reached with arguments a
+// guest chose (guest.go's __host_call), so one left pending fails the NEXT call there —
+// rejecting an invocation that had already produced its answer.
+func TestFailedConversionsTakeTheirException(t *testing.T) {
+	bootRealm(t)
+	for _, tc := range []struct {
+		name  string
+		expr  string
+		asInt bool
+	}{
+		{"symbol to string", `Symbol("x")`, false},
+		{"throwing toString", `({ toString() { throw new Error("no") } })`, false},
+		{"throwing valueOf", `({ valueOf() { throw new Error("no") } })`, true},
+	} {
+		v, err := qc.Eval("conversion-test.js", tc.expr)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if tc.asInt {
+			if n := v.Int64(); n != 0 {
+				t.Fatalf("%s: Int64 = %d, want 0", tc.name, n)
+			}
+		} else if s := v.String(); s != "" {
+			t.Fatalf("%s: String = %q, want the empty string", tc.name, s)
+		}
+		v.Free()
+		next, err := qc.Eval("conversion-next.js", `1 + 1`)
+		if err != nil {
+			t.Fatalf("%s: left its exception pending, failing an unrelated call: %v", tc.name, err)
+		}
+		if got := next.Int32(); got != 2 {
+			t.Fatalf("%s: the next call answered %d, want 2", tc.name, got)
+		}
+		next.Free()
+	}
+}

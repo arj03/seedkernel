@@ -196,18 +196,32 @@ bool QJS_IsUndefined(JSValue v) { return JS_IsUndefined(v); }
 bool QJS_IsNull(JSValue v) { return JS_IsNull(v); }
 bool QJS_IsObject(JSValue v) { return JS_IsObject(v); }
 
-/* 0 when the conversion throws, with the exception left pending. */
+/* A conversion that throws answers the zero value and TAKES its own exception. Every entry
+   point on a context assumes it is handed a clean one, so an exception left pending here
+   would surface as the failure of the next, unrelated call — for a guest realm, of an
+   invocation that had already produced its answer (../value.go: String, Int32, Int64). */
+static void take_exception(JSContext *ctx)
+{
+    JS_FreeValue(ctx, JS_GetException(ctx));
+}
+
 int32_t QJS_ToInt32(JSContext *ctx, JSValue v)
 {
     int32_t r = 0;
-    JS_ToInt32(ctx, &r, v);
+    if (JS_ToInt32(ctx, &r, v) < 0) {
+        take_exception(ctx);
+        return 0;
+    }
     return r;
 }
 
 int64_t QJS_ToInt64(JSContext *ctx, JSValue v)
 {
     int64_t r = 0;
-    JS_ToInt64(ctx, &r, v);
+    if (JS_ToInt64(ctx, &r, v) < 0) {
+        take_exception(ctx);
+        return 0;
+    }
     return r;
 }
 
@@ -218,14 +232,16 @@ JSValue QJS_NewString(JSContext *ctx, const char *s, size_t len)
     return JS_NewStringLen(ctx, s, len);
 }
 
-/* The value as UTF-8, packed; 0 with the exception pending. The address is a string the
-   caller releases with JS_FreeCString. */
+/* The value as UTF-8, packed; 0 when the conversion throws, whose exception it takes (see
+   QJS_ToInt32). The address is a string the caller releases with JS_FreeCString. */
 uint64_t QJS_ToCString(JSContext *ctx, JSValue v)
 {
     size_t len;
     const char *s = JS_ToCStringLen(ctx, &len, v);
-    if (!s)
+    if (!s) {
+        take_exception(ctx);
         return 0;
+    }
     return (uint64_t)(uintptr_t)s << 32 | (uint32_t)len;
 }
 

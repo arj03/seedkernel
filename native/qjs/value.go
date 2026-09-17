@@ -140,7 +140,12 @@ func (v *Value) GetPropertyStr(name string) *Value {
 	return v.c.callV("JS_GetPropertyStr", v.c.handle, v.raw, ptr)
 }
 
-// String renders the value as a string, "" when the conversion throws.
+// String renders the value as a string, "" when the conversion throws — and the throw is
+// TAKEN by the shim rather than left pending, so a value nothing can convert (a Symbol, a
+// throwing toString) cannot surface as the failure of the next, unrelated call on this
+// context. Int64 and Int32 answer 0 the same way. All three are reached with arguments a
+// guest chose (guest.go's __host_call), so the clean-context invariant is not the caller's
+// to keep.
 func (v *Value) String() string {
 	return v.c.rt.readString(v.c.rt.call("QJS_ToCString", v.c.handle, v.raw))
 }
