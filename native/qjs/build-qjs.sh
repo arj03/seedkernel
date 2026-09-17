@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Rebuilds qjs.wasm — the engine the confined realms run on (guest.go, main.go).
-#
-# The blob is no longer upstream's: csrc/ carries a shim we have changed (the execution
-# deadline, see csrc/qjs.c), so a vendored binary nobody can reproduce would be a
-# capability of this repo with no source. This script is that source's other half.
+# Rebuilds qjs.wasm — the engine every realm runs on (main.go, guest.go).
 #
 # What it builds, and from where:
-#   csrc/            — the C shim exposing the flat QJS_* ABI the Go bridge drives.
-#                      Ours: forked from fastschema/qjs v0.0.6 (MIT, LICENSE.fastschema).
+#   csrc/shim.c      — the flat QJS_* ABI the Go bridge drives (qjs.go, value.go).
+#   csrc/*.patch     — applied to the engine before the build (see each patch's hunks).
 #   quickjs-ng       — the engine, fetched at the pin below. Not vendored: it is ~2 MB of
-#                      C we do not modify, and a pinned SHA says exactly as much as a copy.
+#                      C, and a pinned SHA plus the patches say exactly as much as a copy.
+#
+# The build links the engine and wasi-libc, and nothing of quickjs-libc.
 #
 # Requires wasi-sdk (the sysroot clang needs for a WASI target — the PQ builds are
 # freestanding and need none, this one links libc), binaryen for wasm-opt, cmake, git.
@@ -19,15 +17,16 @@
 #   ./build-qjs.sh          # build into .build/ and install over qjs.wasm
 #   WASI_SDK=/path ./build-qjs.sh
 set -euo pipefail
+shopt -s nullglob # no patches is a patch set too
 
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$here/.build"
 wasi_sdk="${WASI_SDK:-/opt/wasi-sdk}"
 
 # quickjs-ng v0.16.2. Moving this is a deliberate engine upgrade: re-run the Go suite,
-# which drives every export the bridge uses. The node/WASM loader's emscripten build
-# (WASM/quickjs/build-quickjs-ng.sh) pins the SAME commit, so both engines stay one
-# version.
+# which drives every export the bridge uses, and check the patches still apply. The
+# node/WASM loader's emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the SAME
+# commit, so both engines stay one version.
 quickjs_repo="https://github.com/quickjs-ng/quickjs"
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 
@@ -40,22 +39,24 @@ if [ ! -d "$work/quickjs/.git" ]; then
   git -C "$work/quickjs" remote add origin "$quickjs_repo" 2>/dev/null || true
 fi
 git -C "$work/quickjs" fetch -q --depth 1 origin "$quickjs_pin"
-git -C "$work/quickjs" checkout -q FETCH_HEAD
+# Forced, so a previous run's patched files give way to the pin before patching again.
+git -C "$work/quickjs" checkout -q -f FETCH_HEAD
+for patch in "$here"/csrc/*.patch; do
+  git -C "$work/quickjs" apply "$patch"
+done
 
 # The shim is compiled from csrc/ rather than copied into the engine tree: the cmake
-# include below names it by absolute path, so the engine checkout stays pristine and
-# `git -C .build/quickjs status` is a real answer about the engine.
+# include below names it by absolute path, so `git -C .build/quickjs diff` shows exactly
+# the patches and nothing else.
 cmake -S "$work/quickjs" -B "$work/build" \
-  -DQJS_BUILD_LIBC=ON \
+  -DQJS_BUILD_LIBC=OFF \
   -DQJS_BUILD_CLI_WITH_MIMALLOC=OFF \
   -DCMAKE_TOOLCHAIN_FILE="$wasi_sdk/share/cmake/wasi-sdk.cmake" \
   -DCMAKE_PROJECT_INCLUDE="$here/csrc/qjswasm.cmake" >/dev/null
 
 make -C "$work/build" qjswasm -j"$(nproc)"
 
-# -O3 after the link, as upstream's Makefile does. It buys little over LTO here, but it
-# is part of the recipe the vendored blob was built with and dropping it would make this
-# script a different build rather than the same one.
+# A post-link pass over what LTO already optimized, for size.
 wasm-opt -O3 "$work/build/qjswasm" -o "$here/qjs.wasm"
 echo "wrote $(stat -c%s "$here/qjs.wasm") bytes -> $here/qjs.wasm"
 echo "now run: cd .. && go test ./..."

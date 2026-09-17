@@ -65,8 +65,7 @@ export interface CliHost extends CliFiles {
   banner: string;
   /** Arguments after the program name. */
   argv: string[];
-  /** One console line. `console.log` on Node; a Go stdout write natively, where
-   *  QuickJS's own `console` writes to a discarded WASI stdout. */
+  /** One console line: `console.error` on Node, a Go stderr write natively. */
   log(line: string): void;
   /** Raw bytes to stdout — `--op` writes the app's response verbatim, so this cannot go
    *  through `log`, and `log` must not go to stdout either (both targets send it to

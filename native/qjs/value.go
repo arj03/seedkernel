@@ -2,7 +2,9 @@ package qjs
 
 import (
 	"errors"
+	"fmt"
 	"math"
+	"strings"
 )
 
 // Context is a QuickJS execution context bound to a Runtime.
@@ -10,11 +12,6 @@ type Context struct {
 	rt     *Runtime
 	handle uint64 // JSContext*
 	global *Value
-	// Cached intrinsics, resolved on first use and retained for the realm's life.
-	// isByteArray/classTag run on every JS→Go bulk transfer, so re-resolving them per call
-	// was needless churn on a hot path.
-	objToString *Value // Object.prototype.toString, for classTag
-	abCtor      *Value // the ArrayBuffer constructor, for isByteArray's instanceof
 }
 
 // Value wraps a NaN-boxed JSValue (uint64) plus its context.
@@ -32,7 +29,7 @@ type This struct {
 
 func (c *Context) value(raw uint64) *Value { return &Value{c: c, raw: raw} }
 
-// call dispatches a wasm export and wraps the i64 result as a *Value.
+// callV dispatches a wasm export and wraps the i64 result as a *Value.
 func (c *Context) callV(name string, args ...uint64) *Value {
 	return c.value(c.rt.call(name, args...))
 }
@@ -62,14 +59,14 @@ func (v *Value) Free() {
 	}
 }
 
-// Dup retains an extra reference (QJS_CloneValue == JS_DupValue), so a JS value handed to
-// a host callback can outlive that synchronous call — the event loop holds JS callbacks
-// this way. The returned *Value must be Free()d once.
+// Dup retains an extra reference, so a JS value handed to a host callback can outlive that
+// synchronous call — the event loop holds JS callbacks this way. The returned *Value must
+// be Free()d once.
 func (v *Value) Dup() *Value {
 	if v == nil || v.raw == 0 {
 		return nil
 	}
-	return v.c.callV("QJS_CloneValue", v.c.handle, v.raw)
+	return v.c.callV("QJS_DupValue", v.c.handle, v.raw)
 }
 
 func (t *This) Context() *Context { return t.context }
@@ -85,8 +82,8 @@ func (c *Context) Global() *Value {
 }
 
 func (c *Context) NewObject() *Value    { return c.callV("JS_NewObject", c.handle) }
-func (c *Context) NewNull() *Value      { return c.callV("JS_NewNull") }
-func (c *Context) NewUndefined() *Value { return c.callV("JS_NewUndefined") }
+func (c *Context) NewNull() *Value      { return c.callV("QJS_Null") }
+func (c *Context) NewUndefined() *Value { return c.callV("QJS_Undefined") }
 
 func (c *Context) NewBool(b bool) *Value {
 	n := uint64(0)
@@ -107,30 +104,31 @@ func (c *Context) NewFloat64(v float64) *Value {
 	return c.callV("QJS_NewFloat64", c.handle, math.Float64bits(v))
 }
 
+// NewString makes a JS string from s, which crosses with its length: a NUL inside it is a
+// character like any other.
 func (c *Context) NewString(s string) *Value {
 	ptr := c.rt.writeCStr(s)
 	defer c.rt.freeAt(ptr) // QJS_NewString copies into a JS string
-	return c.callV("QJS_NewString", c.handle, ptr)
+	return c.callV("QJS_NewString", c.handle, ptr, uint64(len(s)))
 }
 
-// NewArrayBuffer creates a JS ArrayBuffer copy of b, staging the bytes straight into one
-// wasm buffer so the payload is walked once before QJS_NewArrayBufferCopy takes it.
+// NewArrayBuffer creates a JS ArrayBuffer holding a copy of b, written straight into the
+// buffer's own storage. When the engine cannot allocate it, the result is the engine's
+// exception value, with the out-of-memory error left pending for the caller's next check.
 func (c *Context) NewArrayBuffer(b []byte) *Value {
-	if len(b) == 0 {
-		return c.callV("QJS_NewArrayBufferCopy", c.handle, 0, 0)
+	v := c.callV("QJS_NewArrayBuffer", c.handle, uint64(len(b)))
+	if len(b) > 0 {
+		if addr, _, ok := v.bytes(); ok {
+			c.rt.mem.Write(addr, b)
+		}
 	}
-	ptr := c.rt.mallocN(len(b))
-	defer c.rt.freeAt(ptr)
-	c.rt.mem.Write(uint32(ptr), b)
-	return c.callV("QJS_NewArrayBufferCopy", c.handle, ptr, uint64(len(b)))
+	return v
 }
 
-// Function wraps a Go func as a JS function. The callback id is registered and
-// baked into the proxy via QJS_CreateFunctionProxy; ctxID/isAsync are unused
-// (single context, synchronous only).
+// Function wraps a Go func as a JS function: an engine function carrying the id the Go
+// func is registered under, which env.callGo resolves.
 func (c *Context) Function(fn goFunc) *Value {
-	id := c.rt.reg.register(fn)
-	return c.callV("QJS_CreateFunctionProxy", c.handle, id, 0, 0)
+	return c.callV("QJS_NewFunction", c.handle, c.rt.reg.register(fn))
 }
 
 // ── Value properties / conversions ────────────────────────────────────────────
@@ -150,9 +148,9 @@ func (v *Value) GetPropertyStr(name string) *Value {
 	return v.c.callV("JS_GetPropertyStr", v.c.handle, v.raw, ptr)
 }
 
-// String renders the value as a string (QJS_ToCString).
+// String renders the value as a string, "" when the conversion throws.
 func (v *Value) String() string {
-	return v.c.rt.readPackedString(v.c.rt.call("QJS_ToCString", v.c.handle, v.raw))
+	return v.c.rt.readString(v.c.rt.call("QJS_ToCString", v.c.handle, v.raw))
 }
 
 func (v *Value) Int64() int64 {
@@ -171,141 +169,65 @@ func (v *Value) IsUndefined() bool { return v.boolCall("QJS_IsUndefined", v.raw)
 func (v *Value) IsNull() bool      { return v.boolCall("QJS_IsNull", v.raw) }
 func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
 
-// isByteArray reports whether v is an ArrayBuffer — a bare buffer toByteArray can read
-// directly. A typed-array/DataView view is NOT one (JsTypedArrayToGo reads those via their
-// .buffer), so this returns false for them.
-//
-// The brand check must use classTag (Object.prototype.toString.call), NOT v.String():
-// String() is the value's *own* toString, which for a TypedArray is Array's join and
-// serializes every element. Probing a 64 KB Uint8Array that way built a ~200 KB string per
-// call and made every JS→Go bulk transfer O(payload) with a huge constant — ~12 ms for a
-// 64 KB block, vs ~80 µs the other direction. The class tag is O(1) and contents-blind.
-func (v *Value) isByteArray() bool {
-	if !v.IsObject() {
-		return false // a primitive is never an ArrayBuffer
+// ── bytes ─────────────────────────────────────────────────────────────────────
+
+// bytes resolves an ArrayBuffer or a TypedArray to the storage it covers (QJS_GetBytes).
+// ok=false leaves the engine's TypeError pending. The window is live memory, valid only
+// until JS next runs.
+func (v *Value) bytes() (addr, size uint32, ok bool) {
+	packed := v.c.rt.call("QJS_GetBytes", v.c.handle, v.raw)
+	if packed == math.MaxUint64 {
+		return 0, 0, false
 	}
-	// instanceof first (same-realm, the common case); the class-tag fallback catches a
-	// cross-realm ArrayBuffer, for which instanceof against this realm's ctor fails.
-	if ctor := v.c.arrayBufferCtor(); ctor != nil &&
-		v.boolCall("QJS_IsInstanceOf", v.c.handle, v.raw, ctor.raw) {
-		return true
-	}
-	return v.classTag() == "[object ArrayBuffer]"
+	return uint32(packed >> 32), uint32(packed), true
 }
 
-// arrayBufferCtor returns the realm's ArrayBuffer constructor, cached after first use, or
-// nil if the realm has no ArrayBuffer global — in which case isByteArray falls back to the
-// class tag.
-func (c *Context) arrayBufferCtor() *Value {
-	if c.abCtor == nil {
-		ctor := c.Global().GetPropertyStr("ArrayBuffer")
-		if ctor.IsUndefined() {
-			ctor.Free()
-			return nil
-		}
-		c.abCtor = ctor
+// JsTypedArrayToGo returns the bytes of an ArrayBuffer or a TypedArray as an independent Go
+// copy — for a view, just its window. The shape comes from the engine's own slots, never
+// from properties, so no JS runs and nothing a caller defined on the object is believed;
+// anything else (a DataView, an object that only looks like a view, a detached buffer) is
+// refused, and the engine's error is taken so the next call does not inherit it. The source
+// is left intact, so the same value can be read any number of times.
+func JsTypedArrayToGo(input *Value) ([]byte, error) {
+	addr, size, ok := input.bytes()
+	if !ok {
+		return nil, notBytes(input.c)
 	}
-	return c.abCtor
-}
-
-// classTag returns v's brand via Object.prototype.toString.call(v) — e.g. "[object
-// ArrayBuffer]". Unlike String() it ignores the value's own toString, so it is O(1)
-// regardless of contents (see isByteArray).
-func (v *Value) classTag() string {
-	r, err := v.c.Invoke(v.c.objectToString(), v) // Object.prototype.toString.call(v)
-	if err != nil {
-		return ""
-	}
-	defer r.Free()
-	return r.String()
-}
-
-// objectToString returns Object.prototype.toString, cached after first use.
-func (c *Context) objectToString() *Value {
-	if c.objToString == nil {
-		obj := c.Global().GetPropertyStr("Object")
-		defer obj.Free()
-		proto := obj.GetPropertyStr("prototype")
-		defer proto.Free()
-		c.objToString = proto.GetPropertyStr("toString")
-	}
-	return c.objToString
-}
-
-// toByteArray returns a copy of the ArrayBuffer's bytes, leaving the source intact.
-//
-// QJS_GetArrayBuffer returns a pointer to the buffer's *live* storage plus a freshly
-// malloc'd packed cell, so the cell is the only thing this owns to free. Freeing `addr`
-// instead detaches the source ArrayBuffer out from under QuickJS — harmless when a value
-// is read once and dropped, a use-after-free when it is reused (a node identity's
-// privateKey signed against more than one peer, any retained Uint8Array read twice).
-func (v *Value) toByteArray() []byte {
-	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
-	if packed == 0 {
-		return nil
-	}
-	addr, size := v.c.rt.unpackPtr(packed)
-	var out []byte
-	if addr != 0 && size != 0 {
-		buf, _ := v.c.rt.mem.Read(addr, size)
-		out = make([]byte, size)
-		copy(out, buf)
-	}
-	v.c.rt.freeAt(packed) // the malloc'd cell only — addr is the live buffer, owned by JS
-	return out
-}
-
-// byteArrayLength reads an ArrayBuffer's live size without copying its contents. As with
-// toByteArray, QJS_GetArrayBuffer's packed cell is the only allocation this owns.
-func (v *Value) byteArrayLength() (int64, error) {
-	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
-	if packed == 0 {
-		return 0, errors.New("qjs: value is not a byte array")
-	}
-	_, size := v.c.rt.unpackPtr(packed)
-	v.c.rt.freeAt(packed)
-	return int64(size), nil
-}
-
-// checkWindow validates a view's [offset, offset+length) against the buffer size QuickJS
-// itself reports — never the caller's numbers alone, since byteOffset and byteLength are
-// ordinary JS properties a hostile object can forge (viewWindow). Compare by subtraction:
-// a hostile pair near 2^62 would overflow offset+length and pass an additive check.
-func checkWindow(size, offset, length int64) error {
-	if offset < 0 || length < 0 || offset > size || length > size-offset {
-		return errors.New("qjs: typed array view out of range")
-	}
-	return nil
-}
-
-// toByteArrayWindow copies just the [offset, offset+length) window, with the same
-// ownership story as toByteArray and the window checked against the buffer QuickJS reports
-// (checkWindow). O(window), so a small view over a large buffer neither copies nor pins the
-// whole backing store.
-func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
-	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
-	if packed == 0 {
-		return nil, errors.New("qjs: value is not a byte array")
-	}
-	addr, size := v.c.rt.unpackPtr(packed)
-	v.c.rt.freeAt(packed) // the malloc'd cell only — addr is the live buffer, owned by JS
-	if err := checkWindow(int64(size), offset, length); err != nil {
-		return nil, err
-	}
-	out := make([]byte, length)
-	if length > 0 {
-		buf, ok := v.c.rt.mem.Read(addr+uint32(offset), uint32(length))
+	out := make([]byte, size)
+	if size > 0 {
+		buf, ok := input.c.rt.mem.Read(addr, size)
 		if !ok {
-			return nil, errors.New("qjs: buffer window outside wasm memory")
+			return nil, errors.New("qjs: byte window outside wasm memory")
 		}
 		copy(out, buf)
 	}
 	return out, nil
 }
 
-// exception turns an error/exception value into a Go error (message + stack).
-func (v *Value) exception() error {
+// JsTypedArrayByteLength answers the width JsTypedArrayToGo would copy, without copying it:
+// resource gates admit against it before the copy.
+func JsTypedArrayByteLength(input *Value) (int64, error) {
+	_, size, ok := input.bytes()
+	if !ok {
+		return 0, notBytes(input.c)
+	}
+	return int64(size), nil
+}
+
+func notBytes(c *Context) error {
+	return fmt.Errorf("qjs: expected an ArrayBuffer or a TypedArray: %w", c.exception())
+}
+
+// ── errors ────────────────────────────────────────────────────────────────────
+
+// asError renders a thrown or rejected value as a Go error: its string form, plus its stack
+// when it has one. Only an object is asked for a stack — reading a property of undefined or
+// null would itself throw, and leave that exception for the next call to inherit.
+func (v *Value) asError() error {
 	cause := v.String()
+	if !v.IsObject() {
+		return errors.New(cause)
+	}
 	stack := v.GetPropertyStr("stack")
 	defer stack.Free()
 	if stack.IsUndefined() {
@@ -318,58 +240,20 @@ func (c *Context) hasException() bool {
 	return int32(c.rt.call("JS_HasException", c.handle)) != 0
 }
 
-// prop reads property `name`, refusing — and CLEARING — an exception the read left
-// standing, which a throwing getter would otherwise leave for the next unrelated call in
-// the realm to inherit. Bare GetPropertyStr is fine for a property this process wrote; this
-// is for one whose shape is the caller's. The returned value is the caller's to Free.
-func (v *Value) prop(name string) (*Value, error) {
-	p := v.GetPropertyStr(name)
-	if v.c.hasException() {
-		p.Free()
-		return nil, errors.New("qjs: reading ." + name + ": " + v.c.exception().Error())
-	}
-	return p, nil
-}
-
-// numberProp is prop plus the ToInt64 conversion, which throws in its own right on a value
-// no number can be made of (a Symbol, an object whose valueOf throws).
-func (v *Value) numberProp(name string) (int64, error) {
-	p, err := v.prop(name)
-	if err != nil {
-		return 0, err
-	}
-	defer p.Free()
-	n := p.Int64()
-	if v.c.hasException() {
-		return 0, errors.New("qjs: ." + name + " is not a number: " + v.c.exception().Error())
-	}
-	return n, nil
-}
-
-// viewWindow reads a view's own byteOffset and byteLength — ordinary JS properties of an
-// object the caller supplied, so neither is trusted to be a number (prop). The pair is
-// validated against the real buffer by whoever reads the window (checkWindow).
-func (v *Value) viewWindow() (offset, length int64, err error) {
-	if offset, err = v.numberProp("byteOffset"); err != nil {
-		return 0, 0, err
-	}
-	if length, err = v.numberProp("byteLength"); err != nil {
-		return 0, 0, err
-	}
-	return offset, length, nil
-}
-
+// exception takes the pending exception, clearing it, as a Go error.
 func (c *Context) exception() error {
 	val := c.callV("JS_GetException", c.handle)
 	defer val.Free()
-	return val.exception()
+	return val.asError()
 }
 
+// throwError throws err into JS as a plain Error, returning the engine's exception value
+// for a callback to answer with.
 func (c *Context) throwError(err error) uint64 {
-	msg := c.NewString(err.Error())
-	errVal := c.callV("JS_NewError", c.handle)
-	errVal.SetPropertyStr("message", msg)
-	return c.rt.call("JS_Throw", c.handle, errVal.raw)
+	msg := err.Error()
+	ptr := c.rt.writeCStr(msg)
+	defer c.rt.freeAt(ptr)
+	return c.rt.call("QJS_ThrowError", c.handle, ptr, uint64(len(msg)))
 }
 
 // ── invoke ────────────────────────────────────────────────────────────────────
@@ -414,8 +298,7 @@ func (c *Context) normalize(v *Value) (*Value, error) {
 type EvalOptionFunc func(*evalOptions)
 
 type evalOptions struct {
-	code  string
-	flags uint64
+	code string
 }
 
 // Code sets the JS source to evaluate.
@@ -423,114 +306,43 @@ func Code(src string) EvalOptionFunc {
 	return func(o *evalOptions) { o.code = src }
 }
 
-// Eval evaluates JS source (provided via Code) under the given filename.
+// Eval evaluates strict global code (provided via Code) under the given filename, and
+// answers its completion value as it stands: a promise is returned, not awaited, and the
+// jobs the code queued wait for Pump.
 func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
-	o := &evalOptions{flags: evalTypeGlobal | evalFlagStrict}
+	var o evalOptions
 	for _, fn := range opts {
-		fn(o)
+		fn(&o)
 	}
-
 	filePtr := c.rt.writeCStr(file)
-	codePtr := uint64(0)
-	if o.code != "" {
-		codePtr = c.rt.writeCStr(o.code)
-	}
-	// QJS_CreateEvalOption(codeBuf, bytecodeBuf, bytecodeLen, filename, flags)
-	optPtr := c.rt.call("QJS_CreateEvalOption", codePtr, 0, 0, filePtr, o.flags)
-	res := c.callV("QJS_Eval", c.handle, optPtr)
-	// The eval buffers had to outlive QJS_Eval; free them now.
-	if codePtr != 0 {
-		c.rt.freeAt(codePtr)
-	}
-	c.rt.freeAt(filePtr)
-	c.rt.freeAt(optPtr) // the option cell QJS_CreateEvalOption malloc'd; QJS_Eval does not free it
-	return c.normalize(res)
+	defer c.rt.freeAt(filePtr)
+	// NUL-terminated because JS_Eval requires it, with the length passed alongside, so a
+	// NUL inside the source is source like any other byte.
+	codePtr := c.rt.writeCStr(o.code)
+	defer c.rt.freeAt(codePtr)
+	return c.normalize(c.callV("QJS_Eval", c.handle, codePtr, uint64(len(o.code)), filePtr))
 }
 
-// Pump runs the QuickJS job queue (microtasks and settled-promise reactions) to
-// completion, and reports whether a job left an exception standing. The loader supplies
-// Go-backed timers, so there are no os timers to wait on and this returns as soon as the
-// queue is empty. The event loop calls it after every re-entry into JS so promise chains
-// advance, and guest.go calls it once per invocation and per settlement to keep the causal
-// clock on the stack — a path hot enough that the drain is called directly rather than as
-// QJS_Eval's trailing side effect, which had to compile and run an expression first.
-// Verified by TestQjsPumpModel.
+// Pump runs the job queue (microtasks and settled-promise reactions) to completion and
+// reports what went wrong on the way: a job that threw, or — for a runtime made with
+// TrackRejections — the promises still rejected with no handler once the queue is empty.
+// The loader supplies Go-backed timers, so there is nothing to wait on and this returns as
+// soon as the queue is empty. The event loop calls it after every re-entry into JS so
+// promise chains advance, and guest.go calls it once per invocation and per settlement to
+// keep the causal clock on the stack. Verified by TestQjsPumpModel.
 func (c *Context) Pump() error {
-	// js_std_loop answers JS_HasException: an int, so the same narrowing every other
-	// predicate export gets before it is read as a flag.
-	if int32(c.rt.call("js_std_loop", c.handle)) == 0 {
+	n := int32(c.rt.call("QJS_RunJobs", c.handle))
+	if n == 0 {
 		return nil
 	}
-	return c.exception()
-}
-
-// typedArrayView resolves a view (TypedArray/DataView) onto its backing ArrayBuffer and its
-// window — the SLOW path only, a bare ArrayBuffer already ruled out by the caller. That
-// exclusion is what makes buf unconditionally the caller's to Free: a bare buffer IS its own
-// .buffer, and freeing a borrowed value as if owned detaches the source (toByteArray).
-func typedArrayView(input *Value) (buf *Value, offset, length int64, err error) {
-	if buf, err = input.prop("buffer"); err != nil {
-		return nil, 0, 0, err
+	if n < 0 {
+		return c.exception()
 	}
-	if buf.IsUndefined() || buf.IsNull() {
-		buf.Free()
-		return nil, 0, 0, errors.New("qjs: value has no ArrayBuffer backing")
+	reasons := make([]string, n)
+	for i := range reasons {
+		reason := c.callV("QJS_TakeRejection", c.handle)
+		reasons[i] = reason.asError().Error()
+		reason.Free()
 	}
-	if !buf.isByteArray() {
-		buf.Free()
-		return nil, 0, 0, errors.New("qjs: value is not a byte array")
-	}
-	if offset, length, err = input.viewWindow(); err != nil {
-		buf.Free()
-		return nil, 0, 0, err
-	}
-	return buf, offset, length, nil
-}
-
-// JsTypedArrayToGo returns the bytes of a TypedArray/DataView/ArrayBuffer as an
-// independent Go copy. The source is NOT detached, so the same value (a shared singleton,
-// a node key signed against many peers) can be read any number of times, and callers never
-// need a defensive .slice() before handing a typed array across this seam. For a view it
-// returns only that view's window, copying O(view) rather than the backing buffer.
-func JsTypedArrayToGo(input *Value) ([]byte, error) {
-	// Reject non-objects up front: GetPropertyStr("buffer") below would throw a TypeError
-	// on null/undefined/a primitive and leave the exception flag set, poisoning the next
-	// unrelated JS call (and a nil *Value would panic here).
-	if input == nil || !input.IsObject() {
-		return nil, errors.New("qjs: expected a typed array or ArrayBuffer")
-	}
-	if input.isByteArray() {
-		return input.toByteArray(), nil
-	}
-	buffer, offset, length, err := typedArrayView(input)
-	if err != nil {
-		return nil, err
-	}
-	defer buffer.Free()
-	return buffer.toByteArrayWindow(offset, length)
-}
-
-// JsTypedArrayByteLength validates the same TypedArray/DataView/ArrayBuffer shapes as
-// JsTypedArrayToGo and returns the view width without making the payload-sized Go copy.
-// Resource gates use it before crossing that copy boundary.
-func JsTypedArrayByteLength(input *Value) (int64, error) {
-	if input == nil || !input.IsObject() {
-		return 0, errors.New("qjs: expected a typed array or ArrayBuffer")
-	}
-	if input.isByteArray() {
-		return input.byteArrayLength()
-	}
-	buffer, offset, length, err := typedArrayView(input)
-	if err != nil {
-		return 0, err
-	}
-	defer buffer.Free()
-	bufferLength, err := buffer.byteArrayLength()
-	if err != nil {
-		return 0, err
-	}
-	if err := checkWindow(bufferLength, offset, length); err != nil {
-		return 0, err
-	}
-	return length, nil
+	return errors.New("unhandled promise rejection: " + strings.Join(reasons, "; "))
 }

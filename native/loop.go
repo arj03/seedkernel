@@ -1,7 +1,7 @@
 // loop.go — the Go-owned JavaScript event loop. QuickJS cannot drive I/O and wazero is
 // single-threaded, so Go owns the loop: the timer heap, the JS job queue, and re-entry
-// into JS to deliver an event. quickjs's own os.setTimeout is overridden with Go-backed
-// timers, so js_std_loop has nothing to block on — which lets the shared host JS run
+// into JS to deliver an event. The engine has no timers of its own — setTimeout is Go's
+// (install) — so draining the job queue never blocks, which lets the shared host JS run
 // unmodified. Every QuickJS call happens on the loop goroutine; socket readers hand work
 // in via post(), so the timer heap needs no lock.
 package main
@@ -45,6 +45,11 @@ type eventLoop struct {
 	// stepTimer is step()'s single reusable wait timer, Reset per turn — a fresh timer
 	// per turn was per-frame GC churn in the tight pump loop.
 	stepTimer *time.Timer
+
+	// err is a host-realm drain that failed: a job that threw, or a rejection nothing
+	// handled (qjs.TrackRejections) — what ends a Node process. It stops the loop, and
+	// whoever ran the loop reports it: awaitIn to its caller, main by exiting.
+	err error
 }
 
 type jsTimer struct {
@@ -114,9 +119,13 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 // pumpAll drains the job queue of el.c and every registered extra context, el.c first, so
 // a host job that schedules a guest job runs it in the same round. The reverse direction
 // deliberately does not fit in one round: every parked `host.call` queues a host job after
-// el.c has drained, so something has to wake the loop (__host_call, see guest.go).
+// el.c has drained, so something has to wake the loop (__host_call, see guest.go). A host
+// drain that fails stops the loop (eventLoop.err); a guest realm's pump answers for its own.
 func (el *eventLoop) pumpAll() {
-	el.c.Pump()
+	if err := el.c.Pump(); err != nil && el.err == nil {
+		el.err = err
+		el.stopped = true
+	}
 	for _, x := range el.extra {
 		x.pump()
 	}
@@ -341,9 +350,9 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 	}
 	defer func() { el.onSettle = nil }() // release the in-flight result (and its payload)
 
-	// The kick must NOT evaluate to a promise: QJS_Eval js_std_await()s it, blocking this
-	// goroutine so a Go timer could never fire (deadlock). The IIFE makes the completion
-	// value undefined, so QJS_Eval only drains ready jobs.
+	// The kick is an IIFE, so the eval's completion value is undefined and there is nothing
+	// to free: the call's promise is reached only through the handlers it attaches, which
+	// run when the loop pumps.
 	wrap := `(function(){ Promise.resolve(` + callExpr + `).then(` +
 		`(v) => __settle(` + gen + `, 0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
 		`(e) => __settle(` + gen + `, 1, String(e && e.message || e))); })();`
@@ -351,11 +360,16 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 	if _, err = c.Eval("<await>", qjs.Code(wrap)); err != nil {
 		return
 	}
-	if !el.stopped && timeout > 0 {
+	if timeout > 0 {
 		defer el.armSafety(timeout, func() {
 			kind, msg, el.stopped = 2, "await: timed out", true
 		})()
 	}
 	el.run()
+	if el.err != nil {
+		// A failed host drain stopped the loop, which fails the await whatever it was
+		// waiting on (eventLoop.err).
+		err, el.err = el.err, nil
+	}
 	return
 }

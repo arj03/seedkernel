@@ -77,14 +77,12 @@ const POLYFILLS = `
     globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
   }
 
-  // console — quickjs-ng's own has \`log\` and nothing else, written to a WASI stdout wazero
-  // leaves disconnected: console.log was discarded and console.error threw a TypeError
-  // *inside* the handler that reports a wedged transport guest.
+  // console — quickjs-ng defines none, and shared host code logs through one, not least
+  // from the handler that reports a wedged transport guest.
   //
   // Everything here goes to STDERR through \`bridge.log\`, because stdout carries the
-  // app's raw response bytes for --op. Guarded
-  // on the bridge, so only the HOST realm gets it; a confined guest has no console at all
-  // (qjs.WithoutHostObjects), matching the JS target's realm.
+  // app's raw response bytes for --op. Guarded on the bridge, so only the HOST realm gets
+  // it; a confined guest has no console at all, matching the JS target's realm.
   if (typeof bridge !== "undefined" && typeof bridge.log === "function") {
     const show = (a) => {
       if (typeof a === "string") return a;

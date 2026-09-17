@@ -1,77 +1,71 @@
 # qjs — in-repo QuickJS bridge
 
-A thin Go↔wazero bridge to the **quickjs-ng** engine, replacing
-`github.com/fastschema/qjs`. That module pinned an old wazero and carried a
-reflection/generics marshaling layer the loader doesn't need — it only needs a
-small, synchronous slice of the API (objects, strings, ArrayBuffers, function
-callbacks, eval, invoke). This package implements exactly that over the same
-prebuilt wasm and lets us own the wazero version.
+A thin Go↔wazero bridge to the **quickjs-ng** engine: objects, strings,
+ArrayBuffers, function callbacks, eval, invoke and the job queue — the synchronous
+slice of the API the loader uses, and nothing more.
 
-This is **not** a binary-size win: the stripped loader is ~7.5 MiB either way,
-dominated by **wazero's compiler backend** (~4 MiB, linked regardless), with the Go
-runtime (~2.4 MiB) and the qjs+libsodium wasm blobs (~1.3 MiB) making up the rest —
-the fastschema marshaling layer was never the cost. The motivation is owning the
-wazero version and shedding unused complexity, not MiB.
+## Files
 
-## Vendored asset
-
-- **`csrc/`** — the C shim that exposes the flat `QJS_*` ABI with NaN-boxed JSValues
-  (so every export takes/returns a single `i64`). Forked from
-  `github.com/fastschema/qjs@v0.0.6` (MIT, `csrc/LICENSE.fastschema`) and **ours now**:
-  it carries the execution deadline the guest realm's budget is built on
-  (`QJS_SetDeadline` / `QJS_TakeInterrupted`, `csrc/qjs.c`), which upstream ships
-  commented out — its `New_QJS` accepts a `max_execution_time` and ignores it.
-- **`qjs.wasm`** — that shim linked against quickjs-ng, checked in (~1.3 MiB) and
+- **`csrc/shim.c`** — the flat `QJS_*` ABI `qjs.go` and `value.go` drive, and the
+  execution deadline the guest realm's budget is built on (`QJS_SetDeadline` /
+  `QJS_TakeInterrupted`). The exports are an allowlist in `csrc/qjswasm.cmake`.
+- **`csrc/*.patch`** — applied to the engine before the build.
+  `0001-wasi-stack-limit.patch` keeps QuickJS's stack limit, which quickjs-ng
+  switches off for WASI; without it, deep recursion runs off the wasm stack into a
+  trap that leaves the engine unusable, instead of throwing a `RangeError`.
+- **`qjs.wasm`** — the shim linked against the engine, checked in (~1.25 MiB) and
   embedded via `//go:embed`, so a clone builds the loader with nothing but Go.
 
 `./build-qjs.sh` rebuilds it: fetches quickjs-ng at the commit pinned in the script,
-compiles `csrc/` against it with wasi-sdk, and installs the result over `qjs.wasm`.
-The engine is fetched rather than vendored — it is ~2 MB of C we do not modify, and a
-pinned SHA says as much as a copy. Rebuilding is not part of the Go build, and a
-change to `csrc/` is not live until you run it; `go test ./...` from `native/` drives
-every export the bridge uses and is the check that it worked.
+applies the patches, compiles `csrc/` against it with wasi-sdk, and installs the
+result over `qjs.wasm`. The engine is fetched rather than vendored — it is ~2 MB of
+C, and a pinned SHA plus the patches say as much as a copy. Rebuilding is not part of
+the Go build, and a change to `csrc/` is not live until you run it; `go test ./...`
+from `native/` drives every export the bridge uses and is the check that it worked.
 
 The JS platform's engine — `WASM/quickjs/` — is the emscripten build of the **same**
 quickjs-ng pin (v0.16.2, same SHA), so both targets run one engine version; move the
 pin in both build scripts together.
 
-Upstream: https://github.com/fastschema/qjs (MIT) · https://github.com/quickjs-ng/quickjs (MIT)
+Upstream: https://github.com/quickjs-ng/quickjs (MIT)
 
-## ABI notes
+## ABI
 
-- JSValue is a `uint64` (NaN boxing). A `*Value` wraps that handle.
-- The only host import is `env.jsFunctionProxy`; the C trampoline packs its `argv`
-  as `[fnID, ctxID, isAsync, promise, ...realArgs]`. Because quickjs `JS_TAG_INT == 0`,
-  a small int's NaN-boxed word equals the integer, so the callback id round-trips as
-  a plain `uint64`.
-- "Packed pointer" returns (`QJS_ToCString`, `QJS_GetArrayBuffer`) point at an
-  8-byte cell holding `(addr<<32 | size)`.
+- A JSValue is one `uint64` (NaN boxing); a `*Value` wraps that handle.
+- An export that answers an address and a length (`QJS_ToCString`, `QJS_GetBytes`)
+  packs both into its `i64` as `(addr<<32 | len)`, so there is no result cell to free.
+- The only host import is `env.callGo(ctx, this, argc, argv, id)`: a JS call to the Go
+  function registered under `id`, which `QJS_NewFunction` stores on the engine function.
+- `QJS_GetBytes` reads an ArrayBuffer's or a TypedArray's storage from the engine's own
+  slots, never from properties: no JS runs, and an object that only looks like a view
+  is refused.
+- `QJS_Eval` answers the completion value as it stands — a promise is not awaited — and
+  `QJS_RunJobs` drains the job queue. For a runtime created to track rejections,
+  `QJS_RunJobs` also counts the promises still rejected with no handler once the queue
+  is empty, and `QJS_TakeRejection` hands them over.
 - `QJS_SetDeadline(ns)` arms the interrupt handler for `ns` from now, `0` disarms; the
   module resolves it against its own monotonic clock, so the host passes a duration and
   never has to share a clock origin. `QJS_TakeInterrupted()` reports whether the
   deadline has fired since it was last asked, and clears the flag — the only way to
   know, since an interrupt that lands in a promise-reaction job has its exception
   consumed by the job loop rather than returned to whoever pumped it.
+- The module is a WASI reactor: `_initialize` runs once, at instantiation. Its shadow
+  stack is 2 MiB, first in linear memory; the engine's own limit (its default, 1 MiB)
+  throws well before the end of it.
 
 ## Scope
 
-Synchronous only — the bridge exports no Promises/async/`js_std_await`; every `QJS_*`
-call is a plain synchronous Go→wasm call. The loader builds everything async *on top*
-of this surface — a Go-owned event loop, timers, and blocking net — in `../loop.go`.
-A separate `Runtime` is created per realm: a trusted host realm (the sodium/fs/net
-shims + the shared installer/net/guest-seam JS) and a zero-authority confined
-guest realm whose only seam is `host.call`. The wasm links quickjs-libc (WASI), so
-the confinement is a context split: the host realm gets the libc modules and globals
-(`New_QJSContext`), while a guest runtime is created with `WithoutHostObjects`
-(`New_QJSGuestContext`) — std/os/bjson are never registered, `js_set_global_objs`
-never runs, and no module loader is set, so `import("qjs:os")` cannot re-reach them
-and no module name can reach the filesystem. `guest_confinement_test.go` pins both
-halves.
+Synchronous only — every `QJS_*` call is a plain synchronous Go→wasm call, and the
+loader builds everything async on top of it: a Go-owned event loop, timers and socket
+delivery, in `../loop.go`. A separate `Runtime` is created per realm: the trusted host
+realm (the platform primitives plus the shared shell JS) and each zero-authority guest
+realm, whose only seam is `host.call`.
 
-The WASI imports are confined by substitution rather than by the split: a confined
-runtime's `wasi_snapshot_preview1` module is built here
-(`instantiateConfinedWASI`) with every syscall the engine imports stubbed out —
-`poll_oneoff` and the path/fd family answer `ENOSYS`, the void `proc_exit` traps —
-except `clock_time_get`, which the engine's own clock reads. The real host module is
-linked only for the trusted realm. `confined_wasi_test.go` pins that neither
-construction nor any JS path reaches a stub.
+No realm reaches the host through the engine itself. The build links no quickjs-libc —
+no std/os/bjson modules and none of their globals — and sets no module loader, so there
+is nothing to import and no module name that resolves. The engine's WASI imports are
+answered by `instantiateWASI` with stubs that refuse everything but `clock_time_get`,
+which the engine's own clock reads. `wasi_test.go` pins that nothing reaches another
+stub — but for wasi-libc's allocator setup, which asks for entropy once and settles for
+a fixed value when refused — and `../guest_confinement_test.go` pins the missing
+globals and modules.

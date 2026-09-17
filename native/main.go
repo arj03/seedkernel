@@ -58,7 +58,9 @@ func boot() error {
 	sd = bootSodium(rtCore)
 	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
 
-	if qrt, err = qjs.New(); err != nil {
+	// Rejections are tracked because Node ends the process on one nothing handles, and the
+	// shell is the same TS: an unhandled rejection is a shell bug on either target (loop.go).
+	if qrt, err = qjs.New(qjs.TrackRejections()); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
 	}
 	qc = qrt.Context()
@@ -69,9 +71,11 @@ func boot() error {
 	exposeFs(qc)
 	nh = exposeNet(qc, el)
 	exposeBridge(qc)
-	if _, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS)); err != nil {
+	done, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS))
+	if err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
 	}
+	done.Free()
 	// The shim defines the __net dispatchers at the bundle's module scope
 	// (host/native-shim.ts); retain them now that it has evaluated (sock.go).
 	if err := nh.retain(); err != nil {
@@ -150,9 +154,8 @@ func exposeBridge(qc *qjs.Context) {
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("log", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		// The realm's console.log writes to a WASI stdout wazero leaves disconnected, so
-		// operator output and console diagnostics return via stderr — stdout is `--op`'s
-		// raw data channel.
+		// The realm's console is this, by way of host/native-polyfills.ts — the engine has
+		// none — and it writes to stderr, because stdout is `--op`'s raw data channel.
 		fmt.Fprintln(os.Stderr, t.Args()[0].String())
 		return t.Context().NewUndefined(), nil
 	}))
@@ -255,10 +258,14 @@ func main() {
 	go func() { <-sig; os.Exit(0) }()
 	el.stopped = false
 	el.run()
+	// A failed host drain stops the loop, and ends the node as it ends a Node one.
+	if el.err != nil {
+		fatal("seedkernel", el.err)
+	}
 }
 
-// fatal reports a startup failure and exits non-zero, so a script driving the loader
-// sees it.
+// fatal reports a failure that ends the node and exits non-zero, so a script driving the
+// loader sees it.
 func fatal(stage string, err error) {
 	fmt.Fprintln(os.Stderr, "ERROR: "+stage+": "+err.Error())
 	os.Exit(1)

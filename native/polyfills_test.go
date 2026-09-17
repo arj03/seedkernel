@@ -9,12 +9,10 @@ import (
 	"seedloader/qjs"
 )
 
-// TestHostConsoleReachesStderr covers a platform facility this target silently lacked:
-// quickjs-ng gives the realm a `console` with `log` alone, writing to a WASI stdout wazero
-// leaves disconnected, so shared host code's `console.log` went nowhere and its
-// `console.error` threw a TypeError — which made a transport wedged inside a `.catch`
-// handler invisible twice over. host/native-polyfills.ts replaces console over
-// `bridge.log`.
+// TestHostConsoleReachesStderr covers a platform facility the engine lacks: quickjs-ng
+// defines no `console`, while shared host code logs through one — not least from the
+// `.catch` handler that reports a wedged transport. host/native-polyfills.ts supplies
+// console over `bridge.log`.
 //
 // Asserted on stderr rather than on the bridge function, because *which* stream it lands
 // on is the property: stdout carries `--op`'s raw response bytes, which a diagnostic

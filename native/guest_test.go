@@ -49,13 +49,11 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 	}
 }
 
-// A top-level pending promise is the other way signed guest source can wedge its host:
-// QJS_Eval awaits a global eval whose completion value is a Promise (csrc/eval.c), and a
-// confined realm has no os poll loop, so js_std_await spins inside C — where the Budget
-// interrupt never runs, because only the interpreter consults it. guest.go appends
-// `;void 0;` so the completion value is never a promise; without it this probe hangs the
-// child process instead of returning. Runs in a child for the same reason as the budget
-// probe above: a failed fix cannot be timed out from inside the wedged process.
+// Guest source whose completion value is a never-settling promise must not wedge its host
+// either. Eval hands the completion value back as it stands; an eval that waited on it
+// would spin inside C, where the Budget interrupt never runs, because only the interpreter
+// consults it. Runs in a child for the same reason as the budget probe above: a regression
+// cannot be timed out from inside the wedged process.
 func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 	const marker = "SEEDKERNEL_TEST_GUEST_PENDING_PROMISE"
 	if os.Getenv(marker) == "1" {

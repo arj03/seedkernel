@@ -23,10 +23,10 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 				full,
 				mid: full.subarray(8, 12),
 				empty: full.subarray(5, 5),
+				words: new Uint16Array(buf, 16, 2),
 				dv: new DataView(buf, 60, 4),
-				// A forged "view" whose window runs past the real buffer end: the range
-				// check must run against the buffer size QuickJS reports, not these numbers.
-				fake: { buffer: buf, byteOffset: 60, byteLength: 8 },
+				// Shaped like a view, with an honest window: still not one.
+				fake: { buffer: buf, byteOffset: 0, byteLength: 4 },
 			};
 		})();
 	`))
@@ -55,21 +55,53 @@ func TestJsTypedArrayToGoViews(t *testing.T) {
 	for i := range seq {
 		seq[i] = byte(i)
 	}
-	want("buf", seq)                   // bare ArrayBuffer: the whole store
-	want("full", seq)                  // whole-buffer view
-	want("mid", []byte{8, 9, 10, 11})  // interior window only
-	want("mid", []byte{8, 9, 10, 11})  // re-read: the source must be left intact
-	want("empty", []byte{})            // zero-length view
-	want("dv", []byte{60, 61, 62, 63}) // DataView is a view too
+	want("buf", seq)                      // bare ArrayBuffer: the whole store
+	want("full", seq)                     // whole-buffer view
+	want("mid", []byte{8, 9, 10, 11})     // interior window only
+	want("mid", []byte{8, 9, 10, 11})     // re-read: the source must be left intact
+	want("empty", []byte{})               // zero-length view
+	want("words", []byte{16, 17, 18, 19}) // a wider element type: its bytes, not its length
 
-	if _, err := read("fake"); err == nil {
-		t.Fatal("out-of-range window accepted")
+	// Only ArrayBuffers and TypedArrays have the slots the bridge reads.
+	for _, name := range []string{"dv", "fake"} {
+		if b, err := read(name); err == nil {
+			t.Fatalf("%s accepted as bytes: %v", name, b)
+		}
 	}
 }
 
-// A view's byteOffset/byteLength/buffer are ordinary properties of an object the CALLER
-// supplies — untrusted code on the guest seam. One that is not a number, or a getter that
-// throws, must be refused without leaving the exception for the next call to inherit.
+// A view's window is the engine's own: its accessors are not consulted, so redefining them
+// neither changes what is copied nor runs any JS.
+func TestJsTypedArrayToGoIgnoresAccessors(t *testing.T) {
+	bootRealm(t)
+	v, err := qc.Eval("accessor-test.js", qjs.Code(`
+		(() => {
+			globalThis.__touched = 0;
+			const view = new Uint8Array([1, 2, 3, 4]).subarray(1, 3);
+			for (const name of ["buffer", "byteOffset", "byteLength", "length"]) {
+				Object.defineProperty(view, name, { get() { globalThis.__touched++; return 0; } });
+			}
+			return view;
+		})()
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Free()
+	if n, err := qjs.JsTypedArrayByteLength(v); err != nil || n != 2 {
+		t.Fatalf("JsTypedArrayByteLength = %d, %v; want 2", n, err)
+	}
+	if b, err := qjs.JsTypedArrayToGo(v); err != nil || !bytes.Equal(b, []byte{2, 3}) {
+		t.Fatalf("JsTypedArrayToGo = %v, %v; want [2 3]", b, err)
+	}
+	if got := evalString(t, `String(globalThis.__touched)`); got != "0" {
+		t.Fatalf("the bridge ran %s accessor(s) while reading the view", got)
+	}
+}
+
+// The bytes arrive from untrusted code on the guest seam, and an object that merely carries
+// view-shaped properties — odd values, throwing getters — is refused without leaving the
+// engine's error for the next call to inherit.
 func TestJsTypedArrayToGoHostileProperties(t *testing.T) {
 	bootRealm(t)
 	for _, tc := range []struct{ name, src string }{

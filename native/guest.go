@@ -194,10 +194,9 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	budget time.Duration, maxHostCalls int, maxHostCallBytes int64) (*guestRealm, error) {
 	hostQc := loop.c
 	// The execution bound lives in the engine (qjs.Budget arms the interrupt handler), so
-	// an unbounded realm costs what a bounded one does. WithoutHostObjects is the
-	// confinement half: no quickjs-libc modules or globals and no module loader, so the
-	// realm is ECMAScript intrinsics plus the host.call seam and nothing else (qjs.go).
-	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit), qjs.WithoutHostObjects())
+	// an unbounded realm costs what a bounded one does. A qjs runtime holds ECMAScript
+	// intrinsics and nothing else, so the realm is those plus the seam installed below.
+	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +234,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		name := t.Args()[0].String()
 		callID := t.Args()[1].Int64()
 		// Asking the source its width is an engine query, not the copy; admit id, count
-		// and that width together before the copy itself (hostcalls.go).
+		// and that width together before the copy itself (hostcalls.go). No JS runs
+		// between the two reads, so the copy is exactly the width admitted.
 		payloadBytes, err := qjs.JsTypedArrayByteLength(t.Args()[2])
 		if err != nil {
 			return nil, err
@@ -247,10 +247,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		if err != nil {
 			g.hostCalls.release(callID)
 			return nil, err
-		}
-		if int64(len(payload)) != payloadBytes {
-			g.hostCalls.release(callID)
-			return nil, errors.New("guest: host-call payload width changed while copying")
 		}
 		// The admitted custody follows the payload through the synchronous Go-to-host-realm
 		// handoff. It stays charged to this call after the shuttle slice leaves scope.
@@ -312,18 +308,18 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
 	// Guest top-level code is execution just like an entrypoint. Run it under one fresh
-	// budget so installation cannot be wedged before the shell receives a realm. The
-	// trailing `;void 0;` neutralizes the script's completion value: QJS_Eval awaits a
-	// global eval whose result is a Promise (csrc/eval.c), and a confined realm has no os
-	// poll loop, so js_std_await would spin inside C on a never-settling top-level promise
-	// — where the Budget interrupt, which only the interpreter consults, can never fire.
-	// The entrypoint's own promise is driven by __start/pump, not by eval.
+	// budget so installation cannot be wedged before the shell receives a realm. Eval
+	// answers the completion value without awaiting it, so a top-level promise is just a
+	// value here; the jobs the source queued run at this realm's next budgeted pump, as
+	// they do on the JS target.
 	g.consumed = 0
-	if _, err := g.within(func() (*qjs.Value, error) {
-		return g.qc.Eval("guest.js", qjs.Code(source+"\n;void 0;"))
-	}); err != nil {
+	done, err := g.within(func() (*qjs.Value, error) {
+		return g.qc.Eval("guest.js", qjs.Code(source))
+	})
+	if err != nil {
 		return fail(fmt.Errorf("guest source: %w", err))
 	}
+	done.Free()
 	// Retained once — the holder path runs per inbound request, so re-resolving per call is
 	// needless churn. Guest-realm values, freed by rt.Close().
 	g.start = g.qc.Global().GetPropertyStr("__start")
@@ -505,7 +501,7 @@ func (g *guestRealm) pump() {
 		g.loop.wake()
 		return
 	}
-	// js_std_loop returned with the queue empty, and only `within` can refill it.
+	// Pump returned with the queue empty, and only `within` can refill it.
 	g.jobsPending = false
 }
 

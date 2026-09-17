@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -13,13 +14,7 @@ import (
 //  1. Invoke (QJS_Call) does NOT run the job queue — a microtask queued during an
 //     invoked JS callback stays pending afterwards.
 //  2. Pump DOES run it, draining that pending microtask, and returns promptly: the
-//     loader registers no os timers, so js_std_loop has nothing to wait on.
-//
-// Pump reached the queue through QJS_Eval's trailing js_std_loop back when the engine
-// blob was vendored and its exports were not ours to choose. It calls js_std_loop
-// directly now (csrc/qjswasm.cmake), which is the same drain without compiling and
-// running an expression first — a cost every pump paid, and the loop pumps after every
-// re-entry into JS.
+//     engine has no timers or I/O of its own, so the drain has nothing to wait on.
 func TestQjsPumpModel(t *testing.T) {
 	rt, err := qjs.New()
 	if err != nil {
@@ -54,25 +49,32 @@ func TestQjsPumpModel(t *testing.T) {
 	}
 }
 
-// TestQjsAwaitsOsTimer confirms QJS_Eval awaits a promise that only settles when
-// an os.setTimeout fires — i.e. js_std_await drives the built-in timer loop. This
-// is the Phase-0-only driving model (no Go I/O); Phases 1-3 use Go-backed timers.
-func TestQjsAwaitsOsTimer(t *testing.T) {
-	rt, err := qjs.New()
-	if err != nil {
-		t.Fatal(err)
+// Node ends the process on a rejection nothing handles, and the shell is the same TS on
+// both targets, so the native loop fails the same way: the await driving it returns the
+// rejection, and main exits with it. A rejection handled before the queue drains is not
+// one, and the failure is reported once rather than inherited by the next await.
+func TestUnhandledRejectionFailsTheAwait(t *testing.T) {
+	bootRealm(t)
+	if _, err := callRealm(`(async () => {
+		const p = Promise.reject(new Error("handled later"));
+		await null;
+		p.catch(() => {});
+		return new Uint8Array(0);
+	})`, 5*time.Second); err != nil {
+		t.Fatalf("a rejection handled before the queue drained was reported: %v", err)
 	}
-	defer rt.Close()
-	c := rt.Context()
 
-	v, err := c.Eval("await.js", qjs.Code(`
-		new Promise((resolve) => { setTimeout(() => resolve(42), 5); })
-	`))
-	if err != nil {
-		t.Fatal("eval await:", err)
+	_, err := callRealm(`(async () => {
+		Promise.reject(new Error("nobody listens"));
+		return new Uint8Array(0);
+	})`, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "unhandled promise rejection") ||
+		!strings.Contains(err.Error(), "nobody listens") {
+		t.Fatalf("got %v, want the unhandled rejection", err)
 	}
-	if got := v.Int32(); got != 42 {
-		t.Fatalf("QJS_Eval did not await the os.setTimeout promise: got %d, want 42", got)
+
+	if _, err := callRealm(`(async () => new Uint8Array(0))`, 5*time.Second); err != nil {
+		t.Fatalf("the next await inherited the failure: %v", err)
 	}
 }
 
