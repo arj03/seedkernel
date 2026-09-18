@@ -212,13 +212,17 @@ func (el *eventLoop) callJS(cb *qjs.Value) {
 	}
 }
 
-// step drives one turn of the loop: fire every due timer (pumping every realm after each),
-// drain ready microtasks, then block until a posted task or the next timer — and process
-// it. Every realm advances on every pump, which is how a host-call result settling on the
-// host realm resumes a suspended guest.
+// step drives one turn of the loop, phased as Node's is: the timers due when the turn
+// began, then (after draining ready microtasks and blocking until a posted task or the
+// next timer) the tasks queued by then. Each phase takes only what was ready as it began,
+// so neither a timer that re-arms at zero delay nor a peer that keeps the queue full can
+// hold the other phase off. Every realm advances on every pump, which is how a host-call
+// result settling on the host realm resumes a suspended guest.
 func (el *eventLoop) step() {
-	// Fire every due timer, pumping after each so its reactions run before the next.
-	for len(el.timers) > 0 && !el.timers[0].deadline.After(time.Now()) {
+	// Fire the timers due now, pumping after each so its reactions run before the next.
+	// One armed meanwhile waits for the next turn, however short its delay.
+	now := time.Now()
+	for len(el.timers) > 0 && !el.timers[0].deadline.After(now) {
 		t := heap.Pop(&el.timers).(*jsTimer)
 		delete(el.byID, t.id)
 		el.callJS(t.cb)
@@ -252,21 +256,12 @@ func (el *eventLoop) step() {
 	if wait != nil {
 		el.stepTimer.Stop() // disarm (Go 1.23+ needs no drain); reused next turn via Reset
 	}
-	// Drain whatever else is already queued, pumping after each: a burst of posted socket
-	// frames lands in this one turn instead of one per step(), and a result that raced
-	// <-wait (select picks at random when both are ready) is processed now rather than
-	// causing await to report a false timeout.
-	for {
-		if el.stopped {
-			return
-		}
-		select {
-		case task := <-el.tasks:
-			task()
-			el.pumpAll()
-		default:
-			return
-		}
+	// Then the tasks already queued, pumping after each: a burst of socket frames lands in
+	// this one turn, and what is posted meanwhile waits behind the next timer phase.
+	for n := len(el.tasks); n > 0 && !el.stopped; n-- {
+		task := <-el.tasks
+		task()
+		el.pumpAll()
 	}
 }
 

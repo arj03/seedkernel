@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"strings"
 	"testing"
 	"time"
@@ -127,5 +128,73 @@ func TestAwaitIgnoresStaleSettle(t *testing.T) {
 	}
 	if len(value) != 1 || value[0] != 1 {
 		t.Fatalf("second await settled with %v — the abandoned await's result leaked into it", value)
+	}
+}
+
+// TestLoopTimerRunsDuringTaskBacklog pins timer fairness against a queue that never empties:
+// a streaming peer re-posts each delivery as the loop drains the last, so step() must take
+// only the tasks queued when its drain began, or the timers wait until the producers pause.
+func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
+	rt, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	l := newEventLoop(rt.Context())
+	count, fired := 0, false
+	cb := l.c.Function(func(c *qjs.Context, _ []*qjs.Value) (*qjs.Value, error) {
+		fired, l.stopped = true, true
+		return nil, nil
+	})
+	var task func()
+	task = func() {
+		count++
+		if count == 1 {
+			// Make a timer due during the task phase, while more tasks keep arriving.
+			timer := &jsTimer{id: 1, deadline: time.Now(), cb: cb}
+			heap.Push(&l.timers, timer)
+			l.byID[1] = timer
+		}
+		if count < 1000 {
+			l.post(task)
+		} else {
+			l.stopped = true
+		}
+	}
+	l.post(task)
+	l.run()
+	if !fired || count >= 1000 {
+		t.Fatalf("timer starved behind %d tasks", count)
+	}
+}
+
+// TestLoopTaskRunsDuringZeroDelayTimers is the mirror image: a callback that re-arms itself
+// at zero delay — as a guest can re-arm a 0 ms wake from inside its own fire — must not keep
+// the timer phase running, just as Node's never runs a timer armed during it.
+func TestLoopTaskRunsDuringZeroDelayTimers(t *testing.T) {
+	rt, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	l := newEventLoop(rt.Context())
+	if _, err := l.c.Eval("chain.js", `
+		globalThis.fires = 0;
+		const again = () => { if (++globalThis.fires < 1000) setTimeout(again, 0); };
+		setTimeout(again, 0);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	fires := int32(-1)
+	l.post(func() {
+		fires = l.c.Global().GetPropertyStr("fires").Int32()
+		l.stopped = true
+	})
+	l.run()
+	for _, tm := range l.timers {
+		tm.cb.Free() // the chain's next link, still armed when the task stopped the loop
+	}
+	if fires >= 1000 {
+		t.Fatalf("task starved behind %d zero-delay timer fires", fires)
 	}
 }
