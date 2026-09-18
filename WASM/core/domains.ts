@@ -35,7 +35,7 @@ export const HOST_TRANSFORM_NAMES = [
 export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
 /** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant. */
 export const HOST_SERVICES = {
-  node: { calls: ["sign", "verify", "identity", "random"] },
+  node: { calls: ["sign", "verify", "random"] },
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
   clock: { calls: ["now"] },
   timer: { calls: ["arm", "clear"] },

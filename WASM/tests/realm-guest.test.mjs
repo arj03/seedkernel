@@ -55,7 +55,7 @@ async function testGuestSeam() {
   const signScope = appSignScope(id, id.publicKey, "testapp");
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const seam = createGuestSeam({
-    platform: { sodium, identity: id, now: () => Date.now() },
+    platform: { sodium, now: () => Date.now() },
     grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls, timers: TEST_TIMERS },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
@@ -100,7 +100,6 @@ async function testGuestSeam() {
       try { await prim(removed, new Uint8Array(0)); } catch { refused = true; }
       assert(refused, `crypto/${removed} is not host vocabulary — pure transforms ship in their consumer's bundle`);
     }
-    assert(bytesEqual(await seam("node/identity", U()), id.publicKey), "node/identity = the node pubkey");
     assertEqual((await seam("node/random", U(0, 0, 0, 16))).length, 16, "node/random returns n bytes");
     assertEqual((await seam("clock/now", U())).length, 8, "clock/now returns a u64");
 
@@ -609,7 +608,7 @@ async function testSeamGating() {
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (names) => createGuestSeam({
-    platform: { sodium, identity: id, now: () => Date.now(), peers: () => [] },
+    platform: { sodium, now: () => Date.now() },
     grants: { names, signScope: appSignScope(id, new Uint8Array(32), "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   });
@@ -647,11 +646,11 @@ async function testSeamGating() {
   assert(!threw, "clock/now resolves under the declared service");
 
   // The unit a manifest grants is the WHOLE service: declaring `node` grants every
-  // `node/*` method — `node/identity` beside `node/sign` included — because there was
+  // `node/*` method — `node/random` beside `node/sign` included — because there was
   // never a finer boundary anyone held (§12.2).
   const nodeOnly = mk(["node"]);
   assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign resolves under the declared service");
-  assertEqual((await nodeOnly("node/identity", U())).length, 32, "…and so does node/identity, the SAME declared service");
+  assertEqual((await nodeOnly("node/random", U(0, 0, 0, 4))).length, 4, "…and so does node/random, the SAME declared service");
   threw = false;
   try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
   assert(threw, "a different, undeclared service (fs) is still refused beside the declared one");
@@ -834,7 +833,7 @@ async function testModuleCallChargedToGuestBudget() {
   const spinKey = appKey(id.publicKey, "app");
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
-    platform: { sodium, identity: id, now: () => Date.now() },
+    platform: { sodium, now: () => Date.now() },
     grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: {
       names: new Set(["spin"]),
@@ -905,7 +904,7 @@ async function testModuleCallChargedToGuestBudget() {
 async function testPreviousAbiRefused() {
   console.log("Test: every host.call answers a Promise — no name sits on a sync line");
 
-  const NAMES = ["crypto/blake2b-256", "clock/now", "node/identity", "node/random"];
+  const NAMES = ["crypto/blake2b-256", "clock/now", "node/random"];
   // One byte per probed name: 1 when the un-awaited call handed back a thenable.
   const source = `
     const names = ${JSON.stringify(NAMES)};
@@ -920,7 +919,7 @@ async function testPreviousAbiRefused() {
   const realm = await createSafeRealm({
     source,
     hostCall: createGuestSeam({
-      platform: { sodium, identity: generateKeyPair(), now: () => 1 },
+      platform: { sodium, now: () => 1 },
       grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     }),

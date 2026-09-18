@@ -40,8 +40,8 @@ export interface SeamCalls {
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
  *  call that goes the other way — `deliver`, which hands the host a request this occupant
- *  decoded off those links. Transport configuration arrives in `LOCAL`, identity through
- *  `node/identity`, and address-book updates as `addr` events. */
+ *  decoded off those links. Transport configuration arrives in `LOCAL`, the node's identity
+ *  in `HOST`, and address-book updates as `addr` events. */
 export interface RawNet {
   /** Open an opaque destination; id 0 means no route (§12.1). */
   open(dest: string): { linkId: number; stream: boolean };
@@ -75,9 +75,6 @@ export interface HostTimers {
  *  holds these because it is running on this node at all — so nothing here is gated. */
 export interface SeamPlatform {
   sodium: SeamCrypto;
-  /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key SIGN
-   *  uses is `grants.signScope.key`, chosen by the slot — not this. */
-  identity: Keypair;
   /** Wall clock (ms), defaulted by the shell before constructing a seam. */
   now: () => number;
 }
@@ -378,8 +375,7 @@ function u64be(value: number): Uint8Array {
 /** The host half of the catalog (§12.2): keys of this table are the host names a
  *  guest may call. `crypto/*` is ungated; everything else is an authority. */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
-  const { sodium, identity } = platform;
-  const now = platform.now;
+  const { sodium, now } = platform;
   const fs = () => {
     if (!grants.fs) throw new Error("guest-seam: fs.* used but no fs backend wired");
     return grants.fs;
@@ -421,7 +417,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return ZERO;
       }
     },
-    "node/identity": () => new Uint8Array(identity.publicKey),
     "node/random": (payload) => {
       const n = readU32BE(payload, 0);
       if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: node/random size over cap");
@@ -542,7 +537,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       return answer;
     }
     // A `/` says a host method: the table lookup IS the dispatch, gated by the
-    // method's SERVICE — an undeclared `node/identity` is refused even beside a
+    // method's SERVICE — an undeclared `node/random` is refused even beside a
     // declared `node/sign`, because the unit a manifest grants is the SERVICE.
     // `serviceOf` is a table lookup on the text before the first `/`, never a semantic
     // parse. An unknown name (or a primitive this host does not carry) reads

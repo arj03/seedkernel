@@ -19,7 +19,6 @@ import (
 const (
 	nameSign       = "node/sign"
 	nameVerify     = "node/verify"
-	nameIdentity   = "node/identity"
 	nameNodeRandom = "node/random"
 	nameFsGet      = "fs/get"
 	nameFsPut      = "fs/put"
@@ -30,8 +29,8 @@ const (
 func TestGuestSeamOps(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Grant node/sign, node/verify, node/identity, fs/put, fs/get and clock/now (not net,
-	// not link), plus an identity from sodium. The signing scope binds node/sign and
+	// Grant node/sign, node/verify, fs/put, fs/get and clock/now (not net, not link),
+	// plus an identity from sodium. The signing scope binds node/sign and
 	// node/verify to a bundle namespace (README §12.2) — a real node derives it from the
 	// manifest's (author, app); here it is a throwaway pair.
 	if _, err := qc.Eval("build.js", `
@@ -40,7 +39,7 @@ func TestGuestSeamOps(t *testing.T) {
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
 		// the key that signs, all three.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
-		__buildGuestSeam(["node", "fs", "clock"], __id, null, __scope);
+		__buildGuestSeam(["node", "fs", "clock"], null, __scope);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -79,11 +78,6 @@ func TestGuestSeamOps(t *testing.T) {
 	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"))`)
 	if !bytes.Equal(h, want) {
 		t.Fatalf("crypto/blake2b-256 = %x, want %x", h, want)
-	}
-
-	// node/identity: this node's public key.
-	if id := callBytes(nameIdentity, nil); !bytes.Equal(id, pk) {
-		t.Fatalf("node/identity = %x, want node pubkey %x", id, pk)
 	}
 
 	// node/sign and node/verify are scoped (README §12.2): the host applies
@@ -167,7 +161,7 @@ func TestGuestSeamOps(t *testing.T) {
 	// gate can be what refuses it: the same seam narrowed to `clock` alone answers no
 	// fs name. A refusal at the GATE — an undeclared service, still a throw at the call
 	// site (guest-seam.ts) — reaches the test as callRealm's error.
-	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["clock"], __id, null, __scope);`); err != nil {
+	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["clock"], null, __scope);`); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
 	if err := refused(nameFsPut, make([]byte, 8)); err == nil {

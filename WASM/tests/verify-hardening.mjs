@@ -215,9 +215,8 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
 
 console.log("\n§12.2 — the capability gates cannot be reached by omission");
 {
-  const identity = sodium.crypto_sign_keypair();
   const base = {
-    platform: { sodium, identity, now: () => Date.now(), peers: () => [] },
+    platform: { sodium, now: () => Date.now() },
     grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   };
@@ -724,7 +723,7 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     };
     const identity = sodium.crypto_sign_keypair();
     const seam = createGuestSeam({
-      platform: { sodium: burningSodium, identity, now: () => Date.now(), peers: () => [] },
+      platform: { sodium: burningSodium, now: () => Date.now() },
       grants: {
         names: ALL_HOST_SERVICES, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS,
         signScope: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },
@@ -916,6 +915,10 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   "the realm's host-call budget is advertised to the guest, not only enforced against it");
+  // …and so is the node's public key: the keypair `node/sign` signs with, as hex, so what a
+  // guest publishes as its node and what its signatures verify under cannot disagree.
+  ok(advertised.identity === toHex(kp.ed.publicKey),
+    "HOST.identity is the node's public key, the one node/sign signs with");
   bare.close();
 }
 

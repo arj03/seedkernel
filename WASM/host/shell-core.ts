@@ -148,8 +148,8 @@ export interface BootShellOptions {
    *  readies it). */
   sodium: ShellSodium;
   /** The node's keypair (§12.9): its public half is this node's peer id and the one
-   *  identity every target reports through `node/identity`. The handshake and the seam's
-   *  SIGN op both sign with it, under different domains and scopes. */
+   *  identity every realm reads as `HOST.identity`. The handshake and the seam's SIGN op
+   *  both sign with it, under different domains and scopes. */
   identity: Keypair;
   /** Admission for ordinary apps: an author policy, consent dialog, or `admitAll`.
    *  Absent means deny-all for apps. Link is authorized by the selected boot transport
@@ -291,15 +291,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // already refused any non-object).
     const appConfig = b.manifest.guest.config ?? {};
     // The third preamble (§12.5): not what the author signed (`APP`) nor what the
-    // operator set (`LOCAL`), but what the host will admit — told to the guest rather
-    // than discovered by being refused, so it can window its own fan-out. Anything
-    // that changes what the realm admits must change what is advertised here with it.
-    const hostBudgets: JsonObject = {
+    // operator set (`LOCAL`), but the host's own facts, fixed for this realm's life —
+    // the node's public key, the same one `node/sign` signs with, and the budgets the
+    // host will admit, told to the guest rather than discovered by being refused so it
+    // can window its own fan-out. Anything that changes what the realm admits must change
+    // what is advertised here with it.
+    const hostFacts: JsonObject = {
+      identity: toHex(opts.identity.publicKey),
       maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
       maxOutstandingHostCallBytes: DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
     };
     slot.realm = await createRealm({
-      source: jsonPreamble("HOST", hostBudgets) + jsonPreamble("APP", appConfig)
+      source: jsonPreamble("HOST", hostFacts) + jsonPreamble("APP", appConfig)
         + jsonPreamble("LOCAL", localConfig) + b.guestSource,
       hostCall: seamFor(slot),
       memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
@@ -324,7 +327,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // is the HOST's own, and no app key derives it.
     const callerId = genesisHash(sodium, enc.encode(table.keyOf(slot)));
     const fullSeam = createGuestSeam({
-      platform: { sodium, identity: opts.identity, now },
+      platform: { sodium, now },
       grants: {
         // The two signed lists, unmodified. A `host.call` naming a host method
         // resolves iff the method's SERVICE is in `requires`. `crypto/*` and the
@@ -367,9 +370,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // therefore begins at the first post-commit invocation: disposing a candidate is a
     // real undo because a candidate did nothing to undo. One rule over the whole
     // vocabulary and not a list of the names that bite, because the list is what goes
-    // stale when a service is added. A top level still initializes — from `APP`/`LOCAL`
-    // and never off this seam. The transport validates its configuration there and
-    // reads node/identity on its first post-commit invocation (§12.6).
+    // stale when a service is added. A top level still initializes — from `HOST`, `APP`
+    // and `LOCAL`, never off this seam — which is how the transport stands its whole
+    // routing state before it is first invoked (§12.6).
     // The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
     return (name, payload, budget) => {
       if (!slot.active) {

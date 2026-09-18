@@ -26,7 +26,11 @@ const wsHeadJS = `
   const bundle = verifyBundle(sodium, blob);
   const src = bundle.guestSource;
   // The whole preamble the program reads at load; the framer never spends the HOST budget.
-  const HOST = { maxOutstandingHostCalls: 256, maxOutstandingHostCallBytes: 16 * 1024 * 1024 };
+  const HOST = {
+    identity: "00".repeat(32),
+    maxOutstandingHostCalls: 256,
+    maxOutstandingHostCallBytes: 16 * 1024 * 1024,
+  };
   const APP = bundle.manifest.guest.config;
   const LOCAL = { networkKey: "00".repeat(32), peers: [], admitPeers: [] };
   const host = { call: (name) => { throw new Error("ws head probe: the framer called " + name); } };

@@ -122,14 +122,14 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,356 LOC)**
+**Shared — compiled once, run by all three targets (2,354 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 341 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 333 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 678 |
-| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 355 |
+| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 675 |
+| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 356 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 236 |
 | Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 413 |
 
@@ -142,7 +142,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,466 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (333) and `native-polyfills.ts` (80), both TypeScript and riding in the shared bundle | 2,244 Go + 413 TS |
 
-The transport bundle sits outside these host totals: 1,552 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
+The transport bundle sits outside these host totals: 1,533 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 

@@ -3,8 +3,6 @@
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
 const N_RANDOM = "node/random";
-// Read from the host so it matches `node/sign` (§12.2).
-const N_IDENTITY = "node/identity";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
 const N_WS = "ws";

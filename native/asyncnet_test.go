@@ -57,7 +57,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  // slot, so the host loopback stands in for the cross-realm call — the same
 		  // slot, the same entrypoint, the app's own op framing recomposed here (the
 		  // shell passes bytes and never reads them).
-		  __buildGuestSeam([], idB, { call: (id, payload) => {
+		  __buildGuestSeam([], { call: (id, payload) => {
 		    const n = payload[0];
 		    let op = "";
 		    for (let i = 0; i < n; i++) op += String.fromCharCode(payload[1 + i]);

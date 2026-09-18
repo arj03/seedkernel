@@ -102,7 +102,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   const key = deriveNodeKey(sodium, parseHex32(seedHex, "--key"));
   ok(host.lines[0] === `seedkernel-test ${toHex(key.publicKey)}`,
     "the banner line reports the derived key as the peer id");
-  // ONE identity: the key that reaches standUp — and so `node/identity`, `node/sign` and
+  // ONE identity: the key that reaches standUp — and so `HOST.identity`, `node/sign` and
   // the handshake — is the same key the banner prints as the peer id. A node that signed
   // a record with anything else would name an author no peer in its cohort has heard of.
   ok(toHex(host.stood.identity.publicKey) === toHex(key.publicKey),

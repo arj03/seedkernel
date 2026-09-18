@@ -4,13 +4,13 @@
 // the state the earlier parts read at runtime.
 // ============================================================================
 
-// ── per-host state, read from installation-local config ──────────────────────
-// Identity comes from `node/identity`, so it cannot drift from `node/sign` (§12.2).
-// Initialization is async; config validation stays synchronous so invalid bundles fail
-// during load (§12.4).
+// ── per-host state, read from the preamble ───────────────────────────────────
+// Identity comes from `HOST`, which the host fills from the keypair `node/sign` signs
+// with, so the two cannot drift (§12.2). Everything here is built during load, so invalid
+// config fails the load (§12.4) and the first invocation finds the program ready.
 
-let ownPk = null;                       // 32B node channel public key, once `ready` has run
-let ownId = "";                         // the same, hex
+const ownId = HOST.identity;            // the node channel public key, hex
+const ownPk = fromHex(ownId);           // the same, 32 bytes
 const ZERO32 = new Uint8Array(32);
 
 const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
@@ -106,11 +106,6 @@ const unverifiedTimeoutMs = policy("unverifiedTimeoutMs");
 // Frames per direction between key ratchets — a deployment-wide constant BOTH ends must
 // share; a mismatch desynchronizes the record layer and the link dies.
 const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
-
-// The one router and the one request/response layer per host instance.
-let router = null;
-let reqres = null;
-let core = null;
 
 // Deferred teardowns (see Link constructor): flushed after the current event.
 const deferQueue = [];
@@ -423,6 +418,18 @@ class Core {
   }
 }
 
+// The one router, request/response layer and routing core per host instance, wired
+// during load: none of it asks the host for anything.
+const router = new Router(ownPk, ownId);
+const reqres = new ReqRes();
+const core = new Core();
+reqres.attach((to, frame) => core.sendFrame(to, frame));
+router.sink = (from, frame, fromPk) => reqres.onFrame(from, frame, fromPk);
+// The cohort edges stay in this heap; the host reads them with the `peers` op.
+router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
+router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };
+for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
+
 // ── the one entrypoint ────────────────────────────────────────────────────────
 //
 // Reached as an app is: `handle([caller 32][body …])`, body an op envelope
@@ -463,38 +470,7 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-// Started by the FIRST invocation, never at top level: a candidate's seam refuses every
-// name until its installation commits (§3.1), so there is no host to ask our identity of
-// while this file is being evaluated. Early calls await the promise (§12.3).
-let ready = null;
-function start() {
-  if (ready) return ready;
-  ready = (async () => {
-    ownPk = (await host.call(N_IDENTITY, NOTHING)).slice();
-    ownId = toHex(ownPk);
-    router = new Router(ownPk, ownId);
-    reqres = new ReqRes();
-    core = new Core();
-    reqres.attach((to, frame) => core.sendFrame(to, frame));
-    router.sink = (from, frame, fromPk) => reqres.onFrame(from, frame, fromPk);
-    // The cohort edges stay in this heap; the host reads them with the `peers` op.
-    router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-    router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };
-    for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
-  })();
-  // Avoid an unhandled rejection if the realm is disposed mid-setup.
-  ready.catch(() => {});
-  return ready;
-}
-
-/** Pre-ready calls defer without holding the realm queue (§12.3). */
 function handle(argBytes) {
-  if (core) return dispatch(argBytes);
-  globalThis.__deferred = true;
-  return start().then(() => dispatch(argBytes));
-}
-
-function dispatch(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   try {
     if (wakeOwed) wake();

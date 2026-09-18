@@ -317,10 +317,10 @@ func authorsPolicy(ids ...[]byte) string {
 // guest.calls (§12.2, §12.10), which is why this lives in a _test file.
 const testGuestSeamJS = `
 "use strict";
-globalThis.__buildGuestSeam = function (names, identity, calls, scope, localServices) {
+globalThis.__buildGuestSeam = function (names, calls, scope, localServices) {
   globalThis.__guestSeam = createGuestSeam({
     // Per NODE.
-    platform: { sodium, identity, now: () => Date.now() },
+    platform: { sodium, now: () => Date.now() },
     // Per REALM: the granted names straight through — a host call resolves iff the
     // name's SERVICE is one of these (or crypto/*, or one of the bundle's own modules
     // — never grants) — plus the backends behind them.

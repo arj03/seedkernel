@@ -18,8 +18,7 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 	if os.Getenv(marker) == "1" {
 		guestSeamRealm(t)
 		if _, err := qc.Eval("build.js", `
-			globalThis.__id = sodium.crypto_sign_keypair();
-			__buildGuestSeam([], __id, null);
+			__buildGuestSeam([], null);
 			globalThis.__src = "for (;;) {}";
 		`); err != nil {
 			t.Fatal("build seam:", err)
@@ -57,8 +56,7 @@ func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 	if os.Getenv(marker) == "1" {
 		guestSeamRealm(t)
 		if _, err := qc.Eval("build.js", `
-			globalThis.__id = sodium.crypto_sign_keypair();
-			__buildGuestSeam([], __id, null);
+			__buildGuestSeam([], null);
 			globalThis.__src = "new Promise(() => {})";
 		`); err != nil {
 			t.Fatal("build seam:", err)
@@ -224,9 +222,8 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("module-budget-seam.js", `
 		globalThis.__seenModuleDeadline = -1;
-		const __budgetIdentity = sodium.crypto_sign_keypair();
 		globalThis.__guestSeam = createGuestSeam({
-		  platform: { sodium, identity: __budgetIdentity, now: () => Date.now() },
+		  platform: { sodium, now: () => Date.now() },
 		  grants: { names: [], localServices: new Set(), calls: { call: () => null } },
 		  modules: {
 		    names: new Set(["probe"]),
@@ -421,8 +418,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 
 	// Host realm: build the guest seam granting fs/put + fs/get (no net).
 	if _, err := qc.Eval("build.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam(["fs"], __id, null);
+		__buildGuestSeam(["fs"], null);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -471,8 +467,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null);
+		__buildGuestSeam([], null);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -514,8 +509,7 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null);
+		__buildGuestSeam([], null);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -562,9 +556,8 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	// A stub claimant is enough: a cross-realm call only needs a promise that settles on
 	// the loop, and using one keeps the kill (not a socket) as the only variable.
 	if _, err := qc.Eval("setup.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam([], __id,
+		__buildGuestSeam([],
 			{ call: async () => new Uint8Array([9]) }, undefined, ["_net"]);
 	`); err != nil {
 		t.Fatal("setup:", err)
@@ -599,8 +592,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null);
+		__buildGuestSeam([], null);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -685,9 +677,8 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("setup.js", `
-		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam([], __id,
+		__buildGuestSeam([],
 			{ call: () => new Promise(() => {}) }, undefined, ["_net"]);
 	`); err != nil {
 		t.Fatal("setup:", err)
