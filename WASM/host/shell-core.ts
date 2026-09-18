@@ -12,7 +12,7 @@ import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
+import { enc, fromHex, toHex, isHex64, errMessage, concatBytes } from "../core/util.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
 
@@ -206,6 +206,27 @@ export interface BootResult {
 
 /** Stand a node up and install the selected signed transport through the shared installer. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
+  /** One load's realm bounds (§12.3): this load's number, else the node's, else the shared
+   *  one — never the author's. Resolved once for both owners measured against the deadline
+   *  (the realm `standRealm` stands, and the clock its wake banks), and checked here because
+   *  the engines read some numbers differently. Both truncate a fraction, but a heap limit
+   *  that truncates to 0 (or is NaN) is no limit to the JS engine and a refused realm
+   *  natively, 2^32 and up wraps on JS (both engines are 32-bit, so nothing that large bounds
+   *  anything), and a budget under 1 ms is none at all natively and a refused realm on JS. */
+  const boundsFor = (load: InstallOptions): { deadlineMs: number; memoryBytes: number } => {
+    const deadlineMs = load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
+    const memoryBytes = load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES;
+    if (!(deadlineMs >= 1)) {
+      throw new Error(`shell: guestDeadlineMs must be at least 1 ms, or Infinity (got ${deadlineMs})`);
+    }
+    if (!(memoryBytes >= 1 && memoryBytes < 2 ** 32)) {
+      throw new Error(`shell: realmMemoryBytes must be at least 1 and below 2^32 (got ${memoryBytes})`);
+    }
+    return { deadlineMs, memoryBytes };
+  };
+  // A bad node-wide default fails the boot, before anything is built, rather than every
+  // install after it.
+  boundsFor({});
   const sodium = opts.sodium;
   // The defaults are imported lazily: they are JS-target parts (a worker-backed module
   // builder, the QuickJS realm engine), and the one target that never takes them (the
@@ -228,16 +249,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
 
   // ── what this node holds (slot-table.ts) ────────────────────────────────────
   const table = createSlotTable();
-  /** This load's per-invocation ceiling: this load's number, else the node's, else the
-   *  shared one (§12.3). One place, because two owners are measured against it — the realm
-   *  `standRealm` stands, and the clock its realm wake banks one invocation of. */
-  const deadlineFor = (load: InstallOptions): number =>
-    load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   /** An empty slot for `loaded`, with its realm wake already pointed at the realm the
    *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
    *  which is the correct reading anyway: the realm a deadline re-enters is the one
    *  standing when it fires (a transport handover replaces it while the slot stays). */
-  const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions): AppSlot => {
+  const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions,
+    deadlineMs: number): AppSlot => {
     let slot: AppSlot;
     const timers = createRealmTimers(
       // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
@@ -249,7 +266,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
       // Banked against THIS slot's ceiling, not the node's default.
-      deadlineFor(load),
+      deadlineMs,
     );
     const appScope = appScopeFor(sodium, loaded.manifest.app);
     const scope = slotSignScope(opts, loaded.manifest.app, reachesLink(loaded.manifest));
@@ -281,11 +298,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const json = JSON.stringify(value);
     return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
   };
-  /** Stand one candidate realm. It stays out of the slot table until this
-   *  and the freshness write both succeed. Both bounds resolve per load: this load's
-   *  number, else the node's default, else the shared one — never the author's, since a
-   *  bundle cannot ask for more of the host than the operator gave it. */
-  const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: InstallOptions): Promise<void> => {
+  /** Stand one candidate realm under this load's bounds (`boundsFor`). It stays out of the
+   *  slot table until this and the freshness write both succeed. */
+  const standRealm = async (slot: AppSlot, localConfig: JsonObject,
+    bounds: { deadlineMs: number; memoryBytes: number }): Promise<void> => {
     const b = slot.verifiedBundle;
     // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
     // already refused any non-object).
@@ -305,8 +321,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       source: jsonPreamble("HOST", hostFacts) + jsonPreamble("APP", appConfig)
         + jsonPreamble("LOCAL", localConfig) + b.guestSource,
       hostCall: seamFor(slot),
-      memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-      deadlineMs: deadlineFor(load),
+      memoryLimitBytes: bounds.memoryBytes,
+      deadlineMs: bounds.deadlineMs,
     });
   };
   /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
@@ -440,6 +456,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     bootTransport = false): Promise<AppHandle> => {
     const localConfig = opts.localConfig ?? {};
     if (!isJsonObject(localConfig)) throw new Error("shell: localConfig must be a JSON object");
+    const bounds = boundsFor(opts);
     // The slot being retired, resolved to the exact live slot HERE, before any of the
     // candidate's code runs — the table then checks that same slot is still the one
     // installed when the commit lands, so a target that changed underneath fails rather
@@ -469,13 +486,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // free claim while this candidate is built.
     checkInstallation();
     const pureModules = await loadBundleModules(moduleLoader, v);
-    const slot = newSlot(loaded, pureModules, opts);
+    const slot = newSlot(loaded, pureModules, opts, bounds.deadlineMs);
     // Stand the guest, before anything already standing is replaced. Every app is a
     // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
     // discovering that at the first frame would leave the mark advanced for a
     // bundle that never ran a line.
     try {
-      await standRealm(slot, localConfig, opts);
+      await standRealm(slot, localConfig, bounds);
       // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
       // what makes the commit atomic: the gates below, the contest, the mark, and the
       // claim hand-over cannot be interleaved with another load or an uninstall.
@@ -540,7 +557,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     uninstall: doUninstall,
     revoke(authorHex) {
       const hex = authorHex.toLowerCase();
-      if (!/^[0-9a-f]{64}$/.test(hex)) {
+      if (!isHex64(hex)) {
         throw new Error(`shell: revoke expects a 64-character hex author key, got ${JSON.stringify(authorHex)}`);
       }
       // Persist FIRST, then tear down. The other order leaves a window in which the

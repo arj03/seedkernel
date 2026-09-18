@@ -13,7 +13,12 @@ import {
 } from "quickjs-emscripten-core";
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
 // ceiling and the same budget whether its realm is this one or the native target's.
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import {
+  DEFAULT_GUEST_DEADLINE_MS,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+  DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  DEFAULT_REALM_MEMORY_BYTES,
+} from "../core/wasm-limits.js";
 import { errMessage } from "../core/util.js";
 // The in-repo quickjs-ng build (quickjs/): the same v0.16.2 the native loader compiles,
 // emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
@@ -28,7 +33,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__host_call` / `__resolveHostCall` contract this file implements.
 import { guestPreamble, type CallBudget } from "./guest-seam.js";
 import {
-  CausalContext, createActiveHostCallRegistry, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
+  CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, REALM_DISPOSED,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
 
@@ -42,6 +47,70 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
     ? (u8.buffer as ArrayBuffer)
     : new Uint8Array(u8).buffer;
+}
+
+function checkedBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new Error("guest: payload width is not a non-negative safe integer");
+  }
+  return bytes;
+}
+
+/** One active call's custody, held from admission through settlement. */
+export interface ActiveHostCall {
+  reserve(bytes: number): void;
+  release(): void;
+}
+
+/** Own every guest-to-host copy and promise slot from admission through settlement. This
+ *  target's own: native admits the same numbers in Go, before the copy (native/hostcalls.go). */
+export function createActiveHostCallRegistry(
+  maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+  maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+): {
+  admit(callId: number, payloadBytes: number): ActiveHostCall;
+  releaseAll(): void;
+} {
+  const active = new Map<number, ActiveHostCall>();
+  let bytes = 0;
+  return {
+    releaseAll(): void {
+      for (const call of [...active.values()]) call.release();
+    },
+    admit(callId: number, payloadBytes: number): ActiveHostCall {
+      if (!Number.isSafeInteger(callId)) throw new Error("guest: invalid host call id");
+      if (active.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
+      checkedBytes(payloadBytes);
+      if (active.size >= maxCalls) {
+        throw new Error(`guest: too many outstanding host calls (cap ${maxCalls})`);
+      }
+      if (payloadBytes > maxBytes - bytes) {
+        throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
+      }
+      bytes += payloadBytes;
+      let owned = payloadBytes;
+      let live = true;
+      const call: ActiveHostCall = {
+        reserve(additionalBytes: number): void {
+          if (!live) throw new Error("guest: host call is no longer active");
+          checkedBytes(additionalBytes);
+          if (additionalBytes > maxBytes - bytes) {
+            throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
+          }
+          bytes += additionalBytes;
+          owned += additionalBytes;
+        },
+        release(): void {
+          if (!live) return;
+          live = false;
+          active.delete(callId);
+          bytes -= owned;
+        },
+      };
+      active.set(callId, call);
+      return call;
+    },
+  };
 }
 
 /** One entrypoint invocation's execution record. A deferred invocation outlives its entry,
@@ -465,7 +534,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
 
   return {
     call: serializeCalls(entryDeadlines, invoke, () =>
-      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null,
+      (disposed || !ctx.alive) ? new Error(REALM_DISPOSED) : null,
     opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
     dispose(): void {
       disposed = true;
@@ -473,10 +542,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller — a DEFERRED one included, whose answer would
       // otherwise never come (realm-queue.ts's time-bound invariant).
-      failInvocations(new Error("guest realm disposed"));
+      failInvocations(new Error(REALM_DISPOSED));
       // And end custody of every call the host never answered: nothing inside this realm
       // will consume those answers now, so holding their charge would pin this realm's
-      // allowance on one unanswering backend forever (realm-queue.ts `ActiveHostCall`).
+      // allowance on one unanswering backend forever (`ActiveHostCall` above).
       // Their armed deadlines go with them (`disarmAll`).
       activeHostCalls.releaseAll();
       hostCallDeadlines.disarmAll();

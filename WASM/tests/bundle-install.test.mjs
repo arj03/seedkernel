@@ -1044,31 +1044,41 @@ async function testWrongTypedStoreIsRefused() {
   }));
   assert(odd.get(new Uint8Array(32).fill(0xcc), oddApp) === 3,
     "freshness accepts every app spelling the manifest accepts");
+  // A hand-edited file may spell an author in capitals. Accepted, so it must also guard:
+  // marks are looked up by lowercase hex, exactly as revocations are.
+  const shouted = new FreshnessMarks(JSON.stringify({
+    marks: { ["DD".repeat(32) + ":app"]: 4 }, revoked: ["EE".repeat(32)],
+  }));
+  assert(shouted.get(new Uint8Array(32).fill(0xdd), "app") === 4, "a mark spelled in capitals still guards");
+  assert(shouted.isRevoked(new Uint8Array(32).fill(0xee)), "…as a revocation spelled in capitals does");
   for (const version of [-1, Number.MAX_SAFE_INTEGER + 1]) {
     let threw = false;
     try { good.set(new Uint8Array(32).fill(0xaa), "new", version); } catch { threw = true; }
     assert(threw, `persistence refuses invalid version ${version}`);
   }
 
-  // The Node adapter distinguishes a missing first-boot file from malformed or unreadable
-  // state. A directory at the file path is a portable read failure that cannot be mistaken
-  // for ENOENT.
-  const { fileFreshnessStore } = await imp("build/host/shell-node.js");
+  // The shared store over the Node file seam distinguishes a missing first-boot file from
+  // malformed or unreadable state. A directory at the file path is a portable read failure
+  // that cannot be mistaken for ENOENT.
+  const { freshnessStoreFor } = await imp("build/host/cli.js");
+  const { nodeFiles } = await imp("build/host/fs-node.js");
+  const { freshnessPathFor } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-freshness-read-"));
-  const path = pjoin(dir, "marks.json");
+  const dataDir = pjoin(dir, "data");
+  const path = freshnessPathFor(dataDir);
   try {
-    fileFreshnessStore(path); // genuine absence
+    freshnessStoreFor(nodeFiles, dataDir); // genuine absence
     writeFileSync(path, "not json");
     let malformed = false;
-    try { fileFreshnessStore(path); } catch { malformed = true; }
+    try { freshnessStoreFor(nodeFiles, dataDir); } catch { malformed = true; }
     assert(malformed, "Node refuses a malformed freshness file");
     rmSync(path);
     mkdirSync(path);
     let unreadable = false;
-    try { fileFreshnessStore(path); } catch { unreadable = true; }
+    try { freshnessStoreFor(nodeFiles, dataDir); } catch { unreadable = true; }
     assert(unreadable, "Node refuses freshness read errors other than file-not-found");
   } finally {
     rmSync(dir, { recursive: true, force: true });

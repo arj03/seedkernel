@@ -4,11 +4,11 @@
 // runs it inside QuickJS, bundled with every module it imports into
 // native/host-shell.gen.js by scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
-import { FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
-import { runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { type PureModuleLoader } from "./bundle.js";
+import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
-import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -26,7 +26,7 @@ import {
   DEFAULT_REALM_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
-import { errMessage } from "../core/util.js";
+import { enc, errMessage } from "../core/util.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
  *  The answer is always `null`: every call parks, Go holds the guest's Promise under
@@ -296,20 +296,19 @@ const modules: PureModuleLoader = {
     };
   },
 };
-/** The freshness store over the Go file seam (§12.4). The marks live in a SIBLING of the
- *  data dir (`freshnessPathFor`, shared with the Node shell) so a `fs`-capable guest cannot
- *  reach its own mark. The write throws on purpose: `FreshnessMarks` reads that as "the
- *  write did not land", which is what rolls a revocation back and un-binds a load whose mark
- *  could not be raised — swallowing it would report both as successes while the next boot
- *  re-admits the revoked author. 0600, a node's own downgrade guard. */
-function nativeFreshnessStore(dir: string): FreshnessMarks {
-  const path = freshnessPathFor(dir);
-  const raw = bridge.readFile(path);
-  return new FreshnessMarks(
-    raw === null ? null : utf8dec.decode(new Uint8Array(raw)),
-    (json) => bridge.writeFile(path, utf8.encode(json), 0o600),
-  );
-}
+/** This target's `CliFiles` over Go's file seam, for the operator flow and the freshness
+ *  store (`freshnessStoreFor`). A read throws for anything but a missing file, and a write
+ *  throws when it did not land — `FreshnessMarks` reads that as "the write did not land",
+ *  which is what rolls a revocation back and un-binds a load whose mark could not be
+ *  raised; swallowing it would report both as successes while the next boot re-admits the
+ *  revoked author. */
+const files: CliFiles = {
+  readFile(path) {
+    const r = bridge.readFile(path);
+    return r === null ? null : new Uint8Array(r);
+  },
+  writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
+};
 /** This target's socket seam: the transport driver's ChannelFactory over Go's sockets,
  *  producing RawLinks identically to the node:net factory, so the transport bundle's link
  *  state machine runs over Go's primitives unchanged. */
@@ -415,7 +414,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
           const report = causalContext.run(causalClock, () => bridge.realmCall(
             realm, payload, callId,
             (bytes: Uint8Array) => resolve(new Uint8Array(bytes)),
-            (msg: string) => reject(new Error(msg)),
+            // guest.go fails what `dispose` strands with a message of its own; callers
+            // get the one every target uses (realm-queue.ts `REALM_DISPOSED`).
+            (msg: string) => reject(new Error(disposed ? REALM_DISPOSED : msg)),
             handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
           // `elapsedNs * 2 | deferred` — see the bridge declaration above.
           deferred = report % 2 === 1;
@@ -429,7 +430,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
           cancel: (reason) => { bridge.realmCancel(realm, callId); fail(reason); },
         };
       },
-      () => (disposed ? new Error("guest realm disposed") : null),
+      () => (disposed ? new Error(REALM_DISPOSED) : null),
       configuredDeadlineMs,
     ),
     dispose: () => {
@@ -444,11 +445,6 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     },
   };
 };
-/** Everything that crosses back to Go crosses as BYTES — the currency of this seam, and
- *  the one shape Go's await harness carries out of a settled promise. A JSON report is no
- *  exception. */
-const utf8 = new TextEncoder();
-const utf8dec = new TextDecoder();
 /** Stand a node up on this platform via the shared `bootShell` (§12.9): the operator
  *  flow's `standUp`, and what a native test calls to stand a node of its own. Config is
  *  cli.ts's `NodeSetup`, so a field added for one target cannot go missing on this one.
@@ -460,7 +456,7 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
   __fs.open(cfg.dir);
   return bootShell({
     sodium, identity: cfg.identity, modules, fs, createRealm, admit,
-    freshnessStore: nativeFreshnessStore(cfg.dir),
+    freshnessStore: freshnessStoreFor(files, cfg.dir),
     // The network as configured, over Go's sockets.
     transport: cfg.transport && { ...cfg.transport, channels },
     guestDeadlineMs: cfg.guestDeadlineMs,
@@ -475,13 +471,9 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
  *  lines are all cli.ts's. */
 function nativeCliHost(): CliHost {
   return {
+    ...files,
     banner: "seedkernel-loader",
     argv: JSON.parse(bridge.argv()) as string[],
-    readFile(path) {
-      const r = bridge.readFile(path);
-      return r === null ? null : new Uint8Array(r);
-    },
-    writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
     log(line) { bridge.log(line); },
     stdout(bytes) { bridge.stdout(bytes); },
     stdin() { return new Uint8Array(bridge.stdin()); },
@@ -491,11 +483,13 @@ function nativeCliHost(): CliHost {
 }
 /** Run the operator flow. Go calls this with no arguments — every choice comes from the
  *  argv it hands back through the bridge — and reads back whether the node is listening,
- *  which is the one thing Go still decides: whether to keep its event loop running. */
+ *  which is the one thing Go still decides: whether to keep its event loop running. The
+ *  report crosses as BYTES, like everything going back to Go: the one shape Go's await
+ *  harness carries out of a settled promise. */
 async function runMain(): Promise<Uint8Array> {
   const { serving, close } = await runCli(nativeCliHost());
   if (!serving) close();
-  return utf8.encode(JSON.stringify({ serving }));
+  return enc.encode(JSON.stringify({ serving }));
 }
 /** The confined realm's own plumbing, fetched by native/guest.go: one pre-compiled
  *  `__start` wrapper, so an initiator call costs an Invoke rather than a parse. Not the

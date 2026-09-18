@@ -5,9 +5,9 @@
 // of an absent `--policy` (§14), the order (remedies before the bundle, §12.5), which
 // failures are fatal, and the console lines. Those are decisions, and a decision made twice
 // eventually gets made differently.
-import { toHex, fromHex, errMessage } from "../core/util.js";
+import { toHex, fromHex, isHex64, errMessage, enc, dec } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
-import { isJsonObject, type JsonObject } from "./bundle.js";
+import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
 import { OpArgs, writeOp } from "../core/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort, peersConfig } from "./peer-addr.js";
@@ -30,9 +30,11 @@ const FLAGS = new Set([
   "guest-timeout", "guest-memory", "transport",
 ]);
 
-/** File access, as the flow needs it: a read that answers `null` for "absent" rather
- *  than throwing (the `--key` path takes that branch on a first boot), and a write that
- *  is atomic — a half-written key file or freshness mark is worse than none. */
+/** File access, as the flow needs it. A read answers `null` for "absent" rather than
+ *  throwing (the `--key` path takes that branch on a first boot) and throws for anything
+ *  else: a file that exists and cannot be read is not a first boot, and reading it as one
+ *  mints a new seed over the node's identity. A write is atomic: a half-written key file or
+ *  freshness mark is worse than none. */
 export interface CliFiles {
   readFile(path: string): Uint8Array | null;
   writeFile(path: string, bytes: Uint8Array, mode?: number): void;
@@ -91,9 +93,6 @@ export interface CliResult {
   close(): void;
 }
 
-const utf8 = new TextDecoder();
-const utf8enc = new TextEncoder();
-
 /** Split `--name value` / `--name=value` pairs, refusing anything else: an unknown flag is
  *  an error rather than an ignored token, and a flag without a value is an error rather
  *  than a `true` that later reads as a path. */
@@ -121,11 +120,26 @@ function list(v: string | undefined): string[] {
 
 /** Read a file the operator named, failing with the flag rather than the errno — a
  *  missing `--policy` file is an operator mistake, and the message should say which
- *  flag was wrong. */
+ *  flag was wrong. `null` when absent, as `CliFiles` reads it. */
+function readNamed(files: CliFiles, path: string, label: string): Uint8Array | null {
+  try { return files.readFile(path); }
+  catch (e) { throw new Error(`${label}: cannot read ${path}: ${errMessage(e)}`, { cause: e }); }
+}
+
+/** `readNamed` for a file that must exist. */
 function mustRead(files: CliFiles, path: string, label: string): Uint8Array {
-  const b = files.readFile(path);
+  const b = readNamed(files, path, label);
   if (b === null) throw new Error(`${label}: cannot read ${path}`);
   return b;
+}
+
+/** A flag holding a whole number, refused rather than coerced: `Number` reads "5000ms" as
+ *  NaN and "" as 0, and passing either on would quietly lift the bound the flag sets. */
+function wholeNumberFlag(args: Map<string, string>, flag: string): number | undefined {
+  const v = args.get(flag);
+  if (v === undefined) return undefined;
+  if (!/^[0-9]+$/.test(v)) throw new Error(`--${flag} must be a whole number (got ${JSON.stringify(v)})`);
+  return Number(v);
 }
 
 /** Parse 64 hex characters into the 32 bytes they name. Validated rather than decoded
@@ -134,27 +148,37 @@ function mustRead(files: CliFiles, path: string, label: string): Uint8Array {
  *  that looks healthy and is reachable by nobody (§12.6.2). Parse time is the only place
  *  an operator can still be told. */
 export function parseHex32(hex: string, label: string): Uint8Array {
-  if (!/^[0-9a-fA-F]{64}$/.test(hex.trim())) {
-    throw new Error(`${label} must hold 32 bytes as 64 hex characters`);
-  }
-  return fromHex(hex.trim());
+  const trimmed = hex.trim();
+  if (!isHex64(trimmed)) throw new Error(`${label} must hold 32 bytes as 64 hex characters`);
+  return fromHex(trimmed);
 }
 
 /** A 32-byte secret from a file — the master seed (`--key`) and the deployment secret
  *  (`--contact-secret`) are the same shape, read the same way, and fail the same way. */
 function loadHex32(files: CliFiles, path: string, label: string): Uint8Array {
-  return parseHex32(utf8.decode(mustRead(files, path, label)), label);
+  return parseHex32(dec.decode(mustRead(files, path, label)), label);
 }
 
 /** Load the node's MASTER SEED from `--key`, or mint one and persist it 0600, and derive
  *  the node's keypair from it (§12.9). One 32-byte secret on disk; the master signs
  *  nothing itself, and the node's peer id is the derived channel key's public half. */
 function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
-  const existing = host.readFile(keyPath);
-  if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(utf8.decode(existing), `--key ${keyPath}`));
+  const existing = readNamed(host, keyPath, "--key");
+  if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(dec.decode(existing), `--key ${keyPath}`));
   const master = host.sodium.randombytes_buf(32);
-  host.writeFile(keyPath, utf8enc.encode(toHex(master)), 0o600);
+  host.writeFile(keyPath, enc.encode(toHex(master)), 0o600);
   return deriveNodeKey(host.sodium, master);
+}
+
+/** The freshness store (§12.4) a node keeps beside its data directory (`freshnessPathFor`),
+ *  over the target's `CliFiles` — one implementation, so the targets cannot disagree about
+ *  what an unreadable file means (a failed boot: read as a first one, it would drop every
+ *  downgrade mark and every revocation) or how the file is written (atomically, 0600). */
+export function freshnessStoreFor(files: CliFiles, dir: string): FreshnessMarks {
+  const path = freshnessPathFor(dir);
+  const raw = readNamed(files, path, "freshness store");
+  return new FreshnessMarks(raw === null ? null : dec.decode(raw),
+    (json) => files.writeFile(path, enc.encode(json), 0o600));
 }
 
 /** The one console line a successful load prints (§12.4, §12.10): the app label an operator
@@ -177,6 +201,11 @@ export function loadedLine(b: AppHandle): string {
  *  exits, because how a target reports a fatal error is the last platform thing here. */
 export async function runCli(host: CliHost): Promise<CliResult> {
   const args = parseArgs(host.argv);
+  // Guest resource bounds (§12.3), which only widen or tighten the shell's own defaults
+  // (the shell checks their range). `--guest-timeout 0` reads as Infinity — "no budget"
+  // said explicitly, rather than reached by leaving a flag off or mistyping one.
+  const guestTimeout = wholeNumberFlag(args, "guest-timeout");
+  const guestMemory = wholeNumberFlag(args, "guest-memory");
   const dir = args.get("dir") ?? DEFAULT_DIR;
   const keyPath = args.get("key") ?? DEFAULT_KEY;
   const policyPath = args.get("policy");
@@ -184,7 +213,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // boot-selected transport needs no entry in this app-author set.
   const policyJson = policyPath === undefined
     ? undefined
-    : utf8.decode(mustRead(host, policyPath, "--policy"));
+    : dec.decode(mustRead(host, policyPath, "--policy"));
   const key = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
   const bundlePath = args.get("bundle");
@@ -201,7 +230,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // Checked here, not at the load, so a malformed file fails before a node is listening.
   let localConfig: JsonObject | undefined;
   if (args.has("local-config")) {
-    const parsed: unknown = JSON.parse(utf8.decode(mustRead(host, args.get("local-config")!, "--local-config")));
+    const parsed: unknown = JSON.parse(dec.decode(mustRead(host, args.get("local-config")!, "--local-config")));
     if (!isJsonObject(parsed)) throw new Error("--local-config must hold a JSON object");
     localConfig = parsed;
   }
@@ -231,11 +260,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
       config: transportConfig,
     } : false,
-    // Guest resource bounds (§12.3), which only widen or tighten the shell's own
-    // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
-    // rather than reached by leaving a flag off.
-    guestDeadlineMs: args.has("guest-timeout") ? (Number(args.get("guest-timeout")) || Infinity) : undefined,
-    realmMemoryBytes: args.has("guest-memory") ? Number(args.get("guest-memory")) * 1024 * 1024 : undefined,
+    guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
+    realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });
   // The addresses went in with the load above; what is left is to wait for the cohort, on
   // the id the transport claims — the same door a co-resident guest uses. Best-effort: the

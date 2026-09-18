@@ -1562,6 +1562,42 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
     `the throwing channel's link must be failed exactly once with LOCAL, got ${JSON.stringify(cDowns)}`);
 });
 
+await test("DRIVER HANDOVER: an outgoing occupant hears nothing about the links it leaves", async (keep) => {
+  // The shell disposes the outgoing realm right after a handover, so a `linkClosed` queued
+  // into it is work for a realm that will never run it. The binding is released FIRST:
+  // every link still closes and still reports down once, into a vacant binding.
+  class ManualChannel {
+    closes = 0;
+    send() {}
+    onData() {}
+    onClose() {}
+    close() { this.closes++; }
+  }
+  const heard = { old: [], new: [] };
+  const downs = [];
+  const occupant = (who) => (payload) => {
+    heard[who].push(new TextDecoder().decode(payload.subarray(1, 1 + payload[0])));
+    return Promise.resolve(Uint8Array.of(CLOSE_REASON.LOCAL));
+  };
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost(
+    { channels: factory, onLinkClosed: (_linkId, reason) => downs.push(reason) },
+  ));
+  driver.activate(occupant("old"));
+  await driver.start();
+  const channels = [new ManualChannel(), new ManualChannel()];
+  for (const c of channels) factory.give(c);
+  heard.old.length = 0; // their two linkOpens
+
+  driver.activate(occupant("new"));
+  await settle(0);
+  assert(heard.old.length === 0, `the outgoing occupant must hear nothing, heard ${JSON.stringify(heard.old)}`);
+  assert(heard.new.length === 0, `the incoming occupant must hear nothing, heard ${JSON.stringify(heard.new)}`);
+  assert(channels.every((c) => c.closes === 1), "every socket the outgoing occupant held is closed");
+  assert(downs.length === 2 && downs.every((r) => r === 0),
+    `each link reports down once, unanswered, got ${JSON.stringify(downs)}`);
+});
+
 await test("default caps are sane", async () => {
   const defaults = verifyBundle(sodium, transportBlob).manifest.guest.config;
   assert(defaults.maxAuthedLinks > 0 && defaults.maxAuthedLinks <= 4096,

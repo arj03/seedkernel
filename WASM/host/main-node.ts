@@ -11,24 +11,16 @@
 import { readFileSync } from "node:fs";
 import { runCli, type CliHost } from "./cli.js";
 import { bootNodeShell } from "./shell-node.js";
-import { writeFileAtomic } from "./fs-node.js";
+import { nodeFiles } from "./fs-node.js";
 import { loadCrypto } from "./crypto-node.js";
 import { errMessage } from "../core/util.js";
 
 async function nodeHost(): Promise<CliHost> {
   const sodium = await loadCrypto();
   return {
+    ...nodeFiles,
     banner: "seedkernel-shell",
     argv: process.argv.slice(2),
-    // null for absent, per the `CliFiles` contract: the `--key` path takes that branch
-    // on a first boot and mints a seed instead of failing.
-    readFile(path) {
-      try { return new Uint8Array(readFileSync(path)); }
-      catch { return null; }
-    },
-    // Atomic (fs-node.ts): what this writes is the node's master seed, and a seed
-    // half-written on a first boot is a node whose identity changes when it restarts.
-    writeFile: writeFileAtomic,
     // STDERR, not stdout: stdout carries an app's raw `--op` response bytes, which an
     // operator line landing in it would corrupt.
     log(line) { console.error(line); },

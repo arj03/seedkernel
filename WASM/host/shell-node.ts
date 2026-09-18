@@ -10,13 +10,11 @@
 import { readFileSync } from "node:fs";
 import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
-import { FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
-import { NodeFs, writeFileAtomic } from "./fs-node.js";
+import { NodeFs, nodeFiles } from "./fs-node.js";
 import { bootShell, type AppHandle, type InstallOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
 import { type Fs } from "../core/fs.js";
-import { errMessage } from "../core/util.js";
-import type { NodeRuntime as CliNodeRuntime, NodeSetup } from "./cli.js";
+import { freshnessStoreFor, type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
 
 /** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
  *  `installFile` and a guaranteed `fs` (Node always has a filesystem). */
@@ -35,26 +33,6 @@ export interface NodeShellRuntime extends CliNodeRuntime {
   shell: NodeShell;
 }
 
-/** The freshness store (`{ marks, revoked }`) over one JSON file, kept OUTSIDE the
- *  guest-writable fs directory so a `fs`-capable guest cannot tamper with its own mark or
- *  the dead-key set beside it (§12.5). An operator rolls back a mark, or un-revokes a key,
- *  by editing this file out of band. The rules live in `FreshnessMarks` (bundle.ts); this
- *  adds only the Node persistence seam. The write is atomic (fs-node.ts): truncated JSON is
- *  what a boot reads as "start empty", every downgrade mark silently discarded (§12.4). */
-export function fileFreshnessStore(path: string): FreshnessMarks {
-  let json = null;
-  try {
-    json = readFileSync(path, "utf8");
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException)?.code;
-    if (code !== "ENOENT") {
-      throw new Error(`freshness store: cannot read ${path}: ${errMessage(e)}`, { cause: e });
-    }
-    // A genuine missing file is the only first-boot case.
-  }
-  return new FreshnessMarks(json, (out) => writeFileAtomic(path, out));
-}
-
 // The realm factory (§12.3) is deliberately not stated here: bootShell's default IS the
 // lazy safe-js import this platform wants (the engine is heavy, so it loads on the first
 // realm), and a second copy of it would be the drift the assembly exists to remove.
@@ -65,7 +43,7 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
   const sodium = await loadCrypto();
   // ── Node platform seam ─────────────────────────────────────────────────────
   const fs = new NodeFs(opts.dir);
-  const freshness = fileFreshnessStore(freshnessPathFor(opts.dir));
+  const freshness = freshnessStoreFor(nodeFiles, opts.dir);
   // Everything a boot can fail on happens inside bootShell, which tears down what it stood
   // up when it throws, so this function has no partial state to clean.
   const { shell: core, transport } = await bootShell({

@@ -46,10 +46,11 @@ export function fromHex(hex: string): Uint8Array {
   return out;
 }
 
-/** 32 bytes as lowercase hex — the shape of every key and secret an operator types.
+/** 32 bytes as hex, in either case — the shape of every key, author id and secret an
+ *  operator types, and the one check for it; a caller that keeps the string lowercases it.
  *  `fromHex` maps a non-hex pair to 0, so an unvalidated decode turns a typo into a
  *  different-but-plausible 32 bytes. */
-const HEX64 = /^[0-9a-f]{64}$/;
+const HEX64 = /^[0-9a-fA-F]{64}$/;
 export function isHex64(s: string): boolean {
   return HEX64.test(s);
 }

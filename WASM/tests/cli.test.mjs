@@ -4,8 +4,8 @@
 // under test is the flow, not the assembly of a node (transport.test.mjs and the Go
 // suite drive that for real).
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { testkit } from "./testkit.mjs";
 
@@ -61,7 +61,9 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
     stood: null,
     readFile(path) {
       if (written.has(path)) return written.get(path);
-      try { return new Uint8Array(readFileSync(path)); } catch { return null; }
+      // Absent is a missing file and nothing else — the `CliFiles` contract.
+      try { return new Uint8Array(readFileSync(path)); }
+      catch (e) { if (e.code === "ENOENT") return null; throw e; }
     },
     writeFile(path, bytes) { written.set(path, bytes); },
     log(line) { lines.push(line); },
@@ -154,6 +156,48 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1
   const host = fakeHost(["--key", join(work, "g0.key"), "--guest-timeout", "0"]);
   await runCli(host);
   ok(host.stood.guestDeadlineMs === Infinity, "--guest-timeout 0 is Infinity — no budget, said explicitly");
+}
+// Anything but a whole number is refused, never coerced: `Number` reads "5000ms" as NaN,
+// which once became no budget at all, and "64M" as a NaN heap limit, which the JS engine
+// reads as no limit. Refused before a key is minted or a shell stood up.
+for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", "-1"],
+  ["--guest-memory", "64M"], ["--guest-memory", ""], ["--guest-memory", "1.5"]]) {
+  const host = fakeHost(["--key", join(work, "gbad.key"), flag, value]);
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.startsWith(`${flag} must be a whole number`) && host.written.size === 0 && host.stood === null,
+    `${flag} ${JSON.stringify(value)} is refused`);
+}
+
+// A key file that exists and cannot be read fails the boot. Read as absent, the first-boot
+// branch would mint a new seed and write it over the node's identity.
+{
+  const keyPath = join(work, "unreadable.key");
+  const host = fakeHost(["--key", keyPath]);
+  host.readFile = (path) => {
+    if (path === keyPath) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    return null;
+  };
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.startsWith(`--key: cannot read ${keyPath}`) && host.written.size === 0 && host.stood === null,
+    "an unreadable --key fails the boot and mints nothing over it");
+}
+// The Node binding keeps that contract, as native does (fs-node.ts `nodeFiles`). A
+// directory at the path is a portable read failure that cannot be mistaken for ENOENT.
+{
+  const { nodeFiles } = await imp("build/host/fs-node.js");
+  ok(nodeFiles.readFile(join(work, "never-written")) === null, "Node: only a missing file reads as absent");
+  const keyDir = mkdtempSync(join(work, "keydir-"));
+  throws(() => nodeFiles.readFile(keyDir), "Node: a path that exists and cannot be read throws");
+  const host = fakeHost(["--key", keyDir]);
+  host.readFile = nodeFiles.readFile;
+  host.writeFile = nodeFiles.writeFile;
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  const temps = readdirSync(work).filter((n) => n.startsWith(basename(keyDir) + ".") && n.endsWith(".tmp"));
+  ok(msg.startsWith("--key: cannot read") && statSync(keyDir).isDirectory() && temps.length === 0,
+    "Node: an unreadable --key fails at the read, and nothing is written beside it");
 }
 
 // App config belongs to the bundle named in the same invocation. It is not node setup,

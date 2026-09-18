@@ -53,8 +53,8 @@ const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/core/op-frame.js");
-const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { createActiveHostCallRegistry, createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
+const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/safe-js.js");
+const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
 const { ok, throws, summary, sleep } = testkit();
 /** Await a promise and assert it rejects — the async form of `throws`, which is what a
@@ -865,6 +865,24 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   await reload({ realmMemoryBytes: 9 * 1024 * 1024, guestDeadlineMs: 77 });
   ok(seen.at(-1)?.memoryLimitBytes === 9 * 1024 * 1024, "a load's own realmMemoryBytes overrides the shell's");
   ok(seen.at(-1)?.deadlineMs === 77, "a load's own guestDeadlineMs overrides the shell's");
+  // A bound the two engines would read differently is refused where it is resolved, for
+  // one load and the node's defaults alike: a heap limit that truncates to 0 (or is NaN)
+  // is no limit to the JS engine and a refused realm natively, 2^32 and up wraps on JS, and
+  // a budget under 1 ms is none natively and a refused realm on JS.
+  const realmsBefore = seen.length;
+  for (const bad of [0, 0.5, NaN, -1, 2 ** 32]) {
+    await rejects(reload({ realmMemoryBytes: bad }), `a load's realmMemoryBytes of ${bad} is refused`);
+  }
+  for (const bad of [0, 0.5, NaN, -5]) {
+    await rejects(reload({ guestDeadlineMs: bad }), `a load's guestDeadlineMs of ${bad} is refused`);
+  }
+  ok(seen.length === realmsBefore, "…before a realm is stood for it");
+  await reload({ guestDeadlineMs: Infinity });
+  ok(seen.at(-1)?.deadlineMs === Infinity, "Infinity is still the one way to say no budget");
+  for (const bad of [{ realmMemoryBytes: 0 }, { guestDeadlineMs: -5 }]) {
+    await rejects(bootShell({ sodium, identity: kp.ed, transport: false, ...bad }),
+      `a node default of ${JSON.stringify(bad)} fails the boot`);
+  }
   const cyclic = {}; cyclic.self = cyclic;
   await rejects(reload({ localConfig: cyclic }),
     "a non-JSON local value is refused instead of being silently changed during injection");

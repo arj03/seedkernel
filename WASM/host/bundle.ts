@@ -1,5 +1,5 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
+import { concatBytes, toHex, isHex64, enc, dec, errMessage } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService } from "../core/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
@@ -432,20 +432,22 @@ export class FreshnessMarks {
       for (const [k, v] of Object.entries(marks)) {
         // The app suffix is arbitrary manifest text (and may contain line breaks),
         // so validate the fixed author prefix and the non-empty suffix separately.
-        if (!/^[0-9a-fA-F]{64}:/u.test(k) || k.length === 65) {
+        if (!isHex64(k.slice(0, 64)) || k[64] !== ":" || k.length === 65) {
           throw new Error(`freshness store: corrupt file — mark key ${JSON.stringify(k)} is not "<author hex>:<app>"`);
         }
         if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
           throw new Error(`freshness store: corrupt file — mark "${k}" is not a non-negative safe-integer version (got ${JSON.stringify(v)})`);
         }
-        this.marks.set(k, v);
+        // Lowercased like `revoked` below: `key()` looks marks up by `toHex`, so a hand-edited
+        // mark in capitals would parse and then guard nothing.
+        this.marks.set(k.slice(0, 64).toLowerCase() + k.slice(64), v);
       }
       const revoked = raw.revoked;
       if (!Array.isArray(revoked)) {
         throw new Error('freshness store: corrupt file — "revoked" must be an array of hex author ids');
       }
       for (const a of revoked) {
-        if (typeof a !== "string" || !/^[0-9a-fA-F]{64}$/u.test(a)) {
+        if (typeof a !== "string" || !isHex64(a)) {
           throw new Error(`freshness store: corrupt file — a revoked entry is not a 32-byte author id in hex (got ${JSON.stringify(a)})`);
         }
         this.revoked.add(a.toLowerCase());

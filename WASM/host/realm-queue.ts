@@ -1,76 +1,17 @@
-// Per-realm host-side owners shared by the JS and native realm factories: active
-// guest-to-host calls and serialized entry into one confined realm.
+// The realm contract and the per-realm host-side owners both realm factories build on
+// (safe-js.ts, native-shim.ts): serialized entry into one confined realm, and the deadlines
+// that bound it. What a realm's unanswered host calls hold is each target's own to count —
+// after the copy out of the guest heap on JS (safe-js.ts), before it natively
+// (native/hostcalls.go).
 
-import {
-  DEFAULT_GUEST_DEADLINE_MS,
-  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-  DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-} from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS } from "../core/wasm-limits.js";
 import { Fifo } from "../core/util.js";
 import type { HostCall } from "./guest-seam.js";
 
-function checkedBytes(bytes: number): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0) {
-    throw new Error("guest: payload width is not a non-negative safe integer");
-  }
-  return bytes;
-}
-
-/** One active call's custody, held from admission through settlement. */
-export interface ActiveHostCall {
-  reserve(bytes: number): void;
-  release(): void;
-}
-
-/** Own every guest-to-host copy and promise slot from admission through settlement. */
-export function createActiveHostCallRegistry(
-  maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
-  maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-): {
-  admit(callId: number, payloadBytes: number): ActiveHostCall;
-  releaseAll(): void;
-} {
-  const active = new Map<number, ActiveHostCall>();
-  let bytes = 0;
-  return {
-    releaseAll(): void {
-      for (const call of [...active.values()]) call.release();
-    },
-    admit(callId: number, payloadBytes: number): ActiveHostCall {
-      if (!Number.isSafeInteger(callId)) throw new Error("guest: invalid host call id");
-      if (active.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
-      checkedBytes(payloadBytes);
-      if (active.size >= maxCalls) {
-        throw new Error(`guest: too many outstanding host calls (cap ${maxCalls})`);
-      }
-      if (payloadBytes > maxBytes - bytes) {
-        throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
-      }
-      bytes += payloadBytes;
-      let owned = payloadBytes;
-      let live = true;
-      const call: ActiveHostCall = {
-        reserve(additionalBytes: number): void {
-          if (!live) throw new Error("guest: host call is no longer active");
-          checkedBytes(additionalBytes);
-          if (additionalBytes > maxBytes - bytes) {
-            throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
-          }
-          bytes += additionalBytes;
-          owned += additionalBytes;
-        },
-        release(): void {
-          if (!live) return;
-          live = false;
-          active.delete(callId);
-          bytes -= owned;
-        },
-      };
-      active.set(callId, call);
-      return call;
-    },
-  };
-}
+/** The message a disposed realm fails every caller it can no longer answer with — in flight
+ *  or still queued, on every target. One constant, because `TransportHost` also reads it to
+ *  tell its own teardown from a failure worth logging. */
+export const REALM_DISPOSED = "guest realm disposed";
 
 /** One entrypoint invocation. Settling `result` normally releases the realm for the next
  *  one; a DEFERRED entrypoint (`__deferred`) ended its execution segment before its answer

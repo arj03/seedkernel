@@ -5,7 +5,7 @@
 // is the default for ordinary apps.
 
 
-import { toHex } from "../core/util.js";
+import { isHex64, toHex } from "../core/util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
 /** The ONE admission seam. `(v) → bool | Promise<bool>`.
@@ -53,7 +53,7 @@ export function parsePolicy(json: string): Admit {
   for (const key of Object.keys(o)) {
     if (key !== "authors") throw new Error(`policy: "${key}" is not a policy key (expected "authors")`);
   }
-  if (!Array.isArray(o.authors) || o.authors.some((a) => typeof a !== "string" || !/^[0-9a-f]{64}$/i.test(a))) {
+  if (!Array.isArray(o.authors) || o.authors.some((a) => typeof a !== "string" || !isHex64(a))) {
     throw new Error('policy: "authors" must be an array of 64-character hex author ids');
   }
   return authorAllowlist(o.authors);

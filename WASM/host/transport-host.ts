@@ -1,7 +1,7 @@
 // Socket driver: owns links and listeners; protocol and peer state stay in the signed guest
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
-import { fromHex, Fifo } from "../core/util.js";
+import { errMessage, fromHex, Fifo } from "../core/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_FRAME_BYTES,
@@ -15,7 +15,7 @@ import {
 import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
 import { type RawNet } from "./guest-seam.js";
-import type { CausalClock } from "./realm-queue.js";
+import { REALM_DISPOSED, type CausalClock } from "./realm-queue.js";
 import { OpArgs } from "../core/op-frame.js";
 
 const EMPTY = new Uint8Array(0);
@@ -209,9 +209,11 @@ export class TransportHost {
 
   available(): boolean { return !this.closed && this.call !== null; }
 
-  /** Publish the binding, closing links from any previous occupant. */
+  /** Publish the binding, closing links from any previous occupant — released FIRST, so
+   *  those closes find the binding vacant and queue no `linkClosed` into a realm that is on
+   *  its way out (`reset`). */
   activate(call: TransportCall): void {
-    if (this.call) this.reset();
+    this.release();
     this.call = call;
   }
 
@@ -302,7 +304,7 @@ export class TransportHost {
    *  it — this driver's own teardown or replacement, which would otherwise print an error
    *  per ordinary shutdown. */
   private reportOpError(op: string, err: unknown): void {
-    if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+    if (errMessage(err) === REALM_DISPOSED) return;
     console.error(`[transport] error in ${op}: ${String(err)}`);
   }
 
