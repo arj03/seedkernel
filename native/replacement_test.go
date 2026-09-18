@@ -35,18 +35,17 @@ func TestExplicitReplacementAcrossAuthors(t *testing.T) {
 			  try {
 			    let old;
 			    if (links) {
-			      const key = n.shell.resolve("service");
 			      let refused = false;
 			      try { await n.shell.install(second); } catch { refused = true; }
 			      if (!refused) throw new Error("ordinary load acquired link");
-			      old = { key };
 			    } else {
 			      old = await n.shell.install(first);
 			    }
-			    const next = await n.shell.install(second, { replaces: old.key });
-			    if (next.key === old.key || n.shell.resolve("service") !== next.key)
-			      throw new Error("replacement did not transfer the claim");
-			    if (n.shell.uninstall(old.key)) throw new Error("old identity survived");
+			    // Another author under the same label: the claim and the label's namespaces
+			    // pass to the new author.
+			    const next = await n.shell.install(second, { replaces: "service" });
+			    if (n.shell.resolve("service") !== "service")
+			      throw new Error("replacement did not keep the label and its claim");
 			    if (links && !n.transport.available()) throw new Error("link was not transferred");
 			    if (!links) {
 			      let refused = false;

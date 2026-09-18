@@ -138,11 +138,6 @@ export interface VerifiedBundle {
  *  without retaining the raw module bytes after the private instances are built. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
-/** App identity `"<author hex>:<app>"` (§12.4) — freshness, scope, uninstall/revoke. */
-export function appKeyFor(author: Uint8Array, app: string): string {
-  return toHex(author) + ":" + app;
-}
-
 /** The genesis hash (BLAKE2b-256) — the one system hash. A free function taking the crypto
  *  rather than a host method, so target module builders need no crypto dependency. */
 export function genesisHash(sodium: ManifestVerifier, data: Uint8Array): Uint8Array {
@@ -155,14 +150,14 @@ export function reachesLink(manifest: BundleManifest): boolean {
   return manifest.guest.requires.includes("link");
 }
 
-/** The fs keyspace prefix for one app (§12.2). A hash of the app key rather than the key
- *  itself, because it must double as a *filename* component: both fs backends restrict keys
- *  to `[A-Za-z0-9._-]`, which an author-chosen `app` cannot be trusted to satisfy. 128 bits
- *  fixed-length hex also means no prefix can extend another — this separates namespaces, it
- *  does not authenticate them. */
-export function appScopeFor(crypto: ManifestVerifier, author: Uint8Array, app: string): string {
-  const key = enc.encode(appKeyFor(author, app));
-  return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
+/** The fs keyspace prefix for one app label (§12.2). A hash of the label rather than the
+ *  label itself, because it must double as a *filename* component: both fs backends
+ *  restrict keys to `[A-Za-z0-9._-]`, which an author-chosen `app` cannot be trusted to
+ *  satisfy, and lowercase hex cannot be merged by a case-folding filesystem. 128 bits of
+ *  fixed-length hex also means no prefix can extend another — this separates namespaces,
+ *  it does not authenticate them. */
+export function appScopeFor(crypto: ManifestVerifier, app: string): string {
+  return toHex(genesisHash(crypto, enc.encode(app))).slice(0, 32) + "-";
 }
 
 const SUITE_LEN = 1;
@@ -432,7 +427,7 @@ export class FreshnessMarks {
       }
       const marks = raw.marks;
       if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
-        throw new Error('freshness store: corrupt file — "marks" must be an object of {appKey: version} pairs');
+        throw new Error('freshness store: corrupt file — "marks" must be an object of {"<author hex>:<app>": version} pairs');
       }
       for (const [k, v] of Object.entries(marks)) {
         // The app suffix is arbitrary manifest text (and may contain line breaks),
@@ -463,7 +458,9 @@ export class FreshnessMarks {
     for (const [k, v] of this.marks) marks[k] = v;
     return JSON.stringify({ marks, revoked: [...this.revoked] });
   }
-  key(author: Uint8Array, app: string): string { return appKeyFor(author, app); }
+  /** The lineage a mark belongs to, `"<author hex>:<app>"`: an author's own version count
+   *  for a label, so another author installing the same label starts its own. */
+  private key(author: Uint8Array, app: string): string { return toHex(author) + ":" + app; }
   get(author: Uint8Array, app: string): number {
     const v = this.marks.get(this.key(author, app));
     return v === undefined ? -Infinity : v;

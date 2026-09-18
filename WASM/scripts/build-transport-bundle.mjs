@@ -85,7 +85,7 @@ async function main() {
     // of these values through the load's LOCAL config; the guest applies LOCAL ?? APP.
     guestConfig: TRANSPORT_APP_CONFIG,
   });
-  // The 0x02 author id: the key-set hash app keys derive from and freshness is keyed
+  // The 0x02 author id: the key-set hash policy pins and freshness are keyed
   // by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`). Carried on the authorBundle
   // value above.
   writeFileSync(join(root, "build", "transport.skb"), blob);

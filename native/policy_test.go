@@ -11,8 +11,8 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
 	startShell(t, authorsPolicy(author.id()), nil)
-	bundlePath, appKey := writeTestBundle(t, author, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  key "+appKey) {
+	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
+	if status := loadBundle(bundlePath); status != loadedLine("testapp", 1, author.id(), "testapp") {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }
@@ -86,56 +86,45 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// Two authors shipping an app under the SAME name coexist (README §5.1): a slot's
-// identity is derived from its author's key, so B never aims at A's slot in the first
-// place. There is no ownership register and no same-author clause — the collision the old
-// register existed to refuse is unrepresentable, and both slots land.
+// One slot per app label on a node, whoever authored it (README §5.1): the label names the
+// slot's fs and signing namespaces, so a second author's bundle under a label already
+// standing is refused by name, even one claiming nothing the first serves. Taking a label
+// over means naming the slot being replaced, which this operator flow never does.
 //
-// The app name and the wire claim are separate facts, which is what the middle of this
-// test pins down: identity coexists, a claim does not. A claim has ONE active owner
-// (§12.10), so B contesting the id A serves is refused by name — B's own identity is what
-// it may install under, never A's route.
-func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
+// The label and the wire claim are separate facts, and both have ONE owner: B under a
+// label of its own still cannot contest the id A serves (§12.10).
+func TestOneSlotPerLabel(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	authorA := testAuthor(t)
 	authorB := testAuthor(t)
 	// Both authors are allowed to install: this test is about the namespace, not the
 	// closed author set. A permissive policy is exactly the interesting case — even with
-	// nothing refusing anyone, neither author can reach the other's names.
+	// nothing refusing anyone, neither author can take the other's label or claim.
 	startShell(t, authorsPolicy(authorA.id(), authorB.id()), nil)
-	keyA := appKeyFor(authorA.id(), "ownedapp")
-	keyB := appKeyFor(authorB.id(), "ownedapp")
-	if keyA == keyB {
-		t.Fatal("the same app name under two authors must derive distinct app keys")
-	}
 	// A installs and claims the id its manifest declares. Asserted on the whole operator
 	// line rather than on a substring: every rejection below also names the app, so a
 	// `Contains` would read a refused load as a successful one.
-	bundleA, _ := writeTestBundle(t, authorA, "ownedapp", 1)
-	if status := loadBundle(bundleA); status != loadedLine("ownedapp", 1, keyA, "ownedapp") {
+	bundleA, keyA := writeTestBundle(t, authorA, "ownedapp", 1)
+	if status := loadBundle(bundleA); status != loadedLine("ownedapp", 1, authorA.id(), "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
 	}
 	if out, err := invokeBundle(keyA, []byte("A")); err != nil || string(out) != "A" {
 		t.Fatalf("author A's slot did not run through `%s`: %q, %v", keyA, out, err)
 	}
-	// B contesting A's claim is refused by name — and refused WHOLE, so nothing of B is
-	// left behind for the install below to collide with.
-	contested, _ := writeTestBundle(t, authorB, "ownedapp", 1)
-	if status := loadBundle(contested); !strings.Contains(status, "is already held by '"+keyA+"'") {
-		t.Fatalf("a second identity contesting an active claim must be refused by name: %s", status)
-	}
-	// B's bundle declares the same app name under a claim of its own, and installs too —
-	// beside A, never over it.
-	bundleB := writeBundleFile(t, "ownedapp",
+	// B under A's label is refused by name, even claiming an id of its own.
+	sameLabel := writeBundleFile(t, "ownedapp",
 		bundleEnvelope(t, authorB, claimManifest(t, "ownedapp", "ownedapp-b"), stubGuestSrc, forwarderWasm))
-	if status := loadBundle(bundleB); status != loadedLine("ownedapp", 1, keyB, "ownedapp-b") {
-		t.Fatalf("author B's install should be admitted under its own name: %s", status)
+	if status := loadBundle(sameLabel); !strings.Contains(status, "'ownedapp' is already installed") {
+		t.Fatalf("a second author under a standing label must be refused by name: %s", status)
 	}
-	if out, err := invokeBundle(keyB, []byte("B")); err != nil || string(out) != "B" {
-		t.Fatalf("author B's slot did not run through `%s`: %q, %v", keyB, out, err)
+	// B under a label of its own, contesting A's claim, is refused by name too.
+	contested := writeBundleFile(t, "otherapp",
+		bundleEnvelope(t, authorB, claimManifest(t, "otherapp", "ownedapp"), stubGuestSrc, forwarderWasm))
+	if status := loadBundle(contested); !strings.Contains(status, "is already held by '"+keyA+"'") {
+		t.Fatalf("a second app contesting an active claim must be refused by name: %s", status)
 	}
-	// The decisive assertion: A's slot, and the id it serves, are untouched by B's install.
+	// The decisive assertion: A's slot, and the id it serves, are untouched by both.
 	if out, err := invokeBundle(keyA, []byte("A2")); err != nil || string(out) != "A2" {
-		t.Fatalf("author B's install displaced author A's slot `%s`: %q, %v", keyA, out, err)
+		t.Fatalf("author B's installs displaced author A's slot `%s`: %q, %v", keyA, out, err)
 	}
 }

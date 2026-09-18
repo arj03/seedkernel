@@ -233,43 +233,41 @@ The transport options carry the socket adapter, listeners, selected `bundle`, an
 Live changes are the same `install`, naming the slot they retire — ordinary apps and the transport alike:
 
 ```js
-// oldChat.key is the handle returned when the chat app was installed.
-const chat = await shell.install(newChatBlob, { replaces: oldChat.key, localConfig: chatConfig });
+// A slot is named by its app label.
+const chat = await shell.install(newChatBlob, { replaces: "chat", localConfig: chatConfig });
 
 // Use the current transport's declared service id to find its owner.
-const oldTransportKey = shell.resolve(TRANSPORT_SERVICE);
-if (oldTransportKey === null) throw new Error("No transport is installed");
+const oldTransport = shell.resolve(TRANSPORT_SERVICE);
+if (oldTransport === null) throw new Error("No transport is installed");
 const transportApp = await shell.install(newTransportBlob, {
-  replaces: oldTransportKey,
+  replaces: oldTransport,
   localConfig: transportConfig,
 });
 ```
 
-An installer that may be seeing either — a first install or an upgrade — decides with one field, since the app key is a fact of the signed manifest and so is known before the install:
+An installer that may be seeing either — a first install or an upgrade — decides with one field, since the app label is a fact of the signed manifest and so is known before the install:
 
 ```js
-import { appKeyFor, verifyBundle } from "seedkernel-wasm/bundle";
+import { verifyBundle } from "seedkernel-wasm/bundle";
 
-const v = verifyBundle(sodium, blob);
-const key = appKeyFor(v.author, v.manifest.app);   // the key the shell will install under
-await shell.install(blob, { replaces: installedKeys.has(key) ? key : undefined });
+const app = verifyBundle(sodium, blob).manifest.app;   // the label the shell will install under
+await shell.install(blob, { replaces: installed.has(app) ? app : undefined });
 ```
 
-The incoming author and app name may differ from the slot being retired. App candidates still pass `admit`. Naming a slot is the only way to displace one: an install without `replaces` refuses an identity already installed, so an app's own next version names its slot too. Only replacing the current link owner authorizes a candidate requiring `link`.
+The incoming author and app name may differ from the slot being retired. App candidates still pass `admit`. Naming a slot is the only way to displace one: an install without `replaces` refuses a label already installed, whoever authored it, so an app's own next version names its slot too. Only replacing the current link owner authorizes a candidate requiring `link`.
 
-Replacement builds first, then commits the new claims and releases the predecessor. The exact selected slot must still be current at commit; concurrent replacement or uninstall causes failure. Unrelated claims and already-installed candidate identities remain protected. A failed candidate leaves the current owner running. A successful replacement invalidates its predecessor's invocation handles.
+Replacement builds first, then commits the new claims and releases the predecessor. The exact selected slot must still be current at commit; concurrent replacement or uninstall causes failure. Unrelated claims and labels other slots hold remain protected. A failed candidate leaves the current owner running. A successful replacement invalidates its predecessor's invocation handles.
 
-Identity scopes do not transfer: a new author has its own filesystem namespace, app signing scope, and version history. Existing data remains under the old identity; migration is the application's responsibility. Transport replacement keeps node identity and listeners but closes old links and discards the old realm's session keys and address book. Supply the new transport's configuration again.
+The filesystem and signing scopes belong to the label: a replacement keeping the label keeps both, whoever authored it, and one changing the label starts on the new label's while the old label's data stays on disk. Version history is the author's own, so a new author starts its own count. Transport replacement keeps node identity and listeners but closes old links and discards the old realm's session keys and address book. Supply the new transport's configuration again.
 
 The initial transport loads at boot. If the current link owner is uninstalled or replaced by an ordinary app, installing another transport requires booting a new node.
 
 `bootNodeShell` and the native loader's `standUp` take `bootShell`'s own `transport` option, so omitting it stands a node without a network, whose returned `transport` is then `null`; the platform supplies the socket adapter when the options name none. The CLI sets this choice explicitly: networking requires `--listen`, `--ws-listen`, or `--peers`, and `--transport` and `--contact-secret` are refused without one of them.
 
-**Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither adds a host capability, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified `(author, app)` and the signed claim lists `admit` is already handed:
+**Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither adds a host capability, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified author, `app` label and the signed claim lists `admit` is already handed:
 
 ```js
 import { policyFromJson } from "seedkernel-wasm/shell-core";
-import { appKeyFor } from "seedkernel-wasm/bundle";
 
 // Replace these placeholders with approved 64-character lowercase author ids.
 const appAuthor = "<approved app author id in hex>";
@@ -278,6 +276,7 @@ const transportAuthor = "<approved transport author id in hex>";
 const basePolicy = policyFromJson(JSON.stringify({
   authors: [appAuthor],
 }));
+// Each pinned claim names the one author and app label allowed to hold it.
 const protocolOwners = new Map([
   ["private-chat-v1", `${appAuthor}:private-chat`],
 ]);
@@ -286,8 +285,9 @@ const serviceOwners = new Map([
   ["_net", `${transportAuthor}:transport`],
 ]);
 
+const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const approvedClaims = (v) => {
-  const owner = appKeyFor(v.author, v.manifest.app);
+  const owner = `${hex(v.author)}:${v.manifest.app}`;
   const matches = (claims, pins) => (claims ?? []).every(
     (claim) => !pins.has(claim) || pins.get(claim) === owner,
   );
@@ -301,7 +301,7 @@ const admit = async (v) => (await basePolicy(v)) && approvedClaims(v);
 
 Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`. Bundles requiring `link` bypass this predicate: explicit selection is the trust decision, so these maps cannot constrain a transport's claims. Revocation and freshness apply to both paths.
 
-A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
+A load returns an **`AppHandle`**: the verified manifest and author, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
 `install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None becomes signed bundle content. For every app, including the transport, `localConfig` becomes `LOCAL` unchanged. The transport's `networkKey` is ordinary `LOCAL` config: 64 lowercase hex characters when supplied, with absence selecting the public network's zero key. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network. The transport reads the node's identity from `HOST`. Its contact secret is ordinary `LOCAL` config: `contactSecret` is 64 lowercase hex, absence means open, and the `contact` op rotates it at runtime.
 

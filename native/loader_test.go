@@ -19,7 +19,7 @@ import (
 // since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
-	key := appKeyFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp")
+	key := "scratchapp"
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot(forwarder) refused: %v", err)
 	}
@@ -53,12 +53,12 @@ func TestBundleModuleRuns(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
 	startShell(t, authorsPolicy(author.id()), nil)
-	bundlePath, appKey := writeTestBundle(t, author, "runapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  key "+appKey) {
+	bundlePath, app := writeTestBundle(t, author, "runapp", 1)
+	if status := loadBundle(bundlePath); status != loadedLine("runapp", 1, author.id(), "runapp") {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")
-	r, err := invokeBundle(appKey, msg)
+	r, err := invokeBundle(app, msg)
 	if err != nil || !bytes.Equal(r, msg) {
 		t.Fatalf("bundle module echo = %q, want %q (module ran + host read its response)", r, msg)
 	}
@@ -66,15 +66,15 @@ func TestBundleModuleRuns(t *testing.T) {
 
 // TestManifestClaimIsTheRouting covers the load-time claim (§12.10): the manifest names
 // the protocol ids the app serves and the load that admits the code claims them, so there
-// is no operator step between installing an app and it answering — and no app key to
+// is no operator step between installing an app and it answering — and no route to
 // mistype into a node that boots clean and answers an empty body forever. The id's format
 // is checked at the load, so an unroutable claim is refused where it can be named.
 func TestManifestClaimIsTheRouting(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	author := testAuthor(t)
 	startShell(t, authorsPolicy(author.id()), nil)
-	bundlePath, appKey := writeTestBundle(t, author, "claimapp", 1)
-	if status := loadBundle(bundlePath); status != loadedLine("claimapp", 1, appKey, "claimapp") {
+	bundlePath, _ := writeTestBundle(t, author, "claimapp", 1)
+	if status := loadBundle(bundlePath); status != loadedLine("claimapp", 1, author.id(), "claimapp") {
 		t.Fatalf("the load must claim what the manifest declares: %s", status)
 	}
 	// A space is not in the protocol charset (§12.10), so this bundle is refused whole —
@@ -87,8 +87,8 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 	// Two claim lists are two maps: the shipped transport holds "_net" under `services`, so
 	// the same spelling under `protocols` is a second reach with its own owner, not a
 	// contest. No claim name carries authority either way.
-	netPath, netKey := signBundleJSON(t, author, "netsquat", claimManifest(t, "netsquat", "_net"), stubGuestSrc)
-	if status := loadBundle(netPath); status != loadedLine("netsquat", 1, netKey, "_net") {
+	netPath, _ := signBundleJSON(t, author, "netsquat", claimManifest(t, "netsquat", "_net"), stubGuestSrc)
+	if status := loadBundle(netPath); status != loadedLine("netsquat", 1, author.id(), "_net") {
 		t.Fatalf("a protocols claim spelled _net is a peer-side name of its own: %s", status)
 	}
 	// Within ONE map it is still one owner.
@@ -102,8 +102,8 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 	}
 	// An ordinary `_`-led id is a LOCAL service name no peer can reach, so it claims like
 	// any other id: the reservation is about routing, not about authority.
-	localPath, appKey2 := signBundleJSON(t, author, "offerapp", claimManifest(t, "offerapp", "_offer"), stubGuestSrc)
-	if status := loadBundle(localPath); status != loadedLine("offerapp", 1, appKey2, "_offer") {
+	localPath, _ := signBundleJSON(t, author, "offerapp", claimManifest(t, "offerapp", "_offer"), stubGuestSrc)
+	if status := loadBundle(localPath); status != loadedLine("offerapp", 1, author.id(), "_offer") {
 		t.Fatalf("an ordinary reserved id claims like any other: %s", status)
 	}
 }

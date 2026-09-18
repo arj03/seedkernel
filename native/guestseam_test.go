@@ -38,7 +38,7 @@ func TestGuestSeamOps(t *testing.T) {
 		globalThis.__other = sodium.crypto_sign_keypair();
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
 		// the key that signs, all three.
-		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
+		globalThis.__scope = appSignScope(__id, "testapp");
 		__buildGuestSeam(["node", "fs", "clock"], null, __scope);
 	`); err != nil {
 		t.Fatal("build seam:", err)

@@ -208,7 +208,6 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 // stable while the realm and its private session state are replaced.
 console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
-const oldClaimant = a.shell.resolve(TRANSPORT_SERVICE);
 let candidateConfigured;
 const configured = new Promise((resolve) => { candidateConfigured = resolve; });
 let publishCandidate;
@@ -223,10 +222,10 @@ await configured;
 // GONE rather than replayed.
 await addr(a, cId, `tcp://loopback:${cNet.port}`);
 publishCandidate();
-await upgrading;
+const upgraded = await upgrading;
 
-assert(a.shell.resolve(TRANSPORT_SERVICE) !== oldClaimant &&
-  a.shell.resolve(TRANSPORT_SERVICE).startsWith(Buffer.from(replacementKeys.id).toString("hex")),
+assert(Buffer.from(upgraded.author).toString("hex") === Buffer.from(replacementKeys.id).toString("hex") &&
+  a.shell.resolve(TRANSPORT_SERVICE) === upgraded.manifest.app,
   "the new author took over the transport claim");
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
@@ -337,9 +336,9 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
   try { await reinstallTransport(c, transportBundleAt(2, transportKeys)); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), `a bundle whose mark cannot be written fails the load (got: ${msg})`);
   assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
-  assert(c.shell.resolve(TRANSPORT_SERVICE)?.startsWith(transportAuthor),
-    "nothing of the failed load was kept — the claim went back to the transport that was standing, " +
-    "rather than the uncommitted bundle serving on");
+  assert(c.shell.resolve(TRANSPORT_SERVICE) === "transport" && store.get(transportVerified.author, "transport") === 1,
+    "nothing of the failed load was kept — the claim stayed with the transport that was standing, " +
+    "and its mark did not advance");
 
   // The mark was rolled back, so the retry is a fresh advance and not a no-op against a
   // store that never got the first one.

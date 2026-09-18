@@ -331,7 +331,7 @@ export class ModuleTable implements PureModuleLoader {
 
   /** Invoke one module in this private set, returning its response bytes or null. The
    *  scratch-region contract (§4) writes input at scratch, calls handle, and reads the
-   *  response back. The set itself is the scope, so no app key participates in lookup.
+   *  response back. The set itself is the scope, so no app label participates in lookup.
    *  BOUNDED: `deadlineMs` is the call's whole budget, and exceeding it answers empty with
    *  the worker killed and respawned — a module that never returns fails like a trap instead
    *  of holding the node's thread. A guest's call carries its own remaining segment (§4.3). */

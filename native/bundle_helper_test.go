@@ -81,9 +81,9 @@ type authorKeys struct {
 	mlSk   []byte
 }
 
-// id is the 32-byte author id everything downstream is keyed by: policy entries, app keys,
-// freshness marks. A second implementation of bundle.ts `hybridAuthorId`, since a test
-// that asked the loader for the id would agree with it by construction.
+// id is the 32-byte author id everything downstream is keyed by: policy entries,
+// freshness marks, revocation. A second implementation of bundle.ts `hybridAuthorId`,
+// since a test that asked the loader for the id would agree with it by construction.
 func (a authorKeys) id() []byte {
 	pre := append(domainManifestAuthor(), manifestSuite())
 	pre = append(append(pre, a.edPub...), a.mlPk...)
@@ -126,14 +126,6 @@ func testSigner(t testing.TB) *mldsaSigner {
 	return signerCache
 }
 
-// appKeyFor asks the realm for the §5.1 app key, so a test can predict which table entry a
-// bundle's modules land under. The shared `appKeyFor` (bundle.ts) itself, not a Go
-// restatement: one computed here would agree with the table by coincidence and keep
-// agreeing after the derivation moved.
-func appKeyFor(author []byte, app string) string {
-	return realmString("appKeyFor(fromHex(" + jsonString(hex.EncodeToString(author)) + "), " +
-		jsonString(app) + ")")
-}
 
 // realmString evaluates an expression in the booted host realm — `evalString`'s twin for
 // the helpers below, which have no `testing.TB` in hand. A failure here is a broken harness
@@ -172,7 +164,7 @@ func writeTestBundle(t testing.TB, a authorKeys, app string, version int) (strin
 
 // writeBundle assembles a signed bundle FILE: one forwarder module ("fwd") plus the given
 // guest, under an author-signed manifest. A zero guestSrc falls back to the stub — every
-// app is a guest (§12.4). Returns the bundle's path and host audit identity.
+// app is a guest (§12.4). Returns the bundle's path and the app label it installs under.
 func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
@@ -184,7 +176,7 @@ func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc s
 // signBundleJSON signs a complete body and writes the bundle.
 func signBundleJSON(t testing.TB, a authorKeys, app string, mjson []byte, guestSrc string) (string, string) {
 	t.Helper()
-	return writeBundleFile(t, app, bundleEnvelope(t, a, mjson, guestSrc, forwarderWasm)), appKeyFor(a.id(), app)
+	return writeBundleFile(t, app, bundleEnvelope(t, a, mjson, guestSrc, forwarderWasm)), app
 }
 
 // bundleEnvelope independently frames and signs the whole bundle, for the shared JS reader.
@@ -254,8 +246,8 @@ func manifestJSON(t testing.TB, app string, version int, guestSrc string, requir
 
 // manifestJSONForModule is the same fixture shape with an explicitly supplied private
 // module. The RS benchmark uses it to exercise a loaded module through its guest instead
-// of reaching into the native module table by the app key (loaded modules now have opaque
-// slot ids). These bytes ARE the signed bytes: there is no canonicalisation step.
+// of reaching into the native module table (loaded modules have opaque slot ids). These
+// bytes ARE the signed bytes: there is no canonicalisation step.
 func manifestJSONForModule(t testing.TB, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
 	t.Helper()
 

@@ -3,7 +3,7 @@
 // displace platform members only (main.ts, native-shim.ts, seedchat, seedstore). Signed
 // bundles are the only way slots land (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
-import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
+import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
@@ -30,12 +30,12 @@ export type ShellSodium = ManifestVerifier & SeamCrypto;
  *  any validation or precedence between the two values. The realm bounds ride here for the
  *  same reason, one level down: the operator's numbers ABOUT ONE APP. */
 export interface InstallOptions {
-  /** The slot this install RETIRES, by its audit identity (`AppHandle.key`) — the whole
-   *  difference between the two shapes an install has. Absent, the candidate must land on
-   *  a FREE identity and an occupied one is refused. Present, it must name a live slot,
-   *  which the candidate takes over atomically — across authors and app names, and it is
-   *  the only way to take `link`. Named, never inferred from the candidate's own
-   *  identity, so nothing is displaced that the caller did not choose. */
+  /** The slot this install RETIRES, by its `app` label — the whole difference
+   *  between the two shapes an install has. Absent, the candidate must land on a FREE
+   *  label and an occupied one is refused. Present, it must name a live slot, which the
+   *  candidate takes over atomically — across authors and app names, and it is the only
+   *  way to take `link`. Named, never inferred from the candidate's own label, so nothing
+   *  is displaced that the caller did not choose. */
   replaces?: string;
   localConfig?: JsonObject;
   /** QuickJS heap limit for THIS load's realm, in bytes. Omitted ⇒ the shell's
@@ -84,21 +84,23 @@ export interface Shell {
   /** Install a signed bundle blob: verify the manifest, run the admission predicate,
    *  integrity-check + install the modules, stand the guest, commit the slot. THE one way
    *  a bundle enters this node, and `opts.replaces` is the only thing that varies — a
-   *  free identity when absent, the named slot retired atomically when present. App
+   *  free label when absent, the named slot retired atomically when present. App
    *  candidates require admission either way; a candidate reaching `link` is authorized
    *  only by replacing the current link owner. An install either leaves a running app
    *  behind or leaves nothing: the realm is built here, so a guest that cannot compile
    *  fails the install rather than the first frame, the freshness mark is advanced last,
-   *  and a failed candidate leaves the slot it named exactly as it was. Identity scopes
-   *  and history never transfer across a replacement. */
+   *  and a failed candidate leaves the slot it named exactly as it was. The fs and
+   *  signing namespaces are the label's, not the author's: a replacement that keeps the
+   *  label keeps both, and one that changes it moves to the new label's. */
   install(blob: Uint8Array, opts?: InstallOptions): Promise<AppHandle>;
-  /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
-   *  realm, private modules, timers and scopes as one unit. */
-  uninstall(appKey: string): boolean;
+  /** Uninstall the slot holding this label: drop its claims and dispose its realm,
+   *  private modules and timers as one unit. The label's fs keys are data, not slot
+   *  state — they stay for whatever installs the label next. */
+  uninstall(app: string): boolean;
   /** Write off an author key: refuse everything it signs from now on, and uninstall every
-   *  app of its already running. Returns the app keys torn down. One call because the
-   *  halves are useless apart: uninstalling alone leaves the thief's next bundle landing
-   *  on the same derived names, refusing alone leaves the compromised code running.
+   *  app of its already running. Returns the labels torn down. One call because the
+   *  halves are useless apart: uninstalling alone leaves the thief's next bundle free to
+   *  land again, refusing alone leaves the compromised code running.
    *  Permanent and host-local — recovery is a new author key, not an un-revoke. */
   revoke(authorHex: string): string[];
   close(): void;
@@ -106,9 +108,7 @@ export interface Shell {
 
 /** What a load returns: verified facts plus a slot-bound handle (§12.4). */
 export interface AppHandle extends LoadedBundle {
-  /** `<author hex>:<app>` (§12.4) — the slot's audit identity, the freshness key and
-   *  what `uninstall`/`revoke` address. */
-  key: string;
+
   /** This app's fs keyspace view (§12.2): `scopedFs(backend, appScope)` already applied
    *  by the shell, so reads/writes/lists over this handle can only reach this app's
    *  keys. Absent on a shell with no fs. */
@@ -118,7 +118,7 @@ export interface AppHandle extends LoadedBundle {
    *  (outside a running node), `scopedFs(raw, appScope)` (fs-view.ts) re-derives it. */
   appScope: string;
   /** Loopback invoke into this app's one `handle` entrypoint, bound to THE SLOT this
-   *  load stood. A replacement stands a new slot, possibly under a different key. A handle
+   *  load stood. A replacement stands a new slot, possibly under a different label. A handle
    *  taken before it keeps naming the version it was handed and rejects once that slot
    *  is disposed. The replacement load returns the new handle. */
   invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
@@ -251,8 +251,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // Banked against THIS slot's ceiling, not the node's default.
       deadlineFor(load),
     );
-    const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
-    const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, reachesLink(loaded.manifest));
+    const appScope = appScopeFor(sodium, loaded.manifest.app);
+    const scope = slotSignScope(opts, loaded.manifest.app, reachesLink(loaded.manifest));
     slot = {
       verifiedBundle: loaded,
       pureModules,
@@ -321,11 +321,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // As signed. Tells a bare `host.call` name from this bundle's own module
     // (guest-seam.ts dispatch).
     const localServices = new Set(b.manifest.guest.calls ?? []);
-    // The 32 bytes this realm is attributed by when it calls another: the app key,
+    // The 32 bytes this realm is attributed by when it calls another: its label,
     // hashed. The same shape as the sender key prepended to an inbound frame, so a
     // callee reads one field whether the caller was a peer or a co-resident app. Zero
-    // is the HOST's own, and no app key derives it.
-    const callerId = genesisHash(sodium, enc.encode(table.keyOf(slot)));
+    // is the HOST's own, and no label derives it.
+    const callerId = genesisHash(sodium, enc.encode(table.labelOf(slot)));
     const fullSeam = createGuestSeam({
       platform: { sodium, now },
       grants: {
@@ -336,12 +336,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         names: new Set(b.manifest.guest.requires),
         localServices,
         // What node/sign signs under: this slot's ONE scope, derived at load —
-        // an ordinary app's own `DOMAIN_guest ‖ author ‖ app`, the link slot's
+        // an ordinary app's own `DOMAIN_guest ‖ app`, the link slot's
         // `DOMAIN_link_scope` (§12.2). The host chooses what the
         // name means; the seam prefixes and never parses, so no op signs raw
         // bytes.
         signScope: slot.signingScope,
-        // Scoped to this app key, so `fs` grants reach this app's own keyspace, not
+        // Scoped to this app's label, so `fs` grants reach this app's own keyspace, not
         // the node's — the same structural ownership module names have (§5.1).
         // Wired whenever the node has an fs at all, without consulting the
         // manifest: `names` already refuses every `fs/*` the bundle did not
@@ -357,7 +357,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // Unconditional for the same reason `fs` is.
         timers: slot.timers,
       },
-      // This slot's private module value: no app-key lookup and no cross-app
+      // This slot's private module value: no label lookup and no cross-app
       // namespace. The deadline is the calling guest's remaining segment (§4.3).
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
@@ -387,8 +387,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => slot.realm
     ? slot.realm.call(input, deadlineMs, causalClock)
     : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
-  const doUninstall = (appKey: string) => {
-    const slot = table.remove(appKey);
+  const doUninstall = (app: string) => {
+    const slot = table.remove(app);
     if (!slot) return false;
     if (table.hasLink(slot)) netHost?.release();
     disposeSlot(slot);
@@ -434,7 +434,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   // Inbound requests use current peer claims (§12.10).
   netHost?.routeInbound(deliverInbound);
 
-  // One transaction for every install: a free identity, a named replacement, and the
+  // One transaction for every install: a free label, a named replacement, and the
   // selected boot transport are the same sequence with a different target.
   const installBundle = async (blob: Uint8Array, opts: InstallOptions = {},
     bootTransport = false): Promise<AppHandle> => {
@@ -459,10 +459,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
       guestSource: v.guestSource,
     };
-    const key = appKeyFor(loaded.author, loaded.manifest.app);
     const checkInstallation = () => {
       if (closed) throw new Error("shell: node is closed");
-      table.refuseConflicts(loaded, key, replacement, bootTransport);
+      table.refuseConflicts(loaded, replacement, bootTransport);
     };
     // Refuse a conflict already standing BEFORE the candidate's modules or guest
     // execute: a known loser is not worth a realm. The second check in the
@@ -513,17 +512,16 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // cross-realm calls are now its own (`seamFor`).
     slot.active = true;
     disposeSlot(replacement);
-    // The handle: the verified facts plus the bound slot — the key, the scoped fs
+    // The handle: the verified facts plus the bound slot — the scoped fs
     // view and the loopback invoke. One object, so a caller cannot derive half of
     // it from the manifest and half from the shell and have the two disagree.
     const handle: AppHandle = {
       ...loaded,
-      key,
       fs: slot.fsScope,
       appScope: slot.appScope,
       invoke: (payload, deadlineMs) => slot.active
         ? hostCallSlot(slot, payload, deadlineMs)
-        : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
+        : Promise.reject(new Error(`shell: app '${loaded.manifest.app}' slot is no longer loaded`)),
     };
     return handle;
   };
@@ -531,7 +529,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const shell: Shell = {
     resolve(name) {
       const slot = table.owner(name);
-      return slot ? table.keyOf(slot) : null;
+      return slot ? table.labelOf(slot) : null;
     },
     routes: table.routes,
     call: (serviceId, payload, deadlineMs) =>
@@ -551,8 +549,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       freshnessStore.revoke(fromHex(hex));
       const gone = table.all()
         .filter((slot) => toHex(slot.verifiedBundle.author) === hex)
-        .map(table.keyOf);
-      for (const appKey of gone) doUninstall(appKey);
+        .map(table.labelOf);
+      for (const app of gone) doUninstall(app);
       return gone;
     },
     // Disposal is immediate, as for an uninstall: a realm fails whatever is parked in it

@@ -172,10 +172,6 @@ export function harnessAppBlob(author, mode = "echo") {
   return blob;
 }
 
-/** The app key the harness app binds under, for routing assertions. */
-export function harnessAppKey(author) {
-  return `${Buffer.from(author.id).toString("hex")}:harness`;
-}
 
 /** The `send` op's argument bytes:
  *  `[noReply u8][to blob][proto blob][payload blob]` (transport/src/core.js).
@@ -321,7 +317,6 @@ export async function makeTransportHost(opts = {}) {
   };
   node.sendNoReply = (to, proto, payload) => call(to, proto, payload, undefined, true);
   node.app = app;
-  node.appKey = app.key;
   /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller
    *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the
    *  name, which is what those tests pin. */

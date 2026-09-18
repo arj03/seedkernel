@@ -49,12 +49,12 @@ const nativeHandleHarness = `
     const raw = bridge.readFile(path);
     if (raw === null) throw new Error("native test: cannot read " + path);
     const app = await node.shell.install(new Uint8Array(raw));
-    apps.set(app.key, app);
+    apps.set(app.manifest.app, app);
     return new TextEncoder().encode(loadedLine(app));
   };
-  globalThis.invokeApp = (appKey, payload) => {
-    const app = apps.get(appKey);
-    if (!app) throw new Error("native test: no loaded handle for '" + appKey + "'");
+  globalThis.invokeApp = (key, payload) => {
+    const app = apps.get(key);
+    if (!app) throw new Error("native test: no loaded handle for '" + key + "'");
     // This adapter only ever invokes the test fixture's literal "test" operation. Keep
     // that fixture frame here rather than widening the production QuickJS globals with
     // the optional client codec solely for Go assertions.
@@ -225,8 +225,8 @@ func loadBundle(path string) string {
 
 // invokeBundle drives a loaded slot through its guest; pure modules are intentionally
 // unreachable from the host test seam except through this path.
-func invokeBundle(appKey string, payload []byte) ([]byte, error) {
-	return callRealm("invokeApp", 30*time.Second, qc.NewString(appKey), qc.NewArrayBuffer(payload))
+func invokeBundle(app string, payload []byte) ([]byte, error) {
+	return callRealm("invokeApp", 30*time.Second, qc.NewString(app), qc.NewArrayBuffer(payload))
 }
 
 // evalString evaluates a JS expression in the host realm and returns it as a string.

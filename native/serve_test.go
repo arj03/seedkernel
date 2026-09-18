@@ -122,10 +122,10 @@ func ask(t *testing.T, holderID, proto string, payload []byte) []byte {
 }
 
 // loadedLine is the console line a successful load prints (§12.4, §12.10): the app, its
-// version, its app key, and the protocol ids the manifest claimed — the routing came with
+// version, its author, and the protocol ids the manifest claimed — the routing came with
 // the bundle, so the line reports it rather than the operator supplying it.
-func loadedLine(app string, version int, appKey string, serves string) string {
-	return fmt.Sprintf("%s v%d  key %s  serves %s", app, version, appKey, serves)
+func loadedLine(app string, version int, author []byte, serves string) string {
+	return fmt.Sprintf("%s v%d  author %s  serves %s", app, version, hex.EncodeToString(author), serves)
 }
 
 // serveNode boots a listening node under a policy admitting `authorID`, and returns
@@ -144,11 +144,10 @@ func TestServeGuestApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
 	bundlePath, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
-	holderKey := appKeyFor(author.id(), "holderapp")
 	// The load is the whole of it (§12.10): the manifest claims `holderapp`, so the
 	// bundle that landed is already the destination for that protocol, and its guest is
 	// already standing — there is no second call between installing and serving.
-	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
+	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, author.id(), "holderapp") {
 		t.Fatalf("bundle load: %s", status)
 	}
 	startRequester(t, st.PeerID, st.Port)
@@ -179,19 +178,17 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
 
-	// Two guest apps from one author under two app names — so they derive disjoint
-	// table names (§5.1). The holder guest reads fs; the echo guest forwards to its own
+	// Two guest apps under two app labels — so they hold two slots (§5.1). The holder
+	// guest reads fs; the echo guest forwards to its own
 	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
 	// shell handed the guest. Each protocol reaches its own app because each manifest
 	// claims its own id (§12.10) and the two claims cannot collide.
 	guestBundle, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
-	holderKey := appKeyFor(author.id(), "holderapp")
-	if status := loadBundle(guestBundle); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
+	if status := loadBundle(guestBundle); status != loadedLine("holderapp", 1, author.id(), "holderapp") {
 		t.Fatalf("guest bundle load: %s", status)
 	}
 	echoBundle, _ := writeBundle(t, author, "echoapp", 1, echoGuestSource, nil)
-	echoKey := appKeyFor(author.id(), "echoapp")
-	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, echoKey, "echoapp") {
+	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, author.id(), "echoapp") {
 		t.Fatalf("echo bundle load: %s", status)
 	}
 	peerID := startRequester(t, st.PeerID, st.Port)

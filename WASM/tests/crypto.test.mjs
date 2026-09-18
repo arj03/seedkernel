@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
 import {
   sodium, root, toHex, concatBytes, hybridAuthorId, verifyTestBundle, verifyBundle,
-  signTestBundle, authorBundle, testAuthor, appKey, testHost, installBundle,
+  signTestBundle, authorBundle, testAuthor, testHost, installBundle,
   GUEST_TEXT, GUEST_BYTES, forwarderBytes,
   JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN,
 } from "./fixtures.mjs";
@@ -323,9 +323,9 @@ async function testHybridManifestSuite() {
     assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");
   }
 
-  // 6. End to end: a signed bundle loads and its modules bind under the DERIVED id — the
-  //    key-set hash, never either key — so names, policy and freshness are all keyed by
-  //    the one identity the format produces.
+  // 6. End to end: a signed bundle loads, and the author it carries on to policy and
+  //    freshness is the DERIVED id — the key-set hash, never either key — the one identity
+  //    the format produces.
   {
     const { blob } = authorBundle(sodium, keys, {
       app: "pq-app", version: 1,
@@ -336,11 +336,11 @@ async function testHybridManifestSuite() {
     assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey),
       "verifyBundle carries the signing key set through to the policy seam");
     const host = testHost(new JsModuleLoader());
-    await installBundle(host, v);
-    const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
-    assert(host.isBound(derived, "codec"), "the module binds under the derived author id");
-    assert(!host.isBound(appKey(ed.publicKey, "pq-app"), "codec"),
-      "…and never under the Ed25519 key alone");
+    const loaded = await installBundle(host, v);
+    assert(host.isBound("pq-app", "codec"), "the module binds under the app label");
+    assertEqual(toHex(loaded.author), toHex(hybridAuthorId(sodium, ed.publicKey, pq.publicKey)),
+      "the loaded author is the derived id");
+    assert(toHex(loaded.author) !== toHex(ed.publicKey), "…and never the Ed25519 key alone");
   }
 
   console.log("  OK\n");

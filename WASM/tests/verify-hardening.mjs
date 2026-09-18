@@ -33,7 +33,7 @@ const { MAX_QUEUED_SIGNAL_BYTES, MAX_QUEUED_SIGNALS, MAX_UNESTABLISHED_PEERS,
   MAX_PENDING_ICE_BYTES, MAX_SDP_BYTES }
   = await imp("build/host/net-rtc.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { appKeyFor, appScopeFor, loadBundleModules, FreshnessMarks }
+const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/host/bundle-author.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
@@ -42,7 +42,7 @@ const { guestOpFraming } = await imp("build/host/bundle-author.js");
 const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 /** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
- *  identity policy pins and app keys lead with. `ed` doubles as a node identity. */
+ *  identity policy pins and freshness marks name. `ed` doubles as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { createRealmTimers } = await imp("build/host/realm-timers.js");
@@ -147,29 +147,33 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   loaded.dispose();
 }
 
-console.log("\n§12.2 — fs is scoped per app key");
+console.log("\n§12.2 — fs is scoped per app label");
 {
   const disk = new MemoryFs();
-  const A = new Uint8Array(32).fill(0xaa), B = new Uint8Array(32).fill(0xbb);
-  const alice = scopedFs(disk, appScopeFor(sodium, A, "chat"));
-  const bob = scopedFs(disk, appScopeFor(sodium, B, "chat"));
+  const chat = scopedFs(disk, appScopeFor(sodium, "chat"));
+  const notes = scopedFs(disk, appScopeFor(sodium, "notes"));
   // Every method awaits: the seam is async so a browser backend can implement it
   // (core/fs.ts), and MemoryFs answers in a microtask like any other.
-  await alice.put("secret", new Uint8Array([1, 2, 3]));
-  await bob.put("secret", new Uint8Array([9]));
-  ok((await alice.get("secret")).length === 3, "alice reads her own key");
-  ok((await bob.get("secret")).length === 1, "bob's same-named key is a different value");
-  const bobKeys = await bob.list("");
-  ok(bobKeys.length === 1 && bobKeys[0] === "secret", "list() shows only this app's keys, unprefixed");
-  ok(await bob.delete("secret") && (await alice.get("secret")) !== null, "bob's delete cannot reach alice's key");
+  await chat.put("secret", new Uint8Array([1, 2, 3]));
+  await notes.put("secret", new Uint8Array([9]));
+  ok((await chat.get("secret")).length === 3, "chat reads its own key");
+  ok((await notes.get("secret")).length === 1, "notes' same-named key is a different value");
+  const notesKeys = await notes.list("");
+  ok(notesKeys.length === 1 && notesKeys[0] === "secret", "list() shows only this app's keys, unprefixed");
+  ok(await notes.delete("secret") && (await chat.get("secret")) !== null, "notes' delete cannot reach chat's key");
   ok((await disk.list("")).length === 1, "the backend holds both under distinct physical keys");
 
   // Colons in an app name cannot make two scopes overlap, and cannot reach the backend.
-  const amb1 = scopedFs(disk, appScopeFor(sodium, A, "x:y"));
-  const amb2 = scopedFs(disk, appScopeFor(sodium, A, "x"));
+  const amb1 = scopedFs(disk, appScopeFor(sodium, "x:y"));
+  const amb2 = scopedFs(disk, appScopeFor(sodium, "x"));
   await amb1.put("z", new Uint8Array([1]));
   ok((await amb2.get("y:z")) === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
-  ok(/^[A-Za-z0-9._-]+$/.test(appScopeFor(sodium, A, "x:y")), "the derived scope is inside the backend key charset");
+  ok(/^[A-Za-z0-9._-]+$/.test(appScopeFor(sodium, "x:y")), "the derived scope is inside the backend key charset");
+  // Keys are filenames, and a case-folding filesystem would merge two labels differing
+  // only in case if the label were the prefix. The hash is lowercase hex.
+  const upper = appScopeFor(sodium, "Chat");
+  ok(upper !== appScopeFor(sodium, "chat") && upper === upper.toLowerCase(),
+    "labels differing only in case get distinct lowercase prefixes");
   // The real backends reject anything outside that charset, so an unsafe scope must
   // fail at construction rather than on the first write.
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
@@ -225,7 +229,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     "an explicit full service set is accepted");
 
   // A guest reaches its own app's modules with NO grant: a bare name is the asking
-  // bundle's own code, scoped by the app key the seam was wired with, so it resolves under
+  // bundle's own code, scoped by the app the seam was wired for, so it resolves under
   // an empty requires set exactly like `crypto`.
   const chat = new ModuleTable();
   const chatModules = await chat.build([{ name: "codec", wasm: withMax }]);
@@ -826,9 +830,9 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
   });
   // Every load after this one is an upgrade of this same slot — a load only ever takes a
-  // FREE identity — and a replacement carries per-load config and bounds exactly as a
+  // FREE label — and a replacement carries per-load config and bounds exactly as a
   // first install does, which is the whole subject below.
-  const reload = (loadOpts) => shell.install(blob, { ...loadOpts, replaces: probe.key });
+  const reload = (loadOpts) => shell.install(blob, { ...loadOpts, replaces: probe.manifest.app });
   await probe.invoke(new Uint8Array());
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
@@ -885,9 +889,9 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // §12.5 — uninstalling a GUEST-ONLY app reports success. An app is its modules and
   // its realm, and this bundle legitimately declares no modules at all, so a count of
   // dropped modules is the wrong answer to "was there anything here".
-  ok(shell.uninstall(appKeyFor(kp.id, "probe")) === true,
+  ok(shell.uninstall("probe") === true,
     "uninstalling a guest-only app reports success, not 'nothing there'");
-  ok(shell.uninstall(appKeyFor(kp.id, "probe")) === false,
+  ok(shell.uninstall("probe") === false,
     "uninstalling it twice reports nothing the second time");
   shell.close();
 
@@ -1217,7 +1221,7 @@ ${guestOpFraming()}
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   const pending = new Uint8Array([0, 0, 0, 5, 0, 0, 0, 1]);
   await armed("timer/arm", pending);
-  ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");
+  ok(stub.uninstall("ticker") === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);
   stub.close();
@@ -1225,7 +1229,7 @@ ${guestOpFraming()}
 
 // ── §12.2 — the host's one caller id is matched whole, never by prefix ──────────
 // There is exactly ONE host caller id — 32 zero bytes — matched over the WHOLE 32 bytes.
-// Every other caller id is an app key or peer key: a hash of facts its author picks, so
+// Every other caller id is a hashed app label or a peer key: facts their authors pick, so
 // ANY byte of it is grindable (~256 tries per byte). A reader stopping at the first zero
 // byte would hand the "host proper" verdict to whoever wants it, so the match runs the
 // whole prefix rather than a shortcut over its lead byte.
@@ -1238,10 +1242,10 @@ console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not b
   ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
   // A near-miss on the host id is not the host: one late bit is all it takes.
   const nearHost = new Uint8Array(32); nearHost[31] = 1;
-  ok(!callerOf(withCaller(nearHost)).fromHost, "an app key that is zero but for its last byte is not the host");
+  ok(!callerOf(withCaller(nearHost)).fromHost, "a caller id that is zero but for its last byte is not the host");
   const leadingZero = new Uint8Array(32); leadingZero[31] = 0xff; // zero everywhere but the LAST byte
   ok(!callerOf(withCaller(leadingZero)).fromHost,
-    "an app key that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
+    "a caller id that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
 
   // The transport assembler injects the canonical generated reader into its signed source.
   // Evaluate that assembled source rather than restating the reader in this test.

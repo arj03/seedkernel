@@ -9,7 +9,7 @@
 import { writeU32BE, enc } from "./util.js";
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched
- *  over the whole 32 bytes — an app key is grindable, so a prefix test is unsafe. */
+ *  over the whole 32 bytes — a caller id is grindable, so a prefix test is unsafe. */
 export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Array; body: Uint8Array } {
   const caller = arg.subarray(0, 32);
   let fromHost = true;

@@ -2,7 +2,7 @@
 // into them. Both books are projections of the installed manifests — nothing to persist or
 // keep in step — and every rule about what may be installed beside what lives here, so no
 // caller can set a claim past them.
-import { appKeyFor, reachesLink, type LoadedBundle, type PureModules } from "./bundle.js";
+import { reachesLink, type LoadedBundle, type PureModules } from "./bundle.js";
 import { DEFAULT_MAX_APP_SLOTS } from "../core/wasm-limits.js";
 import type { Fs } from "../core/fs.js";
 import type { SignScope } from "./guest-seam.js";
@@ -25,9 +25,8 @@ export interface AppSlot {
    *  read of the raw backend needs the derivation the shell already did. */
   appScope: string;
   /** THE one scope this slot's `node/sign`/`node/verify` are wired to (`slotSignScope`,
-   *  guest-seam.ts): the slot's own `DOMAIN_guest ‖ author ‖ app` when it is an ordinary
-   *  app, its `DOMAIN_link_scope` when it reaches `link` — a fact of the
-   *  slot, not a second name. */
+   *  guest-seam.ts): the slot's own `DOMAIN_guest ‖ app` when it is an ordinary app, its
+   *  `DOMAIN_link_scope` when it reaches `link` — a fact of the slot, not a second name. */
   signingScope: SignScope;
   realm: Realm | null;
   /** Set once this slot's freshness mark and claims have committed; until then its seam
@@ -55,7 +54,7 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
    *  "reachable either way", so uniqueness is enforced per book, never across them. */
   const peer = new Map<string, AppSlot>();
   const local = new Map<string, AppSlot>();
-  const keyOf = (slot: AppSlot): string => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
+  const labelOf = (slot: AppSlot): string => slot.verifiedBundle.manifest.app;
   /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has ONE
    *  event sink, so two holders are not a composition — the second would take the node's
    *  sockets off the first, silently. A pure function of the signed manifest, so there is
@@ -75,37 +74,40 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     }
   };
   return {
-    /** `<author hex>:<app>` (§12.4) — a slot's audit identity, and the key it installs under. */
-    keyOf,
+    /** A slot's manifest `app` label (§12.4) — what it installs under, and the name of its
+     *  fs and signing namespaces. */
+    labelOf,
     hasLink,
-    get: (key: string): AppSlot | undefined => slots.find((slot) => keyOf(slot) === key),
+    get: (app: string): AppSlot | undefined => slots.find((slot) => labelOf(slot) === app),
     /** Every installed slot, in install order. */
     all: (): readonly AppSlot[] => slots,
     /** Who serves this claim, peer-reachable name first. */
     owner: (claim: string): AppSlot | undefined => peer.get(claim) ?? local.get(claim),
     peerClaimant: (claim: string): AppSlot | undefined => peer.get(claim),
     localClaimant: (serviceId: string): AppSlot | undefined => local.get(serviceId),
-    /** Every claim this node serves as `[claim, owner key]`, peer-reachable first. */
+    /** Every claim this node serves as `[claim, owner label]`, peer-reachable first. */
     routes: (): [string, string][] =>
-      [...peer, ...local].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
-    /** Refuse a candidate that contests the identity, a claim or the raw-link binding
+      [...peer, ...local].map(([claim, slot]): [string, string] => [claim, labelOf(slot)]),
+    /** Refuse a candidate that contests the label, a claim or the raw-link binding
      *  another slot holds, or that would exceed the slot cap (§12.10). Asked before
      *  candidate code runs and again in the commit window, because another load may take a
      *  free claim while this candidate is being built. Per BOOK: the same name under
      *  `protocols` and `services` is two claims, not a contest. A replacement may take the
-     *  selected predecessor's identity and claims, and must still target that exact live
+     *  selected predecessor's label and claims, and must still target that exact live
      *  slot at commit. `selected` is the boot's transport selection: the one way to take
      *  the raw-link binding when nothing holds it. */
-    refuseConflicts(loaded: LoadedBundle, key: string, replacement?: AppSlot, selected = false): void {
+    refuseConflicts(loaded: LoadedBundle, replacement?: AppSlot, selected = false): void {
       if (replacement && !slots.includes(replacement))
         throw new Error("shell: replacement target changed while the candidate was loading");
-      // One slot per identity, and an install that names no predecessor takes a FREE one:
-      // an identity already here changes hands only through an install that says so. So a
-      // second install of a running app is refused rather than silently taking it over, and
-      // every rule below has exactly one incumbent to weigh — the named predecessor.
-      const installed = slots.find((slot) => keyOf(slot) === key);
+      // One slot per label, whoever authored it, and an install that names no predecessor
+      // takes a FREE one: a label already here changes hands only through an install that
+      // says so. So a second install of a running app is refused rather than silently
+      // taking it over, and every rule below has exactly one incumbent to weigh — the
+      // named predecessor.
+      const app = loaded.manifest.app;
+      const installed = slots.find((slot) => labelOf(slot) === app);
       if (installed && installed !== replacement)
-        throw new Error(`shell: '${key}' is already installed — install with { replaces: '${key}' } to take over its slot`);
+        throw new Error(`shell: '${app}' is already installed — install with { replaces: '${app}' } to take over its slot`);
       // The raw-link binding changes hands only by explicit selection (§12.5): a candidate
       // reaching `link` must replace the slot holding it or, with no holder, be the boot's
       // selected transport. Refused LOUDLY, because the alternative is a node that looks
@@ -113,14 +115,14 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
       // transport claiming the holder's service id is told the rule it broke.
       const holder = slots.find(hasLink);
       if (holder && holder !== replacement && reachesLink(loaded.manifest))
-        throw new Error(`shell: the transport changes hands only by an install replacing its slot — { replaces: '${keyOf(holder)}' }`);
+        throw new Error(`shell: the transport changes hands only by an install replacing its slot — { replaces: '${labelOf(holder)}' }`);
       if (!holder && !selected && reachesLink(loaded.manifest))
         throw new Error(`shell: "link" is taken only by the boot's transport selection, or by an install replacing the current transport`);
       for (const [book, names, audience] of booksOf(loaded.manifest)) {
         for (const claim of names) {
           const claimant = book.get(claim);
           if (claimant && claimant !== replacement)
-            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(claimant)}'`);
+            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${labelOf(claimant)}'`);
         }
       }
       // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
@@ -143,9 +145,9 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
         for (const claim of names) book.set(claim, slot);
       }
     },
-    /** Drop the slot with this key and release its claims. */
-    remove(appKey: string): AppSlot | undefined {
-      const at = slots.findIndex((slot) => keyOf(slot) === appKey);
+    /** Drop the slot holding this label and release its claims. */
+    remove(app: string): AppSlot | undefined {
+      const at = slots.findIndex((slot) => labelOf(slot) === app);
       if (at < 0) return undefined;
       const [slot] = slots.splice(at, 1);
       release(slot);

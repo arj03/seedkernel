@@ -157,17 +157,18 @@ function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   return deriveNodeKey(host.sodium, master);
 }
 
-/** The one console line a successful load prints (§12.4, §12.10): the app, its version, the
- *  app key an operator would pass to `--uninstall`, and what the load CLAIMED: what a PEER
- *  may reach (`protocols`) always, and what a co-resident guest may reach (`services`) when
- *  there is one — two audiences, so folding them into one list would leave a reader to
- *  guess which name a peer can send to. Both come from the manifest, so a node says what it
- *  will and will not answer at the load rather than at the first frame. */
+/** The one console line a successful load prints (§12.4, §12.10): the app label an operator
+ *  would pass to `--uninstall`, its version, the author an operator would pass to
+ *  `--revoke`, and what the load CLAIMED: what a PEER may reach (`protocols`) always, and
+ *  what a co-resident guest may reach (`services`) when there is one — two audiences, so
+ *  folding them into one list would leave a reader to guess which name a peer can send to.
+ *  All of it comes from the manifest, so a node says what it will and will not answer at
+ *  the load rather than at the first frame. */
 export function loadedLine(b: AppHandle): string {
   const protocols = b.manifest.protocols ?? [];
   const services = b.manifest.services ?? [];
   const serves = protocols.length ? protocols.join(", ") : "(nothing — this bundle claims no protocol)";
-  return `${b.manifest.app} v${b.manifest.version}  key ${b.key}  serves ${serves}` +
+  return `${b.manifest.app} v${b.manifest.version}  author ${toHex(b.author)}  serves ${serves}` +
     (services.length ? `  locally ${services.join(", ")}` : "");
 }
 
@@ -261,8 +262,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     host.log(`  revoke ${authorHex}` +
       (gone.length ? ` (uninstalled ${gone.length} app(s): ${gone.join(", ")})` : " (no apps of its were loaded)"));
   }
-  for (const appKey of list(args.get("uninstall"))) {
-    host.log(`  uninstall ${appKey}${shell.uninstall(appKey) ? "" : " (nothing bound)"}`);
+  for (const app of list(args.get("uninstall"))) {
+    host.log(`  uninstall ${app}${shell.uninstall(app) ? "" : " (nothing bound)"}`);
   }
 
   // A signed bundle from disk. Reading the file is all the operator flow does: the whole

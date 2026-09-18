@@ -122,14 +122,14 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,354 LOC)**
+**Shared — compiled once, run by all three targets (2,342 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 341 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 337 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 333 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 675 |
-| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 356 |
+| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 669 |
+| Shell, node assembly and claim routing (§12.9, §12.10) — the boot assembly, and the installed set with the two claim books that route into it | `host/shell-core.ts`, `host/slot-table.ts` | 354 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts`, `host/peer-addr.ts` | 236 |
 | Core contracts and fixed host vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, host-call names and raw-link event codec (`core/op-frame.ts`, also available to clients) | `core/*.ts` (8 files) | 413 |
 

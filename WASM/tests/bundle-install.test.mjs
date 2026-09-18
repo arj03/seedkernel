@@ -18,12 +18,12 @@ import { readFileSync } from "node:fs";
 import { testkit } from "./testkit.mjs";
 import {
   sodium, generateKeyPair, JsModuleLoader, bootShell, bootNodeShell, TransportHost,
-  toHex, fromHex, concatBytes, writeU32BE, appKeyFor, hybridAuthorId, FreshnessMarks,
+  toHex, fromHex, concatBytes, writeU32BE, hybridAuthorId, FreshnessMarks,
   verifyTestBundle, verifyBundle, loadBundleModules,
   signTestBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
   checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
-  forwarderBytes, installMod, appKey, imp, root, bytesEqual, callerOf, readOp, writeOp,
+  forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp,
   MemoryFs, NodeFs, enc,
 } from "./fixtures.mjs";
 
@@ -36,17 +36,12 @@ async function testFullLifecycle() {
   console.log("Test: install a bundle module and reach it by name (§4, §12.4)");
 
   const { host } = await makeHost();
-
-  const { id: pk } = testAuthor();
-  const chatKey = appKey(pk, "chat");
+  const chatKey = "chat";
 
   // Installed through the same path the bundle loader uses. The forwarder fixture is a
   // pure transform that echoes its input.
   await installMod(host, chatKey, "chat", forwarderBytes);
   assert(host.isBound(chatKey, "chat"), "chat module installed");
-  // No install record to consult: the author is IN the app key (§5.1), so the table
-  // itself says who authored what it holds.
-  assert(chatKey.startsWith(toHex(pk) + ":"), "the app key leads with the author");
 
   // Reach it by name: the host stages input at the module's scratch, calls handle, and
   // reads the response back (§4). A guest reaches the same module through its seam by
@@ -175,46 +170,12 @@ async function testBundleRefusesNonModule() {
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
-  assert(!host.isBound(appKey(author.id, "demo"), "fwd"), "the valid module is NOT bound (the load failed atomically)");
-  assert(!host.isBound(appKey(author.id, "demo"), "broken"), "the non-module is not bound");
+  assert(!host.isBound("demo", "fwd"), "the valid module is NOT bound (the load failed atomically)");
+  assert(!host.isBound("demo", "broken"), "the non-module is not bound");
 
   console.log("  OK\n");
 }
 
-// ─── Test: ownership is structural (§5.1, §12.5) ────────────────────────
-
-async function testDerivedNamesKeepAuthorsApart() {
-  console.log("Test: derived app keys keep two authors' same-named apps apart (§5.1)");
-
-  // No policy can let one author land on another's app, because there is no shared entry
-  // to land on: `fwd` under A and `fwd` under B are keys in two different maps rather
-  // than two strings something had to keep distinct.
-  const { host } = await makeHost();
-
-  const { id: aPk } = testAuthor();
-  const { id: bPk } = testAuthor();
-
-  // Both authors ship an app called "shared" with a module called "fwd".
-  const aKey = appKey(aPk, "shared");
-  const bKey = appKey(bPk, "shared");
-  assert(aKey !== bKey, "the same app name under different authors derives distinct keys");
-  assert(aKey.startsWith(toHex(aPk) + ":"), "A's key leads with A's key");
-  assert(bKey.startsWith(toHex(bPk) + ":"), "B's key leads with B's key");
-
-  // Both install. Neither displaces the other — they coexist.
-  await installMod(host, aKey, "fwd", forwarderBytes);
-  await installMod(host, bKey, "fwd", forwarderBytes);
-  assert(host.isBound(aKey, "fwd"), "A's app is bound");
-  assert(host.isBound(bKey, "fwd"), "B's app is bound — it did not have to contend for a name");
-
-  // A re-install by the SAME author lands on the SAME entry: an update, in place, with no
-  // ownership rule consulted anywhere.
-  await installMod(host, aKey, "fwd", forwarderBytes);
-  assert(host.isBound(aKey, "fwd"), "A's re-install still occupies the entry");
-  assertEqual(appKey(aPk, "shared"), aKey, "the same key derives the same app key");
-
-  console.log("  OK\n");
-}
 
 // ─── Test: the manifest's claim IS the routing (§12.10) ──────────────────────
 // The bundle declares the protocol ids it serves and the load claims them: one act, no
@@ -258,7 +219,7 @@ async function testManifestClaimIsTheRouting() {
   shell.uninstall(shell.resolve("_net"));
   realmBuilds = 0;
   try {
-    const key = appKey(author.id, "store");
+    const key = "store";
     await shell.install(blob(author, "store", 1, ["seedstore/v1"]));
     assertEqual(shell.resolve("seedstore/v1"), key,
       "the load claimed the manifest's protocol — no second operator action");
@@ -267,17 +228,17 @@ async function testManifestClaimIsTheRouting() {
 
     // An app that claims nothing serves nothing: the initiator-only shape (§12.8), and
     // the reason the field is optional rather than a required empty list.
-    const quiet = appKey(author.id, "quiet");
+    const quiet = "quiet";
     await shell.install(blob(author, "quiet", 1, undefined));
     assertEqual(shell.routes().length, 1, "a bundle claiming nothing adds no route");
 
-    // An install that names no predecessor takes a FREE identity: this one is taken, and
+    // An install that names no predecessor takes a FREE label: this one is taken, and
     // taking it over means saying so.
     let taken = "";
     try { await shell.install(blob(author, "store", 2, ["seedstore/v2"])); }
     catch (e) { taken = String(e); }
     assert(taken.includes("is already installed") && taken.includes("replaces"),
-      `an install onto a running identity is refused by name, got: ${taken || "no error"}`);
+      `an install onto a running label is refused by name, got: ${taken || "no error"}`);
     assertEqual(shell.resolve("seedstore/v1"), key, "…leaving the running version's claim untouched");
 
     // An update re-projects from the NEW manifest, so a claim that was dropped stops
@@ -286,13 +247,13 @@ async function testManifestClaimIsTheRouting() {
     assertEqual(shell.resolve("seedstore/v2"), key, "an update claims what the new manifest declares");
     assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
-    // A second identity cannot shadow an active claim. Rejection leaves both the existing
+    // A second app cannot shadow an active claim. Rejection leaves both the existing
     // route and the candidate's install state untouched — including never evaluating its
     // guest, whose top level could already exercise its admitted capabilities.
-    const rival = appKey(other.id, "store");
+    const rival = "rival-store";
     const buildsBeforeConflict = realmBuilds;
     let conflict = "";
-    try { await shell.install(blob(other, "store", 1, ["seedstore/v2"])); }
+    try { await shell.install(blob(other, rival, 1, ["seedstore/v2"])); }
     catch (e) { conflict = String(e); }
     assert(conflict.includes("claim 'seedstore/v2' is already held"),
       `a contested claim is rejected by name, got: ${conflict || "no error"}`);
@@ -310,7 +271,7 @@ async function testManifestClaimIsTheRouting() {
 
     // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so the
     // install list is counted: without this bound each of those ceilings is a floor. A
-    // REPLACEMENT is never refused — it takes the slot its own key already holds — and an
+    // REPLACEMENT is never refused — it takes the slot its own label already holds — and an
     // uninstall gives one back.
     const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
     for (let i = 0; i < DEFAULT_MAX_APP_SLOTS; i++) {
@@ -321,15 +282,15 @@ async function testManifestClaimIsTheRouting() {
     catch (e) { overfull = String(e); }
     assert(overfull.includes("app slots"), `a full node refuses another app, got: ${overfull || "no error"}`);
     assert(shell.resolve("filler/x") === null, "…and the refused candidate claimed nothing");
-    await shell.install(blob(author, "filler0", 2, ["filler/0"]), { replaces: appKey(author.id, "filler0") });
-    assertEqual(shell.resolve("filler/0"), appKey(author.id, "filler0"),
-      "a replacement takes the slot its own key already holds");
-    shell.uninstall(appKey(author.id, "filler0"));
+    await shell.install(blob(author, "filler0", 2, ["filler/0"]), { replaces: "filler0" });
+    assertEqual(shell.resolve("filler/0"), "filler0",
+      "a replacement takes the slot its own label already holds");
+    shell.uninstall("filler0");
     await shell.install(blob(author, "one-too-many", 1, ["filler/x"]));
-    assertEqual(shell.resolve("filler/x"), appKey(author.id, "one-too-many"),
+    assertEqual(shell.resolve("filler/x"), "one-too-many",
       "uninstalling gives the slot back");
-    shell.uninstall(appKey(author.id, "one-too-many"));
-    for (let i = 1; i < DEFAULT_MAX_APP_SLOTS; i++) shell.uninstall(appKey(author.id, `filler${i}`));
+    shell.uninstall("one-too-many");
+    for (let i = 1; i < DEFAULT_MAX_APP_SLOTS; i++) shell.uninstall(`filler${i}`);
     assertEqual(shell.routes().length, 0, "the node is empty again");
 
     // The format's half of the rule: an id that is not routable is a manifest its author
@@ -370,7 +331,7 @@ async function testManifestClaimIsTheRouting() {
     // inspecting the claim table or entering the shell through a second test-only method.
     {
       const pub = "reach/public", priv = "_reach-private";
-      const reachKey = appKey(author.id, "reach");
+      const reachKey = "reach";
       await shell.install(authorBundle(sodium, author, {
         app: "reach", version: 1, protocols: [pub], services: [priv],
         modules: [], guestSource: GUEST_TEXT, guestRequires: [],
@@ -396,29 +357,22 @@ async function testInstallerRemove() {
 
   const { host } = await makeHost();
 
-  // Two apps of one author, plus a SECOND author's app sharing the app name — the
-  // case the app key exists to separate (§5.1).
-  const { id: pk } = testAuthor();
-  const { id: other } = testAuthor();
-  const chat = appKey(pk, "chat");
-  const notes = appKey(pk, "notes");
-  const theirs = appKey(other, "chat");
+  // Two apps, one of them holding two modules.
+  const chat = "chat";
+  const notes = "notes";
 
   await host.bindAll(chat, [{ name: "text", wasm: forwarderBytes }, { name: "media", wasm: forwarderBytes }]);
   await installMod(host, notes, "text", forwarderBytes);
-  await installMod(host, theirs, "text", forwarderBytes);
   assert(host.isBound(chat, "text") && host.isBound(chat, "media"), "the app's two modules installed");
-  assert(host.isBound(notes, "text") && host.isBound(theirs, "text"), "the other two apps installed");
+  assert(host.isBound(notes, "text"), "the other app installed");
 
   // The unbind is per APP, and the app is the key: one delete takes every module the app
   // landed and nothing else.
   assertEqual(host.removeApp(chat), 2, "both modules of the app went in one call");
   assert(!host.isBound(chat, "text") && !host.isBound(chat, "media"), "the app is gone");
-  assert(host.isBound(notes, "text"), "the same author's other app is untouched");
-  assert(host.isBound(theirs, "text"), "another author's same-named app is untouched");
+  assert(host.isBound(notes, "text"), "the other app is untouched");
 
-  // Nothing else to clear: a freed entry is contended for by nobody, since the key can
-  // only be derived by the author whose public key is half of it. No tombstone.
+  // Nothing else to clear: no tombstone.
   assertEqual(host.removeApp(chat), 0, "a second call removes nothing");
   await installMod(host, chat, "text", forwarderBytes);
   assert(host.isBound(chat, "text"), "reinstall after remove succeeds");
@@ -721,11 +675,11 @@ async function testBundle() {
   let shell, shell2;
   try {
     // A minimal one-module bundle (forwarder.wasm) plus a guest stub. Modules install
-    // straight from the manifest (§12.4) under the app key the loader DERIVES from the
-    // signed `(author, app)` pair, each at its own logical name — so the manifest declares
-    // no bind name or filename: module bytes follow the guest in manifest order.
+    // straight from the manifest (§12.4) under the signed `app` label, each at its own
+    // logical name — so the manifest declares no bind name or filename: module bytes
+    // follow the guest in manifest order.
     const { host: h } = await makeHost();
-    const testKey = appKey(author.id, "test");
+    const testKey = "test";
     const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
@@ -764,10 +718,10 @@ async function testBundle() {
     assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
-    // set to 1 by the load above. Re-running this identity against the mark is an explicit
+    // set to 1 by the load above. Re-running this label against the mark is an explicit
     // replacement of the slot already standing, since a load only ever takes a free one.
     const remanifest = (version) => writeBundle({ ...manifest, version });
-    const reload = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: loaded.key });
+    const reload = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: loaded.manifest.app });
     remanifest(1); await reload();                // equal version reinstalls (an ordinary reboot)
     remanifest(2); await reload();                // newer version advances the mark to 2
     remanifest(1);                                // now a downgrade
@@ -812,7 +766,7 @@ async function testGuestBundle() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const demoKey = appKey(author.id, "demo");
+    const demoKey = "demo";
     // A manifest with NO `guest` field is refused: every app is a guest (§12.4).
     let noGuest = "";
     try {
@@ -892,7 +846,7 @@ async function testBundleCorruptNewerRollback() {
     //    slot, which is the shape a half-landed upgrade actually has.
     writeBundle(4);
     const v4 = await shell.installFile(bundlePath);
-    const upgrade = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: v4.key });
+    const upgrade = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: v4.manifest.app });
 
     // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
     //    match the signed body. The load must throw on signature verification.
@@ -917,8 +871,8 @@ async function testBundleCorruptNewerRollback() {
 // ─── Test: writing off a compromised author key (§12.5) ─────────────────────────
 //
 // Freshness cannot answer "is this key still the author's?": a stolen key signs
-// `version + 1`, clears the high-water mark, and lands on the SAME derived names (§5.1)
-// forever. `shell.revoke` is the remedy, and what is tested is that both of its halves
+// `version + 1`, clears the high-water mark, and lands again whenever it likes.
+// `shell.revoke` is the remedy, and what is tested is that both of its halves
 // happen and that the refusal survives a reboot — an operator doing this by hand can
 // uninstall without closing the door, or close it with the code still running.
 async function testAuthorRevocation() {
@@ -943,7 +897,7 @@ async function testAuthorRevocation() {
     }).blob);
 
     shell = await boot({ policyJson, dir: dataDir, identity });
-    const victimKey = appKeyFor(author.id, "victim");
+    const victimKey = "victim";
 
     // 1. The author is trusted: v1 loads and binds.
     writeBundle(1);
@@ -1166,7 +1120,7 @@ async function testPersistFailureRollsBack() {
     modules: [{ name: "fwd", wasm: forwarderBytes }],
     guestSource: GUEST_TEXT, guestRequires: [],
   });
-  const key = appKey(author.id, "persist");
+  const key = "persist";
 
   // Driven through the shell, since the shell is what advances the mark — last, after the
   // guest stands, so the write it rolls back is one that was about to record a version
@@ -1268,7 +1222,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     },
     admit: admitAll,
   });
-  const key = appKey(author.id, "offside");
+  const key = "offside";
   try {
     // The neighbour goes in FIRST, so `_svc` is a claim held by a standing realm before the
     // candidate ever reaches for it: the refusal below is then the offside gate's, and not
@@ -1278,7 +1232,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     await shell.install(neighborBlob);
     loadingNeighbor = false;
     flaky.fail = true;
-    assertEqual(shell.resolve("_svc"), appKey(author.id, "svc-neighbor"),
+    assertEqual(shell.resolve("_svc"), "svc-neighbor",
       "the neighbour holds the claim the candidate is about to reach for");
 
     let rejected = false;
@@ -1358,7 +1312,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
-  const key = appKey(author.id, "upgrade");
+  const key = "upgrade";
   const blob = (version) => authorBundle(sodium, author, {
     app: "upgrade", version,
     protocols: ["upgrade/v1"],
@@ -1474,7 +1428,7 @@ async function testCommitRevalidatesHostGates() {
   console.log("Test: a candidate is re-checked against freshness and revocation at commit");
 
   const author = testAuthor();
-  const racerKey = appKeyFor(author.id, "racer");
+  const racerKey = "racer";
   const blobAt = (version) => authorBundle(sodium, author, {
     app: "racer", version, modules: [],
     guestSource: `${GUEST_TEXT}//v${version}`, guestRequires: [],
@@ -1569,7 +1523,6 @@ await testWholeBundleIsSigned();
 await testDenyAllPolicyRejects();
 testGeneratedOpFrame();
 await testBundleRefusesNonModule();
-await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();
 await testInstallerRemove();
 await testFs();

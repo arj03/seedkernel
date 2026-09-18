@@ -229,7 +229,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
 {
   const order = [];
   const host = fakeHost(["--key", join(work, "r.key"), "--bundle", join(work, "absent.skb"),
-    "--revoke", "aa,bb", "--uninstall", "author:app"], {
+    "--revoke", "aa,bb", "--uninstall", "chat"], {
     shell: {
       revoke: (hex) => { order.push("revoke:" + hex); return []; },
       uninstall: (k) => { order.push("uninstall:" + k); return false; },
@@ -238,7 +238,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
   });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(order.join(" ") === "revoke:aa revoke:bb uninstall:author:app",
+  ok(order.join(" ") === "revoke:aa revoke:bb uninstall:chat",
     "revoke and uninstall run, in flag order, before the bundle is even read");
   ok(msg.startsWith("bundle:"), "an unreadable --bundle is fatal and labelled");
   ok(host.lines.some((l) => l.includes("no apps of its were loaded")),
@@ -279,10 +279,10 @@ console.log("\n— the load line —");
 // tests assert on (native/testhost_test.go drives this very function).
 {
   const author = new Uint8Array(32).fill(0xab);
-  const key = `${toHex(author)}:chat`;
+  const key = "chat";
   const line = loadedLine({ key, author, manifest: { app: "chat", version: 3, protocols: ["chat-v1", "chat-v2"] } });
-  ok(line === `chat v3  key ${key}  serves chat-v1, chat-v2`,
-    "app, version, app key and the public protocols");
+  ok(line === `chat v3  author ${toHex(author)}  serves chat-v1, chat-v2`,
+    "app, version, author and the public protocols");
   const quiet = loadedLine({ key, author, manifest: { app: "tool", version: 1 } });
   ok(quiet.endsWith("serves (nothing — this bundle claims no protocol)"),
     "a bundle claiming no protocol says so at the load, not at the first frame");

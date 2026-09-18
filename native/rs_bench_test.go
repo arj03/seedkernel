@@ -32,7 +32,7 @@ const (
 
 var (
 	rsOnce      sync.Once
-	rsAppKey    string
+	rsApp       string
 	rsEncodeReq []byte // [OP_ENCODE][k][m][bs BE][640 KB data]
 	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks] — block 0 lost
 	rsReady     bool
@@ -81,7 +81,7 @@ func setupRS(tb testing.TB) {
 		rsSetupErr = fmt.Errorf("loadBundle(%s): %s", bundlePath, status)
 		return
 	}
-	rsAppKey = appKeyFor(author.id(), app)
+	rsApp = app
 
 	data := make([]byte, rsK*rsBS)
 	for i := range data {
@@ -93,13 +93,13 @@ func setupRS(tb testing.TB) {
 	binary.BigEndian.PutUint32(rsEncodeReq[3:7], rsBS)
 	copy(rsEncodeReq[7:], data)
 
-	parity, err := invokeBundle(rsAppKey, rsEncodeReq)
+	parity, err := invokeBundle(rsApp, rsEncodeReq)
 	if err != nil {
-		rsSetupErr = fmt.Errorf("encode via %s: %w", rsAppKey, err)
+		rsSetupErr = fmt.Errorf("encode via %s: %w", rsApp, err)
 		return
 	}
 	if len(parity) != rsM*rsBS {
-		rsSetupErr = fmt.Errorf("encode via %s returned %d B, want %d", rsAppKey, len(parity), rsM*rsBS)
+		rsSetupErr = fmt.Errorf("encode via %s returned %d B, want %d", rsApp, len(parity), rsM*rsBS)
 		return
 	}
 
@@ -117,13 +117,13 @@ func setupRS(tb testing.TB) {
 	rows[rsK-1] = byte(rsK)
 	copy(blocks[(rsK-1)*rsBS:], parity[:rsBS])
 
-	out, err := invokeBundle(rsAppKey, rsDecodeReq)
+	out, err := invokeBundle(rsApp, rsDecodeReq)
 	if err != nil {
-		rsSetupErr = fmt.Errorf("decode via %s: %w", rsAppKey, err)
+		rsSetupErr = fmt.Errorf("decode via %s: %w", rsApp, err)
 		return
 	}
 	if len(out) != rsK*rsBS || !bytes.Equal(out[:rsBS], data[:rsBS]) {
-		rsSetupErr = fmt.Errorf("decode via %s did not reconstruct block 0 (%d B out)", rsAppKey, len(out))
+		rsSetupErr = fmt.Errorf("decode via %s did not reconstruct block 0 (%d B out)", rsApp, len(out))
 		return
 	}
 	rsReady = true
@@ -145,7 +145,7 @@ func BenchmarkRSEncode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := invokeBundle(rsAppKey, rsEncodeReq); err != nil {
+		if _, err := invokeBundle(rsApp, rsEncodeReq); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -156,7 +156,7 @@ func BenchmarkRSDecode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := invokeBundle(rsAppKey, rsDecodeReq); err != nil {
+		if _, err := invokeBundle(rsApp, rsDecodeReq); err != nil {
 			b.Fatal(err)
 		}
 	}

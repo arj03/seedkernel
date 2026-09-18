@@ -230,8 +230,9 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	startShell(t, authorsPolicy(a.id()), nil)
 
 	path, key := writeTestBundle(t, a, "pqapp", 1)
-	if status := loadBundle(path); !strings.HasPrefix(status, "pqapp v1") {
-		t.Fatalf("hybrid bundle should load: %s", status)
+	// The load line names the author by the key-set hash the loader derived (§12.4).
+	if status := loadBundle(path); status != loadedLine("pqapp", 1, a.id(), "pqapp") {
+		t.Fatalf("hybrid bundle should load under its derived author id: %s", status)
 	}
 	if out, err := invokeBundle(key, []byte("hybrid")); err != nil || string(out) != "hybrid" {
 		t.Fatalf("hybrid bundle's private module did not run through `%s`: %q, %v", key, out, err)
@@ -241,9 +242,6 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	// an ML-DSA key of their own and lands on the author's names under an unchanged id.
 	if hex.EncodeToString(a.id()) == hex.EncodeToString(a.edPub) {
 		t.Fatal("the hybrid author id must not be the Ed25519 public key")
-	}
-	if _, err := invokeBundle(appKeyFor(a.edPub, "pqapp"), []byte("wrong")); err == nil {
-		t.Fatal("a hybrid bundle was selectable under its Ed25519 key rather than its derived id")
 	}
 }
 

@@ -130,7 +130,7 @@ func wedgeStartWasmBytes() []byte {
 
 func TestModuleCallBound(t *testing.T) {
 	bootRealm(t)
-	key := appKeyFor(bytes.Repeat([]byte{0x5e}, 32), "wedgeapp")
+	key := "wedgeapp"
 	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot refused: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestModuleCallBound(t *testing.T) {
 
 	// The kill CLOSED the module, so it is evicted from the table — a closed instance
 	// left in place would fail every later call silently, which is the app answering
-	// empty on a protocol forever. The app key still holds the healthy module.
+	// empty on a protocol forever. The slot still holds the healthy module.
 	if moduleSlots[key]["wedge"] != nil {
 		t.Fatal("the wedged module must be evicted from the table, not left as a closed instance")
 	}
@@ -197,7 +197,7 @@ func TestModuleCallBound(t *testing.T) {
 func TestModuleRuntimeArmed(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()
-		key := appKeyFor(bytes.Repeat([]byte{0x5c}, 32), "probeapp")
+		key := "probeapp"
 		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 			t.Fatalf("buildModuleSlot refused: %v", err)
 		}
@@ -222,7 +222,7 @@ func TestModuleRuntimeArmed(t *testing.T) {
 // table bounds its worker load for the same reason (module-table.ts).
 func TestModuleBindBound(t *testing.T) {
 	bootRealm(t)
-	key := appKeyFor(bytes.Repeat([]byte{0x5d}, 32), "startwedge")
+	key := "startwedge"
 
 	start := time.Now()
 	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000, 50*time.Millisecond)

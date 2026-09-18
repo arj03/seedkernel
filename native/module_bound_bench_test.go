@@ -174,7 +174,7 @@ func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 // the same bound, and against ~400 µs for the RS calls it actually sits in front of.
 func BenchmarkBoundCallOverhead(b *testing.B) {
 	ensureBooted(b)
-	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")
+	key := "callcost"
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, 5*time.Second); err != nil {
 		b.Fatalf("buildModuleSlot refused: %v", err)
 	}

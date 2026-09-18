@@ -13,9 +13,9 @@ import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
 import {
   sodium, generateKeyPair, JsModuleLoader, root,
-  toHex, concatBytes, appKeyFor, verifyTestBundle,
+  toHex, concatBytes, verifyTestBundle,
   signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
-  testAuthor, bootTestShell, appKey, imp, MemoryFs,
+  testAuthor, bootTestShell, imp, MemoryFs,
   createGuestSeam, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_TIMERS, TEST_CALLS,
   createSafeRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
 } from "./fixtures.mjs";
@@ -47,13 +47,13 @@ async function testGuestSeam() {
 
   // A module reachable by name, for the catalog's app-module half.
   const { host } = await makeHost();
-  const testKey = appKey(id.publicKey, "testapp");
+  const testKey = "testapp";
   await installMod(host, testKey, "echo", forwarderBytes);
 
   // A host-derived signing scope binds the guest's node/sign name to a bundle namespace
-  // (§12.2); a real node derives it from the manifest's (author, app).
-  const signScope = appSignScope(id, id.publicKey, "testapp");
-  const scopeBytes = guestSignScope(id.publicKey, "testapp");
+  // (§12.2); a real node derives it from the manifest's `app` label.
+  const signScope = appSignScope(id, "testapp");
+  const scopeBytes = guestSignScope("testapp");
   const seam = createGuestSeam({
     platform: { sodium, now: () => Date.now() },
     grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls, timers: TEST_TIMERS },
@@ -139,7 +139,7 @@ async function testGuestSeam() {
       "a declared local service id carrying a `/` still routes to the claiming realm");
 
     // A bare name reaches this app's module by its LOGICAL name, in the same `host.call`
-    // shape as every other name (§12.2). The app key is the seam's, never the caller's.
+    // shape as every other name (§12.2). Whose modules is the seam's, never the caller's.
     assertEqual([...await seam("echo", U(8, 9))], [8, 9], "a bare name invokes this app's module");
     let noSuch = false;
     try { await seam("nosuchmodule", U(1)); } catch { noSuch = true; }
@@ -234,7 +234,7 @@ async function testSigningScopeFollowsSlot() {
   const signs = (sig, domain, scope, msg) =>
     sodium.crypto_sign_verify_detached(sig, preimage(domain, scope, msg), identity.publicKey);
   const msg = new Uint8Array([5, 4, 3]);
-  const linkApp = guestSignScope(linkAuthor.id, "linkprobe");
+  const linkApp = guestSignScope("linkprobe");
   try {
     // The link slot's one scope is the LINK scope: the channel AUTH is a fact of the
     // slot, not a second name.
@@ -252,7 +252,7 @@ async function testSigningScopeFollowsSlot() {
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
     await shell.install(blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
-      replaces: appKey(linkAuthor.id, "linkprobe"),
+      replaces: "linkprobe",
       localConfig: { networkKey: "7b".repeat(32) },
     });
     const v2 = await seam("node/sign", msg);
@@ -265,8 +265,8 @@ async function testSigningScopeFollowsSlot() {
     // a second name to reach.
     await shell.install(blob(appAuthor, "plainapp", 1, ["node"]));
     const app = await seam("node/sign", msg);
-    assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
-      "an ordinary app's node/sign signs under DOMAIN_guest ‖ author ‖ app");
+    assert(signs(app, DOMAIN_GUEST, guestSignScope("plainapp"), msg),
+      "an ordinary app's node/sign signs under DOMAIN_guest ‖ app");
     assert(!signs(app, DOMAIN_LINK, linkScope, msg),
       "…and cannot reach the link slot's link scope");
     let refused = false;
@@ -275,10 +275,10 @@ async function testSigningScopeFollowsSlot() {
 
     // The two arms are the one exported constructor, so a caller building a scope by hand
     // agrees with what the slot got.
-    assert(bytesEqual(slotSignScope({ identity }, linkAuthor.id, "linkprobe", true).scope, linkScope),
+    assert(bytesEqual(slotSignScope({ identity }, "linkprobe", true).scope, linkScope),
       "slotSignScope gives the link slot the link scope");
-    assert(bytesEqual(slotSignScope({ identity }, appAuthor.id, "plainapp", false).scope,
-      guestSignScope(appAuthor.id, "plainapp")), "slotSignScope gives an app slot author ‖ app");
+    assert(bytesEqual(slotSignScope({ identity }, "plainapp", false).scope,
+      guestSignScope("plainapp")), "slotSignScope gives an app slot its label");
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -609,7 +609,7 @@ async function testSeamGating() {
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (names) => createGuestSeam({
     platform: { sodium, now: () => Date.now() },
-    grants: { names, signScope: appSignScope(id, new Uint8Array(32), "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
+    grants: { names, signScope: appSignScope(id, "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   });
   const U = (...xs) => new Uint8Array(xs);
@@ -625,7 +625,7 @@ async function testSeamGating() {
   try { await clockOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
   // A bare name is the asking bundle's own module map — code it already holds, scoped by
-  // the app key the seam was built with — so it passes the gate under an empty requires
+  // the app the seam was built for — so it passes the gate under an empty requires
   // set. This seam's `hasModule` says no, so it is refused for NOT EXISTING rather than
   // for not being declared, and the message is the assertion.
   let gateMsg = "";
@@ -688,14 +688,13 @@ async function testCallModuleGuards() {
 
   const { makeHost } = await import("./fixtures.mjs");
   const { host } = await makeHost();
-  const { publicKey: pk } = generateKeyPair();
-  const guards = appKey(pk, "guards");
+  const guards = "guards";
 
   // An unbound module resolves to null, distinct from an empty response — and so does a
   // module under an app that was never installed: neither is a thing that exists.
   assert(await host.callModule(guards, "missing", new Uint8Array([1])) === null,
     "callModule returns null for an unbound module");
-  assert(await host.callModule(appKey(pk, "nope"), "echo", new Uint8Array([1])) === null,
+  assert(await host.callModule("nope", "echo", new Uint8Array([1])) === null,
     "callModule returns null for an app that installed nothing");
 
   // An installed module is reached by name. A confined guest reaches the same module
@@ -744,8 +743,7 @@ async function testModuleCallBound() {
   const { ModuleTable } = await imp("build/host/module-table.js");
   const { SPIN_WASM, SPIN_OR_ECHO_WASM } = await import("./fixtures/spin-wasm.mjs");
   const { testHost } = await import("./fixtures.mjs");
-  const { publicKey: pk } = generateKeyPair();
-  const spinKey = appKey(pk, "spin");
+  const spinKey = "spin";
 
   // The default table bound is generous; a bounded host is the deployment's number. The
   // call's OWN deadline is what a guest's call carries — the guest's remaining segment.
@@ -827,10 +825,9 @@ async function testModuleCallChargedToGuestBudget() {
   const { createGuestSeam } = await imp("build/host/guest-seam.js");
   const { createSafeRealm } = await imp("build/host/safe-js.js");
   const { testHost } = await import("./fixtures.mjs");
-  const id = generateKeyPair();
 
   const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
-  const spinKey = appKey(id.publicKey, "app");
+  const spinKey = "app";
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
     platform: { sodium, now: () => Date.now() },

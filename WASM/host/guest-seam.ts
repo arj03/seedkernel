@@ -15,8 +15,8 @@ export interface SignScope {
   /** Domain tag — `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the slot
    *  holding the raw-link resource. */
   domain: Uint8Array;
-  /** Scope bytes under the domain: `author ‖ app` for an app slot, empty for
-   *  the link slot. */
+  /** Scope bytes under the domain: the app label for an app slot, empty for the link
+   *  slot. */
   scope: Uint8Array;
   /** The keypair that signs. */
   key: Keypair;
@@ -98,8 +98,8 @@ export interface SeamGrants {
    *  otherwise a module. */
   localServices?: ReadonlySet<string>;
   /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
-   *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
-   *  the link slot gets `DOMAIN_link_scope`. The host always chooses
+   *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ app`, the link
+   *  slot gets `DOMAIN_link_scope`. The host always chooses
    *  domain ‖ scope; the guest never supplies either. Without a scope both names are
    *  unavailable, because guest signing and scoped verification are never raw. */
   signScope?: SignScope;
@@ -278,28 +278,28 @@ globalThis.__invoke = (argBuf) => {
 // by a guest. There is exactly ONE host id — the zero id, whose events and loopback calls
 // the host writes (a fired deadline re-enters as an ordinary loopback carrying the opaque
 // body supplied when it was armed, so a second host id is unnecessary). Everything else
-// non-zero is a peer or a co-resident app key.
-/** The host's own caller id: 32 zero bytes. No app key derives it. */
+// non-zero is a peer or a co-resident app.
+/** The host's own caller id: 32 zero bytes. No app label derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
- *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
- *  guest signs only within its own bundle's namespace; every node running the same bundle
- *  derives the same bytes, which is what makes scoped signatures portable across a cohort. */
-export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
+ *  `app_len u8 ‖ app`, the admitted manifest's label. Never guest-supplied, and one slot
+ *  per node holds a label, so a guest signs only within its own namespace; every node
+ *  running an app under that label derives the same bytes, whoever authored it, which is
+ *  what makes scoped signatures portable across a cohort. */
+export function guestSignScope(app: string): Uint8Array {
   const appBytes = enc.encode(app);
   if (appBytes.length > 255) throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
-  const out = new Uint8Array(author.length + 1 + appBytes.length);
-  out.set(author, 0);
-  out[author.length] = appBytes.length;
-  out.set(appBytes, author.length + 1);
+  const out = new Uint8Array(1 + appBytes.length);
+  out[0] = appBytes.length;
+  out.set(appBytes, 1);
   return out;
 }
 
-/** An ordinary app's signing scope: `DOMAIN_guest ‖ author ‖ app`. Two bundles derive
- *  disjoint scopes. */
-export function appSignScope(key: Keypair, author: Uint8Array, app: string): SignScope {
-  return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
+/** An ordinary app's signing scope: `DOMAIN_guest ‖ app`. Two slots on one node hold two
+ *  labels, so they derive disjoint scopes. */
+export function appSignScope(key: Keypair, app: string): SignScope {
+  return { domain: DOMAIN_GUEST, scope: guestSignScope(app), key };
 }
 
 /** The one scoped-signature transcript: `domain ‖ scope ‖ message`. */
@@ -308,18 +308,14 @@ function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message:
 }
 
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). Same scope as `appSignScope`. */
-export function appSigner(
-  sodium: SeamCrypto,
-  key: Keypair,
-  author: Uint8Array, app: string,
-): {
+export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): {
   sign(msg: Uint8Array): Uint8Array;
   /** False on a signature that does not verify under `(scope, pk)`; a `sig` or `pk` of
    *  the wrong shape ALSO reads false (the seam's `node/verify` refuses a mis-framed
    *  payload by throwing; a caller-facing verifier has no caller left to explain to). */
   verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
-  const scope = appSignScope(key, author, app);
+  const scope = appSignScope(key, app);
   return {
     sign(msg) {
       return sodium.crypto_sign_detached(scopedSigningInput(scope, msg), scope.key.privateKey);
@@ -344,15 +340,14 @@ export function linkSignScope(key: Keypair): SignScope {
 }
 
 /** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
- *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope`
- *  for the slot reaching `link`. A function of admitted facts only: nothing local,
- *  and nothing from `protocols`, which move per version and would silently restate what
- *  signed records mean. */
-export function slotSignScope(node: { identity: Keypair },
-  author: Uint8Array, app: string, links: boolean): SignScope {
+ *  `DOMAIN_guest ‖ app` for an ordinary app slot, `DOMAIN_link_scope` for the slot
+ *  reaching `link`. A function of admitted facts only: nothing local, nothing from
+ *  `protocols`, which move per version and would silently restate what signed records
+ *  mean, and not the author, whose key can rotate or fork under the same label. */
+export function slotSignScope(node: { identity: Keypair }, app: string, links: boolean): SignScope {
   return links
     ? linkSignScope(node.identity)
-    : appSignScope(node.identity, author, app);
+    : appSignScope(node.identity, app);
 }
 
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
@@ -393,7 +388,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     ...hostTransforms(sodium),
     // ── authorities: each reaches something no confined guest can hold ──────────
     // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope,
-    // derived at load: an app slot's own `DOMAIN_guest ‖ author ‖ app`, the link
+    // derived at load: an app slot's own `DOMAIN_guest ‖ app`, the link
     // slot's `DOMAIN_link_scope`. The guest never picks a namespace.
     "node/sign": (payload) => {
       const s = grants.signScope;

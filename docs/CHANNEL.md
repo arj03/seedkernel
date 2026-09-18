@@ -215,7 +215,7 @@ relies on it for channel confidentiality, authentication and attribution.
 
 A node signs for two purposes with one key: the handshake, under `DOMAIN_link_scope`
 (with the transport's own `DOMAIN_channel ‖ root ‖ transcript ‖ id` inside), and an app's
-scoped records, under `DOMAIN_guest ‖ author ‖ app`
+scoped records, under `DOMAIN_guest ‖ app`
 ([RUNTIME](RUNTIME.md) §12.6.2b). Deriving a second keypair for the second purpose is the
 obvious hardening, and it is worth saying why it is not done.
 

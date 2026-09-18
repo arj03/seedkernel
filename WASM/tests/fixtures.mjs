@@ -40,10 +40,9 @@ export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/core/util.js");
 export { bytesEqual } from "./bytes.mjs";
 
-// The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
-// code path a bundle load does rather than a parallel copy of it.
-export const { appKeyFor, hybridAuthorId, FreshnessMarks,
-  verifyBundle, loadBundleModules }
+// The loader's admission step (§12.4) — tests drive the SAME code path a bundle load does
+// rather than a parallel copy of it.
+export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
 export const { guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
@@ -56,9 +55,9 @@ export const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 export const GUEST = (extra = {}) => ({ requires: [], ...extra });
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
- *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins, app
- *  keys, freshness marks) and hand the whole object to `signTestBundle`, so none can pin
- *  half an identity. */
+ *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins,
+ *  freshness marks, revocation) and hand the whole object to `signTestBundle`, so none can
+ *  pin half an identity. */
 export const testAuthor = () => makeAuthor(sodium);
 
 /** A NODE-platform node for one test: `bootNodeShell` (shell-node.ts) with no network,
@@ -137,7 +136,7 @@ export class TestModuleHost {
 export const testHost = (loader) => new TestModuleHost(loader);
 export const installBundle = async (host, v) => {
   const modules = await loadBundleModules(host, v);
-  host.adopt(appKeyFor(v.author, v.manifest.app), modules, v.modules.map(({ mod }) => mod.name));
+  host.adopt(v.manifest.app, modules, v.modules.map(({ mod }) => mod.name));
   return { manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, guestSource: v.guestSource };
 };
 export async function makeHost() {
@@ -150,15 +149,10 @@ export const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forw
 // hybrid manifest suite is "a sodium that knows this method" (§12.4).
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 
-// Install one verified module as the whole of `appKey`'s module set. Async: a bind stands
+// Install one verified module as the whole of `app`'s module set. Async: a bind stands
 // each module up in its own worker and returns when it has loaded.
-export async function installMod(host, appKey, module, wasm) {
-  await host.bindAll(appKey, [{ name: module, wasm }]);
+export async function installMod(host, app, module, wasm) {
+  await host.bindAll(app, [{ name: module, wasm }]);
 }
-
-// The §5.1 app key a bundle's modules land under, `"<author hex>:<app>"` — the real
-// derivation, not a mirror, so a test can name a table entry without packing a whole
-// bundle and still land where the loader would put it.
-export const appKey = (authorPk, app) => appKeyFor(authorPk, app);
 
 export { signTestBundle, verifyTestBundle } from "./bundle-fixtures.mjs";
