@@ -64,9 +64,11 @@ declare const bridge: {
     onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
     deadlineMs: number): number;
   realmCancel(realm: number, callId: number): void;
-  /** Settle one guest host.call and drain the continuation it made runnable. Returns the
-   *  execution time of that causal turn in nanoseconds. */
-  realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): number;
+  /** Settle one guest host.call and drain the continuation it made runnable — as a new turn
+   *  under a fresh budget when `detached` is 1 (`CallBudget.detach`). Returns the execution
+   *  time of that causal turn in nanoseconds. */
+  realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null,
+    detached: number): number;
   realmDispose(realm: number): void;
 };
 
@@ -336,7 +338,7 @@ const channels: ChannelFactory = {
  *  not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds.
  *  guest.go enforces it with QuickJS's own interrupt handler (`qjs.Runtime.Budget`), the
  *  mechanism safe-js.ts uses, so an overrun throws inside the guest and the realm survives. */
-const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
+const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs, ownTurns }) => {
   // This realm's wall-clock custody (§12.3): one wake for the host calls it has not
   // answered, one for the invocations waiting to enter it — never merged, and both
   // disarmed with the realm (realm-queue.ts).
@@ -356,10 +358,12 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // Go admitted this call before making the cross-realm copy. This adapter only
     // routes and settles; post-copy accounting here would be a second policy authority.
     const causalClock = causalContext.current;
+    let detached = false;
     const budget: CallBudget = {
       remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
       charge: () => {},
       causalClock,
+      detach: () => { detached = true; },
     };
     if (budget.remainingMs <= 0)
       throw new Error("guest: handoff deadline exhausted before host.call");
@@ -370,7 +374,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // by the same arm and neither can follow the other (realm-queue.ts).
     const settle = (bytes: Uint8Array | null, error: string | null): void =>
       causalContext.run(causalClock, () => {
-        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error);
+        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error, detached ? 1 : 0);
         causalClock?.charge(elapsedNs / 1_000_000);
       });
     void raceDeadline(hostCallDeadlines, budget.remainingMs, answer,
@@ -432,6 +436,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
       },
       () => (disposed ? new Error(REALM_DISPOSED) : null),
       configuredDeadlineMs,
+      ownTurns,
     ),
     dispose: () => {
       disposed = true;

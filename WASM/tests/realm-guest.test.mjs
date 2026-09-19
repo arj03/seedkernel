@@ -1034,6 +1034,71 @@ async function testDeferredKeepsItsDeadline() {
   console.log("  OK\n");
 }
 
+async function testDetachedAnswerIsANewTurn() {
+  console.log("Test: a detached call's answer resumes as a new turn, not under a spent invocation (§12.3)");
+
+  // `deliver` detaches and never answers, so its own handoff deadline — the invocation's
+  // 100 ms — settles it; `remaining` records the remainder its continuation was handed.
+  const remaining = [];
+  const realm = await createSafeRealm({
+    source: `function handle(tag) {
+      host.call("deliver", tag).then(() => {}, () => {})
+        .then(() => host.call("remaining", tag)).catch(() => {});
+      return tag;
+    }`,
+    deadlineMs: 5000,
+    hostCall: (name, tag, budget) => {
+      if (name === "remaining") { remaining.push(budget.remainingMs); return Promise.resolve(tag); }
+      budget.detach?.();
+      return new Promise(() => {});
+    },
+  });
+  try {
+    await realm.call(Uint8Array.of(1), 100);
+    for (let waited = 0; remaining.length === 0 && waited < 2000; waited += 10) await sleep(10);
+    assert(remaining.length === 1 && remaining[0] > 1000,
+      `the answer resumed under a fresh turn, not the invocation's spent 100 ms (${JSON.stringify(remaining)})`);
+  } finally {
+    realm.dispose();
+  }
+
+  console.log("  OK\n");
+}
+
+async function testOwnTurns() {
+  console.log("Test: an ownTurns realm runs on its own ceiling; a caller's deadline bounds only its wait (§12.3)");
+
+  // `wait` answers when the test says, after the caller's 50 ms are long gone; `remaining`
+  // records the remainder the turn still had then.
+  let release;
+  const remaining = [];
+  const realm = await createSafeRealm({
+    source: `async function handle(tag) {
+      try { await host.call("wait", tag); await host.call("remaining", tag); } catch {}
+      return tag;
+    }`,
+    deadlineMs: 5000,
+    ownTurns: true,
+    hostCall: (name, tag, budget) => {
+      if (name === "remaining") { remaining.push(budget.remainingMs); return Promise.resolve(tag); }
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  try {
+    const caller = realm.call(Uint8Array.of(1), 50).then(() => "answered", (err) => err.message);
+    assert(/deadline/.test(await caller), "the caller's own deadline still bounds its wait");
+    await sleep(100);
+    release(EMPTY);
+    for (let waited = 0; remaining.length === 0 && waited < 2000; waited += 10) await sleep(10);
+    assert(remaining.length === 1 && remaining[0] > 1000,
+      `the turn ran on the realm's own 5 s, not the caller's 50 ms (${JSON.stringify(remaining)})`);
+  } finally {
+    realm.dispose();
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testGuestSeam();
@@ -1049,5 +1114,7 @@ await testModuleCallChargedToGuestBudget();
 await testPreviousAbiRefused();
 await testSafeRealmConcurrency();
 await testDeferredKeepsItsDeadline();
+await testDetachedAnswerIsANewTurn();
+await testOwnTurns();
 
 summary("Results");

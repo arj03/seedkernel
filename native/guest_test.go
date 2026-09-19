@@ -325,11 +325,11 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		liveID = id
 	}
 
-	g.settleHostCall(liveID+1000, []byte{}, "")
+	g.settleHostCall(liveID+1000, []byte{}, "", false)
 	if len(g.hostCalls.live) != 1 {
 		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls.live))
 	}
-	g.settleHostCall(liveID, []byte{}, "")
+	g.settleHostCall(liveID, []byte{}, "", false)
 	if len(g.hostCalls.live) != 0 || len(g.hostCallBudgets) != 0 {
 		t.Fatalf("live settlement left %d parked calls and %d invocation clocks", len(g.hostCalls.live), len(g.hostCallBudgets))
 	}
@@ -662,6 +662,95 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 		if (survivor !== "answered") throw new Error("the interrupt failed invocation 2 too: " + survivor);
 		if (!(__remaining.get(2) > 1000))
 		  throw new Error("invocation 2 lost its own remainder: " + __remaining.get(2) + " ms left");
+		return new Uint8Array();
+	})`, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A detached host call's answer is a new turn of its realm, not the tail of the invocation
+// that made it (README §12.3): it resumes under the realm's own ceiling rather than that
+// invocation's spent remainder. realm-guest.test.mjs (testDetachedAnswerIsANewTurn) holds
+// safe-js.ts to the same scenario.
+func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
+	guestSeamRealm(t)
+	// `deliver` detaches and never answers, so its own handoff deadline settles it;
+	// `remaining` records the remainder guest.go handed the continuation.
+	if _, err := qc.Eval("detaching-seam.js", `
+		globalThis.__remaining = [];
+		globalThis.__guestSeam = (name, tag, budget) => {
+		  if (name === "remaining") {
+		    __remaining.push(budget.remainingMs);
+		    return Promise.resolve(tag);
+		  }
+		  budget.detach?.();
+		  return new Promise(() => {});
+		};
+	`); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle(tag) {
+		  host.call("deliver", tag).then(() => {}, () => {})
+		    .then(() => host.call("remaining", tag)).catch(() => {});
+		  return tag;
+		}
+	`, 5000)
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
+
+	if _, err := callRealm(`(async () => {
+		await __realm.call(Uint8Array.of(1), 100);
+		for (let waited = 0; __remaining.length === 0 && waited < 2000; waited += 10)
+		  await new Promise((r) => setTimeout(r, 10));
+		if (!(__remaining.length === 1 && __remaining[0] > 1000))
+		  throw new Error("the answer resumed under the spent invocation: " + JSON.stringify(__remaining));
+		return new Uint8Array();
+	})`, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An ownTurns realm runs every invocation on its own ceiling: a caller's deadline bounds that
+// caller's wait and nothing else (README §12.3). realm-guest.test.mjs (testOwnTurns) holds
+// safe-js.ts to the same scenario.
+func TestGuestRealmOwnTurns(t *testing.T) {
+	guestSeamRealm(t)
+	// `wait` answers when the harness says; `remaining` records the remainder guest.go
+	// handed the turn by then.
+	if _, err := qc.Eval("own-turns-seam.js", `
+		globalThis.__remaining = [];
+		globalThis.__guestSeam = (name, tag, budget) => {
+		  if (name === "remaining") {
+		    __remaining.push(budget.remainingMs);
+		    return Promise.resolve(tag);
+		  }
+		  return new Promise((resolve) => { globalThis.__release = resolve; });
+		};
+		globalThis.__src = "async function handle(tag) {" +
+		  "  try { await host.call('wait', tag); await host.call('remaining', tag); } catch {}" +
+		  "  return tag;" +
+		  "}";
+	`); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	if _, err := callRealm(`(async () => {
+		globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
+		  deadlineMs: 5000, ownTurns: true });
+		return new Uint8Array();
+	})`, 10*time.Second); err != nil {
+		t.Fatal("createRealm:", err)
+	}
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
+
+	if _, err := callRealm(`(async () => {
+		const caller = await __realm.call(Uint8Array.of(1), 50).then(() => "answered", (e) => e.message);
+		if (!/deadline/.test(caller)) throw new Error("the caller's own deadline did not bound its wait: " + caller);
+		await new Promise((r) => setTimeout(r, 100));
+		__release(new Uint8Array());
+		for (let waited = 0; __remaining.length === 0 && waited < 2000; waited += 10)
+		  await new Promise((r) => setTimeout(r, 10));
+		if (!(__remaining.length === 1 && __remaining[0] > 1000))
+		  throw new Error("the turn ran on the caller's 50 ms: " + JSON.stringify(__remaining));
 		return new Uint8Array();
 	})`, 10*time.Second); err != nil {
 		t.Fatal(err)

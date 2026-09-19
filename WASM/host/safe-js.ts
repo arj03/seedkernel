@@ -362,11 +362,16 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // Retain the invocation's shared accounting record, not a snapshot of its
     // remainder: concurrent calls must charge the same accumulated spend.
     const invocationBudget = clock.current;
+    let detached = false;
     const budget: CallBudget = {
       remainingMs: clock.remaining(),
       charge: (ms) => { clock.charge(invocationBudget, ms); causalClock?.charge(ms); },
       causalClock,
+      detach: () => { detached = true; },
     };
+    /** What the answer resumes under: the invocation that made the call, or — detached — a
+     *  new turn's own record, minted as the answer lands. */
+    const resumeUnder = (): InvocationBudget => (detached ? clock.create() : invocationBudget);
     if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
     // `getArrayBuffer` reads as a borrow but is not one: QTS_GetArrayBuffer mallocs a
     // payload-sized copy (libc, so outside setMemoryLimit) that the lifetime frees, and
@@ -399,10 +404,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
           // Request and response coexist while copying the result into the guest. Reserve
           // that overlap and keep the call live through guest-side settlement.
           activeCall.reserve(bytes.byteLength);
-          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), invocationBudget, causalClock);
+          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), resumeUnder(), causalClock);
         } catch (err) {
           if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), resumeUnder(), causalClock);
           }
         } finally {
           activeCall.release();
@@ -411,7 +416,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       (err) => {
         try {
           if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), invocationBudget, causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), resumeUnder(), causalClock);
           }
         } finally {
           activeCall.release();
@@ -535,7 +540,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   return {
     call: serializeCalls(entryDeadlines, invoke, () =>
       (disposed || !ctx.alive) ? new Error(REALM_DISPOSED) : null,
-    opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS),
+    opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS, opts.ownTurns),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those

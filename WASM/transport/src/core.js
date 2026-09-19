@@ -107,9 +107,6 @@ const unverifiedTimeoutMs = policy("unverifiedTimeoutMs");
 // share; a mismatch desynchronizes the record layer and the link dies.
 const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
 
-// Deferred teardowns (see Link constructor): flushed after the current event.
-const deferQueue = [];
-
 // Every link by the id the platform names it with. Outlives the link's own teardown on
 // purpose: `linkClosed` arrives a turn later, and its return is the only thing that carries
 // WHY the link went. Bounded — ids are never reused, and the driver answers every link with
@@ -277,7 +274,6 @@ function rememberProbe(ephI) {
 class Core {
   constructor() {
     this.connecting = new Map(); // peerId → Link[] (outbound, pre-auth)
-    this.inbound = new Set();    // accepted, pre-auth
     this.addrs = new Map();      // peerId → { dest, secret } — this program's address book
     this.readyWaiters = [];      // [{check, d, due}] — one per in-flight ready()
     this.dialing = new Map();    // peerId → in-flight dial, so concurrent senders share one
@@ -350,29 +346,27 @@ class Core {
       source: spec.source,
       limiter: spec.limiter,
       onAuth: (pid, l) => this.onAuth(pid, l),
-      onFrame: (pid, frame, pk) => router.deliver(pid, frame, pk),
+      onFrame: (pid, frame, pk) => reqres.onFrame(pid, frame, pk),
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);
     // `connecting` is keyed by peer because it is what steers an outbound frame at a link
-    // that has not authenticated yet — a dial whose peer we cannot name steers nothing, so
-    // it waits in `inbound` like an accept. (`spec.weDialed` is still passed to `Link`; it
-    // decides who speaks first.)
+    // that has not authenticated yet. An accept, or a dial whose peer we cannot name, steers
+    // nothing, so until it authenticates it is on `linksById` alone. (`spec.weDialed` is
+    // still passed to `Link`; it decides who speaks first.)
     if (link.dialedPeerId) Core.push(this.connecting, link.dialedPeerId, link);
-    else this.inbound.add(link);
     return link;
   }
 
   onAuth(peerId, link) {
-    this.inbound.delete(link);
     Core.drop(this.connecting, link.dialedPeerId, link);
     // The peer lint already answered at msg3/msg4, so a refused peer never reaches the
     // router. Only routing is left.
     router.promote(peerId, link);
   }
 
+  /** A link leaving routing — the moment it closes, not once its teardown has run. */
   forget(link) {
-    this.inbound.delete(link);
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
     // What still waits in its queue never left. Another link to the same peer carries it —
@@ -437,11 +431,10 @@ class Core {
 
 // The one router, request/response layer and routing core per host instance, wired
 // during load: none of it asks the host for anything.
-const router = new Router(ownPk, ownId);
+const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
 reqres.attach((to, frame) => core.sendFrame(to, frame));
-router.sink = (from, frame, fromPk) => reqres.onFrame(from, frame, fromPk);
 // The cohort edges stay in this heap; the host reads them with the `peers` op.
 router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
 router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };
@@ -465,9 +458,6 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 // which cannot be answered or awaited in the same turn — the events that settle them
 // arrive as further invocations, which would queue behind the frame doing the awaiting
 // (realm-queue.ts). They use `defer()` (below).
-//
-// A deferred teardown is flushed at the end of whichever event provoked it, so a link's
-// bookkeeping is never undone by an onClose that ran before its caller finished.
 
 const NOTHING = new Uint8Array(0);
 
@@ -489,21 +479,16 @@ const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
 function handle(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
-  try {
-    if (wakeOwed) wake();
-    if (fromHost && body.length === 4) { onWake(); return NOTHING; }
-    const { op, args } = readOp(body);
-    const r = new Reader(args);
-    const fn = ops[op];
-    if (!fn) throw new Error("transport: no op '" + op + "'");
-    // The platform's events are the host's alone; the caller id is the host's to write,
-    // so this is a real boundary and not a hint.
-    if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
-    return fn(r, caller) || NOTHING;
-  } finally {
-    const deferred = deferQueue.splice(0);
-    for (const f of deferred) { try { f(); } catch { /* teardown of a gone link */ } }
-  }
+  if (wakeOwed) wake();
+  if (fromHost && body.length === 4) { onWake(); return NOTHING; }
+  const { op, args } = readOp(body);
+  const r = new Reader(args);
+  const fn = ops[op];
+  if (!fn) throw new Error("transport: no op '" + op + "'");
+  // The platform's events are the host's alone; the caller id is the host's to write,
+  // so this is a real boundary and not a hint.
+  if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
+  return fn(r, caller) || NOTHING;
 }
 
 /** Platform-opened link event (§12.1). */

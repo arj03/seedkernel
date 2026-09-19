@@ -270,13 +270,17 @@ export async function makeTransportHost(opts = {}) {
     // No disk: nothing here declares `fs`, and the in-memory default would be a backend
     // these tests never meant to hand out.
     fs: false,
+    guestDeadlineMs: opts.guestDeadlineMs,
     transport,
-    createRealm: async (o) => createSafeRealm(opts.onHostCall
+    // `onHostCall` sees every host call this node's realms make, and refuses one by
+    // throwing; `onHostAnswer` may stand in for its answer — a slow one, say.
+    createRealm: async (o) => createSafeRealm(opts.onHostCall || opts.onHostAnswer
       ? {
         ...o,
         hostCall: (...args) => {
-          opts.onHostCall(...args);
-          return o.hostCall(...args);
+          opts.onHostCall?.(...args);
+          const answer = o.hostCall(...args);
+          return opts.onHostAnswer ? opts.onHostAnswer(args[0], answer) : answer;
         },
       }
       : o),

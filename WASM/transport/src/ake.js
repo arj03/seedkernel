@@ -259,11 +259,14 @@ class Link {
     this.weDialed = spec.weDialed;
     this.expectPeerId = spec.expectPeerId;   // 32B or null
     // The `connecting` pool this link waits in, so leaving it is one map hit rather than a
-    // scan of every peer's pool. Empty for an accept, which waits in `inbound` instead.
+    // scan of every peer's pool. Empty for an accept, which is in no pool until it
+    // authenticates.
     this.dialedPeerId = spec.dialedPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
+    // Called the moment the link closes, not once its teardown has run: until then a
+    // frame routed to it could only be dropped (core.js `forget`).
     this.onClose = spec.onClose;
     this.rekeyAfter = rekeyAfterFrames;
     // Address-book dials use the peer's secret; platform-opened links use our live secret
@@ -287,7 +290,6 @@ class Link {
     this.peerEph = null;
     this.closed = false;
     this.stalled = false;
-    this.notified = false;
     // How this link ended, for `closeReason`: whether WE tore it down, whether the teardown
     // was defensive (a peer did something wrong) rather than merely our own decision, and
     // whether a deadline is what retired it. Each is set once, on the way down, and read
@@ -317,11 +319,11 @@ class Link {
     this.work = Promise.resolve();
 
     // Half-open slot BEFORE any key material — a refused connection costs a map lookup,
-    // not a keypair. Teardown of an over-budget link is deferred (see deferTeardown).
+    // not a keypair. Its teardown runs on the chain, after `openLink` has filed it.
     if (spec.limiter) {
       this.slot = spec.limiter.acquire(this.source, () => this.abort());
       if (!this.slot) {
-        this.deferTeardown();
+        this.abort();
         return;
       }
     }
@@ -329,11 +331,9 @@ class Link {
     // Only a dialer speaks unprompted; an accepting link says nothing until a msg1 opens
     // under the contact secret (§12.6.2).
     //
-    // Everything here runs async now, so the constructor's old try/catch becomes the
-    // boot chain's rejection arm — same deferred teardown the refused slot takes: the
-    // slot first and on its own, then the deadline, then the notify-on-later-turn.
-    // RECOVERED, like every later link in the chain: a raw rejecting `work` would silently
-    // skip whatever `enqueue` put behind it, and the deadline's own abort is exactly that.
+    // A boot that fails aborts like any later step. RECOVERED, like every later link in the
+    // chain: a raw rejecting `work` would silently skip whatever `enqueue` put behind it,
+    // and the deadline's own abort is exactly that.
     this.work = (async () => {
       this.root = await hash(DOMAIN_CHANNEL, networkKey);
       if (this.weDialed) {
@@ -343,11 +343,7 @@ class Link {
       } else {
         this.armDeadline(unverifiedTimeoutMs);
       }
-    })().catch(() => {
-      this.releaseSlot();
-      try { this.teardown(); } catch { /* already torn down */ }
-      this.deferTeardown();
-    });
+    })().catch(() => this.abort());
   }
 
   /** Run `fn` as the next step of this link's one work chain. The returned promise
@@ -357,18 +353,6 @@ class Link {
     const done = this.work.then(fn);
     this.work = done.catch(() => {});
     return done;
-  }
-
-  /** Close the host channel and notify, but AFTER the current event: the caller's
-   *  bookkeeping (core.openLink's connecting/inbound pools) runs once the constructor
-   *  returns. */
-  deferTeardown() {
-    this.closed = true;
-    this.closedLocally = true;
-    deferQueue.push(() => {
-      this.closeChannel(false);
-      this.finish();
-    });
   }
 
   /** Hand the socket back to the host. A refused close is owed rather than lost — this
@@ -519,8 +503,8 @@ class Link {
       // Both writes above reached the raw-link owner before teardown, so a graceful
       // channel close flushes a complete farewell rather than truncating its record.
       this.closeChannel(saidGoodbye);
-      this.finish();
     });
+    this.onClose(this);
   }
 
   // Every failure path uses abort(), never close(): only close() emits the authenticated
@@ -536,8 +520,8 @@ class Link {
     void this.enqueue(async () => {
       this.teardown();
       this.closeChannel(false);
-      this.finish();
     });
+    this.onClose(this);
   }
 
   /** Why this link ended, as the occupant alone can say it. A REASON_* code returned
@@ -618,22 +602,19 @@ class Link {
       if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(); }
       return this.enqueue(() => this.onMessage(bytes));
     }
-    // Steps collected as PROMISES, in arrival order: once its cap is raised, a length-framed
-    // chunk's parse loop fires `deliver` synchronously and does not await it, so finishing
-    // the read means waiting on every step through Promise.all rather than counting pushes.
-    // Before that, a framer waits on the step `deliver` answers (LengthFramer `parse`).
-    const out = [];
-    const deliver = (m) => {
-      const step = this.enqueue(() => this.onMessage(m));
-      out.push(step);
-      return step;
-    };
+    // Once its cap is raised, a length-framed chunk's parse loop fires `deliver`
+    // synchronously and does not await it, so finishing the read means waiting on the LAST
+    // step it delivered: steps settle in order on the one chain, and none rejects
+    // (`onMessage` catches). Before that, a framer waits on the step `deliver` answers
+    // (LengthFramer `parse`).
+    let last;
+    const deliver = (m) => (last = this.enqueue(() => this.onMessage(m)));
     try {
       const ok = this.framer.push(bytes, deliver);
       return Promise.resolve(ok).then(
         (good) => {
           if (!good) { this.abort(true); return; }
-          return Promise.all(out).then(() => {});
+          return last;
         },
         () => { this.abort(true); },
       );
@@ -670,13 +651,10 @@ class Link {
     this.clearEphemeral();
   }
 
-  // Refuse the same way, but for OUR contention rather than anything the peer did, so the
-  // exchange is not terminal: a caller that arrived while the verified budget was full may
-  // try again on this connection before its deadline retires it. Indistinguishable on the
-  // wire — both are silence — and a retry costs one AEAD open, the same as a fresh dial.
-  stallBusy() { /* deliberately nothing */ }
-
   async becomeAuthed() {
+    // A step already under way when the link closed (a deadline, an eviction) must not
+    // route it: it left routing as it closed, and nothing would take it out again.
+    if (this.closed) return;
     this.authed = true;
     // The slot is NOT released — it moves to the authed tier and is held until the link
     // dies, so the budget bounds how many peers may be IN rather than how many got in.
@@ -686,8 +664,8 @@ class Link {
     // no framer to raise — for it, `authed` is what raises the cap, in onWire.
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
-    // onAuth may have torn us down (the tie-break): the queue then goes to the link that
-    // won, once this one is forgotten (core.js `forget`).
+    // onAuth may have torn us down (the tie-break): the queue has then gone to the link
+    // that won (core.js `forget`).
     if (this.closed) return;
     for (const frame of this.takeQueued()) await this.wireRecord(frame);
   }
@@ -763,10 +741,9 @@ class Link {
     // recording replays. Each one is accepted ONCE — asked here, before the promotion and
     // the asymmetric work a replay would otherwise buy for free (§12.6.2).
     if (probeSeen(ephI)) { this.stall(); return; }
-    // Proved: move off the contended budget before the expensive work.
-    if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stallBusy(); return; }
-    // Spent only now: a msg1 turned away just above for OUR contention is not spent, and
-    // the caller may try again on this connection (stallBusy).
+    // Proved: move off the contended budget before the expensive work. Every tier evicts,
+    // so only a verified budget of zero refuses here.
+    if (this.slot && !this.slot.limiter.promote(this.slot)) { this.stall(); return; }
     rememberProbe(ephI);
     this.armDeadline(handshakeTimeoutMs);
     await this.ensureKeys();
@@ -927,11 +904,13 @@ class Link {
     this.onFrame(this.peerId, r.pt, this.peerPubkey);
   }
 
+  /** The socket went away. A link that closed itself has already left routing, and its
+   *  teardown is on the work chain. */
   onChannelClosed() {
-    if (this.notified) return;
+    if (this.closed) return;
     this.closed = true;
     this.teardown();
-    this.finish();
+    this.onClose(this);
   }
 
   // ── teardown ────────────────────────────────────────────────────────────────
@@ -964,11 +943,5 @@ class Link {
     const slot = this.slot;
     this.slot = null;
     slot.limiter.release(slot);
-  }
-
-  finish() {
-    if (this.notified) return;
-    this.notified = true;
-    this.onClose(this);
   }
 }

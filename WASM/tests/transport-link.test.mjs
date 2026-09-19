@@ -220,6 +220,27 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   assert(!longSettled, "a peer's short-deadline request must not settle its long-deadline one");
 });
 
+await test("OUT OF TIME: an app past its deadline loses its own request, never the link", async (keep) => {
+  // The transport's turns are its own (§12.3): an app's remainder bounds the app's wait,
+  // not the record the transport seals and writes for it. Here the seal outlives the app's
+  // 30 ms; run on the app's clock, it was refused halfway and the link went down with it.
+  let slowSeal = false;
+  const st = keep(await upPair(undefined, {
+    onHostAnswer: (name, answer) => {
+      if (!slowSeal || name !== "crypto/chacha20poly1305-ietf/seal") return answer;
+      slowSeal = false;
+      return new Promise((r) => setTimeout(() => r(answer), 100));
+    },
+  }));
+  slowSeal = true;
+  const late = await st.A.request(st.B.peerId, PROTO, Uint8Array.of(1), 30).then(() => "answered", () => "failed");
+  assert(late === "failed", "the app's own deadline still bounds its wait");
+  await settle(200);
+  assert(!st.a.closed && !st.b.closed, "the link must outlive one app's deadline");
+  const next = await st.A.request(st.B.peerId, PROTO, Uint8Array.of(2)).then((r) => r[0], () => null);
+  assert(next === 2, "and carry the next request");
+});
+
 await test("a silent peer's correlation is retired on the transport's own timeout", async (keep) => {
   // Hold B's encrypted response after the request reaches its app. A's 100ms transport
   // timeout must beat the still-live 2s kernel deadline, and the response released later
@@ -341,6 +362,21 @@ await test("ANSWER CAP: an answer over the frame cap comes back empty, not never
   assert(got !== null && got.length === 0,
     `the over-cap answer must come back empty (got ${got === null ? "a failure" : got.length + " bytes"} after ${ms}ms)`);
   assert(ms < 2000, `and at once, not at the deadline (${ms}ms)`);
+});
+
+await test("HUNG CLAIMANT: the caller hears empty at the responder's deadline, and the link lives", async (keep) => {
+  // A claimant that never answers is settled by the responder's deadline. A delivery's
+  // answer is a new turn of the transport (§12.3), so the empty reply is written with a
+  // budget of its own; resumed under the read's spent one, its seal was refused and the
+  // responder tore down its own link.
+  const st = keep(await upPair(undefined, {}, { mode: "hang", guestDeadlineMs: 1000 }));
+  const t0 = Date.now();
+  const got = await st.A.request(st.B.peerId, PROTO, Uint8Array.of(1), 4000).then((r) => r, () => null);
+  const ms = Date.now() - t0;
+  assert(got !== null && got.length === 0,
+    `the unanswered request must come back empty (got ${got === null ? "a failure" : got.length + " bytes"} after ${ms}ms)`);
+  assert(ms < 3000, `and at the responder's 1 s deadline, not the caller's 4 s (${ms}ms)`);
+  assert(!st.a.closed && !st.b.closed, "and the link must survive it");
 });
 
 await test("handshake messages are exact-length: a trailing byte is refused", async (keep) => {
@@ -746,6 +782,32 @@ await test("IDLE: traffic keeps a link alive across the clock", async (keep) => 
     await settle(40);
   }
   assert(!st.a.closed && !st.b.closed, "a link with traffic on it must not be retired");
+});
+
+await test("CLOSING: a request sent while its link closes redials instead of vanishing", async (keep) => {
+  // A link leaves routing the moment it closes, not once its queued teardown has run: until
+  // then it could only drop a frame routed to it. Here the idle clock retires A's link and
+  // its goodbye is slow to land; a request sent meanwhile must go out on a fresh dial rather
+  // than into the closing link, to fail when that link finally goes.
+  const fabric = new LoopbackChannels();
+  let slowNext = false, onGoodbye = null;
+  const A = keep(await makeTransportHost({
+    channels: fabric.view(), listen: { port: 0 }, linkIdleTimeoutMs: 200,
+    onHostAnswer: (name, answer) => {
+      if (name !== "link/send" || !slowNext) return answer;
+      slowNext = false;
+      onGoodbye();
+      return new Promise((r) => setTimeout(() => r(answer), 500));
+    },
+  }));
+  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 } }));
+  await A.addr(B.peerId, `tcp://127.0.0.1:${B.driver.port}`);
+  await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  const closing = new Promise((r) => { onGoodbye = r; });
+  slowNext = true; // A's next write is the idle close's goodbye record
+  await closing;
+  const got = await A.request(B.peerId, PROTO, Uint8Array.of(2), 4000).then((r) => r, () => null);
+  assert(got !== null && got[0] === 2, "a request sent while its link closed must be answered over a fresh dial");
 });
 
 await test("READY: a second ready() does not strand the first", async (keep) => {

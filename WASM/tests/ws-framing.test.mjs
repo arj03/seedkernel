@@ -240,24 +240,21 @@ async function run() {
     ok(r2 === true && delivered.length === 1 && delivered[0].length === n, `${n}-byte payload round-trips whole, split across the length-field boundary`);
   }
 
-  {
-    // The pre-auth cap itself: total wire bytes (header + 4-byte client mask + payload)
-    // exactly at the cap must pass; one byte over must close the link. Both payload sizes
-    // use the 4-byte header form (>= 126), so the arithmetic is just `cap - 4 - 4`.
-    const okLen = WS.MAX_HANDSHAKE_FRAME_BYTES - 4 - 4;
-    const overLen = okLen + 1;
-    {
+  // The cap is on the PAYLOAD, as every codec's is on its message: the header and mask are
+  // this codec's own bytes, and a record the sender may send at the cap must cross. Exactly
+  // at the cap passes and one byte over closes the link — before authentication, and once
+  // raised, where a max-size record's masked frame runs 14 bytes past the cap on the wire.
+  for (const raised of [false, true]) {
+    const cap = raised ? TEST_MAX_FRAME_BYTES : WS.MAX_HANDSHAKE_FRAME_BYTES;
+    for (const [len, accepted] of [[cap, true], [cap + 1, false]]) {
       const { framer, delivered } = await serverAfterUpgrade();
-      const frame = await client.frame(WS.WS_OP_BINARY, payload(okLen));
-      assertEqual(frame.length, WS.MAX_HANDSHAKE_FRAME_BYTES, "sanity: this frame is exactly the cap");
+      if (raised) framer.raiseCap();
+      const frame = await client.frame(WS.WS_OP_BINARY, payload(len));
       const r = await framer.push(frame, (p) => delivered.push(p));
-      ok(r === true && delivered.length === 1, "a frame exactly at the pre-auth cap is accepted");
-    }
-    {
-      const { framer, delivered } = await serverAfterUpgrade();
-      const frame = await client.frame(WS.WS_OP_BINARY, payload(overLen));
-      const r = await framer.push(frame, (p) => delivered.push(p));
-      ok(r === false && delivered.length === 0, "one byte over the pre-auth cap closes the link");
+      const held = accepted
+        ? r === true && delivered.length === 1 && delivered[0].length === len
+        : r === false && delivered.length === 0;
+      ok(held, `a ${len}-byte payload (${frame.length} on the wire) against the ${raised ? "raised" : "pre-auth"} cap of ${cap} is ${accepted ? "accepted" : "refused"}`);
     }
   }
 

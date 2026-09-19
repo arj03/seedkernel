@@ -42,6 +42,11 @@ export interface RealmOptions {
   /** Guest execution and handoff budget per entrypoint, in ms. `Infinity` disables it;
    * omitted means the target's shared default. */
   deadlineMs?: number;
+  /** Run every invocation on this realm's own ceiling. A caller's remainder still bounds
+   *  that caller's wait, queueing included, but never the turn itself. For the link
+   *  occupant, whose turns write state every caller shares: one caller running out of time
+   *  must not cut a record in half (§12.3). */
+  ownTurns?: boolean;
 }
 
 /** One confined guest realm, independent of the target that implements it. */
@@ -188,12 +193,15 @@ export function raceDeadline<T>(deadlines: { add(d: Deadline): void; drop(d: Dea
  *
  * Payload bytes are borrowed from a longer-lived upstream owner. Queue depth is likewise
  * derived from those bounded callers rather than capped by an unrelated number here. The
- * absolute deadline covers queue wait, guest execution, and a deferred answer. */
+ * absolute deadline covers queue wait, guest execution, and a deferred answer — or, with
+ * `ownTurns` (RealmOptions), queue wait and the answer, while the turn runs on the realm's
+ * own ceiling. */
 export function serializeCalls(
   deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
   invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
   notReady: () => Error | null,
   defaultDeadlineMs = DEFAULT_GUEST_DEADLINE_MS,
+  ownTurns = false,
 ): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";
   interface Entry extends Deadline {
@@ -258,7 +266,7 @@ export function serializeCalls(
       running = entry;
       try {
         entry.invocation = invoke(entry.payload,
-          entry.at === Infinity ? Infinity : entry.at - now, entry.causalClock);
+          ownTurns ? defaultDeadlineMs : entry.at === Infinity ? Infinity : entry.at - now, entry.causalClock);
       } catch (thrown) { running = undefined; finish(entry, false, thrown); continue; }
       entry.invocation.result.then(
         (value) => { finish(entry, true, value); release(entry); },

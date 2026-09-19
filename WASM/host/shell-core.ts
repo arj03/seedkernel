@@ -323,6 +323,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       hostCall: seamFor(slot),
       memoryLimitBytes: bounds.memoryBytes,
       deadlineMs: bounds.deadlineMs,
+      // The link occupant writes state every caller shares, so its turns are its own.
+      ownTurns: table.hasLink(slot),
     });
   };
   /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),

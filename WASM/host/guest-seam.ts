@@ -59,7 +59,8 @@ export interface RawNet {
    *
    *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
    *  frame, since a realm serializes its invocations. The caller must therefore fire this
-   *  and return from its event rather than await it inside one. */
+   *  and return from its event rather than await it inside one; the answer resumes it as a
+   *  new turn (`CallBudget.detach`). */
   deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
@@ -145,6 +146,11 @@ export interface CallBudget {
   /** The self-initiated root this call descends from, if any. Propagated across realm
    *  calls so the root pays for execution in every callee, never for time awaiting it. */
   causalClock?: CausalClock;
+  /** Resume the caller on this call's answer as a NEW turn, under a fresh budget of the
+   *  caller's own ceiling, instead of the invocation that made the call. For a call its
+   *  caller fires and returns from, whose answer is new work rather than the tail of what
+   *  the caller was doing (`link/deliver`). The call's own handoff deadline is unchanged. */
+  detach(): void;
 }
 
 /** The host half of `host.call`. EVERY name answers a Promise — the seam is async,
@@ -475,7 +481,13 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // that field, filled with the authenticated sender — so nothing here is
     // length-delimited except the claim, and the payload simply runs to the end. One
     // request per call is what makes that safe.
+    //
+    // The answer is the occupant's next turn, not the tail of the read that carried the
+    // request: the reply it writes is new work on a link every request shares, and a
+    // claimant that spends the read's whole deadline would leave that write to a turn with
+    // nothing left — a record the budget refuses halfway is a hole in the stream (§12.3).
     "link/deliver": (payload, budget) => {
+      budget?.detach();
       const attrAt = 1 + payload[0];
       const bodyAt = attrAt + HOST_CALLER_ID.length;
       return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt), budget?.remainingMs, budget?.causalClock);

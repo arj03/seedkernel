@@ -328,7 +328,7 @@ class WsFramer {
     for (;;) {
       const total = this.frameLength();
       if (total < 0) return true;
-      if (total > this.cap) return false;
+      if (total === Infinity) return false;
       if (this.parts.length < total) return true;
       // Staged with room for the request header in front of it, so the frame is gathered
       // out of the slice list ONCE instead of again behind a two-byte prefix.
@@ -381,9 +381,11 @@ class WsFramer {
     return true;
   }
 
-  /** Total byte length of the next frame, from the (unvalidated) header — or -1 when
-   *  too few bytes are buffered to know yet. All real validation is the module's; this
-   *  only sizes the wait. */
+  /** Total byte length of the next frame, from the (unvalidated) header: -1 while too few
+   *  bytes are buffered to know, Infinity once its PAYLOAD is over the cap. The cap is on
+   *  the payload, as every other codec's is on its message — the header and mask are this
+   *  codec's own bytes, and a record the sender may send at the cap must cross. All real
+   *  validation is the module's; this only sizes the wait. */
   frameLength() {
     const p = this.parts;
     if (p.length < 2) return -1;
@@ -401,11 +403,12 @@ class WsFramer {
     } else if (len7 === 127) {
       if (p.length < 10) return -1;
       // The high half of the 64-bit length: any bit set is > 4 GiB and over any cap.
-      if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return 0x7fffffff;
+      if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return Infinity;
       headerLen = 10;
       payloadLen = ((p.byteAt(6) << 24) | (p.byteAt(7) << 16)
         | (p.byteAt(8) << 8) | p.byteAt(9)) >>> 0;
     }
+    if (payloadLen > this.cap) return Infinity;
     return headerLen + (masked ? 4 : 0) + payloadLen;
   }
 }

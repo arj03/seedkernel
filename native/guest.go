@@ -161,21 +161,23 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if !g.hostCalls.has(callID) {
 			return qc.NewInt64(0), nil
 		}
+		// A detached call's answer is a new turn (host/guest-seam.ts `CallBudget.detach`).
+		detached := args[4].Int64() == 1
 		if args[2].IsNull() || args[2].IsUndefined() {
-			return qc.NewInt64(g.settleHostCall(callID, nil, args[3].String()).Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, args[3].String(), detached).Nanoseconds()), nil
 		}
 		resultBytes, err := args[2].ByteLength()
 		if err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes", detached).Nanoseconds()), nil
 		}
 		if err := g.hostCalls.reserve(callID, resultBytes); err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, err.Error()).Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, err.Error(), detached).Nanoseconds()), nil
 		}
 		bytes, err := args[2].Bytes()
 		if err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes").Nanoseconds()), nil
+			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes", detached).Nanoseconds()), nil
 		}
-		return qc.NewInt64(g.settleHostCall(callID, bytes, "").Nanoseconds()), nil
+		return qc.NewInt64(g.settleHostCall(callID, bytes, "", detached).Nanoseconds()), nil
 	}))
 	b.SetPropertyStr("realmDispose", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		id := args[0].Int64()
@@ -518,7 +520,7 @@ func (g *guestRealm) checkAlive() error {
 // settleHostCall resolves or rejects the guest Promise parked under callID when the host
 // realm's seam promise settles (`bytes` fulfils, `msg` rejects), then drains the awaiting
 // continuation before returning its execution time to the bridge.
-func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string) time.Duration {
+func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, detached bool) time.Duration {
 	if !g.hostCalls.has(callID) {
 		return 0
 	}
@@ -529,8 +531,13 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string) time
 	}
 	// Restore the original absolute deadline and accumulated spend before either
 	// resolving or rejecting the promise. A later entry must not lend it time or
-	// interrupt it with that entry's shorter deadline.
-	g.invocationClock = g.hostCallBudgets[callID]
+	// interrupt it with that entry's shorter deadline. A detached call's answer is a new
+	// turn instead, on a clock of its own.
+	if detached {
+		g.invocationClock = g.turnClock()
+	} else {
+		g.invocationClock = g.hostCallBudgets[callID]
+	}
 	before := g.consumed
 	var res *qjs.Value
 	var err error
@@ -566,6 +573,16 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string) time
 	// same causal root and any host.call it creates inherits that root synchronously.
 	g.pump()
 	return g.consumed - before
+}
+
+// turnClock is a new turn's clock: the realm's own ceiling from now, owed to no initiator
+// call — what a detached host call's answer resumes under.
+func (g *guestRealm) turnClock() *invocationClock {
+	c := &invocationClock{invocationBudget: g.budget}
+	if g.budget > 0 {
+		c.invocationDeadline = time.Now().Add(g.budget)
+	}
+	return c
 }
 
 // takeCall consumes an in-flight initiator call, so a duplicate settlement is a no-op.

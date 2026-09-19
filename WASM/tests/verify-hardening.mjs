@@ -837,6 +837,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
   ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
+  ok(!seen[0]?.ownTurns, "an app's turns stay on its callers' clocks; only the link occupant's are its own");
 
   // HOST, APP and LOCAL are three provenance-preserving values, not one host-side merge:
   // what the runtime admits, what the author signed, what the operator set for this load.

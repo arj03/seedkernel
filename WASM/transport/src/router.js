@@ -3,12 +3,10 @@
 // ── the router ────────────────────────────────────────────────────────────────
 
 class Router {
-  constructor(ownPubkey, ownId) {
+  constructor(ownPubkey) {
     this.ownPubkey = ownPubkey;
-    this.ownId = ownId;
     this.links = new Map();      // peerId → Link[] (authenticated, routable)
     this.rr = new Map();         // peerId → round-robin cursor
-    this.sink = null;            // the request/response layer's frame intake
     this.onPeerUp = () => {};
     this.onPeerDown = () => {};
   }
@@ -32,7 +30,7 @@ class Router {
     let rival = null;
     for (const l of pool) if (l.weDialed !== link.weDialed) { rival = l; break; }
     if (rival) {
-      // A losing link's queue goes to the winner once it is forgotten (core.js `forget`).
+      // A losing link's queue goes to the winner as it closes (core.js `forget`).
       if (!this.canonicalKeep(link)) { link.close(); return false; }
       // Out of the pool before it closes, so nothing more is routed to a link on its way down.
       pool.splice(pool.indexOf(rival), 1);
@@ -45,22 +43,10 @@ class Router {
     return true;
   }
 
-  // Keep the link whose *dialer* is the lexicographically smaller identity.
+  // Keep the link whose *dialer* is the lexicographically smaller identity. The two are
+  // never equal: a link to our own key is refused in the handshake (ake.js `openIdentity`).
   canonicalKeep(link) {
-    const peer = link.peerPubkey, mine = this.ownPubkey;
-    const dialer = link.weDialed ? mine : peer;
-    const smaller = bytesCompare(mine, peer) <= 0 ? mine : peer;
-    return bytesCompare(dialer, smaller) === 0;
-  }
-
-  /** One inbound, authenticated, whole message, handed to the request/response layer:
-   *  a request goes on to the host's claim routing, a response settles the app waiting
-   *  on it, and anything else is dropped there. `peerPubkey` is the same identity as
-   *  `peerId`, in the form the host's attribution takes — carried rather than decoded
-   *  again below (ake.js `onRecord`). */
-  deliver(peerId, frame, peerPubkey) {
-    if (!this.sink || peerId === this.ownId) return;
-    this.sink(peerId, frame, peerPubkey);
+    return link.weDialed === (bytesCompare(this.ownPubkey, link.peerPubkey) < 0);
   }
 
   // Keyed on the link's own peer id: a link is only ever pooled under the identity it
@@ -211,9 +197,11 @@ class ReqRes {
     this.hold(from, weight);
     answer.then(
       (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); },
-      // Only the seam itself can reject — a refused claim and a handler that threw
-      // both answer empty. A realm on its way down owes no response.
-      () => this.hold(from, -weight),
+      // Only the seam itself rejects — the delivery's handoff deadline, or an answer this
+      // realm's budget would not copy in. That is no answer either, and it goes back empty
+      // like a refused claim or a handler that threw. Either arm is a turn of its own
+      // (guest-seam.ts `link/deliver`), so the reply has a budget to be written with.
+      () => { this.hold(from, -weight); this.respond(corr, noReply, from, EMPTY); },
     );
   }
 
