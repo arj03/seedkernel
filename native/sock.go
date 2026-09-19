@@ -91,7 +91,7 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o.SetPropertyStr("listen", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		bound, err := n.listen(args[0].String(), int(args[1].Int32()))
 		if err != nil {
-			return qc.NewInt32(-1), nil // -1: the shim throws on a failed bind
+			return nil, err // thrown with the OS's reason, which is what the operator reads
 		}
 		return qc.NewInt32(int32(bound)), nil
 	}))

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -550,5 +551,28 @@ func TestShutdownClosesTheNetwork(t *testing.T) {
 	if after := runtime.NumGoroutine(); after > before {
 		t.Fatalf("shutdown left %d goroutines running (%d before %d boots, %d after)",
 			after-before, before, boots, after)
+	}
+}
+
+// A node whose listener cannot bind fails its boot with the OS's reason — the error Go's own
+// net.Listen gives for that address — through the shim and the shared boot, so the operator
+// reads why rather than only that the bind failed.
+func TestNodeBindFailureCarriesTheReason(t *testing.T) {
+	bootRealm(t)
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen:", err)
+	}
+	defer held.Close()
+	_, want := net.Listen("tcp", held.Addr().String())
+	if want == nil {
+		t.Fatal("a second bind on a held port succeeded; the test needs it refused")
+	}
+	_, err = startNode(nodeConfig{
+		KeyHex: testKeyHex(t),
+		Listen: &hostPort{Host: "127.0.0.1", Port: held.Addr().(*net.TCPAddr).Port},
+	})
+	if err == nil || !strings.Contains(err.Error(), want.Error()) {
+		t.Fatalf("boot on a held port: err = %v, want the OS's reason %q", err, want)
 	}
 }

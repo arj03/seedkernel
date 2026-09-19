@@ -184,7 +184,8 @@ declare const __net: {
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
-  /** Bind a listener; returns the bound port, or -1 on failure. */
+  /** Bind a listener and return the port it bound. A failed bind throws the OS's reason
+   *  (the address is in use, the port needs privileges), which is what the operator reads. */
   listen(host: string, port: number): number;
   /** Queue bytes for the writer goroutine (never blocks the loop goroutine). Answers
    *  nothing: admission happened at the driver's per-link owner, which charged these bytes
@@ -244,7 +245,6 @@ function netConnectRaw(host: string, port: number): RawLink {
 
 function netListenRaw(host: string, port: number, onAccept: (s: RawLink) => void): number {
   const bound = __net.listen(host, port);
-  if (bound < 0) throw new Error("netListenRaw: bind failed");
   netAccepts.set(bound, (id, remoteAddr) => onAccept(makeGoLink(id, remoteAddr)));
   return bound;
 }
@@ -496,44 +496,7 @@ async function runMain(): Promise<Uint8Array> {
   if (!serving) close();
   return enc.encode(JSON.stringify({ serving }));
 }
-/** The confined realm's own plumbing, fetched by native/guest.go: one pre-compiled
- *  `__start` wrapper, so an initiator call costs an Invoke rather than a parse. Not the
- *  guest ABI (that is `guestPreamble`) but this target's twin of what safe-js.ts does —
- *  fetched by Go rather than restated as a Go string TypeScript never saw. */
-function guestDriver(): string {
-  return GUEST_DRIVER;
-}
-const GUEST_DRIVER = `
-"use strict";
-// Returns 1 when the entrypoint handed its answer to a later turn (the guest's own
-// deferred marker) — Go's signal that the realm is free for the next invocation even
-// though this one has not settled (realm-queue.ts's Invocation.deferred). Read after
-// __invoke's synchronous segment, and __invoke cleared the flag on entry, so it
-// describes exactly this invocation.
-globalThis.__start = function (id, arg) {
-  try {
-    const out = __invoke(arg);
-    // A synchronous answer reports WITHOUT a microtask: the guest's job queue is only
-    // pumped by the loop (guest.go pump), and this __start can run inside a host-
-    // realm eval's own drain, where the loop cannot turn — a then() would leave the
-    // caller parked until the drain ends, and the drain ends only when the caller
-    // settles. An ASYNC entrypoint really is parked (its promise settles on a later
-    // turn), so it keeps the then() path.
-    if (out && typeof out.then === "function") {
-      out.then(
-        (v) => __callDone(id, v),
-        (e) => __callFail(id, String(e && e.message || e)));
-    } else {
-      __callDone(id, out);
-    }
-  } catch (e) {
-    __callFail(id, String(e && e.message || e));
-  }
-  return globalThis.__deferred === true ? 1 : 0;
-};
-`;
-
 // What Go reaches by name in the realm. `standUp` and `createRealm` are here for the
 // native tests as much as for the boot above, so a test that stands up a node or a guest
 // drives the very functions production does.
-export { runMain, standUp, createRealm, guestDriver, };
+export { runMain, standUp, createRealm };

@@ -98,7 +98,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  const n = arg[32];
 		  const msg = arg.subarray(33 + n);
 		  const peer = fromHex(APP.peer);                       // A's 32-byte public key
-		  const proto = new TextEncoder().encode("probe");      // the app A claims
+		  const proto = Uint8Array.from("probe", (c) => c.charCodeAt(0)); // the app A claims
 		  // [opLen u8]["send"] then the op's args:
 		  // [noReply u8][to blob][proto blob][payload blob].
 		  const opName = "send";

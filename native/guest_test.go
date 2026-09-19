@@ -379,8 +379,9 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 // entrypoint, and the ops are the guest's own framing after the caller id.
 const storeGuestSource = `
 function hex(u8) { let s = ""; for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0"); return s; }
+function ascii(s) { const out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; }
 function fsPutArg(key, bytes) {
-  const k = new TextEncoder().encode(key);
+  const k = ascii(key);
   const out = new Uint8Array(4 + k.length + bytes.length);
   out[0] = (k.length >>> 24) & 255; out[1] = (k.length >>> 16) & 255;
   out[2] = (k.length >>> 8) & 255;  out[3] = k.length & 255;
@@ -399,7 +400,7 @@ function handle(arg) {
       host.call("fs/put", fsPutArg(hex(id), data)).then(() => id));
   }
   if (op === "get") {
-    return host.call("fs/get", new TextEncoder().encode(hex(data))).then((r) => {
+    return host.call("fs/get", ascii(hex(data))).then((r) => {
       if (r.length < 1 || r[0] !== 1) throw new Error("not found");
       return r.slice(1);
     });
@@ -407,7 +408,7 @@ function handle(arg) {
   if (op === "probe") {
     const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process", "Bun"];
     const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
-    return new TextEncoder().encode(leaked.join(","));
+    return ascii(leaked.join(","));
   }
   return new Uint8Array(0);
 }

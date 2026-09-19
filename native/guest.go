@@ -213,17 +213,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		g.close()
 		return nil, err
 	}
-	// The Web globals quickjs-ng lacks (the text encoders), fetched from the host realm so
-	// both realms polyfill from ONE text (host/native-polyfills.ts); first, because
-	// everything after may use them.
-	if _, err := g.qc.Eval("polyfills.js", hostFnString(hostQc, "nativePolyfills")); err != nil {
-		return fail(fmt.Errorf("polyfills: %w", err))
-	}
-	// The driver's __start wrapper, fetched the same way (native-shim.ts `guestDriver`):
-	// shared TS rather than a Go string TypeScript never saw.
-	if _, err := g.qc.Eval("guest-driver.js", hostFnString(hostQc, "guestDriver")); err != nil {
-		return fail(fmt.Errorf("guest driver: %w", err))
-	}
 	// The guest shares the host loop rather than owning one: it just needs its job queue
 	// pumped, no Go timers of its own.
 	loop.addContext(g.qc, g.pump)
@@ -280,8 +269,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return qc.NewNull(), nil
 	}))
 
-	// An initiator call's two outcomes, reported by __start once the entrypoint's promise
-	// settles, into the host-realm callbacks the shim registered.
+	// An invocation's two outcomes, as the preamble's __start reports them, into the
+	// host-realm callbacks the shim registered.
 	g.qc.Global().SetPropertyStr("__callDone", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		c := g.takeCall(args[0].Int64())
 		if c == nil {
@@ -306,6 +295,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return nil, nil
 	}))
 
+	// The shared preamble (host/guest-seam.ts): host.call and the __start driver, the one
+	// text every target's realm runs ahead of the guest's own source.
 	if _, err := g.qc.Eval("guest-preamble.js", hostFnString(hostQc, "guestPreamble")); err != nil {
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
@@ -330,14 +321,14 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	return g, nil
 }
 
-// hostFnString asks the host realm for one zero-argument string-valued export
-// (host/native-shim.ts), so the plumbing a guest runs on is shared TS, never a Go string.
+// hostFnString asks the host realm for one zero-argument string-valued export of the shared
+// bundle, so the plumbing a guest runs on is shared TS, never a Go string.
 func hostFnString(hostQc *qjs.Context, name string) string {
 	fn := hostQc.Global().GetPropertyStr(name)
 	// IsUndefined, not nil — GetPropertyStr wraps a missing property as JS_UNDEFINED and
 	// never returns Go nil (qjs/value.go).
 	if fn.IsUndefined() {
-		panic("hostFnString: " + name + " not defined (host/native-shim.ts)")
+		panic("hostFnString: " + name + " not exported by the loader bundle (build:loader-bundles)")
 	}
 	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
 	fn.Free()

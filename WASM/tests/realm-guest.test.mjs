@@ -566,9 +566,8 @@ async function testRealmSerialization() {
   // 4. Disposing a realm while an invocation is parked mid-await — the ordinary state of
   //    a node whose initiator waits on the network — fails the parked caller and frees
   //    the context WITHOUT taking the wasm module with it: the engine asserts an empty gc
-  //    object list when a runtime is freed, and a parked call releases its handle from a
-  //    `finally` that runs as a microtask after dispose() returns, so freeing the context
-  //    in the same turn aborts the whole module. Hence the deferred teardown, pinned here.
+  //    object list when a runtime is freed, so a handle the parked call still held would
+  //    abort the whole module.
   {
     const realm = await createSafeRealm({
       source: `async function handle() { await host.call("park", new Uint8Array()); }`,
@@ -585,8 +584,7 @@ async function testRealmSerialization() {
     try { await realm.call(new Uint8Array()); } catch (e) { after = e.message; }
     assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
 
-    // A realm built after the deferred teardown has run proves the module survived it.
-    await sleep(1);
+    // A realm built after the teardown proves the module survived it.
     const next = await createSafeRealm({
       source: `function handle(arg) { return arg; }`,
       hostCall: async () => new Uint8Array(),

@@ -209,7 +209,11 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
 /** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
  *  entrypoint receives `[caller 32][body …]`. Application and local-service bodies use
  *  the callee's format and remain opaque to routing. The socket driver constructs
- *  raw-link event bodies using the kernel ABI in core/op-frame.ts (RUNTIME §12.2). */
+ *  raw-link event bodies using the kernel ABI in core/op-frame.ts (RUNTIME §12.2).
+ *
+ *  Every realm factory drives `handle` through the preamble's `__start`, having installed
+ *  the three host functions it calls out through: `__host_call`, `__callDone` and
+ *  `__callFail`. */
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }
@@ -266,15 +270,29 @@ function __norm(out) {
   }
   throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
 }
-globalThis.__invoke = (argBuf) => {
-  if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
+const __fail = (id, e) => __callFail(id, String(e && e.message || e));
+// The one way in: run handle on one invocation's input and report its answer as bytes
+// through the host's __callDone / __callFail, so no guest promise ever crosses to the
+// host. A synchronous answer is reported within this call, an async one when its promise
+// settles. Answers 1 when the entrypoint handed its answer to a later turn — the realm is
+// free for the next invocation although this one has not settled (realm-queue.ts).
+globalThis.__start = (id, argBuf) => {
   // Cleared HERE rather than by the host, so the flag describes exactly this
   // invocation and a guest cannot leave it set for the next one.
   globalThis.__deferred = false;
-  // A synchronous entrypoint returns bytes; an async one returns a guest promise the host
-  // settles. __norm normalizes both to an ArrayBuffer.
-  const out = globalThis.handle(new Uint8Array(argBuf));
-  return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
+  try {
+    if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
+    const out = globalThis.handle(new Uint8Array(argBuf));
+    if (out && typeof out.then === "function") {
+      out.then((v) => { try { __callDone(id, __norm(v)); } catch (e) { __fail(id, e); } },
+        (e) => __fail(id, e));
+    } else {
+      __callDone(id, __norm(out));
+    }
+  } catch (e) {
+    __fail(id, e);
+  }
+  return globalThis.__deferred === true ? 1 : 0;
 };
 `;
 

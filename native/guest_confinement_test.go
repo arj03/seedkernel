@@ -16,12 +16,12 @@ import (
 	"seedloader/qjs"
 )
 
-// The libc names no realm has. The host realm has a console and timers of its own
-// (host/native-polyfills.ts, loop.go), so those two are checked only on a bare runtime.
-// TextEncoder is deliberately absent: every realm gets it from the shared polyfills.
+// The libc names no realm has. The host realm has a console, timers and text codecs of its
+// own (host/native-polyfills.ts, loop.go), so those are checked only on a bare runtime; a
+// confined realm has none of them (TestConfinedRealmCannotImportLibcModules).
 var (
 	libcNames     = []string{"os", "std", "bjson", "print", "navigator", "gc", "scriptArgs"}
-	loaderGlobals = []string{"console", "setTimeout"}
+	loaderGlobals = []string{"console", "setTimeout", "TextEncoder", "TextDecoder"}
 )
 
 func requireUndefined(t *testing.T, c *qjs.Context, names []string) {
@@ -63,13 +63,16 @@ func TestConfinedRealmCannotImportLibcModules(t *testing.T) {
 		async function handle() {
 		  const report = [
 		    typeof os, typeof std, typeof bjson, typeof print, typeof console,
-		    typeof navigator, typeof gc, typeof setTimeout, typeof TextEncoder,
+		    typeof navigator, typeof gc, typeof setTimeout, typeof TextEncoder, typeof TextDecoder,
 		  ];
 		  for (const name of ["qjs:os", "qjs:std", "qjs:bjson"]) {
 		    try { await import(name); report.push(name + ":loaded"); }
 		    catch (e) { report.push(name + ":rejected"); }
 		  }
-		  return new TextEncoder().encode(JSON.stringify(report));
+		  const s = JSON.stringify(report);
+		  const out = new Uint8Array(s.length);
+		  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+		  return out;
 		}
 	`, 5000)
 	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
@@ -77,7 +80,9 @@ func TestConfinedRealmCannotImportLibcModules(t *testing.T) {
 	if err != nil {
 		t.Fatal("realmCall:", err)
 	}
-	want := `["undefined","undefined","undefined","undefined","undefined","undefined","undefined","undefined","function",` +
+	// The text codecs are the host realm's alone, as on the JS targets: a guest that needs
+	// them carries its own.
+	want := `["undefined","undefined","undefined","undefined","undefined","undefined","undefined","undefined","undefined","undefined",` +
 		`"qjs:os:rejected","qjs:std:rejected","qjs:bjson:rejected"]`
 	if string(out) != want {
 		t.Fatalf("confined realm report:\n got %s\nwant %s", out, want)
