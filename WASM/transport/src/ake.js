@@ -87,17 +87,13 @@ const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-o
 // ── the seam helpers ──────────────────────────────────────────────────────────
 //
 // EVERY seam name answers a Promise now — there is no sync/async line to fall on the
-// wrong side of — so every helper is `async` and its callers await it. The cost is a
-// few microtasks per call; the transforms themselves still run inline in the host.
+// wrong side of — so every helper answers one and its callers await it. A helper with
+// nothing to do after the call hands back the seam's own promise; only one that reads the
+// answer is `async`. The transforms themselves still run inline in the host.
 
-async function hash() {
-  const parts = [...arguments];
-  let len = 0;
-  for (const p of parts) len += p.length;
-  const out = new Uint8Array(len);
-  let off = 0;
-  for (const p of parts) { out.set(p, off); off += p.length; }
-  return host.call(P_HASH, out);
+/** BLAKE2b-256 over the concatenation — the one system hash. */
+function hash(...parts) {
+  return host.call(P_HASH, concatBytes(parts));
 }
 async function verify(pk, sig, msg) {
   let len = pk.length + sig.length + msg.length;
@@ -106,12 +102,10 @@ async function verify(pk, sig, msg) {
   const r = await host.call(N_VERIFY, out);
   return r[0] === 1;
 }
-async function randomBytes(n) {
-  const req = new Uint8Array(4);
-  writeU32BE(req, 0, n);
-  return host.call(N_RANDOM, req);
+function randomBytes(n) {
+  return host.call(N_RANDOM, argU32(n));
 }
-async function aeadEnc(key, npub, msg) {
+function aeadEnc(key, npub, msg) {
   const out = new Uint8Array(npub.length + key.length + msg.length);
   out.set(npub, 0); out.set(key, npub.length); out.set(msg, npub.length + key.length);
   return host.call(P_SEAL, out);
@@ -219,8 +213,18 @@ async function netLinkOpen(dest) {
   return { linkId: readU32BE(r, 0), stream: r[4] === 1 };
 }
 /** Answer once the raw-link owner has accepted the bytes. */
-function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)).then(() => {}); }
-function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {}); }
+function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)); }
+/** Answers false when the seam refused the call outright — this realm's host-call budget,
+ *  often the very pressure tearing the link down — so the close is owed (`Link.closeChannel`)
+ *  rather than thrown out of a teardown that must still finish. */
+function netLinkClose(linkId, graceful) {
+  try {
+    void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
 /** Hand ONE request this program decoded to the host's claim routing:
  *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
  *  (empty both for a claim no peer may reach and for a handler that failed — one fact at
@@ -296,6 +300,7 @@ class Link {
     this.slot = null;
     this.due = 0;             // the tick the handshake deadline or the idle window ends on
     this.sawTraffic = false;  // whether anything crossed since the idle window opened
+    this.closeOwed = null;    // a refused close's `graceful`, asked again each tick
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -361,9 +366,17 @@ class Link {
     this.closed = true;
     this.closedLocally = true;
     deferQueue.push(() => {
-      try { netLinkClose(this.linkId, false); } catch { /* already gone */ }
+      this.closeChannel(false);
       this.finish();
     });
+  }
+
+  /** Hand the socket back to the host. A refused close is owed rather than lost — this
+   *  program forgetting a link does not close its socket, and the peer would go on holding
+   *  it — so it is asked again each tick (`onTick`) until the host takes it. */
+  closeChannel(graceful) {
+    this.closeOwed = netLinkClose(this.linkId, graceful) ? null : graceful;
+    if (this.closeOwed !== null) this.due = dueTick(tickMs);
   }
 
   async ensureKeys() {
@@ -391,13 +404,16 @@ class Link {
     this.due = linkIdleTimeoutMs > 0 ? dueTick(linkIdleTimeoutMs) : 0;
   }
 
-  /** One tick (core.js `onWake`). Past `due`, a link still handshaking has timed out, and an
-   *  authenticated one closes unless its window carried traffic. Answers whether it still
-   *  waits on a later tick. */
+  /** One tick (core.js `onWake`). Past `due`, a link still handshaking has timed out, an
+   *  authenticated one closes unless its window carried traffic, and a closed one asks again
+   *  for a close the host refused. Answers whether it still waits on a later tick. */
   onTick() {
     if (this.due === 0 || tick < this.due) return this.due !== 0;
     this.due = 0;
-    if (this.closed) return false;
+    if (this.closed) {
+      if (this.closeOwed !== null) this.closeChannel(this.closeOwed);
+      return this.due !== 0;
+    }
     if (!this.authed) {
       // Distinguishable from every other pre-auth teardown: "nobody finished the
       // handshake in time" is an address, a firewall or a silent peer, while a defensive
@@ -471,6 +487,16 @@ class Link {
     }
   }
 
+  /** The frames still waiting for authentication, oldest first — handed over, and no longer
+   *  this link's. */
+  takeQueued() {
+    const frames = this.queue.slice(this.queueHead);
+    this.queue = [];
+    this.queueHead = 0;
+    this.queuedBytes = 0;
+    return frames;
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -492,7 +518,7 @@ class Link {
       this.teardown();
       // Both writes above reached the raw-link owner before teardown, so a graceful
       // channel close flushes a complete farewell rather than truncating its record.
-      netLinkClose(this.linkId, saidGoodbye);
+      this.closeChannel(saidGoodbye);
       this.finish();
     });
   }
@@ -509,7 +535,7 @@ class Link {
     // zeroed under it.
     void this.enqueue(async () => {
       this.teardown();
-      netLinkClose(this.linkId, false);
+      this.closeChannel(false);
       this.finish();
     });
   }
@@ -592,11 +618,16 @@ class Link {
       if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(); }
       return this.enqueue(() => this.onMessage(bytes));
     }
-    // Steps collected as PROMISES, in arrival order: a length-framed chunk's parse loop
-    // fires `deliver` synchronously and does not await it, so finishing the read means
-    // waiting on every step through Promise.all rather than counting pushes.
+    // Steps collected as PROMISES, in arrival order: once its cap is raised, a length-framed
+    // chunk's parse loop fires `deliver` synchronously and does not await it, so finishing
+    // the read means waiting on every step through Promise.all rather than counting pushes.
+    // Before that, a framer waits on the step `deliver` answers (LengthFramer `parse`).
     const out = [];
-    const deliver = (m) => { out.push(this.enqueue(() => this.onMessage(m))); };
+    const deliver = (m) => {
+      const step = this.enqueue(() => this.onMessage(m));
+      out.push(step);
+      return step;
+    };
     try {
       const ok = this.framer.push(bytes, deliver);
       return Promise.resolve(ok).then(
@@ -655,20 +686,13 @@ class Link {
     // no framer to raise — for it, `authed` is what raises the cap, in onWire.
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
-    if (this.closed) return; // onAuth may have torn us down (the tie-break)
-    const flush = this.queue, from = this.queueHead;
-    this.queue = [];
-    this.queueHead = 0;
-    this.queuedBytes = 0;
-    for (let i = from; i < flush.length; i++) await this.wireRecord(flush[i]);
+    // onAuth may have torn us down (the tie-break): the queue then goes to the link that
+    // won, once this one is forgotten (core.js `forget`).
+    if (this.closed) return;
+    for (const frame of this.takeQueued()) await this.wireRecord(frame);
   }
 
   // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
-
-  // BLAKE2b-256 over the concatenation — the one system hash.
-  h() {
-    return hash(...arguments);
-  }
 
   // Every handshake key comes through here, so the contact secret is mixed into
   // all of them by construction.
@@ -676,7 +700,7 @@ class Link {
     const parts = [];
     for (const p of ikm) parts.push(p);
     parts.push(this.contactSecret, ctx, label);
-    return this.h(...parts);
+    return hash(...parts);
   }
 
   async sealZero(key, plain) {
@@ -690,7 +714,7 @@ class Link {
   }
 
   async probeKey(suiteByte, ephI, kemPkI) {
-    return this.kdf([], await this.h(this.root, suiteByte, ephI, kemPkI), LABEL_PROBE);
+    return this.kdf([], await hash(this.root, suiteByte, ephI, kemPkI), LABEL_PROBE);
   }
 
   async signIdentity(th) {
@@ -722,7 +746,7 @@ class Link {
     const kemPk = this.myKem.publicKey;
     const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
       await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), this.myNonce)]);
-    this.th = await this.h(this.root, w1);
+    this.th = await hash(this.root, w1);
     await this.wire(w1);
   }
 
@@ -754,13 +778,13 @@ class Link {
     this.kemSecret = kem.sharedSecret;
     this.peerEph = ephI;
 
-    const h1 = await this.h(this.root, w1);
+    const h1 = await hash(this.root, w1);
     const w2 = concatBytes([
       this.myEph.publicKey.subarray(0, EPH_LEN),
       kem.ciphertext,
       await this.sealZero(await this.kdf([this.ee, this.kemSecret], h1, LABEL_M2), this.myNonce),
     ]);
-    this.th = await this.h(h1, w2);
+    this.th = await hash(h1, w2);
     await this.wire(w2);
   }
 
@@ -778,11 +802,11 @@ class Link {
     if (!r.ok) { this.stall(); return; }
     this.ee = dh.x; this.kemSecret = kem.sharedSecret; this.peerEph = ephR;
 
-    const h2 = await this.h(this.th, w2);
+    const h2 = await hash(this.th, w2);
     const si = await this.signIdentity(h2);
     if (!si) return;
     const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([si.id, si.sig]));
-    this.th = await this.h(h2, w3);
+    this.th = await hash(h2, w3);
     await this.wire(w3);
   }
 
@@ -797,11 +821,11 @@ class Link {
     if (!admits(idI)) { this.stall(); return; }
     this.peerPubkey = idI; this.peerId = peerId;
 
-    const h3 = await this.h(this.th, w3);
+    const h3 = await hash(this.th, w3);
     const si = await this.signIdentity(h3);
     if (!si) return;
     const w4 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h3, LABEL_M4), concatBytes([si.id, si.sig]));
-    this.th = await this.h(h3, w4);
+    this.th = await hash(h3, w4);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
     await this.wire(w4);
     await this.becomeAuthed();
@@ -819,7 +843,7 @@ class Link {
     // msg3, so an abort here is honest rather than a probe.
     if (!admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
-    this.th = await this.h(this.th, w4);
+    this.th = await hash(this.th, w4);
     try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
     await this.becomeAuthed();
   }
@@ -860,7 +884,7 @@ class Link {
   }
 
   async ratchet(k) {
-    const next = await this.h(k, LABEL_REKEY);
+    const next = await hash(k, LABEL_REKEY);
     k.fill(0);
     return next;
   }
@@ -925,9 +949,7 @@ class Link {
     this.severWire();
     this.due = 0;
     this.releaseSlot();
-    this.queue.length = 0;
-    this.queueHead = 0;
-    this.queuedBytes = 0;
+    // The pre-auth queue stays: `forget` (core.js) hands it to another link to the peer.
     if (this.sendKey) this.sendKey.fill(0);
     if (this.recvKey) this.recvKey.fill(0);
     this.sendKey = null;

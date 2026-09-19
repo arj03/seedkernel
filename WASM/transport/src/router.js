@@ -32,9 +32,9 @@ class Router {
     let rival = null;
     for (const l of pool) if (l.weDialed !== link.weDialed) { rival = l; break; }
     if (rival) {
+      // A losing link's queue goes to the winner once it is forgotten (core.js `forget`).
       if (!this.canonicalKeep(link)) { link.close(); return false; }
-      // Splice the rival out BEFORE closing it: close() reaches forget() → remove()
-      // synchronously, which would otherwise splice the array we are editing.
+      // Out of the pool before it closes, so nothing more is routed to a link on its way down.
       pool.splice(pool.indexOf(rival), 1);
       this.links.set(peerId, pool);
       rival.close();
@@ -84,6 +84,8 @@ class Router {
 /** A request frame's own head: `[kind u8][corr u32][protoLen u8]`. Named because the
  *  `send` op measures a caller's arguments against the frame cap before copying them. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
+/** A response frame's: `[kind u8][corr u32]`, which `respond` measures an answer against. */
+const RES_HEAD_LEN = 1 + 4;
 
 class ReqRes {
   constructor() {
@@ -140,7 +142,8 @@ class ReqRes {
    *  kernel's deadline. When shorter it leaves the caller time to try another peer; when
    *  longer it only cleans this correlation after the caller has expired. That cleanup still
    *  matters because a peer that vanished mid-link sends no close for anything else to notice
-   *  (§16.1). */
+   *  (§16.1). A frame no link took is another matter: nothing will ever answer it, so it
+   *  fails at once, while the caller may still have time to ask someone else. */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
     // The wire carries corr as a u32, so the counter wraps where the wire does: past 2^32 a
@@ -151,7 +154,8 @@ class ReqRes {
     if (!noReply) {
       this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueTick(requestTimeoutMs) : 0 });
     }
-    this.sendFrame(to, frame);
+    const unanswerable = () => this.finish(corr, null);
+    this.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
   }
 
   buildReq(corr, noReply, proto, payload) {
@@ -169,7 +173,7 @@ class ReqRes {
     // bytes — the shortest legal frame, and the one a request nobody claims answers
     // with. Six, the request branch's floor, would drop it and make "no app serves
     // this protocol" indistinguishable from an unreachable peer.
-    if (frame.length < 5) return;
+    if (frame.length < RES_HEAD_LEN) return;
     const kind = frame[0];
     const noReply = !!(kind & 0x80);
     const corr = readU32BE(frame, 1);
@@ -179,7 +183,7 @@ class ReqRes {
       if (!p || p.to !== from) return; // response bound to the peer it went to
       // finish copies into the answer synchronously; an intermediate payload copy adds
       // no ownership boundary. netLinkDeliver below likewise assembles its own buffer.
-      this.finish(corr, frame.subarray(5));
+      this.finish(corr, frame.subarray(RES_HEAD_LEN));
       return;
     }
     if (frame.length < 6) return; // no room for the protocol-id length byte
@@ -214,14 +218,17 @@ class ReqRes {
   }
 
   // The response to a delivered request, addressed back to `from`. noReply ran the
-  // app's handler but skips the wire response.
+  // app's handler but skips the wire response. An answer too big for one record goes back
+  // empty — this boundary's one voice for "no answer" — rather than being dropped at the
+  // link, which would leave the caller waiting out its deadline.
   respond(corr, noReply, from, payload) {
     if (noReply) return;
-    const body = payload || EMPTY;
-    const frame = new Uint8Array(5 + body.length);
+    const fits = payload && RES_HEAD_LEN + payload.length <= maxFrameBytes - TAG_LEN;
+    const body = fits ? payload : EMPTY;
+    const frame = new Uint8Array(RES_HEAD_LEN + body.length);
     frame[0] = 1; // KIND_RES
     writeU32BE(frame, 1, corr);
-    frame.set(body, 5);
+    frame.set(body, RES_HEAD_LEN);
     this.sendFrame(from, frame);
   }
 

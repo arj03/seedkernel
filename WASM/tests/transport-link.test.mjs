@@ -9,6 +9,7 @@ import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, CLOSE_REASON, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
   transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
+  LoopbackChannels, generatorRequest,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -309,6 +310,39 @@ await test("a stalled link still settles on the deadline", async (keep) => {
   assert(ms < 1500, `a frozen backlog must settle on the deadline, not wait forever (took ${ms}ms)`);
 });
 
+await test("NO ROUTE: a request nothing can carry fails at once, not at its timeout", async (keep) => {
+  // The transport knows when it dropped a frame for want of a link — a peer it has no
+  // address for, a dial the network refused — and nothing will ever answer that request. It
+  // fails now, while the caller may still have time to ask someone else.
+  const fabric = new LoopbackChannels();
+  const A = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 } }));
+  const nobody = hexOf(generateKeyPair().publicKey);
+  const ask = async () => {
+    const t0 = Date.now();
+    const r = await A.request(nobody, PROTO, Uint8Array.of(1), 4000).then(() => "answered", () => "failed");
+    return `${r} after ${Date.now() - t0}ms`;
+  };
+  const unknown = await ask();
+  assert(/^failed after \d{1,3}ms$/.test(unknown), `a peer with no address must fail at once (${unknown})`);
+  await A.addr(nobody, "tcp://127.0.0.1:1"); // nothing listens there
+  const refused = await ask();
+  assert(/^failed after \d{1,3}ms$/.test(refused), `a refused dial must fail at once (${refused})`);
+});
+
+await test("ANSWER CAP: an answer over the frame cap comes back empty, not never", async (keep) => {
+  // A claimant's answer too big for one record cannot cross. Dropped at the link, it would
+  // leave the caller waiting out its deadline for an answer that was never sent; it goes
+  // back empty instead — this boundary's one voice for "no answer".
+  const st = keep(await upPair());
+  const t0 = Date.now();
+  const got = await st.A.request(st.B.peerId, PROTO, generatorRequest(3 * 1024 * 1024, 1), 4000)
+    .then((r) => r, () => null);
+  const ms = Date.now() - t0;
+  assert(got !== null && got.length === 0,
+    `the over-cap answer must come back empty (got ${got === null ? "a failure" : got.length + " bytes"} after ${ms}ms)`);
+  assert(ms < 2000, `and at once, not at the deadline (${ms}ms)`);
+});
+
 await test("handshake messages are exact-length: a trailing byte is refused", async (keep) => {
   // Trailing bytes would ride outside the transcript hash, and so outside what both
   // signatures cover. Exact, not minimum, for every message in the flight.
@@ -480,20 +514,26 @@ await test("FRAME CAP: an unauthenticated peer cannot declare a large frame", as
 });
 
 await test("FRAME CAP: authentication raises it, before anything can arrive under it", async (keep) => {
-  // The raise happens inside becomeAuthed(), ahead of the queued-frame flush: a responder
-  // authenticates at msg3 and may put application data on the wire alongside msg4 — which
-  // arrives in the same delivery. Raising the cap afterwards would measure that first
-  // frame against the handshake bound and kill every connection on its first real exchange.
+  // A responder authenticates at msg3 and may put application data on the wire right behind
+  // msg4, which the dialer can read in the SAME delivery. The dialer raises its cap only when
+  // msg4's step has run (becomeAuthed), so the framer must measure what rides behind msg4
+  // after that step — or it holds a full-size first record to the handshake bound and kills
+  // the link on its first real exchange.
   const chans = wirePair({ stream: true });
+  chans[1].hold(); // B's writes: msg2 alone, then msg4 and whatever follows it as one read
   const st = keep(await linked(chans));
-  // The app path, issued before the handshake completes: the guest's own `connecting`
-  // pool is keyed by `expectPeerId` on the dial, so an app send to that peer id queues
-  // pre-auth rather than failing for want of a link — far over the (pre-auth) cap, but
-  // maxFrameBytes is 2 MiB so it is well inside the post-auth one.
-  st.A.sendNoReply(st.B.peerId, PROTO, new Uint8Array(64 * 1024).fill(7));
-  await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
-  await settle();
-  assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
+  await until(() => chans[1].held.length === 1, 4000, "msg2");
+  chans[1].flush();
+  chans[1].hold();
+  await until(() => bUp(st), 4000, "the responder to authenticate");
+  // Far over the pre-auth cap, well inside the post-auth one (maxFrameBytes is 2 MiB).
+  const answer = st.B.request(st.A.peerId, PROTO, new Uint8Array(64 * 1024).fill(7), 4000)
+    .then((r) => r, () => null);
+  await until(() => chans[1].held.length === 2, 4000, "msg4 and a record behind it");
+  assert(chans[1].flush() === 2, "msg4 and the record must arrive as ONE read");
+  const got = await answer;
+  assert(got !== null && got.length === 64 * 1024, "the record behind msg4 must cross under the raised cap");
+  assert(!st.a.closed && !st.b.closed, "and neither end may close the link over it");
 });
 
 await test("A REFUSED SEND fails the link, never one record", async (keep) => {
@@ -513,6 +553,36 @@ await test("A REFUSED SEND fails the link, never one record", async (keep) => {
   await st.A.sendNoReply(st.B.peerId, PROTO, Uint8Array.of(1));
   await until(() => st.a.closed, 4000, "the refused write must end the link");
   assert(st.a.closed, "a record that could not be issued must fail its link");
+});
+
+await test("A REFUSED CLOSE still retires the link, and the socket follows on a later tick", async (keep) => {
+  // `link/close` is a host call too, so the budget pressure that tears a link down can refuse
+  // the close itself. The link must still leave routing at once — a dead link left routable
+  // swallows every frame sent to its peer — and the close is owed until the host takes it,
+  // or the peer goes on holding a link this end has forgotten.
+  let refusing = false, refused = 0, forge = false;
+  const chans = wirePair({
+    tamper: (bytes, from) => {
+      if (from !== "B" || !forge) return bytes;
+      const forged = Uint8Array.from(bytes);
+      forged[forged.length - 1] ^= 1;
+      return forged;
+    },
+  });
+  const st = keep(await linked(chans, {
+    onHostCall: (name) => {
+      if (refusing && name === "link/close") { refused++; throw new Error("guest: budget refused the close"); }
+    },
+  }));
+  await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
+  refusing = true;
+  forge = true;
+  await st.B.sendNoReply(st.A.peerId, PROTO, Uint8Array.of(1)); // A aborts on the forged record
+  await until(() => refused > 0, 4000, "the close to be refused");
+  await until(async () => !(await aUp(st)), 1000, "the refused link to leave routing");
+  assert(!chans[0].dead, "the socket stays open while the host refuses to close it");
+  refusing = false;
+  await until(() => chans[0].dead, 2000, "the owed close, asked again on a later tick");
 });
 
 await test("PRE-AUTH QUEUE: tiny frames are bounded by count", async (keep) => {
@@ -688,6 +758,24 @@ await test("READY: a second ready() does not strand the first", async (keep) => 
     ready(st.A, 50).then(() => "ok", () => "failed"),
   ]);
   assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle (got ${r1}/${r2})`);
+});
+
+await test("TIE-BREAK: a dial that loses hands what it queued to the link that won", async (keep) => {
+  // Two nodes dialing each other at once keep ONE link, the one the smaller identity dialed.
+  // A request queued on the larger identity's dial while it was still handshaking must not
+  // die with that dial: the link that won carries it.
+  let [ia, ib] = [generateKeyPair(), generateKeyPair()];
+  if (Buffer.compare(Buffer.from(ia.publicKey), Buffer.from(ib.publicKey)) < 0) [ia, ib] = [ib, ia];
+  const losing = wirePair();
+  losing[1].hold(); // A's dial stalls before msg2, so the request queues on it
+  const st = keep(await linked(losing, { identity: ia }, { identity: ib }));
+  const answer = st.A.request(st.B.peerId, PROTO, Uint8Array.of(1, 2, 3), 4000).then((r) => r, () => null);
+  await settle(50);
+  openPair(st.B, st.A, wirePair({ addrA: "10.0.0.3", addrB: "10.0.0.4" })); // B dials A, and wins
+  await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "B's dial");
+  losing[1].flush(); // A's dial completes, and loses the tie-break
+  const got = await answer;
+  assert(got !== null && got.length === 3 && got[2] === 3, "the queued request must be answered over the winning link");
 });
 
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {

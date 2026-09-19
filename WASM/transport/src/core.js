@@ -375,22 +375,39 @@ class Core {
     this.inbound.delete(link);
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
+    // What still waits in its queue never left. Another link to the same peer carries it —
+    // the winner of a double-connect tie-break, or a second dial — and a dial that dies as
+    // the last way to its peer fails what waits on that peer now, not at its retention
+    // timeout. (An authenticated link's last departure is the router's down edge.)
+    const peerId = link.peerId || link.dialedPeerId;
+    if (peerId) {
+      for (const frame of link.takeQueued()) this.place(peerId, frame);
+      if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) reqres.peerDown(peerId);
+    }
     // Left in `linksById`: `linkClosed` has yet to ask why it went.
+  }
+
+  /** Put a frame on a link that can carry it to `to`: an authenticated one, else the queue
+   *  of a dial still handshaking. False when there is neither. */
+  place(to, frame) {
+    if (router.send(to, frame)) return true;
+    const pool = this.connecting.get(to);
+    if (!pool || pool.length === 0) return false;
+    pool[0].send(frame);
+    return true;
   }
 
   // A frame for a peer with no routable link yet: dial, then hand the frame to the
   // link that lands (it queues pre-auth). The dial is shared per peer (`dial`), so a
-  // burst of frames to one unreachable peer costs one open, and a frame with no
-  // address at all is dropped, as a fabric with no route drops it.
+  // burst of frames to one unreachable peer costs one open. Answers whether a link took
+  // the frame: false is a frame dropped for want of a route — no address, or a dial that
+  // opened nothing — as a fabric with no route drops it.
   async sendFrame(to, frame) {
-    if (to === ownId) return;
-    if (router.send(to, frame)) return;
-    const pool = this.connecting.get(to);
-    if (pool && pool.length > 0) { pool[0].send(frame); return; }
-    if (!this.addrs.has(to)) return;
+    if (to === ownId) return false;
+    if (this.place(to, frame)) return true;
+    if (!this.addrs.has(to)) return false;
     await this.dial(to);
-    const landed = this.connecting.get(to);
-    if (landed && landed.length > 0) landed[0].send(frame);
+    return this.place(to, frame);
   }
 
   // Resolve once every known peer is authenticated, or the deadline passes —

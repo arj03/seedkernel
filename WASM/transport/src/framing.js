@@ -116,16 +116,25 @@ class LengthFramer {
 
   /** Feed inbound bytes, delivering each whole message. Returns false when the peer
    *  declared an over-cap frame — a protocol violation the caller answers by tearing
-   *  the link down, never by growing the buffer. */
+   *  the link down, never by growing the buffer — and true when it waits for more; before
+   *  the cap is raised, a promise of either (`parse`). */
   push(chunk, deliver) {
     this.parts.push(chunk);
+    return this.parse(deliver);
+  }
+
+  /** Until the cap is raised, one message at a time: the step `deliver` answers may be the
+   *  one that raises it (ake.js `becomeAuthed`), and a frame riding the same read must be
+   *  measured against what that step leaves, so the parse resumes once it has run. */
+  parse(deliver) {
     for (;;) {
       if (this.parts.length < 4) return true;
       const p = this.parts;
       const len = ((p.byteAt(0) << 24) | (p.byteAt(1) << 16) | (p.byteAt(2) << 8) | p.byteAt(3)) >>> 0;
       if (len > this.cap) return false;
       if (this.parts.length < 4 + len) return true;
-      deliver(this.parts.take(4 + len).subarray(4));
+      const step = deliver(this.parts.take(4 + len).subarray(4));
+      if (this.cap !== maxFrameBytes) return Promise.resolve(step).then(() => this.parse(deliver));
     }
   }
 }
@@ -243,7 +252,7 @@ class WsFramer {
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
    *  that keeps two parses from running at once, which matters twice: `frames()` takes a
    *  frame before awaiting its decode, so a second parser would read the frame after it;
-   *  and `raiseCap()` lands only when msg4 is delivered, so a second parser would measure
+   *  and `raiseCap()` lands only once msg4's step has run, so a second parser would measure
    *  a frame riding the same segment against the pre-auth cap. */
   push(chunk, deliver) {
     const done = this.reads.then(() => this.read(chunk, deliver));
@@ -311,8 +320,9 @@ class WsFramer {
     return sep + 4;
   }
 
-  /** Parse whatever frames are complete. Delivery is per frame rather than per chunk:
-   *  delivering msg4 raises the cap, and an application frame riding the same TCP
+  /** Parse whatever frames are complete. Delivery is per frame rather than per chunk, and
+   *  until the cap is raised each message's step runs before the next frame is measured
+   *  (`dispatch`): msg4's step raises the cap, and an application frame riding the same TCP
    *  segment must be measured against the raised cap, not the pre-auth one. */
   async frames(deliver) {
     for (;;) {
@@ -362,8 +372,11 @@ class WsFramer {
   }
 
   async dispatch(opcode, payload, deliver) {
-    if (opcode === WS_OP_BINARY) deliver(payload);
-    else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
+    if (opcode === WS_OP_BINARY) {
+      const step = deliver(payload);
+      // Until the cap is raised, this message's step may be what raises it (LengthFramer `parse`).
+      if (this.cap !== maxFrameBytes) await step;
+    } else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
     return true;
   }
