@@ -340,9 +340,9 @@ export class ModuleTable implements PureModuleLoader {
     if (!w) return { bytes: null, ms: 0 };
     if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
     const bound = deadlineMs ?? this.deadlineMs;
-    // Bytes are not this table's to account for: the enclosing `host.call`'s
-    // `ActiveHostCall` owns `payload` until the module settles (§12.3). Execution IS —
-    // one in-flight call per module, so a spinner burns one core for one bound.
+    // Bytes are not this table's to account for: the realm's `ActiveHostCalls` ledger holds
+    // `payload` under the enclosing `host.call` until the module settles (§12.3). Execution
+    // IS — one in-flight call per module, so a spinner burns one core for one bound.
     const started = w.tail.then(() => this.call(w, payload, bound));
     w.tail = started.catch(() => {});
     return started;

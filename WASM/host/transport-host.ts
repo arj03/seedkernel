@@ -14,7 +14,7 @@ import {
 } from "../core/net-limits.js";
 import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
-import { type RawNet } from "./guest-seam.js";
+import { HOST_CALLER_ID, type RawNet } from "./guest-seam.js";
 import { REALM_DISPOSED, type CausalClock } from "./realm-queue.js";
 import { OpArgs } from "../core/op-frame.js";
 
@@ -53,13 +53,16 @@ const ev = (name: LinkEvent) => new OpArgs(name);
  *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
 export { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
 
-/** Active transport entrypoint; `null` means the binding is vacant. */
-export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
+/** Active transport entrypoint; `null` means the binding is vacant. `input` is the whole
+ *  realm argument, `[caller 32][body …]`, built in one pass here (`OpArgs.build`). */
+export type TransportCall = (input: Uint8Array) => Promise<Uint8Array> | null;
 
 /** The claim routing a `link/deliver` call is handed to (§12.10). `null` for a claim no
  *  peer may reach. Inbound attributed delivery costs no grant beyond `link` itself: the
- *  occupant that saw the plaintext is the one that attributes it. */
-export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array,
+ *  occupant that saw the plaintext is the one that attributes it. `framed` is
+ *  `[attribution 32][payload …]`, which the occupant's own call body already spells that
+ *  way, so it IS the realm argument and nothing rebuilds it. */
+export type TransportDeliver = (claim: string, framed: Uint8Array,
   deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
@@ -275,10 +278,19 @@ export class TransportHost {
     // because `channelClosed` deletes as it goes, and idempotent, so a backend callback
     // racing this loop is a no-op. On a teardown or a handover the binding is released
     // before this runs, so only a sever — where the same occupant stays — hears them.
-    for (const [linkId, c] of [...this.channels.entries()]) {
-      try { c.close(false); } catch { /* already gone */ }
-      this.channelClosed(linkId, c);
-    }
+    for (const [linkId, c] of [...this.channels.entries()]) this.dropLink(linkId, c);
+  }
+
+  /** Sever one socket. A throw is a backend that has already let go. */
+  private shut(channel: RawLink): void {
+    try { channel.close(false); } catch { /* already gone */ }
+  }
+
+  /** Sever it AND take it out of the table: every hard teardown this driver makes. The
+   *  only close that is not one is the occupant's `link/close`, which may be graceful. */
+  private dropLink(linkId: number, channel: RawLink): void {
+    this.shut(channel);
+    this.channelClosed(linkId, channel);
   }
 
   /** Whether `close` has run. Public because a teardown has to be checkable: a replaced
@@ -288,16 +300,15 @@ export class TransportHost {
   // ── reaching the transport ──────────────────────────────────────────────────
   //
   // `OpArgs` (core/op-frame.ts) encodes the kernel's raw-link event ABI (RUNTIME §12.2).
-  // The shell adds the 32-byte host caller id (shell-core.ts `hostCallSlot`); any
-  // replacement link occupant must understand this envelope and these event fields.
+  // Any replacement link occupant must understand this envelope and these event fields.
 
-  /** Call the transport, with the shell's caller-id prefix added at the realm call.
+  /** Call the transport, caller id and envelope built in the one pass.
    *
    *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
    *  so bytes arriving on one link reach the occupant in arrival order. */
   private toTransport(args: OpArgs): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
-    return this.call(args.build());
+    return this.call(args.build(HOST_CALLER_ID));
   }
 
   /** A rejected op nobody was waiting on. Logged, except a realm disposed out from under
@@ -340,8 +351,7 @@ export class TransportHost {
         catch {
           // A throwing backend may already have emitted a prefix (notably an RTC write
           // split into SCTP-sized chunks). Continuing would desynchronize LENGTH framing.
-          try { channel.close(false); } catch { /* already gone */ }
-          this.channelClosed(linkId, channel);
+          this.dropLink(linkId, channel);
         }
       },
       close: (linkId, graceful) => {
@@ -360,9 +370,9 @@ export class TransportHost {
       // further grant — the occupant names no link here, and it already chose all three of
       // these arguments. A claim no peer may reach and a handler that threw both answer
       // EMPTY, so refusal and silence are one fact at this boundary.
-      deliver: (claim, attribution, payload, deadlineMs, causalClock) => {
+      deliver: (claim, framed, deadlineMs, causalClock) => {
         if (!bound() || !this.deliver) return Promise.resolve(EMPTY);
-        const answer = this.deliver(claim, attribution, payload, deadlineMs, causalClock);
+        const answer = this.deliver(claim, framed, deadlineMs, causalClock);
         if (!answer) return Promise.resolve(EMPTY);
         return answer.then((bytes) => bytes ?? EMPTY, () => EMPTY);
       },
@@ -379,7 +389,7 @@ export class TransportHost {
    *  that left it open would strand a descriptor. */
   private register(channel: RawLink): number {
     if (this.channels.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
-      try { channel.close(false); } catch { /* already gone */ }
+      this.shut(channel);
       return 0;
     }
     const linkId = this.nextLinkId++;
@@ -393,8 +403,9 @@ export class TransportHost {
     // paused is paused at the socket, where the peer's own transport pushes back; one that
     // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
     // so thousands of links cannot multiply a per-link allowance behind one realm.
-    let readActive = false;
-    let activeBytes = 0;
+    // The width of the read inside the realm, or -1 for none — one field, not a flag
+    // beside it, since an empty read is still a read in flight and 0 could not say so.
+    let activeBytes = -1;
     const held = new Fifo<Uint8Array>();
 
     const dropHeld = () => {
@@ -402,15 +413,13 @@ export class TransportHost {
       held.clear();
     };
     const releaseActive = () => {
-      if (!readActive) return;
-      readActive = false;
+      if (activeBytes < 0) return;
       this.releaseInboundRead(activeBytes);
-      activeBytes = 0;
+      activeBytes = -1;
     };
     const failReadSide = () => {
       dropHeld();
-      try { channel.close(false); } catch { /* already gone */ }
-      this.channelClosed(linkId, channel);
+      this.dropLink(linkId, channel);
     };
     /** One read has finished (or the link has just been registered): drain what was held
      *  behind it, oldest first. A LOOP rather than a call back into itself — a vacant
@@ -432,7 +441,6 @@ export class TransportHost {
      *  died trying — true only when it was over before it began, which is the vacant
      *  binding and nothing else. */
     const dispatchRead = (bytes: Uint8Array): boolean => {
-      readActive = true;
       activeBytes = bytes.length;
       try { channel.setReadable?.(false); }
       catch { releaseActive(); failReadSide(); return false; }
@@ -453,7 +461,7 @@ export class TransportHost {
       // invocation; stream backends naturally deliver much smaller slices.
       if (bytes.length > MAX_FRAME_BYTES) { failReadSide(); return; }
       if (!this.reserveInboundRead(bytes.length)) { failReadSide(); return; }
-      if (!readActive) {
+      if (activeBytes < 0) {
         if (dispatchRead(bytes)) releaseRead(); // over before it began: go back to draining
         return;
       }
@@ -529,7 +537,7 @@ export class TransportHost {
       this.opts.listen, this.opts.wsListen,
       (channel, arrival) => {
         if (!this.available()) {
-          try { channel.close(false); } catch { /* already gone */ }
+          this.shut(channel);
           return;
         }
         const linkId = this.register(channel);

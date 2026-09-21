@@ -8,8 +8,8 @@ import { type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
-import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, HOST_CALL_SPENT, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
-import type { CallBudget } from "./guest-seam.js";
+import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
@@ -357,15 +357,10 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
   const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
     // Go admitted this call before making the cross-realm copy. This adapter only
     // routes and settles; post-copy accounting here would be a second policy authority.
+    // No spend record either: guest.go owns this realm's execution clock and a native
+    // module runs inside the same armed segment, so a charge here would bill it twice.
     const causalClock = causalContext.current;
-    let detached = false;
-    const budget: CallBudget = {
-      remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
-      charge: () => {},
-      causalClock,
-      detach: () => { detached = true; },
-    };
-    if (budget.remainingMs <= 0) throw new Error(HOST_CALL_SPENT);
+    const budget = new CallBudget(deadlineMs < 0 ? Infinity : deadlineMs, causalClock, undefined);
     // A synchronous throw is a refused NAME, which fails at the guest's call site
     // (guest-seam.ts); guest.go releases the call it had already admitted.
     const answer = hostCall(name, new Uint8Array(payload), budget);
@@ -373,7 +368,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // by the same arm and neither can follow the other (realm-queue.ts).
     const settle = (bytes: Uint8Array | null, error: string | null): void =>
       causalContext.run(causalClock, () => {
-        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error, detached ? 1 : 0);
+        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error, budget.detached ? 1 : 0);
         causalClock?.charge(elapsedNs / 1_000_000);
       });
     void raceDeadline(hostCallDeadlines, budget.remainingMs, answer, HOST_CALL_LATE).then(

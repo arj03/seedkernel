@@ -319,10 +319,16 @@ await test("one peer's pipeline cannot spend the host calls every other link nee
   const held = [];
   let answering = false;
   const routeInbound = TransportHost.prototype.routeInbound;
+  // The route is handed the realm argument whole — `[attribution 32][payload …]`
+  // (transport-host.ts `TransportDeliver`) — so this stand-in claimant reads the sender and
+  // the request out of it the way a claimant's own realm would.
+  const ATTR = 32;
   TransportHost.prototype.routeInbound = function () {
-    return routeInbound.call(this, (_claim, attribution, payload) => (answering
-      ? Promise.resolve(payload.slice())
-      : new Promise((resolve) => { held.push({ from: Buffer.from(attribution).toString("hex"), resolve }); })));
+    return routeInbound.call(this, (_claim, framed) => (answering
+      ? Promise.resolve(framed.slice(ATTR))
+      : new Promise((resolve) => {
+        held.push({ from: Buffer.from(framed.subarray(0, ATTR)).toString("hex"), resolve });
+      })));
   };
   let closed = 0;
   let s;

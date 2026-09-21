@@ -63,7 +63,8 @@ function opHeader(op: string): Uint8Array {
 }
 
 /** One op's payload. The op is named in the constructor so `build()` emits the whole
- *  envelope in one pass, rather than copying every payload again behind its header. */
+ *  envelope in one pass, rather than copying every payload again behind its header. The
+ *  attribution prefix is part of that one pass too (see `build`). */
 export class OpArgs {
   readonly op: string;
   private readonly parts: Uint8Array[] = [];
@@ -91,9 +92,14 @@ export class OpArgs {
   /** A UTF-8 string as a blob. */
   text(s: string): this { return this.blob(enc.encode(s)); }
   private raw(b: Uint8Array): this { this.parts.push(b); this.len += b.length; return this; }
-  build(): Uint8Array {
-    const out = new Uint8Array(this.len);
-    let off = 0;
+  /** The whole thing as one buffer. `prefix` — the kernel's 32-byte caller id — is written
+   *  in FRONT of the envelope, so a socket read is gathered once here instead of again
+   *  behind a prefix added downstream. */
+  build(prefix?: Uint8Array): Uint8Array {
+    const head = prefix ? prefix.length : 0;
+    const out = new Uint8Array(head + this.len);
+    if (prefix) out.set(prefix, 0);
+    let off = head;
     for (const p of this.parts) { out.set(p, off); off += p.length; }
     return out;
   }

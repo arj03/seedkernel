@@ -536,23 +536,21 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, deta
 		g.invocationClock = parked.clock
 	}
 	before := g.consumed
-	var res *qjs.Value
-	var err error
+	// One settlement, either way: the preamble's resolve and reject take the same
+	// (callId, value) pair, so only the function and the value it carries differ.
+	// new Uint8Array(ab) inside __resolveHostCall retains the ArrayBuffer, so freeing our
+	// handle after the call leaves the guest's copy alive.
+	settler := g.resolveHostCall
+	var arg *qjs.Value
 	if bytes != nil {
-		// new Uint8Array(ab) inside __resolveHostCall retains the ArrayBuffer, so freeing our
-		// handle after the call leaves the guest's copy alive.
-		ab := g.qc.NewArrayBuffer(bytes)
-		res, err = g.within(func() (*qjs.Value, error) {
-			return g.qc.Invoke(g.resolveHostCall, g.qc.NewUndefined(), g.qc.NewInt64(callID), ab)
-		})
-		ab.Free()
+		arg = g.qc.NewArrayBuffer(bytes)
 	} else {
-		msgV := g.qc.NewString(msg)
-		res, err = g.within(func() (*qjs.Value, error) {
-			return g.qc.Invoke(g.rejectHostCall, g.qc.NewUndefined(), g.qc.NewInt64(callID), msgV)
-		})
-		msgV.Free()
+		settler, arg = g.rejectHostCall, g.qc.NewString(msg)
 	}
+	res, err := g.within(func() (*qjs.Value, error) {
+		return g.qc.Invoke(settler, g.qc.NewUndefined(), g.qc.NewInt64(callID), arg)
+	})
+	arg.Free()
 	if res != nil {
 		res.Free()
 	}

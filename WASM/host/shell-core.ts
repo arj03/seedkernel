@@ -430,13 +430,16 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  on the PEER book, so a `services` claim is unreachable by a peer by construction
    *  rather than by a second test against the slot's manifest. The resolved answer also
    *  goes to the slot's `onInbound`, if its load named one. */
-  const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array,
+  const deliverInbound = (claim: string, framed: Uint8Array,
     deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
     const slot = table.peerClaimant(claim);
     if (!slot) return null;
-    const answer = callFramed(slot, attribution, payload, deadlineMs, causalClock);
+    // Already framed by the occupant's own call (guest-seam.ts `link/deliver`), so this
+    // door enters the realm directly rather than taking the frame apart to rebuild it.
+    const answer = callSlot(slot, framed, deadlineMs, causalClock);
     if (slot.onInbound) {
       const onInbound = slot.onInbound;
+      const attribution = framed.subarray(0, HOST_CALLER_ID.length);
       // Two-arg `.then`, not a bare call plus a stray `.catch`: this branch's own
       // Promise must settle either way, or a guest that refuses the frame leaves an
       // unhandled rejection behind that `answer` — the one the caller actually
@@ -523,7 +526,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // commit. A replacement that DROPS `link` releases the binding the same way
     // dropping a claim releases the claim.
     if (table.hasLink(slot)) {
-      netHost?.activate((payload) => hostCallSlot(slot, payload));
+      // The driver builds the whole realm argument, caller id included (`TransportCall`),
+      // so a socket read is not copied a second time behind that prefix here.
+      netHost?.activate((input) => callSlot(slot, input));
     } else if (replacement && table.hasLink(replacement)) {
       netHost?.release();
     }

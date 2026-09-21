@@ -336,13 +336,14 @@ async function testManifestClaimIsTheRouting() {
         app: "reach", version: 1, protocols: [pub], services: [priv],
         modules: [], guestSource: GUEST_TEXT, guestRequires: [],
       }).blob);
-      const sender = new Uint8Array(32).fill(0x11);
-      const payload = new Uint8Array([1, 2, 3]);
+      // The route takes the realm argument whole: `[attribution 32][payload …]`, which is
+      // what the occupant's own `link/deliver` body already holds (transport-host.ts).
+      const framed = concatBytes([new Uint8Array(32).fill(0x11), new Uint8Array([1, 2, 3])]);
       assert(typeof routeDeliver === "function", "the shell wires inbound delivery through the transport route");
-      const publicAnswer = routeDeliver(pub, sender, payload);
+      const publicAnswer = routeDeliver(pub, framed);
       assert(publicAnswer !== null, "a name in `protocols` is reachable by a peer");
       await publicAnswer;
-      assert(routeDeliver(priv, sender, payload) === null,
+      assert(routeDeliver(priv, framed) === null,
         "the same bundle's `services` name is unreachable by a peer, however it is spelled");
       shell.uninstall(reachKey);
     }

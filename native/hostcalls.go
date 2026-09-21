@@ -47,10 +47,20 @@ func (l *hostCallLedger) admit(id, bytes int64, clock *invocationClock) error {
 	if len(l.live) >= l.maxCalls {
 		return fmt.Errorf("guest: too many outstanding host calls (cap %d)", l.maxCalls)
 	}
+	if err := l.charge(bytes); err != nil {
+		return err
+	}
+	l.live[id] = parkedCall{bytes: bytes, clock: clock}
+	return nil
+}
+
+// charge puts `bytes` on the realm's aggregate allowance, or refuses them and charges
+// nothing. One place: admit and reserve ask the same question at two moments — a new
+// call's payload, a parked call's answer — and two voices would be two ceilings.
+func (l *hostCallLedger) charge(bytes int64) error {
 	if bytes < 0 || bytes > l.maxBytes-l.bytes {
 		return fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", l.maxBytes)
 	}
-	l.live[id] = parkedCall{bytes: bytes, clock: clock}
 	l.bytes += bytes
 	return nil
 }
@@ -63,12 +73,11 @@ func (l *hostCallLedger) reserve(id, bytes int64) error {
 	if !live {
 		return errors.New("guest: host call is no longer active")
 	}
-	if bytes < 0 || bytes > l.maxBytes-l.bytes {
-		return fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", l.maxBytes)
+	if err := l.charge(bytes); err != nil {
+		return err
 	}
 	call.bytes += bytes
 	l.live[id] = call
-	l.bytes += bytes
 	return nil
 }
 

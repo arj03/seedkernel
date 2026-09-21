@@ -467,13 +467,14 @@ console.log("\n§12.3 — guest-created invocation roots have a bounded clock sh
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
 {
   const active = createActiveHostCallRegistry(2, 8);
-  const first = active.admit(1, 5);
+  active.admit(1, 5);
   throws(() => active.admit(1, 0), "a registry refuses a duplicate live id");
-  first.reserve(3);
+  active.reserve(1, 3);
   throws(() => active.admit(2, 1), "responses awaiting delivery remain charged");
-  first.release();
-  throws(() => first.reserve(1), "a settled call cannot reserve more against its realm");
-  active.admit(2, 8).release();
+  active.release(1);
+  throws(() => active.reserve(1, 1), "a settled call cannot reserve more against its realm");
+  active.admit(2, 8);
+  active.release(2);
   ok(true, "terminal settlement releases request, response, id, and count together");
 
   // A realm that dies with calls still parked releases them: nothing is left to consume

@@ -6,7 +6,7 @@ import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, type HostTransformName, type CapabilityName } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
-import { monotonicMs, type CausalClock } from "./realm-queue.js";
+import { HOST_CALL_SPENT, monotonicMs, type CausalClock } from "./realm-queue.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
@@ -51,17 +51,18 @@ export interface RawNet {
   /** Tear a link down. `graceful` asks the channel to flush already-written bytes
    *  first (socket-seam.ts `RawLink.close`). */
   close(linkId: number, graceful: boolean): void;
-  /** Route one request this occupant decoded off its links: `(claim, attribution,
-   *  payload)`, answered with the claimant's bytes. No new authority — the call names no
-   *  link, and all three arguments are already the caller's own to choose, so it is worth
-   *  exactly what holding the sockets is worth (§12.10). Both a claim no peer may reach
-   *  and a handler that failed answer EMPTY: refusal and silence are one fact here.
+  /** Route one request this occupant decoded off its links: a claim and the `[attribution
+   *  32][payload …]` the claimant is entered with, answered with that claimant's bytes. No
+   *  new authority — the call names no link, and both arguments are already the caller's
+   *  own to choose, so it is worth exactly what holding the sockets is worth (§12.10). Both
+   *  a claim no peer may reach and a handler that failed answer EMPTY: refusal and silence
+   *  are one fact here.
    *
    *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
    *  frame, since a realm serializes its invocations. The caller must therefore fire this
    *  and return from its event rather than await it inside one; the answer resumes it as a
    *  new turn (`CallBudget.detach`). */
-  deliver(claim: string, attribution: Uint8Array, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
+  deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
 /** One replaceable wake. The four-byte tag is opaque guest content, returned after
@@ -136,21 +137,57 @@ export interface GuestSeamDeps {
   modules: SeamModules;
 }
 
-/** Calling guest's execution segment. Host plumbing, never ABI: `remainingMs`
- *  is what a module call runs under; `charge` bills it afterwards. */
-export interface CallBudget {
-  /** Milliseconds left in the calling guest's segment; `Infinity` when unbudgeted. */
-  remainingMs: number;
-  /** Bill `ms` of host-side CPU to that segment. */
-  charge(ms: number): void;
-  /** The self-initiated root this call descends from, if any. Propagated across realm
-   *  calls so the root pays for execution in every callee, never for time awaiting it. */
-  causalClock?: CausalClock;
-  /** Resume the caller on this call's answer as a NEW turn, under a fresh budget of the
-   *  caller's own ceiling, instead of the invocation that made the call. For a call its
-   *  caller fires and returns from, whose answer is new work rather than the tail of what
-   *  the caller was doing (`link/deliver`). The call's own handoff deadline is unchanged. */
-  detach(): void;
+/** What host CPU spent on a guest's behalf is added to: one invocation's accumulated
+ *  execution (§4.3). The realm factory owns the rest of that record. */
+export interface Spend {
+  consumedMs: number;
+}
+
+/** The calling guest's execution segment, as the seam sees it. Host plumbing, never ABI.
+ *
+ *  A CLASS rather than a record built per call: the record layer makes one of these for
+ *  every hash, seal and write, and as a literal each one carried two closures of its own.
+ *  Here `charge` and `detach` are on the prototype and the object is three fields. */
+export class CallBudget {
+  /** Set by a name whose answer is new work rather than the tail of what the caller was
+   *  doing (`link/deliver`); read by the settlement, which then resumes the caller as a NEW
+   *  turn under a fresh budget of its own ceiling instead of the invocation that made the
+   *  call. The call's own handoff deadline is unchanged. */
+  detached = false;
+
+  /** @param remainingMs milliseconds left in the calling guest's segment, `Infinity` when
+   *    unbudgeted — what a module call runs under. A caller with none left is refused
+   *    HERE, so a spent budget cannot be built and no name below need ask again.
+   *  @param causalClock the self-initiated root this call descends from, if any.
+   *    Propagated across realm calls so the root pays for execution in every callee, never
+   *    for time awaiting it.
+   *  @param spend the invocation record host burn is billed to. NONE on the native target,
+   *    where a module runs inside the guest's own armed segment and Go has already counted
+   *    it — billing here would be a second charge for the same work. */
+  constructor(
+    readonly remainingMs: number,
+    readonly causalClock: CausalClock | undefined,
+    private readonly spend: Spend | undefined,
+  ) {
+    if (remainingMs <= 0) throw new Error(HOST_CALL_SPENT);
+  }
+
+  /** Add CPU the host burned ON THE GUEST'S BEHALF to the caller's segment — a module
+   *  call, whose time is the guest's by §4.3 but is burned while that segment is closed.
+   *  What it bounds that the handoff deadline cannot is CONCURRENT burn: a guest awaiting
+   *  one module at a time spends wall clock at the same rate, so the deadline already stops
+   *  it, but a guest fanning out to N workers burns N ms of CPU per ms of its own wait.
+   *  Summing the measured burns holds that sum inside the window the invocation was
+   *  admitted under, instead of multiplying it by however many modules the bundle ships. */
+  charge(ms: number): void {
+    if (ms <= 0 || this.spend === undefined) return;
+    this.spend.consumedMs += ms;
+    this.causalClock?.charge(ms);
+  }
+
+  detach(): void {
+    this.detached = true;
+  }
 }
 
 /** The host half of `host.call`. EVERY name answers a Promise — the seam is async,
@@ -507,8 +544,11 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     "link/deliver": (payload, budget) => {
       budget?.detach();
       const attrAt = 1 + payload[0];
-      const bodyAt = attrAt + HOST_CALLER_ID.length;
-      return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt), budget?.remainingMs, budget?.causalClock);
+      // Everything past the claim is ALREADY `[attribution 32][payload …]`, which is the
+      // shape a realm is entered with — this body writes those two fields in that order
+      // and adjacent. So the frame handed on is a view of this call, never the two halves
+      // taken apart here and copied back together one layer down.
+      return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget?.remainingMs, budget?.causalClock);
     },
     // ── timers: the platform's event loop ─────────────────────────────────────
     "timer/arm": (payload) => {
@@ -554,9 +594,8 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // on a later turn, never inside this guest's frame; an id nothing claims is refused
     // by name rather than parked on a promise no one will settle.
     if (localServices.has(name)) {
-      if (budget !== undefined && budget.remainingMs <= 0) {
-        throw new Error("guest-seam: execution budget exhausted before " + name);
-      }
+      // No budget check here or at the module call below: a `CallBudget` cannot exist with
+      // nothing left, so the refusal has already happened at the guest's call site.
       const answer = grants.calls.call(name, payload, budget?.remainingMs, budget?.causalClock);
       if (!answer) throw new Error("guest-seam: no realm claims " + name);
       return answer;
@@ -607,11 +646,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     if (!modules.names.has(name)) {
       throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
     }
-    // Module call charged to caller's segment (§4.3). Refuse if nothing left —
-    // realm interrupt alone cannot catch a guest that only awaits.
-    if (budget !== undefined && budget.remainingMs <= 0) {
-      throw new Error("guest-seam: execution budget exhausted before " + name);
-    }
+    // Module call charged to the caller's segment (§4.3).
     return modules.call(name, payload, budget?.remainingMs).then(({ bytes, ms }) => {
       // Bill the module's OWN processing time (measured on the worker that ran
       // it), never the issue-to-settle wall clock — a burst of fire-and-forget

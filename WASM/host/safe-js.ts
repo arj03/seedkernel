@@ -31,10 +31,10 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__start` / `__host_call` contract this file implements.
-import { guestPreamble, type CallBudget } from "./guest-seam.js";
+import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
   CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
-  HOST_CALL_LATE, HOST_CALL_SPENT, REALM_DISPOSED,
+  HOST_CALL_LATE, REALM_DISPOSED,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
 
@@ -57,69 +57,68 @@ function checkedBytes(bytes: number): number {
   return bytes;
 }
 
-/** One active call's custody, held from admission through settlement. */
-export interface ActiveHostCall {
-  reserve(bytes: number): void;
-  release(): void;
+/** Own every guest-to-host copy and promise slot from admission through settlement,
+ *  addressed by the guest-minted call id — the same ledger native keeps in Go, operations
+ *  and all (native/hostcalls.go), which is what keeps the two targets describing one
+ *  custody one way and leaves the seam allocating nothing per call. The rules each method
+ *  enforces are stated there; the one difference is WHEN: this target admits after the copy
+ *  out of the guest heap (`admitPayload`), native before it. */
+export interface ActiveHostCalls {
+  admit(callId: number, payloadBytes: number): void;
+  reserve(callId: number, additionalBytes: number): void;
+  release(callId: number): void;
+  releaseAll(): void;
 }
 
-/** Own every guest-to-host copy and promise slot from admission through settlement. This
- *  target's own: native admits the same numbers in Go, before the copy (native/hostcalls.go). */
 export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
-): {
-  admit(callId: number, payloadBytes: number): ActiveHostCall;
-  releaseAll(): void;
-} {
-  const active = new Map<number, ActiveHostCall>();
+): ActiveHostCalls {
+  /** call id → the bytes charged to it; `bytes` is the sum, kept as one number. */
+  const live = new Map<number, number>();
   let bytes = 0;
+  const charge = (additionalBytes: number): void => {
+    checkedBytes(additionalBytes);
+    if (additionalBytes > maxBytes - bytes) {
+      throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
+    }
+    bytes += additionalBytes;
+  };
   return {
-    releaseAll(): void {
-      for (const call of [...active.values()]) call.release();
-    },
-    admit(callId: number, payloadBytes: number): ActiveHostCall {
+    admit(callId, payloadBytes): void {
       if (!Number.isSafeInteger(callId)) throw new Error("guest: invalid host call id");
-      if (active.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
-      checkedBytes(payloadBytes);
-      if (active.size >= maxCalls) {
+      if (live.has(callId)) throw new Error(`guest: duplicate live host call id ${callId}`);
+      if (live.size >= maxCalls) {
         throw new Error(`guest: too many outstanding host calls (cap ${maxCalls})`);
       }
-      if (payloadBytes > maxBytes - bytes) {
-        throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
-      }
-      bytes += payloadBytes;
-      let owned = payloadBytes;
-      let live = true;
-      const call: ActiveHostCall = {
-        reserve(additionalBytes: number): void {
-          if (!live) throw new Error("guest: host call is no longer active");
-          checkedBytes(additionalBytes);
-          if (additionalBytes > maxBytes - bytes) {
-            throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
-          }
-          bytes += additionalBytes;
-          owned += additionalBytes;
-        },
-        release(): void {
-          if (!live) return;
-          live = false;
-          active.delete(callId);
-          bytes -= owned;
-        },
-      };
-      active.set(callId, call);
-      return call;
+      charge(payloadBytes);
+      live.set(callId, payloadBytes);
+    },
+    reserve(callId, additionalBytes): void {
+      const owned = live.get(callId);
+      if (owned === undefined) throw new Error("guest: host call is no longer active");
+      charge(additionalBytes);
+      live.set(callId, owned + additionalBytes);
+    },
+    release(callId): void {
+      const owned = live.get(callId);
+      if (owned === undefined) return;
+      live.delete(callId);
+      bytes -= owned;
+    },
+    releaseAll(): void {
+      live.clear();
+      bytes = 0;
     },
   };
 }
 
-/** One entrypoint invocation's execution record. A deferred invocation outlives its entry,
+/** One entrypoint invocation's execution record, and what a host call made under it bills
+ *  its host-side burn to (`CallBudget`, `Spend`). A deferred invocation outlives its entry,
  *  so each host call keeps the record it was made under and resumes on it (§12.3). */
-interface InvocationBudget {
+interface InvocationBudget extends Spend {
   budgetMs: number;
   wallDeadline: number;
-  consumedMs: number;
   /** Fails this invocation while its answer is pending. */
   reject?: (err: Error) => void;
 }
@@ -136,16 +135,9 @@ interface ExecClock {
   readonly current: InvocationBudget;
   /** The guest's remaining execution segment, in ms — read at the moment a call is made,
    *  and carried as a module call's deadline, so a module runs under the budget of the
-   *  segment that called it (§4.3). Infinity for an unbounded realm. */
+   *  segment that called it (§4.3). Infinity for an unbounded realm. Host burn on the
+   *  guest's behalf goes back the other way, onto the record itself (`CallBudget.charge`). */
   remaining(): number;
-  /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module call,
-   *  whose time is the guest's by §4.3 but is burned while the segment is closed. What it
-   *  bounds that the handoff deadline cannot is CONCURRENT burn: a guest awaiting one module
-   *  at a time spends wall clock at the same rate, so the deadline already stops it, but a
-   *  guest fanning out to N workers burns N ms of CPU per ms of its own wait. Summing the
-   *  measured burns is what holds that sum inside the window the invocation was admitted
-   *  under, instead of multiplying it by however many modules the bundle ships. */
-  charge(budget: InvocationBudget, ms: number): void;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
@@ -193,7 +185,6 @@ function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
       const spent = active.consumedMs + (running ? now - segmentStart : 0);
       return Math.max(0, Math.min(active.budgetMs - spent, active.wallDeadline - now));
     },
-    charge(budget, ms) { if (ms > 0) budget.consumedMs += ms; },
   };
 }
 
@@ -291,16 +282,22 @@ export const createSafeRealm: RealmFactory = async (opts) => {
 
   // Settle a parked host.call by calling the guest's own __resolveHostCall/__rejectHostCall
   // (the preamble's half of the contract), then pump so the awaiting continuation runs.
-  const settleHostCall = (fn: "__resolveHostCall" | "__rejectHostCall", callId: number, arg: QuickJSHandle,
-    invocationBudget: InvocationBudget, causalClock?: CausalClock): void => {
+  // `made` is the invocation the call was made under.
+  const settleHostCall = (fn: "__resolveHostCall" | "__rejectHostCall", callId: number,
+    arg: QuickJSHandle, budget: CallBudget, made: InvocationBudget): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
+    // What the answer resumes under, decided in ONE place: the invocation that made the
+    // call — restoring its absolute deadline and accumulated spend, since a later entry must
+    // neither lend it time nor interrupt it with that entry's shorter deadline — or, for a
+    // DETACHED call, a new turn's own record, minted here as the answer lands.
+    const under = budget.detached ? clock.create() : made;
     // The continuation of a parked `await` is guest code, so it runs on the guest's budget.
     // Every handle is released in `finally`, which is load-bearing rather than tidy: this
     // call can be interrupted mid-flight by the budget, and a runtime freed with live handles
     // aborts the whole wasm module at dispose() time.
-    causalContext.run(causalClock, () => {
-      clock.begin(invocationBudget, causalClock);
+    causalContext.run(budget.causalClock, () => {
+      clock.begin(under, budget.causalClock);
       try {
         const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
         res.dispose();
@@ -308,7 +305,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       } catch (err) {
         // The guest was interrupted while resuming, so nothing inside the realm will ever
         // settle the caller's promise: fail it here, or `call()` hangs forever.
-        invocationBudget.reject?.(err instanceof Error ? err : new Error(String(err)));
+        under.reject?.(err instanceof Error ? err : new Error(String(err)));
       } finally {
         clock.end();
         id.dispose();
@@ -316,6 +313,24 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         settler.dispose();
       }
     });
+  };
+
+  /** Copy one call's payload out of the guest heap, having admitted it first.
+   *  `getArrayBuffer` reads as a borrow but is not one: QTS_GetArrayBuffer mallocs a
+   *  payload-sized copy (libc, so outside setMemoryLimit) that the lifetime frees, and
+   *  `.slice()` must still copy again — the view dies with the lifetime and detaches on heap
+   *  growth. So admission refuses an over-budget call AFTER that copy, not before. */
+  const admitPayload = (callId: number, handle: QuickJSHandle): Uint8Array => {
+    const heapCopy = ctx.getArrayBuffer(handle);
+    try {
+      // A refused admission charged nothing and must NOT release: on a duplicate id that
+      // would end the custody of the call already holding it.
+      activeHostCalls.admit(callId, heapCopy.value.byteLength);
+      try { return heapCopy.value.slice(); }
+      catch (err) { activeHostCalls.release(callId); throw err; }
+    } finally {
+      heapCopy.dispose();
+    }
   };
 
   // The single seam. QuickJS calls it synchronously; the answer never comes back this
@@ -326,70 +341,46 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment is
-    // live — what a module call runs under; `charge` bills a module's burn once it settles,
-    // since the segment is closed by then (§4.3).
-    const causalClock = causalContext.current;
-    // Retain the invocation's shared accounting record, not a snapshot of its
-    // remainder: concurrent calls must charge the same accumulated spend.
-    const invocationBudget = clock.current;
-    let detached = false;
-    const budget: CallBudget = {
-      remainingMs: clock.remaining(),
-      charge: (ms) => { clock.charge(invocationBudget, ms); causalClock?.charge(ms); },
-      causalClock,
-      detach: () => { detached = true; },
-    };
-    /** What the answer resumes under: the invocation that made the call, or — detached — a
-     *  new turn's own record, minted as the answer lands. */
-    const resumeUnder = (): InvocationBudget => (detached ? clock.create() : invocationBudget);
-    if (budget.remainingMs <= 0) throw new Error(HOST_CALL_SPENT);
-    // `getArrayBuffer` reads as a borrow but is not one: QTS_GetArrayBuffer mallocs a
-    // payload-sized copy (libc, so outside setMemoryLimit) that the lifetime frees, and
-    // `.slice()` must still copy again — the view dies with the lifetime and detaches on
-    // heap growth. So admission refuses an over-budget call AFTER that copy, not before.
-    const [payload, activeCall] = (() => {
-      const heapCopy = ctx.getArrayBuffer(payloadHandle);
-      try {
-        const call = activeHostCalls.admit(callId, heapCopy.value.byteLength);
-        try { return [heapCopy.value.slice(), call] as const; }
-        catch (err) { call.release(); throw err; }
-      } finally {
-        heapCopy.dispose();
-      }
-    })();
+    // The invocation's shared accounting record, not a snapshot of its remainder:
+    // concurrent calls charge the same accumulated spend, and the answer resumes on it.
+    const made = clock.current;
+    // `remainingMs` is read HERE, while the segment is live — it is what a module call runs
+    // under (§4.3). A caller with none left is refused by the constructor, which throws at
+    // the guest's own call site.
+    const budget = new CallBudget(clock.remaining(), causalContext.current, made);
+    const payload = admitPayload(callId, payloadHandle);
     let answer: Promise<Uint8Array> | Uint8Array;
     try {
       answer = opts.hostCall(name, payload, budget);
     } catch (err) {
-      activeCall.release();
+      activeHostCalls.release(callId);
       throw err;
     }
     // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
-    // its own: the arm below is the only one, for a backend answer and a late one alike.
+    // its own: the arms below are the only ones, for a backend answer and a late one alike.
     void raceDeadline(hostCallDeadlines, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE).then(
       (bytes) => {
         try {
           if (disposed || !ctx.alive) return;
           // Request and response coexist while copying the result into the guest. Reserve
           // that overlap and keep the call live through guest-side settlement.
-          activeCall.reserve(bytes.byteLength);
-          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), resumeUnder(), causalClock);
+          activeHostCalls.reserve(callId, bytes.byteLength);
+          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), budget, made);
         } catch (err) {
           if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), resumeUnder(), causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), budget, made);
           }
         } finally {
-          activeCall.release();
+          activeHostCalls.release(callId);
         }
       },
-      (err) => {
+      (err: unknown) => {
         try {
           if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), resumeUnder(), causalClock);
+            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), budget, made);
           }
         } finally {
-          activeCall.release();
+          activeHostCalls.release(callId);
         }
       },
     );
@@ -501,7 +492,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       failInvocations(new Error(REALM_DISPOSED));
       // And end custody of every call the host never answered: nothing inside this realm
       // will consume those answers now, so holding their charge would pin this realm's
-      // allowance on one unanswering backend forever (`ActiveHostCall` above).
+      // allowance on one unanswering backend forever (`ActiveHostCalls` above).
       // Their armed deadlines go with them (`disarmAll`).
       activeHostCalls.releaseAll();
       hostCallDeadlines.disarmAll();

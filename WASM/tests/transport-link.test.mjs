@@ -15,6 +15,17 @@ import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/core/net-limits.js";
 import { REASON_NAMES } from "../build/host/transport-host.js";
+import { HOST_CALLER_ID } from "../build/host/guest-seam.js";
+
+/** Read a link event the way the realm behind the binding does. The driver hands an
+ *  occupant the WHOLE realm argument — `[caller 32][opLen u8][op][args …]`, the host's own
+ *  caller id already in front (transport-host.ts `TransportCall`) — so a test standing in
+ *  for an occupant opens it at the same seam the signed one does. */
+function opOf(input) {
+  const body = input.subarray(HOST_CALLER_ID.length);
+  const n = body[0];
+  return { op: new TextDecoder().decode(body.subarray(1, 1 + n)), args: body.subarray(1 + n) };
+}
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
 // The RawLink shape (core/socket-seam.ts) plus the hooks these tests need: every byte
@@ -1434,10 +1445,8 @@ await test("DRIVER BACKPRESSURE: one blocked read cannot fill the realm queue", 
   let acceptedReads = 0;
   const factory = new InjectedChannels();
   const driver = keep(new TransportHost({ channels: factory }));
-  driver.activate((payload) => {
-    const n = payload[0];
-    const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
-    if (op === "linkBytes") { acceptedReads++; return blockedRead; }
+  driver.activate((input) => {
+    if (opOf(input).op === "linkBytes") { acceptedReads++; return blockedRead; }
     return Promise.resolve(new Uint8Array());
   });
   await driver.start();
@@ -1478,13 +1487,11 @@ function heldReadDriver(keep) {
   const driver = keep(new TransportHost({ channels: factory }));
   const reads = [];
   let release = null;
-  driver.activate((payload) => {
-    const n = payload[0];
-    if (new TextDecoder().decode(payload.subarray(1, 1 + n)) !== "linkBytes") {
-      return Promise.resolve(new Uint8Array());
-    }
-    // `linkBytes` is [opLen u8][op][linkId u32][blobLen u32][blob] — the blob runs to the end.
-    reads.push(payload.subarray(1 + n + 4 + 4));
+  driver.activate((input) => {
+    const { op, args } = opOf(input);
+    if (op !== "linkBytes") return Promise.resolve(new Uint8Array());
+    // `linkBytes` args are [linkId u32][blobLen u32][blob] — the blob runs to the end.
+    reads.push(args.subarray(4 + 4));
     return new Promise((r) => { release = () => r(new Uint8Array()); });
   });
   return { factory, driver, reads, next: () => { const r = release; release = null; r(); } };
@@ -1598,11 +1605,8 @@ await test("DRIVER BACKPRESSURE: a hold answered synchronously drains whole", as
   const driver = keep(new TransportHost({ channels: factory }));
   let reads = 0;
   let releaseFirst;
-  driver.activate((payload) => {
-    const n = payload[0];
-    if (new TextDecoder().decode(payload.subarray(1, 1 + n)) !== "linkBytes") {
-      return Promise.resolve(new Uint8Array());
-    }
+  driver.activate((input) => {
+    if (opOf(input).op !== "linkBytes") return Promise.resolve(new Uint8Array());
     // The first read occupies the realm; every later one answers on the spot.
     if (++reads > 1) return null;
     return new Promise((r) => { releaseFirst = () => r(new Uint8Array()); });
@@ -1654,12 +1658,10 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   const driver = keep(new TransportHost(
     { channels: factory, onLinkClosed: (linkId, reason) => downs.push({ linkId, reason }) },
   ));
-  driver.activate(async (payload) => {
-    const n = payload[0];
-    const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
-    const rest = payload.subarray(1 + n);
-    if (op === "linkBytes" || op === "linkOpen") events.push({ op, linkId: readU32(rest, 0) });
-    if (op === "linkClosed") { events.push({ op, linkId: readU32(rest, 0) }); return Uint8Array.of(CLOSE_REASON.LOCAL); }
+  driver.activate(async (input) => {
+    const { op, args } = opOf(input);
+    if (op === "linkBytes" || op === "linkOpen") events.push({ op, linkId: readU32(args, 0) });
+    if (op === "linkClosed") { events.push({ op, linkId: readU32(args, 0) }); return Uint8Array.of(CLOSE_REASON.LOCAL); }
     return new Uint8Array();
   });
   await driver.start();
@@ -1725,8 +1727,8 @@ await test("DRIVER HANDOVER: an outgoing occupant hears nothing about the links 
   }
   const heard = { old: [], new: [] };
   const downs = [];
-  const occupant = (who) => (payload) => {
-    heard[who].push(new TextDecoder().decode(payload.subarray(1, 1 + payload[0])));
+  const occupant = (who) => (input) => {
+    heard[who].push(opOf(input).op);
     return Promise.resolve(Uint8Array.of(CLOSE_REASON.LOCAL));
   };
   const factory = new InjectedChannels();
