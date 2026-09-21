@@ -94,10 +94,6 @@ class ReqRes {
     p.d.settle(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
   }
 
-  attach(sendFrame) {
-    this.sendFrame = sendFrame;
-  }
-
   /** Whether `from` may put one more request, `weight` wide, on `link/deliver` (core.js
    *  `deliveryWindow`). A peer with none waiting may take any room left; one already waiting
    *  leaves a max-size request's room to a peer that is not, and stops at an equal share
@@ -141,7 +137,7 @@ class ReqRes {
       this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueTick(requestTimeoutMs) : 0 });
     }
     const unanswerable = () => this.finish(corr, null);
-    this.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
+    core.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
   }
 
   buildReq(corr, noReply, proto, payload) {
@@ -195,14 +191,12 @@ class ReqRes {
     if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
     const answer = netLinkDeliver(proto, fromPubkey, payload);
     this.hold(from, weight);
-    answer.then(
-      (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); },
-      // Only the seam itself rejects — the delivery's handoff deadline, or an answer this
-      // realm's budget would not copy in. That is no answer either, and it goes back empty
-      // like a refused claim or a handler that threw. Either arm is a turn of its own
-      // (guest-seam.ts `link/deliver`), so the reply has a budget to be written with.
-      () => { this.hold(from, -weight); this.respond(corr, noReply, from, EMPTY); },
-    );
+    // Only the seam itself rejects — the delivery's handoff deadline, or an answer this
+    // realm's budget would not copy in. That is no answer either, and it goes back empty
+    // like a refused claim or a handler that threw. Either arm is a turn of its own
+    // (guest-seam.ts `link/deliver`), so the reply has a budget to be written with.
+    const done = (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); };
+    answer.then(done, () => done(EMPTY));
   }
 
   // The response to a delivered request, addressed back to `from`. noReply ran the
@@ -217,7 +211,7 @@ class ReqRes {
     frame[0] = 1; // KIND_RES
     writeU32BE(frame, 1, corr);
     frame.set(body, RES_HEAD_LEN);
-    this.sendFrame(from, frame);
+    core.sendFrame(from, frame);
   }
 
   peerDown(peerId) {

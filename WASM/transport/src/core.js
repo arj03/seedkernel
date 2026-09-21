@@ -332,19 +332,12 @@ class Core {
     }
   }
 
-  // An inbound (accepted) channel, or a link we just dialed.
+  // An inbound (accepted) channel, or a link we just dialed. The spec IS the link's own
+  // description, so it is passed through whole: a field its callers fill is a field `Link`
+  // reads, with no second spelling here to keep in step. Only the callbacks are ours.
   openLink(spec) {
     const link = new Link({
-      linkId: spec.linkId,
-      stream: spec.stream,
-      dest: spec.dest,
-      listener: spec.listener,
-      weDialed: spec.weDialed,
-      expectPeerId: spec.expectPeerId,
-      linkSecret: spec.linkSecret,
-      dialedPeerId: spec.dialedPeerId,
-      source: spec.source,
-      limiter: spec.limiter,
+      ...spec,
       onAuth: (pid, l) => this.onAuth(pid, l),
       onFrame: (pid, frame, pk) => reqres.onFrame(pid, frame, pk),
       onClose: (l) => this.forget(l),
@@ -434,7 +427,6 @@ class Core {
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
-reqres.attach((to, frame) => core.sendFrame(to, frame));
 // The cohort edges stay in this heap; the host reads them with the `peers` op.
 router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
 router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };

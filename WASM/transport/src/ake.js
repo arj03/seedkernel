@@ -53,7 +53,7 @@ const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 
 
 const SUITE_CHANNEL_CONCEALED = 0x03;
 const SUITE_LEN = 1, PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
-const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
+const NPUB_LEN = 12, TAG_LEN = 16;
 const KEM_PK_LEN = 1184, KEM_SK_LEN = 2400, KEM_CT_LEN = 1088, KEM_SS_LEN = 32;
 const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + NONCE_LEN + TAG_LEN; // 1265
 const M2_LEN = EPH_LEN + KEM_CT_LEN + NONCE_LEN + TAG_LEN;             // 1168
@@ -481,16 +481,21 @@ class Link {
     return frames;
   }
 
-  close() {
+  /** Our own end of the link, in one shape. It leaves routing at once (`onClose`) and runs
+   *  the teardown behind the work chain, so a step already in flight finishes before its
+   *  keys are zeroed under it. `farewell` tries the authenticated end-of-stream record
+   *  first; `defensive` records that a peer provoked this (`closeReason`). */
+  end(farewell, defensive) {
     if (this.closed) return;
     this.closed = true;
     this.closedLocally = true;
+    if (defensive) this.aborted = true;
     this.severWire();
-    // The goodbye rides the same work chain as everything else, so it cannot overtake
-    // a record still being sealed and cannot race teardown's key-zeroing.
     void this.enqueue(async () => {
       let saidGoodbye = false;
-      if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
+      // The goodbye rides the same work chain as everything else, so it cannot overtake
+      // a record still being sealed and cannot race teardown's key-zeroing.
+      if (farewell && this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
         try {
           await this.wire(await this.seal(new Uint8Array(0)));
           // A codec with its own end-of-stream signal says it too, on the same byte
@@ -507,22 +512,12 @@ class Link {
     this.onClose(this);
   }
 
+  /** Our own deliberate shutdown, and the only path that says goodbye. */
+  close() { this.end(true, false); }
+
   // Every failure path uses abort(), never close(): only close() emits the authenticated
   // end-of-stream record, so "the peer said goodbye" means "the peer chose to stop".
-  abort(defensive) {
-    if (this.closed) return;
-    this.closed = true;
-    this.closedLocally = true;
-    if (defensive) this.aborted = true;
-    this.severWire();
-    // Behind the chain like close(), so an in-flight step finishes before its keys are
-    // zeroed under it.
-    void this.enqueue(async () => {
-      this.teardown();
-      this.closeChannel(false);
-    });
-    this.onClose(this);
-  }
+  abort(defensive) { this.end(false, defensive); }
 
   /** Why this link ended, as the occupant alone can say it. A REASON_* code returned
    *  from `linkClosed`, printed by the driver — the node's one answer to "is it me, them, or
