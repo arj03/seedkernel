@@ -133,51 +133,46 @@ async function boxKeypair() {
   if (!r.ok) throw new Error("transport: ephemeral keygen failed");
   return { publicKey: r.x, privateKey: sk };
 }
-async function kemKeypair(seed) {
-  const req = concatBytes([Uint8Array.of(0), seed]);
+/** One call into the ML-KEM module: `[op][parts …]` in, `take` reads the answer. The three
+ *  operations share this body for the part that has to be right every time — the request,
+ *  the caller's inputs named in `wipe`, and the answer are all secrets, and all three are
+ *  zeroed on every path, the throwing ones included. */
+async function kemCall(op, parts, wipe, take) {
+  const req = concatBytes([Uint8Array.of(op), ...parts]);
   let r;
   try {
     r = await host.call(N_MLKEM, req);
   } finally {
     req.fill(0);
-    seed.fill(0);
+    for (const secret of wipe) secret.fill(0);
   }
-  if (r.length !== KEM_PK_LEN + KEM_SK_LEN) {
+  try {
+    return take(r);
+  } finally {
     r.fill(0);
-    throw new Error("transport: ML-KEM keygen failed");
   }
-  const pair = { publicKey: r.slice(0, KEM_PK_LEN), privateKey: r.slice(KEM_PK_LEN) };
-  r.fill(0);
-  return pair;
 }
-async function kemEncaps(pk, coins) {
-  const req = concatBytes([Uint8Array.of(1), pk, coins]);
-  let r;
-  try {
-    r = await host.call(N_MLKEM, req);
-  } finally {
-    req.fill(0);
-    coins.fill(0);
-  }
-  const result = r.length === 1 + KEM_CT_LEN + KEM_SS_LEN && r[0] === 1
-    ? { ok: true, ciphertext: r.slice(1, 1 + KEM_CT_LEN), sharedSecret: r.slice(1 + KEM_CT_LEN) }
-    : { ok: false, ciphertext: null, sharedSecret: null };
-  r.fill(0);
-  return result;
+/** No status byte: the width IS the status, and a wrong one is our own module failing
+ *  rather than anything a peer did — so it throws where the other two answer `{ok:false}`. */
+function kemKeypair(seed) {
+  return kemCall(0, [seed], [seed], (r) => {
+    if (r.length !== KEM_PK_LEN + KEM_SK_LEN) throw new Error("transport: ML-KEM keygen failed");
+    return { publicKey: r.slice(0, KEM_PK_LEN), privateKey: r.slice(KEM_PK_LEN) };
+  });
 }
-async function kemDecaps(sk, ct) {
-  const req = concatBytes([Uint8Array.of(2), sk, ct]);
-  let r;
-  try {
-    r = await host.call(N_MLKEM, req);
-  } finally {
-    req.fill(0);
-  }
-  const result = r.length === 1 + KEM_SS_LEN && r[0] === 1
-    ? { ok: true, sharedSecret: r.slice(1) }
-    : { ok: false, sharedSecret: null };
-  r.fill(0);
-  return result;
+function kemEncaps(pk, coins) {
+  // `pk` is the peer's public encapsulation key and stays; only the coins are ours to lose.
+  return kemCall(1, [pk, coins], [coins], (r) => (
+    r.length === 1 + KEM_CT_LEN + KEM_SS_LEN && r[0] === 1
+      ? { ok: true, ciphertext: r.slice(1, 1 + KEM_CT_LEN), sharedSecret: r.slice(1 + KEM_CT_LEN) }
+      : { ok: false, ciphertext: null, sharedSecret: null }));
+}
+function kemDecaps(sk, ct) {
+  // `sk` is `myKem.privateKey`, which the link still needs and `clearEphemeral` zeroes.
+  return kemCall(2, [sk, ct], [], (r) => (
+    r.length === 1 + KEM_SS_LEN && r[0] === 1
+      ? { ok: true, sharedSecret: r.slice(1) }
+      : { ok: false, sharedSecret: null }));
 }
 /** The channel's tagged identity-signature format — the host's slot scope, prefixed by
  *  the HOST, wraps this whole value as an opaque suffix. */
