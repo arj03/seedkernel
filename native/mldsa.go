@@ -78,6 +78,6 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 // than falling back to the Ed25519 half alone.
 func exposeMlDsa(qc *qjs.Context, o *qjs.Value, m *mldsa) {
 	o.SetPropertyStr("ml_dsa65_verify_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewBool(m.verifyDetached(argBytes(args, 0), argBytes(args, 1), argBytes(args, 2))), nil
+		return qc.NewBool(m.verifyDetached(argView(args, 0), argView(args, 1), argView(args, 2))), nil
 	}))
 }

@@ -33,7 +33,8 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__start` / `__host_call` contract this file implements.
 import { guestPreamble, type CallBudget } from "./guest-seam.js";
 import {
-  CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, REALM_DISPOSED,
+  CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
+  HOST_CALL_LATE, HOST_CALL_SPENT, REALM_DISPOSED,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
 
@@ -342,7 +343,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     /** What the answer resumes under: the invocation that made the call, or — detached — a
      *  new turn's own record, minted as the answer lands. */
     const resumeUnder = (): InvocationBudget => (detached ? clock.create() : invocationBudget);
-    if (budget.remainingMs <= 0) throw new Error("guest: handoff deadline exhausted before host.call");
+    if (budget.remainingMs <= 0) throw new Error(HOST_CALL_SPENT);
     // `getArrayBuffer` reads as a borrow but is not one: QTS_GetArrayBuffer mallocs a
     // payload-sized copy (libc, so outside setMemoryLimit) that the lifetime frees, and
     // `.slice()` must still copy again — the view dies with the lifetime and detaches on
@@ -366,8 +367,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     }
     // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
     // its own: the arm below is the only one, for a backend answer and a late one alike.
-    void raceDeadline(hostCallDeadlines, budget.remainingMs, Promise.resolve(answer),
-      "guest: host.call handoff deadline exceeded").then(
+    void raceDeadline(hostCallDeadlines, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE).then(
       (bytes) => {
         try {
           if (disposed || !ctx.alive) return;

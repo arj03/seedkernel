@@ -13,8 +13,8 @@ import "testing"
 func sumCharged(t *testing.T, l *hostCallLedger) {
 	t.Helper()
 	var sum int64
-	for _, b := range l.live {
-		sum += b
+	for _, call := range l.live {
+		sum += call.bytes
 	}
 	if sum != l.bytes {
 		t.Fatalf("aggregate %d does not match the %d bytes the %d live calls hold", l.bytes, sum, len(l.live))
@@ -24,15 +24,15 @@ func sumCharged(t *testing.T, l *hostCallLedger) {
 func TestHostCallLedgerCallCap(t *testing.T) {
 	l := newHostCallLedger(3, 1<<20)
 	for i := int64(0); i < 3; i++ {
-		if err := l.admit(i, 8); err != nil {
+		if err := l.admit(i, 8, nil); err != nil {
 			t.Fatalf("admit %d within the cap: %v", i, err)
 		}
 	}
 	// The refusal must cost the host nothing: no id recorded, no bytes charged.
-	if err := l.admit(99, 8); err == nil {
+	if err := l.admit(99, 8, nil); err == nil {
 		t.Fatal("admitted a 4th call against a cap of 3")
 	}
-	if l.has(99) {
+	if _, live := l.at(99); live {
 		t.Fatal("a refused call was recorded live")
 	}
 	if l.bytes != 24 {
@@ -43,7 +43,7 @@ func TestHostCallLedgerCallCap(t *testing.T) {
 	// Releasing one makes room again — the cap is on what is outstanding, not on how many
 	// calls a realm may make over its life.
 	l.release(1)
-	if err := l.admit(99, 8); err != nil {
+	if err := l.admit(99, 8, nil); err != nil {
 		t.Fatalf("admit after a release: %v", err)
 	}
 	sumCharged(t, &l)
@@ -51,17 +51,17 @@ func TestHostCallLedgerCallCap(t *testing.T) {
 
 func TestHostCallLedgerByteCap(t *testing.T) {
 	l := newHostCallLedger(256, 100)
-	if err := l.admit(1, 60); err != nil {
+	if err := l.admit(1, 60, nil); err != nil {
 		t.Fatal("admit within the byte cap:", err)
 	}
-	if err := l.admit(2, 41); err == nil {
+	if err := l.admit(2, 41, nil); err == nil {
 		t.Fatal("admitted 41 bytes with 40 left under a 100-byte cap")
 	}
-	if l.has(2) || l.bytes != 60 {
-		t.Fatalf("a refused admit left id 2 live=%v and %d bytes charged", l.has(2), l.bytes)
+	if _, live := l.at(2); live || l.bytes != 60 {
+		t.Fatalf("a refused admit left id 2 live=%v and %d bytes charged", live, l.bytes)
 	}
 	// Exactly the remainder still fits: the cap is a ceiling, not a strict inequality.
-	if err := l.admit(2, 40); err != nil {
+	if err := l.admit(2, 40, nil); err != nil {
 		t.Fatal("admit of exactly the remaining allowance:", err)
 	}
 	if l.bytes != 100 {
@@ -70,7 +70,7 @@ func TestHostCallLedgerByteCap(t *testing.T) {
 	sumCharged(t, &l)
 
 	// A negative width is a bogus source read, not free space.
-	if err := l.admit(3, -1); err == nil {
+	if err := l.admit(3, -1, nil); err == nil {
 		t.Fatal("admitted a negative payload width")
 	}
 	sumCharged(t, &l)
@@ -78,12 +78,12 @@ func TestHostCallLedgerByteCap(t *testing.T) {
 
 func TestHostCallLedgerDuplicateID(t *testing.T) {
 	l := newHostCallLedger(256, 1<<20)
-	if err := l.admit(7, 10); err != nil {
+	if err := l.admit(7, 10, nil); err != nil {
 		t.Fatal("first admit:", err)
 	}
 	// A guest re-using a live id must not be able to re-charge it or displace the entry —
 	// its release would then credit the realm for bytes it still holds.
-	if err := l.admit(7, 10); err == nil {
+	if err := l.admit(7, 10, nil); err == nil {
 		t.Fatal("admitted a duplicate live call id")
 	}
 	if l.bytes != 10 {
@@ -94,7 +94,7 @@ func TestHostCallLedgerDuplicateID(t *testing.T) {
 
 func TestHostCallLedgerReserveRefusalKeepsTheCall(t *testing.T) {
 	l := newHostCallLedger(256, 100)
-	if err := l.admit(1, 60); err != nil {
+	if err := l.admit(1, 60, nil); err != nil {
 		t.Fatal("admit:", err)
 	}
 	// A response too big for the remaining allowance is refused, but the call stays live
@@ -103,7 +103,7 @@ func TestHostCallLedgerReserveRefusalKeepsTheCall(t *testing.T) {
 	if err := l.reserve(1, 41); err == nil {
 		t.Fatal("reserved 41 bytes with 40 left")
 	}
-	if !l.has(1) {
+	if _, live := l.at(1); !live {
 		t.Fatal("a refused reserve dropped the call")
 	}
 	if l.bytes != 60 {
@@ -131,7 +131,7 @@ func TestHostCallLedgerReserveRefusalKeepsTheCall(t *testing.T) {
 
 func TestHostCallLedgerStrayReleaseIsANoOp(t *testing.T) {
 	l := newHostCallLedger(256, 1<<20)
-	if err := l.admit(1, 25); err != nil {
+	if err := l.admit(1, 25, nil); err != nil {
 		t.Fatal("admit:", err)
 	}
 	// A settlement for an id that was never parked, and a second settlement for one
@@ -145,7 +145,7 @@ func TestHostCallLedgerStrayReleaseIsANoOp(t *testing.T) {
 	sumCharged(t, &l)
 
 	// The allowance is fully back: a fresh call of the whole cap is admitted.
-	if err := l.admit(2, 1<<20); err != nil {
+	if err := l.admit(2, 1<<20, nil); err != nil {
 		t.Fatal("the released allowance did not come back:", err)
 	}
 	sumCharged(t, &l)
@@ -154,7 +154,7 @@ func TestHostCallLedgerStrayReleaseIsANoOp(t *testing.T) {
 func TestHostCallLedgerReleaseAll(t *testing.T) {
 	l := newHostCallLedger(256, 1<<20)
 	for i := int64(0); i < 10; i++ {
-		if err := l.admit(i, 100); err != nil {
+		if err := l.admit(i, 100, nil); err != nil {
 			t.Fatalf("admit %d: %v", i, err)
 		}
 	}
@@ -167,7 +167,7 @@ func TestHostCallLedgerReleaseAll(t *testing.T) {
 	}
 	// The ledger stays usable afterwards — close() is the only caller today, but a zeroed
 	// map that could not be admitted into would be a trap for the next one.
-	if err := l.admit(1, 100); err != nil {
+	if err := l.admit(1, 100, nil); err != nil {
 		t.Fatal("admit after releaseAll:", err)
 	}
 	sumCharged(t, &l)

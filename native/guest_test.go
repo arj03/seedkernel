@@ -330,8 +330,8 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls.live))
 	}
 	g.settleHostCall(liveID, []byte{}, "", false)
-	if len(g.hostCalls.live) != 0 || len(g.hostCallBudgets) != 0 {
-		t.Fatalf("live settlement left %d parked calls and %d invocation clocks", len(g.hostCalls.live), len(g.hostCallBudgets))
+	if len(g.hostCalls.live) != 0 {
+		t.Fatalf("live settlement left %d parked calls", len(g.hostCalls.live))
 	}
 }
 
@@ -362,9 +362,8 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	if _, err := qc.Eval("dispose.js", `__realm.dispose()`); err != nil {
 		t.Fatal("dispose:", err)
 	}
-	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 || len(g.hostCallBudgets) != 0 {
-		t.Fatalf("close left %d parked calls, %d bytes charged and %d invocation clocks",
-			len(g.hostCalls.live), g.hostCalls.bytes, len(g.hostCallBudgets))
+	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 {
+		t.Fatalf("close left %d parked calls and %d bytes charged", len(g.hostCalls.live), g.hostCalls.bytes)
 	}
 }
 

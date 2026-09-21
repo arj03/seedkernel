@@ -42,8 +42,8 @@ type netHost struct {
 	maxInboundReadBytes  int
 	maxInboundReadSlices int
 
-	// Native staging custody: copied socket reads posted toward QuickJS but not yet
-	// synchronously handed to TransportHost's existing driver-wide allowance.
+	// Native staging custody: socket reads posted toward QuickJS but not yet synchronously
+	// handed to TransportHost's existing driver-wide allowance.
 	inboundReadBytes  int
 	inboundReadSlices int
 	readSpace         *sync.Cond // signalled as staging custody is released
@@ -100,8 +100,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	// channel that is gone is dropped, exactly as one on a dead channel is.
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		if ch := n.get(args[0].Int64()); ch != nil {
-			// b is a fresh copy (Value.Bytes), so send takes ownership without another. It
-			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
+			// Bytes, never View: send only QUEUES, and the write happens later on the
+			// channel's writer goroutine (net.go writeLoop), so these bytes outlive this
+			// engine's next turn and must be the channel's own.
 			if b, err := args[1].Bytes(); err == nil {
 				ch.send(b)
 			}
@@ -181,10 +182,10 @@ func (n *netHost) waitSpace() *sync.Cond {
 	return n.readSpace
 }
 
-// reserveInboundRead charges a socket read before the reader makes the retained copy that
-// crosses into el.post — the driver-wide staging allowance of §16.1. A full window WAITS,
-// parking this reader goroutine so the socket's own receive window carries the pressure to
-// the peer; only a read that can never fit is refused, since waiting would park forever.
+// reserveInboundRead charges a socket read before the reader posts it into el.post — the
+// driver-wide staging allowance of §16.1. A full window WAITS, parking this reader
+// goroutine so the socket's own receive window carries the pressure to the peer; only a
+// read that can never fit is refused, since waiting would park forever.
 func (n *netHost) reserveInboundRead(length int) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -333,18 +334,21 @@ func (n *netHost) wrapInbound(id int64, conn net.Conn) (*sockChannel, func()) {
 // goroutine, which owns all QuickJS access.
 func (n *netHost) onMsg(id int64) func([]byte) bool {
 	return func(b []byte) bool {
-		// The readLoop's buffer is borrowed and reused. Reserve BEFORE copying it, and on
-		// a read that can never fit leave nothing allocated and nothing posted.
+		// Reserve BEFORE posting, and on a read that can never fit leave nothing allocated
+		// and nothing posted.
 		if !n.reserveInboundRead(len(b)) {
 			return false
 		}
-		owned := append([]byte(nil), b...)
+		// The readLoop's buffer is BORROWED rather than copied: this channel's one read
+		// token is spent until the task below has run, so the next read cannot begin — let
+		// alone overwrite it — before NewArrayBuffer has copied it into the engine
+		// (net.go readLoop, TestSockChannelReadBackpressure).
 		n.el.post(func() {
-			// NewArrayBuffer copies into QuickJS, whose synchronous __netDeliver then enters
+			// That copy lands in QuickJS, whose synchronous __netDeliver then enters
 			// TransportHost's existing allowance. Release native staging custody only after
 			// that handoff returns, including when the JS dispatcher rejects or throws.
-			defer n.releaseInboundRead(len(owned))
-			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(owned))
+			defer n.releaseInboundRead(len(b))
+			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
 		})
 		return true
 	}

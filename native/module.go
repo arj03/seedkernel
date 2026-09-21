@@ -354,12 +354,15 @@ func installModuleBridge(qc *qjs.Context, b *qjs.Value) {
 		return qc.NewNull(), nil
 	}))
 	b.SetPropertyStr("callModule", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		pl, err := args[2].Bytes()
+		slot, module := args[0].String(), args[1].String()
+		deadline := time.Duration(args[3].Int64()) * time.Millisecond
+		// BORROWED last: callModule writes it into the module's own memory, which is not
+		// this engine's, and nothing re-enters this one in between (qjs.Value.View).
+		pl, err := args[2].View()
 		if err != nil {
 			return qc.NewNull(), nil
 		}
-		deadline := time.Duration(args[3].Int64()) * time.Millisecond
-		resp := callModule(args[0].String(), args[1].String(), pl, deadline)
+		resp := callModule(slot, module, pl, deadline)
 		if resp == nil {
 			return qc.NewNull(), nil
 		}

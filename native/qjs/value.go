@@ -201,6 +201,31 @@ func (v *Value) Bytes() ([]byte, error) {
 	return out, nil
 }
 
+// View BORROWS the bytes of an ArrayBuffer or a TypedArray: the engine's own storage,
+// with nothing copied. It is valid only until this Value's runtime next runs — any call
+// into that engine may grow its wasm memory, after which the window describes a buffer
+// the engine has moved on from — so a caller must read EVERY other argument first, take
+// the view last, and consume it before returning to the engine.
+//
+// What consuming it means: handing the bytes to something OUTSIDE this runtime — the
+// other realm's engine, a wazero module's memory, a hash, a file — which copies or
+// finishes with them in the same breath. Anything that outlives that window, such as a
+// slice queued for another goroutine, takes Bytes() instead.
+func (v *Value) View() ([]byte, error) {
+	addr, size, ok := v.window()
+	if !ok {
+		return nil, notBytes(v.c)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	buf, ok := v.c.rt.mem.Read(addr, size)
+	if !ok {
+		return nil, errors.New("qjs: byte window outside wasm memory")
+	}
+	return buf, nil
+}
+
 // ByteLength answers the width Bytes would copy, without copying it: resource gates admit
 // against it before the copy.
 func (v *Value) ByteLength() (int64, error) {

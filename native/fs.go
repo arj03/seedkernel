@@ -245,11 +245,15 @@ func exposeFs(qc *qjs.Context) {
 		return qc.NewArrayBuffer(b), nil
 	}))
 	o.SetPropertyStr("put", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		b, err := args[1].Bytes()
+		// The key first: the bytes are BORROWED, and reading a string allocates in this
+		// engine, which would leave the window describing a buffer it has moved on from
+		// (qjs.Value.View). The store writes them out before returning.
+		key := args[0].String()
+		b, err := args[1].View()
 		if err != nil {
 			return nil, err // non-bytes arg throws, like NodeFs — not a silent empty write
 		}
-		if err := fs.put(args[0].String(), b); err != nil {
+		if err := fs.put(key, b); err != nil {
 			return nil, err // surfaces as a JS exception, like NodeFs writeFileSync
 		}
 		return qc.NewUndefined(), nil

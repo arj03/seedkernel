@@ -142,13 +142,16 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewArrayBuffer(fb), nil
 	}))
 	b.SetPropertyStr("writeFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		bytes, err := args[1].Bytes()
+		// Path and mode first, bytes BORROWED last: the write consumes them before this
+		// engine runs again (qjs.Value.View).
+		path, mode := args[0].String(), os.FileMode(args[2].Int64())
+		bytes, err := args[1].View()
 		if err != nil {
 			return nil, err
 		}
 		// Atomic for every caller: a truncated freshness file must never replace the last
 		// readable guard state (and is refused on read if one exists out of band).
-		if err := writeFileAtomic(args[0].String(), bytes, ".seedkernel-", os.FileMode(args[2].Int64())); err != nil {
+		if err := writeFileAtomic(path, bytes, ".seedkernel-", mode); err != nil {
 			return nil, err
 		}
 		return qc.NewUndefined(), nil
@@ -160,7 +163,7 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewUndefined(), nil
 	}))
 	b.SetPropertyStr("stdout", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		bytes, err := args[0].Bytes()
+		bytes, err := args[0].View()
 		if err != nil {
 			return nil, err
 		}

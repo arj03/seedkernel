@@ -13,6 +13,15 @@ import type { HostCall } from "./guest-seam.js";
  *  tell its own teardown from a failure worth logging. */
 export const REALM_DISPOSED = "guest realm disposed";
 
+/** The two ways a host call ends on the clock rather than on an answer, said the same way
+ *  by every realm factory: SPENT is a call the caller had no time left to make — thrown at
+ *  the guest's call site, since the name was never issued — and LATE is one the handoff
+ *  deadline overtook, which arrives as an ordinary rejection (`raceDeadline`). Constants
+ *  for the reason REALM_DISPOSED is one: two targets, one contract, and a message that
+ *  drifted would describe the same refusal two ways. */
+export const HOST_CALL_SPENT = "guest: handoff deadline exhausted before host.call";
+export const HOST_CALL_LATE = "guest: host.call handoff deadline exceeded";
+
 /** One entrypoint invocation. Settling `result` normally releases the realm for the next
  *  one; a DEFERRED entrypoint (`__deferred`) ended its execution segment before its answer
  *  exists, so it releases the realm at once and answers under the same deadline later. */

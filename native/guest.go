@@ -66,12 +66,10 @@ type guestRealm struct {
 	jobsPending bool
 
 	// Host-side calls parked for this realm (hostcalls.go). This is the authoritative
-	// native registry: it rejects before the guest-to-Go payload copy and retains custody
-	// through delivery.
-	hostCalls hostCallLedger
-	// Each parked host call retains its invocation's accounting record. Several
+	// native registry: it rejects before the payload reaches the host realm, retains
+	// custody through delivery, and holds each parked call's invocation record — several
 	// calls from one invocation share its spend, including after another entry.
-	hostCallBudgets map[int64]*invocationClock
+	hostCalls hostCallLedger
 }
 
 // invocationClock is one entrypoint invocation's execution budget. A deferred invocation
@@ -122,12 +120,14 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if g == nil {
 			return nil, fmt.Errorf("realmCall: no such realm")
 		}
-		payload, err := args[1].Bytes()
+		callID := args[2].Int64()
+		deadlineMs := args[5].Int64()
+		// Read LAST and consumed inside `call`, where it crosses into the guest engine —
+		// this realm's own is the one that must not run meanwhile (qjs.Value.View).
+		payload, err := args[1].View()
 		if err != nil {
 			return nil, err
 		}
-		callID := args[2].Int64()
-		deadlineMs := args[5].Int64()
 		deferred, elapsed := g.call(callID, payload, args[3], args[4], deadlineMs)
 		// Two facts, one number, because this is the dispatch path and an object would cost
 		// an allocation and two interned property writes per invocation. Nanoseconds, not
@@ -158,26 +158,29 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 			return qc.NewInt64(0), nil
 		}
 		callID := args[1].Int64()
-		if !g.hostCalls.has(callID) {
+		if _, live := g.hostCalls.at(callID); !live {
 			return qc.NewInt64(0), nil
 		}
 		// A detached call's answer is a new turn (host/guest-seam.ts `CallBudget.detach`).
 		detached := args[4].Int64() == 1
+		// The answer, however it ends: the bytes to resolve with, or the message to reject
+		// with — one settlement either way, so a refusal below reads as the answer it is.
+		// The result is BORROWED last, after every other engine read, and crosses into the
+		// guest engine inside settleHostCall (qjs.Value.View).
+		var bytes []byte
+		var msg string
 		if args[2].IsNull() || args[2].IsUndefined() {
-			return qc.NewInt64(g.settleHostCall(callID, nil, args[3].String(), detached).Nanoseconds()), nil
+			msg = args[3].String()
+		} else if width, err := args[2].ByteLength(); err != nil {
+			msg = "host call result not bytes"
+		} else if err := g.hostCalls.reserve(callID, width); err != nil {
+			msg = err.Error()
+		} else if view, err := args[2].View(); err != nil {
+			msg = "host call result not bytes"
+		} else {
+			bytes = view
 		}
-		resultBytes, err := args[2].ByteLength()
-		if err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes", detached).Nanoseconds()), nil
-		}
-		if err := g.hostCalls.reserve(callID, resultBytes); err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, err.Error(), detached).Nanoseconds()), nil
-		}
-		bytes, err := args[2].Bytes()
-		if err != nil {
-			return qc.NewInt64(g.settleHostCall(callID, nil, "host call result not bytes", detached).Nanoseconds()), nil
-		}
-		return qc.NewInt64(g.settleHostCall(callID, bytes, "", detached).Nanoseconds()), nil
+		return qc.NewInt64(g.settleHostCall(callID, bytes, msg, detached).Nanoseconds()), nil
 	}))
 	b.SetPropertyStr("realmDispose", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		id := args[0].Int64()
@@ -207,7 +210,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		hostCalls: newHostCallLedger(maxHostCalls, maxHostCallBytes),
 		budget:    budget, invocationClock: &invocationClock{invocationBudget: budget},
-		hostCallBudgets: map[int64]*invocationClock{},
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -224,23 +226,27 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		name := args[0].String()
 		callID := args[1].Int64()
-		// Asking the source its width is an engine query, not the copy; admit id, count
-		// and that width together before the copy itself (hostcalls.go). No JS runs
-		// between the two reads, so the copy is exactly the width admitted.
+		// Asking the source its width is an engine query, not the copy; admit id, count,
+		// that width and the clock the answer resumes on together, before the copy itself
+		// (hostcalls.go). No JS runs between the two reads, so the copy is exactly the
+		// width admitted, and none runs before the clock is recorded either.
 		payloadBytes, err := args[2].ByteLength()
 		if err != nil {
 			return nil, err
 		}
-		if err := g.hostCalls.admit(callID, payloadBytes); err != nil {
+		if err := g.hostCalls.admit(callID, payloadBytes, g.invocationClock); err != nil {
 			return nil, err
 		}
-		payload, err := args[2].Bytes()
+		// BORROWED from the guest engine and handed straight to the host's, which is a
+		// runtime of its own: nothing re-enters this one in between, so the bytes are
+		// copied once rather than through a Go slice on the way (qjs.Value.View).
+		payload, err := args[2].View()
 		if err != nil {
 			g.hostCalls.release(callID)
 			return nil, err
 		}
-		// The admitted custody follows the payload through the synchronous Go-to-host-realm
-		// handoff. It stays charged to this call after the shuttle slice leaves scope.
+		// The admitted custody follows the payload through the synchronous handoff. It
+		// stays charged to this call after the borrowed window closes.
 		// nv and pv are the refcounted args (callID is an immediate) and Invoke only
 		// borrows them, so both are freed once the call returns.
 		nv := hostQc.NewString(name)
@@ -261,7 +267,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 			return nil, err
 		}
 		res.Free() // always the JS_NULL immediate: the call parked
-		g.hostCallBudgets[callID] = g.invocationClock
 		// The settlement arrives as a HOST-realm microtask after pumpAll already drained
 		// el.c this round, and a holder answering from local fs generates no I/O of its
 		// own — so without a nudge nothing wakes the loop.
@@ -277,7 +282,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 			return nil, nil
 		}
 		defer c.free()
-		out, err := args[1].Bytes()
+		out, err := args[1].View()
 		if err != nil {
 			g.reportCall(c.onFail, hostQc.NewString("guest: entrypoint result is not bytes"))
 			return nil, nil
@@ -346,17 +351,19 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 func (g *guestRealm) call(id int64, payload []byte, onDone, onFail *qjs.Value, deadlineMs int64) (bool, time.Duration) {
 	// Neither refusal below retains the callback past the report, so both pass it BORROWED:
 	// a Dup here would be a reference nothing is left to release.
-	if err := g.checkAlive(); err != nil {
+	if !g.alive() {
 		// Settle in the HOST realm, which is a different runtime and still alive.
-		g.reportCall(onFail, g.hostQc.NewString(err.Error()))
+		g.reportCall(onFail, g.hostQc.NewString(realmClosed))
 		return false, 0
 	}
 	if _, duplicate := g.calls[id]; duplicate {
 		g.reportCall(onFail, g.hostQc.NewString("guest: duplicate live realm invocation id"))
 		return false, 0
 	}
-	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
+	// The payload is a window into the HOST engine (realmCall), so it is copied into the
+	// guest's before the Dup()s below re-enter the host's (qjs.Value.View).
 	argV := g.qc.NewArrayBuffer(payload)
+	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
 	g.invocationClock = &invocationClock{id: id, invocationBudget: g.budget}
 	if deadlineMs >= 0 {
 		remaining := time.Duration(deadlineMs) * time.Millisecond
@@ -498,26 +505,25 @@ func (g *guestRealm) pump() {
 	g.jobsPending = false
 }
 
-// checkAlive refuses a realm close() or discard() already tore down. Callers must ask
-// BEFORE allocating in the guest runtime: NewString/NewArrayBuffer on a freed runtime
-// panics, so a check inside within() would come one allocation too late.
-func (g *guestRealm) checkAlive() error {
-	if g.rt == nil {
-		return errors.New("guest realm closed")
-	}
-	return nil
-}
+// realmClosed is what a realm close() or discard() already tore down answers its callers,
+// and what settleAll fails the calls it strands with.
+const realmClosed = "guest realm closed"
+
+// alive reports whether the guest runtime is still standing. Callers must ask BEFORE
+// allocating in it: NewString/NewArrayBuffer on a freed runtime panics, so a check inside
+// within() would come one allocation too late.
+func (g *guestRealm) alive() bool { return g.rt != nil }
 
 // settleHostCall resolves or rejects the guest Promise parked under callID when the host
 // realm's seam promise settles (`bytes` fulfils, `msg` rejects), then drains the awaiting
 // continuation before returning its execution time to the bridge.
 func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, detached bool) time.Duration {
-	if !g.hostCalls.has(callID) {
+	parked, live := g.hostCalls.at(callID)
+	if !live {
 		return 0
 	}
 	defer g.hostCalls.release(callID)
-	defer delete(g.hostCallBudgets, callID)
-	if g.checkAlive() != nil {
+	if !g.alive() {
 		return 0 // the realm the continuation belonged to no longer exists
 	}
 	// Restore the original absolute deadline and accumulated spend before either
@@ -527,7 +533,7 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, deta
 	if detached {
 		g.invocationClock = g.turnClock()
 	} else {
-		g.invocationClock = g.hostCallBudgets[callID]
+		g.invocationClock = parked.clock
 	}
 	before := g.consumed
 	var res *qjs.Value
@@ -555,7 +561,7 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, deta
 		// coming — but the realm must NOT end. An overrun is already an ordinary error
 		// (see within), and anything else is a fault contained to one guest's
 		// `__resolveHostCall`; killing the realm would brick it until the bundle reloads.
-		if g.checkAlive() == nil {
+		if g.alive() {
 			g.failInvocation(fmt.Sprintf("guest realm failed delivering a host call result: %v", err))
 		}
 	}
@@ -618,9 +624,8 @@ func (g *guestRealm) close() {
 		return
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
-	g.settleAll("guest realm closed")
+	g.settleAll(realmClosed)
 	g.hostCalls.releaseAll() // the custody every parked call holds ends here (hostcalls.go)
-	clear(g.hostCallBudgets)
 	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil
