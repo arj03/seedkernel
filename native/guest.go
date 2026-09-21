@@ -157,10 +157,9 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if g == nil {
 			return qc.NewInt64(0), nil
 		}
+		// Whether the call is still parked is settleHostCall's lookup to make — the one on
+		// this path — and `reserve` below refuses a dead id on its own account.
 		callID := args[1].Int64()
-		if _, live := g.hostCalls.at(callID); !live {
-			return qc.NewInt64(0), nil
-		}
 		// A detached call's answer is a new turn (host/guest-seam.ts `CallBudget.detach`).
 		detached := args[4].Int64() == 1
 		// The answer, however it ends: the bytes to resolve with, or the message to reject

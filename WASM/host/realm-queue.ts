@@ -111,6 +111,13 @@ export interface Deadline {
   expire(): void;
 }
 
+/** One tier's queue: what a realm arms against, and what disposal ends. */
+export interface DeadlineQueue {
+  add(deadline: Deadline): void;
+  drop(deadline: Deadline): void;
+  disarmAll(): void;
+}
+
 /** The deadlines a realm has armed for work it has not settled, sharing one physical timer
  *  — the wall-clock half of the custody the active-call registry keeps in bytes (§12.3).
  *  Unsorted: the scan for the earliest runs when the timer fires, never on the call path.
@@ -124,11 +131,7 @@ export interface Deadline {
  *  invocation, so it is always a hair earlier and would jostle the wake the outer deadline
  *  waits on. That one then fires late by the host timer clock's coarseness and loses the
  *  race against the guest budget derived from it, which is what it exists to backstop. */
-export function createDeadlineQueue(): {
-  add(deadline: Deadline): void;
-  drop(deadline: Deadline): void;
-  disarmAll(): void;
-} {
+export function createDeadlineQueue(): DeadlineQueue {
   const pending = new Set<Deadline>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timerAt = Infinity;
@@ -178,6 +181,21 @@ export function createDeadlineQueue(): {
       clear();
       pending.clear();
     },
+  };
+}
+
+/** The two queues one realm arms, and the teardown that ends both. Every realm factory
+ *  builds this pair and every path that ends a realm — a guest that fails while loading,
+ *  dispose — must disarm both of them, so the pair is one value here rather than two
+ *  locals and the same comment in each factory. One per tier still: nothing merges them.
+ */
+export function createRealmDeadlines(): { hostCall: DeadlineQueue; entry: DeadlineQueue; disarmAll(): void } {
+  const hostCall = createDeadlineQueue();
+  const entry = createDeadlineQueue();
+  return {
+    hostCall,
+    entry,
+    disarmAll(): void { hostCall.disarmAll(); entry.disarmAll(); },
   };
 }
 

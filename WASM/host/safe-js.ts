@@ -33,7 +33,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__start` / `__host_call` contract this file implements.
 import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
-  CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls,
+  CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls,
   HOST_CALL_LATE, REALM_DISPOSED,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
@@ -221,10 +221,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
   // The wall-clock half of the same custody (§12.3): one wake for the host calls this realm
-  // has not answered, one for the invocations waiting to enter it — never merged, and both
-  // disarmed with the realm (realm-queue.ts).
-  const hostCallDeadlines = createDeadlineQueue();
-  const entryDeadlines = createDeadlineQueue();
+  // has not answered, one for the invocations waiting to enter it (realm-queue.ts).
+  const deadlines = createRealmDeadlines();
 
   // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
   // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
@@ -356,33 +354,36 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       activeHostCalls.release(callId);
       throw err;
     }
+    // The answer, however it ends: the bytes to resolve with, or the failure to reject
+    // with — one settlement either way, so a refused copy reads as the failure it is, and
+    // custody ends once. The shape native-shim.ts settles by, spelled the same here.
+    const settle = (bytes: Uint8Array | null, error: unknown): void => {
+      try {
+        let failure = error;
+        if (bytes !== null) {
+          try {
+            if (disposed || !ctx.alive) return;
+            // Request and response coexist while copying the result into the guest. Reserve
+            // that overlap and keep the call live through guest-side settlement.
+            activeHostCalls.reserve(callId, bytes.byteLength);
+            settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), budget, made);
+            return;
+          } catch (err) {
+            failure = err;
+          }
+        }
+        if (!disposed && ctx.alive) {
+          settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(failure)), budget, made);
+        }
+      } finally {
+        activeHostCalls.release(callId);
+      }
+    };
     // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
     // its own: the arms below are the only ones, for a backend answer and a late one alike.
-    void raceDeadline(hostCallDeadlines, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE).then(
-      (bytes) => {
-        try {
-          if (disposed || !ctx.alive) return;
-          // Request and response coexist while copying the result into the guest. Reserve
-          // that overlap and keep the call live through guest-side settlement.
-          activeHostCalls.reserve(callId, bytes.byteLength);
-          settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), budget, made);
-        } catch (err) {
-          if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), budget, made);
-          }
-        } finally {
-          activeHostCalls.release(callId);
-        }
-      },
-      (err: unknown) => {
-        try {
-          if (!disposed && ctx.alive) {
-            settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(err)), budget, made);
-          }
-        } finally {
-          activeHostCalls.release(callId);
-        }
-      },
+    void raceDeadline(deadlines.hostCall, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE).then(
+      (bytes: Uint8Array) => settle(bytes, null),
+      (err: unknown) => settle(null, err),
     );
     return ctx.null;
   });
@@ -421,8 +422,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // consume those answers and no handle survives to release them later.
     disposed = true;
     activeHostCalls.releaseAll();
-    hostCallDeadlines.disarmAll();
-    entryDeadlines.disarmAll();
+    deadlines.disarmAll();
     disposePhantoms();
     try {
       if (ctx.alive) ctx.dispose();
@@ -480,7 +480,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   };
 
   return {
-    call: serializeCalls(entryDeadlines, invoke, () =>
+    call: serializeCalls(deadlines.entry, invoke, () =>
       (disposed || !ctx.alive) ? new Error(REALM_DISPOSED) : null,
     opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS, opts.ownTurns),
     dispose(): void {
@@ -495,8 +495,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       // allowance on one unanswering backend forever (`ActiveHostCalls` above).
       // Their armed deadlines go with them (`disarmAll`).
       activeHostCalls.releaseAll();
-      hostCallDeadlines.disarmAll();
-      entryDeadlines.disarmAll();
+      deadlines.disarmAll();
       // Then the engine, context before runtime. `JS_FreeRuntime` asserts an empty GC object
       // list, so one live handle would abort the whole wasm module and every realm with it;
       // `start` is the only one held between calls, since answers cross as bytes.

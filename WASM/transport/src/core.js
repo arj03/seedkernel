@@ -170,11 +170,11 @@ class LinkLimiter {
   constructor(maxUnverified, maxPerSource, maxVerified, maxAuthed) {
     this.maxPerSource = maxPerSource;
     this.max = { unverified: maxUnverified, verified: maxVerified, authed: maxAuthed };
-    this.count = { unverified: 0, verified: 0, authed: 0 };
-    // One book per tier; book order is the eviction policy. A slot carries the id it
-    // was booked under, so leaving a tier is a delete rather than a scan for itself — the
-    // scan was O(n) per move, which is O(n²) across filling and promoting a full tier, and
-    // unauthenticated inbound connections are what drive it.
+    // One book per tier, whose SIZE is that tier's occupancy; book order is the eviction
+    // policy. A slot carries the id it was booked under, so leaving a tier is a delete
+    // rather than a scan for itself — the scan was O(n) per move, which is O(n²) across
+    // filling and promoting a full tier, and unauthenticated inbound connections are what
+    // drive it.
     this.books = { unverified: new Map(), verified: new Map(), authed: new Map() };
     this.nextId = 0;
     this.perSource = new Map();
@@ -185,7 +185,6 @@ class LinkLimiter {
     if (!this.makeRoom("unverified")) return null;
     const slot = { source, tier: "unverified", released: false, evict, limiter: this, bookId: this.nextId++ };
     if (source !== undefined) this.perSource.set(source, (this.perSource.get(source) || 0) + 1);
-    this.count.unverified++;
     this.books.unverified.set(slot.bookId, slot);
     return slot;
   }
@@ -212,9 +211,7 @@ class LinkLimiter {
     if (slot.released || slot.tier === tier) return true;
     if (!this.makeRoom(tier)) return false;
     this.unbook(slot);
-    if (this.count[slot.tier] > 0) this.count[slot.tier]--;
     slot.tier = tier;
-    this.count[tier]++;
     slot.bookId = this.nextId++;
     this.books[tier].set(slot.bookId, slot);
     return true;
@@ -223,34 +220,28 @@ class LinkLimiter {
   /** Make one slot's worth of room in a tier, evicting its stalest occupant if it is
    *  full. False only when the tier's budget is zero — nothing to evict and no room. */
   makeRoom(tier) {
-    if (this.count[tier] < this.max[tier]) return true;
-    const oldest = this.books[tier].keys().next();
-    if (oldest.done) return false;
-    const victim = this.books[tier].get(oldest.value);
-    this.books[tier].delete(oldest.value);
-    this.forget(victim);
+    const book = this.books[tier];
+    if (book.size < this.max[tier]) return true;
+    const victim = book.values().next().value;
+    if (victim === undefined) return false;
+    this.release(victim);
     try { victim.evict(); } catch { /* already gone */ }
     return true;
   }
 
+  /** Out of its tier and off its source's tally, for good: a slot never returns. */
   release(slot) {
     if (slot.released) return;
     this.unbook(slot);
-    this.forget(slot);
-  }
-
-  unbook(slot) {
-    this.books[slot.tier].delete(slot.bookId);
-  }
-
-  forget(slot) {
-    if (slot.released) return;
     slot.released = true;
-    if (this.count[slot.tier] > 0) this.count[slot.tier]--;
     if (slot.source === undefined) return;
     const n = this.perSource.get(slot.source);
     if (n === undefined) return;
     if (n <= 1) this.perSource.delete(slot.source); else this.perSource.set(slot.source, n - 1);
+  }
+
+  unbook(slot) {
+    this.books[slot.tier].delete(slot.bookId);
   }
 }
 

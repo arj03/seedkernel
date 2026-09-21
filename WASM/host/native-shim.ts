@@ -8,7 +8,7 @@ import { type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
-import { CausalContext, createDeadlineQueue, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
 import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import {
@@ -340,10 +340,8 @@ const channels: ChannelFactory = {
  *  mechanism safe-js.ts uses, so an overrun throws inside the guest and the realm survives. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs, ownTurns }) => {
   // This realm's wall-clock custody (§12.3): one wake for the host calls it has not
-  // answered, one for the invocations waiting to enter it — never merged, and both
-  // disarmed with the realm (realm-queue.ts).
-  const hostCallDeadlines = createDeadlineQueue();
-  const entryDeadlines = createDeadlineQueue();
+  // answered, one for the invocations waiting to enter it (realm-queue.ts).
+  const deadlines = createRealmDeadlines();
   // Go mints the handle, but createRealm runs the guest's top-level code before returning
   // it — so a host.call made from there reaches `nativeCall` while this is still 0. Safe
   // because settlement is a HOST-realm microtask, and that realm is not pumped from
@@ -371,7 +369,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         const elapsedNs = bridge.realmSettle(realm, callId, bytes, error, budget.detached ? 1 : 0);
         causalClock?.charge(elapsedNs / 1_000_000);
       });
-    void raceDeadline(hostCallDeadlines, budget.remainingMs, answer, HOST_CALL_LATE).then(
+    void raceDeadline(deadlines.hostCall, budget.remainingMs, answer, HOST_CALL_LATE).then(
       (bytes: Uint8Array) => settle(bytes, null),
       (e: unknown) => settle(null, errMessage(e)),
     );
@@ -384,8 +382,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
   } catch (err) {
     // A guest may have parked host calls before its top-level source failed. No Realm handle
     // will be returned to own their wakeups, so construction itself must end that custody.
-    hostCallDeadlines.disarmAll();
-    entryDeadlines.disarmAll();
+    deadlines.disarmAll();
     throw err;
   }
   const configuredDeadlineMs = deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
@@ -396,7 +393,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // contract (realm-queue.ts) is what keeps the two targets from differing about
     // when a second entrypoint may begin.
     call: serializeCalls(
-      entryDeadlines,
+      deadlines.entry,
       (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
         // The executor runs synchronously, so `deferred` carries Go's answer by
         // the time the return statement reads it.
@@ -437,8 +434,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
       // still owns is rejected synchronously here — safe-js.ts needs its own registry for
       // this, and this target does not (§12.3). The armed deadlines are host-side and do
       // NOT go with it, so disarm them here (realm-queue.ts `disarmAll`).
-      hostCallDeadlines.disarmAll();
-      entryDeadlines.disarmAll();
+      deadlines.disarmAll();
       bridge.realmDispose(realm);
     },
   };
