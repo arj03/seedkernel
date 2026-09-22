@@ -164,9 +164,8 @@ export function harnessAppBlob(author, mode = "echo") {
     modules: [],
     guestSource: HARNESS_GUEST,
     // The whole of what an app needs to talk to the network: the id the transport claims.
-    // A local call graph edge, so `calls`; this app holds no host service at all.
-    guestRequires: [],
-    guestCalls: [TRANSPORT_SERVICE],
+    // A local service id; this app holds no host service at all.
+    guestRequires: [TRANSPORT_SERVICE],
     guestConfig: { mode },
   });
   return blob;

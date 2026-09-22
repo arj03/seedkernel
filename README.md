@@ -38,7 +38,7 @@ The model has two parts, a host and the bundles it admits:
 | Component | Role |
 | --- | --- |
 | **Host** | The runtime outside installed bundles: shared JS plus platform adapters, deployed as one artifact per target (§12.9). It verifies and admits bundles, builds their private slots, confines execution through its sandbox engines, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
-| ↳ **Host services** | What a confined app cannot obtain for itself: `node` (signing with the node's private key, entropy), `fs` (storage), `clock`, `timer` and `link` (sockets) — the `HOST_SERVICES` set (§12.2). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold (§12.1). A guest reaches only the services its signed manifest declares. |
+| ↳ **Host services** | What a confined app cannot obtain for itself: `node` (signing with the node's private key), `fs` (storage), `timer` and `link` (sockets) — the `HOST_SERVICES` set (§12.2). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold (§12.1). A guest reaches only the services its signed manifest declares. |
 | **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. The transport uses this same format. |
 | ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
 | ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no host imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
@@ -103,8 +103,8 @@ The application and transport are both bundles. The host runs them in separate s
 +------------------------------------------------------+
 | Host                                                 |
 | Admission, confinement, guest calls and routing      |
-| Host services: raw I/O, storage, entropy, time and   |
-| signing, each within its resource limits             |
+| Host services: raw I/O, storage, wakes and signing,  |
+| each within its resource limits                      |
 +------------------------------------------------------+
 ```
 
@@ -114,16 +114,16 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,343 LOC)**
+**Shared — compiled once, run by all three targets (2,340 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 465 |
+| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 463 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 329 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 642 |
-| Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 369 |
+| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 640 |
+| Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 367 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 196 |
-| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 342 |
+| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 345 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
@@ -134,13 +134,13 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,471 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (296) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,240 Go + 363 TS |
 
-The transport bundle sits outside these host totals: 1,456 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
+The transport bundle sits outside these host totals: 1,469 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 
 ## The overhead, measured
 
-The [seed store](https://github.com/arj03/seedstore) measurements below describe specific workloads, not a general throughput guarantee. Native deadline checks measured 1.07–1.21× execution time on the tested transforms; JS module calls added a worker hop of ~30 µs for small calls and ~160 µs for a 64 KiB transfer both ways (§14). That fixed hop can dominate small transforms; larger calls amortize it, and transfer rate and latency dominated the network configurations measured below:
+The [seed store](https://github.com/arj03/seedstore) measurements below describe specific workloads, not a general throughput guarantee. Native deadline checks measured 1.07–1.21× execution time on the tested transforms; JS module calls added a worker hop of ~25 µs for small calls and ~110 µs for a 64 KiB transfer both ways (§14). That fixed hop can dominate small transforms; larger calls amortize it, and transfer rate and latency dominated the network configurations measured below:
 
 - **The compute-only write pipeline — encrypt, name every block, RS-encode — measured 177–189 MiB/s** in three runs on 2026-09-17 (100 MiB, RS(10,6), 64 KiB blocks, Node 20.11.1). ChaCha20-Poly1305 sealing measured 393–395 MiB/s, author-bound BLAKE2b block IDs 720–733 MiB/s, and SIMD RS encode 1,447–1,482 MiB/s. This benchmark calls host crypto and the codec directly; it does not measure guest scheduling, signing, storage, or transport overhead.
 - **A read with every block present needs no GF(2⁸) work:** the compute benchmark's concatenation measured 2,339–2,926 MiB/s; reconstructing one missing block measured 1,465–1,682 MiB/s in those runs. These are component measurements, not complete GET rates.

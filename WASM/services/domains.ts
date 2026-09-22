@@ -24,20 +24,25 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  host itself already carries and calls the same implementation — which is why this list
  *  is at its floor rather than shrinking: dropping a name duplicates code the artifact
  *  already ships, and a module cannot borrow the host's copy without exporting the linear
- *  memory the node key lives in (docs/SECURITY.md). */
+ *  memory the node key lives in (docs/SECURITY.md). `random` is the host's entropy source:
+ *  ungated like the rest, because random bytes reach nothing and a guest needing a nonce
+ *  should not have to be granted the node key to get one. */
 export const HOST_TRANSFORM_NAMES = [
   "blake2b-256",
   "chacha20poly1305-ietf/seal",
   "chacha20poly1305-ietf/open",
   "x25519/dh",
+  "random",
 ] as const;
 
 export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
-/** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant. */
+/** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant.
+ *  Only what a confined realm cannot reach for itself: the node key, disk, its wake and
+ *  sockets. Time is not here — every realm already reads `Date.now()` and
+ *  `performance.now()` as ECMAScript intrinsics — and neither is entropy (`crypto/random`). */
 export const HOST_SERVICES = {
-  node: { calls: ["sign", "verify", "random"] },
+  node: { calls: ["sign", "verify"] },
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
-  clock: { calls: ["now"] },
   timer: { calls: ["arm", "clear"] },
   link: {
     calls: ["open", "send", "close", "deliver"],
@@ -61,6 +66,12 @@ export type HostMethod = {
  *  name. An own-property check, never a parse. */
 export function isService(name: string): name is ServiceName {
   return Object.prototype.hasOwnProperty.call(HOST_SERVICES, name);
+}
+/** The host's own `host.call` namespace for the text before a name's first `/`: a service,
+ *  or `crypto`, the ungated transform table. A local service id may not live in one, so a
+ *  declared name never shadows a host name (bundle.ts `validateManifest`). */
+export function isHostNamespace(head: string): boolean {
+  return head === "crypto" || isService(head);
 }
 /** The service a host method belongs to, or null. Split at the FIRST `/` and looked up in
  *  the table — what the seam's gate checks a `host.call` name against (guest-seam.ts). */

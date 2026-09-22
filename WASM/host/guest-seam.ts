@@ -1,9 +1,9 @@
 // guest-seam — `host.call(name, bytes)` (§12.2). Ownership of the three deps:
-//   platform — per node (crypto, identity, clock)
+//   platform — per node (crypto)
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../services/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, type HostTransformName, type HostMethod } from "../services/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, isService, type HostTransformName, type HostMethod } from "../services/domains.js";
 import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, monotonicMs, type CausalClock } from "./realm-queue.js";
@@ -77,8 +77,6 @@ export interface HostTimers {
  *  holds these because it is running on this node at all — so nothing here is gated. */
 export interface SeamPlatform {
   sodium: SeamCrypto;
-  /** Wall clock (ms), defaulted by the shell before constructing a seam. */
-  now: () => number;
 }
 
 /** Per-REALM: exactly what THIS realm may reach — the names it may utter, the scope its
@@ -89,15 +87,12 @@ export interface SeamPlatform {
  *  an undeclared name a refusal by name rather than a null backend surfacing later as a
  *  confusing failure. */
 export interface SeamGrants {
-  /** EXACTLY the manifest's declared `guest.requires` (§12.2) — the host SERVICES this
-   *  realm is granted, as signed. A `host.call` naming a host method is refused unless the
-   *  method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
-   *  declared local service pass regardless. */
+  /** EXACTLY the manifest's declared `guest.requires` (§12.2), as signed: host SERVICES
+   *  and local service ids in one list, told apart by `isService`. A `host.call` naming a
+   *  host method is refused unless the method's SERVICE (`serviceOf`) is a member; a local
+   *  id routes to its claimant (§12.10) whatever its spelling; `crypto/*` and a bare module
+   *  name pass regardless. */
   names: Iterable<string>;
-  /** EXACTLY the manifest's declared `guest.calls` (§12.10) — the local service ids this
-   *  realm may reach on a co-resident guest, as signed. Each routes to its claimant
-   *  whatever its spelling; absent ≡ none. */
-  localServices?: ReadonlySet<string>;
   /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
    *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ app`, the link
    *  slot gets `DOMAIN_link_scope`. The host always chooses
@@ -113,7 +108,7 @@ export interface SeamGrants {
   rawNet?: RawNet;
   /** The platform's event loop. `names` decides whether this realm may reach it. */
   timers: HostTimers;
-  /** The cross-realm call: how a name in `localServices` is answered. Wired for every
+  /** The cross-realm call: how a local service id in `names` is answered. Wired for every
    *  realm — reaching one is a grant like any other, and the signed list above decides who
    *  holds it. */
   calls: SeamCalls;
@@ -210,7 +205,7 @@ type CryptoName = `crypto/${HostTransformName}`;
 type HandlerKey = HostMethod | CryptoName;
 
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
- *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
+ *  may answer inline (every crypto name, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
 type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
@@ -218,6 +213,12 @@ type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Pro
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
     "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
+    // [n u32] -> n bytes of host entropy.
+    "crypto/random": (a) => {
+      const n = readU32BE(a, 0);
+      if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: crypto/random size over cap");
+      return sodium.randombytes_buf(n);
+    },
     // `subarray`, not `slice`: every primitive below reads its arguments into its own
     // storage before it returns, so a view is enough — and on the record layer's hot path
     // `slice` copied the whole payload once more on the way in, for nothing.
@@ -411,7 +412,7 @@ export function slotSignScope(node: { identity: Keypair }, app: string, links: b
 
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
 // does not cover host allocations the guest requests, so the seam caps them itself.
-const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
+const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per crypto/random call
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);
@@ -426,7 +427,7 @@ function u64be(value: number): Uint8Array {
 /** The host half of the catalog (§12.2): keys of this table are the host names a
  *  guest may call. `crypto/*` is ungated; everything else is an authority. */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
-  const { sodium, now } = platform;
+  const { sodium } = platform;
   const fs = () => {
     if (!grants.fs) throw new Error("guest-seam: fs.* used but no fs backend wired");
     return grants.fs;
@@ -468,11 +469,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return ZERO;
       }
     },
-    "node/random": (payload) => {
-      const n = readU32BE(payload, 0);
-      if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: node/random size over cap");
-      return sodium.randombytes_buf(n);
-    },
     // ── fs: raw bytes under an opaque key. Every one round-trips, so each returns a
     // Promise the guest awaits — the seam is what is async, not the backend (§12.1).
     "fs/get": (payload) => fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
@@ -505,8 +501,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
       return out;
     }),
     "fs/stat": () => fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
-    // ── clock ─────────────────────────────────────────────────────────────────
-    "clock/now": () => u64be(now()),
     // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` (§12.1).
     // No peer, no protocol id, no correlation: those are the transport's own. Inbound
     // bytes arrive the other way, as ordinary invocations of the transport's `handle`.
@@ -579,8 +573,8 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
   const allowed = new Set(grants.names);
   const handlers = hostCatalog(platform, grants);
   // What this manifest DECLARED, resolved once here: a name is whatever the manifest
-  // declared it as (§12.2), never what its spelling suggests. Install refuses a
-  // `guest.calls` entry that spells a host method or one of this bundle's module names
+  // declared it as (§12.2), never what its spelling suggests. Install refuses a local
+  // service id in a host namespace or spelling one of this bundle's module names
   // (bundle.ts), and a module name cannot contain the `/` every host name does, so the
   // three sources are disjoint and the order below never decides anything.
   //
@@ -604,11 +598,12 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       return bytes;
     }));
   }
-  // Another realm's service, however it is spelled — an id is an ordinary claim and may
-  // carry a `/`. The callee answers on a later turn, never inside this guest's frame; an
+  // Another realm's service: every declared name that is not a host service. An id is an
+  // ordinary claim and may carry a `/`. The callee answers on a later turn, never inside this guest's frame; an
   // id nothing claims is refused by name rather than parked on a promise no one will
   // settle.
-  for (const id of grants.localServices ?? []) {
+  for (const id of allowed) {
+    if (isService(id)) continue;
     declared.set(id, (payload, budget) => {
       const answer = grants.calls.call(id, payload, budget.remainingMs, budget.causalClock);
       if (!answer) throw new Error("guest-seam: no realm claims " + id);
@@ -619,9 +614,9 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     const route = declared.get(name);
     if (route) return route(payload, budget);
     // Everything else is the host table: the lookup IS the dispatch, gated by the
-    // method's SERVICE — an undeclared `node/random` is refused even beside a declared
-    // `node/sign`, because the unit a manifest grants is the SERVICE. `serviceOf` is a
-    // table lookup on the text before the first `/`, never a semantic parse. An unknown
+    // method's SERVICE — declaring `node` grants `node/sign` and `node/verify` together,
+    // because the unit a manifest grants is the SERVICE. `serviceOf` is a table lookup on
+    // the text before the first `/`, never a semantic parse. An unknown
     // name (or a primitive this host does not carry) is refused regardless of the gate.
     const svc = serviceOf(name);
     if (svc && !allowed.has(svc)) {
@@ -630,7 +625,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     const fn = handlers[name];
     if (!fn) throw new Error("guest-seam: no such name " + name);
     // Flattened so the caller reads ONE shape: a handler that answered inline
-    // (every crypto name, clock, link, timer) resolves in a microtask exactly like
+    // (every crypto name, link, timer) resolves in a microtask exactly like
     // a round-tripping one. An inline THROW propagates synchronously, on purpose —
     // see the contract above.
     //

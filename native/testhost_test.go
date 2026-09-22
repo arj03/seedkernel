@@ -313,22 +313,20 @@ func authorsPolicy(ids ...[]byte) string {
 
 // testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience over the
 // shared createGuestSeam, so a test can hand a realm a seam with no signed bundle behind
-// it. Production wires the seam from the admitted manifest's guest.requires and
-// guest.calls (§12.2, §12.10), which is why this lives in a _test file.
+// it. Production wires the seam from the admitted manifest's guest.requires (§12.2,
+// §12.10), which is why this lives in a _test file.
 const testGuestSeamJS = `
 "use strict";
-globalThis.__buildGuestSeam = function (names, calls, scope, localServices) {
+globalThis.__buildGuestSeam = function (names, calls, scope) {
   globalThis.__guestSeam = createGuestSeam({
     // Per NODE.
-    platform: { sodium, now: () => Date.now() },
-    // Per REALM: the granted names straight through — a host call resolves iff the
+    platform: { sodium },
+    // Per REALM: the declared names straight through — a host call resolves iff the
     // name's SERVICE is one of these (or crypto/*, or one of the bundle's own modules
-    // — never grants) — plus the backends behind them.
+    // — never grants), and every other name here is a LOCAL service id (§12.10) — plus
+    // the backends behind them.
     grants: {
       names,
-      // This realm's LOCAL service ids — the manifest's own guest.calls in production
-      // (§12.10). What tells one from a bare module name at the dispatch.
-      localServices: new Set(localServices || []),
       signScope: scope || undefined,
       fs,
       // The routing a local service id resolves through: the shell's, in production.

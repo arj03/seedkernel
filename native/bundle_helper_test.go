@@ -218,17 +218,6 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	return mjson
 }
 
-// isHostService mirrors services/domains.ts HOST_SERVICES, so a fixture's one `requires`
-// argument can be split into the manifest's two signed lists. Restated rather than read out
-// of the realm because it is the fixture's convenience; install refuses a wrong split.
-func isHostService(name string) bool {
-	switch name {
-	case "node", "fs", "clock", "timer", "link":
-		return true
-	}
-	return false
-}
-
 // appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
 // spellings carry no authority (§12.10) and the host ties nothing to one, so a fixture
 // deriving `_net` from a `link` requires would only be borrowing the transport's claim
@@ -254,11 +243,10 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 	type mod struct {
 		Name string `json:"name"`
 	}
-	// requires + calls + config live inside `guest` (§12.4), so "no authority" is an empty
+	// requires + config live inside `guest` (§12.4), so "no authority" is an empty
 	// `requires` list rather than an absent object.
 	type guest struct {
 		Requires []string `json:"requires"`
-		Calls    []string `json:"calls,omitempty"`
 	}
 	manifest := struct {
 		App       string   `json:"app"`
@@ -276,19 +264,7 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		Modules: []mod{{
 			Name: moduleName,
 		}},
-		Guest: guest{},
-	}
-	// One fixture argument, split into the two signed lists by the question install also
-	// asks: is this a host service?
-	for _, r := range requires {
-		if isHostService(r) {
-			manifest.Guest.Requires = append(manifest.Guest.Requires, r)
-		} else {
-			manifest.Guest.Calls = append(manifest.Guest.Calls, r)
-		}
-	}
-	if manifest.Guest.Requires == nil {
-		manifest.Guest.Requires = []string{}
+		Guest: guest{Requires: append([]string{}, requires...)},
 	}
 	mjson, err := json.Marshal(manifest)
 	if err != nil {

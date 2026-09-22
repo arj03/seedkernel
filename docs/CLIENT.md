@@ -112,11 +112,11 @@ Keep a private 32-byte author seed across releases and pass it to `hybridAuthorK
 | --- | --- |
 | A private WASM transform | Add `{ name: "codec", wasm }` to `modules`; call `await host.call("codec", bytes)`. The module exports `memory`, `scratch`, and `handle`, declares a memory maximum, and imports nothing from the host ([ABI §4](PROTOCOL.md#4-the-wasm-module-abi)). |
 | Receive peer requests | Add a claim such as `protocols: ["counter/v1"]`. A networked host routes requests for that protocol to `handle`; your guest validates the payload and decides what the caller may do. |
-| Provide a local service | Add `services: ["counter-local"]`. The host calls it through `shell.call`; another guest also declares it in its own `guestCalls`. |
-| Send through the shipped transport | Add `guestCalls: ["_net"]`, then call `host.call("_net", encodedRequest)` using the transport's message format. The host must have configured and admitted the transport (§2). |
+| Provide a local service | Add `services: ["counter-local"]`. The host calls it through `shell.call`; another guest also declares it in its own `guestRequires`. |
+| Send through the shipped transport | Add `"_net"` to `guestRequires`, then call `host.call("_net", encodedRequest)` using the transport's message format. The host must have configured and admitted the transport (§2). |
 | Use app-scoped storage | Add `guestRequires: ["fs"]`, then use the `fs/*` byte formats in [RUNTIME §12.2](RUNTIME.md). Durable storage requires a persistent host backend. |
 
-`guestRequires` names host **services**, such as `fs`, rather than methods such as `fs/get`. `guestCalls` names co-resident services; `protocols` and `services` declare who may call *you*. Private modules need no entry in either call list.
+`guestRequires` is everything your guest reaches: host **services**, such as `fs` rather than methods such as `fs/get`, and the co-resident services it calls, such as `_net`. `protocols` and `services` declare who may call *you*. Private modules, the `crypto/*` transforms (entropy included, as `crypto/random`) and time (`Date.now()`) need no entry.
 
 Guests are plain scripts with ECMAScript intrinsics and four supplied globals: `host`, `HOST` (the host's own facts: `identity`, the node's public key in hex, and the host-call budget this load admits — `maxOutstandingHostCalls` and `maxOutstandingHostCallBytes`, advertised so a guest can window its own fan-out instead of being refused), `APP` (signed config), and `LOCAL` (installation config). They have no `fetch`, DOM, Node APIs, or runtime package imports. Bundle compatible dependencies into flat guest source; keep UI and platform code in the host client. For a multi-operation byte API, `guestOpFraming()` supplies the same `callerOf`/`readOp`/`writeOp` helpers used by host callers, so you need not write two codecs.
 

@@ -17,19 +17,18 @@ import (
 // The names of guest-seam.ts's catalog, written here so a rename shows up as
 // one edit rather than as bare strings scattered through the assertions.
 const (
-	nameSign       = "node/sign"
-	nameVerify     = "node/verify"
-	nameNodeRandom = "node/random"
-	nameFsGet      = "fs/get"
-	nameFsPut      = "fs/put"
-	nameClockNow   = "clock/now"
-	nameLinkSend   = "link/send"
+	nameSign     = "node/sign"
+	nameVerify   = "node/verify"
+	nameRandom   = "crypto/random"
+	nameFsGet    = "fs/get"
+	nameFsPut    = "fs/put"
+	nameLinkSend = "link/send"
 )
 
 func TestGuestSeamOps(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Grant node/sign, node/verify, fs/put, fs/get and clock/now (not net, not link),
+	// Grant node/sign, node/verify, fs/put and fs/get (not link),
 	// plus an identity from sodium. The signing scope binds node/sign and
 	// node/verify to a bundle namespace (README §12.2) — a real node derives it from the
 	// manifest's (author, app); here it is a throwaway pair.
@@ -39,7 +38,7 @@ func TestGuestSeamOps(t *testing.T) {
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
 		// the key that signs, all three.
 		globalThis.__scope = appSignScope(__id, "testapp");
-		__buildGuestSeam(["node", "fs", "clock"], null, __scope);
+		__buildGuestSeam(["node", "fs"], null, __scope);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -141,15 +140,9 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatalf("fs/get = %v, want [1] ++ %q", got, value)
 	}
 
-	// clock/now: 8-byte big-endian millis, nonzero.
-	if clk := callBytes(nameClockNow, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
-		t.Fatalf("clock/now = %v, want nonzero u64", clk)
-	}
-
-	// The unit a manifest declares is the SERVICE, so node/random resolves beside
-	// node/sign: one service under two calls, never a boundary a guest could hold half of.
-	if r := callBytes(nameNodeRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
-		t.Fatalf("node/random = %d bytes, want 4", len(r))
+	// Entropy is an ungated host transform: random bytes reach nothing.
+	if r := callBytes(nameRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
+		t.Fatalf("crypto/random = %d bytes, want 4", len(r))
 	}
 	// And raw net is not merely undeclared here — it is wired only for the link occupant, so no app
 	// seam is ever wired one.
@@ -158,17 +151,20 @@ func TestGuestSeamOps(t *testing.T) {
 	}
 
 	// THE gate, on a service this harness wires a real backend for, so nothing but the
-	// gate can be what refuses it: the same seam narrowed to `clock` alone answers no
+	// gate can be what refuses it: the same seam narrowed to `node` alone answers no
 	// fs name. A refusal at the GATE — an undeclared service, still a throw at the call
 	// site (guest-seam.ts) — reaches the test as callRealm's error.
-	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["clock"], null, __scope);`); err != nil {
+	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["node"], null, __scope);`); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
 	if err := refused(nameFsPut, make([]byte, 8)); err == nil {
 		t.Fatal("fs/put resolved on a seam declaring no fs service")
 	}
-	if clk := callBytes(nameClockNow, nil); len(clk) != 8 {
-		t.Fatalf("clock/now = %v on the narrowed seam, want the one service it declares", clk)
+	if sig := callBytes(nameSign, []byte{1}); len(sig) != 64 {
+		t.Fatalf("node/sign = %d bytes on the narrowed seam, want the one service it declares", len(sig))
+	}
+	if r := callBytes(nameRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
+		t.Fatalf("crypto/random = %d bytes on the narrowed seam, want 4 — it is not a grant", len(r))
 	}
 }
 

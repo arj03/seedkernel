@@ -76,10 +76,9 @@ async function main() {
       { name: "mlkem", wasm: mlkemWasm },
     ],
     guestSource: guest,
-    // Exactly the host services this program holds. `link` is authorized only for the
+    // Exactly what this program reaches: host services only. `link` is authorized only for the
     // boot-selected transport or an explicit replacement of its owner (§12.5), and
-    // includes inbound delivery (`link/deliver`). It calls no co-resident guest, so there
-    // is no `guestCalls`.
+    // includes inbound delivery (`link/deliver`). It calls no co-resident guest.
     guestRequires: ["node", "link", "timer"],
     // Transport policy belongs to this signed program. An installation may override any
     // of these values through the load's LOCAL config; the guest applies LOCAL ?? APP.

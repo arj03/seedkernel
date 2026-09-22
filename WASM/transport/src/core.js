@@ -112,47 +112,60 @@ const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
 const linksById = new Map();
 
 // ── deadlines ───────────────────────────────────────────────────────────────────
-// A zero-authority realm has no clock, so a deadline here is a count of the host's one wake
-// (§12.3). Each wake is a tick, and every link, open correlation and `ready` waiter holds the
-// tick it ends on — no timer per deadline, one walk per tick (`onWake`). A tick is 100 ms, or
-// the shortest configured timeout when that is shorter.
-const tickMs = Math.max(1, Math.ceil(Math.min(100,
-  ...[linkIdleTimeoutMs, requestTimeoutMs, handshakeTimeoutMs, unverifiedTimeoutMs].filter((ms) => ms > 0))));
-let tick = 0;
-let waking = false;   // the wake is armed
-let wakeOwed = false; // its arm was refused, so the next event asks again
+// Every link, open correlation and `ready` waiter holds the monotonic time it ends on
+// (`performance.now()`; `Infinity` is none), and the host's one wake (§12.3) is armed for the
+// soonest of them — no timer per deadline and no polling: each wake walks them once
+// (`onWake`), retires what is due, and re-arms for what is next. `timer/arm` replaces the
+// armed wake, so moving it earlier is one call; a wake a replacement left in flight walks,
+// finds nothing due, and re-arms.
+const now = () => performance.now();
+/** A refused close is asked again after this long (`Link.closeChannel`). */
+const CLOSE_RETRY_MS = 100;
+let wakeAt = Infinity;  // when the armed wake fires
+let armGen = 0;         // which arm is the latest, so a stale refusal changes nothing
+let owedAt = Infinity;  // the latest arm was refused; the next event asks again for this
+let walking = false;    // inside `onWake`, which arms once at the end
 
-/** The tick by which `ms` has surely passed. A tick already under way counts for nothing, so
- *  a deadline runs up to two ticks long and never short. */
-function dueTick(ms) {
-  const due = tick + Math.max(1, Math.ceil(ms / tickMs)) + (waking ? 1 : 0);
-  wake();
-  return due;
+/** The time `ms` from now, with the wake armed to see it. */
+function dueIn(ms) {
+  const at = now() + ms;
+  wakeBy(at);
+  return at;
 }
 
-/** Arm the wake unless it is armed. It is never cleared, so every wake that arrives is a tick. */
-function wake() {
-  if (waking) return;
-  waking = true;
-  wakeOwed = false;
-  try { void host.call(N_TIMER_ARM, args([tickMs, 0], [])).catch(wakeRefused); } catch { wakeRefused(); }
+/** Make sure a wake comes by `at`. */
+function wakeBy(at) {
+  if (at >= wakeAt) return;
+  wakeAt = at;
+  if (!walking) arm(at);
 }
 
-/** Refused by this realm's host-call budget, which frees up on its own. Failing the deadlines
- *  over it would close every link at once, so they stand until an event re-arms (`dispatch`). */
-function wakeRefused() {
-  waking = false;
-  wakeOwed = true;
+function arm(at) {
+  const gen = ++armGen;
+  owedAt = Infinity;
+  const ms = Math.min(0x7fffffff, Math.max(0, Math.ceil(at - now())));
+  const refused = () => {
+    if (gen !== armGen) return;
+    wakeAt = Infinity;
+    owedAt = at;
+  };
+  try { void host.call(N_TIMER_ARM, args([ms, 0], [])).catch(refused); } catch { refused(); }
 }
 
-/** One tick: retire what is due, and arm again while anything still waits. */
+/** Retire what is due, and arm for the soonest deadline still standing. A wake that comes
+ *  early (a replaced arm's, or one clamped at the timer's range) just re-arms. */
 function onWake() {
-  waking = false;
-  tick++;
-  let waiting = reqres.onTick();
-  if (core.checkReady()) waiting = true;
-  for (const link of linksById.values()) if (link.onTick()) waiting = true;
-  if (waiting) wake();
+  wakeAt = Infinity;
+  walking = true;
+  try {
+    const t = now();
+    wakeBy(reqres.onWake(t));
+    wakeBy(core.checkReady(t));
+    for (const link of linksById.values()) wakeBy(link.onWake(t));
+  } finally {
+    walking = false;
+  }
+  if (wakeAt < Infinity) arm(wakeAt);
 }
 
 // The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
@@ -394,19 +407,21 @@ class Core {
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
     // A LIST, not a slot: two callers may wait at once, each with its own deferred.
-    this.readyWaiters.push({ check: allUp, d, due: dueTick(timeoutMs) });
+    this.readyWaiters.push({ check: allUp, d, due: dueIn(timeoutMs) });
   }
 
-  /** Settle each waiter whose cohort is up or whose deadline tick has come. Either way: the
+  /** Settle each waiter whose cohort is up or whose deadline has come. Either way: the
    *  caller asked to WAIT for the cohort, not to be told whether it arrived — one that cares
-   *  reads `peers`. Run on each up edge and each tick; answers whether any still wait. */
-  checkReady() {
+   *  reads `peers`. Run on each up edge and each wake; answers the soonest deadline still
+   *  waiting. */
+  checkReady(t = now()) {
+    let next = Infinity;
     for (const w of [...this.readyWaiters]) {
-      if (!w.check() && tick < w.due) continue;
+      if (!w.check() && t < w.due) { next = Math.min(next, w.due); continue; }
       this.readyWaiters.splice(this.readyWaiters.indexOf(w), 1);
       w.d.settle(EMPTY);
     }
-    return this.readyWaiters.length > 0;
+    return next;
   }
 }
 
@@ -456,7 +471,7 @@ const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
 function handle(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
-  if (wakeOwed) wake();
+  if (owedAt < Infinity) wakeBy(owedAt);
   if (fromHost && body.length === 4) { onWake(); return NOTHING; }
   const { op, args } = readOp(body);
   const r = new Reader(args);

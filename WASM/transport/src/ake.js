@@ -2,7 +2,7 @@
 
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
-const N_RANDOM = "node/random";
+const N_RANDOM = "crypto/random";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
 const N_WS = "ws";
@@ -24,7 +24,7 @@ const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
 
 // The X25519 base point: `dh(sk, BASEPOINT)` IS the public-key derivation, so the
-// residual host transform needs no keygen entry while the secret comes from node/random.
+// residual host transform needs no keygen entry while the secret comes from crypto/random.
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
@@ -293,9 +293,9 @@ class Link {
     this.aborted = false;
     this.timedOut = false;
     this.slot = null;
-    this.due = 0;             // the tick the handshake deadline or the idle window ends on
-    this.sawTraffic = false;  // whether anything crossed since the idle window opened
-    this.closeOwed = null;    // a refused close's `graceful`, asked again each tick
+    this.due = Infinity;      // when the handshake deadline or the idle window ends
+    this.lastSeen = 0;        // when anything last crossed, for the idle window
+    this.closeOwed = null;    // a refused close's `graceful`, asked again shortly
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -350,10 +350,10 @@ class Link {
 
   /** Hand the socket back to the host. A refused close is owed rather than lost — this
    *  program forgetting a link does not close its socket, and the peer would go on holding
-   *  it — so it is asked again each tick (`onTick`) until the host takes it. */
+   *  it — so it is asked again (`onWake`) until the host takes it. */
   closeChannel(graceful) {
     this.closeOwed = netLinkClose(this.linkId, graceful) ? null : graceful;
-    if (this.closeOwed !== null) this.due = dueTick(tickMs);
+    if (this.closeOwed !== null) this.due = dueIn(CLOSE_RETRY_MS);
   }
 
   async ensureKeys() {
@@ -366,30 +366,28 @@ class Link {
 
   /** The pre-auth deadline, 0 disabling it; authentication hands it over to `armIdle`. */
   armDeadline(ms) {
-    this.due = ms > 0 ? dueTick(ms) : 0;
+    this.due = ms > 0 ? dueIn(ms) : Infinity;
   }
 
   /** The post-auth idle clock, which the handshake deadline hands over to: a peer that
    *  opens links and goes quiet is the cheapest way to spend our budget of sockets and
-   *  slots. Retired with the authenticated goodbye.
-   *
-   *  Windows rather than a timestamp: a zero-authority realm has no clock, so "idle" is
-   *  "a whole window passed with nothing seen" — the effective window is one to two
-   *  `linkIdleTimeoutMs`. */
+   *  slots. Retired with the authenticated goodbye. "Idle" is `linkIdleTimeoutMs` since
+   *  anything last crossed (`markTraffic`); the deadline is only re-read on a wake, so
+   *  traffic costs a clock read and never a timer call. */
   armIdle() {
-    this.sawTraffic = false;
-    this.due = linkIdleTimeoutMs > 0 ? dueTick(linkIdleTimeoutMs) : 0;
+    this.lastSeen = now();
+    this.due = linkIdleTimeoutMs > 0 ? dueIn(linkIdleTimeoutMs) : Infinity;
   }
 
-  /** One tick (core.js `onWake`). Past `due`, a link still handshaking has timed out, an
-   *  authenticated one closes unless its window carried traffic, and a closed one asks again
-   *  for a close the host refused. Answers whether it still waits on a later tick. */
-  onTick() {
-    if (this.due === 0 || tick < this.due) return this.due !== 0;
-    this.due = 0;
+  /** One wake (core.js `onWake`). Past `due`, a link still handshaking has timed out, an
+   *  authenticated one closes unless traffic moved its window on, and a closed one asks
+   *  again for a close the host refused. Answers its next deadline, or `Infinity`. */
+  onWake(t) {
+    if (t < this.due) return this.due;
+    this.due = Infinity;
     if (this.closed) {
       if (this.closeOwed !== null) this.closeChannel(this.closeOwed);
-      return this.due !== 0;
+      return this.due;
     }
     if (!this.authed) {
       // Distinguishable from every other pre-auth teardown: "nobody finished the
@@ -397,19 +395,19 @@ class Link {
       // abort is a peer that answered with something wrong. Different things to go fix.
       this.timedOut = true;
       this.abort();
-    } else if (this.sawTraffic) {
-      this.armIdle();
+    } else if (t - this.lastSeen < linkIdleTimeoutMs) {
+      this.due = this.lastSeen + linkIdleTimeoutMs;
     } else {
       this.close();
     }
-    return this.due !== 0;
+    return this.due;
   }
 
-  /** Traffic in either direction: the idle clock's flag, and the limiter's eviction order,
-   *  which for an authenticated link is how recently it carried something rather than how
-   *  long ago it arrived. */
+  /** Traffic in either direction: the idle clock, and the limiter's eviction order, which
+   *  for an authenticated link is how recently it carried something rather than how long
+   *  ago it arrived. */
   markTraffic() {
-    this.sawTraffic = true;
+    this.lastSeen = now();
     if (this.slot) this.slot.limiter.touch(this.slot);
   }
 
@@ -915,7 +913,7 @@ class Link {
 
   teardown() {
     this.severWire();
-    this.due = 0;
+    this.due = Infinity;
     this.releaseSlot();
     // The pre-auth queue stays: `forget` (core.js) hands it to another link to the peer.
     if (this.sendKey) this.sendKey.fill(0);

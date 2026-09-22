@@ -49,7 +49,7 @@ const { createRealmTimers } = await imp("build/host/realm-timers.js");
 const { toHex } = await imp("build/services/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, CallBudget, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
-const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
+const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
@@ -220,7 +220,7 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
 console.log("\n§12.2 — the service gates cannot be reached by omission");
 {
   const base = {
-    platform: { sodium, now: () => Date.now() },
+    platform: { sodium },
     grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   };
@@ -729,7 +729,7 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     };
     const identity = sodium.crypto_sign_keypair();
     const seam = createGuestSeam({
-      platform: { sodium: burningSodium, now: () => Date.now() },
+      platform: { sodium: burningSodium },
       grants: {
         names: ALL_HOST_SERVICES, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS,
         signScope: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },

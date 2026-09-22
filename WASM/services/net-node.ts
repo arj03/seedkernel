@@ -71,7 +71,7 @@ export class NodeChannelFactory {
   private tcpServer: TcpServer | null = null;
   private wsServer: TcpServer | null = null;
   /** Takes no crypto: the WebSocket client key and the frame masks are the transport
-   *  bundle's, which reaches entropy through `node/random` like any other authority. */
+   *  bundle's, which draws entropy from the ungated `crypto/random`. */
   constructor() {}
   /** Dial TCP-backed destinations; `wss://` is unsupported because this factory has no TLS. */
   connect(dest: string): RawLink | null {

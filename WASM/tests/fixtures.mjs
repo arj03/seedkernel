@@ -33,7 +33,7 @@ export const { createGuestSeam, guestSignScope, appSignScope, CallBudget } = awa
  *  segment with no causal root and no spend record. */
 export const withTestBudget = (seam) => (name, payload) =>
   seam(name, payload, new CallBudget(Infinity, undefined, undefined));
-export const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
+export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 export const TEST_CALLS = { call: () => null };
 export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");

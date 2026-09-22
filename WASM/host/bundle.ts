@@ -1,6 +1,6 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
 import { concatBytes, toHex, isHex64, enc, dec, errMessage, type JsonValue, type JsonObject } from "../services/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService } from "../services/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "../services/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
 export type { JsonValue, JsonObject };
 
@@ -13,17 +13,14 @@ export interface BundleModule {
  *  top level because both are the guest's alone: WASM modules carry no authority and read
  *  no config. */
 export interface BundleGuest {
-  /** Exactly the host SERVICES this guest is granted (`HOST_SERVICES`) — what it calls on
-   *  the HOST. Closed at load: a service this host does not grant is a refused manifest, not
-   *  a requirement that quietly grants nothing at first use. A method name (`fs/get`) is
-   *  refused too — the unit a manifest declares is the service. `crypto/*` and the bundle's
-   *  own module names are not declarable, so the list an operator reads is the whole reach. */
+  /** Everything this guest reaches outside itself, in one list: host SERVICES
+   *  (`HOST_SERVICES`) and the local service ids it calls on a CO-RESIDENT guest (§12.10).
+   *  `isService` tells them apart; a local id may not be spelled like a host method or one
+   *  of this bundle's modules, so every `host.call` name means one declared thing. A method
+   *  name (`fs/get`) is refused — the unit a manifest declares is the service. `crypto/*`
+   *  and the bundle's own module names are not declarable, so the list an operator reads
+   *  is the whole reach. */
   requires: string[];
-  /** The local service ids this guest calls on a CO-RESIDENT guest (§12.10), over the
-   *  same `host.call`. Separate from `requires` because a local service id carries no
-   *  host authority. Also what tells a bare `host.call` from
-   *  one of this bundle's own modules, which is why it must not spell one. Absent ≡ none. */
-  calls?: string[];
   /** The app's signed configuration, injected unchanged into the guest preamble as
    *  `const APP`. Its schema is the app's alone; the one shape the runtime insists on is an
    *  object — a guest reads config by name, so a signed scalar would leave every `APP.x`
@@ -174,12 +171,12 @@ const OFF_BODY = OFF_ML_SIG + ML_DSA_SIG_LEN;
 
 /** Module names are the guest's module keys, so they are held to an unambiguous charset
  *  with no `/`, which every host name carries — so no module can share a name with a host
- *  method. A collision with a name in `guest.calls` is checked by the call site
- *  (`validateManifest`): one `host.call` name means exactly one declared thing. */
+ *  method. A collision with a local service id in `guest.requires` is checked by the call
+ *  site (`validateManifest`): one `host.call` name means exactly one declared thing. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
-/** The claim charset (§12.10): shared by `protocols`, `services` and `guest.calls` — one
- *  shape for every name a manifest signs outside its module table. A leading
+/** The claim charset (§12.10): shared by `protocols`, `services` and the local service ids
+ *  in `guest.requires` — one shape for every name a manifest signs outside its module table. A leading
  *  `_` is admitted like any other character: it is a spelling convention this repo's own
  *  bundles use for a local-only name (`_net`), never a host-known reservation. These travel
  *  on the wire (`protocols`) or name a local call graph edge, so the whitespace, control and
@@ -271,7 +268,6 @@ function isValidManifest(m: unknown): m is BundleManifest {
   const g = o.guest as Record<string, unknown>;
   if (typeof g !== "object" || g === null || Array.isArray(g)) return false;
   if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string")) return false;
-  if (g.calls !== undefined && (!Array.isArray(g.calls) || g.calls.some((c: unknown) => typeof c !== "string"))) return false;
   if (g.config !== undefined && !isJsonObject(g.config)) return false;
   return true;
 }
@@ -282,33 +278,27 @@ function isValidManifest(m: unknown): m is BundleManifest {
  *  name is policy (§12.5). */
 export function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
   if (!isValidManifest(manifest)) throw new Error("bundle: malformed manifest");
-  // `requires` is the HOST's, so its vocabulary is closed to SERVICES: each names one
-  // host service. An unknown name — `crypto/*` and a finer method name (`fs/get`)
-  // included — is a refused manifest, not a grant that quietly reaches nothing at first
-  // use. Well-formedness only: whether this node authorizes `link` is the shell's call
-  // (§12.5).
+  // Each entry names a host service or a local service id. Services are the closed
+  // `HOST_SERVICES` vocabulary; anything else is a local id, held to the claim charset.
+  // One `host.call` name means one thing, so a local id may not live in a host namespace —
+  // `fs/get` is a method, finer than the unit a manifest grants, and `crypto/*` is the
+  // ungated host table — nor spell one of this bundle's modules. Whether anything claims a
+  // local id is NOT checked here: it is answered at the call (guest-seam.ts), since an app
+  // may be installed before the service that answers it. Well-formedness only: whether this
+  // node authorizes `link` is the shell's call (§12.5).
+  const moduleNames = new Set(manifest.modules.map((m) => m.name));
   for (const r of manifest.guest.requires) {
     if (isService(r)) continue;
     const head = r.slice(0, r.indexOf("/") < 0 ? r.length : r.indexOf("/"));
-    const fix = isService(head) ? ` — declare the SERVICE "${head}" instead` : "";
-    throw new Error(`bundle: "${r}" is not one of this host's services (manifest guest.requires)${fix} (this host's services: ${Object.keys(HOST_SERVICES).join(", ")}). A local service id belongs in guest.calls.`);
-  }
-  // `calls` is this node's own call graph, and carries no privilege. Whether anything
-  // claims an id is NOT checked here — it is answered at the call (guest-seam.ts), since
-  // an app may be installed before the service that answers it.
-  const moduleNames = new Set(manifest.modules.map((m) => m.name));
-  for (const c of manifest.guest.calls ?? []) {
-    if (!CLAIM_RE.test(c)) {
-      throw new Error(`bundle: "${c}" is not a well-formed local service id (manifest guest.calls; alphanumeric-or-"_" first, then alphanumerics and ._/-, at most 64 bytes)`);
+    if (isHostNamespace(head)) {
+      const fix = isService(head) ? ` — declare the SERVICE "${head}" instead` : "";
+      throw new Error(`bundle: "${r}" (manifest guest.requires) is a host method, not a service or a local service id${fix} (this host's services: ${Object.keys(HOST_SERVICES).join(", ")})`);
     }
-    // One name, one meaning: declared here it IS a cross-realm call, so spelling a host
-    // method would take that method away from this bundle.
-    const head = c.slice(0, c.indexOf("/") < 0 ? c.length : c.indexOf("/"));
-    if (isService(head)) {
-      throw new Error(`bundle: "${c}" (manifest guest.calls) is spelled like a method of this host's "${head}" service — a host.call name means one thing, and declared here it would never reach the host method`);
+    if (!CLAIM_RE.test(r)) {
+      throw new Error(`bundle: "${r}" (manifest guest.requires) is neither one of this host's services (${Object.keys(HOST_SERVICES).join(", ")}) nor a well-formed local service id (alphanumeric-or-"_" first, then alphanumerics and ._/-, at most 64 bytes)`);
     }
-    if (moduleNames.has(c)) {
-      throw new Error(`bundle: "${c}" is both a called local service id (manifest guest.calls) and one of this bundle's own module names — a host.call name means one thing, so declare one or the other`);
+    if (moduleNames.has(r)) {
+      throw new Error(`bundle: "${r}" is both a local service id (manifest guest.requires) and one of this bundle's own module names — a host.call name means one thing, so declare one or the other`);
     }
   }
 }

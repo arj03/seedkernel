@@ -174,7 +174,6 @@ export interface BootShellOptions {
    *  Default: the lazy safe-js import, since the QuickJS engine is heavy and loads on the
    *  first realm. */
   createRealm?: RealmFactory;
-  now?: () => number;
   /** This node's DEFAULT guest execution and handoff budget per entrypoint invocation,
    *  in ms. Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables the local ceiling.
    *  A finite initiating caller still narrows an unbounded callee. The operator's number,
@@ -240,7 +239,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const createRealm = opts.createRealm
     ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
   const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
-  const now = opts.now ?? (() => Date.now());
   const net = opts.transport === false ? undefined : opts.transport;
   const netHost = net ? new TransportHost(net) : null;
   const transportBlob = netHost ? (net!.bundle ?? transportBundleBytes()) : null;
@@ -343,14 +341,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // is the HOST's own, and no label derives it.
     const callerId = genesisHash(sodium, enc.encode(table.labelOf(slot)));
     const fullSeam = createGuestSeam({
-      platform: { sodium, now },
+      platform: { sodium },
       grants: {
-        // The two signed lists, unmodified. A `host.call` naming a host method
-        // resolves iff the method's SERVICE is in `requires`. `crypto/*` and the
-        // bundle's own module names are exempt from both — a fixed catalog and the
-        // app's own code, never grants.
+        // The signed list, unmodified: host services and local service ids. A
+        // `host.call` naming a host method resolves iff the method's SERVICE is in it.
+        // `crypto/*` and the bundle's own module names are exempt — a fixed catalog and
+        // the app's own code, never grants.
         names: new Set(b.manifest.guest.requires),
-        localServices: new Set(b.manifest.guest.calls ?? []),
         // What node/sign signs under: this slot's ONE scope, derived at load —
         // an ordinary app's own `DOMAIN_guest ‖ app`, the link slot's
         // `DOMAIN_link_scope` (§12.2). The host chooses what the

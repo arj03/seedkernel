@@ -71,8 +71,8 @@ const RES_HEAD_LEN = 1 + 4;
 
 class ReqRes {
   constructor() {
-    // corr → {to, d, due} — d is the deferred answering the app, due the tick its retention
-    // bound ends on (0: none)
+    // corr → {to, d, due} — d is the deferred answering the app, due when its retention
+    // bound ends (Infinity: none)
     this.pending = new Map();
     this.nextCorr = 1;
     // peerId → the weight of that peer's requests waiting on `link/deliver`, and their sum
@@ -130,7 +130,7 @@ class ReqRes {
     if (this.nextCorr > 0xffffffff) this.nextCorr = 1;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
-      this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueTick(requestTimeoutMs) : 0 });
+      this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueIn(requestTimeoutMs) : Infinity });
     }
     const unanswerable = () => this.finish(corr, null);
     core.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
@@ -216,15 +216,15 @@ class ReqRes {
     }
   }
 
-  /** One tick (core.js `onWake`): retire the correlations whose retention bound has come.
+  /** One wake (core.js `onWake`): retire the correlations whose retention bound has come.
    *  Every bound is the same length, so `pending` is in due order and the walk stops at the
-   *  first still waiting. Answers whether one is. */
-  onTick() {
-    if (requestTimeoutMs <= 0) return false;
+   *  first still waiting. Answers its deadline, or `Infinity` when none waits. */
+  onWake(t) {
+    if (requestTimeoutMs <= 0) return Infinity;
     for (const [corr, p] of this.pending) {
-      if (tick < p.due) return true;
+      if (t < p.due) return p.due;
       this.finish(corr, null);
     }
-    return false;
+    return Infinity;
   }
 }

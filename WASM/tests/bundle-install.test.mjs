@@ -1182,7 +1182,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
   const { blob } = authorBundle(sodium, author, {
     app: "offside", version: 1, protocols: ["offside/v1"],
     modules: [{ name: "fwd", wasm: forwarderBytes }],
-    guestSource: GUEST_TEXT, guestRequires: ["fs", "link"], guestCalls: ["_svc"],
+    guestSource: GUEST_TEXT, guestRequires: ["fs", "link", "_svc"],
   });
   // The neighbour a candidate must not reach: a REAL second bundle declaring `_svc`
   // under `services` (a co-resident guest's to reach, never a peer's), installed under
@@ -1218,7 +1218,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
         ["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)],
         ["_svc", new Uint8Array()],
         ["link/open", new Uint8Array(32)],
-        ["clock/now", new Uint8Array()],
+        ["crypto/random", Uint8Array.of(0, 0, 0, 1)],
         ["crypto/blake2b-256", new Uint8Array()],
         ["fwd", Uint8Array.of(4)],
       ]) {
@@ -1261,7 +1261,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second init path");
     assertEqual(candidates[0].refused.sort(),
-      ["_svc", "clock/now", "crypto/blake2b-256", "fs/put", "fwd", "link/open"],
+      ["_svc", "crypto/blake2b-256", "crypto/random", "fs/put", "fwd", "link/open"],
       "a candidate reaches nothing at all — not a write, another realm, a link, or a read");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
