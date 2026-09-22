@@ -20,7 +20,7 @@ export const OP_BASE64 = 4;
 export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // One WS frame must fit the scratch region, so this is sized to hold the largest transport
-// message (MAX_FRAME_BYTES, net-limits.ts) plus header/mask overhead — the two transports
+// message (MAX_FRAME_BYTES, scripts/transport-config.mjs) plus header/mask overhead — the two transports
 // must cap identically, or a message that succeeds over TCP tears down a WS link.
 //
 // **Keep this in step with MAX_FRAME_BYTES: it is the FLOOR on that cap.** The scratch is

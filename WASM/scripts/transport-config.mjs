@@ -1,12 +1,16 @@
 // Defaults owned by the signed transport program. The build writes this object into
 // manifest.guest.config, so changing one changes the signed artifact rather than the
 // generic host that happens to load it.
-import { MAX_FRAME_BYTES } from "../build/services/net-limits.js";
 
 /** The local service id this composition claims under `services`: a co-resident guest's and
  *  the host's to reach, no peer's. This program's own choice with no host semantics, which
  *  is why it is emitted beside the blob rather than known to the host. */
 export const TRANSPORT_SERVICE = "_net";
+
+/** This program's largest frame, and so its largest application message. ws.wasm stages a
+ *  whole frame in its compiled scratch, and on a platform-framed link one message carries
+ *  one frame, so it must fit the host's MAX_LINK_READ_BYTES (both: tests/transport.test.mjs). */
+export const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 
 export const TRANSPORT_APP_CONFIG = Object.freeze({
   connsPerPeer: 1,

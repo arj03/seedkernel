@@ -149,7 +149,7 @@ function arm(at) {
     wakeAt = Infinity;
     owedAt = at;
   };
-  try { void host.call(N_TIMER_ARM, args([ms, 0], [])).catch(refused); } catch { refused(); }
+  try { void host.call(N_TIMER_ARM, args([ms], [])).catch(refused); } catch { refused(); }
 }
 
 /** Retire what is due, and arm for the soonest deadline still standing. A wake that comes
@@ -437,8 +437,7 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 // Reached as an app is: `handle([caller 32][body …])`, body an op envelope
 // `[opLen u8][op][args]` (util.js `readOp`) — this bundle's envelope, which is how an
 // app's `send` and the host's own events land on one entrypoint. The op is a NAME, not a
-// tag byte — an unimplemented op fails loud. The one body without a name is the host's
-// wake: four bytes, shorter than any envelope (`onWake`).
+// tag byte — an unimplemented op fails loud.
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
 //   the HOST  32 zero bytes — the platform's events: sockets opening, bytes
@@ -472,7 +471,6 @@ const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 function handle(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   if (owedAt < Infinity) wakeBy(owedAt);
-  if (fromHost && body.length === 4) { onWake(); return NOTHING; }
   const { op, args } = readOp(body);
   const r = new Reader(args);
   const fn = ops[op];
@@ -482,6 +480,9 @@ function handle(argBytes) {
   if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
   return fn(r, caller) || NOTHING;
 }
+
+/** The realm's one wake (§12.3): walk the deadlines (`onWake`). */
+entry("wake", () => { onWake(); });
 
 /** Platform-opened link event (§12.1). */
 entry("linkOpen", (r) => {

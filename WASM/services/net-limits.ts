@@ -1,6 +1,9 @@
-// Inbound flood bound (§12.6.2, §16.1). Host-owned; the bundle learns it at init.
-/** Hard cap on one link frame, checked against the declared length before buffering. */
-export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
+// Driver bounds (§12.6). Host-owned: the socket side of a link, never its framing.
+/** Hard cap on one read the driver hands the link occupant — a platform-framed message
+ *  whole, or a stream slice — refused before it is copied into a realm. Framing is the
+ *  occupant's: on a platform-framed link one message carries one of its frames, so its
+ *  frame cap must fit under this. Also the unit the buffer windows below are sized in. */
+export const MAX_LINK_READ_BYTES = 2 * 1024 * 1024; // 2 MiB
 
 /** Aggregate inbound bytes one driver admits across dispatched and held reads. A browser
  *  WebSocket and an RTCDataChannel cannot be paused, while a pausable socket still owns one
@@ -13,8 +16,8 @@ export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
  *  The window is what a pipelining peer really runs at, not a guess: seedstore's holder
  *  ingest bench (1 MiB batched STOREs against a zero-latency fabric, the hardest case there
  *  is — no wire to pace the sender) peaks at ~6 MiB of hold, so this leaves ~2.5× headroom.
- *  The value is eight maximum-sized frames, shared by the entire transport realm. */
-export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_FRAME_BYTES;
+ *  The value is eight maximum-sized reads, shared by the entire transport realm. */
+export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** Driver-wide count companion to `MAX_INBOUND_HOLD_BYTES`. A byte bound alone lets peers
  *  sending one-byte messages turn that window into millions of queued realm invocations
@@ -25,7 +28,7 @@ export const MAX_INBOUND_HOLD_SLICES = 4096;
  *  transport may have many authenticated producers (local requests and peer responses),
  *  so the adapter reports backlog to the host owner for custody reconciliation and the
  *  owner fails the link before accepting a write past this ceiling. */
-export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_FRAME_BYTES;
+export const MAX_OUTBOUND_QUEUE_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** Count companion to `MAX_OUTBOUND_QUEUE_BYTES`. Tiny writes otherwise fit millions of
  *  queue nodes inside the byte window while spending much more host memory in metadata. */

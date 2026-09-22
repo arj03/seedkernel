@@ -4,7 +4,7 @@
 import { errMessage, fromHex, Fifo } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
-  MAX_FRAME_BYTES,
+  MAX_LINK_READ_BYTES,
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
   MAX_NODE_OUTBOUND_QUEUE_BYTES,
@@ -457,10 +457,9 @@ export class TransportHost {
     // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
       if (this.links.get(linkId) !== link) return;
-      // Platform-framed adapters have no declared-length prefix at which to enforce the
-      // hard host cap. Refuse the oversized delivery before OpArgs copies it into a realm
-      // invocation; stream backends naturally deliver much smaller slices.
-      if (bytes.length > MAX_FRAME_BYTES) { failReadSide(); return; }
+      // Refuse an oversized read before OpArgs copies it into a realm invocation. Only a
+      // platform-framed message can reach this; stream backends deliver much smaller slices.
+      if (bytes.length > MAX_LINK_READ_BYTES) { failReadSide(); return; }
       if (!this.reserveInboundRead(bytes.length)) { failReadSide(); return; }
       if (activeBytes < 0) {
         if (dispatchRead(bytes)) releaseRead(); // over before it began: go back to draining

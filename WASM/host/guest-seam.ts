@@ -65,10 +65,10 @@ export interface RawNet {
   deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
 }
 
-/** One replaceable wake. The four-byte tag is opaque guest content, returned after
- *  HOST_CALLER_ID. Content multiplexes deadlines inside its own confined heap. */
+/** One replaceable wake, delivered as the `wake` host event. Content multiplexes deadlines
+ *  inside its own confined heap and reads its own clock to tell which are due. */
 export interface HostTimers {
-  arm(ms: number, tag: Uint8Array): void;
+  arm(ms: number): void;
   /** Cancel the armed wake; a notification already in flight cannot be retracted. */
   clear(): void;
 }
@@ -336,9 +336,8 @@ globalThis.__start = (id, argBuf) => {
 //
 // The ONLY bytes the host puts in front of a callee's format: one 32-byte id, unforgeable
 // by a guest. There is exactly ONE host id — the zero id, whose events and loopback calls
-// the host writes (a fired deadline re-enters as an ordinary loopback carrying the opaque
-// body supplied when it was armed, so a second host id is unnecessary). Everything else
-// non-zero is a peer or a co-resident app.
+// the host writes (a wake is an event like the link events, named in the op envelope, so a
+// second host id is unnecessary). Everything else non-zero is a peer or a co-resident app.
 /** The host's own caller id: 32 zero bytes. No app label derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 
@@ -541,8 +540,8 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     },
     // ── timers: the platform's event loop ─────────────────────────────────────
     "timer/arm": (payload) => {
-      if (payload.byteLength !== 8) throw new Error("guest: timer/arm requires [ms u32][tag 4]");
-      timers.arm(readU32BE(payload, 0), payload.subarray(4));
+      if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
+      timers.arm(readU32BE(payload, 0));
       return NONE;
     },
     "timer/clear": (payload) => {

@@ -5,7 +5,8 @@
 // and the refusals it owes its callers.
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
-import { MAX_FRAME_BYTES } from "../build/services/net-limits.js";
+import { MAX_LINK_READ_BYTES } from "../build/services/net-limits.js";
+import { MAX_FRAME_BYTES } from "../scripts/transport-config.mjs";
 import { parsePeerRef, parseDest, peersConfig } from "../build/services/peer-addr.js";
 import { testkit } from "./testkit.mjs";
 import { readFileSync } from "node:fs";
@@ -83,16 +84,20 @@ test("a truncated frame decodes to nothing rather than reading past its end", ()
   assert(decodeOne(f.subarray(0, f.length - 10), false) === null, "short frame");
 });
 
-// The one cross-artifact coupling in the frame path, checked rather than documented:
-// `MAX_FRAME_BYTES` (host, services/net-limits.ts) is a floor under the module's compiled
-// scratch, and raising the cap past it fails nothing at build time — TCP keeps carrying
-// the frame while WS tears the link down on the first big one. Red here, naming the rebuild.
+// The cross-artifact couplings in the frame path, checked rather than documented. The
+// transport's `MAX_FRAME_BYTES` (scripts/transport-config.mjs) is a floor under the module's
+// compiled scratch, and raising the cap past it fails nothing at build time — TCP keeps
+// carrying the frame while WS tears the link down on the first big one. Red here, naming
+// the rebuild. It must also fit the host's read cap, or a platform-framed link (a browser
+// WebSocket, a data channel) is failed by the driver on its first full-size frame.
 test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () => {
   // The encoder's own ceiling: header (10) + mask (4) ≤ the 16 bytes abi.ts holds back.
   assert(MAX_FRAME_BYTES + 16 <= SCRATCH_SIZE,
     `MAX_FRAME_BYTES ${MAX_FRAME_BYTES} needs ${MAX_FRAME_BYTES + 16} B of scratch, `
     + `ws.wasm allocates ${SCRATCH_SIZE} — raise SCRATCH_SIZE in assembly/ws/abi.ts and `
     + `rebuild (npm run build:ws)`);
+  assert(MAX_FRAME_BYTES <= MAX_LINK_READ_BYTES,
+    `MAX_FRAME_BYTES ${MAX_FRAME_BYTES} exceeds the host's MAX_LINK_READ_BYTES ${MAX_LINK_READ_BYTES}`);
   // Not vacuous: the largest frame really does encode and decode through the module.
   const got = decodeOne(encodeFrame(WS_OP.BINARY, body(MAX_FRAME_BYTES), MASK), true);
   assert(got !== null && got.payload.length === MAX_FRAME_BYTES, "a full-size frame round-trips");

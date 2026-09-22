@@ -255,8 +255,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     deadlineMs: number): AppSlot => {
     let slot: AppSlot;
     const timers = createRealmTimers(
-      // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is an
-      // event the host delivers, not a host authority, and `body` arrives pre-framed. A
+      // A host event, delivered like the link events (§12.2): the `wake` op under the
+      // host's caller id, not a host authority, and `body` arrives pre-framed. A
       // throw has no caller left to reject — the arming call returned turns ago — so it
       // is reported and swallowed. The promise is RETURNED, not discarded: that is what
       // allows the next due wake to enter (realm-timers.ts).

@@ -23,7 +23,7 @@ import {
   signTestBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
   checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
-  forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp,
+  forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp, isWake,
   MemoryFs, NodeFs, enc, withTestBudget,
 } from "./fixtures.mjs";
 
@@ -1338,12 +1338,11 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   // firing inside that window is a legitimate turn of the guest that armed it.
   const realms = [];
   let failNextRealm = false;
-  const arm = (tag, ms) => {
-    const p = new Uint8Array(8);
-    writeU32BE(p, 0, ms); writeU32BE(p, 4, tag);
+  const arm = (ms) => {
+    const p = new Uint8Array(4);
+    writeU32BE(p, 0, ms);
     return p;
   };
-  // Wake bodies are four-byte tags; ordinary invoke below uses an empty body.
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
@@ -1351,8 +1350,8 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       // refuses everything until its installation commits (§3.1), which is the same
       // reason a real guest defers its setup to its first invocation.
       const r = { calls: [], disposed: false, call: async (p) => {
-        r.calls.push(p.length === 36 ? "timer" : "invoke");
-        if (!r.armed) { r.armed = true; await withTestBudget(o.hostCall)("timer/arm", arm(1, 200)); }
+        r.calls.push(isWake(p) ? "timer" : "invoke");
+        if (!r.armed) { r.armed = true; await withTestBudget(o.hostCall)("timer/arm", arm(200)); }
         return new Uint8Array();
       }, dispose() { r.disposed = true; } };
       realms.push(r);

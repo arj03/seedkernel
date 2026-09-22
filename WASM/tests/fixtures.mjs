@@ -37,6 +37,8 @@ export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 export const TEST_CALLS = { call: () => null };
 export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
+/** Is this realm argument the host's wake event (§12.3)? */
+export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
 export const enc = new TextEncoder();
 export const { NodeFs } = await imp("build/services/fs-node.js");

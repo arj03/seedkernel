@@ -53,6 +53,7 @@ const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
+const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/safe-js.js");
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
@@ -621,31 +622,29 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
 console.log("\nOne replaceable wake and one in-flight notification per realm");
 {
   const fired = [];
-  const wake = createRealmTimers((body) => { fired.push([...body]); });
-  const tag = Uint8Array.of(1, 2, 3, 4);
-  wake.arm(1, tag);
-  tag.fill(9);
+  const wake = createRealmTimers((body) => { fired.push(body); });
+  wake.arm(1);
   await sleep(20);
-  ok(fired.length === 1 && fired[0].slice(-4).join() === "1,2,3,4", "wake copies its fixed opaque tag");
-  for (let i = 0; i < 2000; i++) wake.arm(10, Uint8Array.of(0, 0, 0, i & 255));
-  throws(() => wake.arm(0, new Uint8Array(5)), "oversize tag is refused without replacing the wake");
-  throws(() => wake.arm(0x80000000, new Uint8Array(4)), "delay overflow is refused rather than firing immediately");
+  ok(fired.length === 1 && isWake(fired[0]), "a wake arrives as the host's `wake` event");
+  for (let i = 0; i < 2000; i++) wake.arm(10);
+  throws(() => wake.arm(1.5), "a fractional delay is refused without replacing the wake");
+  throws(() => wake.arm(0x80000000), "delay overflow is refused rather than firing immediately");
   await sleep(30);
-  ok(fired.length === 2 && fired[1].at(-1) === (1999 & 255), "replacement retains only the latest wake, with no timer-count cap");
-  wake.arm(1, tag); wake.clear();
+  ok(fired.length === 2, "replacement retains only the latest wake, with no timer-count cap");
+  wake.arm(1); wake.clear();
   await sleep(20);
   ok(fired.length === 2, "clear cancels the armed wake");
   wake.clearAll();
-  throws(() => wake.arm(0, tag), "disposal permanently closes the wake");
+  throws(() => wake.arm(0), "disposal permanently closes the wake");
 
   let releaseFired, calls = 0;
   const inFlight = createRealmTimers(() => {
     calls++;
     if (calls === 1) return new Promise((resolve) => { releaseFired = resolve; });
   });
-  inFlight.arm(0, tag);
+  inFlight.arm(0);
   await sleep(20);
-  for (let i = 0; i < 2000; i++) inFlight.arm(0, tag);
+  for (let i = 0; i < 2000; i++) inFlight.arm(0);
   await sleep(20);
   ok(calls === 1, "a deferred wake cannot accumulate in-flight notifications");
   releaseFired();
@@ -666,14 +665,14 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     let table;
     table = createRealmTimers((_body, causalClock) => {
       fires += 1;
-      table.arm(0, new Uint8Array(4));
+      table.arm(0);
       // Stand in for the realm's execution report. Burn real time too, so divisor 1 is
       // the control where execution spend and concurrent credit accrual cancel exactly.
       const started = performance.now();
       while (performance.now() - started < occupyMs) { /* guest is computing */ }
       causalClock.charge(performance.now() - started);
     }, budgetMs, clockDivisor);
-    table.arm(0, new Uint8Array(4));
+    table.arm(0);
     await sleep(spinForMs);
     table.clearAll();
     return fires;
@@ -689,7 +688,7 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   // Replacement is cheap and leaves just one pending host wake.
   let cheap = 0;
   const honest = createRealmTimers(() => { cheap += 1; });
-  for (let id = 0; id < 64; id++) honest.arm(0, new Uint8Array(4));
+  for (let id = 0; id < 64; id++) honest.arm(0);
   await sleep(60);
   ok(cheap === 1, `64 replacements produce one cheap wake (${cheap})`);
   honest.clearAll();
@@ -703,9 +702,9 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     causalClock.charge(2 * budgetMs); // clamps the bank to -budgetMs
     return new Promise((resolve) => { releaseWait = resolve; });
   }, budgetMs, 4);
-  waiting.arm(0, new Uint8Array(4));
+  waiting.arm(0);
   await sleep(20);
-  waiting.arm(0, new Uint8Array(4));
+  waiting.arm(0);
   await sleep(220); // -40 -> +1 earns in 164 ms at a divisor of 4
   ok(waitingFires === 1, "a due successor waits for the in-flight wake to settle");
   releaseWait();
@@ -785,9 +784,9 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     return caller.call(body, undefined, causalClock);
   }, budgetMs, 4);
   const charged = new Promise((resolve) => { moduleCharged = resolve; });
-  rooted.arm(0, new Uint8Array(4));
+  rooted.arm(0);
   await charged;
-  rooted.arm(0, new Uint8Array(4));
+  rooted.arm(0);
   await sleep(30);
   ok(rootedFires === 1,
     "fire-and-forget work remains charged through an await and a cross-realm call");
@@ -1147,22 +1146,28 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   // The catalog calls `timer` an app service (services/domains.ts), so what is under test is
   // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring it
   // off the transport driver would admit such an app and then fail it at its first
-  // `host.call` — a manifest install accepted naming a backend nothing wired.
+  // `host.call` — a manifest install accepted naming a backend nothing wired. Which
+  // deadline is due is the guest's own state, never a host-side id.
   const kp = testAuthor();
   const guestSrc = `
-    let fired = [];
-    const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    // Four-byte host bodies are wake tags; other inputs use this app's op framing.
+    let fired = [], armedId = null;
 ${guestOpFraming()}
     function handle(arg) {
-      const { body } = callerOf(arg);
-      if (body.length === 4) { fired.push(body[3]); return new Uint8Array(0); }
+      const { fromHost, body } = callerOf(arg);
       const { op, args: p } = readOp(body);
-      if (op === "arm") {
-        const request = u32x2(p[1], p[0]);
-        return host.call("timer/arm", request).then(() => new Uint8Array(0));
+      if (fromHost && op === "wake") {
+        if (armedId !== null) fired.push(armedId);
+        armedId = null;
+        return new Uint8Array(0);
       }
-      if (op === "clear") { return host.call("timer/clear", new Uint8Array(0)).then(() => new Uint8Array(0)); }
+      if (op === "arm") {
+        armedId = p[0];
+        return host.call("timer/arm", new Uint8Array([0, 0, 0, p[1]])).then(() => new Uint8Array(0));
+      }
+      if (op === "clear") {
+        armedId = null;
+        return host.call("timer/clear", new Uint8Array(0)).then(() => new Uint8Array(0));
+      }
       if (op === "fired") return new Uint8Array(fired);
       return new Uint8Array(0);
     }
@@ -1196,8 +1201,7 @@ ${guestOpFraming()}
   ok(fired.length === 1 && fired[0] === 7,
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
-  // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
-  // it back: the tag is opaque content, not a host-side timer id.
+  // Re-arming replaces the deadline rather than adding one, and `clear` takes it back.
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("clear", new Uint8Array([9])));
@@ -1229,7 +1233,7 @@ ${guestOpFraming()}
       armed = o.hostCall;
       return {
         call: async (p) => {
-          entries.push(p.length === 36 ? "timer" : "invoke");
+          entries.push(isWake(p) ? "timer" : "invoke");
           return new Uint8Array();
         },
         dispose() {},
@@ -1240,7 +1244,7 @@ ${guestOpFraming()}
   const stubApp = await stub.install(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
-  const pending = new Uint8Array([0, 0, 0, 5, 0, 0, 0, 1]);
+  const pending = new Uint8Array([0, 0, 0, 5]);
   await armed("timer/arm", pending, new CallBudget(Infinity, undefined, undefined));
   ok(stub.uninstall("ticker") === true, "the app uninstalls with a deadline still pending");
   await sleep(80);

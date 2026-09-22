@@ -124,7 +124,7 @@ Install keeps the three disjoint: every host name contains `/`, a module name ma
 | `link/send` | `[linkId u32][bytes ..]` | (empty) |
 | `link/close` | `[linkId u32][graceful u8]` | (empty) |
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the peer claim map (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
-| `timer/arm` | `[ms u32][tag 4]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as `handle([32 zero bytes][tag 4])`. A realm that has spent its clock share has it slipped, not failed. |
+| `timer/arm` | `[ms u32]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as the `wake` host event (§12.2). A realm that has spent its clock share has it slipped, not failed. |
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a notification already handed to the realm is not retracted. |
 | *declared local service id* | opaque bytes; the host prepends the **caller's** 32-byte id | what the claimant's `handle` returned. Refused by name when nothing claims it. |
 
@@ -146,12 +146,13 @@ Each slot has **one** signing scope, derived once at load from admitted facts (`
 
 `node/sign` signs `domain ‖ scope ‖ msg`; `node/verify` checks a caller-named key's signature under the same prefix. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. Raw verification stays host-internal (`SeamCrypto`). The domain family is disjoint (§16.1). Every node running an app under the same label derives the same scope, whoever authored it. The format inside a scope — including the transport's `DOMAIN_channel` tag — is bundle content.
 
-#### Raw-link events
+#### Host events
 
-The driver delivers three events to the slot holding `link`, and only there. They are the `link` service's `events` list in `services/domains.ts`, beside its `calls`. Each arrives at the occupant's `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`services/op-frame.ts`); the envelope and field order are host ABI every link occupant must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
+The host enters a realm with its own events. A realm that armed a wake receives `wake` when it fires; the slot holding `link`, and only it, receives the three raw-link events, the `link` service's `events` list beside its `calls` in `services/domains.ts`. Each arrives at `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`services/op-frame.ts`); the envelope and field order are host ABI every guest that arms a wake, and every link occupant, must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
 
 | Event | `opLen` | `args`, in byte order | Return body |
 | --- | --- | --- | --- |
+| `wake` | 4 | none | ignored |
 | `linkOpen` | 8 | `[linkId u32][stream u8][listener text][dialed blob][remoteAddr text]` | ignored |
 | `linkBytes` | 9 | `[linkId u32][bytes blob]` | ignored; the driver awaits completion before admitting the next read on this link |
 | `linkClosed` | 10 | `[linkId u32]` | `[reason u8]`, bare; an absent, malformed or rejected answer reads as `0` |
@@ -179,7 +180,7 @@ The driver prints every reason but `clean` and `local` as `[transport] link N fr
 
 A guest runs as confined JS in a QuickJS realm (`host/safe-js.ts`) holding only the ECMAScript intrinsics and the injected preamble. It cannot name `fs`, `net`, `process` or `fetch`.
 
-- **One entrypoint.** `realm.call(bytes)` invokes the guest's `handle` with `[caller 32][body …]`. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, 32 zero bytes for the host itself, a timer and raw-link events. The body format is the callee's. A guest declares `handle`; nothing else is ever invoked.
+- **One entrypoint.** `realm.call(bytes)` invokes the guest's `handle` with `[caller 32][body …]`. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, 32 zero bytes for the host itself and its events (the wake and the raw-link events). The body format is the callee's. A guest declares `handle`; nothing else is ever invoked.
 - **Invocations are serialized per realm** (`host/realm-queue.ts`, shared by both targets): one invocation holds the queue until it completes or sets `__deferred`.
 - **Top-level evaluation** runs at install, before commit, while the seam refuses every name (§3.1).
 - **Disposal fails what is parked.** `Shell.close()`, uninstall and revoke dispose a slot's realm at once, rejecting every invocation still parked in it and freeing the engine on a later turn. A handle held past that rejects, naming the slot.
@@ -210,7 +211,7 @@ No operation name relaxes custody; a name may tighten what an owner admits (`fs/
 - **Deadline** — per entrypoint invocation: 5 s default, `guestDeadlineMs` / `--guest-timeout`. Admission resolves one absolute deadline, the tighter of the initiator's live remainder and the callee realm's ceiling. It begins **before** the realm queue and runs through guest execution, host-call waits, socket backlog and a deferred answer. Every `host.call` and cross-realm delivery carries the remainder. A queued invocation keeps its deadline and is rejected rather than given a fresh segment. Installation-time evaluation runs under the configured ceiling. `Infinity` disables a realm's local ceiling but cannot widen a finite deadline handed to it. Every reading is monotonic (`performance.now`). Both targets enforce it with QuickJS's interrupt handler; an interrupted guest throws and the realm survives.
 - **The link occupant's turns are its own** (`ownTurns`). A caller's remainder bounds the caller's wait and the time its request queues, but the occupant runs each invocation on its own ceiling, and a `link/deliver` answer resumes it as a new turn.
 - **Module calls** run under the calling segment's remaining time and are killed at the engine when it runs out (§4.3).
-- **One wake per realm.** The host retains at most one armed wake and one notification in flight, each body exactly `[32 zero bytes][tag 4]`. A due successor waits for the previous wake invocation to settle. Replacement is transactional, clear cancels, disposal closes permanently; none retracts a notification already handed over. A wake handler must return before waiting for work that needs another wake.
+- **One wake per realm.** The host retains at most one armed wake and one notification in flight, each the fixed `wake` event. The guest reads its own clock to find what is due. A due successor waits for the previous wake invocation to settle. Replacement is transactional, clear cancels, disposal closes permanently; none retracts a notification already handed over. A wake handler must return before waiting for work that needs another wake.
 - **Clock share for self-initiated work.** Each timer fire receives a host-only causal clock, restored whenever that root's continuations run and carried through host calls, module calls, `link/deliver` and cross-realm calls, awaited or not. It debits **execution**: QuickJS segments, the measured CPU of module calls, and the synchronous span of host-service calls; time parked on I/O is free. A realm banks one invocation's budget and earns credit at `1 / SELF_INITIATED_CLOCK_DIVISOR` (twice `DEFAULT_MAX_APP_SLOTS`). A wake due with the share spent is **slipped**, never failed or dropped. Attribution is per turn: roots live in one realm share its account. A full node's summed self-initiated execution is at most half a CPU after the initial bank (`tests/verify-hardening.mjs`).
 - **Outstanding host calls** — at most 256 unresolved calls and 16 MiB of copied input per realm (`DEFAULT_MAX_OUTSTANDING_HOST_CALLS`, `DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES`), plus a response's bytes while it coexists with its request. The id, count slot and width are admitted together, before the copy leaves QuickJS. A response is charged when it is delivered. Release paths: settlement, the handoff deadline, disposal (which also clears their armed deadlines).
 - **The realm-entry queue** has no depth of its own: every entry borrows its bytes and population from a bounded upstream owner (the driver's inbound window, the calling realm's call registry, an explicit host owner) and keeps its admission deadline.
@@ -331,7 +332,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 #### Framing
 
 - Node↔node over TCP: a length prefix. Browser↔node: RFC 6455 in `ws.wasm` over the same TCP socket. Platform `WebSocket` and `RTCDataChannel`: whole messages as delivered.
-- Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and the host-resolved `MAX_FRAME_BYTES` after. `raiseCap()` lands once msg4's step has run; until then framers take one message at a time.
+- Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and `maxFrameBytes` (`MAX_FRAME_BYTES` by default) after. `raiseCap()` lands once msg4's step has run; until then framers take one message at a time.
 - `ByteParts` merges slices below 8 KiB (`MERGE_BELOW`) into a doubling tail buffer and keeps larger slices as they arrived. The WebSocket framer serializes `push`.
 
 #### Handshake
@@ -406,6 +407,7 @@ Measured behaviour: `tests/transport-load.test.mjs`.
 
 The host driver keeps its own coarse bounds beneath the transport's, on structures a socket costs the moment it is accepted:
 
+- **`MAX_LINK_READ_BYTES` (2 MiB)** caps one read handed to the occupant — a platform-framed message whole — and fails the link past it, before the copy into the realm. The occupant's frame cap must fit under it. The byte windows below are sized in it.
 - **`DEFAULT_MAX_RAW_LINKS` (4096)** bounds the link table on the one path that mints a link id, and **refuses** rather than evicts (`TransportHostOptions.maxRawLinks`).
 - **`MAX_INBOUND_HOLD_BYTES` / `MAX_INBOUND_HOLD_SLICES`** are one driver-wide budget for reads admitted toward the transport realm, charged while held and while dispatched. The link whose next read crosses a ceiling is failed; reservations release when the dispatched call settles or held input is dropped. The native reader goroutine charges the same ceiling again on its staging copy and **waits** instead of failing, so native inbound memory is bounded at twice this figure.
 - **`MAX_QUEUED_SIGNAL_BYTES` (4 MiB) / `MAX_QUEUED_SIGNALS` (256)** bound the one ordered WebRTC signaling lane, node-wide; overflow **drops** the newcomer. Per peer, `MAX_PENDING_ICE_BYTES` (256 KiB) and `MAX_PENDING_ICE_CANDIDATES` (256); across peers, `MAX_UNESTABLISHED_PEERS` (256), each entry reaped by `UNESTABLISHED_PEER_TTL_MS` unless it both connects and binds a data channel.

@@ -23,7 +23,7 @@
 //   OP_BASE64     (4) args [bytes]       → base64(bytes)
 
 // The ABI ops, handshake GUID and scratch caps live beside this module in
-// assembly/ws/abi.ts (sized to MAX_FRAME_BYTES from net-limits.ts plus header/mask
+// assembly/ws/abi.ts (sized to MAX_FRAME_BYTES from scripts/transport-config.mjs plus header/mask
 // overhead — the two codecs must cap identically).
 import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "./abi";
 

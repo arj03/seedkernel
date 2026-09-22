@@ -1,5 +1,5 @@
 // One replaceable wake per realm (§12.3). Deadline tables belong in the guest heap.
-import { concatBytes } from "../services/util.js";
+import { OpArgs } from "../services/op-frame.js";
 import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "./wasm-limits.js";
 import { HOST_CALLER_ID, type HostTimers } from "./guest-seam.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
@@ -9,11 +9,15 @@ export interface RealmTimers extends HostTimers {
   clearAll(): void;
 }
 
-/** At most one armed notification and one in flight, each a caller id plus four opaque
- *  bytes. A due successor waits for the previous invocation to settle. This bounds host
- *  retention even when the guest defers its answer and repeatedly arms another wake.
- *  Clear/replacement cannot retract a notification already handed to the realm; its
- *  guest-owned tag lets content recognize that case without host-side timer ids. */
+/** Every wake arrives as the host's caller id and the `wake` event, no args. Built per fire:
+ *  the realm owns what it is handed. */
+const wakeBody = (): Uint8Array => new OpArgs("wake").build(HOST_CALLER_ID);
+
+/** At most one armed notification and one in flight, each the fixed wake event. A due
+ *  successor waits for the previous invocation to settle. This bounds host retention even
+ *  when the guest defers its answer and repeatedly arms another wake. Clear/replacement
+ *  cannot retract a notification already handed to the realm; the guest reads its own
+ *  clock to find a wake with nothing due. */
 export function createRealmTimers(
   fire: (payload: Uint8Array, causalClock: CausalClock) => Promise<unknown> | void,
   budgetMs = DEFAULT_GUEST_DEADLINE_MS,
@@ -48,11 +52,10 @@ export function createRealmTimers(
     if (live && live.timer === undefined) live.attempt();
   };
   return {
-    arm(ms, tag) {
+    arm(ms) {
       if (disposed) throw new Error("guest: wake disposed");
-      if (!Number.isInteger(ms) || ms < 0 || ms > 0x7fffffff || tag.byteLength !== 4)
-        throw new Error("guest: wake requires a delay in 0..2147483647 and a four-byte tag");
-      const body = concatBytes([HOST_CALLER_ID, tag]);
+      if (!Number.isInteger(ms) || ms < 0 || ms > 0x7fffffff)
+        throw new Error("guest: wake requires a delay in 0..2147483647");
       clear();
       const entry = { timer: undefined as ReturnType<typeof setTimeout> | undefined, attempt: () => {
         if (live !== entry) return;
@@ -66,7 +69,7 @@ export function createRealmTimers(
         live = undefined;
         firing = true;
         let handed: Promise<unknown> | void;
-        try { handed = fire(body, newCausalClock()); } catch { handed = undefined; }
+        try { handed = fire(wakeBody(), newCausalClock()); } catch { handed = undefined; }
         if (handed) void handed.then(release, release);
         else release();
       } };
