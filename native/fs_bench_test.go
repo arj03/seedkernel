@@ -1,6 +1,6 @@
 package main
 
-// fs.* perf for the Go loader — the storage hot path, where a holder turns every FETCH
+// fs.* perf for the native binary — the storage hot path, where a holder turns every FETCH
 // into fs.get → os.ReadFile and every STORE into fs.put → os.WriteFile, one ~64 KB block
 // at a time (§27). Timed at two levels:
 //
@@ -13,7 +13,7 @@ package main
 // and stat-ing every block (store-fs.ts), so that O(N) scan is a node-startup cost, not a
 // per-request one. The sweep over directory size shows its scaling.
 //
-// Loader-internal numbers: node uses node:fs, so there is no byte-identical twin to
+// Native-internal numbers: node uses node:fs, so there is no byte-identical twin to
 // compare against.
 //
 //	go test -run x -bench 'BenchmarkNodeFs|BenchmarkFs' -benchmem ./...

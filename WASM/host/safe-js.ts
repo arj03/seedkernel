@@ -1,7 +1,7 @@
 // Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus the shared preamble's
 // three host functions. The preamble's `__start` reports each invocation's answer through
 // `__callDone`/`__callFail`, and every `__host_call` parks and settles via
-// `__resolveHostCall`/`__rejectHostCall` — the contract the native loader implements too.
+// `__resolveHostCall`/`__rejectHostCall` — the contract the native binary implements too.
 // Invocations are serialized (realm-queue.ts).
 
 import {
@@ -18,9 +18,9 @@ import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_REALM_MEMORY_BYTES,
-} from "../core/wasm-limits.js";
-import { errMessage } from "../core/util.js";
-// The in-repo quickjs-ng build (quickjs/): the same v0.16.2 the native loader compiles,
+} from "./wasm-limits.js";
+import { errMessage } from "../services/util.js";
+// The in-repo quickjs-ng build (quickjs/): the same v0.16.2 the native binary compiles,
 // emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
 // Only the non-Asyncify (sync) flavour is needed — net is a real Promise resolved by the
 // host, not an Asyncify stack unwind. The cast bridges the ESM variant's typing gap.
@@ -29,7 +29,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModuleFromVariant>[0]
 >;
 
-// The guest-side ABI, shared with the native loader. See `guestPreamble` for the
+// The guest-side ABI, shared with the native binary. See `guestPreamble` for the
 // `__start` / `__host_call` contract this file implements.
 import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {

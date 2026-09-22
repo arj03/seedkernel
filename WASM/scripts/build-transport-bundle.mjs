@@ -97,18 +97,18 @@ async function main() {
 // selects this transport; live changes install over it by naming its current slot.
 // A rebuild with a different key selects a new author. The ML-DSA half derives
 // from the same seed, so one key file holds the whole identity.
-import { fromBase64 } from "../core/util.js";
+import { fromBase64 } from "../services/util.js";
 /** The local service id this bundle claims under \`services\` — what the CLI and an embedder
  *  hand to \`Shell.call\`. Emitted with the blob it belongs to rather than known to the
- *  loader: a REPLACEMENT transport may spell it differently, and then its entry is the one
+ *  host: a REPLACEMENT transport may spell it differently, and then its entry is the one
  *  the host reaches. */
 export const TRANSPORT_SERVICE = "${TRANSPORT_SERVICE}";
 const TRANSPORT_BUNDLE_B64 = "${b64}";
 let decoded: Uint8Array | null = null;
 /** The artifact-shipped transport bundle as raw bytes (§12.6) — the shape every
  *  consumer of this artifact wants, instead of the b64 string and a hand-rolled
- *  atob loop. A fresh copy per call; the blob is a value callers may hand to the
- *  bundle loader, which does not mutate it but is not relied on either.
+ *  atob loop. A fresh copy per call; the blob is a value callers may hand to
+ *  install, which does not mutate it but is not relied on either.
  *
  *  The b64 behind it is module-private on purpose: an exported const carries the
  *  whole blob into the declaration file as a literal type, so every downstream tsc

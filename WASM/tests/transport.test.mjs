@@ -5,11 +5,11 @@
 // and the refusals it owes its callers.
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
-import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
-import { parsePeerRef, parseDest, peersConfig } from "../build/host/peer-addr.js";
+import { MAX_FRAME_BYTES } from "../build/services/net-limits.js";
+import { parsePeerRef, parseDest, peersConfig } from "../build/services/peer-addr.js";
 import { testkit } from "./testkit.mjs";
 import { readFileSync } from "node:fs";
-import { toHex } from "../build/core/util.js";
+import { toHex } from "../build/services/util.js";
 import { createSafeRealm } from "../build/host/safe-js.js";
 
 const { test, assert, summary } = testkit();
@@ -84,7 +84,7 @@ test("a truncated frame decodes to nothing rather than reading past its end", ()
 });
 
 // The one cross-artifact coupling in the frame path, checked rather than documented:
-// `MAX_FRAME_BYTES` (host, core/net-limits.ts) is a floor under the module's compiled
+// `MAX_FRAME_BYTES` (host, services/net-limits.ts) is a floor under the module's compiled
 // scratch, and raising the cap past it fails nothing at build time — TCP keeps carrying
 // the frame while WS tears the link down on the first big one. Red here, naming the rebuild.
 test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () => {
@@ -163,7 +163,7 @@ test("peer refs: a malformed secret is rejected, not silently ignored", () => {
 test("peer refs: a malformed destination fails at the reference, not at the dial", () => {
   // Both dispositions of the ONE parser: a human's reference throws where the typo is,
   // while a socket factory handed something it cannot route answers `null`, which the
-  // driver reads as "no route" (core/socket-seam.ts).
+  // driver reads as "no route" (services/socket-seam.ts).
   for (const bad of [`${PK}@host`, `${PK}@host:0`, `${PK}@host:70000`, `${PK}@:9`]) {
     let threw = false;
     try { parsePeerRef(bad, "tcp"); } catch { threw = true; }

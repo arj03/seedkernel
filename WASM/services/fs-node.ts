@@ -1,9 +1,9 @@
-// Node backend for the `fs.*` capability (exported as `seedkernel-wasm/fs-node`): one flat
+// Node backend for the `fs` service (exported as `seedkernel-wasm/fs-node`): one flat
 // file per key under a directory, no nested paths. Content-addressing and quota are the
 // app's, layered on top.
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-// The seam is async (core/fs.ts), so this backend is genuinely async rather than sync
+import { mkdirSync } from "node:fs";
+// The seam is async (services/fs.ts), so this backend is genuinely async rather than sync
 // calls in an async wrapper: a node serving requests should not block its only thread on
 // a disk read. `mkdirSync` is the exception and stays sync — it runs once, in the
 // constructor, where there is no promise to return.
@@ -12,33 +12,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { Fs, FsStat } from "../core/fs.js";
-import { FS_AVAILABLE_UNKNOWN } from "../core/fs.js";
-import type { CliFiles } from "./cli.js";
-
-/** Write a whole file or none: a temp beside the target, then a rename onto it. A bare
- *  `writeFileSync` truncates in place, so a crash mid-write leaves a partial file that the
- *  next boot reads as something else entirely. Sync, because what it writes is boot-time
- *  state a node cannot start without: the key file and the freshness marks. */
-function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
-  renameSync(tmp, path);
-}
-
-/** This platform's `CliFiles` (cli.ts), for the operator flow (main-node.ts) and the
- *  freshness store (shell-node.ts). Only a missing file reads as `null`, as natively: an
- *  unreadable one throws, or the `--key` first-boot branch would write over it. */
-export const nodeFiles: CliFiles = {
-  readFile(path) {
-    try { return new Uint8Array(readFileSync(path)); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
-      throw e;
-    }
-  },
-  writeFile: writeFileAtomic,
-};
+import type { Fs, FsStat } from "./fs.js";
+import { FS_AVAILABLE_UNKNOWN } from "./fs.js";
 
 export class NodeFs implements Fs {
   private used = 0;
@@ -85,7 +60,7 @@ export class NodeFs implements Fs {
     return result;
   }
 
-  /** Which keys are representable is `isSafeFsKey` (core/fs.ts), applied over every backend
+  /** Which keys are representable is `isSafeFsKey` (services/fs.ts), applied over every backend
    *  by `validatedFs` — not restated here, because a backend's copy of that rule is how key
    *  spaces start differing between targets. What this adds is containment: a key that got
    *  this far while still holding a separator would escape `dir`. */

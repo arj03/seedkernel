@@ -1,5 +1,4 @@
-import { fromHex, toHex, isHex64 } from "../core/util.js";
-import type { JsonObject } from "./bundle.js";
+import { fromHex, toHex, isHex64, type JsonObject } from "./util.js";
 
 // ── the `pk[.secret]@dest` grammar ────────────────────────────────────────────
 //
@@ -16,7 +15,7 @@ export type DestScheme = "tcp" | "ws" | "wss";
 
 /** A destination taken apart: `scheme://host:port[/path]`. `null` rather than a throw for
  *  anything malformed, because the caller is a `ChannelFactory.connect` whose answer for an
- *  unroutable destination is "no route" and not an exception (core/socket-seam.ts). */
+ *  unroutable destination is "no route" and not an exception (services/socket-seam.ts). */
 export function parseDest(dest: string): { scheme: DestScheme; host: string; port: number; path?: string } | null {
   const sep = dest.indexOf("://");
   if (sep < 0) return null;

@@ -9,36 +9,36 @@
       "default": "./build/host/crypto-node.js"
     },
     "./net-node": {
-      "types": "./build/host/net-node.d.ts",
-      "default": "./build/host/net-node.js"
+      "types": "./build/services/net-node.d.ts",
+      "default": "./build/services/net-node.js"
     },
     "./peer-addr": {
-      "types": "./build/host/peer-addr.d.ts",
-      "default": "./build/host/peer-addr.js"
+      "types": "./build/services/peer-addr.d.ts",
+      "default": "./build/services/peer-addr.js"
     },
     "./net-rtc": {
-      "types": "./build/host/net-rtc.d.ts",
-      "default": "./build/host/net-rtc.js"
+      "types": "./build/services/net-rtc.d.ts",
+      "default": "./build/services/net-rtc.js"
     },
     "./net-ws": {
-      "types": "./build/host/net-ws.d.ts",
-      "default": "./build/host/net-ws.js"
+      "types": "./build/services/net-ws.d.ts",
+      "default": "./build/services/net-ws.js"
     },
     "./fs": {
-      "types": "./build/core/fs.d.ts",
-      "default": "./build/core/fs.js"
+      "types": "./build/services/fs.d.ts",
+      "default": "./build/services/fs.js"
     },
     "./op-frame": {
-      "types": "./build/core/op-frame.d.ts",
-      "default": "./build/core/op-frame.js"
+      "types": "./build/services/op-frame.d.ts",
+      "default": "./build/services/op-frame.js"
     },
     "./fs-memory": {
-      "types": "./build/host/fs-memory.d.ts",
-      "default": "./build/host/fs-memory.js"
+      "types": "./build/services/fs-memory.d.ts",
+      "default": "./build/services/fs-memory.js"
     },
     "./fs-node": {
-      "types": "./build/host/fs-node.d.ts",
-      "default": "./build/host/fs-node.js"
+      "types": "./build/services/fs-node.d.ts",
+      "default": "./build/services/fs-node.js"
     },
     "./guest-seam": {
       "types": "./build/host/guest-seam.d.ts",
@@ -78,9 +78,9 @@
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
     "build:host": "node scripts/prune-build.mjs && tsc -p .",
     "build:host:min": "node scripts/minify.mjs",
-    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,isService,toHex,fromHex,freshnessPathFor,fs,sodium,deriveNodeKey,verifyBundle,validateManifest,transportBundleBytes,linkSignScope,HOST_SERVICES,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,SUITE_MANIFEST_HYBRID_PQ\" build/host/native-polyfills.js build/core/util.js build/core/op-frame.js build/core/domains.js build/core/wasm-limits.js build/core/net-limits.js build/core/fs.js build/core/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/host/realm-timers.js build/host/fs-view.js build/host/slot-table.js build/core/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/host/peer-addr.js build/host/cli.js build/host/native-shim.js",
-    "build:loader-wasm": "npm run build:ws && npm run build:browser-sodium && npm run build:pq && node scripts/copy-loader-wasm.mjs",
-    "build:loader": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
+    "build:native-host": "node scripts/bundle-native-host.mjs ../native/host-shell.gen.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,isService,toHex,fromHex,freshnessPathFor,fs,sodium,deriveNodeKey,verifyBundle,validateManifest,transportBundleBytes,linkSignScope,HOST_SERVICES,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,SUITE_MANIFEST_HYBRID_PQ\" build/host/native-polyfills.js build/services/util.js build/services/op-frame.js build/services/domains.js build/host/wasm-limits.js build/services/net-limits.js build/services/fs.js build/services/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/host/realm-timers.js build/host/fs-view.js build/host/slot-table.js build/services/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/services/peer-addr.js build/host/cli.js build/host/native-shim.js",
+    "build:native-wasm": "npm run build:ws && npm run build:browser-sodium && npm run build:pq && node scripts/copy-native-wasm.mjs",
+    "build:native": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:native-host && npm run build:native-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build:pq": "node scripts/build-mldsa.mjs && node scripts/build-mlkem.mjs",
     "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host:min",

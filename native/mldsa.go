@@ -1,4 +1,4 @@
-// mldsa.go — ML-DSA-65 (FIPS 204) for the native loader: the PQ half of manifest suite
+// mldsa.go — ML-DSA-65 (FIPS 204) for the native binary: the PQ half of manifest suite
 // 0x02 (§12.4, §14.1).
 //
 // Deliberately NOT a Go implementation. It drives wasm/mldsa65.wasm — the same artifact the
@@ -14,7 +14,7 @@ import (
 	_ "embed"
 	"fmt"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -37,8 +37,8 @@ type mldsa struct {
 
 var md *mldsa // the process-wide ML-DSA-65 instance (manifest suite 0x02)
 
-// bootMlDsa instantiates mldsa65.wasm and binds the exports the loader uses. Verification
-// is all it needs: signing manifests is a build-side job, and a loader that cannot sign
+// bootMlDsa instantiates mldsa65.wasm and binds the exports the binary uses. Verification
+// is all it needs: signing manifests is a build-side job, and a binary that cannot sign
 // cannot be turned into a signing oracle (§12.4).
 func bootMlDsa(rt wazero.Runtime) *mldsa {
 	m := newWasmModule(rt, "mldsa65", mldsaWasm, map[string]uint64{

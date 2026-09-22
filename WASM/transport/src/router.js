@@ -113,11 +113,11 @@ class ReqRes {
    *  `proto` and `payload` are BORROWED views of the calling app's argument bytes: `buildReq`
    *  is their only reader and must stay the first thing this does, ahead of any await.
    *
-   *  The kernel owns the caller's TIME and no field here can name it. What this arms is the
+   *  The host owns the caller's TIME and no field here can name it. What this arms is the
    *  transport's own retention bound on the correlation it just opened — the same kind of
    *  bound `handshakeTimeoutMs` puts on a half-open link and `linkIdleTimeoutMs` on a silent
    *  one, and the pending map is the last waiting state that had none. It cannot EXTEND the
-   *  kernel's deadline. When shorter it leaves the caller time to try another peer; when
+   *  host's deadline. When shorter it leaves the caller time to try another peer; when
    *  longer it only cleans this correlation after the caller has expired. That cleanup still
    *  matters because a peer that vanished mid-link sends no close for anything else to notice
    *  (§16.1). A frame no link took is another matter: nothing will ever answer it, so it

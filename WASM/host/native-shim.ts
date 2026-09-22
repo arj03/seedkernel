@@ -1,32 +1,32 @@
-// The native loader's platform seam (§12.9): Go supplies primitives — pure modules over
+// The native binary's platform seam (§12.9): Go supplies primitives — pure modules over
 // wazero, libsodium, an `fs` directory, TCP sockets, a confined QuickJS realm per app — and
 // this file adapts them to the interfaces `bootShell` consumes, then hands them to it. Go
 // runs it inside QuickJS, bundled with every module it imports into
-// native/host-shell.gen.js by scripts/bundle-loader.mjs.
+// native/host-shell.gen.js by scripts/bundle-native-host.mjs.
 import { policyFromJson } from "./policy.js";
 import { type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
-import { parseDest } from "./peer-addr.js";
+import { parseDest } from "../services/peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
 import { CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
-import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
+import { LISTENER, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
   TCP_LINGER_MS,
-} from "../core/net-limits.js";
-import type { Keypair } from "../core/subkeys.js";
-import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
+} from "../services/net-limits.js";
+import type { Keypair } from "../services/subkeys.js";
+import { FS_AVAILABLE_UNKNOWN, type Fs } from "../services/fs.js";
 import {
   DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_REALM_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
-} from "../core/wasm-limits.js";
-import { enc, errMessage } from "../core/util.js";
+} from "./wasm-limits.js";
+import { enc, errMessage } from "../services/util.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
  *  The answer is always `null`: every call parks, Go holds the guest's Promise under
@@ -94,7 +94,7 @@ declare const __sodium: {
 
 /** The crypto surface this target serves: `ShellSodium` plus the two keypair producers a
  *  node's identity comes out of. `crypto_generichash` is restated with its key optional,
- *  which is what satisfies both halves of `ShellSodium` at once: the loader calls it with an
+ *  which is what satisfies both halves of `ShellSodium` at once: the host calls it with an
  *  explicit `null` key and the guest seam calls it with two arguments. */
 export interface NativeSodium extends ShellSodium {
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
@@ -134,13 +134,13 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
   };
 }
 
-/** The one `sodium` this target has. Exported — and published as a global by the loader
+/** The one `sodium` this target has. Exported — and published as a global by the native host
  *  bundle — so the native tests drive the same wrapper production does. */
 export const sodium: NativeSodium = wrapNativeSodium(__sodium);
 
 /** The `fs.*` primitive over Go's data directory (native/fs.go), declared with its real,
  *  **synchronous** shape: Go answers a read in the call, and qjs has no promise primitive
- *  to hand back anyway. The seam the shared code consumes is async (`Fs`, core/fs.ts), so
+ *  to hand back anyway. The seam the shared code consumes is async (`Fs`, services/fs.ts), so
  *  the adaptation happens here — Go grows with primitives, never with logic. */
 declare const __fs: {
   /** Point the backend at a data directory, creating it if needed. Late-bound because which
@@ -172,7 +172,7 @@ export const fs: Fs = {
   async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
   async delete(key) { return __fs.delete(key); },
   // Go answers -1 when it cannot ask the OS for free space; the sentinel a guest reads is
-  // the seam's (core/fs.ts), so it cannot differ by backend.
+  // the seam's (services/fs.ts), so it cannot differ by backend.
   async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
@@ -468,7 +468,7 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
 function nativeCliHost(): CliHost {
   return {
     ...files,
-    banner: "seedkernel-loader",
+    banner: "seedkernel-native",
     argv: JSON.parse(bridge.argv()) as string[],
     log(line) { bridge.log(line); },
     stdout(bytes) { bridge.stdout(bytes); },

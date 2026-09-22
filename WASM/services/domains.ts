@@ -54,7 +54,7 @@ export const LINK_EVENTS = HOST_SERVICES.link.events;
 export type LinkEvent = (typeof LINK_EVENTS)[number];
 /** The full `service/call` vocabulary as a template-literal union — what the dispatch
  *  table's keys are typed against (guest-seam.ts `HandlerKey`). */
-export type CapabilityName = {
+export type HostMethod = {
   [S in ServiceName]: `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
 }[ServiceName];
 /** Whether a name is a host SERVICE — the vocabulary a manifest's `guest.requires` may

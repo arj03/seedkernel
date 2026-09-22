@@ -16,8 +16,8 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadCrypto } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { runCli, parseArgs, parseHex32, loadedLine, DEFAULT_DIR, DEFAULT_KEY } = await imp("build/host/cli.js");
-const { deriveNodeKey } = await imp("build/core/subkeys.js");
-const { toHex } = await imp("build/core/util.js");
+const { deriveNodeKey } = await imp("build/services/subkeys.js");
+const { toHex } = await imp("build/services/util.js");
 
 const { ok, throws, summary } = testkit();
 const work = mkdtempSync(join(tmpdir(), "seedkernel-cli-"));
@@ -186,7 +186,7 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
 // The Node binding keeps that contract, as native does (fs-node.ts `nodeFiles`). A
 // directory at the path is a portable read failure that cannot be mistaken for ENOENT.
 {
-  const { nodeFiles } = await imp("build/host/fs-node.js");
+  const { nodeFiles } = await imp("build/host/shell-node.js");
   ok(nodeFiles.readFile(join(work, "never-written")) === null, "Node: only a missing file reads as absent");
   const keyDir = mkdtempSync(join(work, "keydir-"));
   throws(() => nodeFiles.readFile(keyDir), "Node: a path that exists and cannot be read throws");

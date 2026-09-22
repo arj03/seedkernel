@@ -1,7 +1,7 @@
 // The quickjs-emscripten "variant" for the in-repo quickjs-ng 0.16.2 build.
 // This is the same shape @jitl/quickjs-ng-wasmfile-release-sync exposes; see
 // build-quickjs-ng.sh for how the engine is built. The engine is the only
-// piece of the old @jitl package that differed from the native loader's —
+// piece of the old @jitl package that differed from the native binary's —
 // the JS API layer (quickjs-emscripten-core) is shared with the npm variant.
 export default {
   type: "sync",

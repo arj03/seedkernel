@@ -1,5 +1,5 @@
-// What the generated loader bundle was made FROM: the in-repo sources behind it, and what
-// each hashed to when it was written. bundle-loader.mjs stamps the answer into
+// What the generated native host bundle was made FROM: the in-repo sources behind it, and what
+// each hashed to when it was written. bundle-native-host.mjs stamps the answer into
 // native/host-shell.gen.js; the Go side re-hashes the same files and refuses an artifact
 // whose sources have moved on (native/shell_stamp_test.go).
 //
@@ -14,7 +14,7 @@
 // bundle. The generators are deliberately absent — editing one is an edit whose whole point
 // was to run it.
 //
-// The stamp is a statement about `npm run build:loader`, which rebuilds the chain in
+// The stamp is a statement about `npm run build:native`, which rebuilds the chain in
 // order (ws.wasm → transport bundle → tsc → this). Running one sub-step of that by hand can
 // stamp a source the artifact did not really pick up; the answer is to run the whole thing.
 import { createHash } from "node:crypto";
@@ -27,7 +27,7 @@ const wasmDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const posix = (p) => p.split(sep).join("/");
 
-/** Sources for one bundle-loader input list, as WASM-relative posix paths, sorted.
+/** Sources for one bundle-native-host input list, as WASM-relative posix paths, sorted.
  *  `build/x/y.js` is tsc's output for `x/y.ts`; host/transport-bundle.ts is itself
  *  generated, so the guest parts and the ws module stand in for it. */
 export function stampedSources(buildFiles) {
@@ -44,7 +44,7 @@ export function stampedSources(buildFiles) {
   return [...new Set([...ts, ...guest, ...ws, "scripts/transport-config.mjs"])].sort();
 }
 
-/** `{ "core/util.ts": "<sha256 hex>", ... }` — the stamp itself. */
+/** `{ "services/util.ts": "<sha256 hex>", ... }` — the stamp itself. */
 export function sourceStamp(buildFiles) {
   const out = {};
   for (const p of stampedSources(buildFiles)) {

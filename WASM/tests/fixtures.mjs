@@ -36,15 +36,15 @@ export const withTestBudget = (seam) => (name, payload) =>
 export const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 export const TEST_CALLS = { call: () => null };
-export const { callerOf, readOp, writeOp } = await imp("build/core/op-frame.js");
-export const { MemoryFs } = await imp("build/host/fs-memory.js");
+export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
+export const { MemoryFs } = await imp("build/services/fs-memory.js");
 export const enc = new TextEncoder();
-export const { NodeFs } = await imp("build/host/fs-node.js");
+export const { NodeFs } = await imp("build/services/fs-node.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");
-export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/core/util.js");
+export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
 export { bytesEqual } from "./bytes.mjs";
 
-// The loader's admission step (§12.4) — tests drive the SAME code path a bundle load does
+// Install's admission step (§12.4) — tests drive the SAME code path a bundle load does
 // rather than a parallel copy of it.
 export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");

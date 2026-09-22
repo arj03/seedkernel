@@ -1,5 +1,5 @@
 // Named-op envelope for the kernel's raw-link event ABI and optional application framing.
-// Event names live in core/domains.ts; their byte layouts are documented in RUNTIME §12.2.
+// Event names live in services/domains.ts; their byte layouts are documented in RUNTIME §12.2.
 // The three functions below are serialized by bundle-author.ts's `guestOpFraming` for
 // import-free guests, and the transport assembler injects that source before signing — so
 // they must reference nothing outside themselves, not even this file's imports. The type

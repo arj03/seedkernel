@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -232,7 +232,7 @@ func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 // ───────────────────────── the crypto ops ─────────────────────────
 
 // genericHash is native Go BLAKE2b (see the file header) and the one system hash: the
-// content-address block-id, the guest `HASH` op and the loader's genesis hash (§12.4) all
+// content-address block-id, the guest `HASH` op and the host's genesis hash (§12.4) all
 // route here. This build computes only the UNKEYED 32-byte digest; any other length is
 // rejected loudly, because a quietly-wrong consensus-affecting hash is worse than a hard
 // failure. (Keyed hashing is rejected at the JS seam, where the key would be dropped.)

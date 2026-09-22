@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // The libc names no realm has. The host realm has a console, timers and text codecs of its
@@ -21,7 +21,7 @@ import (
 // confined realm has none of them (TestConfinedRealmCannotImportLibcModules).
 var (
 	libcNames     = []string{"os", "std", "bjson", "print", "navigator", "gc", "scriptArgs"}
-	loaderGlobals = []string{"console", "setTimeout", "TextEncoder", "TextDecoder"}
+	hostGlobals = []string{"console", "setTimeout", "TextEncoder", "TextDecoder"}
 )
 
 func requireUndefined(t *testing.T, c *qjs.Context, names []string) {
@@ -47,7 +47,7 @@ func TestRuntimesHaveNoLibcGlobals(t *testing.T) {
 		t.Fatal("qjs.New:", err)
 	}
 	defer bare.Close()
-	requireUndefined(t, bare.Context(), append(libcNames, loaderGlobals...))
+	requireUndefined(t, bare.Context(), append(libcNames, hostGlobals...))
 
 	bootRealm(t)
 	requireUndefined(t, qc, libcNames)

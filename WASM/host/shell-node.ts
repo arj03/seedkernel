@@ -7,18 +7,42 @@
 //
 // The operator's side — flags, defaults, boot sequence, console lines — is `cli.ts`, which
 // every target runs; `main-node.ts` binds it to this platform.
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
-import { NodeChannelFactory } from "./net-node.js";
-import { NodeFs, nodeFiles } from "./fs-node.js";
-import { bootShell, type AppHandle, type InstallOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
-import { type Fs } from "../core/fs.js";
-import { freshnessStoreFor, type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
+import { NodeChannelFactory } from "../services/net-node.js";
+import { NodeFs } from "../services/fs-node.js";
+import { bootShell, type AppHandle, type InstallOptions, type Shell, type ShellSodium } from "./shell-core.js";
+import { type Fs } from "../services/fs.js";
+import { freshnessStoreFor, type CliFiles, type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
 
-/** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
+/** Write a whole file or none: a temp beside the target, then a rename onto it. A bare
+ *  `writeFileSync` truncates in place, so a crash mid-write leaves a partial file that the
+ *  next boot reads as something else entirely. Sync, because what it writes is boot-time
+ *  state a node cannot start without: the key file and the freshness marks. */
+function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
+  renameSync(tmp, path);
+}
+
+/** This platform's `CliFiles` (cli.ts), for the operator flow (main-node.ts) and the
+ *  freshness store below. Only a missing file reads as `null`, as natively: an
+ *  unreadable one throws, or the `--key` first-boot branch would write over it. */
+export const nodeFiles: CliFiles = {
+  readFile(path) {
+    try { return new Uint8Array(readFileSync(path)); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw e;
+    }
+  },
+  writeFile: writeFileAtomic,
+};
+
+/** The Node-side Shell — the platform-neutral `Shell` plus a file-backed
  *  `installFile` and a guaranteed `fs` (Node always has a filesystem). */
-export interface NodeShell extends CoreShell {
+export interface NodeShell extends Shell {
   fs: Fs;
   /** Install a signed bundle *file*: read it from disk then delegate to `install`
    *  (§12.4), `opts.replaces` included — a file on disk is as ordinary a source for a
@@ -38,7 +62,7 @@ export interface NodeShellRuntime extends CliNodeRuntime {
 // realm), and a second copy of it would be the drift the assembly exists to remove.
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
  *  `bootShell` — which installs the selected transport bundle, the signed program that is
- *  the node's network (§12.6) — then wrap the core shell with the file-backed `installFile`. */
+ *  the node's network (§12.6) — then wrap its shell with the file-backed `installFile`. */
 export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> {
   const sodium = await loadCrypto();
   // ── Node platform seam ─────────────────────────────────────────────────────
@@ -46,7 +70,7 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
   const freshness = freshnessStoreFor(nodeFiles, opts.dir);
   // Everything a boot can fail on happens inside bootShell, which tears down what it stood
   // up when it throws, so this function has no partial state to clean.
-  const { shell: core, transport } = await bootShell({
+  const { shell: base, transport } = await bootShell({
     sodium: sodium as unknown as ShellSodium,
     identity: opts.identity,
     fs,
@@ -61,12 +85,12 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
   });
   // ── Node wrapper: add file-backed installFile ───────────────────────────────────
   const shell: NodeShell = {
-    ...core,
+    ...base,
     // This platform always supplies an fs (Node always has a filesystem), so the
     // optional seam member is non-null here.
-    fs: core.fs!,
+    fs: base.fs!,
     async installFile(file, opts) {
-      return core.install(new Uint8Array(readFileSync(file)), opts);
+      return base.install(new Uint8Array(readFileSync(file)), opts);
     },
   };
   return { shell, transport };

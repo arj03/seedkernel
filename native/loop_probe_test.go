@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // TestQjsPumpModel is the gate for the whole Go-owned async design. It verifies the two

@@ -2,12 +2,12 @@
 //   platform — per node (crypto, identity, clock)
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
-import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, type HostTransformName, type CapabilityName } from "../core/domains.js";
-import { type Fs } from "../core/fs.js";
+import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../services/util.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, type HostTransformName, type HostMethod } from "../services/domains.js";
+import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, monotonicMs, type CausalClock } from "./realm-queue.js";
-import type { Keypair } from "../core/subkeys.js";
+import type { Keypair } from "../services/subkeys.js";
 
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
@@ -38,7 +38,7 @@ export interface SeamCalls {
   call(id: string, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null;
 }
 
-/** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
+/** Raw-link service (§12.1): bytes over an opaque host-minted link id, plus the one
  *  call that goes the other way — `deliver`, which hands the host a request this occupant
  *  decoded off those links. Transport configuration arrives in `LOCAL`, the node's identity
  *  in `HOST`, and address-book updates as `addr` events. */
@@ -108,9 +108,9 @@ export interface SeamGrants {
   /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
    *  (`scopedFs`). Optional: a node that only initiates never reads it. */
   fs?: Fs;
-  /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for a bundle
+  /** The raw `link` service — sockets behind opaque link ids. Wired ONLY for a bundle
    *  that requires the `link` service, so nothing else can ever reach a descriptor
-   *  whatever is installed (§1, capability-by-non-wiring). */
+   *  whatever is installed (§1: an ungranted service is never wired). */
   rawNet?: RawNet;
   /** The platform's event loop. `names` decides whether this realm may reach it. */
   timers: HostTimers;
@@ -195,7 +195,7 @@ export class CallBudget {
  *  wrong for all of them alike. `budget` is the caller's segment, supplied by the realm. */
 export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>;
 
-export { HOST_TRANSFORM_NAMES } from "../core/domains.js";
+export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
 
 /** The `crypto/` members of the legacy host transform table, as a template literal over
  *  `HOST_TRANSFORM_NAMES`, so
@@ -204,12 +204,12 @@ export { HOST_TRANSFORM_NAMES } from "../core/domains.js";
 type CryptoName = `crypto/${HostTransformName}`;
 
 /** The keys the dispatch table must cover, typed so a name added to the vocabulary without
- *  a handler is a compile error, and so is a handler whose name the loader would refuse.
+ *  a handler is a compile error, and so is a handler whose name install would refuse.
  *
  *  Every one contains a `/`, which is load-bearing (§12.2): module names are held to
  *  `[A-Za-z0-9_-]`, so they cannot spell one of these — that is what lets the dispatch tell
  *  host names and module names apart by the name alone. */
-type HandlerKey = CapabilityName | CryptoName;
+type HandlerKey = HostMethod | CryptoName;
 
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
@@ -246,7 +246,7 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
 /** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
  *  entrypoint receives `[caller 32][body …]`. Application and local-service bodies use
  *  the callee's format and remain opaque to routing. The socket driver constructs
- *  raw-link event bodies using the kernel ABI in core/op-frame.ts (RUNTIME §12.2).
+ *  raw-link event bodies using the host ABI in services/op-frame.ts (RUNTIME §12.2).
  *
  *  Every realm factory drives `handle` through the preamble's `__start`, having installed
  *  the three host functions it calls out through: `__host_call`, `__callDone` and
@@ -391,10 +391,10 @@ export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): {
   };
 }
 
-/** The `link` capability's signing scope: `DOMAIN_link_scope`, signed by the
+/** The `link` service's signing scope: `DOMAIN_link_scope`, signed by the
  *  node's identity key. The suffix is the slot occupant's business and the host does not
  *  look at it — the transport bundle tags its own handshake format inside it, so changing
- *  that format is a bundle update and never a kernel change. Network separation belongs
+ *  that format is a bundle update and never a host change. Network separation belongs
  *  to the transport's signed handshake content (§12.6). */
 export function linkSignScope(key: Keypair): SignScope {
   return { domain: DOMAIN_LINK_SCOPE, scope: new Uint8Array(0), key };
@@ -532,7 +532,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     },
     // Inbound attributed delivery (§12.10), the one `link` name that carries something
     // INTO the node rather than out of it: `[claimLen u8][claim][attribution 32]
-    // [payload …]`. The attribution is fixed at the kernel's caller-id width — it IS
+    // [payload …]`. The attribution is fixed at the host's caller-id width — it IS
     // that field, filled with the authenticated sender — so nothing here is
     // length-delimited except the claim, and the payload simply runs to the end. One
     // request per call is what makes that safe.
@@ -589,7 +589,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // name THIS realm declared as a local service is another realm's, however it is
     // spelled: the id is an ordinary claim and may carry a `/` like any other, so
     // asking the declaration before the charset is what keeps one vocabulary from
-    // becoming two. It can never shadow a host method — the loader refuses a
+    // becoming two. It can never shadow a host method — install refuses a
     // `guest.calls` entry whose head is a known service (bundle.ts). The callee answers
     // on a later turn, never inside this guest's frame; an id nothing claims is refused
     // by name rather than parked on a promise no one will settle.

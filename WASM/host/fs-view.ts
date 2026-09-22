@@ -1,9 +1,9 @@
 // One app's view of an fs backend (§12.2): the key rule applied once, under that app's
-// scope prefix. The rule itself is a consensus predicate and lives in the core
-// (`isSafeFsKey`); this is the host applying it over whichever backend the target
+// scope prefix. The rule itself is a consensus predicate and lives with the `fs`
+// service (`isSafeFsKey`, services/fs.ts); this is the host applying it over whichever backend the target
 // supplied, so every host admits exactly the same key space — which is what decides the
 // contents a node stores and advertises.
-import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
+import { isSafeFsKey, isSafeFsScope, type Fs } from "../services/fs.js";
 
 /** Apply the key rule over a backend. Rejected keys throw; `list`/`stat` exempt.
  *  Sits under `scopedFs` so the composite `scope + key` is checked. */

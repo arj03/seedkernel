@@ -1,11 +1,11 @@
 // Defaults owned by the signed transport program. The build writes this object into
 // manifest.guest.config, so changing one changes the signed artifact rather than the
 // generic host that happens to load it.
-import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
+import { MAX_FRAME_BYTES } from "../build/services/net-limits.js";
 
 /** The local service id this composition claims under `services`: a co-resident guest's and
- *  the host's to reach, no peer's. This program's own choice with no kernel semantics, which
- *  is why it is emitted beside the blob rather than known to the loader. */
+ *  the host's to reach, no peer's. This program's own choice with no host semantics, which
+ *  is why it is emitted beside the blob rather than known to the host. */
 export const TRANSPORT_SERVICE = "_net";
 
 export const TRANSPORT_APP_CONFIG = Object.freeze({
@@ -19,7 +19,7 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   linkIdleTimeoutMs: 300_000,
   // How long one open correlation waits for its peer before the transport gives up on it.
   // A deployment whose invocation deadline is shorter than this should say so: an app can
-  // only route around a silent holder while it still has segment left. Otherwise its kernel
+  // only route around a silent holder while it still has segment left. Otherwise its host
   // deadline wins and this timer cleans the transport's correlation afterwards (§16.1).
   requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),

@@ -1,6 +1,6 @@
 package main
 
-// Perf benchmarks for the Go loader's crypto primitives, to compare runtime-to-runtime
+// Perf benchmarks for the native binary's crypto primitives, to compare runtime-to-runtime
 // against node. Ed25519 verify runs on native/wasm/libsodium.wasm under wazero — the same
 // wasm node runs under V8; BLAKE2b is native Go (see sodium.go). The node counterpart for
 // BLAKE2b is the block-ids line of seedstore's WASM/tests/bench.mjs.

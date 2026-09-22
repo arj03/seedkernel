@@ -2,8 +2,8 @@
 // Test infrastructure, so it stays out of the shared bundle every target ships: tests
 // drive the transport through this ChannelFactory the way a node drives real sockets.
 
-import { LISTENER } from "../build/core/socket-seam.js";
-import { parseDest } from "../build/host/peer-addr.js";
+import { LISTENER } from "../build/services/socket-seam.js";
+import { parseDest } from "../build/services/peer-addr.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
  *  mirroring a real socket; closing one end fires the other's onClose — the close
@@ -80,7 +80,7 @@ export class LoopbackChannels {
     return port;
   }
 
-  /** Dial an opaque destination, like a real `ChannelFactory` (core/socket-seam.ts): this
+  /** Dial an opaque destination, like a real `ChannelFactory` (services/socket-seam.ts): this
    *  fabric speaks `tcp://host:port`, and anything else is a destination it cannot route. */
   connect(dest) {
     const d = parseDest(dest);

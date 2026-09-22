@@ -2,8 +2,8 @@
 // native HOST realm's, and only its: browser and Node have all of them, and a confined guest
 // realm holds ECMAScript intrinsics on every target, these not among them (§12.3).
 //
-// FIRST in the loader bundle, so the globals exist before any module reaches for one at load
-// time (core/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
+// FIRST in the native host bundle, so the globals exist before any module reaches for one at load
+// time (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
 
 /** The one `bridge` member this file uses (native-shim.ts declares the whole of it). */
 declare const bridge: { log(line: string): void };

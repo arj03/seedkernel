@@ -1,4 +1,4 @@
-// ws — RFC 6455 framing + opening-handshake bytes as a no-capability module.
+// ws — RFC 6455 framing + opening-handshake bytes as a pure module.
 //
 // A wire codec is pure byte transformation — exactly the shape of a no-cap WASM module.
 // It imports nothing but the AS runtime, and ships as a module of the transport bundle,

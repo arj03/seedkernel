@@ -7,14 +7,14 @@ import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, ve
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
-import { type Fs } from "../core/fs.js";
+import { type Fs } from "../services/fs.js";
 import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, errMessage, concatBytes } from "../core/util.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
+import { enc, fromHex, toHex, isHex64, errMessage, concatBytes } from "../services/util.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
-import type { Keypair } from "../core/subkeys.js";
+import type { Keypair } from "../services/subkeys.js";
 
 /** Neutral realm contracts exposed through the shell facade clients configure. */
 export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
@@ -155,7 +155,7 @@ export interface BootShellOptions {
    *  Absent means deny-all for apps. Link is authorized by the selected boot transport
    *  or explicit replacement of its current owner. Host gates apply to every bundle. */
   admit?: Admit;
-  /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
+  /** The fs backend the `fs` service and every app's scoped view sit on.
    *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
    *
    *  `false` is "a node with no disk" (§12.2): no backend wired at all, so a bundle
@@ -167,7 +167,7 @@ export interface BootShellOptions {
    *  in-memory. */
   freshnessStore?: FreshnessStore;
   /** The target-specific builder for a bundle's private pure modules (§4). Default:
-   *  `ModuleTable`, the JS worker-backed builder; the native loader passes its Go-backed
+   *  `ModuleTable`, the JS worker-backed builder; the native binary passes its Go-backed
    *  one. */
   modules?: PureModuleLoader;
   /** The confined realm factory (§12.3) — every app is a guest, so there is always one.
@@ -230,10 +230,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const sodium = opts.sodium;
   // The defaults are imported lazily: they are JS-target parts (a worker-backed module
   // builder, the QuickJS realm engine), and the one target that never takes them (the
-  // native loader, which supplies Go-backed equivalents) must not pay for them.
+  // native binary, which supplies Go-backed equivalents) must not pay for them.
   // `false` is a node with no disk, the one member whose absence is NOT its default:
   // omitted asks for the in-memory backend, said-as-false asks for none.
-  const backend = opts.fs === false ? undefined : opts.fs ?? new ((await import("./fs-memory.js")).MemoryFs)();
+  const backend = opts.fs === false ? undefined : opts.fs ?? new ((await import("../services/fs-memory.js")).MemoryFs)();
   // The one place the key rule is applied to a target's backend (fs-view.ts).
   const fs = backend ? validatedFs(backend) : undefined;
   const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
@@ -332,7 +332,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  as the three things that own it: what this NODE is, what this REALM may reach
    *  (`grants`), and what this APP installed (`modules`). A bundle reaching `link` is
    *  wired with `rawNet`: without it a bundle is never handed a socket descriptor (§1,
-   *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*` is an ordinary
+   *  an ungranted service is never wired). Timers are NOT such a grant — `timer/*` is an ordinary
    *  host service, so every realm gets a table. */
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
@@ -449,7 +449,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // observe.
       answer.then((bytes) => {
         try { onInbound(claim, attribution, bytes); }
-        catch (err) { console.error(`[shell] the loader's onInbound threw: ${errMessage(err)}`); }
+        catch (err) { console.error(`[shell] the installer's onInbound threw: ${errMessage(err)}`); }
       }, () => {});
     }
     return answer;

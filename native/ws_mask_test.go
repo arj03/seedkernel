@@ -29,7 +29,7 @@ globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).
 `
 
 // wsModule stands the codec up on the module table's runtime. The scratch floor mirrors
-// core/wasm-limits.ts DEFAULT_SCRATCH_SIZE; ws.wasm exports its own larger `scratchSize`,
+// host/wasm-limits.ts DEFAULT_SCRATCH_SIZE; ws.wasm exports its own larger `scratchSize`,
 // so this only has to be a floor it clears.
 func wsModule(t *testing.T) *boundModule {
 	t.Helper()

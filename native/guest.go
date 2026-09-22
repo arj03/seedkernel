@@ -13,11 +13,11 @@ import (
 	"os"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // The realm's resource bounds (heap cap, execution budget) are the shared host's numbers
-// — core/wasm-limits.ts — sent across by the shim on every createRealm, so no Go copy can
+// — host/wasm-limits.ts — sent across by the shim on every createRealm, so no Go copy can
 // drift from safe-js.ts's.
 
 var (
@@ -332,7 +332,7 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 	// IsUndefined, not nil — GetPropertyStr wraps a missing property as JS_UNDEFINED and
 	// never returns Go nil (qjs/value.go).
 	if fn.IsUndefined() {
-		panic("hostFnString: " + name + " not exported by the loader bundle (build:loader-bundles)")
+		panic("hostFnString: " + name + " not exported by the native host bundle (build:native-host)")
 	}
 	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
 	fn.Free()

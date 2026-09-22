@@ -18,7 +18,7 @@ import (
 //
 // Only the WebSocket transport is exercised here, which drives the full WS path: the raw
 // Go byte stream (sock.go), the shared net-frame MessageChannel and the RFC 6455 codec. The TCP
-// twin is asyncnet_test, and scripts/loader-interop.sh covers both against real node/bun
+// twin is asyncnet_test, and scripts/native-interop.sh covers both against real node/bun
 // nodes.
 //
 // The realm is the production one — boot() installs the primitives and evaluates the

@@ -332,7 +332,7 @@ func (c *Context) Eval(file, src string) (*Value, error) {
 // Pump runs the job queue (microtasks and settled-promise reactions) to completion and
 // reports what went wrong on the way: a job that threw, or — for a runtime made with
 // TrackRejections — the promises still rejected with no handler once the queue is empty.
-// The loader supplies Go-backed timers, so there is nothing to wait on and this returns as
+// The native host supplies Go-backed timers, so there is nothing to wait on and this returns as
 // soon as the queue is empty. The event loop calls it after every re-entry into JS so
 // promise chains advance, and guest.go calls it once per invocation and per settlement to
 // keep the causal clock on the stack. Verified by TestQjsPumpModel.

@@ -10,10 +10,9 @@
 // native binary runs inside QuickJS.
 import { readFileSync } from "node:fs";
 import { runCli, type CliHost } from "./cli.js";
-import { bootNodeShell } from "./shell-node.js";
-import { nodeFiles } from "./fs-node.js";
+import { bootNodeShell, nodeFiles } from "./shell-node.js";
 import { loadCrypto } from "./crypto-node.js";
-import { errMessage } from "../core/util.js";
+import { errMessage } from "../services/util.js";
 
 async function nodeHost(): Promise<CliHost> {
   const sodium = await loadCrypto();

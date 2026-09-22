@@ -370,7 +370,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 // A confined guest realm runs an app's entrypoints over the single
 // host.call seam, reaching only its declared requires. This exercises a
 // content-addressed put/get guest (local, synchronous ops) end-to-end, and asserts
-// the realm is zero-authority — the host capabilities are not reachable by name.
+// the realm is zero-authority — the host services are not reachable by name.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
 // put hashes the data (crypto/blake2b-256, by name) and stores it under that id
@@ -448,7 +448,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 		t.Fatal("get of an absent id should have failed")
 	}
 
-	// Confinement: none of the host capabilities are reachable by name in the realm.
+	// Confinement: none of the host services are reachable by name in the realm.
 	leaked, err := realmCall("probe", nil)
 	if err != nil {
 		t.Fatal("probe:", err)
@@ -471,7 +471,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
-	// Twice the shared 64 MiB default (core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
+	// Twice the shared 64 MiB default (host/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
 	// resolved by the shim) — mirrored here because the runtime no longer owns a copy.
 	src := fmt.Sprintf(`
 		function handle(arg) {

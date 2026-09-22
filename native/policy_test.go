@@ -73,7 +73,7 @@ func TestPolicyMalformed(t *testing.T) {
 
 // The whole point of the omitted-policy default: a node that was never given a policy
 // refuses every ordinary app install (README §14). The JS
-// shell has always done this (main.ts) — the native loader used to do the opposite.
+// shell has always done this (main.ts) — the native binary used to do the opposite.
 func TestNoPolicyDeniesInstalls(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)

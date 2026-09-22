@@ -1,9 +1,9 @@
-// Offline app-bundle authoring (§12.4). Runtime shells import only bundle.ts, which has no
+// Offline app-bundle authoring (§12.4). A running host imports only bundle.ts, which has no
 // signing or packing surface; this module depends on the verifier's manifest validation so
-// an author's accepted vocabulary cannot drift behind what a loader will accept.
-import { concatBytes, enc } from "../core/util.js";
-import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../core/domains.js";
-import { callerOf, readOp, writeOp } from "../core/op-frame.js";
+// an author's accepted vocabulary cannot drift behind what install will accept.
+import { concatBytes, enc } from "../services/util.js";
+import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
+import { callerOf, readOp, writeOp } from "../services/op-frame.js";
 import {
   hybridAuthorId,
   bundleSigningInput,
@@ -152,7 +152,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
 export function guestOpFraming(): string {
   const src = [callerOf, readOp, writeOp].map((fn) => fn.toString()).join("\n");
   return `
-// op-frame: kernel raw-link event ABI; optional framing for application bodies.
+// op-frame: the host's raw-link event ABI; optional framing for application bodies.
 ${src}
 `.replace(/\r\n/g, "\n");
 }

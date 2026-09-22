@@ -3,7 +3,7 @@ package main
 // The native half of "one implementation, three targets" (§12.9, §14.1). The JS suite
 // checks mldsa65.wasm from Node; these check that THIS target's embedded copy, under
 // wazero, reaches the same verdicts — on NIST's vectors and on a whole hybrid-signed
-// bundle through the production loader. Otherwise the target that embeds its own copy of
+// bundle through the production install path. Otherwise the target that embeds its own copy of
 // the artifact would be the one nobody checked, and a verifier's boundary is consensus.
 
 import (
@@ -20,7 +20,7 @@ import (
 
 // ─── a test-only signer ──────────────────────────────────────────────────────────
 //
-// The shipped loader binds mldsa65_verify and nothing else, which is what keeps it from
+// The shipped native binary binds mldsa65_verify and nothing else, which is what keeps it from
 // being turned into a signing oracle (§12.4). A test still has to produce a hybrid bundle
 // for it to admit, so it instantiates its OWN copy of the same artifact and binds the
 // signing exports there — keeping the signing half to _test files.
@@ -195,7 +195,7 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 	msg := []byte("native adapter path")
 	sig := s.signDetached(t, msg, sk)
 	if !md.verifyDetached(sig, msg, pk) {
-		t.Fatal("the loader's verifier rejects a signature made by the same artifact")
+		t.Fatal("the binary's verifier rejects a signature made by the same artifact")
 	}
 	flipped := append([]byte(nil), sig...)
 	flipped[0] ^= 1
@@ -208,7 +208,7 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 	t.Logf("%d NIST vectors", len(kat.SigVer)+len(kat.SigGen))
 }
 
-// ─── a hybrid bundle, end to end, through the production loader ──────────────────
+// ─── a hybrid bundle, end to end, through the production install path ──────────────────
 
 // Suite 0x02 envelope offsets:
 // [suite 1][ed_pk 32][ml_dsa_pk 1952][ed_sig 64][ml_dsa_sig 3309][json].
@@ -230,7 +230,7 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	startShell(t, authorsPolicy(a.id()), nil)
 
 	path, key := writeTestBundle(t, a, "pqapp", 1)
-	// The load line names the author by the key-set hash the loader derived (§12.4).
+	// The load line names the author by the key-set hash the host derived (§12.4).
 	if status := loadBundle(path); status != loadedLine("pqapp", 1, a.id(), "pqapp") {
 		t.Fatalf("hybrid bundle should load under its derived author id: %s", status)
 	}
@@ -276,7 +276,7 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 
 // The retired genesis suite, refused on this target too (§14.1). `0x01` bundles were
 // Ed25519-only; a host that still admitted one would be a downgrade an attacker can ask
-// for by writing a byte, so the loader answers "a suite I do not implement" — a
+// for by writing a byte, so the host answers "a suite I do not implement" — a
 // legibility failure, not a signature verdict.
 func TestGenesisManifestSuiteRefused(t *testing.T) {
 	bootRealmIn(t, t.TempDir())

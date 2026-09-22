@@ -91,9 +91,9 @@ const maxAuthed = policy("maxAuthedLinks");
 // How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
 const linkIdleTimeoutMs = policy("linkIdleTimeoutMs");
 // How long one open correlation is retained waiting for its peer's response; 0 disables.
-// Not the caller's deadline — the kernel owns that and no field here can name it — but the
+// Not the caller's deadline — the host owns that and no field here can name it — but the
 // transport's bound on its own waiting state. It gives the caller time to ask someone else
-// only when configured shorter than that caller's live remainder; otherwise the kernel
+// only when configured shorter than that caller's live remainder; otherwise the host
 // deadline wins and this timer cleans the correlation afterwards.
 const requestTimeoutMs = policy("requestTimeoutMs");
 // How long a link may stay pre-authentication: the dialing side's whole handshake, and
@@ -438,7 +438,7 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 const NOTHING = new Uint8Array(0);
 
-// Answer on a later turn without holding the realm's queue; the kernel supplies the
+// Answer on a later turn without holding the realm's queue; the host supplies the
 // release marker (`__deferred`), everything else is ours.
 const defer = () => {
   let settle, fail;
@@ -515,7 +515,7 @@ entry("linkClosed", (r) => {
 });
 
 /** App-facing send: deferred because the peer's response is another invocation of this
- *  realm. Its deadline is kernel handoff state, not a field in this content protocol. */
+ *  realm. Its deadline is host handoff state, not a field in this content protocol. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
   // VIEWS of the caller's argument bytes, and they stay views: `buildReq` gathers both

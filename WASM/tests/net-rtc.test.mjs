@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
-const rtc = await imp("build/host/net-rtc.js");
+const rtc = await imp("build/services/net-rtc.js");
 const {
   RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
   MAX_SDP_BYTES, MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES,
@@ -55,7 +55,7 @@ function stubPeerConnection() {
 console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.6.1)\n");
 
 await test("net-rtc exports the signaling seam, not a WebSocket relay implementation", async () => {
-  assert(!("relaySignaling" in rtc), "the kernel must not ship a rendezvous wire implementation");
+  assert(!("relaySignaling" in rtc), "the host must not ship a rendezvous wire implementation");
 });
 
 await test("RtcNetwork validates encoded signaling strings before admitting them", async () => {

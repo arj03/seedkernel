@@ -1,18 +1,12 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, isHex64, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService } from "../core/domains.js";
-import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { concatBytes, toHex, isHex64, enc, dec, errMessage, type JsonValue, type JsonObject } from "../services/util.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService } from "../services/domains.js";
+import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
+export type { JsonValue, JsonObject };
 
 export interface BundleModule {
   /** The logical key the guest addresses through `host.call`; unique in the manifest. */
   name: string;
-}
-
-/** A value representable by the manifest's signed JSON encoding. App configuration is
- *  schema-free here: its shape and meaning belong to the bundle that reads it. */
-export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
-export interface JsonObject {
-  [key: string]: JsonValue;
 }
 
 /** The zero-authority guest program. `requires` and `config` live here rather than at the
@@ -57,8 +51,8 @@ export interface BundleManifest {
 }
 
 /** The surface *verifying* a manifest needs (a subset of libsodium). Separate from
- *  `ManifestCrypto` so a loader is handed no way to sign — which also lets a verify-only
- *  realm (the native loader, §12.9) run the shared loader below. */
+ *  `ManifestCrypto` so install is handed no way to sign — which also lets a verify-only
+ *  realm (the native binary, §12.9) run the shared install path below. */
 export interface ManifestVerifier {
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
   /** The genesis hash — content integrity, and the author id (`hybridAuthorId`). */
@@ -188,7 +182,7 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 /** The claim charset (§12.10): shared by `protocols`, `services` and `guest.calls` — one
  *  shape for every name a manifest signs outside its module table. A leading
  *  `_` is admitted like any other character: it is a spelling convention this repo's own
- *  bundles use for a local-only name (`_net`), never a kernel-known reservation. These travel
+ *  bundles use for a local-only name (`_net`), never a host-known reservation. These travel
  *  on the wire (`protocols`) or name a local call graph edge, so the whitespace, control and
  *  lookalike characters an operator could not tell apart are out. */
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
@@ -240,7 +234,7 @@ export function isJsonObject(value: unknown): value is JsonObject {
 
 /** Structural check on a parsed manifest, run only *after* the signature verified — not a
  *  security boundary: it turns a manifest the author signed but got wrong into a loud
- *  rejection instead of a TypeError deep in the loader. Whether this host serves a required
+ *  rejection instead of a TypeError deep in install. Whether this host serves a required
  *  name is `validateManifest`'s. */
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;

@@ -4,13 +4,13 @@
     "declaration": false
   },
   "files": [
-    "core/util.ts",
-    "core/domains.ts",
-    "core/net-limits.ts",
-    "core/wasm-limits.ts",
+    "services/util.ts",
+    "services/domains.ts",
+    "services/net-limits.ts",
+    "host/wasm-limits.ts",
     "host/bundle.ts",
     "host/bundle-author.ts",
-    "core/op-frame.ts",
+    "services/op-frame.ts",
     "host/pq.ts"
   ],
   "include": []

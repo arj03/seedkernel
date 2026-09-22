@@ -19,7 +19,7 @@ export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
-export const { OpArgs } = await imp("build/core/op-frame.js");
+export const { OpArgs } = await imp("build/services/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest returns from `linkClosed`
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
@@ -70,9 +70,9 @@ export const PROTO = "harness/v1";
  *    seen/from — everything `handle` was handed INBOUND, and who it was attributed to. */
 const HARNESS_GUEST = `
 // This app's own copies of the shape it shares with whatever it calls (its own format
-// after the kernel's 32-byte caller prefix): a local op is [opLen u8][op][args], and
+// after the host's 32-byte caller prefix): a local op is [opLen u8][op][args], and
 // the transport's app contract (the id this app calls) is spelled the same way. The
-// kernel never reads any of it.
+// host never reads any of it.
 function readOp(b) {
   const n = b.length > 0 ? b[0] : -1;
   if (n < 0 || b.length < 1 + n) throw new Error("harness: malformed op");
@@ -288,7 +288,7 @@ export async function makeTransportHost(opts = {}) {
   });
   // The node's own channel key, hex — off the identity this harness minted, not asked of
   // the driver: it is `toHex(identity.publicKey)`, which every caller of this factory
-  // already holds, and the driver says nothing about peers any more (core/socket-seam.ts).
+  // already holds, and the driver says nothing about peers any more (services/socket-seam.ts).
   const peerId = Buffer.from(identity.publicKey).toString("hex");
   const node = { shell, driver, identity, appAuthor, peerId };
   if (opts.app === false) return node;
@@ -297,7 +297,7 @@ export async function makeTransportHost(opts = {}) {
   const enc = new TextEncoder();
   const call = (to, proto, payload, deadlineMs, noReply) => {
     // The `send` op's own argument order (transport/src/core.js):
-    // [noReply u8][to blob][proto blob][payload blob]. The deadline is kernel state on
+    // [noReply u8][to blob][proto blob][payload blob]. The deadline is host state on
     // `invoke`, not guest protocol data.
     const p = enc.encode(proto);
     const out = new Uint8Array(1 + 4 + 32 + 4 + p.length + 4 + payload.length);

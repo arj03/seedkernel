@@ -17,14 +17,14 @@ import (
 	"runtime"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 
 	"github.com/tetratelabs/wazero"
 )
 
 // hostShellJS is the shared shell plus the native platform binding (host/native-shim.ts)
 // — the same TS the Node shell runs, so no rule of the protocol is re-derived in a second
-// language (README §12.9). Bundled by scripts/bundle-loader.mjs, never hand-edited.
+// language (README §12.9). Bundled by scripts/bundle-native-host.mjs, never hand-edited.
 //
 //go:embed host-shell.gen.js
 var hostShellJS string
@@ -268,7 +268,7 @@ func main() {
 }
 
 // fatal reports a failure that ends the node and exits non-zero, so a script driving the
-// loader sees it.
+// binary sees it.
 func fatal(stage string, err error) {
 	fmt.Fprintln(os.Stderr, "ERROR: "+stage+": "+err.Error())
 	os.Exit(1)

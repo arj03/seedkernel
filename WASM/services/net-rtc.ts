@@ -16,8 +16,8 @@
 // `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
 // owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel } from "./net-channel.js";
-import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
-import { isHex64, Fifo } from "../core/util.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
+import { isHex64, Fifo } from "./util.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
  *  Exported because it is the seam an app subclass works against — see the note on media
@@ -58,7 +58,7 @@ export interface Signaling {
 
 /** Every signaling message names its sender, and a directed one its recipient, by channel
  *  public key in lowercase hex — this file's own vocabulary. Nothing below it deals in
- *  peers: a socket seam takes destinations, not identities (core/socket-seam.ts). */
+ *  peers: a socket seam takes destinations, not identities (services/socket-seam.ts). */
 interface SignalBase {
   from: string;
   to?: string;

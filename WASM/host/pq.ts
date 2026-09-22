@@ -1,11 +1,10 @@
 // pq.ts — the post-quantum half of the hybrid manifest suite (§12.4, §14.1): ML-DSA-65
 // (FIPS 204), driven from browser/mldsa65.wasm and exposed in libsodium-wrappers-shaped
-// method names so it mixes straight into the `sodium` object the shared loader already
+// method names so it mixes straight into the `sodium` object the shared install path already
 // consumes.
 //
-// Host code, not core: a *driver* — a bump arena over a wasm module's linear memory — where
-// what is core is the vocabulary (core/domains.ts) and the manifest suite that names
-// ML-DSA-65. The field widths below are format constants of that suite (bundle.ts keeps its
+// Host code: a *driver* — a bump arena over a wasm module's linear memory — beside the
+// vocabulary it serves (services/domains.ts) and the manifest suite that names ML-DSA-65. The field widths below are format constants of that suite (bundle.ts keeps its
 // copy of them), kept here only because the driver cross-checks them at load.
 //
 // **One implementation, three targets.** The wasm is built from mldsa-native (pinned;
@@ -26,7 +25,7 @@ export const ML_DSA65_SIG_LEN = 3309;
 export const ML_DSA65_SEED_LEN = 32;
 export const ML_DSA65_RND_LEN = 32;
 
-/** The verify half — all a loader is ever handed (§12.4). Named to sit alongside
+/** The verify half — all install is ever handed (§12.4). Named to sit alongside
  *  `crypto_sign_verify_detached` on the same object, with the same argument order. */
 export interface MlDsa65Verifier {
   ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;

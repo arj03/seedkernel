@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // The shared guest-seam.ts runs in the host realm over the Go
@@ -119,7 +119,7 @@ func TestGuestSeamOps(t *testing.T) {
 
 	// fs/put then fs/get: content-addressed round trip. Both AWAIT — fs round-trips at
 	// the seam, because a synchronous `get` is a shape no browser backend can implement
-	// and the seam is one shape on every target (core/fs.ts).
+	// and the seam is one shape on every target (services/fs.ts).
 	awaitBytes := func(name string, payload []byte) []byte {
 		t.Helper()
 		b, err := callRealm("__callSeamAwait", 5*time.Second,
@@ -151,7 +151,7 @@ func TestGuestSeamOps(t *testing.T) {
 	if r := callBytes(nameNodeRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
 		t.Fatalf("node/random = %d bytes, want 4", len(r))
 	}
-	// And raw net is not merely undeclared here — it is capability-wired, so no app
+	// And raw net is not merely undeclared here — it is wired only for the link occupant, so no app
 	// seam is ever wired one.
 	if err := refused(nameLinkSend, make([]byte, 8)); err == nil {
 		t.Fatal("a link/* name resolved on an app seam")

@@ -13,9 +13,9 @@
 **An observer who can open sockets to a node and watch traffic cannot enumerate which
 identities are present on the network, nor which pairs are talking.**
 
-Three capabilities are denied:
+Three attacks are denied:
 
-| Capability | Denied by |
+| Attack | Denied by |
 | --- | --- |
 | **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1) and the message ordering (§4) |
 | **Attribute** — watch a flow, learn which pair it belongs to | both identities travelling under the hybrid ephemeral secrets (§3) |

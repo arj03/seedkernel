@@ -1,10 +1,10 @@
-# quickjs — in-repo quickjs-ng (emscripten) engine for the node/WASM loader
+# quickjs — in-repo quickjs-ng (emscripten) engine for the JS targets
 
 The engine the node-side confined realms run on (`safe-js.ts`), compiled to
-emscripten WASM from the same quickjs-ng v0.16.2 source the native loader
+emscripten WASM from the same quickjs-ng v0.16.2 source the native binary
 builds (`native/qjs/build-qjs.sh`). It replaces the `@jitl/quickjs-ng-*`
 npm variants, which vendored quickjs-ng **0.12.1** — a different engine
-version than the native loader, which is exactly the drift this artifact
+version than the native binary, which is exactly the drift this artifact
 removes.
 
 ## Layout
@@ -52,7 +52,7 @@ over `dist/`. After a rebuild, re-run the suites:
 ## Why not the npm variants
 
 The published `@jitl/quickjs-ng-*` packages top out at 0.32.0, which vendors
-quickjs-ng 0.12.1; nothing on npm ships 0.16.2. The native loader already
+quickjs-ng 0.12.1; nothing on npm ships 0.16.2. The native binary already
 built its own 0.16.2 blob (`native/qjs/`), so the node side is the
 odd-one-out only because its engine came from npm. This artifact is that
 same owning-the-blob pattern applied to the emscripten build.

@@ -1,5 +1,5 @@
 // The Node platform binding for the TCP/WS socket seam: a `ChannelFactory`
-// (core/socket-seam.ts) that opens node:net sockets and wraps them as RawLinks, and
+// (services/socket-seam.ts) that opens node:net sockets and wraps them as RawLinks, and
 // nothing else. The handshake, link routing and request/response layer run in the transport
 // bundle's guest, driven by TransportHost.
 //
@@ -7,9 +7,9 @@
 // framing from the destination or listener label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
-import { errMessage } from "../core/util.js";
-import { LISTENER, type Arrival, type ListenAddress, type RawLink } from "../core/socket-seam.js";
-import { TCP_LINGER_MS } from "../core/net-limits.js";
+import { errMessage } from "./util.js";
+import { LISTENER, type Arrival, type ListenAddress, type RawLink } from "./socket-seam.js";
+import { TCP_LINGER_MS } from "./net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
 // node:net buffers pre-connect writes, so the link is immediately writable.

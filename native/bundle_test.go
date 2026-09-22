@@ -14,7 +14,7 @@ import (
 // only the clamp refuses it. (The declared-scratchSize branch belongs to modules like
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 //
-// The default itself is the shared host's number (core/wasm-limits.ts
+// The default itself is the shared host's number (host/wasm-limits.ts
 // DEFAULT_SCRATCH_SIZE), passed by the shim at every slot build; the test mirrors it,
 // since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {

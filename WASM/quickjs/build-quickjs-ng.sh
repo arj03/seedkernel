@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuilds dist/emscripten-module.{wasm,mjs} — the emscripten quickjs-ng 0.16.2
-# engine the node/WASM loader runs its confined realms on (safe-js.ts).
+# engine the JS targets run their confined realms on (safe-js.ts).
 #
 # ONE glue for both targets (`ENVIRONMENT=web,node`): the browser apps vendor
 # this same dist/ and load it from a static server, so a node-only glue —
@@ -39,7 +39,7 @@ work="$here/.build"
 dist="$here/dist"
 version="v0.16.2"
 
-# quickjs-ng v0.16.2 — the SAME pin the native loader builds
+# quickjs-ng v0.16.2 — the SAME pin the native binary builds
 # (native/qjs/build-qjs.sh). Moving this is a deliberate engine upgrade:
 # re-run the WASM and native suites, which drive every export the shim uses.
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"

@@ -1,7 +1,7 @@
 // Computes the README's LOC figures ("one implementation, three targets") rather than
 // remembering them: `npm run loc` drifts → exit 1, `--write` rewrites the README.
 // Counted per the README's own rule (non-test sources, no blanks/comments), and the
-// shared set is DERIVED from build:loader-bundles and reconciled against the rows, so a
+// shared set is DERIVED from build:native-host and reconciled against the rows, so a
 // shared file appearing in no row fails too.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,7 @@ const fmt = (n) => n.toLocaleString("en-US");
 // ── the shared set, from the build script that defines it ────────────────────
 const pkg = JSON.parse(readFileSync(resolve(wasmDir, "package.json"), "utf8"));
 const sharedSet = new Set(
-  (pkg.scripts["build:loader-bundles"].match(/build\/\S+\.js/g) ?? [])
+  (pkg.scripts["build:native-host"].match(/build\/\S+\.js/g) ?? [])
     .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
 // ── the rows, exactly as the README groups them ──────────────────────────────
@@ -40,7 +40,7 @@ const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
   { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
-    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts"] },
+    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts"] },
   { find: /`host\/transport-host\.ts`/,
     files: ["WASM/host/transport-host.ts"] },
   { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,
@@ -48,10 +48,10 @@ const sharedRows = [
       "WASM/host/realm-timers.ts", "WASM/host/fs-view.ts"] },
   { find: /`host\/shell-core\.ts`/,
     files: ["WASM/host/shell-core.ts", "WASM/host/slot-table.ts"] },
-  { find: /`host\/cli\.ts`, `host\/peer-addr\.ts`/,
-    files: ["WASM/host/cli.ts", "WASM/host/peer-addr.ts"] },
-  { find: /`core\/\*\.ts` \(\d+ files\)/,
-    files: [...sharedSet].filter((f) => f.startsWith("WASM/core/")) },
+  { find: /`host\/cli\.ts`/,
+    files: ["WASM/host/cli.ts"] },
+  { find: /`services\/\*\.ts` \(\d+ shared files\)/,
+    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/")) },
 ];
 
 // Ride in the shared bundle but counted elsewhere on purpose (the Go target's own;
@@ -62,9 +62,9 @@ const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
 // A public build-tool entry point, deliberately absent from both runtime artifacts.
 const offlineTs = ["WASM/host/bundle-author.ts"];
 
-/** Per-target JS: every non-test TS under core/ and host/ that the shared bundle does
+/** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
  *  not compile in. Derived rather than listed, so a new backend counts itself. */
-const jsFiles = ["core", "host"].flatMap((d) =>
+const jsFiles = ["services", "host"].flatMap((d) =>
   readdirSync(resolve(wasmDir, d))
     .filter((f) => f.endsWith(".ts"))
     .map((f) => `WASM/${d}/${f}`))

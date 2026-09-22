@@ -50,7 +50,7 @@ func TestNodeFsRoundTrip(t *testing.T) {
 
 // Containment: a key that could name something other than a plain file inside the data
 // directory is rejected on write and never resolves on read/delete. WHICH keys are legal
-// is `isSafeFsKey` (WASM/core/fs.ts), one rule for every target, tested there.
+// is `isSafeFsKey` (WASM/services/fs.ts), one rule for every target, tested there.
 //
 // "" is in the list for a reason of this layer's own: filepath.Join(dir, "") is the data
 // directory itself, so an unchecked empty key makes delete("") remove the store.
@@ -87,7 +87,7 @@ func TestNodeFsNoEscape(t *testing.T) {
 	}
 }
 
-// The `fs` seam the shared code consumes (core/fs.ts) presents its shape — Uint8Array on
+// The `fs` seam the shared code consumes (services/fs.ts) presents its shape — Uint8Array on
 // a hit, null on a miss — end to end over Go's synchronous primitive.
 //
 // Every call awaits, because the seam is async on every target: a synchronous `get` is a

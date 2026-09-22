@@ -1,6 +1,6 @@
 package main
 
-// Networking round-trip perf for the Go loader: the transport bundle's request/response
+// Networking round-trip perf for the native binary: the transport bundle's request/response
 // over a real loopback socket — dial/accept, the AKE + record layer (amortized: the warmup
 // request establishes the link), routing, the TCP framing (net.go), the Go↔JS
 // frame-delivery boundary (sock.go), and the correlation/timeout layer. This is the
@@ -41,7 +41,7 @@ const benchProto = "netbench"
 //	         control-plane round trip. A local loopback (the host's zero caller id) carries
 //	         this app's own op framing: `send` is the transport's send op behind the name
 //	         this side writes, `echo` is the bare realm hop. The framing is content — the
-//	         kernel never reads it.
+//	         host never reads it.
 const netBenchGuestSource = `
   function readOp(b) {
     const n = b.length > 0 ? b[0] : -1;
@@ -168,7 +168,7 @@ func setupNetBench(b *testing.B) {
 	}
 	if v.String() != "function" {
 		// The app is signed HERE, by the Go-side writer, for the same reason the tests'
-		// probe app is: the realm holds no signing key and the loader deliberately cannot
+		// probe app is: the realm holds no signing key and the native binary deliberately cannot
 		// sign (mldsa.go binds verify only, §12.4).
 		author := testAuthor(b)
 		blob := signedBundleBytes(b, author, benchProto, 1, netBenchGuestSource, []string{"_net"})

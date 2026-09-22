@@ -70,13 +70,6 @@ export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
  *  zero-memory declarations must not turn admission into an unbounded module-array walk. */
 export const DEFAULT_MAX_BUNDLE_MODULES = 256;
 
-/** The default in-memory `Fs` backend's whole quota (host/fs-memory.ts `MemoryFs`), so a
- *  successful put cannot turn bounded in-flight calls into unbounded permanent process RAM.
- *  Declared here rather than in fs-memory.ts so one file holds every node-scoped ceiling
- *  the §12.3 sum adds up; fs-memory.ts re-exports it. */
-export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
-export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
-
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so it decides whether
    *  instantiating the module is itself an attack. */

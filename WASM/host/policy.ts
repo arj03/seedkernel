@@ -5,7 +5,7 @@
 // is the default for ordinary apps.
 
 
-import { isHex64, toHex } from "../core/util.js";
+import { isHex64, toHex } from "../services/util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
 /** The ONE admission seam. `(v) → bool | Promise<bool>`.
@@ -22,7 +22,7 @@ export const admitAll: Admit = () => true;
 
 /** Revocation (§12.5) before the downgrade guard (§12.4), so a written-off key never reaches
  *  an interactive consent dialog. Equal versions reload, transport included. Sync and
- *  throwing, and read off the store at the call: the loader asks it again in the commit
+ *  throwing, and read off the store at the call: install asks it again in the commit
  *  window, which cannot await, and a `revoke` or another load may have moved both facts. */
 export function checkHostGates(v: VerifiedBundle, store: FreshnessStore): void {
   if (store.isRevoked(v.author)) {

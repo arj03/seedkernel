@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // acceptErrBackoff paces the accept loop after a non-fatal error: EMFILE makes Accept fail

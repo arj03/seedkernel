@@ -5,12 +5,12 @@
 // of an absent `--policy` (§14), the order (remedies before the bundle, §12.5), which
 // failures are fatal, and the console lines. Those are decisions, and a decision made twice
 // eventually gets made differently.
-import { toHex, fromHex, isHex64, errMessage, enc, dec } from "../core/util.js";
-import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
+import { toHex, fromHex, isHex64, errMessage, enc, dec } from "../services/util.js";
+import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subkeys.js";
 import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
-import { OpArgs, writeOp } from "../core/op-frame.js";
+import { OpArgs, writeOp } from "../services/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
-import { parseHostPort, peersConfig } from "./peer-addr.js";
+import { parseHostPort, peersConfig } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
@@ -46,7 +46,7 @@ export interface CliFiles {
  *  — `NodeFs` + `node:net` here, a wazero table + Go sockets there — which is why
  *  `standUp` is a member rather than code in this file. */
 export interface NodeSetup extends Pick<BootShellOptions, "identity" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
-  /** Directory backing the fs.* capability. */
+  /** Directory backing the `fs` service. */
   dir: string;
   /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
    *  accepts no ordinary app installs. */
@@ -62,7 +62,7 @@ export interface NodeRuntime {
 /** The platform under the operator flow. */
 export interface CliHost extends CliFiles {
   /** The first word of the first console line — the artifact you are running
-   *  (`seedkernel-shell` on Node, `seedkernel-loader` natively). The only thing on that
+   *  (`seedkernel-shell` on Node, `seedkernel-native` natively). The only thing on that
    *  line allowed to differ; the peer id after it is not. */
   banner: string;
   /** Arguments after the program name. */

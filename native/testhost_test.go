@@ -1,6 +1,6 @@
 package main
 
-// The one way a test stands the loader up. Production has a single assembly path — boot()
+// The one way a test stands the native host up. Production has a single assembly path — boot()
 // installs the platform primitives and evaluates the shared bundle, standUp() builds the
 // node and shell inside it — so the tests drive that path. A harness that assembled the
 // realm differently would be the second implementation this target exists not to have
@@ -117,7 +117,7 @@ var ownedRealmDir string
 // primitive (fs, the byte seam) or the shared JS directly.
 func bootRealm(tb testing.TB) {
 	tb.Helper()
-	dir, err := os.MkdirTemp("", "seedloader-realm-")
+	dir, err := os.MkdirTemp("", "seedkernel-realm-")
 	if err != nil {
 		tb.Fatal("realm data dir:", err)
 	}
@@ -288,7 +288,7 @@ const testContactSecretHex = "03030303030303030303030303030303030303030303030303
 
 // testKeyHex mints a node identity master seed: 32 bytes of entropy, hex — the same
 // 64 hex chars --key holds. startNode derives the node's keypair from it inside the
-// shared realm (deriveNodeKey, core/subkeys.ts).
+// shared realm (deriveNodeKey, services/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
 	seed := make([]byte, 32)
@@ -385,7 +385,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 				deadlineMs: __deadlineMs || undefined });
 			// The test driver's twin of the shell's callSlot: the host's 32 zero-byte
 			// caller id in front of the guest's own op framing (composed here, since the
-			// kernel writing it would learn the guest's vocabulary).
+			// host writing it would learn the guest's vocabulary).
 			globalThis.__realmCall = (op, arg, causalClock) => {
 			  const body = new Uint8Array(arg);
 			  const framed = new Uint8Array(1 + op.length + body.length);

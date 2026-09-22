@@ -1,11 +1,11 @@
 package main
 
-// Reed–Solomon codec perf for the Go loader. RS lives in seedstore's codec.wasm;
+// Reed–Solomon codec perf for the native binary. RS lives in seedstore's codec.wasm;
 // this benchmark signs it into a tiny app and calls it through the loaded guest, the
 // same private-module path a deployment uses. The request shape matches
 // seedstore/WASM/tests/bench.mjs: RS(10,6), 64 KB blocks and 640 KB of data per chunk.
 //
-// Opt-in, since the loader has no seedstore dependency: with SEEDSTORE_CODEC unset these
+// Opt-in, since the native binary has no seedstore dependency: with SEEDSTORE_CODEC unset these
 // benchmarks skip.
 //
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench 'BenchmarkRS' -benchmem ./...

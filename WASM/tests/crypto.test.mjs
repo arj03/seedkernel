@@ -98,7 +98,7 @@ async function testManifestSuiteByte() {
 // attached, plus sigGen cases where the signature must match byte for byte.
 //
 // That makes "one implementation across three targets" checkable rather than asserted:
-// the same bytes the browser fetches, Node reads and the Go loader embeds, so a drifting
+// the same bytes the browser fetches, Node reads and the native binary embeds, so a drifting
 // build fails here instead of splitting the network into nodes that admit a bundle and
 // nodes that refuse it.
 async function testMlDsaAcvpVectors() {

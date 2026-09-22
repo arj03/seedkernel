@@ -5,7 +5,7 @@
 import {
   DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_SCRATCH_SIZE,
-} from "../core/wasm-limits.js";
+} from "./wasm-limits.js";
 import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 
 // ─── module routing ─────────────────────────────────────────────────────

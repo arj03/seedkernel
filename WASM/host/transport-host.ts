@@ -1,7 +1,7 @@
 // Socket driver: owns links and listeners; protocol and peer state stay in the signed guest
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
-import { errMessage, fromHex, Fifo } from "../core/util.js";
+import { errMessage, fromHex, Fifo } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_FRAME_BYTES,
@@ -11,12 +11,12 @@ import {
   MAX_NODE_OUTBOUND_QUEUE_SLICES,
   MAX_OUTBOUND_QUEUE_BYTES,
   MAX_OUTBOUND_QUEUE_SLICES,
-} from "../core/net-limits.js";
-import { type LinkEvent } from "../core/domains.js";
-import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../core/socket-seam.js";
+} from "../services/net-limits.js";
+import { type LinkEvent } from "../services/domains.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../services/socket-seam.js";
 import { HOST_CALLER_ID, type RawNet } from "./guest-seam.js";
 import { REALM_DISPOSED, type CausalClock } from "./realm-queue.js";
-import { OpArgs } from "../core/op-frame.js";
+import { OpArgs } from "../services/op-frame.js";
 
 const EMPTY = new Uint8Array(0);
 
@@ -51,7 +51,7 @@ const ev = (name: LinkEvent) => new OpArgs(name);
 
 /** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
  *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
-export { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
+export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
 
 /** Active transport entrypoint; `null` means the binding is vacant. `input` is the whole
  *  realm argument, `[caller 32][body …]`, built in one pass here (`OpArgs.build`). */
@@ -300,7 +300,7 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
   //
-  // `OpArgs` (core/op-frame.ts) encodes the kernel's raw-link event ABI (RUNTIME §12.2).
+  // `OpArgs` (services/op-frame.ts) encodes the host's raw-link event ABI (RUNTIME §12.2).
   // Any replacement link occupant must understand this envelope and these event fields.
 
   /** Call the transport, caller id and envelope built in the one pass.
@@ -326,9 +326,9 @@ export class TransportHost {
     if (r) void r.catch((err: unknown) => this.reportOpError(args.op, err));
   }
 
-  // ── the capability backend the transport guest's seam is wired to ───────────
+  // ── the `link` backend the transport guest's seam is wired to ───────────
 
-  /** The RAW net capability: an opaque link id over the platform's sockets, and the whole
+  /** The raw `link` service: an opaque link id over the platform's sockets, and the whole
    *  of what the host contributes to the network. */
   rawNet(): RawNet {
     const bound = () => this.call !== null;

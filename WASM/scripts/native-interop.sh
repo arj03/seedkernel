@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# §12.9 interop — the definition of "done" for the Go/native loader target.
+# §12.9 interop — the definition of "done" for the native binary target.
 #
-# A Go loader node and JS (node + bun) nodes share one seedstore cohort over real
+# A native binary node and JS (node + bun) nodes share one seedstore cohort over real
 # loopback TCP, exercising the same signed bundle on the byte-identical genesis. It
 # proves wire + crypto + bundle parity in both directions:
 #   1. Go  put → node get   (Go writes blocks JS can read back)
@@ -12,8 +12,8 @@
 # bundle are shared.
 #
 # Manual integration check (NOT part of `go test`): needs `node` + `bun` on PATH
-# and a built Windows seedloader.exe. Run from Git Bash on Windows:
-#   bash scripts/loader-interop.sh [path/to/seedloader.exe]
+# and a built Windows seedkernel.exe. Run from Git Bash on Windows:
+#   bash scripts/native-interop.sh [path/to/seedkernel.exe]
 set -euo pipefail
 
 SK=/c/Users/ander/Documents/GitHub/seedkernel/WASM
@@ -21,16 +21,16 @@ SS=/c/Users/ander/Documents/GitHub/seedstore/WASM
 # A bundle is ONE blob (§12.4) — both targets read this file, not a directory.
 BUNDLE="$SS/bundle/seedstore.skb"
 NODEMAIN="$SK/build/host/main-node.js"
-GOEXE="${1:-$SK/../native/seedloader.exe}"
+GOEXE="${1:-$SK/../native/seedkernel.exe}"
 
 HOLDERS=6
 BASEPORT=47100
 
-[ -f "$GOEXE" ]    || { echo "missing seedloader exe: $GOEXE"; exit 1; }
+[ -f "$GOEXE" ]    || { echo "missing seedkernel exe: $GOEXE"; exit 1; }
 [ -f "$NODEMAIN" ] || { echo "missing built shell: $NODEMAIN (run: npm run build:host)"; exit 1; }
 [ -f "$BUNDLE" ]   || { echo "missing seedstore bundle: $BUNDLE (run: npm run build:bundle in seedstore/WASM)"; exit 1; }
 
-# Read the author through the shared loader rather than re-deriving container and
+# Read the author through the shared install path rather than re-deriving container and
 # envelope offsets here: the bundle is a packed blob whose manifest envelope leads with
 # a suite byte (§12.4), so `bytes[0:32]` is not the author key and never was after the
 # suite byte landed. verifyBundle is the one definition of both layouts.

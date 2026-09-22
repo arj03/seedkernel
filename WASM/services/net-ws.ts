@@ -9,7 +9,7 @@
 // the record layer, the routing — is the transport bundle's, identical to the TCP path.
 // The WebSocket global is touched only inside `connect` (or an injected factory), so
 // importing it where WebSocket is absent is safe.
-import type { ChannelFactory, ListenAddress, RawLink } from "../core/socket-seam.js";
+import type { ChannelFactory, ListenAddress, RawLink } from "./socket-seam.js";
 import { MessageChannel, type MessageTransport } from "./net-channel.js";
 import { parseDest } from "./peer-addr.js";
 

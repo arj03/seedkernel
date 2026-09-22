@@ -342,7 +342,7 @@ await test("one peer's pipeline cannot spend the host calls every other link nee
   await ready(flooder, 4000);
   await ready(other, 4000);
 
-  const FLOOD = 300; // past the kernel's per-realm call ceiling
+  const FLOOD = 300; // past the host's per-realm call ceiling
   for (let i = 0; i < FLOOD; i++) await flooder.sendNoReply(s.peerId, PROTO, Uint8Array.of(i & 255));
   const refused = await flooder.request(s.peerId, PROTO, Uint8Array.of(1), 3000);
   const flooded = held.filter((d) => d.from === flooder.peerId).length;

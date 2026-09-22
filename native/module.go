@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -38,7 +38,7 @@ var (
 	modSeq = 0
 )
 
-// The §4.1 scratch default arrives from the shared host (core/wasm-limits.ts
+// The §4.1 scratch default arrives from the shared host (host/wasm-limits.ts
 // DEFAULT_SCRATCH_SIZE) with every slot build, so Go owns no copy that could drift from
 // the JS table's. A module needing more exports a `scratchSize` global.
 

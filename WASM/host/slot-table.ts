@@ -3,9 +3,9 @@
 // keep in step — and every rule about what may be installed beside what lives here, so no
 // caller can set a claim past them.
 import { type LoadedBundle, type PureModules } from "./bundle.js";
-import { isOccupiedService } from "../core/domains.js";
-import { DEFAULT_MAX_APP_SLOTS } from "../core/wasm-limits.js";
-import type { Fs } from "../core/fs.js";
+import { isOccupiedService } from "../services/domains.js";
+import { DEFAULT_MAX_APP_SLOTS } from "./wasm-limits.js";
+import type { Fs } from "../services/fs.js";
 import type { SignScope } from "./guest-seam.js";
 import type { Realm } from "./realm-queue.js";
 import type { RealmTimers } from "./realm-timers.js";

@@ -3,7 +3,7 @@
 // quickjs-ng plus csrc/shim.c, a flat QJS_* ABI (README.md), driven directly over wazero
 // linear memory with one host import, env.callGo, for JS→Go calls.
 //
-// The loader needs only a small synchronous slice of the API — objects, strings,
+// The native host needs only a small synchronous slice of the API — objects, strings,
 // ArrayBuffers, function callbacks, eval, invoke — so this mirrors exactly that surface
 // and nothing more.
 //
@@ -34,7 +34,7 @@ var wasmBytes []byte
 type goFunc = func(*Context, []*Value) (*Value, error)
 
 // Runtime owns one engine: the wazero runtime, the instantiated qjs module, and the QuickJS
-// runtime and context inside it. Single-threaded: the loader drives every realm from one
+// runtime and context inside it. Single-threaded: the native host drives every realm from one
 // goroutine, so engine calls need no locking.
 type Runtime struct {
 	ctx     context.Context
@@ -320,7 +320,7 @@ func (r *Runtime) Close() {
 // ── low-level engine plumbing ─────────────────────────────────────────────────
 
 // call invokes an exported wasm function and returns its single i64 result (0 if
-// the function is void). Panics on a wasm trap — the loader treats engine faults
+// the function is void). Panics on a wasm trap — the native host treats engine faults
 // as fatal, same as the rest of main.go.
 func (r *Runtime) call(name string, args ...uint64) uint64 {
 	// wazero's api.Function lazily allocates and reuses a per-instance execution stack, so

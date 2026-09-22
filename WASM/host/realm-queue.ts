@@ -4,7 +4,7 @@
 // after the copy out of the guest heap on JS (safe-js.ts), before it natively
 // (native/hostcalls.go).
 
-import { Fifo } from "../core/util.js";
+import { Fifo } from "../services/util.js";
 import type { HostCall } from "./guest-seam.js";
 
 /** The message a disposed realm fails every caller it can no longer answer with — in flight

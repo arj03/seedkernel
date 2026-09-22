@@ -13,7 +13,7 @@ import {
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
-import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/core/net-limits.js";
+import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
 import { REASON_NAMES } from "../build/host/transport-host.js";
 import { HOST_CALLER_ID } from "../build/host/guest-seam.js";
 
@@ -28,7 +28,7 @@ function opOf(input) {
 }
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
-// The RawLink shape (core/socket-seam.ts) plus the hooks these tests need: every byte
+// The RawLink shape (services/socket-seam.ts) plus the hooks these tests need: every byte
 // written is recorded, `tamper` may corrupt or drop a message in flight, `destructive`
 // models a transport discarding unflushed writes on a hard close, `closeArgs` records
 // what the guest asked. Delivery is deferred a microtask (like a real socket); `hold`/
@@ -57,7 +57,7 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       queueMicrotask(() => { if (!this.peer.dead) this.peer.msg?.(one); });
       return parts.length;
     },
-    // The host owner's custody signal (core/socket-seam.ts `RawLink.buffered`):
+    // The host owner's custody signal (services/socket-seam.ts `RawLink.buffered`):
     // bytes written but not yet on the wire, driven directly by a test to model a socket
     // that is backpressured, draining or stuck. `trackBacklog` instead grows it by what
     // `send` was handed: `LinkOutboundOwner` reconciles against the DELTA of this report,
@@ -254,7 +254,7 @@ await test("OUT OF TIME: an app past its deadline loses its own request, never t
 
 await test("a silent peer's correlation is retired on the transport's own timeout", async (keep) => {
   // Hold B's encrypted response after the request reaches its app. A's 100ms transport
-  // timeout must beat the still-live 2s kernel deadline, and the response released later
+  // timeout must beat the still-live 2s host deadline, and the response released later
   // must be ignored rather than poisoning the next correlation or closing the link.
   const st = keep(await upPair(undefined, { transportConfig: { requestTimeoutMs: 100 } }));
   st.chans[1].hold();
@@ -323,7 +323,7 @@ await test("the handoff deadline includes time in the outbound socket queue", as
   const ms = await settled;
   clearInterval(drain);
   assert(typeof ms === "number", "an unanswered request must reject");
-  assert(ms < 1000, `the kernel deadline must not be extended by transport progress (${ms}ms)`);
+  assert(ms < 1000, `the host deadline must not be extended by transport progress (${ms}ms)`);
   assert(chans[0].backlog > 0, "the deadline fires while the initiating owner's bytes are still queued");
 });
 
@@ -530,7 +530,7 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
 
 await test("CONTACT SECRET: the address book alone does not grant a probe", async (keep) => {
   // Every peer holding this node's ADDRESS also holds its static key, so without a contact
-  // secret an address-book leak is a probe capability: elicit msg2, confirm which identity
+  // secret an address-book leak is a probe: elicit msg2, confirm which identity
   // lives at that host, and keep doing it after being removed from the member set. With
   // one, an address leak costs the address and nothing more.
   const chans = wirePair();
@@ -852,7 +852,7 @@ await test("TIE-BREAK: a dial that loses hands what it queued to the link that w
 });
 
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {
-  const { deriveNodeKey } = await import("../build/core/subkeys.js");
+  const { deriveNodeKey } = await import("../build/services/subkeys.js");
   const master = new Uint8Array(32).fill(5);
   const a = deriveNodeKey(sodium, master), b = deriveNodeKey(sodium, master);
   // Deterministic: a node rebuilds its key at boot from the one secret it stores.
@@ -862,7 +862,7 @@ await test("SUBKEYS: one master seed, one derived identity, deterministic", asyn
   // The master itself is never a signing key — only a derivation input.
   assert(hexOf(a.privateKey) !== hexOf(master), "the master seed must not be used as a key");
   // ONE key, deliberately: purposes are kept apart by the domain and scope the host binds
-  // into every preimage, not by a second keypair (core/subkeys.ts).
+  // into every preimage, not by a second keypair (services/subkeys.ts).
   assert(!("channel" in a), "derivation returns the keypair directly");
 });
 
@@ -1049,7 +1049,7 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
 
 await test("DIAGNOSTIC: a socket that dies mid-handshake reads DROPPED, not the catch-all", async (keep) => {
   // The shape of "the other machine is not there" — a refused connect, an unreachable host,
-  // a far end that hangs up before authenticating. Verified against the real loader binary:
+  // a far end that hangs up before authenticating. Verified against the real native binary:
   // `--peers <id>@127.0.0.1:9` prints exactly this. It must NOT read as `handshake`, which
   // is the residual bucket for OUR OWN failures (a half-open budget evicting us), nor as
   // `timeout`, which means the socket stayed open and went quiet.
@@ -1246,7 +1246,7 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   // msg4 is built, and a concealed refusal is silence rather than a close.
   const chans = wirePair();
   // An empty-but-present list: the receiver admits nobody. The lint is the transport's own
-  // now (transport/src `admits`), read from its capability rather than asked of the
+  // now (transport/src `admits`), read from its own config rather than asked of the
   // host per link — see the note there for why the host was never gating this anyway.
   const st = keep(await linked(chans, {}, { admitPeers: [new Uint8Array(32).fill(1)] }));
   await settle();
@@ -1279,13 +1279,13 @@ await test("a decrypt failure does not advance the receive counter", async (keep
   assert((await st.B.seen()).length === 0, "a forged record must not be delivered");
 });
 
-// ── §12.10: a slot's own answer reaches its loader through onInbound ────────────
+// ── §12.10: a slot's own answer reaches its installer through onInbound ────────────
 // Dispatch is one claim → slot map, with no second table an embedder's own name could
 // occupy — but the one thing a table never gave an embedder is a view of what its own app
 // just answered: a peer-inbound frame's reply is consumed by the wire on the way back out.
 // `InstallOptions.onInbound` is that one seam — scoped to the load that named it, not
 // the shell, so there is no table, no owner and no name to contest.
-await test("a peer-inbound answer reaches the loader through onInbound", async (keep) => {
+await test("a peer-inbound answer reaches the installer through onInbound", async (keep) => {
   const st = keep(await upPair());
   // A second, tiny app on B: it claims its own protocol and answers by flipping every
   // byte, so the response is trivially distinct from the request that produced it.

@@ -1,14 +1,15 @@
 // The in-RAM `Fs` backend — the portable one, for tests and ephemeral nodes, and the shape
 // a browser backend (OPFS/IndexedDB) will mirror. It sits with the other backends
-// (`fs-node.ts`, Go's `native/fs.go`), not in core: core is the seam it satisfies and the
-// key rule (core/fs.ts), with the wrappers that apply them in fs-view.ts — those decide
-// what an app can reach. Which medium the bytes land in decides nothing.
+// (`fs-node.ts`, Go's `native/fs.go`) and the seam it satisfies (`fs.ts`). The per-app key
+// rule is applied in host/fs-view.ts — that decides what an app can reach. Which medium the
+// bytes land in decides nothing.
 
-import { type Fs, type FsStat } from "../core/fs.js";
-// The quotas live in core/wasm-limits.ts so its derived node-memory ceiling can name them
-// without core importing a host file; re-exported here, where they are applied.
-import { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
-export { DEFAULT_MEMORY_FS_MAX_BYTES, DEFAULT_MEMORY_FS_MAX_ENTRIES } from "../core/wasm-limits.js";
+import { type Fs, type FsStat } from "./fs.js";
+
+/** The default in-memory backend's whole quota, so a successful put cannot turn bounded
+ *  in-flight calls into unbounded permanent process RAM. */
+export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 
 /** In-RAM Fs. Stores copies so callers can reuse their buffers.
  *

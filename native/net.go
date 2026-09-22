@@ -39,7 +39,7 @@ func dialTCP(addr string) (net.Conn, error) {
 
 // ───────────────────────── RawLink: a byte duplex ──────────────────────────────
 
-// sockChannel delivers bytes as they arrive (core/socket-seam.ts RawLink): one delivery is
+// sockChannel delivers bytes as they arrive (services/socket-seam.ts RawLink): one delivery is
 // an arbitrary slice of the stream and implies no boundary, which the transport bundle's
 // framer imposes on the far side of __net. A channel owns one socket, one read goroutine
 // and one writer goroutine. send only queues — safe from any goroutine — and takes

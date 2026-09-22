@@ -11,7 +11,7 @@ package main
 //
 // Both configurations run in one process, so the comparison is not across two builds. The
 // ratio between them is the number SECURITY §14.1 quotes, and the one to re-measure after
-// any wazero bump: the loader runs a patched wazero whose back-edge check is inline rather
+// any wazero bump: the native binary runs a patched wazero whose back-edge check is inline rather
 // than an exit into Go (see the go.mod replace), and this bench keeps that patch honest.
 
 import (
@@ -165,7 +165,7 @@ func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 // where a fixed cost has nothing to hide behind.
 //
 // Both arms run against ONE boot, so the runtime is armed in both and only the context
-// differs. That is deliberate: it isolates the context, which is the part the loader
+// differs. That is deliberate: it isolates the context, which is the part the native host
 // controls. wazero spawns a watchdog goroutine and channel per call whenever the
 // runtime is armed, whatever context it is handed (internal/wasm module_instance.go
 // CloseModuleOnCanceledOrTimeout), so that cost is in both arms and is not what this

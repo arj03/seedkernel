@@ -69,7 +69,7 @@ export function testkit({ verbose = true } = {}) {
   return { assert, ok, assertEqual, throws, note, sleep, keep, test, summary };
 }
 
-// The author helper below reaches the loader's own derivations rather than restating them
+// The author helper below reaches the host's own derivations rather than restating them
 // — a test-side copy of an identity rule would agree with itself and nothing else.
 // Resolved from this file's location; every suite runs after `npm run build`.
 const impBuilt = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));

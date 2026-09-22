@@ -1,6 +1,6 @@
 // One replaceable wake per realm (§12.3). Deadline tables belong in the guest heap.
-import { concatBytes } from "../core/util.js";
-import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "../core/wasm-limits.js";
+import { concatBytes } from "../services/util.js";
+import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "./wasm-limits.js";
 import { HOST_CALLER_ID, type HostTimers } from "./guest-seam.js";
 import { monotonicMs, type CausalClock } from "./realm-queue.js";
 

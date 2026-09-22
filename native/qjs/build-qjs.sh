@@ -25,7 +25,7 @@ wasi_sdk="${WASI_SDK:-/opt/wasi-sdk}"
 
 # quickjs-ng v0.16.2. Moving this is a deliberate engine upgrade: re-run the Go suite,
 # which drives every export the bridge uses, and check the patches still apply. The
-# node/WASM loader's emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the SAME
+# JS targets' emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the SAME
 # commit, so both engines stay one version.
 quickjs_repo="https://github.com/quickjs-ng/quickjs"
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"

@@ -23,16 +23,16 @@ const { readModuleLimits, checkModuleLimits, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_BUNDLE_MODULES,
   DEFAULT_MAX_APP_SLOTS, DEFAULT_GUEST_DEADLINE_MS,
   SELF_INITIATED_CLOCK_DIVISOR,
-  DEFAULT_REALM_MEMORY_BYTES, DEFAULT_MAX_MODULE_MEMORY_BYTES,
-  DEFAULT_MEMORY_FS_MAX_BYTES }
-  = await imp("build/core/wasm-limits.js");
+  DEFAULT_REALM_MEMORY_BYTES, DEFAULT_MAX_MODULE_MEMORY_BYTES }
+  = await imp("build/host/wasm-limits.js");
+const { DEFAULT_MEMORY_FS_MAX_BYTES } = await imp("build/services/fs-memory.js");
 const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES,
   MAX_NODE_OUTBOUND_QUEUE_BYTES, MAX_INBOUND_HOLD_BYTES }
-  = await imp("build/core/net-limits.js");
+  = await imp("build/services/net-limits.js");
 const { MAX_QUEUED_SIGNAL_BYTES, MAX_QUEUED_SIGNALS, MAX_UNESTABLISHED_PEERS,
   MAX_PENDING_ICE_BYTES, MAX_SDP_BYTES }
-  = await imp("build/host/net-rtc.js");
-const { MemoryFs } = await imp("build/host/fs-memory.js");
+  = await imp("build/services/net-rtc.js");
+const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/host/bundle-author.js");
@@ -46,13 +46,13 @@ withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.w
 const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { createRealmTimers } = await imp("build/host/realm-timers.js");
-const { toHex } = await imp("build/core/util.js");
+const { toHex } = await imp("build/services/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, CallBudget, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { callerOf, readOp, writeOp } = await imp("build/core/op-frame.js");
+const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
 const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/safe-js.js");
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
@@ -67,7 +67,7 @@ const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |
 const section = (id, body) => [id, ...leb(body.length), ...body];
 /** A module header plus whichever sections the bounds read looks at, and nothing else.
  *  Enough for that read, which walks section headers and deliberately does not validate
- *  (core/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
+ *  (host/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
 const rawModule = (...sections) => new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sections.flat()]);
 const memSection = (initialPages, maxPages) => section(5, [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]); // one memory, flags=1 (a maximum is declared)
 /** One funcref table of `initial` elements; `max` null declares no maximum. */
@@ -153,7 +153,7 @@ console.log("\n§12.2 — fs is scoped per app label");
   const chat = scopedFs(disk, appScopeFor(sodium, "chat"));
   const notes = scopedFs(disk, appScopeFor(sodium, "notes"));
   // Every method awaits: the seam is async so a browser backend can implement it
-  // (core/fs.ts), and MemoryFs answers in a microtask like any other.
+  // (services/fs.ts), and MemoryFs answers in a microtask like any other.
   await chat.put("secret", new Uint8Array([1, 2, 3]));
   await notes.put("secret", new Uint8Array([9]));
   ok((await chat.get("secret")).length === 3, "chat reads its own key");
@@ -217,7 +217,7 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
   }
 }
 
-console.log("\n§12.2 — the capability gates cannot be reached by omission");
+console.log("\n§12.2 — the service gates cannot be reached by omission");
 {
   const base = {
     platform: { sodium, now: () => Date.now() },
@@ -916,7 +916,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     "uninstalling it twice reports nothing the second time");
   shell.close();
 
-  // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts), not undefined
+  // Omitted ⇒ the SHARED defaults arrive at the seam (host/wasm-limits.ts), not undefined
   // and not "unbounded". The shell resolves them so no factory owns the numbers.
   let seen2 = null;
   const { shell: bare } = await bootShell({
@@ -949,8 +949,8 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 
 console.log("\n§12.6 — host socket send queues are bounded");
 {
-  const { MessageChannel } = await imp("build/host/net-channel.js");
-  const { NodeChannelFactory } = await imp("build/host/net-node.js");
+  const { MessageChannel } = await imp("build/services/net-channel.js");
+  const { NodeChannelFactory } = await imp("build/services/net-node.js");
   const { TransportHost } = await imp("build/host/transport-host.js");
   const ownedChannel = (channel, limits = {}) => {
     let ownerClosed = false;
@@ -1144,10 +1144,10 @@ console.log("\n§12.6 — host socket send queues are bounded");
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
-  // The catalog calls `timer` an app service (core/domains.ts), so what is under test is
+  // The catalog calls `timer` an app service (services/domains.ts), so what is under test is
   // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring it
   // off the transport driver would admit such an app and then fail it at its first
-  // `host.call` — a manifest the loader accepted naming a backend nothing wired.
+  // `host.call` — a manifest install accepted naming a backend nothing wired.
   const kp = testAuthor();
   const guestSrc = `
     let fired = [];
@@ -1259,7 +1259,7 @@ console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not b
   const body = new Uint8Array([9, 9, 9, 9]);
   const withCaller = (caller) => { const a = new Uint8Array(36); a.set(caller, 0); a.set(body, 32); return a; };
 
-  // This test app's reader; the kernel contributes only the 32-byte attribution prefix.
+  // This test app's reader; the host contributes only the 32-byte attribution prefix.
   ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
   // A near-miss on the host id is not the host: one late bit is all it takes.
   const nearHost = new Uint8Array(32); nearHost[31] = 1;

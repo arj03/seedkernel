@@ -426,7 +426,7 @@ function headerValue(head, name) {
   return m ? m[1] : null;
 }
 
-/** Must match `LISTENER.WS` in core/socket-seam.ts. */
+/** Must match `LISTENER.WS` in services/socket-seam.ts. */
 const LISTENER_WS = "ws";
 
 function makeFramer(stream, linkId, dest, listener) {

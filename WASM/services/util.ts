@@ -1,5 +1,12 @@
 // Small helpers shared across the runtime host. No dependencies.
 
+/** A value representable by the manifest's signed JSON encoding. App configuration is
+ *  schema-free here: its shape and meaning belong to the bundle that reads it. */
+export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+export interface JsonObject {
+  [key: string]: JsonValue;
+}
+
 const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
 
 /** One TextEncoder/TextDecoder for the whole host. Both are stateless and present on every

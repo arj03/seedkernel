@@ -1,18 +1,18 @@
-# Generated host JS bundles — the shared core/ + host/ TS, bundled for //go:embed.
-# Regenerate from WASM/: `npm run build:loader`.
+# Generated host JS bundles — the shared services/ + host/ TS, bundled for //go:embed.
+# Regenerate from WASM/: `npm run build:native`.
 *.gen.js
 
-# WASM artifacts copied in by `npm run build:loader` (WASM/scripts/copy-loader-wasm.mjs):
+# WASM artifacts copied in by `npm run build:native` (WASM/scripts/copy-native-wasm.mjs):
 # libsodium from the upstream npm dist, ML-DSA-65 built from the mldsa-native submodule.
 # qjs/qjs.wasm is NOT ignored — it is checked in, built from qjs/csrc/ by
-# qjs/build-qjs.sh, so a clone needs no wasi-sdk to build the loader.
+# qjs/build-qjs.sh, so a clone needs no wasi-sdk to build the binary.
 /wasm/libsodium.wasm
 /wasm/mldsa65.wasm
 
-# Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
-/seedloader
-/seedloader-linux-amd64
-/seedloader.exe
+# Built native binary (`gorun.sh build -o seedkernel[.exe] .`).
+/seedkernel
+/seedkernel-linux-amd64
+/seedkernel.exe
 
 # Local dev wrapper that runs the Go toolchain through WSL — machine-specific setup.
 /gorun.sh

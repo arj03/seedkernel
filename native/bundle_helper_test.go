@@ -28,7 +28,7 @@ import (
 var forwarderWasm []byte
 
 // The manifest signing vocabulary these test bundles are written against, READ OUT OF THE
-// SHARED BUNDLE (core/domains.ts) rather than restated here.
+// SHARED BUNDLE (services/domains.ts) rather than restated here.
 //
 // That is the line between the two kinds of duplication in this file: `bundleEnvelope` is a deliberate second *implementation* fed to the shared reader, so
 // a drift between them is the point. A constant has nothing to disagree with — a copy can
@@ -83,7 +83,7 @@ type authorKeys struct {
 
 // id is the 32-byte author id everything downstream is keyed by: policy entries,
 // freshness marks, revocation. A second implementation of bundle.ts `hybridAuthorId`,
-// since a test that asked the loader for the id would agree with it by construction.
+// since a test that asked the host for the id would agree with it by construction.
 func (a authorKeys) id() []byte {
 	pre := append(domainManifestAuthor(), manifestSuite())
 	pre = append(append(pre, a.edPub...), a.mlPk...)
@@ -107,7 +107,7 @@ func testAuthor(t testing.TB) authorKeys {
 	return authorKeys{edPriv: edPriv, edPub: edPub, mlPk: mlPk, mlSk: mlSk}
 }
 
-// testSigner is the ML-DSA-65 signing half the tests need and the shipped loader
+// testSigner is the ML-DSA-65 signing half the tests need and the shipped native binary
 // deliberately does not have (mldsa.go binds verify only, §12.4).
 //
 // One instance per RUNTIME, not per author: compiling it for every author would cost
@@ -145,7 +145,7 @@ func realmString(expr string) string {
 // The stub guest every test bundle that does not exercise the guest declares: every
 // app is a guest (§12.4), so the one app shape ships a guest program even when the
 // test's point is elsewhere (policy, freshness, suite admission…). It reads the payload
-// after the kernel's 32-byte caller with ITS OWN framing (the op-lead shape the test
+// after the host's 32-byte caller with ITS OWN framing (the op-lead shape the test
 // harness composes around invokeApp) and forwards the arguments to its one module.
 const stubGuestSrc = `function handle(arg) {
 	const n = arg.length > 32 ? arg[32] : -1;
@@ -197,7 +197,7 @@ func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, m
 }
 
 // claimManifest builds a manifest body claiming exactly the given protocol ids — the one
-// field the ordinary fixture derives, spelled out, so a test can feed the loader an id the
+// field the ordinary fixture derives, spelled out, so a test can feed the host an id the
 // format refuses (§12.10). Everything else matches manifestJSON.
 func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	t.Helper()
@@ -218,9 +218,9 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	return mjson
 }
 
-// isHostService mirrors core/domains.ts HOST_SERVICES, so a fixture's one `requires`
+// isHostService mirrors services/domains.ts HOST_SERVICES, so a fixture's one `requires`
 // argument can be split into the manifest's two signed lists. Restated rather than read out
-// of the realm because it is the fixture's convenience; the loader refuses a wrong split.
+// of the realm because it is the fixture's convenience; install refuses a wrong split.
 func isHostService(name string) bool {
 	switch name {
 	case "node", "fs", "clock", "timer", "link":
@@ -230,7 +230,7 @@ func isHostService(name string) bool {
 }
 
 // appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
-// spellings carry no authority (§12.10) and the loader ties nothing to one, so a fixture
+// spellings carry no authority (§12.10) and the host ties nothing to one, so a fixture
 // deriving `_net` from a `link` requires would only be borrowing the transport's claim
 // and testing the CLAIM contest wherever it meant to test `link`. A claim has one
 // active owner, so two fixtures must not derive the same id.
@@ -278,7 +278,7 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		}},
 		Guest: guest{},
 	}
-	// One fixture argument, split into the two signed lists by the question the loader also
+	// One fixture argument, split into the two signed lists by the question install also
 	// asks: is this a host service?
 	for _, r := range requires {
 		if isHostService(r) {
@@ -330,9 +330,9 @@ func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int
 // deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given, and for a local loopback
-// the `send` op is one request out. The envelope after the kernel's 32-byte caller is
+// the `send` op is one request out. The envelope after the host's 32-byte caller is
 // read and written with THIS probe's own copies, so the probe carries the call shape a
-// real app does — content, not a kernel ABI.
+// real app does — content, not a host ABI.
 const probeGuestSource = `
   function readOp(b) {
     const n = b.length > 0 ? b[0] : -1;

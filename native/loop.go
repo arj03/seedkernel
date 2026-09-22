@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 type eventLoop struct {
@@ -294,7 +294,7 @@ func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func(
 // error string), with timeout as a safety net. Every realm is pumped meanwhile, which is
 // how a guest suspended on a host call resumes. Sequential awaits are isolated by awaitGen;
 // nesting is not, since el.onSettle is a single shared slot and a nested await would orphan
-// the outer one. The loader never nests it (a guest's net call settles through guest.go's
+// the outer one. The native host never nests it (a guest's net call settles through guest.go's
 // own callbacks, which don't touch onSettle).
 func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1

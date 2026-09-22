@@ -15,7 +15,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { bootShell } = await imp("build/host/shell-core.js");
-const { NodeChannelFactory } = await imp("build/host/net-node.js");
+const { NodeChannelFactory } = await imp("build/services/net-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
@@ -58,7 +58,7 @@ async function makeNode(ws = false, extraConfig = {}) {
   const app = await shell.install(harnessAppBlob(appAuthor));
   // The node's own channel key, hex. Read off the identity this factory minted rather than
   // asked of the driver: it is the same `toHex(identity.publicKey)` every caller already
-  // holds, and the driver has nothing to say about peers any more (core/socket-seam.ts).
+  // holds, and the driver has nothing to say about peers any more (services/socket-seam.ts).
   return { shell, transport, app, peerId: Buffer.from(identity.publicKey).toString("hex") };
 }
 

@@ -1,5 +1,5 @@
 // fs.go — the Go target's `fs.*` platform primitive: raw bytes under an opaque flat key,
-// one file per key under the data directory `__fs.open` names. Mirrors host/fs-node.ts
+// one file per key under the data directory `__fs.open` names. Mirrors services/fs-node.ts
 // (NodeFs), so a Go node's store behaves like a Bun node's.
 package main
 
@@ -9,13 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // fsKeySafe is only the backend's containment backstop. Which keys are portable is the
-// shared isSafeFsKey predicate (WASM/core/fs.ts), applied by validatedFs; restating that
+// shared isSafeFsKey predicate (WASM/services/fs.ts), applied by validatedFs; restating that
 // policy here would let targets' key spaces drift. Keep path-shaped cases because the
-// loader's direct fs handle bypasses validatedFs. Empty is also refused because it names
+// host's direct fs handle bypasses validatedFs. Empty is also refused because it names
 // the store directory itself, which os.Remove can remove when it is empty.
 func fsKeySafe(k string) bool {
 	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, `/\`)
@@ -222,7 +222,7 @@ func (f *nodeFs) stat() int64 {
 }
 
 // exposeFs installs `__fs` into the realm: Go byte primitives, ArrayBuffer in and out;
-// shaping them into the async core/fs.ts `Fs` seam is host/native-shim.ts. The backend
+// shaping them into the async services/fs.ts `Fs` seam is host/native-shim.ts. The backend
 // starts CLOSED until `__fs.open` names the operator's `--dir`: a half-configured node
 // must not quietly store blocks somewhere nobody asked for.
 func exposeFs(qc *qjs.Context) {
@@ -279,7 +279,7 @@ func exposeFs(qc *qjs.Context) {
 		s := qc.NewObject()
 		s.SetPropertyStr("used", qc.NewInt64(fs.stat()))
 		// -1: no portable free-disk figure; the shim maps it to FS_AVAILABLE_UNKNOWN
-		// (core/fs.ts), so Go holds no copy of that value.
+		// (services/fs.ts), so Go holds no copy of that value.
 		s.SetPropertyStr("available", qc.NewInt64(-1))
 		return s, nil
 	}))

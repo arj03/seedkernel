@@ -21,12 +21,12 @@ import (
 // embeds — the transport guest and ws.wasm. So a checkout whose npm build has not been
 // re-run tests a program that is no longer in the repository, with every suite green.
 //
-// bundle-loader.mjs stamps the sources it generated from into the artifact
+// bundle-native-host.mjs stamps the sources it generated from into the artifact
 // (scripts/source-stamp.mjs); this re-hashes them. The file list comes OUT of the artifact,
 // so nothing here restates the build's own set — a source added to the bundle is described
 // by the next artifact generated, and every source already in one is checked byte for byte.
 
-// shellSourceMarker introduces the stamp line bundle-loader.mjs writes.
+// shellSourceMarker introduces the stamp line bundle-native-host.mjs writes.
 const shellSourceMarker = "//@sources "
 
 var shellStamp struct {
@@ -41,7 +41,7 @@ func requireFreshShell(tb testing.TB) {
 	tb.Helper()
 	shellStamp.Do(func() { shellStamp.err = shellSourceDrift() })
 	if shellStamp.err != nil {
-		tb.Fatalf("%v\n\nRegenerate it:  (cd WASM && npm run build:loader)", shellStamp.err)
+		tb.Fatalf("%v\n\nRegenerate it:  (cd WASM && npm run build:native)", shellStamp.err)
 	}
 }
 

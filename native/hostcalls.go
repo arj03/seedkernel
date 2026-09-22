@@ -23,7 +23,7 @@ type parkedCall struct {
 type hostCallLedger struct {
 	live  map[int64]parkedCall // guest-minted call id → what it holds
 	bytes int64                // the sum of live's charges, kept as one number
-	// The ceilings arrive from the shared host (core/wasm-limits.ts) on every createRealm,
+	// The ceilings arrive from the shared host (host/wasm-limits.ts) on every createRealm,
 	// so Go holds no copy that could drift from the JS target's.
 	maxCalls int
 	maxBytes int64

@@ -5,7 +5,7 @@ import {
   FreshnessMarks, toHex, concatBytes, imp, withTestBudget,
 } from "./fixtures.mjs";
 
-const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
+const { DEFAULT_MAX_APP_SLOTS } = await imp("build/host/wasm-limits.js");
 const alice = testAuthor(), bob = testAuthor(), carol = testAuthor();
 const bundle = (author, app, version = 1, extra = {}) => authorBundle(sodium, author, {
   app, version, modules: [], guestSource: "function handle() { return new Uint8Array(); }",

@@ -2,7 +2,7 @@
 
 A thin Go↔wazero bridge to the **quickjs-ng** engine: objects, strings,
 ArrayBuffers, function callbacks, eval, invoke and the job queue — the synchronous
-slice of the API the loader uses, and nothing more.
+slice of the API the native host uses, and nothing more.
 
 ## Files
 
@@ -14,7 +14,7 @@ slice of the API the loader uses, and nothing more.
   switches off for WASI; without it, deep recursion runs off the wasm stack into a
   trap that leaves the engine unusable, instead of throwing a `RangeError`.
 - **`qjs.wasm`** — the shim linked against the engine, checked in (~1.25 MiB) and
-  embedded via `//go:embed`, so a clone builds the loader with nothing but Go.
+  embedded via `//go:embed`, so a clone builds the binary with nothing but Go.
 
 `./build-qjs.sh` rebuilds it: fetches quickjs-ng at the commit pinned in the script,
 applies the patches, compiles `csrc/` against it with wasi-sdk, and installs the
@@ -56,7 +56,7 @@ Upstream: https://github.com/quickjs-ng/quickjs (MIT)
 ## Scope
 
 Synchronous only — every `QJS_*` call is a plain synchronous Go→wasm call, and the
-loader builds everything async on top of it: a Go-owned event loop, timers and socket
+native host builds everything async on top of it: a Go-owned event loop, timers and socket
 delivery, in `../loop.go`. A separate `Runtime` is created per realm: the trusted host
 realm (the platform primitives plus the shared shell JS) and each zero-authority guest
 realm, whose only seam is `host.call`.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"seedloader/qjs"
+	"seedkernel/qjs"
 )
 
 // asyncnet: a confined guest *initiates* a real network round-trip, which proves the

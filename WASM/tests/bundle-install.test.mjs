@@ -38,7 +38,7 @@ async function testFullLifecycle() {
   const { host } = await makeHost();
   const chatKey = "chat";
 
-  // Installed through the same path the bundle loader uses. The forwarder fixture is a
+  // Installed through the same path install uses. The forwarder fixture is a
   // pure transform that echoes its input.
   await installMod(host, chatKey, "chat", forwarderBytes);
   assert(host.isBound(chatKey, "chat"), "chat module installed");
@@ -249,7 +249,7 @@ async function testManifestClaimIsTheRouting() {
 
     // A second app cannot shadow an active claim. Rejection leaves both the existing
     // route and the candidate's install state untouched — including never evaluating its
-    // guest, whose top level could already exercise its admitted capabilities.
+    // guest, whose top level could already exercise its granted services.
     const rival = "rival-store";
     const buildsBeforeConflict = realmBuilds;
     let conflict = "";
@@ -273,7 +273,7 @@ async function testManifestClaimIsTheRouting() {
     // install list is counted: without this bound each of those ceilings is a floor. A
     // REPLACEMENT is never refused — it takes the slot its own label already holds — and an
     // uninstall gives one back.
-    const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
+    const { DEFAULT_MAX_APP_SLOTS } = await imp("build/host/wasm-limits.js");
     for (let i = 0; i < DEFAULT_MAX_APP_SLOTS; i++) {
       await shell.install(blob(author, `filler${i}`, 1, [`filler/${i}`]));
     }
@@ -303,7 +303,7 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
     }
-    // No spelling is reserved to the kernel: a `_`-led name is legal in either claim
+    // No spelling is reserved to the host: a `_`-led name is legal in either claim
     // list, and it is the LIST — never the spelling — that decides who may reach it.
     for (const claim of ["_offer", "_host", "_net", "plain"]) {
       verifyTestBundle(sodium, signTestBundle(sodium, author,
@@ -381,10 +381,10 @@ async function testInstallerRemove() {
   console.log("  OK\n");
 }
 
-// ─── Test: fs.* capability (opaque key → bytes) ─────────────────────────
+// ─── Test: fs service (opaque key → bytes) ─────────────────────────
 
 async function testFs() {
-  console.log("Test: fs.* capability — opaque key → bytes (NodeFs + MemoryFs)");
+  console.log("Test: fs service — opaque key → bytes (NodeFs + MemoryFs)");
 
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -405,7 +405,7 @@ async function testFs() {
   for (const { name, make } of backends) {
     const { fs, cleanup } = make();
     try {
-      // The seam is async on every backend (core/fs.ts), which is what lets a browser
+      // The seam is async on every backend (services/fs.ts), which is what lets a browser
       // backend satisfy this shape at all.
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
       assert(await fs.size("a.blk") < 0, `${name}: absent before put`);
@@ -518,13 +518,13 @@ async function testFs() {
 // ─── Test: the fs key space is ONE rule, shared by every target ──────────
 // Which keys a node admits decides which blocks it stores and advertises, so it is a
 // consensus predicate: a Go node and a Bun node that disagree about it disagree about
-// their contents. The rule lives in shared JS (core/fs.ts `isSafeFsKey`), applied over
+// their contents. The rule lives in shared JS (services/fs.ts `isSafeFsKey`), applied over
 // whatever backend a target supplies (`validatedFs`, host/fs-view.ts).
 
 async function testFsKeyRule() {
   console.log("Test: fs key space is one rule — isSafeFsKey over any backend (validatedFs)");
 
-  const { isSafeFsKey } = await imp("build/core/fs.js");
+  const { isSafeFsKey } = await imp("build/services/fs.js");
   const { validatedFs, scopedFs } = await imp("build/host/fs-view.js");
 
   const legal = ["a", "a.blk", "A_b-c.9", "0".repeat(64) + ".blk", "_", "-", "..a", "a.."];
@@ -636,7 +636,7 @@ async function testSlotFreshness() {
 }
 
 async function testShellBoot() {
-  console.log("Test: seedkernel-shell boots under a policy and wires its capability backends");
+  console.log("Test: seedkernel-shell boots under a policy and wires its host service backends");
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -790,7 +790,7 @@ async function testGuestBundle() {
     assert(bytesEqual(v.author, author.id), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
     assertEqual(v.guestSource, GUEST_TEXT, "verifyBundle yields the verified guest source");
-    // Load the bundle through the shared §12.4 loader.
+    // Load the bundle through the shared install path.
     wf(bundlePath, packed);
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
@@ -1062,7 +1062,7 @@ async function testWrongTypedStoreIsRefused() {
   // malformed or unreadable state. A directory at the file path is a portable read failure
   // that cannot be mistaken for ENOENT.
   const { freshnessStoreFor } = await imp("build/host/cli.js");
-  const { nodeFiles } = await imp("build/host/fs-node.js");
+  const { nodeFiles } = await imp("build/host/shell-node.js");
   const { freshnessPathFor } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1395,7 +1395,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
 // ─── Test: generated guest op-frame source is the canonical implementation ─────
 //
-// core/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
+// services/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
 // functions for import-free guests; the transport assembler injects the same fragment.
 // Exercise the emitted program at every boundary so serialization cannot change behavior.
 function testGeneratedOpFrame() {

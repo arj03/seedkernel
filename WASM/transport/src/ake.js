@@ -60,7 +60,7 @@ const M2_LEN = EPH_LEN + KEM_CT_LEN + NONCE_LEN + TAG_LEN;             // 1168
 const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 
-// The one suite this transport speaks. Lives here, not in the host's core, since a
+// The one suite this transport speaks. Lives here, not in services/domains.ts, since a
 // channel suite is read entirely by this AKE (§14.1); not negotiated (§12.6).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
@@ -76,7 +76,7 @@ const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 
 // This channel format tag seeds the session root and prefixes every identity-signature
-// payload. Transport CONTENT, not a kernel signing domain — which is how a bundle update
+// payload. Transport CONTENT, not a host signing domain — which is how a bundle update
 // changes the handshake format: the host supplies only the opaque scope. (§12.6.2b)
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
@@ -542,7 +542,7 @@ class Link {
       if (this.timedOut) return REASON_TIMEOUT;
       // Nothing of ours closed it, so the socket died on its own: refused, unreachable, or
       // hung up. Same test as `truncated` below, which is the post-auth form of it — and
-      // the commonest line an operator sees, verified against the real loader binary
+      // the commonest line an operator sees, verified against the real native binary
       // (`--peers <id>@127.0.0.1:9` prints `link 1 down: dropped`).
       if (!this.closedLocally) return REASON_DROPPED;
       return REASON_HANDSHAKE;

@@ -3,7 +3,7 @@ package main
 import "testing"
 
 // The native node's identity is the key the shared code derives from the master seed
-// (deriveNodeKey, core/subkeys.ts, §12.6.2b), computed over THIS target's crypto — whose
+// (deriveNodeKey, services/subkeys.ts, §12.6.2b), computed over THIS target's crypto — whose
 // BLAKE2b is native. The expected peer id is the JS target's answer for the same seed, so
 // a native derivation that drifted would stand up a node every other target names
 // differently.
