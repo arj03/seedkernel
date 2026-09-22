@@ -337,9 +337,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
     const links = reachesLink(b.manifest);
-    // As signed. Tells a bare `host.call` name from this bundle's own module
-    // (guest-seam.ts dispatch).
-    const localServices = new Set(b.manifest.guest.calls ?? []);
     // The 32 bytes this realm is attributed by when it calls another: its label,
     // hashed. The same shape as the sender key prepended to an inbound frame, so a
     // callee reads one field whether the caller was a peer or a co-resident app. Zero
@@ -353,7 +350,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // bundle's own module names are exempt from both — a fixed catalog and the
         // app's own code, never grants.
         names: new Set(b.manifest.guest.requires),
-        localServices,
+        localServices: new Set(b.manifest.guest.calls ?? []),
         // What node/sign signs under: this slot's ONE scope, derived at load —
         // an ordinary app's own `DOMAIN_guest ‖ app`, the link slot's
         // `DOMAIN_link_scope` (§12.2). The host chooses what the

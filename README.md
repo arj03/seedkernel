@@ -114,14 +114,14 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,344 LOC)**
+**Shared — compiled once, run by all three targets (2,343 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 465 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 329 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 642 |
-| Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 370 |
+| Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 369 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 196 |
 | Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 342 |
 

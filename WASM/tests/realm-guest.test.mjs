@@ -132,9 +132,9 @@ async function testGuestSeam() {
     let unclaimed = false;
     try { await seam("_nobody", U()); } catch { unclaimed = true; }
     assert(unclaimed, "a local service id no realm claims is refused by name, not left pending");
-    // The declaration is asked BEFORE the charset, so an id spelled with a `/` — legal
-    // for any claim (§12.10) — reaches the routing rather than the host table, where it
-    // would have died as an unknown host name.
+    // A name is what the manifest declared it as, never what its spelling suggests: an
+    // id with a `/` — legal for any claim (§12.10) — routes to its claimant rather than
+    // the host table, where it would have died as an unknown host name.
     assertEqual([...await seam("chat/v1", U(1))], [9, 9],
       "a declared local service id carrying a `/` still routes to the claiming realm");
 
@@ -624,11 +624,11 @@ async function testSeamGating() {
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
   // A bare name is the asking bundle's own module map — code it already holds, scoped by
   // the app the seam was built for — so it passes the gate under an empty requires
-  // set. This seam's `hasModule` says no, so it is refused for NOT EXISTING rather than
-  // for not being declared, and the message is the assertion.
+  // set. This seam declares no such module, so it is refused for NOT EXISTING rather than
+  // by the requires gate, and the message is the assertion.
   let gateMsg = "";
   try { await clockOnly("echo", U(1, 120)); } catch (e) { gateMsg = e.message; }
-  assert(gateMsg.includes("no module by that name"),
+  assert(gateMsg.includes("no such name") && !gateMsg.includes("guest.requires"),
     `a bare name passes the gate ungated and fails only on existence (got: ${gateMsg})`);
 
   // Grants are gated by SERVICE, not by method: declaring `clock` resolves `clock/now`,

@@ -172,11 +172,10 @@ const OFF_ED_SIG = OFF_ML_PK + ML_DSA_PK_LEN;
 const OFF_ML_SIG = OFF_ED_SIG + SIG_LEN;
 const OFF_BODY = OFF_ML_SIG + ML_DSA_SIG_LEN;
 
-/** Module names are the guest's module keys, so they are held to an
- *  unambiguous charset — and, since one `host.call` name is either a host method or a bare
- *  name, to a first character that cannot start one: a `/` would spell a host method. A
- *  collision with a name in `guest.calls` is checked by the call site (`validateManifest`),
- *  since the dispatch resolves a called service before this bundle's modules. */
+/** Module names are the guest's module keys, so they are held to an unambiguous charset
+ *  with no `/`, which every host name carries — so no module can share a name with a host
+ *  method. A collision with a name in `guest.calls` is checked by the call site
+ *  (`validateManifest`): one `host.call` name means exactly one declared thing. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /** The claim charset (§12.10): shared by `protocols`, `services` and `guest.calls` — one
@@ -302,14 +301,14 @@ export function validateManifest(manifest: unknown): asserts manifest is BundleM
     if (!CLAIM_RE.test(c)) {
       throw new Error(`bundle: "${c}" is not a well-formed local service id (manifest guest.calls; alphanumeric-or-"_" first, then alphanumerics and ._/-, at most 64 bytes)`);
     }
-    // Spelled like a host method, this would resolve as a cross-realm call before the
-    // host table is consulted, taking that method away from this bundle.
+    // One name, one meaning: declared here it IS a cross-realm call, so spelling a host
+    // method would take that method away from this bundle.
     const head = c.slice(0, c.indexOf("/") < 0 ? c.length : c.indexOf("/"));
     if (isService(head)) {
-      throw new Error(`bundle: "${c}" (manifest guest.calls) is spelled like a method of this host's "${head}" service — the seam would resolve the call first and the host method would never be reached`);
+      throw new Error(`bundle: "${c}" (manifest guest.calls) is spelled like a method of this host's "${head}" service — a host.call name means one thing, and declared here it would never reach the host method`);
     }
     if (moduleNames.has(c)) {
-      throw new Error(`bundle: "${c}" is both a called local service id (manifest guest.calls) and one of this bundle's own module names — the seam would resolve the call first and the module would never be reached`);
+      throw new Error(`bundle: "${c}" is both a called local service id (manifest guest.calls) and one of this bundle's own module names — a host.call name means one thing, so declare one or the other`);
     }
   }
 }

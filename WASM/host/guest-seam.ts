@@ -95,9 +95,8 @@ export interface SeamGrants {
    *  declared local service pass regardless. */
   names: Iterable<string>;
   /** EXACTLY the manifest's declared `guest.calls` (§12.10) — the local service ids this
-   *  realm may reach on a co-resident guest, as signed. What tells a bare `host.call` name
-   *  from one of this bundle's own modules: declared here, it is a cross-realm call;
-   *  otherwise a module. */
+   *  realm may reach on a co-resident guest, as signed. Each routes to its claimant
+   *  whatever its spelling; absent ≡ none. */
   localServices?: ReadonlySet<string>;
   /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
    *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ app`, the link
@@ -206,9 +205,8 @@ type CryptoName = `crypto/${HostTransformName}`;
 /** The keys the dispatch table must cover, typed so a name added to the vocabulary without
  *  a handler is a compile error, and so is a handler whose name install would refuse.
  *
- *  Every one contains a `/`, which is load-bearing (§12.2): module names are held to
- *  `[A-Za-z0-9_-]`, so they cannot spell one of these — that is what lets the dispatch tell
- *  host names and module names apart by the name alone. */
+ *  Every one contains a `/`, and module names are held to `[A-Za-z0-9_-]` (§12.4), so no
+ *  module can share a name with one of these. */
 type HandlerKey = HostMethod | CryptoName;
 
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
@@ -417,9 +415,6 @@ const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);
-/** `grants.localServices`'s default: a realm whose manifest named no `guest.calls` reaches
- *  no local service, not every bare name. */
-const EMPTY_SET: ReadonlySet<string> = new Set();
 
 function u64be(value: number): Uint8Array {
   const out = new Uint8Array(8);
@@ -582,72 +577,22 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     throw new Error("guest-seam: grants.names is required — pass the manifest's declared guest.requires");
   }
   const allowed = new Set(grants.names);
-  const localServices = grants.localServices ?? EMPTY_SET;
   const handlers = hostCatalog(platform, grants);
-  return (name, payload, budget) => {
-    // ONE catalog, three sources of names, resolved in DECLARATION order (§12.2). A
-    // name THIS realm declared as a local service is another realm's, however it is
-    // spelled: the id is an ordinary claim and may carry a `/` like any other, so
-    // asking the declaration before the charset is what keeps one vocabulary from
-    // becoming two. It can never shadow a host method — install refuses a
-    // `guest.calls` entry whose head is a known service (bundle.ts). The callee answers
-    // on a later turn, never inside this guest's frame; an id nothing claims is refused
-    // by name rather than parked on a promise no one will settle.
-    if (localServices.has(name)) {
-      // No budget check here or at the module call below: a `CallBudget` cannot exist with
-      // nothing left, so the refusal has already happened at the guest's call site.
-      const answer = grants.calls.call(name, payload, budget.remainingMs, budget.causalClock);
-      if (!answer) throw new Error("guest-seam: no realm claims " + name);
-      return answer;
-    }
-    // A `/` says a host method: the table lookup IS the dispatch, gated by the
-    // method's SERVICE — an undeclared `node/random` is refused even beside a
-    // declared `node/sign`, because the unit a manifest grants is the SERVICE.
-    // `serviceOf` is a table lookup on the text before the first `/`, never a semantic
-    // parse. An unknown name (or a primitive this host does not carry) reads
-    // `undefined` and is refused regardless of the gate.
-    if (name.includes("/")) {
-      const svc = serviceOf(name);
-      if (svc && !allowed.has(svc)) {
-        throw new Error("guest-seam: " + name + " not declared by the bundle manifest guest.requires");
-      }
-      const fn = handlers[name];
-      if (!fn) throw new Error("guest-seam: no such name " + name);
-      // Flattened so the caller reads ONE shape: a handler that answered inline
-      // (every crypto name, clock, link, timer) resolves in a microtask exactly like
-      // a round-tripping one. An inline THROW propagates synchronously, on purpose —
-      // see the contract above.
-      //
-      // The SYNCHRONOUS span is host compute spent on this caller's behalf: libsodium
-      // runs ed25519, x25519 and the AEADs to completion before returning, while an
-      // I/O name returns its promise having done nothing. Measuring exactly that span
-      // bills the causal root (§12.3) for host CPU and leaves waiting free, with no
-      // second list of which names are which to keep in step with the catalog. In
-      // `finally` because an AEAD that rejects a bad tag has already done the whole
-      // open. Not `budget.charge`: this is the root's pacing share, not the calling
-      // realm's own execution segment (§4.3), which the host is not running inside.
-      //
-      // Only a timer root carries a clock, so the reading is skipped entirely for
-      // peer- and host-initiated work — which is every seam call the transport makes
-      // on the frame path, and the reason this measurement costs that path nothing.
-      const owner = budget.causalClock;
-      if (owner === undefined) return Promise.resolve(fn(payload, budget));
-      const at = monotonicMs();
-      try {
-        return Promise.resolve(fn(payload, budget));
-      } finally {
-        owner.charge(monotonicMs() - at);
-      }
-    }
-    // Any other name is one of THIS slot's private modules, by its manifest name. The
-    // slot wired this value directly, so no name can reach another app. Ungated like
-    // `crypto/*`. A name the app never installed is a typo, refused by name; a module
-    // that runs and fails is a different event, and rejects like any other (§12.2).
-    if (!modules.names.has(name)) {
-      throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
-    }
-    // Module call charged to the caller's segment (§4.3).
-    return modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
+  // What this manifest DECLARED, resolved once here: a name is whatever the manifest
+  // declared it as (§12.2), never what its spelling suggests. Install refuses a
+  // `guest.calls` entry that spells a host method or one of this bundle's module names
+  // (bundle.ts), and a module name cannot contain the `/` every host name does, so the
+  // three sources are disjoint and the order below never decides anything.
+  //
+  // No budget check in either route: a `CallBudget` cannot exist with nothing left, so
+  // the refusal has already happened at the guest's call site.
+  const declared = new Map<string, (payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>>();
+  // THIS slot's private modules, by manifest name. The slot wired this value directly,
+  // so no name can reach another app. Ungated like `crypto/*`. A module that runs and
+  // fails rejects like any other round trip (§12.2). Charged to the caller's segment
+  // (§4.3).
+  for (const name of modules.names) {
+    declared.set(name, (payload, budget) => modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
       // Bill the module's OWN processing time (measured on the worker that ran
       // it), never the issue-to-settle wall clock — a burst of fire-and-forget
       // module calls serialized through one worker would otherwise charge their
@@ -657,6 +602,57 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       // Folding them together would make every caller guess failure from a length.
       if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
       return bytes;
+    }));
+  }
+  // Another realm's service, however it is spelled — an id is an ordinary claim and may
+  // carry a `/`. The callee answers on a later turn, never inside this guest's frame; an
+  // id nothing claims is refused by name rather than parked on a promise no one will
+  // settle.
+  for (const id of grants.localServices ?? []) {
+    declared.set(id, (payload, budget) => {
+      const answer = grants.calls.call(id, payload, budget.remainingMs, budget.causalClock);
+      if (!answer) throw new Error("guest-seam: no realm claims " + id);
+      return answer;
     });
+  }
+  return (name, payload, budget) => {
+    const route = declared.get(name);
+    if (route) return route(payload, budget);
+    // Everything else is the host table: the lookup IS the dispatch, gated by the
+    // method's SERVICE — an undeclared `node/random` is refused even beside a declared
+    // `node/sign`, because the unit a manifest grants is the SERVICE. `serviceOf` is a
+    // table lookup on the text before the first `/`, never a semantic parse. An unknown
+    // name (or a primitive this host does not carry) is refused regardless of the gate.
+    const svc = serviceOf(name);
+    if (svc && !allowed.has(svc)) {
+      throw new Error("guest-seam: " + name + " not declared by the bundle manifest guest.requires");
+    }
+    const fn = handlers[name];
+    if (!fn) throw new Error("guest-seam: no such name " + name);
+    // Flattened so the caller reads ONE shape: a handler that answered inline
+    // (every crypto name, clock, link, timer) resolves in a microtask exactly like
+    // a round-tripping one. An inline THROW propagates synchronously, on purpose —
+    // see the contract above.
+    //
+    // The SYNCHRONOUS span is host compute spent on this caller's behalf: libsodium
+    // runs ed25519, x25519 and the AEADs to completion before returning, while an
+    // I/O name returns its promise having done nothing. Measuring exactly that span
+    // bills the causal root (§12.3) for host CPU and leaves waiting free, with no
+    // second list of which names are which to keep in step with the catalog. In
+    // `finally` because an AEAD that rejects a bad tag has already done the whole
+    // open. Not `budget.charge`: this is the root's pacing share, not the calling
+    // realm's own execution segment (§4.3), which the host is not running inside.
+    //
+    // Only a timer root carries a clock, so the reading is skipped entirely for
+    // peer- and host-initiated work — which is every seam call the transport makes
+    // on the frame path, and the reason this measurement costs that path nothing.
+    const owner = budget.causalClock;
+    if (owner === undefined) return Promise.resolve(fn(payload, budget));
+    const at = monotonicMs();
+    try {
+      return Promise.resolve(fn(payload, budget));
+    } finally {
+      owner.charge(monotonicMs() - at);
+    }
   };
 }
