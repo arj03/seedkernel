@@ -521,10 +521,9 @@ export class TransportHost {
   private announce(linkId: number, channel: RawLink, arrival?: Arrival): void {
     this.tell(ev("linkOpen")
       .u32(linkId)
-      .u8(arrival?.weDialed ? 1 : 0)
       .u8(channel.stream ? 1 : 0)
       .text(arrival?.listener ?? "")
-      .blob(arrival?.expectPeerId ? fromHex(arrival.expectPeerId) : EMPTY)
+      .blob(arrival?.dialed ? fromHex(arrival.dialed) : EMPTY)
       .text(channel.remoteAddr ?? ""));
   }
 

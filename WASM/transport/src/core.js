@@ -471,11 +471,12 @@ function handle(argBytes) {
 /** Platform-opened link event (§12.1). */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
-  const weDialed = r.u8() === 1;
   const stream = r.u8() === 1;
   const listener = r.blob();
-  const expectPeerId = r.blob();
+  // The peer the platform dialed for, or empty for an accepted socket.
+  const dialed = r.blob();
   const source = r.blob();
+  const weDialed = dialed.length > 0;
   core.openLink({
     linkId, weDialed, stream,
     listener: listener.length > 0 ? utf8Decode(listener) : "",
@@ -484,8 +485,7 @@ entry("linkOpen", (r) => {
     source: source.length > 0 ? utf8Decode(source) : undefined,
     // Only an accept spends half-open budget; a dial is our own decision to make.
     limiter: weDialed ? null : core.limiter,
-    // The identity a platform-initiated dial expects; an accept's is not ours to demand.
-    dialedPeerId: weDialed && expectPeerId.length > 0 ? toHex(expectPeerId) : null,
+    dialedPeerId: weDialed ? toHex(dialed) : null,
   });
 });
 

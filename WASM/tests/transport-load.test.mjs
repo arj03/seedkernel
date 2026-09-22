@@ -201,7 +201,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),
     };
-    factory.give(gated, { weDialed: true, expectPeerId: s.peerId });
+    factory.give(gated, { dialed: s.peerId });
     d.ch.onClose(() => {});
   }
   await sleep(500);

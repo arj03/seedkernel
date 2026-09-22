@@ -1,8 +1,9 @@
-// What this node holds (§12.10): the installed slots and the two claim books that route
-// into them. Both books are projections of the installed manifests — nothing to persist or
+// What this node holds (§12.10): the installed slots and the three claim books that route
+// into them. All three are projections of the installed manifests — nothing to persist or
 // keep in step — and every rule about what may be installed beside what lives here, so no
 // caller can set a claim past them.
-import { reachesLink, type LoadedBundle, type PureModules } from "./bundle.js";
+import { type LoadedBundle, type PureModules } from "./bundle.js";
+import { isOccupiedService } from "../core/domains.js";
 import { DEFAULT_MAX_APP_SLOTS } from "../core/wasm-limits.js";
 import type { Fs } from "../core/fs.js";
 import type { SignScope } from "./guest-seam.js";
@@ -43,7 +44,7 @@ export interface AppSlot {
   onInbound?: InboundObserver;
 }
 
-/** The installed set and the two audiences that reach into it. Reads are the routing
+/** The installed set and the three books that reach into it. Reads are the routing
  *  lookups; the only writes are a whole install, a whole removal, or emptying it. */
 export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
   const slots: AppSlot[] = [];
@@ -54,15 +55,16 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
    *  "reachable either way", so uniqueness is enforced per book, never across them. */
   const peer = new Map<string, AppSlot>();
   const local = new Map<string, AppSlot>();
+  /** The third book: the occupied host services a manifest requires (`isOccupiedService`,
+   *  today `link`). Their events have one sink, so a second holder would silently take the
+   *  node's sockets off the first — one owner per name, which is a claim's rule. */
+  const occupied = new Map<string, AppSlot>();
   const labelOf = (slot: AppSlot): string => slot.verifiedBundle.manifest.app;
-  /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has ONE
-   *  event sink, so two holders are not a composition — the second would take the node's
-   *  sockets off the first, silently. A pure function of the signed manifest, so there is
-   *  nothing here to store or keep in step — the search below IS the binding's holder. */
-  const hasLink = (slot: AppSlot): boolean => reachesLink(slot.verifiedBundle.manifest);
   /** Each signed list paired with the book it claims in, so every caller iterating a
-   *  bundle's claims covers both audiences. */
+   *  bundle's claims covers all three. Occupied services first, so a would-be transport
+   *  claiming the holder's service id is told the rule it broke. */
   const booksOf = (manifest: LoadedBundle["manifest"]): readonly (readonly [Map<string, AppSlot>, readonly string[], string])[] => [
+    [occupied, manifest.guest.requires.filter(isOccupiedService), "requires"],
     [peer, manifest.protocols ?? [], "protocols"],
     [local, manifest.services ?? [], "services"],
   ];
@@ -77,7 +79,6 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     /** A slot's manifest `app` label (§12.4) — what it installs under, and the name of its
      *  fs and signing namespaces. */
     labelOf,
-    hasLink,
     get: (app: string): AppSlot | undefined => slots.find((slot) => labelOf(slot) === app),
     /** Every installed slot, in install order. */
     all: (): readonly AppSlot[] => slots,
@@ -85,17 +86,18 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     owner: (claim: string): AppSlot | undefined => peer.get(claim) ?? local.get(claim),
     peerClaimant: (claim: string): AppSlot | undefined => peer.get(claim),
     localClaimant: (serviceId: string): AppSlot | undefined => local.get(serviceId),
+    /** The slot holding an occupied host service, e.g. the raw-link binding. */
+    occupant: (service: string): AppSlot | undefined => occupied.get(service),
     /** Every claim this node serves as `[claim, owner label]`, peer-reachable first. */
     routes: (): [string, string][] =>
       [...peer, ...local].map(([claim, slot]): [string, string] => [claim, labelOf(slot)]),
-    /** Refuse a candidate that contests the label, a claim or the raw-link binding
-     *  another slot holds, or that would exceed the slot cap (§12.10). Asked before
-     *  candidate code runs and again in the commit window, because another load may take a
-     *  free claim while this candidate is being built. Per BOOK: the same name under
-     *  `protocols` and `services` is two claims, not a contest. A replacement may take the
-     *  selected predecessor's label and claims, and must still target that exact live
-     *  slot at commit. `selected` is the boot's transport selection: the one way to take
-     *  the raw-link binding when nothing holds it. */
+    /** Refuse a candidate that contests the label or a claim another slot holds, or that
+     *  would exceed the slot cap (§12.10). Asked before candidate code runs and again in the
+     *  commit window, because another load may take a free claim while this candidate is
+     *  being built. Per BOOK: the same name under `protocols` and `services` is two claims,
+     *  not a contest. A replacement may take the selected predecessor's label and claims,
+     *  and must still target that exact live slot at commit. `selected` is the boot's
+     *  transport selection: the one way to take an occupied service nothing holds. */
     refuseConflicts(loaded: LoadedBundle, replacement?: AppSlot, selected = false): void {
       if (replacement && !slots.includes(replacement))
         throw new Error("shell: replacement target changed while the candidate was loading");
@@ -108,21 +110,16 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
       const installed = slots.find((slot) => labelOf(slot) === app);
       if (installed && installed !== replacement)
         throw new Error(`shell: '${app}' is already installed — install with { replaces: '${app}' } to take over its slot`);
-      // The raw-link binding changes hands only by explicit selection (§12.5): a candidate
-      // reaching `link` must replace the slot holding it or, with no holder, be the boot's
-      // selected transport. Refused LOUDLY, because the alternative is a node that looks
-      // installed and is off the network. Asked before the claim contest, so a would-be
-      // transport claiming the holder's service id is told the rule it broke.
-      const holder = slots.find(hasLink);
-      if (holder && holder !== replacement && reachesLink(loaded.manifest))
-        throw new Error(`shell: the transport changes hands only by an install replacing its slot — { replaces: '${labelOf(holder)}' }`);
-      if (!holder && !selected && reachesLink(loaded.manifest))
-        throw new Error(`shell: "link" is taken only by the boot's transport selection, or by an install replacing the current transport`);
       for (const [book, names, audience] of booksOf(loaded.manifest)) {
         for (const claim of names) {
           const claimant = book.get(claim);
           if (claimant && claimant !== replacement)
-            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${labelOf(claimant)}'`);
+            throw new Error(`shell: ${audience} claim '${claim}' is already held by '${labelOf(claimant)}' — install with { replaces: '${labelOf(claimant)}' } to take it over`);
+          // An occupied service carries authority no app policy grants (§12.5), so a FREE
+          // one is not free for the taking: only the boot's selection takes it, and after
+          // that it changes hands only with its holder's slot.
+          if (!claimant && book === occupied && !selected)
+            throw new Error(`shell: "${claim}" is taken only by the boot's transport selection, or by an install replacing its current holder`);
         }
       }
       // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so an
@@ -159,6 +156,7 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
       slots.length = 0;
       peer.clear();
       local.clear();
+      occupied.clear();
       return gone;
     },
   };

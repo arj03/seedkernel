@@ -325,7 +325,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       memoryLimitBytes: bounds.memoryBytes,
       deadlineMs: bounds.deadlineMs,
       // The link occupant writes state every caller shares, so its turns are its own.
-      ownTurns: table.hasLink(slot),
+      ownTurns: reachesLink(slot.verifiedBundle.manifest),
     });
   };
   /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
@@ -336,7 +336,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  host service, so every realm gets a table. */
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
-    const links = table.hasLink(slot);
+    const links = reachesLink(b.manifest);
     // As signed. Tells a bare `host.call` name from this bundle's own module
     // (guest-seam.ts dispatch).
     const localServices = new Set(b.manifest.guest.calls ?? []);
@@ -409,7 +409,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const doUninstall = (app: string) => {
     const slot = table.remove(app);
     if (!slot) return false;
-    if (table.hasLink(slot)) netHost?.release();
+    // The driver follows the book: with nothing holding `link`, nothing may hear its events.
+    if (!table.occupant("link")) netHost?.release();
     disposeSlot(slot);
     return true;
   };
@@ -522,15 +523,15 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // did its address book, which is why the incoming guest redials from the peers
     // its own load named and not from anything retained here (§12.10). After the
     // claim hand-over above, so `onClose` finds the channels already gone and queues
-    // no `linkClosed` at the new realm for links it never had. Only ever a free
-    // binding or the explicitly selected predecessor: conflicts were checked before
-    // commit. A replacement that DROPS `link` releases the binding the same way
-    // dropping a claim releases the claim.
-    if (table.hasLink(slot)) {
+    // no `linkClosed` at the new realm for links it never had. The driver follows the
+    // `link` claim: this slot took it, or nothing holds it — a replacement that DROPS
+    // `link` releases the binding the same way dropping a claim releases the claim.
+    const linkHolder = table.occupant("link");
+    if (linkHolder === slot) {
       // The driver builds the whole realm argument, caller id included (`TransportCall`),
       // so a socket read is not copied a second time behind that prefix here.
       netHost?.activate((input) => callSlot(slot, input));
-    } else if (replacement && table.hasLink(replacement)) {
+    } else if (!linkHolder) {
       netHost?.release();
     }
     // The mark and every claim/link binding have landed, so this slot's writes and

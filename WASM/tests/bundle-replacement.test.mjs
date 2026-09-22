@@ -181,9 +181,9 @@ await test("transport author can change only through replacement of its current 
     // arrives by replacement; a DIFFERENT label reaching `link` is refused by the
     // binding rule instead, before it can contest the holder's service id.
     await assert.rejects(n.shell.install(linkBundle(alice, 2)), /is already installed/);
-    await assert.rejects(n.shell.install(bobLink()), /an install replacing/);
+    await assert.rejects(n.shell.install(bobLink()), /claim 'link' is already held by 'transport'/);
     await n.shell.install(bundle(carol, "chat"));
-    await assert.rejects(n.shell.install(bobLink(), { replaces: "chat" }), /an install replacing/);
+    await assert.rejects(n.shell.install(bobLink(), { replaces: "chat" }), /claim 'link' is already held by 'transport'/);
     await n.shell.install(bobLink(), { replaces: standing });
     assert.equal(n.shell.resolve("_net"), "bob-transport");
     assert.equal(n.shell.uninstall(standing), false);

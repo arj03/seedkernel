@@ -388,8 +388,8 @@ export class RtcNetwork implements ChannelFactory {
     dc.addEventListener("close", () => this.forget(peerId, e));
     dc.addEventListener("error", () => this.forget(peerId, e));
     e.linked = true;
-    // Signaling-created links have no listener; arrival records the selected dialer.
-    accept(new RtcChannel(dc), { weDialed, expectPeerId: peerId });
+    // Signaling-created links have no listener; the side signaling chose to dial names its peer.
+    accept(new RtcChannel(dc), weDialed ? { dialed: peerId } : {});
   }
   forget(peerId: string, expected?: PeerEntry) {
     const e = this.peers.get(peerId);

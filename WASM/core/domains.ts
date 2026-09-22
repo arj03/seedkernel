@@ -45,6 +45,11 @@ export const HOST_SERVICES = {
   },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
+/** Services with `events` have an OCCUPANT: the one slot those events enter. One sink, so
+ *  requiring one is a claim like any other — one holder per node (slot-table.ts). */
+export function isOccupiedService(name: string): boolean {
+  return isService(name) && "events" in HOST_SERVICES[name];
+}
 export const LINK_EVENTS = HOST_SERVICES.link.events;
 export type LinkEvent = (typeof LINK_EVENTS)[number];
 /** The full `service/call` vocabulary as a template-literal union — what the dispatch

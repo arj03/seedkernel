@@ -162,7 +162,7 @@ async function linked(chans, aOpts = {}, bOpts = {}) {
   st.B = B;
   // A presents its OWN contact secret (aOpts.contactSecret, default CONTACT) on the dial;
   // B's factory hands over a plain accept.
-  aFactory.give(chans[0], { weDialed: true, expectPeerId: B.peerId });
+  aFactory.give(chans[0], { dialed: B.peerId });
   bFactory.give(chans[1]);
   return st;
 }
@@ -186,7 +186,7 @@ async function upPair(chanOpts, aOpts, bOpts) {
  *  an accept on B's. Split out because several tests open a second link on nodes
  *  `linked()`/`upPair()` already built. */
 function openPair(A, B, chans) {
-  A.factory.give(chans[0], { weDialed: true, expectPeerId: B.peerId });
+  A.factory.give(chans[0], { dialed: B.peerId });
   B.factory.give(chans[1]);
 }
 
@@ -481,7 +481,7 @@ await test("a node that dials ITSELF never authenticates: its own identity refle
   // produce; the refusal is silence, like every other one a responder makes.
   const st = keep(await upPair());
   const self = wirePair({ addrA: "10.0.8.1", addrB: "10.0.8.2" });
-  st.A.factory.give(self[0], { weDialed: true, expectPeerId: st.A.peerId });
+  st.A.factory.give(self[0], { dialed: st.A.peerId });
   st.A.factory.give(self[1]);
   // msg1, then msg3: the reflected identity really was put on the wire.
   await until(() => self[0].sent.length >= 2, 4000, "the dialer to name itself in msg3");
@@ -1040,7 +1040,7 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
     onLinkClosed: (_id, r) => { reason = r; },
   });
   keep({ close() { try { A.shell.close(); } catch { /* down */ } } });
-  factory.give(chans[0], { weDialed: true, expectPeerId: A.peerId });
+  factory.give(chans[0], { dialed: A.peerId });
   await until(() => reason !== null, 3000, "the deadline to close the link and notify");
   assert(reason === CLOSE_REASON.TIMEOUT,
     `a peer that never speaks is a TIMEOUT — the one an operator chases an address for — got ${reason}`);

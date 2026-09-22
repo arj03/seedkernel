@@ -28,10 +28,10 @@ export interface RawLink {
 export interface Arrival {
   /** Opaque listener label used by the bundle to select framing. */
   readonly listener?: string;
-  /** Set for platform-initiated dials such as WebRTC. */
-  readonly weDialed?: boolean;
-  /** Expected peer identity for a platform-initiated dial. */
-  readonly expectPeerId?: string;
+  /** The peer the PLATFORM dialed this link for (hex), when it dialed on the node's behalf —
+   *  WebRTC, whose signaling picks the initiator. Absent for an accepted socket. The link's
+   *  handshake must prove this identity. */
+  readonly dialed?: string;
 }
 
 /** Standard listener labels interpreted by the transport bundle. */

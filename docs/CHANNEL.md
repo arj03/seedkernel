@@ -154,7 +154,7 @@ rotate, re-issue your address to your own peers, nothing else in the network mov
 **It is not what conceals the identities.** §4 does that, and an open node conceals just as
 well. What the secret adds is narrower: a stranger costs no asymmetric cryptography; the
 *caller's* identity is protected from an active attacker, since otherwise anyone answering
-at a dialed address collects it at msg3 and `expectPeerId` cannot help because msg3 precedes
+at a dialed address collects it at msg3 and pinning the dialed identity cannot help because msg3 precedes
 msg4; and active probing draws silence, so "a node speaks this protocol here" stops being
 observable. In Noise's grading the first of those is worth nothing and the second moves the
 initiator from 2 to 8 (§8.1).
