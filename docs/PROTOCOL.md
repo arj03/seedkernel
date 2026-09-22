@@ -1,6 +1,6 @@
 # Seed kernel — Protocol
 
-*The message model, bundle slots, the restartable WASM module ABI, and layering. §16 collects the protocol constants.*
+*The message model, bundle slots, the restartable WASM module ABI, and names. §16 collects the protocol constants.*
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
@@ -94,7 +94,7 @@ A module imports **nothing from the runtime** — no host seam, no host function
 Concretely, a module **cannot**:
 
 - reach the filesystem, network, clock, or any I/O;
-- call another module, or resolve a name — it cannot reach the table, and has no cross-module call;
+- call another module, or resolve a name — there is no cross-module call and nothing to look a name up in;
 - ask who sent the input, who signed anything, or who called it — there is no signer, no caller, no author query.
 
 External data arrives **in the input**, and results leave **in the output**; a module may also read and modify its own private memory. When a message must carry the sender's identity to the module, the orchestrator prepends it to the input from the authenticated channel (§12.6) — as the chat app does, staging `senderPk ‖ body` (§11). Private state does not add ambient authority: the module still has no capability imports.
@@ -116,35 +116,21 @@ What a module **cannot** do, restated as guarantees:
 >
 > **Compute** is charged to the calling guest and interruptible where the guest's budget ends. A module call runs under a deadline: the calling guest's **remaining execution segment**, computed by the realm at the moment of the call, and a call that burns it rejects at the guest seam — as a trap does — while the engine kills the module. A successful zero-length result remains distinct from failure (§12.2). How the kill lands is per-target, because no engine mechanism is shared: the JS targets run each module in its own worker, and `terminate()` destroys the isolate mid-loop if it must (the one interrupt the JS platform's WebAssembly exposes), respawning a fresh instance for the next call; the native target arms wazero's `WithCloseOnContextDone` and passes that same per-call remainder as the call context's deadline. The call is async on the guest seam (§12.2) — the guest parks on it like any other round-tripping name — so a spinning module burns one core for at most one budget and holds nothing else on the node. §14 has the exposure that remains and what a deployer does about it.
 
-**Replay and ordering are settled off the module.** A module's memory is disposable, not a system of record (above), so it has no durable notion of "seen this before." Where that matters, the defence lives at the layer that owns the bytes: live-traffic replay is closed by the transport's strict per-direction counter (§12.6), and an older install is refused by bundle freshness (§12.4). An app that **relays** messages through intermediaries — where neither of those applies to the original author — adds its own per-message signature and backlink chain (§5.1, §14). None of it is the host's or the module's concern.
+**Replay and ordering are settled off the module.** A module's memory is disposable, not a system of record (above), so it has no durable notion of "seen this before." Where that matters, the defence lives at the layer that owns the bytes: live-traffic replay is closed by the transport's strict per-direction counter (§12.6), and an older install is refused by bundle freshness (§12.4). An app that **relays** messages through intermediaries — where neither of those applies to the original author — adds its own per-message signature and backlink chain (§5, §14). None of it is the host's or the module's concern.
 
 ---
 
-## 5. Layering and composition
+## 5. Names, hashes and relayed authenticity
 
-Modules form an onion — the stack diagram in §1 draws it: each layer depends only on the layers below it, and no layer has a hard dependency on the ones around it. The onion is a typical composition, not a required one; every layer is independently usable.
+**Names are strings.** A module name, an `app` label and a claim are opaque strings the host only ever matches — nothing forces a hash, so a name reads plainly in a log and in a manifest.
 
-### 5.1 Modules in the reference implementation
-
-| Layer | Modules | What lives there |
-| --- | --- | --- |
-| **Bundle slot** | `claim → {bundle, realm, modules, fsScope, signingScope}` | Direct dispatch plus the private resources one verified bundle owns (§3). |
-| **Guest seam** | Guest seam (host-side) | The `host.call(name, bytes)` seam a confined guest reaches its I/O through — the only outward reach the guest has (§12.2). |
-| **App** | [seedchat](https://github.com/arj03/seedchat) (§11), [seed store](https://github.com/arj03/seedstore) — both live outside this repo | A confined JS guest (the app's logic) over its restartable WASM modules — delivered as one signed bundle (§12.4). |
-
-Each layer is testable standalone: the table is exercised on its own, the loader against a bundle with no live transport, chat as a guest over a handful of transforms with no crypto in sight. Composition across layers is the guest's (or a host-side embedder's), through `callModule` / a guest`s bare-name `host.call` (§4.2) — never a module reaching sideways.
-
-**The hash function used for id derivation.** Content hashes and binary pins use **BLAKE2b-256** — the genesis hash, computed by `genesisHash`. The same primitive appears in the guest catalog, AKE KDF/transcript, and block-id path. App labels and module names remain literal fields rather than derived module addresses.
-
-**Names are strings.** A name is an opaque string the host only ever matches — nothing forces a hash, so a name reads plainly in a log and in a manifest.
-
-**A name is slot-local.** Nothing on the wire names a module. A peer sends a protocol id and the receiving host resolves that claim directly to a slot; the confined guest reaches only that slot's modules by manifest name through `host.call`. Two hosts can install the same code under different app names and still interoperate.
-
-**There is no composite module name.** A module is addressed only by its manifest logical name inside the private slot value. The slot's `app` label names its scopes and is what an operator selects; it is not concatenated with or consulted for module dispatch.
+**A module name is slot-local.** Nothing on the wire names a module. A peer sends a protocol id and the receiving host resolves that claim directly to a slot (§3); the slot's guest reaches only its own modules, by manifest name through `host.call` (§12.2). No label is concatenated with or consulted for that lookup, so two hosts can install the same code under different app names and still interoperate.
 
 **The label is the namespace; the author is trust and lineage.** The `app` label, each `protocols` claim and each `services` claim are literal manifest strings, and each has one active owner on a node. A candidate contesting an occupied label or claim is refused; a replacement of the slot holding it atomically takes over that slot, its label and its claim set, whoever authored it (§12.10). The label names the slot's filesystem and signing scopes, so they belong to the label rather than to an author: a fork under the same label signs and verifies in the same scope, an author who rotates its key keeps its records, and whatever holds the label next inherits its data. The author is what admission and revocation decide on (§12.5), and it keys the freshness mark, so versions are an author's own count (§12.4).
 
-**Relayed-message apps layer their own authenticity.** The channel authenticates one hop (§12.6). An app whose messages pass through intermediaries — a feed, a forum, store-and-forward gossip — cannot let the channel speak for the *original* author, so it becomes its own layer: a per-message signature naming the author, plus **backlinks** (a hash-chain, à la [SSB](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` or [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s lipmaa links) to order the history and make equivocation detectable. Signed bundles (§12.4) already do the author half for relayed *code*; a relayed-message app does the same one layer up, and it is a distinct app from chat, whose every message travels a single hop (§14 has the rationale for keeping lineage out of the loader).
+**One hash.** Content hashes, author ids and binary pins use **BLAKE2b-256** — the genesis hash, computed by `genesisHash`. The same primitive appears in the guest catalog, the AKE KDF and transcript, and the block-id path.
+
+**Relayed-message apps layer their own authenticity.** The channel authenticates one hop (§12.6). An app whose messages pass through intermediaries — a feed, a forum, store-and-forward gossip — cannot let the channel speak for the *original* author, so it adds a per-message signature naming the author, plus **backlinks** (a hash-chain, à la [SSB](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` or [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s lipmaa links) to order the history and make equivocation detectable. Signed bundles (§12.4) already do the author half for relayed *code*; a relayed-message app does the same one layer up, and it is a distinct app from chat, whose every message travels a single hop (§14 has the rationale for keeping lineage out of the loader).
 
 ---
 
@@ -164,11 +150,11 @@ An unclaimed peer protocol is answered with an **empty response** (§12.10), whi
 
 ### 16.1 Runtime (shell) constants
 
-These belong to the reference runtime (§12), not the §3 table contract — a different shell could change them without breaking anything the table sees, but they are wire- or ABI-visible to bundles and peers of *this* runtime. Its bounds implement three distinct laws: retained space uses continuous custody, one causal chain carries a monotone deadline, and fresh invocation roots need explicit rate control. A limit in one column must not be read as a guarantee in another.
+These belong to the reference runtime (§12), not the §3 slot model — a different shell could change them without changing that model, but they are wire- or ABI-visible to bundles and peers of *this* runtime. Its bounds implement three distinct laws: retained space uses continuous custody, one causal chain carries a monotone deadline, and fresh invocation roots need explicit rate control. A limit in one column must not be read as a guarantee in another.
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| Author id | 32 bytes | Manifest envelope (§12.4) | `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` over the author's whole key set, so the identity is unreachable without both private keys. One suite, one derivation — and 32 bytes, which keeps app-key construction (§5.1), policy files and freshness marks written against a single fixed-width identity. The paired genesis hash is BLAKE2b-256, the one system hash (§5.1). |
+| Author id | 32 bytes | Manifest envelope (§12.4) | `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` over the author's whole key set, so the identity is unreachable without both private keys. One suite, one derivation — and 32 bytes, which keeps policy files and freshness marks written against a single fixed-width identity. The paired genesis hash is BLAKE2b-256, the one system hash (§5). |
 | Seam names | `crypto/*`, `node/*`, `fs/*`, `clock/now`, `timer/*`, `link/*`, this realm's own declared local service ids, plus the bare names of the calling bundle's own modules (`codec`, `ws`, `mlkem`, …) | guest seam (§12.2) | Guest↔host identifiers, never wire values. A declared local service dispatches to its claimant; what remains splits by charset — every host name contains `/`, while module names are `[A-Za-z0-9_-]`. Bare module names are private to the asking bundle and carry no grant. |
 | Manifest requires | `HOST_SERVICES` (`core/domains.ts`) | manifest `guest.requires` (§12.4) | Exactly the host SERVICES a guest may call, granted BY SERVICE. The seam refuses a host method whose service is undeclared, and the loader refuses an entry naming a finer method (`fs/get`) rather than its service (`fs`), naming an unknown service, or naming a local service id — which belongs in `guest.calls`. `link` requires explicit transport selection; inbound delivery rides that slot and is never a name to declare. Ungated `crypto/*` and the bundle's own modules are not declarable. |
 | Manifest calls | local service ids, claim charset | manifest `guest.calls` (§12.10) | The local service ids this guest reaches on a co-resident guest, over the same `host.call`. Carries no privilege and nobody grants it; resolved at call time through the local claim map, so an id nothing claims yet is not a manifest error. Refused only when it spells a host method or one of this bundle's own module names, either of which the dispatch would resolve first. |

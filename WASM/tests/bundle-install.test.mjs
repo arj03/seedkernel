@@ -949,7 +949,7 @@ async function testAuthorRevocation() {
     try { await shell.installFile(bundlePath); } catch { refusedAfterReboot = true; }
     assert(refusedAfterReboot, "the revocation survives a reboot with the policy untouched");
 
-    // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5.1) and
+    // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5) and
     //    its own mark, so it is unaffected by the dead key's state.
     const heir = testAuthor();
     writeBundle(1, heir);

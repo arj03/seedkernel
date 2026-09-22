@@ -178,7 +178,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
 
-	// Two guest apps under two app labels — so they hold two slots (§5.1). The holder
+	// Two guest apps under two app labels — so they hold two slots (§5). The holder
 	// guest reads fs; the echo guest forwards to its own
 	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
 	// shell handed the guest. Each protocol reaches its own app because each manifest

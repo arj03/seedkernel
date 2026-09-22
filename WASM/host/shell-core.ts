@@ -361,7 +361,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         // bytes.
         signScope: slot.signingScope,
         // Scoped to this app's label, so `fs` grants reach this app's own keyspace, not
-        // the node's — the same structural ownership module names have (§5.1).
+        // the node's — the same structural ownership module names have (§5).
         // Wired whenever the node has an fs at all, without consulting the
         // manifest: `names` already refuses every `fs/*` the bundle did not
         // declare, and a second test here would decide one grant in two places.

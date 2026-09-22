@@ -86,7 +86,7 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// One slot per app label on a node, whoever authored it (README §5.1): the label names the
+// One slot per app label on a node, whoever authored it (§5): the label names the
 // slot's fs and signing namespaces, so a second author's bundle under a label already
 // standing is refused by name, even one claiming nothing the first serves. Taking a label
 // over means naming the slot being replaced, which this operator flow never does.
