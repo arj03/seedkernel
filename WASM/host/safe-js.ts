@@ -50,13 +50,6 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : new Uint8Array(u8).buffer;
 }
 
-function checkedBytes(bytes: number): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0) {
-    throw new Error("guest: payload width is not a non-negative safe integer");
-  }
-  return bytes;
-}
-
 /** Own every guest-to-host copy and promise slot from admission through settlement,
  *  addressed by the guest-minted call id — the same ledger native keeps in Go, operations
  *  and all (native/hostcalls.go), which is what keeps the two targets describing one
@@ -74,11 +67,11 @@ export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
 ): ActiveHostCalls {
-  /** call id → the bytes charged to it; `bytes` is the sum, kept as one number. */
+  /** call id → the bytes charged to it; `bytes` is the sum, kept as one number. Every
+   *  width charged is a buffer's `byteLength`. */
   const live = new Map<number, number>();
   let bytes = 0;
   const charge = (additionalBytes: number): void => {
-    checkedBytes(additionalBytes);
     if (additionalBytes > maxBytes - bytes) {
       throw new Error(`guest: too many outstanding host call payload bytes (cap ${maxBytes})`);
     }
@@ -217,7 +210,6 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     phantoms.clear();
   };
   const clock = configureRealm(ctx, opts);
-  let disposed = false;
   const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
   // The wall-clock half of the same custody (§12.3): one wake for the host calls this realm
@@ -362,7 +354,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         let failure = error;
         if (bytes !== null) {
           try {
-            if (disposed || !ctx.alive) return;
+            if (!ctx.alive) return;
             // Request and response coexist while copying the result into the guest. Reserve
             // that overlap and keep the call live through guest-side settlement.
             activeHostCalls.reserve(callId, bytes.byteLength);
@@ -372,7 +364,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
             failure = err;
           }
         }
-        if (!disposed && ctx.alive) {
+        if (ctx.alive) {
           settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(failure)), budget, made);
         }
       } finally {
@@ -420,7 +412,6 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     // here, or repeated rejected installs turn a bounded guest into an unbounded host leak
     // — the custody of any call its source parked included, since nothing is left to
     // consume those answers and no handle survives to release them later.
-    disposed = true;
     activeHostCalls.releaseAll();
     deadlines.disarmAll();
     disposePhantoms();
@@ -481,10 +472,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
 
   return {
     call: serializeCalls(deadlines.entry, invoke, () =>
-      (disposed || !ctx.alive) ? new Error(REALM_DISPOSED) : null,
+      ctx.alive ? null : new Error(REALM_DISPOSED),
     opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS, opts.ownTurns),
     dispose(): void {
-      disposed = true;
       // Fail anyone still awaiting an answer before tearing the realm down: answers are
       // only ever reported from inside the realm, so disposing first would strand every
       // parked caller — a DEFERRED one included, whose answer would otherwise never come

@@ -4,7 +4,6 @@
 // after the copy out of the guest heap on JS (safe-js.ts), before it natively
 // (native/hostcalls.go).
 
-import { DEFAULT_GUEST_DEADLINE_MS } from "../core/wasm-limits.js";
 import { Fifo } from "../core/util.js";
 import type { HostCall } from "./guest-seam.js";
 
@@ -227,7 +226,7 @@ export function serializeCalls(
   deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
   invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
   notReady: () => Error | null,
-  defaultDeadlineMs = DEFAULT_GUEST_DEADLINE_MS,
+  defaultDeadlineMs: number,
   ownTurns = false,
 ): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";

@@ -272,6 +272,11 @@ globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed()
 globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(port); if (a) a(id, remoteAddr); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
+/** A deadline as the bridge carries it, which is numbers only: `Infinity` crosses as -1 and
+ *  an omitted one as the shared default. */
+const bridgeMs = (ms: number | undefined): number =>
+  ms === undefined ? DEFAULT_GUEST_DEADLINE_MS : ms === Infinity ? -1 : ms;
+
 /** Build private module values over opaque Go handles (wazero instances cannot be JS
  *  values). The handle is target plumbing and never an app identity. */
 let moduleSlotSeq = 0;
@@ -286,9 +291,7 @@ const modules: PureModuleLoader = {
         // behind earlier calls (the native target serializes per slot in Go). Return
         // it as `ms` so the seam bills actual work, matching the JS worker's report.
         const t0 = monotonicMs();
-        const bound = deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS
-          : (deadlineMs === Infinity ? -1 : deadlineMs);
-        const r = bridge.callModule(slot, module, payload, bound);
+        const r = bridge.callModule(slot, module, payload, bridgeMs(deadlineMs));
         return Promise.resolve({
           bytes: r === null ? null : new Uint8Array(r),
           ms: monotonicMs() - t0,
@@ -334,9 +337,8 @@ const channels: ChannelFactory = {
  *  stays here rather than in Go: `nativeCall` closes over this realm, so a settled op routes
  *  to the realm that parked it structurally, and Go needs no promise primitive of its own.
  *
- *  `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers and
- *  not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds.
- *  guest.go enforces it with QuickJS's own interrupt handler (`qjs.Runtime.Budget`), the
+ *  `deadlineMs` crosses in the bridge's one sentinel encoding (`bridgeMs`): negative means
+ *  Infinity, everything else is milliseconds. guest.go enforces it with QuickJS's own interrupt handler (`qjs.Runtime.Budget`), the
  *  mechanism safe-js.ts uses, so an overrun throws inside the guest and the realm survives. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs, ownTurns }) => {
   // This realm's wall-clock custody (§12.3): one wake for the host calls it has not
@@ -377,7 +379,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
   };
   try {
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-      deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
+      bridgeMs(deadlineMs),
       DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
   } catch (err) {
     // A guest may have parked host calls before its top-level source failed. No Realm handle
@@ -411,7 +413,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
             // guest.go fails what `dispose` strands with a message of its own; callers
             // get the one every target uses (realm-queue.ts `REALM_DISPOSED`).
             (msg: string) => reject(new Error(disposed ? REALM_DISPOSED : msg)),
-            handoffDeadlineMs === Infinity ? -1 : handoffDeadlineMs));
+            bridgeMs(handoffDeadlineMs)));
           // `elapsedNs * 2 | deferred` — see the bridge declaration above.
           deferred = report % 2 === 1;
           causalClock?.charge(Math.floor(report / 2) / 1_000_000);

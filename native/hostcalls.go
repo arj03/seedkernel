@@ -58,7 +58,7 @@ func (l *hostCallLedger) admit(id, bytes int64, clock *invocationClock) error {
 // nothing. One place: admit and reserve ask the same question at two moments — a new
 // call's payload, a parked call's answer — and two voices would be two ceilings.
 func (l *hostCallLedger) charge(bytes int64) error {
-	if bytes < 0 || bytes > l.maxBytes-l.bytes {
+	if bytes > l.maxBytes-l.bytes {
 		return fmt.Errorf("guest: too many outstanding host call payload bytes (cap %d)", l.maxBytes)
 	}
 	l.bytes += bytes

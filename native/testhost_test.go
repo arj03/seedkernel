@@ -343,7 +343,9 @@ globalThis.__buildGuestSeam = function (names, calls, scope, localServices) {
   });
   return __guestSeam;
 };
-globalThis.__callSeam = async (name, ab) => __guestSeam(name, new Uint8Array(ab));
+// With the budget a realm would pass: an unbounded segment, no causal root, no spend.
+const __testBudget = { remainingMs: Infinity, causalClock: undefined, charge() {}, detach() {} };
+globalThis.__callSeam = async (name, ab) => __guestSeam(name, new Uint8Array(ab), __testBudget);
 // EVERY name answers a Promise now — crypto included — so this is the one calling
 // convention. Driven through callRealm, which already knows how to pump the loop
 // until a realm promise settles.

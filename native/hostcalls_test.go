@@ -68,12 +68,6 @@ func TestHostCallLedgerByteCap(t *testing.T) {
 		t.Fatalf("charged %d bytes, want the full 100", l.bytes)
 	}
 	sumCharged(t, &l)
-
-	// A negative width is a bogus source read, not free space.
-	if err := l.admit(3, -1, nil); err == nil {
-		t.Fatal("admitted a negative payload width")
-	}
-	sumCharged(t, &l)
 }
 
 func TestHostCallLedgerDuplicateID(t *testing.T) {

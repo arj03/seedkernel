@@ -100,8 +100,9 @@ export interface TransportHostOptions {
 }
 
 /** One link's continuous outbound custody (§12.6), spanning adapter pre-open buffering and
- * the platform socket backlog. What the adapter still holds IS the charge; the sizes queue
- * is only what turns its one byte total back into the slices that make it up. */
+ * the platform socket backlog — and the driver's one table entry for that link, channel
+ * included. What the adapter still holds IS the charge; the sizes queue is only what turns
+ * its one byte total back into the slices that make it up. */
 class LinkOutboundOwner {
   /** Admitted write sizes in send order, so a drained PREFIX can be retired without
    *  waiting for the whole backlog to empty — the node-wide slice count is shared, and one
@@ -111,7 +112,7 @@ class LinkOutboundOwner {
   private closed = false;
 
   constructor(
-    private readonly channel: RawLink,
+    readonly channel: RawLink,
     private readonly reserveParent: (bytes: number) => boolean,
     private readonly releaseParent: (bytes: number, slices: number) => void,
   ) {}
@@ -189,8 +190,8 @@ export class TransportHost {
   wsPort = 0;
 
   private readonly opts: TransportHostOptions;
-  private readonly channels = new Map<number, RawLink>;
-  private readonly outbound = new Map<number, LinkOutboundOwner>;
+  /** Every live link, by the id the occupant names it with. */
+  private readonly links = new Map<number, LinkOutboundOwner>;
   private nextLinkId = 1;
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
@@ -252,7 +253,7 @@ export class TransportHost {
       // keeps bytes that have already left one link from refusing a write on another — but
       // only a refusal needs the exact number, so the sweep stays off the per-write path
       // rather than costing every send a walk of the whole link table.
-      for (const owner of this.outbound.values()) owner.reconcile();
+      for (const owner of this.links.values()) owner.reconcile();
     }
     if (!this.outboundFits(length)) {
       return false;
@@ -278,7 +279,7 @@ export class TransportHost {
     // because `channelClosed` deletes as it goes, and idempotent, so a backend callback
     // racing this loop is a no-op. On a teardown or a handover the binding is released
     // before this runs, so only a sever — where the same occupant stays — hears them.
-    for (const [linkId, c] of [...this.channels.entries()]) this.dropLink(linkId, c);
+    for (const [linkId, link] of [...this.links]) this.dropLink(linkId, link);
   }
 
   /** Sever one socket. A throw is a backend that has already let go. */
@@ -288,9 +289,9 @@ export class TransportHost {
 
   /** Sever it AND take it out of the table: every hard teardown this driver makes. The
    *  only close that is not one is the occupant's `link/close`, which may be graceful. */
-  private dropLink(linkId: number, channel: RawLink): void {
-    this.shut(channel);
-    this.channelClosed(linkId, channel);
+  private dropLink(linkId: number, link: LinkOutboundOwner): void {
+    this.shut(link.channel);
+    this.channelClosed(linkId, link);
   }
 
   /** Whether `close` has run. Public because a teardown has to be checkable: a replaced
@@ -345,24 +346,24 @@ export class TransportHost {
       },
       send: (linkId, bytes) => {
         if (!bound()) return;
-        const channel = this.channels.get(linkId);
-        if (!channel) return;
-        try { this.outbound.get(linkId)?.send(bytes); }
+        const link = this.links.get(linkId);
+        if (!link) return;
+        try { link.send(bytes); }
         catch {
           // A throwing backend may already have emitted a prefix (notably an RTC write
           // split into SCTP-sized chunks). Continuing would desynchronize LENGTH framing.
-          this.dropLink(linkId, channel);
+          this.dropLink(linkId, link);
         }
       },
       close: (linkId, graceful) => {
         if (!bound()) return;
-        const channel = this.channels.get(linkId);
-        if (!channel) return;
-        try { channel.close(graceful); } catch { /* already gone */ }
+        const link = this.links.get(linkId);
+        if (!link) return;
+        try { link.channel.close(graceful); } catch { /* already gone */ }
         // RawLink implementations disagree about whether a deliberate local close later
         // fires onClose (native explicitly cannot). The driver owns the table, so it makes
         // the event universal on a later turn; a backend callback racing it is idempotent.
-        queueMicrotask(() => this.channelClosed(linkId, channel));
+        queueMicrotask(() => this.channelClosed(linkId, link));
       },
       // Inbound attributed delivery (§12.10): one request the occupant decoded, routed
       // through the shell's claim table and answered back to the occupant, which frames it
@@ -388,17 +389,17 @@ export class TransportHost {
    *  the channel it refused: registration is what takes ownership of a socket, so a refusal
    *  that left it open would strand a descriptor. */
   private register(channel: RawLink): number {
-    if (this.channels.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
+    if (this.links.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
       this.shut(channel);
       return 0;
     }
     const linkId = this.nextLinkId++;
-    this.channels.set(linkId, channel);
-    this.outbound.set(linkId, new LinkOutboundOwner(
+    const link = new LinkOutboundOwner(
       channel,
       (bytes) => this.reserveOutbound(bytes),
       (bytes, slices) => this.releaseOutbound(bytes, slices),
-    ));
+    );
+    this.links.set(linkId, link);
     // Admit one read per link into the serialized realm at a time. An adapter that can be
     // paused is paused at the socket, where the peer's own transport pushes back; one that
     // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
@@ -419,7 +420,7 @@ export class TransportHost {
     };
     const failReadSide = () => {
       dropHeld();
-      this.dropLink(linkId, channel);
+      this.dropLink(linkId, link);
     };
     /** One read has finished (or the link has just been registered): drain what was held
      *  behind it, oldest first. A LOOP rather than a call back into itself — a vacant
@@ -428,7 +429,7 @@ export class TransportHost {
     const releaseRead = () => {
       releaseActive();
       for (;;) {
-        if (this.channels.get(linkId) !== channel) { dropHeld(); return; }
+        if (this.links.get(linkId) !== link) { dropHeld(); return; }
         const next = held.shift();
         if (!next) break;
         if (!dispatchRead(next)) return; // in flight: its settle re-enters here
@@ -455,7 +456,7 @@ export class TransportHost {
     // Inbound bytes are a plain event now — the request the occupant decoded off this
     // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
-      if (this.channels.get(linkId) !== channel) return;
+      if (this.links.get(linkId) !== link) return;
       // Platform-framed adapters have no declared-length prefix at which to enforce the
       // hard host cap. Refuse the oversized delivery before OpArgs copies it into a realm
       // invocation; stream backends naturally deliver much smaller slices.
@@ -472,7 +473,7 @@ export class TransportHost {
         failReadSide();
       }
     });
-    channel.onClose(() => { dropHeld(); this.channelClosed(linkId, channel); });
+    channel.onClose(() => { dropHeld(); this.channelClosed(linkId, link); });
     return linkId;
   }
 
@@ -495,13 +496,12 @@ export class TransportHost {
    *  defensive teardown or a cut stream. The event names the link, so the return carries
    *  no link id and cannot be redirected at another socket; a malformed or absent answer
    *  reads as `0` rather than guessing. */
-  private channelClosed(linkId: number, channel: RawLink): void {
-    if (this.channels.get(linkId) !== channel) return;
-    this.channels.delete(linkId);
-    this.outbound.get(linkId)?.releaseAll();
-    this.outbound.delete(linkId);
+  private channelClosed(linkId: number, link: LinkOutboundOwner): void {
+    if (this.links.get(linkId) !== link) return;
+    this.links.delete(linkId);
+    link.releaseAll();
     const report = (reason: number) => {
-      this.logLinkDown(linkId, channel, reason);
+      this.logLinkDown(linkId, link.channel, reason);
       try { this.opts.onLinkClosed?.(linkId, reason); }
       catch { /* a platform callback cannot corrupt this driver's link table */ }
     };

@@ -193,7 +193,7 @@ export class CallBudget {
 /** The host half of `host.call`. EVERY name answers a Promise — the seam is async,
  *  not any backend — so "forgetting the await" is the one calling convention and it is
  *  wrong for all of them alike. `budget` is the caller's segment, supplied by the realm. */
-export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array>;
+export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>;
 
 export { HOST_TRANSFORM_NAMES } from "../core/domains.js";
 
@@ -214,7 +214,7 @@ type HandlerKey = CapabilityName | CryptoName;
 /** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
-type SeamHandler = (payload: Uint8Array, budget?: CallBudget) => Uint8Array | Promise<Uint8Array>;
+type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
 /** Residual host-transform table (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
@@ -542,13 +542,13 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // claimant that spends the read's whole deadline would leave that write to a turn with
     // nothing left — a record the budget refuses halfway is a hole in the stream (§12.3).
     "link/deliver": (payload, budget) => {
-      budget?.detach();
+      budget.detach();
       const attrAt = 1 + payload[0];
       // Everything past the claim is ALREADY `[attribution 32][payload …]`, which is the
       // shape a realm is entered with — this body writes those two fields in that order
       // and adjacent. So the frame handed on is a view of this call, never the two halves
       // taken apart here and copied back together one layer down.
-      return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget?.remainingMs, budget?.causalClock);
+      return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
     },
     // ── timers: the platform's event loop ─────────────────────────────────────
     "timer/arm": (payload) => {
@@ -596,7 +596,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     if (localServices.has(name)) {
       // No budget check here or at the module call below: a `CallBudget` cannot exist with
       // nothing left, so the refusal has already happened at the guest's call site.
-      const answer = grants.calls.call(name, payload, budget?.remainingMs, budget?.causalClock);
+      const answer = grants.calls.call(name, payload, budget.remainingMs, budget.causalClock);
       if (!answer) throw new Error("guest-seam: no realm claims " + name);
       return answer;
     }
@@ -630,7 +630,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       // Only a timer root carries a clock, so the reading is skipped entirely for
       // peer- and host-initiated work — which is every seam call the transport makes
       // on the frame path, and the reason this measurement costs that path nothing.
-      const owner = budget?.causalClock;
+      const owner = budget.causalClock;
       if (owner === undefined) return Promise.resolve(fn(payload, budget));
       const at = monotonicMs();
       try {
@@ -647,12 +647,12 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
       throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
     }
     // Module call charged to the caller's segment (§4.3).
-    return modules.call(name, payload, budget?.remainingMs).then(({ bytes, ms }) => {
+    return modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
       // Bill the module's OWN processing time (measured on the worker that ran
       // it), never the issue-to-settle wall clock — a burst of fire-and-forget
       // module calls serialized through one worker would otherwise charge their
       // queue wait quadratically.
-      budget?.charge(ms);
+      budget.charge(ms);
       // Null is the table's failure, empty is a module that said nothing (§12.2).
       // Folding them together would make every caller guess failure from a length.
       if (bytes === null) throw new Error("guest-seam: module " + name + " failed");

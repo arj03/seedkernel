@@ -24,7 +24,7 @@ import {
   checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
   forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp,
-  MemoryFs, NodeFs, enc,
+  MemoryFs, NodeFs, enc, withTestBudget,
 } from "./fixtures.mjs";
 
 const { ok, assertEqual, summary } = testkit({ verbose: false });
@@ -1222,7 +1222,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
         ["crypto/blake2b-256", new Uint8Array()],
         ["fwd", Uint8Array.of(4)],
       ]) {
-        try { await hostCall(name, payload); } catch { refused.push(name); }
+        try { await withTestBudget(hostCall)(name, payload); } catch { refused.push(name); }
       }
       const candidate = { hostCall, refused, source, calls: 0 };
       candidates.push(candidate);
@@ -1270,8 +1270,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
     flaky.fail = false;
     await shell.install(blob, { replaces: shell.resolve("_fixture-transport"), localConfig });
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
-    await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
-    await candidates[1].hostCall("_svc", new Uint8Array());
+    await withTestBudget(candidates[1].hostCall)("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
+    await withTestBudget(candidates[1].hostCall)("_svc", new Uint8Array());
     assertEqual((await fs.stat()).used, 1, "the committed realm writes");
     assertEqual(reached, 1, "…and reaches its neighbour");
   } finally {
@@ -1352,7 +1352,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       // reason a real guest defers its setup to its first invocation.
       const r = { calls: [], disposed: false, call: async (p) => {
         r.calls.push(p.length === 36 ? "timer" : "invoke");
-        if (!r.armed) { r.armed = true; await o.hostCall("timer/arm", arm(1, 200)); }
+        if (!r.armed) { r.armed = true; await withTestBudget(o.hostCall)("timer/arm", arm(1, 200)); }
         return new Uint8Array();
       }, dispose() { r.disposed = true; } };
       realms.push(r);

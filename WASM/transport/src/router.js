@@ -5,42 +5,39 @@
 class Router {
   constructor(ownPubkey) {
     this.ownPubkey = ownPubkey;
-    this.links = new Map();      // peerId → Link[] (authenticated, routable)
-    this.rr = new Map();         // peerId → round-robin cursor
-    this.onPeerUp = () => {};
-    this.onPeerDown = () => {};
+    // peerId → { links: Link[] (authenticated, routable), next: round-robin cursor }. A peer
+    // is here exactly while it holds a link, so this map IS the cohort `peers` reports.
+    this.pools = new Map();
   }
 
-  linkCount(peerId) { const a = this.links.get(peerId); return a ? a.length : 0; }
+  linkCount(peerId) { const p = this.pools.get(peerId); return p ? p.links.length : 0; }
   send(to, frame) {
-    const pool = this.links.get(to);
-    if (!pool || pool.length === 0) return false;
-    const i = (this.rr.get(to) || 0) % pool.length;
-    this.rr.set(to, i + 1);
-    pool[i].send(frame);
+    const pool = this.pools.get(to);
+    // Empty only inside `promote`, while a tie-break loser hands its queue on.
+    if (!pool || pool.links.length === 0) return false;
+    const i = pool.next % pool.links.length;
+    pool.next = i + 1;
+    pool.links[i].send(frame);
     return true;
   }
 
-  // Install a freshly-authenticated link: the double-connect tie-break and the up edge on
-  // a peer's first link. Returns false — the link closed — when it lost the tie-break.
+  // Install a freshly-authenticated link: the double-connect tie-break, and the up edge on
+  // a peer's first link. A link that loses the tie-break is closed instead.
   // The peer lint already ran at msg3/msg4 (`admits`, ake.js).
   promote(peerId, link) {
-    const pool = this.links.get(peerId) || [];
-    const wasEmpty = pool.length === 0;
-    let rival = null;
-    for (const l of pool) if (l.weDialed !== link.weDialed) { rival = l; break; }
+    let pool = this.pools.get(peerId);
+    const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed);
     if (rival) {
       // A losing link's queue goes to the winner as it closes (core.js `forget`).
-      if (!this.canonicalKeep(link)) { link.close(); return false; }
+      if (!this.canonicalKeep(link)) { link.close(); return; }
       // Out of the pool before it closes, so nothing more is routed to a link on its way down.
-      pool.splice(pool.indexOf(rival), 1);
-      this.links.set(peerId, pool);
+      pool.links.splice(pool.links.indexOf(rival), 1);
       rival.close();
     }
-    pool.push(link);
-    this.links.set(peerId, pool);
-    if (wasEmpty) this.onPeerUp(peerId);
-    return true;
+    const up = !pool;
+    if (up) { pool = { links: [], next: 0 }; this.pools.set(peerId, pool); }
+    pool.links.push(link);
+    if (up) core.checkReady();
   }
 
   // Keep the link whose *dialer* is the lexicographically smaller identity. The two are
@@ -51,17 +48,16 @@ class Router {
 
   // Keyed on the link's own peer id: a link is only ever pooled under the identity it
   // authenticated as (`promote`), so leaving the pool is one map hit and not a walk of
-  // every peer. A link that never authenticated carries "" and finds nothing, which is
-  // the same answer the walk gave.
+  // every peer. A link that never authenticated carries "" and finds nothing. The last
+  // link out is the peer's down edge.
   remove(link) {
     const pid = link.peerId;
-    const pool = this.links.get(pid);
-    if (!pool) return false;
-    const i = pool.indexOf(link);
-    if (i < 0) return false;
-    pool.splice(i, 1);
-    if (pool.length === 0) { this.links.delete(pid); this.rr.delete(pid); this.onPeerDown(pid); }
-    return true;
+    const pool = this.pools.get(pid);
+    if (!pool) return;
+    const i = pool.links.indexOf(link);
+    if (i < 0) return;
+    pool.links.splice(i, 1);
+    if (pool.links.length === 0) { this.pools.delete(pid); reqres.peerDown(pid); }
   }
 }
 

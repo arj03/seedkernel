@@ -262,7 +262,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // throw has no caller left to reject — the arming call returned turns ago — so it
       // is reported and swallowed. The promise is RETURNED, not discarded: that is what
       // allows the next due wake to enter (realm-timers.ts).
-      (body, causalClock) => slot.realm?.call(body, undefined, causalClock).catch((err: unknown) => {
+      (body, causalClock) => callSlot(slot, body, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
       // Banked against THIS slot's ceiling, not the node's default.
@@ -284,11 +284,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     return slot;
   };
   /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
-  const disposeSlot = (slot: AppSlot | null | undefined) => {
-    if (slot) slot.active = false;
-    slot?.timers.clearAll();
-    slot?.realm?.dispose();
-    slot?.pureModules.dispose();
+  const disposeSlot = (slot: AppSlot | undefined) => {
+    if (!slot) return;
+    slot.active = false;
+    slot.timers.clearAll();
+    slot.realm?.dispose();
+    slot.pureModules.dispose();
   };
   /** Reify a JSON value through JSON.parse rather than as an object literal. Besides
    *  keeping strings safely quoted inside source, this preserves JSON's treatment of a
@@ -400,11 +401,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     };
   };
   /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
-   *  prefix, never the guest's own spelling. The null arm is reachable only from guest
-   *  top-level code while its candidate realm is still being constructed. */
-  const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => slot.realm
-    ? slot.realm.call(input, deadlineMs, causalClock)
-    : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
+   *  prefix, never the guest's own spelling. Every door here opens only once the install
+   *  has committed — the table, the handle and the link binding hold committed slots, and
+   *  `seamFor` refuses the timer a candidate would arm — so the realm is always standing. */
+  const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) =>
+    slot.realm!.call(input, deadlineMs, causalClock);
   const doUninstall = (app: string) => {
     const slot = table.remove(app);
     if (!slot) return false;

@@ -252,10 +252,9 @@ class Link {
     // Framing derives from stream shape and route metadata (§12.1).
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
-    this.expectPeerId = spec.expectPeerId;   // 32B or null
-    // The `connecting` pool this link waits in, so leaving it is one map hit rather than a
-    // scan of every peer's pool. Empty for an accept, which is in no pool until it
-    // authenticates.
+    // The peer this dial is for: the identity msg4 must prove, and the `connecting` pool
+    // this link waits in, so leaving it is one map hit rather than a scan of every peer's
+    // pool. Empty for an accept, which is in no pool until it authenticates.
     this.dialedPeerId = spec.dialedPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
@@ -263,7 +262,6 @@ class Link {
     // Called the moment the link closes, not once its teardown has run: until then a
     // frame routed to it could only be dropped (core.js `forget`).
     this.onClose = spec.onClose;
-    this.rekeyAfter = rekeyAfterFrames;
     // Address-book dials use the peer's secret; platform-opened links use our live secret
     // (§12.6.3).
     this.contactSecret = spec.linkSecret || contactSecret;
@@ -622,6 +620,8 @@ class Link {
     // Several complete frames can share one stream read and are enqueued before the first
     // is processed. Re-check here so a refusal by the first cheaply consumes the rest.
     if (this.closed || this.stalled) return Promise.resolve();
+    // The one phase check: each handler is reached only in its own role and step, and the
+    // work chain runs one step at a time, so a handler checks only the message's width.
     const step = this.authed
       ? this.onRecord(m)
       : this.weDialed
@@ -719,8 +719,7 @@ class Link {
   }
 
   async onMsg1(w1) {
-    if (this.peerEph || this.weDialed || w1.length !== M1_LEN) { this.stall(); return; }
-    if (w1[0] !== SUITE_CHANNEL_CONCEALED) { this.stall(); return; }
+    if (w1.length !== M1_LEN || w1[0] !== SUITE_CHANNEL_CONCEALED) { this.stall(); return; }
     const ephI = w1.slice(SUITE_LEN, SUITE_LEN + EPH_LEN);
     const kemPkI = w1.slice(SUITE_LEN + EPH_LEN, SUITE_LEN + EPH_LEN + KEM_PK_LEN);
     const probe = await this.openZero(
@@ -756,7 +755,7 @@ class Link {
   }
 
   async onMsg2(w2) {
-    if (this.authed || this.peerEph || !this.th || w2.length !== M2_LEN) { this.stall(); return; }
+    if (w2.length !== M2_LEN) { this.stall(); return; }
     const ephR = w2.slice(0, EPH_LEN);
     const kemCt = w2.slice(EPH_LEN, EPH_LEN + KEM_CT_LEN);
     const dh = await scalarmult(this.myEph.privateKey, ephR);
@@ -778,7 +777,7 @@ class Link {
   }
 
   async onMsg3(w3) {
-    if (this.authed || !this.peerEph || !this.th || !this.ee || w3.length !== M3_LEN) { this.stall(); return; }
+    if (w3.length !== M3_LEN) { this.stall(); return; }
     const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
@@ -799,13 +798,13 @@ class Link {
   }
 
   async onMsg4(w4) {
-    if (this.authed || !this.peerEph || !this.th || !this.ee || w4.length !== M4_LEN) { this.stall(); return; }
+    if (w4.length !== M4_LEN) { this.stall(); return; }
     const idR = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M4), w4, this.th);
     if (!idR) { this.stall(); return; }
     const peerId = toHex(idR);
     // A mismatch here is a local fault, not a probe to hide from — we already revealed
     // ourselves at msg3 — so it aborts rather than stalls.
-    if (this.expectPeerId && peerId !== toHex(this.expectPeerId)) { this.abort(); return; }
+    if (this.dialedPeerId && peerId !== this.dialedPeerId) { this.abort(); return; }
     // The peer lint, on the end that dialed. Not concealed: we named ourselves at
     // msg3, so an abort here is honest rather than a probe.
     if (!admits(idR)) { this.abort(true); return; }
@@ -858,7 +857,7 @@ class Link {
 
   async seal(frame) {
     const ct = await aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
-    if (++this.sendCtr >= this.rekeyAfter) {
+    if (++this.sendCtr >= rekeyAfterFrames) {
       this.sendKey = await this.ratchet(this.sendKey);
       this.sendEpoch++;
       this.sendCtr = 0;
@@ -877,7 +876,7 @@ class Link {
     if (!r.ok) { this.abort(true); return; }
     this.markTraffic();
     // Advance only on success — a failed decrypt must never move the counter.
-    if (++this.recvCtr >= this.rekeyAfter) {
+    if (++this.recvCtr >= rekeyAfterFrames) {
       this.recvKey = await this.ratchet(this.recvKey);
       this.recvEpoch++;
       this.recvCtr = 0;

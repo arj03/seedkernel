@@ -16,7 +16,7 @@ import {
   toHex, concatBytes, verifyTestBundle,
   signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
   testAuthor, bootTestShell, imp, MemoryFs,
-  createGuestSeam, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_TIMERS, TEST_CALLS,
+  createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_TIMERS, TEST_CALLS,
   createSafeRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
 } from "./fixtures.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -54,7 +54,7 @@ async function testGuestSeam() {
   // (§12.2); a real node derives it from the manifest's `app` label.
   const signScope = appSignScope(id, "testapp");
   const scopeBytes = guestSignScope("testapp");
-  const seam = createGuestSeam({
+  const seam = withTestBudget(createGuestSeam({
     platform: { sodium, now: () => Date.now() },
     grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls, timers: TEST_TIMERS },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
@@ -63,7 +63,7 @@ async function testGuestSeam() {
       names: new Set(["echo"]),
       call: (name, p) => host.slots.get(testKey)?.call(name, p) ?? Promise.resolve({ bytes: null, ms: 0 }),
     },
-  });
+  }));
   const U = (...xs) => new Uint8Array(xs);
 
   try {
@@ -219,7 +219,7 @@ async function testSigningScopeFollowsSlot() {
   const shell = await bootTestShell({
     identity,
     createRealm: async ({ hostCall }) => {
-      seam = hostCall;
+      seam = withTestBudget(hostCall);
       return { call: async () => new Uint8Array(), dispose() {} };
     },
     transportAuthor: linkAuthor,
@@ -605,11 +605,11 @@ async function testSeamGating() {
 
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
-  const mk = (names) => createGuestSeam({
+  const mk = (names) => withTestBudget(createGuestSeam({
     platform: { sodium, now: () => Date.now() },
     grants: { names, signScope: appSignScope(id, "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
-  });
+  }));
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
 

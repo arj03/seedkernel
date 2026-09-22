@@ -67,8 +67,6 @@ const cohort = configuredPeers.map((p) => {
     dest: p.dest ?? "",
   };
 });
-// The peers we hold at least one authenticated link to; the host asks with `peers`.
-const connected = new Set();
 // These policies and their defaults belong to this signed program. LOCAL is the
 // installation's general override path; APP is the author's signed fallback.
 const maxFrameBytes = policy("maxFrameBytes");
@@ -315,7 +313,6 @@ class Core {
         stream: opened.stream,
         dest: addr.dest,
         weDialed: true,
-        expectPeerId: fromHex(peerId),
         linkSecret: addr.secret,
         limiter: null,
         dialedPeerId: peerId,
@@ -418,9 +415,6 @@ class Core {
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
-// The cohort edges stay in this heap; the host reads them with the `peers` op.
-router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-router.onPeerDown = (peerId) => { connected.delete(peerId); reqres.peerDown(peerId); };
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
@@ -486,11 +480,11 @@ entry("linkOpen", (r) => {
     linkId, weDialed, stream,
     listener: listener.length > 0 ? utf8Decode(listener) : "",
     dest: "",
-    expectPeerId: expectPeerId.length > 0 ? expectPeerId.slice() : null,
     linkSecret: null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
     // Only an accept spends half-open budget; a dial is our own decision to make.
     limiter: weDialed ? null : core.limiter,
+    // The identity a platform-initiated dial expects; an accept's is not ours to demand.
     dialedPeerId: weDialed && expectPeerId.length > 0 ? toHex(expectPeerId) : null,
   });
 });
@@ -578,7 +572,7 @@ entry("ready", (r) => {
  *  name as well as the host's: it is what an app placing replicas has to know. */
 entry("peers", () => {
   const out = [];
-  for (const p of connected) out.push(fromHex(p));
+  for (const pool of router.pools.values()) out.push(pool.links[0].peerPubkey);
   return concatBytes(out);
 });
 

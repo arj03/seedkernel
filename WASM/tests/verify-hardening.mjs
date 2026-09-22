@@ -48,7 +48,7 @@ const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { createRealmTimers } = await imp("build/host/realm-timers.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createGuestSeam, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
+const { createGuestSeam, CallBudget, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
@@ -240,8 +240,9 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     modules: { names: new Set(["codec"]), call: chatModules.call },
   });
   // The forwarder echoes its input, so a resolved module answers with the body.
-  ok((await scoped("codec", new Uint8Array([7, 7, 7]))).length === 3, "a module of this app resolves and runs");
-  throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
+  const budget = () => new CallBudget(Infinity, undefined, undefined);
+  ok((await scoped("codec", new Uint8Array([7, 7, 7]), budget())).length === 3, "a module of this app resolves and runs");
+  throws(() => scoped("evil", new Uint8Array([7, 7, 7]), budget()),
     "another app's module name reaches nothing through this seam");
   chatModules.dispose(); otherModules.dispose();
 }
@@ -1240,7 +1241,7 @@ ${guestOpFraming()}
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   const pending = new Uint8Array([0, 0, 0, 5, 0, 0, 0, 1]);
-  await armed("timer/arm", pending);
+  await armed("timer/arm", pending, new CallBudget(Infinity, undefined, undefined));
   ok(stub.uninstall("ticker") === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);

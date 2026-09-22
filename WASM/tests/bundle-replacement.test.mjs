@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import {
   sodium, generateKeyPair, authorBundle, testAuthor, bootShell, MemoryFs,
-  FreshnessMarks, toHex, concatBytes, imp,
+  FreshnessMarks, toHex, concatBytes, imp, withTestBudget,
 } from "./fixtures.mjs";
 
 const { DEFAULT_MAX_APP_SLOTS } = await imp("build/core/wasm-limits.js");
@@ -25,7 +25,7 @@ async function node({ transport = false, store = new FreshnessMarks(), admit = (
       // Compile the fixture without executing guest top-level code.
       new Function(o.source);
       const app = Function(o.source.split("\n").slice(0, 3).join("\n") + "\nreturn APP;")();
-      const r = { tag: app.tag, seam: o.hostCall, disposed: false,
+      const r = { tag: app.tag, seam: withTestBudget(o.hostCall), disposed: false,
         call: async () => Uint8Array.of(app.tag), dispose() { r.disposed = true; } };
       records.push(r);
       if (control.hook) await control.hook(r);
