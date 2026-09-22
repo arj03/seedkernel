@@ -1,5 +1,5 @@
 // transport-link.test.mjs — regression tests for the §12.6.1 link hardening and the
-// §12.6.2 concealed handshake. The link logic lives in the SIGNED transport bundle, where
+// §12.6 concealed handshake. The link logic lives in the SIGNED transport bundle, where
 // no test can reach in and hold an object, so each property is pinned where it ships —
 // through the real host stack (shell → TransportHost → guest realm) with an instrumented
 // in-process channel for the socket. The half-open budgets are the exception (a
@@ -195,7 +195,7 @@ const { test, assert, summary } = testkit();
 
 const hexOf = (u) => Buffer.from(u).toString("hex");
 
-console.log("\nTransport link hardening (§12.6.1) + concealed handshake (§12.6.2)\n");
+console.log("\nTransport link hardening (§12.6.1) + concealed handshake (§12.6)\n");
 
 await test("baseline: two ends authenticate and exchange frames", async (keep) => {
   const st = keep(await upPair());

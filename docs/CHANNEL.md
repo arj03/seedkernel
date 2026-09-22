@@ -4,7 +4,8 @@
 
 > Rationale companion to the normative text in [RUNTIME](RUNTIME.md) §12.6–§12.6.3,
 > [PROTOCOL](PROTOCOL.md) §16.1 and [SECURITY](SECURITY.md) §14–§14.1. Those say what the
-> protocol *is*; this says why it is shaped that way.
+> protocol *is*; this says why it is shaped that way. The rest of the runtime's
+> rationale is in [DESIGN](DESIGN.md).
 
 ---
 
@@ -189,11 +190,8 @@ the transcript root means every signature *preimage* differs too, so a signature
 on one network is not even a well-formed candidate on another, and a cross-network handshake
 fails at the first message rather than somewhere later and more confusingly.
 
-The network key is ordinary transport `LOCAL` config. The host applies only the constant
-`DOMAIN_link_scope` signing prefix; the transport binds the network through its signed
-root. Network separation therefore trusts the transport: a compromised occupant can ask
-the host to sign another network's transcript using the node's identity. The master seed
-and private signing key remain in the host.
+The host applies only the constant `DOMAIN_link_scope` prefix; the transport binds the
+network through its signed root, so network separation trusts the transport (§14).
 
 ### 6.3 Why the peer list runs after verification
 
@@ -206,10 +204,7 @@ It is optional and empty by default. Revocation is key rotation — a node dropp
 rotates its contact secret, a network splitting rotates its network key — so the list is a
 convenience for expressing membership without re-keying, not a revocation mechanism.
 
-**Peer admission depends on the transport.** The configured list is checked by the transport
-against signature-verified identities. A malicious transport can bypass it or fabricate
-attribution. The host confines the transport's service access and resource use (§14), but
-relies on it for channel confidentiality, authentication and attribution.
+The list is the transport's to enforce, so a malicious transport can bypass it (§14).
 
 ## 7. Why one identity key, and not a key per purpose
 

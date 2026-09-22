@@ -367,13 +367,13 @@ async function testGuestAbi() {
   console.log("  OK\n");
 }
 
-// ─── Test: safe-js zero-authority JS confinement (§2.1) ─────────────────
+// ─── Test: safe-js zero-authority JS confinement (§12.3) ─────────────────
 // Run zero-authority guest JS over a single host-call seam. Three load-bearing properties,
 // over stand-in seams: airtight by construction, the async seam + byte boundary, and realm
 // isolation.
 
 async function testSafeJs() {
-  console.log("Test: safe-js — zero-authority JS confinement (§2.1)");
+  console.log("Test: safe-js — zero-authority JS confinement (§12.3)");
 
   // 1. Airtight: the guest cannot name fs/net/Bun/process/fetch/require, and
   //    dynamic import() is unavailable (no module loader).

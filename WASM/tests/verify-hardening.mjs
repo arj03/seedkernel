@@ -1216,7 +1216,7 @@ ${guestOpFraming()}
   ungated.close();
 
   // Uninstall CANCELS: a pending setTimeout holds a callback that re-enters the realm, so
-  // one outliving its realm is a call into a freed QuickJS context (§2.1) rather than an
+  // one outliving its realm is a call into a freed QuickJS context (§12.3) rather than an
   // error. Through a stub realm, since what must be observed is the entrypoint NOT being
   // invoked — which a real realm would report only by crashing, or not at all.
   let armed = null;

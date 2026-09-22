@@ -1,4 +1,4 @@
-// Load behaviour of the half-open budgets (§12.6.2 §6.5, §11.4). The concealed handshake
+// Load behaviour of the half-open budgets (§12.6.2; CHANNEL §5, §11). The concealed handshake
 // refuses strangers by SILENCE (an immediate close is an oracle), so an unproven connection
 // occupies a socket for the whole deadline, and these budgets are what stand between a
 // stranger and the node. Three questions: what an unproven connection costs us, whether a
@@ -66,14 +66,14 @@ async function member(fabric, serverNode, host) {
   const m = await makeTransportHost({ channels: fabric.view(), contactSecret: CONTACT });
   // The server's port is only known once it is listening, so the peer is taught to the
   // running occupant rather than named in its load config. `host` is what the fabric hands
-  // back as `remoteAddr`, which is what the per-source cap buckets on (§12.6.1).
+  // back as `remoteAddr`, which is what the per-source cap buckets on (§12.6.2).
   m.addr(serverNode.peerId, `tcp://${host}:${serverNode.driver.port}`, CONTACT);
   return m;
 }
 
 const { test, assert, keep, note, sleep, summary } = testkit();
 
-console.log("\nTransport load behaviour (§12.6.2 §6.5)\n");
+console.log("\nTransport load behaviour (§12.6.2; CHANNEL §5)\n");
 
 // ─────────────────────────────────────────────────────────────────────────────
 await test("a silent stranger costs NO asymmetric crypto", async () => {

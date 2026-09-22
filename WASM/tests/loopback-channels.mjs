@@ -95,7 +95,7 @@ export class LoopbackChannels {
       return dial;
     }
     // The destination's host is the "far end" both sides see — it is what the
-    // half-open limiter buckets accepts by (the per-source cap; §12.6.1).
+    // half-open limiter buckets accepts by (the per-source cap; §12.6.2).
     const [dial, accepted] = LoopbackChannel.pair(d.host);
     queueMicrotask(() => onAccept(accepted));
     return dial;

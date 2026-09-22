@@ -219,7 +219,7 @@ window.addEventListener("pagehide", () => shell.close(), { once: true });
 
 ## The assembly is an export
 
-`bootShell` (`./shell-core`) is the ONE node-assembly (§12.9), and entering it is how a client gets a node that is correct by construction. Every field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. One default is a decision rather than a convenience: `admit` absent denies ordinary app installs. Enabling `transport` authorizes its selected boot blob independently of app policy. Browser and Node clients, the native binary, and seedstore's wrapper all enter through this assembly; they differ only in which defaults they displace.
+Every `bootShell` field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. An absent `admit` denies ordinary app installs (§12.5).
 
 Transport startup has two modes:
 
@@ -254,17 +254,11 @@ const app = verifyBundle(sodium, blob).manifest.app;   // the label the host wil
 await shell.install(blob, { replaces: installed.has(app) ? app : undefined });
 ```
 
-The incoming author and app name may differ from the slot being retired. App candidates still pass `admit`. Naming a slot is the only way to displace one: an install without `replaces` refuses a label already installed, whoever authored it, so an app's own next version names its slot too. Only replacing the current link owner authorizes a candidate requiring `link`.
+The incoming author and app name may differ from the slot being retired. What a replacement may take, what `link` requires, and what a failure leaves running are §12.5; scopes follow the label (§5). A transport replacement keeps the node identity and listeners but discards links, session keys and the address book, so supply its configuration again (§12.10).
 
-Replacement builds first, then commits the new claims and releases the predecessor. The exact selected slot must still be current at commit; concurrent replacement or uninstall causes failure. Unrelated claims and labels other slots hold remain protected. A failed candidate leaves the current owner running. A successful replacement invalidates its predecessor's invocation handles.
+`bootNodeShell` and the native binary's `standUp` take `bootShell`'s own `transport` option, so omitting it stands a node without a network, whose returned `transport` is then `null`; the platform supplies the socket adapter when the options name none.
 
-The filesystem and signing scopes belong to the label: a replacement keeping the label keeps both, whoever authored it, and one changing the label starts on the new label's while the old label's data stays on disk. Version history is the author's own, so a new author starts its own count. Transport replacement keeps node identity and listeners but closes old links and discards the old realm's session keys and address book. Supply the new transport's configuration again.
-
-The initial transport loads at boot. If the current link owner is uninstalled or replaced by an ordinary app, installing another transport requires booting a new node.
-
-`bootNodeShell` and the native binary's `standUp` take `bootShell`'s own `transport` option, so omitting it stands a node without a network, whose returned `transport` is then `null`; the platform supplies the socket adapter when the options name none. The CLI sets this choice explicitly: networking requires `--listen`, `--ws-listen`, or `--peers`, and `--transport` and `--contact-secret` are refused without one of them.
-
-**Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Neither grants a host service, but both decide who sees your data and whose answers your callers trust — and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified author, `app` label and the signed claim lists `admit` is already handed:
+**Pinning claim owners is yours, not the assembly's.** Protocol claims select the app receiving decrypted peer input; service claims select the app receiving local call arguments. Both decide who sees your data and whose answers your callers trust (§14), and the JSON policy reserves no names (§12.5). Compose an owner check onto your predicate, reading the verified author, `app` label and the signed claim lists `admit` is already handed:
 
 ```js
 import { policyFromJson } from "seedkernel-wasm/shell-core";
@@ -299,17 +293,17 @@ const approvedClaims = (v) => {
 const admit = async (v) => (await basePolicy(v)) && approvedClaims(v);
 ```
 
-Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`. Bundles requiring `link` bypass this predicate: explicit selection is the trust decision, so these maps cannot constrain a transport's claims. Revocation and freshness apply to both paths.
+Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`; bundles requiring `link` bypass the predicate (§12.5).
 
 A load returns an **`AppHandle`**: the verified manifest and author, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the host has already made. Take the handle; do not re-derive its parts.
 
-`install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None becomes signed bundle content. For every app, including the transport, `localConfig` becomes `LOCAL` unchanged. The transport's `networkKey` is ordinary `LOCAL` config: 64 lowercase hex characters when supplied, with absence selecting the public network's zero key. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network. The transport reads the node's identity from `HOST`. Its contact secret is ordinary `LOCAL` config: `contactSecret` is 64 lowercase hex, absence means open, and the `contact` op rotates it at runtime.
+`install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds (§12.3), and an `onInbound` observer (§12.10). None becomes signed bundle content; `localConfig` becomes `LOCAL` unchanged, for the transport too, whose keys are listed in §12.6. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network.
 
 The handle's `invoke` is bound to the slot this install stood. On an upgrade, the replacing install stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the install they intend to drive.
 
 ## Reaching a claim from the host
 
-`shell.call(serviceId, payload)` calls the realm claiming that LOCAL service id, with the host's caller id — the host half of the same routing a co-resident guest reaches through `host.call`. It answers `null` when nothing claims the name, which is how "this node has no transport" is said. It resolves `services` claims and never `protocols`: a name a *peer* may reach is a peer's to reach.
+`shell.call(serviceId, payload)` calls the realm claiming that local service id with the host's caller id, and answers `null` when nothing claims it — which is how "this node has no transport" is said (§12.10).
 
 That is the door to the node's own network. Waiting for a cohort, listing linked peers and teaching an address are ordinary calls on the id the transport bundle claims (`TRANSPORT_SERVICE` from `./transport-bundle`, `"_net"` for the shipped one), composed with the codec both ends already share:
 

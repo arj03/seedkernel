@@ -1,5 +1,5 @@
 // net-rtc.test.mjs — RtcNetwork's untrusted signaling boundary and speculative-entry cap
-// (§12.6.1). A signaling endpoint can name arbitrary `from` values in hellos AND in SDP
+// (§12.7). A signaling endpoint can name arbitrary `from` values in hellos AND in SDP
 // offers, and every entry carries an RTCPeerConnection — so decoding precedes policy and
 // every path that CREATES an entry answers to the same MAX_UNESTABLISHED_PEERS bound. Pinned with
 // stubs: the browser globals are referenced only inside methods, so net-rtc runs under Node.
@@ -52,7 +52,7 @@ function stubPeerConnection() {
   return { pc, listeners };
 }
 
-console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.6.1)\n");
+console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.7)\n");
 
 await test("net-rtc exports the signaling seam, not a WebSocket relay implementation", async () => {
   assert(!("relaySignaling" in rtc), "the host must not ship a rendezvous wire implementation");
