@@ -360,7 +360,7 @@ class Core {
 
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
-    // The peer lint already answered at msg3/msg4, so a refused peer never reaches the
+    // The peer lint already answered at msg3/msg2, so a refused peer never reaches the
     // router. Only routing is left.
     router.promote(peerId, link);
   }

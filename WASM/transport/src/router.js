@@ -23,7 +23,7 @@ class Router {
 
   // Install a freshly-authenticated link: the double-connect tie-break, and the up edge on
   // a peer's first link. A link that loses the tie-break is closed instead.
-  // The peer lint already ran at msg3/msg4 (`admits`, ake.js).
+  // The peer lint already ran at msg3/msg2 (`admits`, ake.js).
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
     const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed);

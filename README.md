@@ -114,16 +114,16 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,340 LOC)**
+**Shared — compiled once, run by all three targets (2,349 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 463 |
 | Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 329 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 640 |
+| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 660 |
 | Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 367 |
-| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 196 |
-| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 345 |
+| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 193 |
+| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 337 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
@@ -132,7 +132,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,471 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (296) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,240 Go + 363 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (295) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,250 Go + 362 TS |
 
 The transport bundle sits outside these host totals: 1,469 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
 
@@ -168,7 +168,7 @@ This file is §1; the rest of the spec lives in `docs/`, split by concern. Secti
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the host's normative surface: host services, the guest-seam ABI, zero-authority JS realms, signed bundles and how the host admits them under policy, the node↔node transport, the Go/native binary, routing. Rules and ABI tables only, each stated once. |
 | [DESIGN](docs/DESIGN.md) | §12 | Why RUNTIME §12 is shaped the way it is, under the same section numbers. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
-| [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the four messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
+| [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the three messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
 | [CLIENT](docs/CLIENT.md) | — | How to write a bundle and the client that hosts it: a runnable first bundle, the manifest declarations an app adds as it grows, dependency setup, node boot, platform adapters, loading and invocation, browser integration traps, and the two existing clients as worked examples. Build guide, not protocol. |
 
 To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. DESIGN, CHANNEL and CLIENT sit outside that sequence — the first two are rationale, the last the guide to building on the runtime.

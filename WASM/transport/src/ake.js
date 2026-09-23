@@ -52,13 +52,14 @@ const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
 
 const SUITE_CHANNEL_CONCEALED = 0x03;
-const SUITE_LEN = 1, PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
+const SUITE_LEN = 1, PK_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const NPUB_LEN = 12, TAG_LEN = 16;
 const KEM_PK_LEN = 1184, KEM_SK_LEN = 2400, KEM_CT_LEN = 1088, KEM_SS_LEN = 32;
-const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + NONCE_LEN + TAG_LEN; // 1265
-const M2_LEN = EPH_LEN + KEM_CT_LEN + NONCE_LEN + TAG_LEN;             // 1168
-const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
-const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
+// msg1's seal carries nothing: its tag is the contact-secret proof. msg2 carries only the
+// receiver's signature, since every dial already holds the key it is checked against.
+const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + TAG_LEN; // 1233
+const M2_LEN = EPH_LEN + KEM_CT_LEN + SIG_LEN + TAG_LEN;   // 1200
+const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                 // 112
 
 // The one suite this transport speaks. Lives here, not in services/domains.ts, since a
 // channel suite is read entirely by this AKE (§14.1); not negotiated (§12.6).
@@ -71,7 +72,6 @@ const LABEL_REKEY = utf8Encode("seedkernel-session-rekey-v1\0");
 const LABEL_PROBE = utf8Encode("seedkernel-c-probe-v1\0");
 const LABEL_M2 = utf8Encode("seedkernel-c-msg2-v1\0");
 const LABEL_M3 = utf8Encode("seedkernel-c-msg3-v1\0");
-const LABEL_M4 = utf8Encode("seedkernel-c-msg4-v1\0");
 const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 
@@ -240,9 +240,9 @@ function netLinkDeliver(claim, attribution, payload) {
   return host.call(N_LINK_DELIVER, concatBytes([Uint8Array.of(claim.length), claim, attribution, payload]));
 }
 
-/** Peer lint (§12.6): asked at msg3 when accepting, msg4 when dialing — before this
- *  end has revealed anything. A lint, not a gate: a hostile occupant still reaches
- *  only `link/*`. */
+/** Peer lint (§12.6): asked at msg3 when accepting, msg2 when dialing — on a verified
+ *  identity, before this end has named itself. A lint, not a gate: a hostile occupant
+ *  still reaches only `link/*`. */
 function admits(peerBytes) {
   if (admitPeers === null) return true;
   return admitPeers.has(toHex(peerBytes));
@@ -259,9 +259,9 @@ class Link {
     // Framing derives from stream shape and route metadata (§12.1).
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
-    // The peer this dial is for: the identity msg4 must prove, and the `connecting` pool
-    // this link waits in, so leaving it is one map hit rather than a scan of every peer's
-    // pool. Empty for an accept, which is in no pool until it authenticates.
+    // The peer this dial is for: the key msg2's signature must verify under, and the
+    // `connecting` pool this link waits in, so leaving it is one map hit rather than a scan
+    // of every peer's pool. Empty for an accept, which is in no pool until it authenticates.
     this.dialedPeerId = spec.dialedPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
@@ -278,7 +278,6 @@ class Link {
     this.peerId = "";
     this.authed = false;
     this.peerSaidGoodbye = false;
-    this.myNonce = null;
     this.myEph = null;
     this.myKem = null;
     this.kemSecret = null;
@@ -364,7 +363,6 @@ class Link {
   }
 
   async ensureKeys() {
-    if (!this.myNonce) this.myNonce = await randomBytes(NONCE_LEN);
     if (!this.myEph) this.myEph = await boxKeypair();
     // Only the initiator publishes an encapsulation key. The responder creates its KEM
     // state by encapsulating that key after the contact-secret probe has opened.
@@ -630,7 +628,7 @@ class Link {
     const step = this.authed
       ? this.onRecord(m)
       : this.weDialed
-        ? (this.peerEph ? this.onMsg4(m) : this.onMsg2(m))
+        ? this.onMsg2(m)
         : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
     return Promise.resolve(step).catch(() => { this.refuse(); });
   }
@@ -732,7 +730,7 @@ class Link {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
     const kemPk = this.myKem.publicKey;
     const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
-      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), this.myNonce)]);
+      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), new Uint8Array(0))]);
     this.th = await hash(this.root, w1);
     await this.wire(w1);
   }
@@ -763,73 +761,68 @@ class Link {
     this.kemSecret = kem.sharedSecret;
     this.peerEph = ephI;
 
+    // The receiver signs everything up to its own seal — both ephemerals, the KEM key and
+    // ciphertext — without naming itself: the caller dialed this key, so it already holds
+    // the one to check against, and the key never goes on the wire.
     const h1 = await hash(this.root, w1);
-    const w2 = concatBytes([
-      this.myEph.publicKey.subarray(0, EPH_LEN),
-      kem.ciphertext,
-      await this.sealZero(await this.kdf([this.ee, this.kemSecret], h1, LABEL_M2), this.myNonce),
-    ]);
+    const head = concatBytes([this.myEph.publicKey.subarray(0, EPH_LEN), kem.ciphertext]);
+    const hs = await hash(h1, head);
+    const si = await this.signIdentity(hs);
+    if (!si) return;
+    const w2 = concatBytes([head,
+      await this.sealZero(await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), si.sig)]);
     this.th = await hash(h1, w2);
     await this.wire(w2);
   }
 
   async onMsg2(w2) {
     if (w2.length !== M2_LEN) { this.stall(); return; }
-    const ephR = w2.slice(0, EPH_LEN);
-    const kemCt = w2.slice(EPH_LEN, EPH_LEN + KEM_CT_LEN);
+    const head = w2.slice(0, EPH_LEN + KEM_CT_LEN);
+    const ephR = head.slice(0, EPH_LEN);
+    const kemCt = head.slice(EPH_LEN);
     const dh = await scalarmult(this.myEph.privateKey, ephR);
     if (!dh.ok) { this.stall(); return; }
     const kem = await kemDecaps(this.myKem.privateKey, kemCt);
     if (!kem.ok) { this.stall(); return; }
+    const hs = await hash(this.th, head);
     const r = await this.openZero(
-      await this.kdf([dh.x, kem.sharedSecret], this.th, LABEL_M2),
+      await this.kdf([dh.x, kem.sharedSecret], hs, LABEL_M2),
       w2.slice(EPH_LEN + KEM_CT_LEN));
     if (!r.ok) { this.stall(); return; }
-    this.ee = dh.x; this.kemSecret = kem.sharedSecret; this.peerEph = ephR;
+    this.ee = dh.x; this.kemSecret = kem.sharedSecret;
+    // The receiver proves the key this dial is for. Nothing of ours is on the wire yet, so
+    // a failure has nothing to conceal and closes rather than waits out the deadline.
+    const idR = fromHex(this.dialedPeerId);
+    // A dial pinned to our own key would hold a session with ourselves: our own mistake.
+    if (bytesCompare(idR, ownPk) === 0) { this.abort(); return; }
+    if (!(await verify(idR, r.pt, channelIdentityMessage(this.root, hs, idR)))) { this.abort(true); return; }
+    // The peer lint, on the end that dialed — before this end names itself.
+    if (!admits(idR)) { this.abort(true); return; }
+    this.peerPubkey = idR; this.peerId = this.dialedPeerId;
 
     const h2 = await hash(this.th, w2);
     const si = await this.signIdentity(h2);
     if (!si) return;
     const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([si.id, si.sig]));
     this.th = await hash(h2, w3);
+    try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
     await this.wire(w3);
+    // Records follow msg3 on the same ordered channel, so the caller's first data leaves
+    // one round trip after its msg1.
+    await this.becomeAuthed();
   }
 
   async onMsg3(w3) {
     if (w3.length !== M3_LEN) { this.stall(); return; }
     const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
-    const peerId = toHex(idI);
-    // The peer lint runs HERE: after decryption and signature, never on a claimed key,
-    // and before msg4 puts our identity on the wire. A refusal is silence, so being
-    // turned away is indistinguishable from a msg3 that never arrived (§12.6.2).
-    if (!admits(idI)) { this.stall(); return; }
-    this.peerPubkey = idI; this.peerId = peerId;
-
-    const h3 = await hash(this.th, w3);
-    const si = await this.signIdentity(h3);
-    if (!si) return;
-    const w4 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h3, LABEL_M4), concatBytes([si.id, si.sig]));
-    this.th = await hash(h3, w4);
+    // The peer lint runs HERE: after decryption and signature, never on a claimed key. It
+    // closes rather than stalls: the caller verified this end at msg2, so silence would hide
+    // nothing and only leave it sending into a link that will never answer (§12.6.2).
+    if (!admits(idI)) { this.abort(true); return; }
+    this.peerPubkey = idI; this.peerId = toHex(idI);
+    this.th = await hash(this.th, w3);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
-    await this.wire(w4);
-    await this.becomeAuthed();
-  }
-
-  async onMsg4(w4) {
-    if (w4.length !== M4_LEN) { this.stall(); return; }
-    const idR = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M4), w4, this.th);
-    if (!idR) { this.stall(); return; }
-    const peerId = toHex(idR);
-    // A mismatch here is a local fault, not a probe to hide from — we already revealed
-    // ourselves at msg3 — so it aborts rather than stalls.
-    if (this.dialedPeerId && peerId !== this.dialedPeerId) { this.abort(); return; }
-    // The peer lint, on the end that dialed. Not concealed: we named ourselves at
-    // msg3, so an abort here is honest rather than a probe.
-    if (!admits(idR)) { this.abort(true); return; }
-    this.peerPubkey = idR; this.peerId = peerId;
-    this.th = await hash(this.th, w4);
-    try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
     await this.becomeAuthed();
   }
 
@@ -843,7 +836,7 @@ class Link {
     this.clearEphemeral();
   }
 
-  /** Zero and drop the handshake's private material (ephemeral secret, `ee`, nonce).
+  /** Zero and drop the handshake's private material (ephemeral secrets, `ee`, KEM secret).
    *  Called when session keys exist and again at teardown. `myEph` is dropped, not only
    *  zeroed — `ensureKeys` would treat an all-zero secret as already generated. */
   clearEphemeral() {
@@ -855,7 +848,6 @@ class Link {
       this.myKem.privateKey.fill(0);
       this.myKem = null;
     }
-    if (this.myNonce) { this.myNonce.fill(0); this.myNonce = null; }
     if (this.ee) { this.ee.fill(0); this.ee = null; }
     if (this.kemSecret) { this.kemSecret.fill(0); this.kemSecret = null; }
   }

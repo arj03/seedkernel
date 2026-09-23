@@ -260,7 +260,7 @@ async function run() {
 
   {
     // The cap rises when the step a delivery starts has RUN (ake.js `becomeAuthed`), not when
-    // the message is handed over — so a full-size record riding the same read as msg4 must be
+    // the message is handed over — so a full-size record riding the same read as msg3 must be
     // measured once that step has settled, against the raised cap. The step here is a later
     // turn, as the real one's host calls are.
     const raisingStep = (framer, delivered) => (p) => {
@@ -271,19 +271,19 @@ async function run() {
     {
       const framer = new WS.LengthFramer(() => {});
       const lengthFrame = (body) => concat([Uint8Array.of(0, 0, 0, 0), body]);
-      const msg4 = lengthFrame(payload(112)), record = lengthFrame(payload(big));
-      new DataView(msg4.buffer).setUint32(0, 112);
+      const msg3 = lengthFrame(payload(112)), record = lengthFrame(payload(big));
+      new DataView(msg3.buffer).setUint32(0, 112);
       new DataView(record.buffer).setUint32(0, big);
       const delivered = [];
-      const r = await framer.push(concat([msg4, record]), raisingStep(framer, delivered));
+      const r = await framer.push(concat([msg3, record]), raisingStep(framer, delivered));
       ok(r === true && delivered.length === 2 && delivered[1].length === big,
         "length framer: the record behind the cap-raising message is measured after its step");
     }
     {
       const { framer, delivered } = await serverAfterUpgrade();
-      const msg4 = await client.frame(WS.WS_OP_BINARY, payload(112));
+      const msg3 = await client.frame(WS.WS_OP_BINARY, payload(112));
       const record = await client.frame(WS.WS_OP_BINARY, payload(big));
-      const r = await framer.push(concat([msg4, record]), raisingStep(framer, delivered));
+      const r = await framer.push(concat([msg3, record]), raisingStep(framer, delivered));
       ok(r === true && delivered.length === 2 && delivered[1].length === big,
         "ws framer: the record behind the cap-raising message is measured after its step");
     }

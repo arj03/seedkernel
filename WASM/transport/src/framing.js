@@ -258,7 +258,7 @@ class WsFramer {
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
    *  that keeps two parses from running at once, which matters twice: `frames()` takes a
    *  frame before awaiting its decode, so a second parser would read the frame after it;
-   *  and `raiseCap()` lands only once msg4's step has run, so a second parser would measure
+   *  and `raiseCap()` lands only once msg3's step has run, so a second parser would measure
    *  a frame riding the same segment against the pre-auth cap. */
   push(chunk, deliver) {
     const done = this.reads.then(() => this.read(chunk, deliver));
@@ -328,7 +328,7 @@ class WsFramer {
 
   /** Parse whatever frames are complete. Delivery is per frame rather than per chunk, and
    *  until the cap is raised each message's step runs before the next frame is measured
-   *  (`dispatch`): msg4's step raises the cap, and an application frame riding the same TCP
+   *  (`dispatch`): msg3's step raises the cap, and an application frame riding the same TCP
    *  segment must be measured against the raised cap, not the pre-auth one. */
   async frames(deliver) {
     for (;;) {

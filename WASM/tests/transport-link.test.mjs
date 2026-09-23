@@ -394,7 +394,7 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
   // Trailing bytes would ride outside the transcript hash, and so outside what both
   // signatures cover. Exact, not minimum, for every message in the flight.
   // A's two handshake messages, by the width each is accepted at: msg1 and msg3.
-  for (const len of [1265, 112]) {
+  for (const len of [1233, 112]) {
     const chans = wirePair({
       tamper: (b, from) => (from === "A" && b.length === len ? Buffer.concat([Buffer.from(b), Buffer.from([0])]) : b),
     });
@@ -402,7 +402,7 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
     await settle();
     // The responder is the end that reads a tampered message from A, so it is the end
     // that must refuse. (For msg3 the initiator has legitimately authenticated by then:
-    // it verified msg2 at 1 RTT, a round trip before the responder authenticates it.)
+    // it verified msg2 at 1 RTT, before the responder has msg3 to authenticate it by.)
     assert(!(await bUp(st)), `responder must refuse an over-long ${len}-byte message`);
     if (len === 81) assert(!(await aUp(st)), "a rejected msg1 must leave the initiator unauthenticated");
     st.close();
@@ -454,7 +454,7 @@ await test("a RECORDED msg1 replayed on a fresh connection draws nothing", async
   }));
   await until(async () => await bUp(st), 4000, "the genuine handshake");
   const msg1 = Uint8Array.from(Buffer.from(chans[0].sent[0], "hex"));
-  assert(msg1.length === 1265, `expected msg1 first on A's wire, got ${msg1.length} bytes`);
+  assert(msg1.length === 1233, `expected msg1 first on A's wire, got ${msg1.length} bytes`);
   const spentGenuinely = bKem;
 
   // The recording, arriving on a connection of its own — an accept like any other.
@@ -474,21 +474,39 @@ await test("a RECORDED msg1 replayed on a fresh connection draws nothing", async
   await until(() => again[1].sent.length > 0, 4000, "the responder to answer a FRESH msg1");
 });
 
-await test("a node that dials ITSELF never authenticates: its own identity reflected is refused", async (keep) => {
-  // Both ends of this exchange hold the network key and the contact secret, so it gets all
-  // the way to a correctly signed identity — this node's own. Taking it would leave a node
-  // holding a session with itself, on a transcript anything that echoes its traffic can
-  // produce; the refusal is silence, like every other one a responder makes.
+await test("a node that dials ITSELF never authenticates: its own signature is refused", async (keep) => {
+  // Both ends of this exchange hold the network key and the contact secret, so msg2 arrives
+  // correctly signed by the very key the dial pinned — this node's own. Taking it would
+  // leave a node holding a session with itself, on a transcript anything that echoes its
+  // traffic can produce. The dialer refuses at msg2, before naming itself.
   const st = keep(await upPair());
   const self = wirePair({ addrA: "10.0.8.1", addrB: "10.0.8.2" });
   st.A.factory.give(self[0], { dialed: st.A.peerId });
   st.A.factory.give(self[1]);
-  // msg1, then msg3: the reflected identity really was put on the wire.
-  await until(() => self[0].sent.length >= 2, 4000, "the dialer to name itself in msg3");
+  await until(() => self[1].sent.length >= 1, 4000, "the responder to answer with msg2");
   await settle();
-  assert(self[1].sent.length === 1,
-    `the responder answered its own reflected identity (${self[1].sent.length} messages, want msg2 alone)`);
+  assert(self[0].sent.length === 1,
+    `the dialer went on past its own signature (${self[0].sent.length} messages, want msg1 alone)`);
   assert(!(await linkedTo(st.A, st.A.peerId)), "a node must never hold a link to itself");
+});
+
+await test("a caller names itself only to the key it dialed", async (keep) => {
+  // Every holder of a node's address holds its contact secret, so any of them can answer
+  // msg1 as that node. msg2 is signed under the answering node's key and checked against
+  // the one the dial pinned, so an impostor holding the secret draws msg1 and nothing
+  // more: the caller's identity goes only to the receiver it meant.
+  const st = keep(await upPair());
+  const impostor = wirePair({ addrA: "10.0.7.1", addrB: "10.0.7.2" });
+  // A believes it dials `nobody`; B, holding the same contact secret, answers as itself.
+  const nobody = hexOf(generateKeyPair().publicKey);
+  st.A.factory.give(impostor[0], { dialed: nobody });
+  st.B.factory.give(impostor[1]);
+  await until(() => impostor[1].sent.length >= 1, 4000, "the impostor to answer with msg2");
+  await until(() => impostor[0].dead, 4000, "the caller to close on the wrong signature");
+  assert(impostor[0].sent.length === 1,
+    `the caller answered an impostor (${impostor[0].sent.length} messages, want msg1 alone)`);
+  assert(!impostor[0].sent.join("").includes(st.A.peerId), "the caller's identity reached an impostor");
+  assert(!(await linkedTo(st.A, nobody)), "an impostor must not authenticate as the dialed key");
 });
 
 await test("COHORT: a node dials the peers its config spells as pk[.secret]@dest", async (keep) => {
@@ -537,7 +555,7 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
   const st = keep(await linked(chans));
   await until(() => chans[0].sent.length > 0, 4000, "msg1");
   const msg1 = Buffer.from(chans[0].sent[0], "hex");
-  assert(msg1.length === 1265, `hybrid msg1 should be 1265 bytes, got ${msg1.length}`);
+  assert(msg1.length === 1233, `hybrid msg1 should be 1233 bytes, got ${msg1.length}`);
   assert(!msg1.includes(Buffer.from(st.A.peerId, "hex")), "msg1 must not carry the initiator identity");
 });
 
@@ -587,25 +605,25 @@ await test("FRAME CAP: an over-cap pre-auth frame draws the silence every refusa
 });
 
 await test("FRAME CAP: authentication raises it, before anything can arrive under it", async (keep) => {
-  // A responder authenticates at msg3 and may put application data on the wire right behind
-  // msg4, which the dialer can read in the SAME delivery. The dialer raises its cap only when
-  // msg4's step has run (becomeAuthed), so the framer must measure what rides behind msg4
-  // after that step — or it holds a full-size first record to the handshake bound and kills
-  // the link on its first real exchange.
+  // A dialer authenticates at msg2 and may put application data on the wire right behind
+  // msg3, which the responder can read in the SAME delivery. The responder raises its cap
+  // only when msg3's step has run (becomeAuthed), so the framer must measure what rides
+  // behind msg3 after that step — or it holds a full-size first record to the handshake
+  // bound and kills the link on its first real exchange.
   const chans = wirePair({ stream: true });
-  chans[1].hold(); // B's writes: msg2 alone, then msg4 and whatever follows it as one read
+  chans[0].hold(); // A's writes: msg1 alone, then msg3 and whatever follows it as one read
   const st = keep(await linked(chans));
-  await until(() => chans[1].held.length === 1, 4000, "msg2");
-  chans[1].flush();
-  chans[1].hold();
-  await until(() => bUp(st), 4000, "the responder to authenticate");
+  await until(() => chans[0].held.length === 1, 4000, "msg1");
+  chans[0].flush();
+  chans[0].hold();
+  await until(() => aUp(st), 4000, "the dialer to authenticate");
   // Far over the pre-auth cap, well inside the post-auth one (maxFrameBytes is 2 MiB).
-  const answer = st.B.request(st.A.peerId, PROTO, new Uint8Array(64 * 1024).fill(7), 4000)
+  const answer = st.A.request(st.B.peerId, PROTO, new Uint8Array(64 * 1024).fill(7), 4000)
     .then((r) => r, () => null);
-  await until(() => chans[1].held.length === 2, 4000, "msg4 and a record behind it");
-  assert(chans[1].flush() === 2, "msg4 and the record must arrive as ONE read");
+  await until(() => chans[0].held.length === 2, 4000, "msg3 and a record behind it");
+  assert(chans[0].flush() === 2, "msg3 and the record must arrive as ONE read");
   const got = await answer;
-  assert(got !== null && got.length === 64 * 1024, "the record behind msg4 must cross under the raised cap");
+  assert(got !== null && got.length === 64 * 1024, "the record behind msg3 must cross under the raised cap");
   assert(!st.a.closed && !st.b.closed, "and neither end may close the link over it");
 });
 
@@ -976,13 +994,13 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   assert(c2[1].sent.length === 0, `the stale secret drew ${c2[1].sent.length} message(s)`);
 
   // A now presents the NEW value too: the door opens again — checked as wire progress on
-  // c3 (both ends complete their two-message half of the handshake), for the same reason
+  // c3 (msg1 and msg3 from the dialer, msg2 from the receiver), for the same reason
   // the failure case above is checked on the wire rather than the aggregate peer set —
   // and the guest never re-loaded to get it.
   await contact(A, secretC);
   const c3 = wirePair();
   openPair(A, B, c3);
-  await until(() => c3[0].sent.length >= 2 && c3[1].sent.length >= 2, 4000, "rotated secret handshake");
+  await until(() => c3[0].sent.length >= 2 && c3[1].sent.length >= 1, 4000, "rotated secret handshake");
   await settle();
   assert(loads === 0, `a secret rotation must not re-load the transport (loaded ${loads} times)`);
   // The link that authenticated under the old secret is untouched by a rotation.
@@ -1034,13 +1052,10 @@ await test("CONTACT SECRET: it never appears on the wire", async (keep) => {
 });
 
 await test("LEAK FIX: a link that closes itself mid-handshake still reports down", async (keep) => {
-  // Two nodes sharing one identity, so B sees its own key in A's msg3: the reflection
-  // guard (ake.js openIdentity, `bytesCompare(id, ownPk)`) refuses it — but a refusal
-  // mid-handshake is concealment, so it STALLS (silently) rather than closing outright,
-  // exactly like a wrong contact secret. Nobody ever completes the handshake, so what
-  // actually closes each side is its own ordinary handshake deadline firing abort() — a
+  // Two nodes sharing one identity, so A's dial is pinned to its own key: A refuses the
+  // msg2 signed under it (ake.js onMsg2, `bytesCompare(idR, ownPk)`) and aborts — a
   // SELF-close from inside the guest, not a host-driven one (the host cannot ask a link to
-  // close any more). Shortened here so the test does not wait out the real default.
+  // close any more).
   // `onLinkClosed` must still fire for a link that never authenticated, which is the leak
   // this pins: a channel whose close() merely set `dead` without ever firing onClose would
   // leave such a link stuck in the pre-auth bookkeeping forever.
@@ -1050,9 +1065,8 @@ await test("LEAK FIX: a link that closes itself mid-handshake still reports down
     { identity: id, transportConfig: { handshakeTimeoutMs: 80 } },
     { identity: id, transportConfig: { handshakeTimeoutMs: 80 } }));
   await until(() => st.a.closed, 3000, "the self-close MUST reach onLinkClosed (this is the leak)");
-  // Nobody ever answered, so the deadline is what retired it: TIMEOUT, not a peer that sent
-  // something wrong. The two are the operator's actual fork in the road.
-  assert(st.a.reason === CLOSE_REASON.TIMEOUT, `a stalled handshake should read TIMEOUT, got ${st.a.reason}`);
+  // Dialing our own key is our own fault, not a peer's: HANDSHAKE, not REFUSED.
+  assert(st.a.reason === CLOSE_REASON.HANDSHAKE, `a self-dial should read HANDSHAKE, got ${st.a.reason}`);
   assert(!(await aUp(st)) && !(await bUp(st)), "a node must not link to itself");
 });
 
@@ -1259,30 +1273,24 @@ await test("WHITELIST: absent by default, and an absent hook admits everyone", a
   assert((await aUp(st)) && (await bUp(st)), "no whitelist configured must mean admit-all");
 });
 
-await test("GUARD: a refused caller learns NOTHING about the receiver", async (keep) => {
-  // What the second round trip bought: the caller names itself at msg3, before the receiver
-  // has said anything about itself, so a caller off the whitelist is turned away without
-  // learning whether the identity it dialed is even here. Under the OLD 1-RTT ordering the
-  // receiver signed its identity at msg2 — before it knew who was calling — so any
-  // whitelist member could confirm who lived at any address.
-  //
-  // This caught a real regression when the suite was ported: the gate was first asked from
-  // becomeAuthed(), which the accepting end reaches only AFTER msg4 already put its
-  // identity and signature on the wire. The gate now runs in the guest's onMsg3, before
-  // msg4 is built, and a concealed refusal is silence rather than a close.
+await test("GUARD: a refused caller is closed at msg3 and never sees the receiver's key", async (keep) => {
+  // The receiver signs at msg2 but never sends its key: the caller checks the signature
+  // against the key it dialed. The gate runs in the guest's onMsg3, on a verified identity.
+  // It closes rather than stalls — the caller already verified the receiver, so silence
+  // would hide nothing and only leave the caller sending into a link that never answers.
   const chans = wirePair();
   // An empty-but-present list: the receiver admits nobody. The lint is the transport's own
   // now (transport/src `admits`), read from its own config rather than asked of the
   // host per link — see the note there for why the host was never gating this anyway.
   const st = keep(await linked(chans, {}, { admitPeers: [new Uint8Array(32).fill(1)] }));
-  await settle();
+  await until(() => st.b.closed && st.a.closed, 4000, "the refusal to close both ends");
+  assert(st.b.reason === CLOSE_REASON.REFUSED, `the receiver should read REFUSED, got ${REASON_NAMES[st.b.reason]}`);
   assert(!(await bUp(st)), "a refused caller must not be authenticated by the receiver");
-  // One message back (msg2, an ephemeral and a contact proof), then silence. The
-  // receiver's identity and signature must never go out.
-  assert(chans[1].sent.length === 1, `refused caller drew ${chans[1].sent.length} messages, want 1 (msg4 leaked)`);
+  assert(!(await aUp(st)), "a refused caller must not keep a link");
+  // msg2 is all the receiver ever sends, and its key is never in it.
+  assert(chans[1].sent.length === 1, `refused caller drew ${chans[1].sent.length} messages, want 1`);
   assert(!chans[1].sent.join("").includes(st.B.peerId),
-    "the receiver revealed its identity to a caller it then refused");
-  assert(!(await aUp(st)), "a refused caller must not authenticate");
+    "the receiver put its key on the wire");
 });
 
 await test("a decrypt failure does not advance the receive counter", async (keep) => {

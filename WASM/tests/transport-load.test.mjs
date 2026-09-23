@@ -112,7 +112,7 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
     // A well-formed-looking msg1 — right suite byte, right length, wrong everything
     // else. The suite byte matters: get it wrong and the guest refuses on the byte
     // alone, and this measures a cheaper path than a real attacker gets.
-    const junk = new Uint8Array(1265);
+    const junk = new Uint8Array(1233);
     junk[0] = 0x03; // SUITE_CHANNEL_CONCEALED
     for (let j = 1; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
     d.ch.send(junk);

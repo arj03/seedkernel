@@ -18,9 +18,9 @@ Three attacks are denied:
 
 | Attack | Denied by |
 | --- | --- |
-| **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1); on an open node, only a peer list with the message ordering (§4) |
-| **Attribute** — watch a flow, learn which pair it belongs to | both identities travelling under the hybrid ephemeral secrets (§3) |
-| **Membership-test** — ask a node "would you talk to key P?" | silent refusal on every pre-auth path (§5) |
+| **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1); an open node does not deny it (§8.1) |
+| **Attribute** — watch a flow, learn which pair it belongs to | the caller's identity travelling under the hybrid ephemeral secrets, the receiver's not travelling at all (§3) |
+| **Membership-test** — ask a node "would you talk to key P?" | a peer list that sees only verified identities (§6.3), and silent refusal before one (§5) |
 
 Two things it does not provide, stated here rather than buried: a node at a stable
 `host:port` is still identified to anyone holding an address book and a packet capture, and
@@ -32,16 +32,16 @@ different project. §9 has the full list.
 
 ## 2. Shape
 
-Four messages. The initiator opens with an X25519 ephemeral, an ML-KEM-768 public key, and
+Three messages. The initiator opens with an X25519 ephemeral, an ML-KEM-768 public key, and
 a seal keyed by the receiver's contact secret; the receiver answers with its X25519
-ephemeral, an ML-KEM ciphertext, and a seal derived from both shared secrets. The caller
-then names itself; and only then does the receiver name itself.
+ephemeral, an ML-KEM ciphertext, and its signature over both, sealed under both shared
+secrets. The caller checks that signature against the key it dialed, and only then names
+itself.
 
 ```
-msg1  i→r   X25519 ephemeral + KEM pk + contact proof  — no identity
-msg2  r→i   X25519 ephemeral + KEM ct + hybrid proof  — no identity
+msg1  i→r   X25519 ephemeral + KEM pk + contact proof       — no identity
+msg2  r→i   X25519 ephemeral + KEM ct + sealed signature   — no identity
 msg3  i→r   the caller names itself
-msg4  r→i   the receiver answers, or does not
 ```
 
 Wire layout, exact widths, the key schedule and the constants are normative and live in
@@ -49,11 +49,13 @@ Wire layout, exact widths, the key schedule and the constants are normative and 
 
 ## 3. Identities travel under the hybrid ephemeral secrets
 
-Neither identity public key appears in cleartext. Both are sealed under keys derived from
-the ephemeral X25519 secret `ee` and the ephemeral ML-KEM secret. Both are erased once the
-session keys exist, so a node seized years later yields nothing from a recording of one.
+Neither identity public key appears in cleartext. The caller's is sealed under keys derived
+from the ephemeral X25519 secret `ee` and the ephemeral ML-KEM secret; the receiver's is
+never sent, since every caller dialed it, and its signature is sealed under the same keys.
+Both secrets are erased once the session keys exist, so a node seized years later yields
+nothing from a recording of one.
 
-This is why identities wait for the third and fourth messages rather than the first. At
+This is why the identity and signatures wait for the second and third messages. At
 msg1 the only key in existence is long-term, so anything sealed there is sealed under a key
 that lives for years — the property Noise names for its `IK` pattern and WireGuard
 documents as a known limitation: compromising a responder's private key plus a traffic log
@@ -68,44 +70,43 @@ so the post-quantum `0x03` landing did not change the address format (§11).
 
 ---
 
-## 4. The caller names itself first
+## 4. The receiver proves itself first
 
-The receiver learns who is calling before it says who it is. A caller that fails the peer
-lint (§6.3) is turned away without the receiver's identity or a signature by it. It has
-still learned, from msg2, that the holder of the contact secret it presented answers at that
-address. And the lint is the only thing the ordering serves: with no peer list, any caller
-can mint a throwaway identity, pass msg3 and read msg4.
+The caller names itself only to the receiver it meant. Every dial is pinned: the caller
+holds the receiver's key from the address it dialed, so msg2 carries a signature and no key,
+and the caller checks it before building msg3. Every peer the node has given its address to
+holds the contact secret and can answer msg1 as the node, but none can produce that
+signature, so an impostor draws msg1 and nothing more. This is SIGMA-I's order with the
+responder's identity left off the wire, and it grades the caller as `XX` does (§8.1).
 
-This is what the fourth message buys, and it is the one place this design leaves the
-standard patterns. No Noise pattern lets the responder check the initiator's identity before
-sending its own while keeping the initiator's identity forward-secret: where the responder
-transmits its static, it does so in message 2, and the one family that sends the initiator's
-static first, `IX`, sends it in the clear — or, as `IXpsk0`, under a key derived from the
-pre-shared key and public values alone, without forward secrecy.
+Someone must go first; that is not solvable, only assignable. Assigning it to the receiver
+costs the receiver little. With a contact secret, only secret holders reach msg2, and the
+secret travels in an address that already names the key. What msg2 gives away is a
+signature an anonymous caller can check against candidate keys, and an anonymous caller
+reaches msg2 only on an open node. A node that must be invisible to scanners sets a contact
+secret; that is what the secret is for (§6.1).
 
-Someone must name themselves first; that is not solvable, only assignable. Because both
-early messages carry a seal keyed by the contact secret, whoever goes first is exposed only
-to a party already holding the credential. Assigning it to the caller is what lets the
-receiver run its peer lint before revealing its identity. The caller pays for that: it names
-itself to anyone holding the contact secret — every peer the node has given its address to —
-before it can check who answered (§8.1).
+The peer lint (§6.3) runs at msg3, on the caller's verified identity. A caller it declines is
+closed rather than stalled: it verified the receiver at msg2, so silence would conceal
+nothing and only leave it sending into a link that never answers. What that caller sees is
+its link come up at msg2 and close at once — the caller authenticates first, as a TLS 1.3
+client does before the server has checked its certificate.
 
-The cost is one round trip per connection, and the property it buys holds only where a peer
-list is set.
+The caller's first records ride behind msg3, one round trip after msg1.
 
 ---
 
 ## 5. Refusals are silent
 
-Every refusal before the responder reveals its identity does nothing at all and lets the
-deadline expire, so an unauthorised caller cannot tell this node from any server that waits
+Every refusal before an identity is verified does nothing at all and lets the deadline
+expire, so an unauthorised caller cannot tell this node from any server that waits
 for its client to speak first. It can still tell it from a closed port, which refuses the
 connection, and the fixed deadline that ends the silence is itself observable. The framing
 layer refuses the same way: an over-cap length prefix or message is a refusal like any
 other, because almost every four random bytes declare more than the cap, and closing on
-sight would let them identify the node. After the initiator has revealed itself at msg3,
-its local msg4 peer-pin or peer-policy rejection may abort because there is no responder
-identity left to conceal.
+sight would let them identify the node. Two refusals close instead, because neither has
+anything left to hide: the caller's own at msg2 — a signature under a key it did not dial,
+or one its peer lint declines — and the receiver's peer lint at msg3 (§4).
 
 The alternative — closing on a bad message — answers a question. "I am a seedkernel node
 and that is not the key" is exactly the oracle §1 removes, and it is available to anyone
@@ -165,14 +166,11 @@ rotate, re-issue your address to your own peers, nothing else in the network mov
 
 **It is not what conceals the identities from an observer.** §3 does that, and against a
 passive observer an open node conceals just as well. Against an active prober it does not:
-an open node answers anyone's msg1, and without a peer list a throwaway identity then draws
-msg4, so its identity is one connection away (§8.1). What the secret adds: a stranger costs
-no asymmetric cryptography; the *caller's* identity is protected from an active attacker
-without the secret, since otherwise anyone answering at a dialed address collects it at
-msg3, and pinning the dialed identity cannot help because msg3 precedes msg4; and active
-probing draws silence, so "a node speaks this protocol here" stops being observable. The
-caller's protection reaches only as far as the secret does: anyone the node has given its
-address to can answer as it and collect msg3.
+an open node answers anyone's msg1, and msg2's signature can be checked against a list of
+candidate keys (§8.1). What the secret adds: a stranger costs no asymmetric cryptography;
+active probing draws silence, so "a node speaks this protocol here" stops being observable;
+and msg2's signature reaches only parties whose address already names the key. The caller's
+identity does not depend on it: msg3 goes only to a receiver that proved the dialed key (§4).
 
 **Why a secret rather than a published key.** Gating msg1 on a long-term public key is
 WireGuard's `mac1` and Noise's `XK`, and it is weaker on both counts Noise names: the value
@@ -212,7 +210,12 @@ network through its signed root, so network separation trusts the transport (§1
 A filter on an unproven key that refuses visibly is a membership oracle: name any key, watch
 whether the response differs, and read the list off a node without holding a single private
 key. On a list that tracks a social graph, that is the graph. So the check sees only
-identities whose signature has verified, and refuses by silence.
+identities whose signature has verified. It may then refuse by closing (§4): a caller that
+reached it has signed as the key it names, so the answer is only ever "would you talk to
+*me*", never "would you talk to P".
+
+It controls admission, not concealment. A node whose key must stay unconfirmable to
+scanners sets a contact secret; the list does not need one to do its own job.
 
 It is optional and empty by default. Revocation is key rotation — a node dropping a peer
 rotates its contact secret, a network splitting rotates its network key — so the list is a
@@ -285,25 +288,23 @@ Noise scores each side's static key 0–9. This design places as:
 
 | | Initiator | Responder |
 | --- | --- | --- |
-| **Open** (no contact secret) | **2** — *"sent to an anonymous responder"* | **1** — *"can be probed by an anonymous initiator"*; withheld from unlisted callers with a peer list |
-| **With a contact secret** | **2** against anyone holding the secret; beyond them, not transmitted | **1** against anyone holding the secret; withheld from unlisted callers with a peer list |
+| **Open** (no contact secret) | **8** — *"encrypted with forward secrecy to an authenticated party"* | not transmitted; an anonymous initiator can check candidates against msg2's signature |
+| **With a contact secret** | **8** | not transmitted; the signature reaches only secret holders, whose address already names the key |
 
 A holder of the contact secret is not an authenticated party in Noise's sense: the secret
 travels in the node's address, so it is shared by every peer the node has given that
-address to, and any of them can answer as the node. The secret moves the initiator from
-**2** to out of reach only for everyone else (§6.1).
+address to, and any of them can answer msg1 as the node. None of them can produce msg2's
+signature, which is why the initiator's grade does not depend on the secret.
 
-The responder's static is withheld only with a peer list, and that property has no Noise
-number because no Noise pattern withholds the responder's static until a forward-secret
-initiator has authenticated (§4). Without a list, a throwaway identity passes msg3 and the
-responder grades like `XX`'s. Even with one, a caller holding the address already knows the
-responder's key; what withholding msg4 denies it is confirmation, and msg2 already confirms
-that the secret's owner answers there.
+The open responder falls between Noise's **1** and **3**. Its static is never transmitted, so
+a passive observer learns nothing, but an active anonymous initiator draws a signature it can
+test candidate keys against — the `XK` weakness, reached by probing rather than by
+eavesdropping.
 
-For comparison, the two nearest standard patterns: `XX` grades the initiator **8**,
-*"encrypted with forward secrecy to an authenticated party"*, and the responder **1**; `XK`
-grades the responder **3**, not transmitted but with candidates checkable and replays
-linkable — a replay property msg1 shares (§9).
+For comparison, the two nearest standard patterns: `XX` grades the initiator **8** and
+transmits the responder's static in message 2 (**1**); `XK` grades the responder **3**, not
+transmitted but with candidates checkable and replays linkable — a replay property msg1
+shares (§9).
 
 ### 8.2 Why not Noise itself
 
@@ -315,8 +316,9 @@ Three reasons, in order of weight.
    static inside the handshake payload. `XX` statics travel in the handshake, so addresses
    would not change; the cost is a second key per node and a signature binding it to the
    identity.
-2. **No standard pattern gives the ordering in §4**, and that ordering pays only where a
-   peer list is set (§8.1).
+2. **The pinned dial is pre-knowledge of a signing key.** Noise's pre-message patterns
+   (`XK`, `NK`, `IK`) pre-share the responder's static as a DH key; with a signing
+   identity the nearest fit is `XX`, which transmits the static the caller already holds.
 3. **Hybrid key establishment is not standard Noise.** ML-KEM enters Noise only through the
    draft HFS extension (`e1`/`ekem1`) or PQNoise's KEM patterns, with few implementations to
    test against.
@@ -381,11 +383,12 @@ that node. Only §3's deferral limits the *retroactive* damage.
 ## 10. Invariants worth a named test
 
 1. A node never transmits anything before opening the caller's msg1.
-2. A wrong contact secret, a declined identity, an over-cap frame and silence are mutually
+2. A wrong contact secret, a malformed message, an over-cap frame and silence are mutually
    indistinguishable.
 3. Neither identity appears in cleartext anywhere on the wire.
 4. msg1 contains no identity, so a recording plus a later key seizure reveals none.
-5. The receiver's identity does not go out to a caller it then declines.
+5. The receiver's key never goes on the wire, and the caller's goes only to a receiver that
+   proved the dialed key.
 6. Neither the contact secret nor the network key appears on the wire.
 7. Honest transports on different network keys never link.
 8. Subkey derivation is deterministic: a node rebuilds its identity from the seed alone.
@@ -403,17 +406,14 @@ All but 15 are covered by `tests/transport-link.test.mjs` and
 through the real host stack, over an instrumented in-process channel — rather than against
 a library object a test could hold.
 
-**Where 5 lives, and why it is easy to lose.** The peer list is *configuration*, shipped to
-the occupant at init and applied by it — a LINT rather than a gate, since a host checking a
-key supplied by a malicious occupant cannot establish authentic attribution. What matters is
-the *order*, and the invariant is entirely about order. The gate is asked
-at the first point the peer is known and before this end has revealed anything about itself:
-`onMsg3` when accepting, `onMsg4` when dialing. Asking it from `becomeAuthed()` instead
-would be one message too late on the accepting side, because that is reached only after
-msg4 — the receiver's identity and signature — is already on the wire. A concealed refusal
-is also silence rather than a close: closing at msg3 would answer the same question the
-ordering exists to leave unanswered. The lint takes a `conceal` flag for exactly that
-distinction.
+**Where 5 lives, and why it is easy to lose.** The receiver's half is structural: msg2 has
+no field for its key. The caller's half is one check in `onMsg2`: the signature is verified
+against `dialedPeerId` before msg3 is built, and a dial pinned to the node's own key is
+refused there too. Moving that check after the `wire(w3)` call, or verifying against a key
+the message itself supplies, loses the invariant silently — every honest handshake still
+succeeds. The self-dial and impostor tests pin it. The peer list is *configuration*, shipped
+to the occupant at init and applied by it — a LINT rather than a gate, since a host checking
+a key supplied by a malicious occupant cannot establish authentic attribution.
 
 ---
 
@@ -424,33 +424,33 @@ module, reached under the bare name `mlkem` through the same private module map 
 `ws.wasm`. It adds no host transform name, native KEM bridge or separately embedded host
 artifact. The generic module ABI is pinned to 40 NIST ACVP cases.
 
-The message widths are derived in one place from named field lengths (`M1_LEN`…`M4_LEN`,
+The message widths are derived in one place from named field lengths (`M1_LEN`…`M3_LEN`,
 `transport/src/ake.js`); the host never sees a handshake width. The key schedule takes a
 *list* of shared secrets, so a KEM secret joins it rather than displacing anything. And
 because the handshake publishes no long-term DH key, **a KEM never enters an address** —
 addresses use `pk[.secret]@host:port`.
 
 Msg1 carries the initiator's ML-KEM-768 encapsulation key and msg2 the responder's
-ciphertext: exactly 1,265 and 1,168 bytes.
+ciphertext with the receiver's signature: exactly 1,233 and 1,200 bytes.
 Session keys derive from the X25519 and KEM secrets both — hybrid, so the classical half
 stays load-bearing while the PQ half is young. The worry that hybrid costs a round trip
-belongs to a symmetric two-message layout; this one has four messages with explicit roles,
-so the responder encapsulates at exactly the point it is already generating an ephemeral of
-its own. Still four messages, still 1.5 RTT to the responder's authentication and 2 to the
-initiator's, one encapsulation and one decapsulation per link.
+belongs to a symmetric two-message layout; this one has explicit roles, so the responder
+encapsulates at exactly the point it is already generating an ephemeral of its own. Still
+three messages: 1 RTT to the initiator's authentication of the responder, 1.5 to the
+responder's of the initiator, one encapsulation and one decapsulation per link.
 
 **Where the KEM secret enters is the part that is quiet when wrong.** It is appended to the
 schedule's ordered list, never XOR-ed into `ee` and never substituted for it. Msg2's seal
 key is the first key available to both endpoints after encapsulation/decapsulation, and it
-already derives from `[ee, kemSecret]`; msg3, msg4 and both session directions inherit the
-same pair. The transcript chains complete messages, binding both the encapsulation key and
+already derives from `[ee, kemSecret]`; msg3 and both session directions inherit the same
+pair. The transcript chains complete messages, binding both the encapsulation key and
 ciphertext.
 
 **What must not change.** The transcript chain, the signature preimages, the contact-secret
 and network-key mixes, the silence discipline, the address format, the record layer, and the
 invariant that the bytes a node sends are the bytes it folds into the transcript.
 
-**The DoS interaction.** A refused connection is held to its deadline, and msg1 is 1,265
+**The DoS interaction.** A refused connection is held to its deadline, and msg1 is 1,233
 bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
 both PQ widths with room while bounding a stranger to that cap times the unverified budget.
 `MAX_QUEUE_BYTES` is unaffected: it bounds queued application frames, not the handshake.

@@ -336,20 +336,19 @@ Everything in this section is the **shipped transport bundle's guest program** (
 #### Framing
 
 - Node↔node over TCP: a length prefix. Browser↔node: RFC 6455 in `ws.wasm` over the same TCP socket. Platform `WebSocket` and `RTCDataChannel`: whole messages as delivered.
-- Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and `maxFrameBytes` (`MAX_FRAME_BYTES` by default) after. `raiseCap()` lands once msg4's step has run; until then framers take one message at a time.
+- Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and `maxFrameBytes` (`MAX_FRAME_BYTES` by default) after. `raiseCap()` lands once the authenticating step (msg2 dialing, msg3 accepting) has run; until then framers take one message at a time.
 - `ByteParts` merges slices below 8 KiB (`MERGE_BELOW`) into a doubling tail buffer and keeps larger slices as they arrived. The WebSocket framer serializes `push`.
 
 #### Handshake
 
-Four messages, then records. A message is a bare body — no type byte.
+Three messages, then records. A message is a bare body — no type byte.
 
 ```
 msg1  i→r   [suite: 1][eph_i: 32][kem_pk_i: 1184]
-             [seal(k_probe; nonce_i: 32): 48]               1,265 B  contact proof, no identity
+             [seal(k_probe; ∅): 16]                         1,233 B  contact proof, no identity
 msg2  r→i   [eph_r: 32][kem_ct: 1088]
-             [seal(k2; nonce_r: 32): 48]                    1,168 B  hybrid reply, no identity
+             [seal(k2; sig_r: 64): 80]                      1,200 B  hybrid reply, signed, no identity
 msg3  i→r   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]             112 B  the caller names itself
-msg4  r→i   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]             112 B  the receiver answers, or not
 FRAME       [AEAD record ..]                                          only after authentication
 ```
 
@@ -359,26 +358,25 @@ k_probe = KDF(contact, H(root ‖ suite ‖ eph_i ‖ kem_pk_i), LABEL_probe)
 h1      = H(root ‖ msg1)
 ee      = X25519(eph_i_sk, eph_r) = X25519(eph_r_sk, eph_i)
 pq      = ML-KEM-768.Decaps(kem_sk_i, kem_ct) = ML-KEM-768.Encaps(kem_pk_i).shared_secret
-k2      = KDF(ee ‖ pq ‖ contact, h1, LABEL_msg2)
+hs      = H(h1 ‖ eph_r ‖ kem_ct)
+sig_r   = Sign(DOMAIN_channel ‖ root ‖ hs ‖ id_r)
+k2      = KDF(ee ‖ pq ‖ contact, hs, LABEL_msg2)
 h2      = H(h1 ‖ msg2)
 k3      = KDF(ee ‖ pq ‖ contact, h2, LABEL_msg3)
 sig_i   = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
 h3      = H(h2 ‖ msg3)
-k4      = KDF(ee ‖ pq ‖ contact, h3, LABEL_msg4)
-sig_r   = Sign(DOMAIN_channel ‖ root ‖ h3 ‖ id_r)
-h4      = H(h3 ‖ msg4)
-k_i2r, k_r2i = KDF(ee ‖ pq ‖ contact, h4, "…i->r-v1\0" / "…r->i-v1\0")
+k_i2r, k_r2i = KDF(ee ‖ pq ‖ contact, h3, "…i->r-v1\0" / "…r->i-v1\0")
 
 Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   — node/sign; the prefix is the host's
 ```
 
-- **Parsing is by state.** The initiator reads msg2 then msg4, the responder msg1 then msg3, and everything after authentication is a record. Each handshake message is accepted only at its exact width.
+- **Parsing is by state.** The initiator reads msg2, the responder msg1 then msg3, and everything after authentication is a record. Each handshake message is accepted only at its exact width.
 - **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret and network key are KDF inputs.
 - **Suite `0x03`** is the only suite: Ed25519 identity, ephemeral X25519 + ML-KEM-768, contact secret, ChaCha20-Poly1305 records. An unrecognised id draws silence. There is no list, fallback or negotiation. `suite` is folded into `h1`, so both signatures cover it.
-- **Ordering.** An accepting node sends nothing until a msg1 opens under its contact secret. The caller names itself at msg3; the receiver names itself at msg4 only if it accepts the caller.
-- **Signatures** cover `DOMAIN_channel ‖ root ‖ transcript ‖ own id` under the host's `DOMAIN_link_scope`; the transcript chains the suite, both ephemerals, the KEM key and ciphertext, and both nonces. The responder authenticates the initiator at msg3 (1.5 RTT), the initiator the responder at msg4 (2 RTT).
-- **A dial pins its peer.** If msg4 presents a different key than the one dialed, the link closes before the dial counts as live.
-- **Refusals are silent.** Before revealing itself, a responder refuses — wrong contact secret, wrong network, malformed message, bad signature, a caller the peer lint declines at msg3 — by doing nothing until the deadline. An initiator's identity-mismatch or peer-lint rejection at msg4 aborts.
+- **A dial pins its peer, and the receiver's key never travels.** `sig_r` is checked against the key the caller dialed; `id_r` is in the signed message but not on the wire. A signature under any other key — including the caller's own — closes the link before the caller names itself.
+- **Ordering.** An accepting node sends nothing until a msg1 opens under its contact secret. The receiver proves itself at msg2; the caller names itself at msg3, only to a receiver it has verified.
+- **Signatures** cover `DOMAIN_channel ‖ root ‖ transcript ‖ own id` under the host's `DOMAIN_link_scope`; `sig_r`'s transcript chains the suite, both ephemerals, the KEM key and ciphertext, and `sig_i`'s all of msg2 besides. The initiator authenticates the responder at msg2 (1 RTT) and sends its first records behind msg3; the responder authenticates the initiator at msg3 (1.5 RTT).
+- **Refusals before msg3 are silent.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until the deadline. A caller the peer lint declines at msg3 is closed at once: it has verified the receiver, so silence would conceal nothing. An initiator's rejection at msg2 — a bad signature, its own key, the peer lint — closes.
 - **Pre-auth sends** are queued oldest-dropped under both `MAX_QUEUE_BYTES` and `maxPreAuthQueueSlices`. When the link goes before authenticating — a dial that dies, or the loser of the double-connect tie-break (the link the smaller identity dialed is kept) — the queue passes to another link to the same peer.
 
 #### 12.6.1 Records and link teardown
@@ -430,7 +428,7 @@ A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` deriv
 | --- | --- | --- | --- |
 | **Contact secret** | per node | yes | A caller that cannot produce the receiver's secret draws no response. Distributed with the node's address. Absent (32 zero bytes), the node is open. Mixed at msg1 with the initiator's ephemeral and into every later key. |
 | **Network key** | per deployment | **no, public** | Seeds the transcript root, so every key and signature preimage differs between networks and a cross-network handshake fails at msg1. Isolation, not access control. |
-| **`admitPeers`** | per node | n/a | Optional peer list, applied as a lint to signature-verified identities only — at msg3 when accepting, msg4 when dialing — refusing by silence. Empty by default in the signed `APP`; overridable in `LOCAL`. |
+| **`admitPeers`** | per node | n/a | Optional peer list, applied as a lint to signature-verified identities only — at msg3 when accepting, closing the link, and at msg2 when dialing. It controls admission, not concealment: to stay invisible to scanners, set a contact secret. Empty by default in the signed `APP`; overridable in `LOCAL`. |
 
 The transport enforces all three; a malicious transport can bypass the lint or fabricate attribution (§14). Revocation is key rotation: rotate a contact secret to drop a peer, a network key to split a network.
 
