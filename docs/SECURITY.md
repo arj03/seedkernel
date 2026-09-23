@@ -1,8 +1,8 @@
-# Seed kernel — Security
+# Seedkernel — Security
 
 *A worked example of a message arriving at a node, then the trust model, the load-bearing invariants, and the channel AKE, collected in one place.*
 
-> **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
+> **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
 > [README](../README.md) §1 · [PROTOCOL](PROTOCOL.md) §2–§5, §16 · [RUNTIME](RUNTIME.md) §10–§12 · **SECURITY §13–§14**
 
@@ -56,7 +56,7 @@ The transport is replaceable signed content and remains in the trusted computing
 2. **It cannot be delivered as a module at the endpoints** — the manifest verifier is the canonical example, because it cannot be admitted through the format it verifies.
 3. **It is a migration the host itself must call.** Provisioning a transform merely so some future bundle can utter its name does not qualify.
 
-A pure function of bytes the guest already holds is computation, not a grant, and belongs at the endpoint unless the endpoint cannot implement it correctly. Raw Ed25519 verification remains on `SeamCrypto` because the host calls it for scoped `node/verify`; it is not a second guest-visible name. Seed store reaches `HOST_TRANSFORM_NAMES` only for hashing and record encryption, and uses scoped `node/verify` for signatures; the transport carries ML-KEM in its own `mlkem` module. The host-transform table is not a primitive catalog or a promise that more algorithms will be provisioned there.
+A pure function of bytes the guest already holds is computation, not a grant, and belongs at the endpoint unless the endpoint cannot implement it correctly. Raw Ed25519 verification remains on `SeamCrypto` because the host calls it for scoped `node/verify`; it is not a second guest-visible name. Seedstore reaches `HOST_TRANSFORM_NAMES` only for hashing and record encryption, and uses scoped `node/verify` for signatures; the transport carries ML-KEM in its own `mlkem` module. The host-transform table is not a primitive catalog or a promise that more algorithms will be provisioned there.
 
 **The same test is why the residual table does not shrink further.** It gates additions; read backwards as a removal mandate it would trade tested primitives for vendored ones to delete a name. `blake2b-256` is test 1 outright — the host hashes bundles, derives author ids and subkeys with it, and it is the one system hash — so the guest name is a second caller of code the TCB carries regardless; on the native target it is additionally a Go primitive on the storage hot path. `chacha20poly1305-ietf/{seal,open}` is the channel's per-frame record layer, not a twice-per-handshake step like ML-KEM, so relocating it buys a scratch copy per record against a library the host already links. `x25519/dh` is the one name that fails the test on its merits, but no X25519 exists in the vendored PQ trees (`WASM/pq`), so dropping it means vendoring a second, unreviewed, handshake-critical implementation; the libsodium core is 217 KB with or without it. And **a bundle module cannot borrow the host's copy**: a module runs in its own isolate under exactly three imports — `abort`, `seed`, `trace` (`host/module-table.ts`) — and reaching libsodium would mean exporting the linear memory that holds the node secret key on every `node/sign`. The seam is that import in its safe form. The honest remaining win is narrowing what the host's `loadCrypto` *publishes*, which is an export surface, not this ABI.
 

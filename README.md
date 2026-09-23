@@ -1,4 +1,4 @@
-# Seed kernel: a sandboxed app runtime that grows from signed bundles
+# Seedkernel: a sandboxed app runtime that grows from signed bundles
 
 Seedkernel runs signed apps in a sandbox (JavaScript or WebAssembly) across browsers, Node and a small native executable. It gives an app controlled access to storage and to authenticated, encrypted peer connections. Every app, the transport included, arrives as a signed bundle on top of a minimal host.
 
@@ -6,7 +6,7 @@ That suits three kinds of work:
 
 - **Hosting third-party extensions.** The operator controls which authors can install code and what each extension can access. Extensions run in isolated slots without direct access to the host's file system, sockets or process.
 - **Distributing app updates as signed bundles.** A release is one blob — manifest, guest and modules under hybrid author signatures — verified at admission, checked against a version floor, and landed as one atomic slot commit. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
-- **Building peer applications on a shared runtime.** [seed store](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
+- **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
 
 **Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand — neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
 
@@ -18,7 +18,7 @@ That suits three kinds of work:
 
 ## Status
 
-Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seed store](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles. There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Treat the security properties as design intent, not as verified.
+Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles. There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Treat the security properties as design intent, not as verified.
 
 ## What runs today
 
@@ -27,7 +27,7 @@ Beta: it works, on all three targets, and everything measured below was measured
 - **Bundles are sandboxed on every target.** Modules receive no I/O at all. A guest can access only the host services and local calls declared in its signed manifest, its private modules, and a fixed set of host transforms. The module bound has a measured cost on each target ([the overhead, measured](#the-overhead-measured)).
 - **Confinement has workload-dependent overhead.** The measured storage workload encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and reads back at ~2.6 GiB/s. Its tested network configurations were limited by transfer rate and latency ([the overhead, measured](#the-overhead-measured)).
 - **Network buffers have explicit limits.** Socket write backlogs, reads waiting on a busy guest, and queued signaling messages are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it drops signaling messages or closes the affected link ([every host-side byte has an owner](#the-shape-of-it)).
-- **Code really does arrive only as a bundle.** Even the transport is one, so that it can be upgraded: it opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)). The chat demo installs its whole UI and logic at runtime, and so does [seed store](https://github.com/arj03/seedstore), a real high performance storage layer.
+- **Code really does arrive only as a bundle.** Even the transport is one, so that it can be upgraded: it opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)). The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
 - **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
 - **Channels combine hybrid key establishment with Ed25519 authentication.** X25519 + ML-KEM-768 protects recorded traffic under the hybrid scheme's assumptions. Breaking Ed25519 later does not reveal earlier session keys, but peer authentication must be upgraded before attackers can forge live handshakes. That requires updating the host's signing interface and the transport bundle. The runtime's `node/sign` operation also remains Ed25519; long-lived signed app records need separate consideration ([security limits](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)).
 
@@ -140,7 +140,7 @@ All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, i
 
 ## The overhead, measured
 
-The [seed store](https://github.com/arj03/seedstore) measurements below describe specific workloads, not a general throughput guarantee. Confinement itself costs a per-call worker hop on the JS targets and inline deadline checks on native, measured in §14. The fixed hop can dominate small transforms; larger calls amortize it, and transfer rate and latency dominated the network configurations measured below:
+The [seedstore](https://github.com/arj03/seedstore) measurements below describe specific workloads, not a general throughput guarantee. Confinement itself costs a per-call worker hop on the JS targets and inline deadline checks on native, measured in §14. The fixed hop can dominate small transforms; larger calls amortize it, and transfer rate and latency dominated the network configurations measured below:
 
 - **The compute-only write pipeline — encrypt, name every block, RS-encode — measured 177–189 MiB/s** in three runs on 2026-09-17 (100 MiB, RS(10,6), 64 KiB blocks, Node 20.11.1). ChaCha20-Poly1305 sealing measured 393–395 MiB/s, author-bound BLAKE2b block IDs 720–733 MiB/s, and SIMD RS encode 1,447–1,482 MiB/s. This benchmark calls host crypto and the codec directly; it does not measure guest scheduling, signing, storage, or transport overhead.
 - **A read with every block present needs no GF(2⁸) work:** the compute benchmark's concatenation measured 2,339–2,926 MiB/s; reconstructing one missing block measured 1,465–1,682 MiB/s in those runs. These are component measurements, not complete GET rates.
@@ -156,7 +156,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seed store also points at — and its host seam carries only opaque encoded strings, never JavaScript message objects.
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seedstore also points at — and its host seam carries only opaque encoded strings, never JavaScript message objects.
 
 ## The rest of the spec
 

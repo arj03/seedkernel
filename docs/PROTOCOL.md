@@ -1,8 +1,8 @@
-# Seed kernel — Protocol
+# Seedkernel — Protocol
 
 *The message model, bundle slots, the restartable WASM module ABI, and names. §16 collects the protocol constants.*
 
-> **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
+> **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
 > [README](../README.md) §1 · **PROTOCOL §2–§5, §16** · [RUNTIME](RUNTIME.md) §10–§12 · [SECURITY](SECURITY.md) §13–§14
 

@@ -1,8 +1,8 @@
-# Seed kernel — Runtime
+# Seedkernel — Runtime
 
 *The runtime as an app host: performance, the chat demo, and the host's normative surface — host services, the guest-seam ABI, zero-authority JS realms, signed bundles, admission, the node↔node transport, the targets and routing.*
 
-> **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
+> **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
 > [README](../README.md) §1 · [PROTOCOL](PROTOCOL.md) §2–§5, §16 · **RUNTIME §10–§12** · [SECURITY](SECURITY.md) §13–§14
 >
@@ -20,7 +20,7 @@ The message path does **no asymmetric cryptography and no recursion**: routing a
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6).
 - **Per bundle load:** one BLAKE2b-256 hash of the body and verification of both Ed25519 and ML-DSA-65 signatures (§12.4).
 
-The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (§12.9); `npm test` from `WASM/` exercises them end-to-end on the JS target, and seed store's `WASM/tests/bench.mjs` measures storage throughput.
+The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (§12.9); `npm test` from `WASM/` exercises them end-to-end on the JS target, and seedstore's `WASM/tests/bench.mjs` measures storage throughput.
 
 ### 10.2 Distribution Size
 
@@ -60,7 +60,7 @@ To run it: `npm run build:browser` here, then follow seedchat's build steps (`np
 
 ## 12. The runtime as an app host: host services and signed bundles
 
-The host knows nothing about chat or storage: it offers a fixed, generic surface, verifies a bundle against a policy, and becomes whatever the bundle is. [seed store](https://github.com/arj03/seedstore) is the worked example: a peer-to-peer storage node is the host plus a signed bundle.
+The host knows nothing about chat or storage: it offers a fixed, generic surface, verifies a bundle against a policy, and becomes whatever the bundle is. [seedstore](https://github.com/arj03/seedstore) is the worked example: a peer-to-peer storage node is the host plus a signed bundle.
 
 ### 12.1 Host services: raw-byte backends
 
@@ -445,7 +445,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - **Signaling only.** Peers connect directly; the app-neutral [`seedrelay`](https://github.com/arj03/seedrelay) server is the SDP/ICE rendezvous and can be killed once channels are open. The `Signaling` seam is pluggable and carries one opaque encoded string each way; the compact NUL-separated frame is decoded once inside `RtcNetwork`, before policy or allocation. Signaling carries no SDP-fingerprint signature and no credential.
 - **One ordered binary channel per peer.** Its `Arrival` carries `dialed` on the side signaling chose to initiate, and no listener. An RTC link opens under the node's own contact secret.
 - **Bounds.** `MAX_SDP_BYTES` (worst-case UTF-16 storage) is charged at the signaling boundary before policy runs; an oversized description is dropped. Candidates queued before a remote description are normalized to the four standard scalar fields and capped per peer; crossing a cap tears the speculative peer down. A peer connection that does not reach `connected` with a bound data channel within 30 s is closed (§12.6).
-- **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. seedstore's `scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
+- **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. Seedstore's `scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
 - DTLS on the data channel is a second, redundant encryption layer.
 
 ### 12.8 The shell: node assembly and the CLI
@@ -470,7 +470,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 - **`--peers`** becomes `transport.config.peers` on the automatic transport load; a malformed reference fails before anything listens. Once up, the CLI waits for the cohort through `Shell.call` on the transport's service id; `null` means no transport is installed.
 - **`--op name`** invokes the app `--bundle` just loaded, through that load's handle: stdin is the argument, stdout the response, framed as `[opLen u8][op][args]`. Logs go to stderr on both targets.
 
-**The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. seed store's WASM README has a complete storage walkthrough.
+**The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
 
 ### 12.9 The native binary — the primary non-browser deployment
 

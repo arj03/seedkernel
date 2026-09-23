@@ -1,4 +1,4 @@
-# Seed kernel — Design rationale
+# Seedkernel — Design rationale
 
 *Why the runtime is shaped the way it is.*
 
