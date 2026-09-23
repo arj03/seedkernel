@@ -1,4 +1,4 @@
-# qjs — in-repo QuickJS bridge
+# qjs: in-repo QuickJS bridge
 
 A thin Go↔wazero bridge to the **quickjs-ng** engine: objects, strings,
 ArrayBuffers, function callbacks, eval, invoke and the job queue — the synchronous

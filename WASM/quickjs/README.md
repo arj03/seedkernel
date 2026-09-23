@@ -1,4 +1,4 @@
-# quickjs — in-repo quickjs-ng (emscripten) engine for the JS targets
+# quickjs: in-repo quickjs-ng (emscripten) engine for the JS targets
 
 The engine the node-side confined realms run on (`safe-js.ts`), compiled to
 emscripten WASM from the same quickjs-ng v0.16.2 source the native binary

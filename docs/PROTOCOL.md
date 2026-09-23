@@ -1,4 +1,4 @@
-# Seedkernel — Protocol
+# seedkernel: protocol
 
 *The message model, bundle slots, the restartable WASM module ABI, and names. §16 collects the protocol constants.*
 
@@ -79,7 +79,7 @@ For AssemblyScript that requirement is one build flag, `--maximumMemory` (in pag
 
 Memory outside the scratch region is the module's private state — statics, globals, whatever allocator it wants for its own bookkeeping — but none of it is durable: a deadline kill discards the instance and respawns a fresh one (§4.3), so that memory is scratch or cache, never the system of record. Anything that must survive a respawn belongs in the guest or the filesystem, not module memory.
 
-### 4.2 No host imports — the isolation boundary
+### 4.2 No host imports: the isolation boundary
 
 A module imports **nothing from the runtime** — no host seam, no host functions. The only imports it carries are its own language runtime's shims (for AssemblyScript, `env.abort` / `seed` / `trace`), which are not a route to the outside world.
 

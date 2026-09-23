@@ -1,4 +1,4 @@
-# Seedkernel — Runtime
+# seedkernel: runtime
 
 *The runtime as an app host: performance, the chat demo, and the host's normative surface — host services, the guest-seam ABI, zero-authority JS realms, signed bundles, admission, the node↔node transport, the targets and routing.*
 
@@ -472,7 +472,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 
 **The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
 
-### 12.9 The native binary — the primary non-browser deployment
+### 12.9 The native binary: the primary non-browser deployment
 
 The Go/native target (`native/`) is the recommended non-browser deployment: one cgo-free binary, `seedkernel`, with no Node, Bun or separate JS engine.
 
@@ -492,7 +492,7 @@ seedkernel --policy ./allowed-keys.json --dir ./data --key ./node.key \
 
 Benchmarks: `wsl bash gorun.sh test -run x -bench . -benchmem ./...` from `native/`; `node tests/bench-module-call.mjs` from `WASM/` for the JS module-call hop.
 
-### 12.10 Protocol routing — which app handles a message
+### 12.10 Protocol routing: which app handles a message
 
 A frame names a **protocol id**, never an app, author or module. Each installed slot claims names from its signed manifest; the host keeps three books, all projections of the installed set, recomputed at every commit and removal and never persisted:
 

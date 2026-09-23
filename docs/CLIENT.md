@@ -1,4 +1,4 @@
-# Writing bundles and clients on Seedkernel
+# seedkernel: writing bundles and clients
 
 An app starts with a plain JavaScript function, `handle(bytes)`, running in a confined guest. WASM modules are optional: add them for computation the guest should delegate. A build script signs the guest and its modules into a bundle; a host program loads that bundle and connects it to a CLI, browser UI, or peers.
 
@@ -131,7 +131,7 @@ Execution is serialized per realm and bounded. Long work must fit the deployment
 
 The authoring module also carries the lower-level signing and packing primitives. They stay exported for hardening tests and for a consumer that deliberately forges or tampers with a bundle to prove the verifier rejects it — not a path a client should take. Author with `authorBundle`, verify with `verifyBundle`. Runtime shells import only `./bundle`, which has no signing surface.
 
-## 2. Runtime — boot a node and drive the host
+## 2. Runtime: boot a node and drive the host
 
 `bootShell` is the one shared node assembly (§12.9). Browser and custom-platform clients call it directly; Node clients may use `bootNodeShell`, the convenience wrapper that supplies Node's adapters and then enters the same assembly.
 
@@ -172,7 +172,7 @@ try {
 }
 ```
 
-## 3. Platform adapters — the target-specific pieces you choose and hand to §2
+## 3. Platform adapters: the target-specific pieces you choose and hand to §2
 
 A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node-fs), not internals leaking out.
 

@@ -1,4 +1,4 @@
-# Seedkernel — Security
+# seedkernel: security
 
 *A worked example of a message arriving at a node, then the trust model, the load-bearing invariants, and the channel AKE, collected in one place.*
 

@@ -1,4 +1,4 @@
-# Seedkernel — Design rationale
+# seedkernel: design rationale
 
 *Why the runtime is shaped the way it is.*
 
@@ -142,7 +142,7 @@
 
 **`--contact-secret` is a file** because an argument is visible in `ps` output and shell history.
 
-## 12.9 The native binary — the primary non-browser deployment
+## 12.9 The native binary: the primary non-browser deployment
 
 **A platform target, not a reimplementation.** Go grows with primitives, never with logic: protocol is never re-derived in a second language, and verification, admission, scope derivation, freshness and routing each have one implementation to audit. The generated bundle makes a missed target change a compile error. Both QuickJS builds come from one pin, so a behavioural difference between targets is a build difference, not a version difference.
 
@@ -152,7 +152,7 @@
 
 **Minification is a second `tsc` pass**, not a bundler: no new dependency, and the compiler is the one tool on hand that can tell a regex literal from a division, so nothing hand-written lexes the host.
 
-## 12.10 Protocol routing — which app handles a message
+## 12.10 Protocol routing: which app handles a message
 
 **A frame names a protocol, not an app.** Apps, authors and modules are node-local; a wire that named them would make every peer's install choices everyone else's business. A peer states only the protocol, and the receiver's installed claims decide which verified code answers.
 
