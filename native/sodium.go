@@ -2,7 +2,7 @@
 // over wazero, so this file is the FFI seam over the emscripten ABI plus a `sodium` object
 // carrying libsodium-wrappers method names — the shared host JS calls `sodium.*` unchanged
 // and a Go node's output is byte-identical to a Bun node's. Under the native fast-path
-// rule (§12.9), genericHash (BLAKE2b-256, pinned by TestSodiumGenericHash — the one hash
+// rule (§12.9), genericHash (BLAKE2b, pinned by TestSodiumGenericHash — the one hash
 // wazero runs slower than V8) and the ChaCha20-Poly1305-IETF record layer (RFC 8439,
 // pinned by TestSodiumAead from this build's own binary; ~8× faster, no scratch lock) run
 // on native Go. Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm: a verifier's
@@ -231,17 +231,22 @@ func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 
 // ───────────────────────── the crypto ops ─────────────────────────
 
-// genericHash is native Go BLAKE2b (see the file header) and the one system hash: the
-// content-address block-id, the guest `HASH` op and the host's genesis hash (§12.4) all
-// route here. This build computes only the UNKEYED 32-byte digest; any other length is
-// rejected loudly, because a quietly-wrong consensus-affecting hash is worse than a hard
-// failure. (Keyed hashing is rejected at the JS seam, where the key would be dropped.)
-func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
-	if outLen != 32 {
-		panic(fmt.Sprintf("genericHash: native blake2b is 32-byte-only in this build, got %d", outLen))
+// genericHash is native Go BLAKE2b (see the file header): the one system hash — the
+// content-address block-id and the host's genesis hash (§12.4) — and the guest's
+// `crypto/blake2b` over RFC 7693's whole interface, output 1..64 bytes, keyed or not, as
+// libsodium's crypto_generichash takes it. The seam checks the ranges before a guest's
+// call gets here, so an out-of-range argument is an invariant violation and panics.
+func (s *libsodium) genericHash(outLen int, msg, key []byte) []byte {
+	if outLen == 32 && len(key) == 0 {
+		sum := blake2b.Sum256(msg)
+		return sum[:]
 	}
-	sum := blake2b.Sum256(msg)
-	return sum[:]
+	h, err := blake2b.New(outLen, key)
+	if err != nil {
+		panic(fmt.Sprintf("genericHash: %v", err))
+	}
+	h.Write(msg)
+	return h.Sum(nil)
 }
 
 func (s *libsodium) signDetached(msg, sk []byte) []byte {
@@ -316,29 +321,29 @@ func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	return s.read(q, 32), true
 }
 
-// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, no AAD; the result
-// is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header). npub/key are
-// locally derived, so New/Seal can only fail on an invariant violation — panic, like the
-// other primitives. No wasm scratch means no lock: per-connection goroutines seal
-// concurrently.
-func (s *libsodium) aeadEncrypt(msg, npub, key []byte) []byte {
+// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, binding ad (nil for
+// none); the result is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header).
+// The seam frames npub and key to their widths, so New/Seal can only fail on an invariant
+// violation — panic, like the other primitives. No wasm scratch means no lock:
+// per-connection goroutines seal concurrently.
+func (s *libsodium) aeadEncrypt(msg, ad, npub, key []byte) []byte {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
 	}
-	return aead.Seal(nil, npub, msg, nil)
+	return aead.Seal(nil, npub, msg, ad)
 }
 
 // aeadDecrypt opens a ChaCha20-Poly1305-IETF record (native Go, see aeadEncrypt).
 // ct is attacker-controlled, so a bad tag or a short ct is an ordinary open failure
 // (ok=false, and PeerLink tears the link down); npub/key are ours, so a wrong length there
 // is an invariant violation and panics.
-func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
+func (s *libsodium) aeadDecrypt(ct, ad, npub, key []byte) ([]byte, bool) {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
 	}
-	pt, err := aead.Open(nil, npub, ct, nil)
+	pt, err := aead.Open(nil, npub, ct, ad)
 	if err != nil {
 		return nil, false
 	}
@@ -358,6 +363,14 @@ func argView(args []*qjs.Value, i int) []byte {
 	return b
 }
 
+// optView is argView for an optional argument: absent, null or undefined reads as nil.
+func optView(args []*qjs.Value, i int) []byte {
+	if i >= len(args) || args[i].IsNull() || args[i].IsUndefined() {
+		return nil
+	}
+	return argView(args, i)
+}
+
 // exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and the
 // whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the shared
 // code consumes is `wrapNativeSodium` in host/native-shim.ts, where it is typechecked
@@ -368,16 +381,13 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("crypto_generichash", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// crypto_generichash(hashLength, message, key?): the native blake2b shim computes
-		// only the UNKEYED hash, so a key arg would be silently dropped — a plain hash
-		// where libsodium computes a MAC.
-		if len(args) > 2 && !args[2].IsNull() && !args[2].IsUndefined() {
-			// Its WIDTH is the whole question, so it is never copied to ask.
-			if k, _ := args[2].ByteLength(); k > 0 {
-				return nil, fmt.Errorf("crypto_generichash: keyed hashing not supported by the native blake2b shim")
-			}
+		// crypto_generichash(hashLength, message, key): libsodium's ranges, 1..64 out and a
+		// key of at most 64 bytes, answered as a JS error like the wrappers throw.
+		outLen, key := int(args[0].Int32()), optView(args, 2)
+		if outLen < 1 || outLen > 64 || len(key) > 64 {
+			return nil, fmt.Errorf("crypto_generichash: output 1..64 and key 0..64 bytes, got %d and %d", outLen, len(key))
 		}
-		return qc.NewArrayBuffer(s.genericHash(int(args[0].Int32()), argView(args, 1))), nil
+		return qc.NewArrayBuffer(s.genericHash(outLen, argView(args, 1), key)), nil
 	}))
 	o.SetPropertyStr("crypto_sign_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		return qc.NewArrayBuffer(s.signDetached(argView(args, 0), argView(args, 1))), nil
@@ -393,10 +403,10 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		return qc.NewArrayBuffer(q), nil
 	}))
 	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewArrayBuffer(s.aeadEncrypt(argView(args, 0), argView(args, 1), argView(args, 2))), nil
+		return qc.NewArrayBuffer(s.aeadEncrypt(argView(args, 0), optView(args, 1), argView(args, 2), argView(args, 3))), nil
 	}))
 	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		pt, ok := s.aeadDecrypt(argView(args, 0), argView(args, 1), argView(args, 2))
+		pt, ok := s.aeadDecrypt(argView(args, 0), optView(args, 1), argView(args, 2), argView(args, 3))
 		if !ok {
 			return qc.NewNull(), nil
 		}

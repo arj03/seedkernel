@@ -36,6 +36,8 @@
 
 **`linkClosed` returns a reason instead of exposing a name.** A guest-callable "report close" would let the occupant say it about a link it never observed, and the return carries no link id, so it cannot redirect a transition to another socket. The pre-auth split answers the question an operator actually has — is the other machine absent, hostile, silent, or is the failure ours — and since the byte never goes on the wire, telling these apart locally does not weaken the handshake's silence ([CHANNEL](CHANNEL.md) §5).
 
+**A host transform takes its algorithm's whole interface.** The table exists only because the host already carries the code (§14). A name trimmed to what one bundle uses — the AEAD without associated data, BLAKE2b fixed at 32 bytes — makes the next bundle re-ship code the host already has, or wait for a host release to adopt a standard protocol such as Noise. The names are frozen; their interfaces are complete, and a published-vector test holds them there.
+
 **The signing scope is derived, never supplied.** It is the label's rather than the author's for the reason §5 gives. Deriving it from admitted facts (`slotSignScope`) is what makes it the same on boot, on `--bundle` and on an in-place update, so an upgrade cannot silently re-scope a node. `node/verify` counts as an authority, not a transform, because its scope is host-derived: "does this verify under *my* scope?" is a fact the guest cannot state for itself. Why the purposes share one key at all is [CHANNEL](CHANNEL.md) §7.
 
 ## 12.3 Zero-authority JS realms
@@ -104,7 +106,7 @@
 
 ## 12.6 Node↔node transport: channel identity binding
 
-**The protocol is content.** The handshake, records and routing are a signed bundle so a deployment can change them without a host fork. The *first* transport cannot travel: a node has no network until it has one, and fetching it over raw net from a peer it does not yet trust would open a metadata window before any channel exists to close it. So it ships in the artifact, and what travels is the next one. The handshake's own reasoning — concealment, ordering, silence, the three secrets, one identity key — is [CHANNEL](CHANNEL.md).
+**The protocol is content.** The handshake, records and routing are a signed bundle so a deployment can change them without a host fork. The *first* transport cannot travel: a node has no network until it has one, and fetching it over raw net from a peer it does not yet trust would open a metadata window before any channel exists to close it. So it ships in the artifact, and what travels is the next one. That holds only while nothing beneath the bundle assumes *this* handshake: the host sees no handshake width, the shell passes the transport's flags through unread, and the crypto names are complete (§12.2). The handshake's own reasoning — concealment, ordering, silence, the three secrets, one identity key — is [CHANNEL](CHANNEL.md).
 
 **The pre-auth cap exists because the application cap was a memory hole.** Applying the full frame cap to an unauthenticated peer let a stranger reserve megabytes per connection; 8 KiB against the 1,024 unverified budget is 8 MiB (sizing against the PQ message widths: CHANNEL §11). The cap is raised only after msg4's step runs because a full-size first record riding the same segment, measured against the pre-auth cap, would refuse a legitimate link.
 

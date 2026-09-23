@@ -491,10 +491,23 @@ await test("a node that dials ITSELF never authenticates: its own identity refle
   assert(!(await linkedTo(st.A, st.A.peerId)), "a node must never hold a link to itself");
 });
 
+await test("COHORT: a node dials the peers its config spells as pk[.secret]@dest", async (keep) => {
+  // The CLI hands `--peers` to the transport unread (§12.8): the reference grammar is this
+  // bundle's, parsed at its load, with the peer's contact secret riding in the reference.
+  const fabric = new LoopbackChannels();
+  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 }, contactSecret: CONTACT }));
+  const A = keep(await makeTransportHost({
+    channels: fabric.view(), listen: { port: 0 },
+    transportConfig: { peers: [`${B.peerId.toUpperCase()}.${hexOf(CONTACT)}@127.0.0.1:${B.driver.port}`] },
+  }));
+  await ready(A, 4000);
+  assert(await linkedTo(A, B.peerId), "the configured peer is dialed, through its contact secret");
+});
+
 await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
   // A node that speaks first is a directory service: one connect reads its identity
   // straight off the wire. A caller without the contact secret must get silence — nothing
-  // that distinguishes this node from a port that is not listening.
+  // that distinguishes this node from any server waiting for its client to speak.
   const chans = wirePair();
   // The caller's OWN contact secret — what a host-announced dial presents — is not the
   // receiver's.
@@ -542,22 +555,35 @@ await test("CONTACT SECRET: the address book alone does not grant a probe", asyn
   assert(!(await aUp(st)) && !(await bUp(st)), "a wrong contact secret must not authenticate");
 });
 
-await test("FRAME CAP: an unauthenticated peer cannot declare a large frame", async (keep) => {
+await test("FRAME CAP: an over-cap pre-auth frame draws the silence every refusal draws", async (keep) => {
   // A stranger who knows only host:port must not reserve memory by declaring a big frame
-  // and dribbling the body. On a length-framed link the declaration is the 4-byte prefix;
-  // one over the pre-auth cap is fatal on sight — the body never arrives and nothing is
-  // allocated for it.
-  const chans = wirePair({ stream: true });
-  const st = keep(await linked(chans));
-  chans[1].msg(new Uint8Array([0x00, 0x01, 0x00, 0x00])); // declares 64 KiB, cap is 8 KiB
-  await settle();
-  assert(st.b.closed, "an over-cap pre-auth declaration must tear the link down");
-  assert(!(await bUp(st)), "and it must never have authenticated");
-  // REFUSED, not the catch-all: the peer sent something wrong, which is a different thing
-  // to go fix than a handshake nobody answered. The distinction is LOCAL — what the caller
-  // observes is still silence and a closed socket, exactly like a wrong contact secret.
-  assert(st.b.reason === CLOSE_REASON.REFUSED,
-    `a peer-provoked pre-auth teardown should read REFUSED, got ${st.b.reason}`);
+  // and dribbling the body — nor learn anything from the refusal. Almost every random
+  // 4-byte prefix declares more than the 8 KiB cap, so closing on sight would let four
+  // random bytes tell a scanner what a wrong contact secret never does: this is a node. The
+  // frame is dropped unbuffered and the socket held to the same deadline as any refusal.
+  // Both shapes: a length prefix on a stream, and a whole platform-framed message.
+  for (const [stream, bytes] of [[true, Uint8Array.of(0x00, 0x01, 0x00, 0x00)], [false, new Uint8Array(9000)]]) {
+    const chans = wirePair({ stream });
+    const factory = new InjectedChannels();
+    let reason = null;
+    const B = await makeTransportHost({
+      channels: factory, contactSecret: CONTACT,
+      transportConfig: { unverifiedTimeoutMs: 1000 },
+      onLinkClosed: (_id, r) => { reason = r; },
+    });
+    keep({ close() { try { B.shell.close(); } catch { /* already down */ } } });
+    factory.give(chans[1]);
+    await settle(50);
+    chans[1].msg(bytes);
+    await settle(100);
+    const shape = stream ? "an over-cap length prefix" : "an over-cap message";
+    assert(reason === null, `${shape} must not close the socket on sight`);
+    assert(chans[1].sent.length === 0, `…nor draw a byte (drew ${chans[1].sent.length})`);
+    await until(() => reason !== null, 3000, "the unverified deadline to retire it");
+    // REFUSED, not TIMEOUT: the peer sent something wrong, which is a different thing to go
+    // fix than a caller that went quiet. The distinction is LOCAL, never on the wire.
+    assert(reason === CLOSE_REASON.REFUSED, `${shape} should read REFUSED, got ${REASON_NAMES[reason]}`);
+  }
 });
 
 await test("FRAME CAP: authentication raises it, before anything can arrive under it", async (keep) => {

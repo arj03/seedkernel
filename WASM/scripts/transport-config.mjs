@@ -27,7 +27,7 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   // deadline wins and this timer cleans the transport's correlation afterwards (§16.1).
   requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),
-  // Peers this program dials, as `{ peerId, dest, contactSecret? }` in hex. Empty by
+  // Peers this program dials, as `pk[.secret]@dest` strings (core.js `peerRef`). Empty by
   // default because a cohort is a DEPLOYMENT's fact, not an author's — an installation
   // names it in `LOCAL`, and does so again for a replacement transport, whose address book
   // starts empty like every other part of a fresh realm (§12.10).

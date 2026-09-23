@@ -75,17 +75,17 @@ declare const bridge: {
 /** Go's host crypto primitives (native/sodium.go, mldsa.go). Bytes cross as
  *  ArrayBuffers and a failure as `null` — what the bridge can carry.
  *
- *  `crypto_generichash` takes its optional key so the native blake2b shim can refuse a
- *  keyed hash loudly; dropping the argument here would turn a MAC into a plain hash. */
+ *  `crypto_generichash` and the AEAD carry their optional key and associated data through
+ *  to Go: dropping either here would turn a MAC into a plain hash or bind nothing. */
 declare const __sodium: {
-  crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): ArrayBuffer;
+  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): ArrayBuffer;
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): ArrayBuffer;
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
   crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): ArrayBuffer | null;
-  /** libsodium-wrappers' signature is (message, ad, nsec, npub, key); the record layer
-   *  uses no additional data, so the native primitive takes just (m, npub, key). */
-  crypto_aead_chacha20poly1305_ietf_encrypt(message: Uint8Array, npub: Uint8Array, key: Uint8Array): ArrayBuffer;
-  crypto_aead_chacha20poly1305_ietf_decrypt(ciphertext: Uint8Array, npub: Uint8Array, key: Uint8Array): ArrayBuffer | null;
+  /** libsodium-wrappers' signature is (message, ad, nsec, npub, key); `nsec` is unused,
+   *  so the native primitive takes (m, ad, npub, key), `ad` null for none. */
+  crypto_aead_chacha20poly1305_ietf_encrypt(message: Uint8Array, ad: Uint8Array | null, npub: Uint8Array, key: Uint8Array): ArrayBuffer;
+  crypto_aead_chacha20poly1305_ietf_decrypt(ciphertext: Uint8Array, ad: Uint8Array | null, npub: Uint8Array, key: Uint8Array): ArrayBuffer | null;
   crypto_sign_keypair(): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
   crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
   randombytes_buf(n: number): ArrayBuffer;
@@ -93,11 +93,8 @@ declare const __sodium: {
 };
 
 /** The crypto surface this target serves: `ShellSodium` plus the two keypair producers a
- *  node's identity comes out of. `crypto_generichash` is restated with its key optional,
- *  which is what satisfies both halves of `ShellSodium` at once: the host calls it with an
- *  explicit `null` key and the guest seam calls it with two arguments. */
+ *  node's identity comes out of. */
 export interface NativeSodium extends ShellSodium {
-  crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
   crypto_sign_keypair(): Keypair;
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
@@ -112,7 +109,7 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
   const kp = (k: { publicKey: ArrayBuffer; privateKey: ArrayBuffer }): Keypair =>
     ({ publicKey: u8(k.publicKey), privateKey: u8(k.privateKey) });
   return {
-    crypto_generichash: (len: number, m: Uint8Array, key?: Uint8Array | null) => u8(N.crypto_generichash(len, m, key)),
+    crypto_generichash: (len, m, key) => u8(N.crypto_generichash(len, m, key)),
     crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
     crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
     ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
@@ -121,10 +118,10 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
       if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");
       return u8(r);
     },
-    crypto_aead_chacha20poly1305_ietf_encrypt: (m, _ad, _nsec, npub, key) =>
-      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, npub, key)),
-    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, _ad, npub, key) => {
-      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, npub, key);
+    crypto_aead_chacha20poly1305_ietf_encrypt: (m, ad, _nsec, npub, key) =>
+      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, ad, npub, key)),
+    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, ad, npub, key) => {
+      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, ad, npub, key);
       if (r === null) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
       return u8(r);
     },

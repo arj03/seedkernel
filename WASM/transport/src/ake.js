@@ -18,7 +18,7 @@ const N_LINK_DELIVER = "link/deliver";
 
 const N_TIMER_ARM = "timer/arm";
 
-const P_HASH = "crypto/blake2b-256";
+const P_HASH = "crypto/blake2b";
 const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
 const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
@@ -35,9 +35,9 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 //
 // It is a LOCAL fact and never goes on the wire, which is what lets the pre-auth cases be
 // told apart without weakening §12.6.2: what a refused peer observes is still silence
-// followed by a socket close, identical to every other refusal and to a port that is not
-// listening. The peer learns nothing; our own operator learns which of the two questions
-// they are looking at.
+// followed by a socket close, identical to every other refusal and to any server that waits
+// for its client to speak. The peer learns nothing; our own operator learns which of the two
+// questions they are looking at.
 //
 // WHERE THIS ENDS UP, so it does not read as a value nobody consumes: the driver prints
 // every non-routine one on stderr (`host/transport-host.ts` `logLinkDown`), which is the
@@ -91,9 +91,11 @@ const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-o
 // nothing to do after the call hands back the seam's own promise; only one that reads the
 // answer is `async`. The transforms themselves still run inline in the host.
 
-/** BLAKE2b-256 over the concatenation — the one system hash. */
+/** BLAKE2b-256 over the concatenation — the one system hash. `crypto/blake2b` takes
+ *  `[outLen][keyLen][key][msg]`, so the 32-byte unkeyed header leads the parts. */
+const HASH_256 = new Uint8Array([32, 0]);
 function hash(...parts) {
-  return host.call(P_HASH, concatBytes(parts));
+  return host.call(P_HASH, concatBytes([HASH_256, ...parts]));
 }
 async function verify(pk, sig, msg) {
   let len = pk.length + sig.length + msg.length;
@@ -105,15 +107,20 @@ async function verify(pk, sig, msg) {
 function randomBytes(n) {
   return host.call(N_RANDOM, argU32(n));
 }
+/** The AEAD names' framing, `[npub 12][key 32][adLen u32][ad][msg]`. This suite binds no
+ *  associated data — each handshake key seals one message, and a record's position is its
+ *  nonce — so `adLen` stays the zero a fresh buffer already holds. */
+function aeadArgs(key, npub, msg) {
+  const at = npub.length + key.length + 4;
+  const out = new Uint8Array(at + msg.length);
+  out.set(npub, 0); out.set(key, npub.length); out.set(msg, at);
+  return out;
+}
 function aeadEnc(key, npub, msg) {
-  const out = new Uint8Array(npub.length + key.length + msg.length);
-  out.set(npub, 0); out.set(key, npub.length); out.set(msg, npub.length + key.length);
-  return host.call(P_SEAL, out);
+  return host.call(P_SEAL, aeadArgs(key, npub, msg));
 }
 async function aeadDec(key, npub, ct) {
-  const out = new Uint8Array(npub.length + key.length + ct.length);
-  out.set(npub, 0); out.set(key, npub.length); out.set(ct, npub.length + key.length);
-  const r = await host.call(P_OPEN, out);
+  const r = await host.call(P_OPEN, aeadArgs(key, npub, ct));
   return r[0] === 1 ? { ok: true, pt: r.subarray(1) } : { ok: false, pt: null };
 }
 async function scalarmult(sk, pk) {
@@ -585,7 +592,7 @@ class Link {
       // boundaries already on it — but the two-stage cap is about how much a peer may
       // make us HOLD, not about who framed it. Without this, one huge message takes the
       // realm down.
-      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(); }
+      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.refuse(); return Promise.resolve(); }
       return this.enqueue(() => this.onMessage(bytes));
     }
     // Once its cap is raised, a length-framed chunk's parse loop fires `deliver`
@@ -599,13 +606,13 @@ class Link {
       const ok = this.framer.push(bytes, deliver);
       return Promise.resolve(ok).then(
         (good) => {
-          if (!good) { this.abort(true); return; }
+          if (!good) { this.refuse(); return; }
           return last;
         },
-        () => { this.abort(true); },
+        () => { this.refuse(); },
       );
     } catch {
-      this.abort(true);
+      this.refuse();
       return Promise.resolve();
     }
   }
@@ -625,7 +632,16 @@ class Link {
       : this.weDialed
         ? (this.peerEph ? this.onMsg4(m) : this.onMsg2(m))
         : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
-    return Promise.resolve(step).catch(() => { this.abort(true); });
+    return Promise.resolve(step).catch(() => { this.refuse(); });
+  }
+
+  /** The peer sent something this end will not take. Authenticated, that tears the link
+   *  down. Before that it is a stall like every other refusal, the framing ones included:
+   *  closing at once on an over-cap or malformed frame would answer a stranger's four
+   *  random bytes, where a well-formed wrong message draws only the deadline (CHANNEL §5). */
+  refuse() {
+    if (this.authed) this.abort(true);
+    else this.stall();
   }
 
   // Refuse WITHOUT saying so — every refusal funnels here, so they are
@@ -634,8 +650,13 @@ class Link {
   stall() {
     if (this.stalled) return;
     this.stalled = true;
+    // A local fact for `closeReason`, never the wire: the deadline that retires this link
+    // is closing a refusal, not a peer that went quiet.
+    this.aborted = true;
     // The deadline and the half-open slot stay live: silence must still cost the sender a
-    // slot until that deadline. Private handshake material has no further use, though.
+    // slot until that deadline. Its buffered input and private handshake material have no
+    // further use, though — a stall must not pin a whole read for that long.
+    if (this.framer) this.framer.discard();
     this.clearEphemeral();
   }
 

@@ -46,6 +46,6 @@ func BenchmarkSodiumBlake2b64K(b *testing.B) {
 	b.SetBytes(int64(len(block)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = s.genericHash(32, block)
+		_ = s.genericHash(32, block, nil)
 	}
 }

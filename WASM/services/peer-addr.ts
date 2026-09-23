@@ -1,4 +1,4 @@
-import { fromHex, toHex, isHex64, type JsonObject } from "./util.js";
+import { fromHex, isHex64 } from "./util.js";
 
 // ── the `pk[.secret]@dest` grammar ────────────────────────────────────────────
 //
@@ -43,7 +43,11 @@ export function parseDest(dest: string): { scheme: DestScheme; host: string; por
  *
  *  Every check here is syntax, and it is done HERE rather than at connect time because
  *  learning at dial that a port names nothing makes a typo look like an unreachable
- *  peer. Nothing about admission or trust changes if a target hand-rolled its own parser. */
+ *  peer. Nothing about admission or trust changes if a target hand-rolled its own parser.
+ *
+ *  This is the shipped transport's grammar, for an embedder teaching it a peer through its
+ *  `addr` op. The shell never parses a reference: `--peers` reaches the transport as typed,
+ *  and the transport reads its own (transport/src/core.js `peerRef`). */
 export function parsePeerRef(spec: string, defaultScheme: DestScheme = "tcp"): { peerId: string; contactSecret?: Uint8Array; dest: string } {
   const at = spec.indexOf("@");
   if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@dest): ${spec}`);
@@ -62,26 +66,6 @@ export function parsePeerRef(spec: string, defaultScheme: DestScheme = "tcp"): {
   const parsed = parseDest(dest);
   if (!parsed) throw new Error(`bad peer destination (want [scheme://]host:port[/path]): ${spec}`);
   return { peerId, contactSecret, dest };
-}
-
-/** A list of `pk[.secret]@dest` references as the transport reads them out of its
- *  installation-local config — the boot-time half of an address book that now lives in the
- *  transport guest and dies with its realm (§12.10). Hex, like every other `LOCAL` fact, so
- *  the whole object survives a JSON round trip through a target that holds no bytes.
- *
- *  This is the ONE way a deployment names its cohort: the same list goes into the first
- *  load's `transportConfig` and into a replacement's, because a transport upgrade is a
- *  reconnect from an empty book. */
-export function peersConfig(specs: readonly string[], defaultScheme: DestScheme = "tcp"): JsonObject[] {
-  return specs.map((spec) => {
-    const { peerId, contactSecret, dest } = parsePeerRef(spec, defaultScheme);
-    const entry: JsonObject = { peerId, dest };
-    // Left OUT rather than spelled as zeros for a peer that named none: the transport reads
-    // an absent secret as an open door, and a zero secret means the same, but only one of
-    // the two says so in the config an operator reads back.
-    if (contactSecret !== undefined) entry.contactSecret = toHex(contactSecret);
-    return entry;
-  });
 }
 
 /** Split a `host:port` address. The strict form (the default) is a peer dial

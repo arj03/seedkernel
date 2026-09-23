@@ -312,16 +312,26 @@ assert((await request(a.app, bId, new Uint8Array([7]))).length === 1,
 // The same rule one field over: a half-length peer key would key the guest's address book
 // under an id no handshake can ever match, and the only symptom would be a peer that never
 // links — indistinguishable from one that is switched off. So the guest checks the shape
-// of `LOCAL.peers` where it reads it, and a load naming a cohort wrong fails outright.
-let badPeersMsg = "";
-try {
-  await reinstallTransport(a, transportBundleAt(3, replacementKeys), {
-    localConfig: { peers: [{ peerId: "ab".repeat(20), dest: "tcp://loopback:1" }] },
-  });
-} catch (e) { badPeersMsg = e.message; }
-assert(/peers/.test(badPeersMsg), `a short peer key in the cohort config fails the load (${badPeersMsg})`);
+// of `LOCAL.peers` where it reads it, and a load naming a cohort wrong fails outright. The
+// references are the transport's own grammar — the CLI passes `--peers` through unread —
+// and so is the contact secret's encoding.
+const PK = "ab".repeat(32);
+for (const [what, localConfig] of [
+  ["a short peer key", { peers: ["ab".repeat(20) + "@tcp://loopback:1"] }],
+  ["a reference with no destination", { peers: [PK] }],
+  ["a short contact secret", { peers: [`${PK}.${"cd".repeat(20)}@tcp://loopback:1`] }],
+  ["a destination with no port", { peers: [`${PK}@ws://loopback/p`] }],
+  ["a port out of range", { peers: [`${PK}@loopback:70000`] }],
+  ["an object where a reference belongs", { peers: [{ peerId: PK, dest: "tcp://loopback:1" }] }],
+  ["a malformed contact secret", { contactSecret: "not a secret" }],
+]) {
+  let msg = "";
+  try { await reinstallTransport(a, transportBundleAt(3, replacementKeys), { localConfig }); }
+  catch (e) { msg = e.message; }
+  assert(/config (peers|contactSecret)/.test(msg), `${what} fails the load (${msg || "it loaded"})`);
+}
 assert((await request(a.app, bId, new Uint8Array([3]))).length === 1,
-  "…and that refusal too left the standing transport serving");
+  "…and those refusals too left the standing transport serving");
 
 // ── A mark that cannot be persisted is a failed load ─────────────────────────────
 console.log("  an `_net` claimant whose mark cannot be persisted fails the load…");

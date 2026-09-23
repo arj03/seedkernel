@@ -18,7 +18,7 @@ Three attacks are denied:
 
 | Attack | Denied by |
 | --- | --- |
-| **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1) and the message ordering (§4) |
+| **Probe** — connect to a host, learn which node lives there | the contact secret (§6.1); on an open node, only a peer list with the message ordering (§4) |
 | **Attribute** — watch a flow, learn which pair it belongs to | both identities travelling under the hybrid ephemeral secrets (§3) |
 | **Membership-test** — ask a node "would you talk to key P?" | silent refusal on every pre-auth path (§5) |
 
@@ -70,31 +70,42 @@ so the post-quantum `0x03` landing did not change the address format (§11).
 
 ## 4. The caller names itself first
 
-The receiver learns who is calling before it says who it is. A caller that fails
-the peer lint is turned away having learned nothing — not even whether the identity it dialed
-is live at that address.
+The receiver learns who is calling before it says who it is. A caller that fails the peer
+lint (§6.3) is turned away without the receiver's identity or a signature by it. It has
+still learned, from msg2, that the holder of the contact secret it presented answers at that
+address. And the lint is the only thing the ordering serves: with no peer list, any caller
+can mint a throwaway identity, pass msg3 and read msg4.
 
 This is what the fourth message buys, and it is the one place this design leaves the
-standard patterns. Across all twelve fundamental and twenty-three deferred Noise patterns,
-whenever the responder transmits its static key it does so in message 2, *before* the
-initiator's. Receiver-decides-first has no standard pattern.
+standard patterns. No Noise pattern lets the responder check the initiator's identity before
+sending its own while keeping the initiator's identity forward-secret: where the responder
+transmits its static, it does so in message 2, and the one family that sends the initiator's
+static first, `IX`, sends it in the clear — or, as `IXpsk0`, under a key derived from the
+pre-shared key and public values alone, without forward secrecy.
 
 Someone must name themselves first; that is not solvable, only assignable. Because both
 early messages carry a seal keyed by the contact secret, whoever goes first is exposed only
 to a party already holding the credential. Assigning it to the caller is what lets the
-receiver run its peer lint before revealing anything.
+receiver run its peer lint before revealing its identity. The caller pays for that: it names
+itself to anyone holding the contact secret — every peer the node has given its address to —
+before it can check who answered (§8.1).
 
-The cost is one round trip, once per connection, against a property that holds for every
-connection forever.
+The cost is one round trip per connection, and the property it buys holds only where a peer
+list is set.
 
 ---
 
 ## 5. Refusals are silent
 
 Every refusal before the responder reveals its identity does nothing at all and lets the
-deadline expire, so an unauthorised caller cannot distinguish this node from a port that is
-not listening. After the initiator has revealed itself at msg3, its local msg4 peer-pin or
-peer-policy rejection may abort because there is no responder identity left to conceal.
+deadline expire, so an unauthorised caller cannot tell this node from any server that waits
+for its client to speak first. It can still tell it from a closed port, which refuses the
+connection, and the fixed deadline that ends the silence is itself observable. The framing
+layer refuses the same way: an over-cap length prefix or message is a refusal like any
+other, because almost every four random bytes declare more than the cap, and closing on
+sight would let them identify the node. After the initiator has revealed itself at msg3,
+its local msg4 peer-pin or peer-policy rejection may abort because there is no responder
+identity left to conceal.
 
 The alternative — closing on a bad message — answers a question. "I am a seedkernel node
 and that is not the key" is exactly the oracle §1 removes, and it is available to anyone
@@ -107,21 +118,21 @@ The cost is that a refused connection occupies a socket until its deadline inste
 dropped on sight, which promotes the half-open budgets from defence in depth to the thing
 standing between a stranger and the node. Four measures bound this exposure:
 
-- **No asymmetric cryptography before proof.** The accepting side verifies the contact-secret
-  proof before generating ephemeral keys or invoking the KEM.
+- **No asymmetric cryptography before proof.** The accepting side verifies the
+  contact-secret proof before generating ephemeral keys or invoking the KEM.
 - **A proved msg1 is spent** (§9), so a recording cannot buy that work, or an answer, more
   than once.
 - **Separate budgets for proven and unproven callers**, so a flood without the contact
   secret cannot crowd out those that have it.
-- **Evict rather than refuse the newest.** Refusing arrivals at a full budget
-  would let a flood block peers before they could send their proof. The oldest unverified connection is overwhelmingly
-  likely to be a stranger making no progress, while a legitimate caller occupies that budget
-  for one round trip — so an attacker must cycle the whole budget faster than a round trip
-  rather than merely fill it once. The same argument applies one tier up, which is why the
-  verified budget evicts too. Past the door the question changes: every authenticated link
-  has proved the same thing, so that budget evicts the link that has been quiet longest
-  rather than the one admitted longest. Order of arrival there would say only who has been
-  useful longest.
+- **Evict rather than refuse the newest.** Refusing arrivals at a full budget would let a
+  flood block peers before they could send their proof. The oldest unverified connection is
+  overwhelmingly likely to be a stranger making no progress, while a legitimate caller
+  occupies that budget for one round trip — so an attacker must cycle the whole budget
+  faster than a round trip rather than merely fill it once. The same argument applies one
+  tier up, which is why the verified budget evicts too. Past the door the question changes:
+  every authenticated link has proved the same thing, so that budget evicts the link that
+  has been quiet longest rather than the one admitted longest. Order of arrival there would
+  say only who has been useful longest.
 
 Constants and measured numbers: [RUNTIME](RUNTIME.md) §12.6.2 and
 `tests/transport-load.test.mjs`.
@@ -152,13 +163,16 @@ The secret gating the first message can only be one the receiver identifies unai
 Per node is the only granularity that is both selectable at msg1 and containable on leak:
 rotate, re-issue your address to your own peers, nothing else in the network moves.
 
-**It is not what conceals the identities.** §4 does that, and an open node conceals just as
-well. What the secret adds is narrower: a stranger costs no asymmetric cryptography; the
-*caller's* identity is protected from an active attacker, since otherwise anyone answering
-at a dialed address collects it at msg3 and pinning the dialed identity cannot help because msg3 precedes
-msg4; and active probing draws silence, so "a node speaks this protocol here" stops being
-observable. In Noise's grading the first of those is worth nothing and the second moves the
-initiator from 2 to 8 (§8.1).
+**It is not what conceals the identities from an observer.** §3 does that, and against a
+passive observer an open node conceals just as well. Against an active prober it does not:
+an open node answers anyone's msg1, and without a peer list a throwaway identity then draws
+msg4, so its identity is one connection away (§8.1). What the secret adds: a stranger costs
+no asymmetric cryptography; the *caller's* identity is protected from an active attacker
+without the secret, since otherwise anyone answering at a dialed address collects it at
+msg3, and pinning the dialed identity cannot help because msg3 precedes msg4; and active
+probing draws silence, so "a node speaks this protocol here" stops being observable. The
+caller's protection reaches only as far as the secret does: anyone the node has given its
+address to can answer as it and collect msg3.
 
 **Why a secret rather than a published key.** Gating msg1 on a long-term public key is
 WireGuard's `mac1` and Noise's `XK`, and it is weaker on both counts Noise names: the value
@@ -271,30 +285,52 @@ Noise scores each side's static key 0–9. This design places as:
 
 | | Initiator | Responder |
 | --- | --- | --- |
-| **Open** (no contact secret) | **2** — *"sent to an anonymous responder"* | *off the table* |
-| **With a contact secret** | ~8 — encrypted with forward secrecy to a credentialled party | *off the table* |
+| **Open** (no contact secret) | **2** — *"sent to an anonymous responder"* | **1** — *"can be probed by an anonymous initiator"*; withheld from unlisted callers with a peer list |
+| **With a contact secret** | **2** against anyone holding the secret; beyond them, not transmitted | **1** against anyone holding the secret; withheld from unlisted callers with a peer list |
 
-The responder property has no Noise number because no Noise pattern withholds the
-responder's static until the initiator has authenticated. The initiator column is exactly
-what §6.1 exists to buy.
+A holder of the contact secret is not an authenticated party in Noise's sense: the secret
+travels in the node's address, so it is shared by every peer the node has given that
+address to, and any of them can answer as the node. The secret moves the initiator from
+**2** to out of reach only for everyone else (§6.1).
 
-For comparison, the two nearest standard patterns: `XX` grades the responder **1**,
-*"encrypted with forward secrecy, but can be probed by an anonymous initiator"*; `XK` grades
-it **3**, not transmitted but with candidates checkable and replays linkable.
+The responder's static is withheld only with a peer list, and that property has no Noise
+number because no Noise pattern withholds the responder's static until a forward-secret
+initiator has authenticated (§4). Without a list, a throwaway identity passes msg3 and the
+responder grades like `XX`'s. Even with one, a caller holding the address already knows the
+responder's key; what withholding msg4 denies it is confirmation, and msg2 already confirms
+that the secret's owner answers there.
+
+For comparison, the two nearest standard patterns: `XX` grades the initiator **8**,
+*"encrypted with forward secrecy to an authenticated party"*, and the responder **1**; `XK`
+grades the responder **3**, not transmitted but with candidates checkable and replays
+linkable — a replay property msg1 shares (§9).
 
 ### 8.2 Why not Noise itself
 
 Three reasons, in order of weight.
 
 1. **Noise authenticates with static DH; this authenticates with signatures.** Signature
-   replacement is an explicitly future extension, and the spec notes that every fundamental
-   pattern can replace only one authentication DH with a signature — mutual signature
-   authentication needs the deferred variants and does not exist today.
-2. **Noise's static-key guidance costs us an address field.** A Noise static must be a DH
-   key, so adopting Noise means a second long-term key per node, published in every address
-   and 1,216 bytes if that long-term address key were hybrid X25519 + ML-KEM-768. §7 satisfies the *spirit* of that guidance — the
-   identity key never takes a DH role — without publishing a DH key at all.
-3. **No standard pattern gives the ordering in §4.**
+   authentication is a future extension in the Noise spec. The established workaround is
+   libp2p's: `XX` with a per-node X25519 static, and the Ed25519 identity signing that
+   static inside the handshake payload. `XX` statics travel in the handshake, so addresses
+   would not change; the cost is a second key per node and a signature binding it to the
+   identity.
+2. **No standard pattern gives the ordering in §4**, and that ordering pays only where a
+   peer list is set (§8.1).
+3. **Hybrid key establishment is not standard Noise.** ML-KEM enters Noise only through the
+   draft HFS extension (`e1`/`ekem1`) or PQNoise's KEM patterns, with few implementations to
+   test against.
+
+None of these reaches the host: the crypto names carry what a Noise transport needs, and a
+published-vector test holds them there (RUNTIME §12.6), so choosing Noise later is a bundle
+update.
+
+**What signatures cost.** A transcript signature is transferable. Each end finishes holding
+a signature by the other over a transcript that contains its own ephemeral, which it can
+show a third party as proof that the two spoke. Noise's DH authentication leaves no such
+proof, because either end could have produced the whole transcript alone. §1 hides which
+pairs talk from observers; against a peer that later turns informant, signatures give that
+fact away.
 
 What is taken from Noise regardless: the identity-hiding vocabulary; the prologue
 construction (§6.2); the PSK validity rule and the `psk1`-over-`psk0` reasoning that forces
@@ -342,7 +378,8 @@ that node. Only §3's deferral limits the *retroactive* damage.
 ## 10. Invariants worth a named test
 
 1. A node never transmits anything before opening the caller's msg1.
-2. A wrong contact secret, a declined identity, and silence are mutually indistinguishable.
+2. A wrong contact secret, a declined identity, an over-cap frame and silence are mutually
+   indistinguishable.
 3. Neither identity appears in cleartext anywhere on the wire.
 4. msg1 contains no identity, so a recording plus a later key seizure reveals none.
 5. The receiver's identity does not go out to a caller it then declines.
@@ -358,9 +395,10 @@ that node. Only §3's deferral limits the *retroactive* damage.
 15. The channel Ed25519 key is never an argument to `crypto_scalarmult`. Worth a grep test
     in CI — the invariant most likely to be lost to a convenient refactor.
 
-All but 15 are covered by `tests/transport-link.test.mjs` and `tests/transport-load.test.mjs`,
-which pin them against the shipped transport bundle — through the real host stack, over an
-instrumented in-process channel — rather than against a library object a test could hold.
+All but 15 are covered by `tests/transport-link.test.mjs` and
+`tests/transport-load.test.mjs`, which pin them against the shipped transport bundle —
+through the real host stack, over an instrumented in-process channel — rather than against
+a library object a test could hold.
 
 **Where 5 lives, and why it is easy to lose.** The peer list is *configuration*, shipped to
 the occupant at init and applied by it — a LINT rather than a gate, since a host checking a
@@ -383,8 +421,8 @@ module, reached under the bare name `mlkem` through the same private module map 
 `ws.wasm`. It adds no host transform name, native KEM bridge or separately embedded host
 artifact. The generic module ABI is pinned to 40 NIST ACVP cases.
 
-The message widths are derived in one place from named field
-lengths (`M1_LEN`…`M4_LEN`, `transport/src/ake.js`); the host never sees a handshake width. The key schedule takes a
+The message widths are derived in one place from named field lengths (`M1_LEN`…`M4_LEN`,
+`transport/src/ake.js`); the host never sees a handshake width. The key schedule takes a
 *list* of shared secrets, so a KEM secret joins it rather than displacing anything. And
 because the handshake publishes no long-term DH key, **a KEM never enters an address** —
 addresses use `pk[.secret]@host:port`.
@@ -411,9 +449,9 @@ invariant that the bytes a node sends are the bytes it folds into the transcript
 
 **The DoS interaction.** A refused connection is held to its deadline, and msg1 is 1,265
 bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
-both PQ widths with room while bounding a stranger to that cap times the
-unverified budget. `MAX_QUEUE_BYTES` is unaffected: it bounds queued application
-frames, not the handshake. What does change is the memory a stranger holds for
-`UNVERIFIED_TIMEOUT_MS`, and — on any datagram path — that msg1 stops fitting one common-case
-MTU. The contact-secret seal covers the KEM public key and is checked before the responder
-performs encapsulation, so unauthenticated junk does not reach the expensive transform.
+both PQ widths with room while bounding a stranger to that cap times the unverified budget.
+`MAX_QUEUE_BYTES` is unaffected: it bounds queued application frames, not the handshake.
+What does change is the memory a stranger holds for `UNVERIFIED_TIMEOUT_MS`, and — on any
+datagram path — that msg1 stops fitting one common-case MTU. The contact-secret seal covers
+the KEM public key and is checked before the responder performs encapsulation, so
+unauthenticated junk does not reach the expensive transform.

@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
@@ -69,14 +72,33 @@ func TestGuestSeamOps(t *testing.T) {
 	// A primitive is reached BY NAME through the `crypto/` prefix, so there is no op
 	// number per algorithm and no ABI rev to add one.
 
-	// blake2b-256: must equal sodium.crypto_generichash.
-	h := callBytes("crypto/blake2b-256", []byte("hello seedkernel"))
-	if len(h) != 32 {
-		t.Fatalf("crypto/blake2b-256 len = %d, want 32", len(h))
-	}
-	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"))`)
+	// crypto/blake2b — [outLen][keyLen][key][msg] — over RFC 7693's whole interface: the
+	// system hash's 32 bytes, and the published 64-byte unkeyed and keyed answers.
+	h := callBytes("crypto/blake2b", append([]byte{32, 0}, "hello seedkernel"...))
+	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"), null)`)
 	if !bytes.Equal(h, want) {
-		t.Fatalf("crypto/blake2b-256 = %x, want %x", h, want)
+		t.Fatalf("crypto/blake2b(32) = %x, want %x", h, want)
+	}
+	blake2bKat := func(arg []byte, wantHex string) {
+		t.Helper()
+		if got := hex.EncodeToString(callBytes("crypto/blake2b", arg)); got != wantHex {
+			t.Fatalf("crypto/blake2b(%x) = %s, want %s", arg[:2], got, wantHex)
+		}
+	}
+	// RFC 7693 Appendix A: BLAKE2b-512("abc").
+	blake2bKat(append([]byte{64, 0}, "abc"...),
+		"ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
+	// BLAKE2's keyed KAT, first entry: key 00..3f, empty message.
+	katKey := make([]byte, 64)
+	for i := range katKey {
+		katKey[i] = byte(i)
+	}
+	blake2bKat(append([]byte{64, 64}, katKey...),
+		"10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568")
+	for _, bad := range [][]byte{{}, {0, 0}, {65, 0}, {32, 65}, {32, 8, 1, 2}} {
+		if err := refused("crypto/blake2b", bad); err == nil {
+			t.Fatalf("crypto/blake2b(%x) answered, want a mis-framing error", bad)
+		}
 	}
 
 	// node/sign and node/verify are scoped (README §12.2): the host applies
@@ -180,4 +202,45 @@ func jsBytes(t *testing.T, qc *qjs.Context, expr string) []byte {
 		t.Fatalf("bytes of %q: %v", expr, err)
 	}
 	return b
+}
+
+// TestGuestSeamNoiseVectors replays the published Noise XX vectors through the Go
+// primitives by way of the shared seam — the same script tests/realm-guest.test.mjs runs
+// on the JS target. The crypto/ names must carry their algorithms' whole interface, or a
+// replacement transport stops being a bundle update (services/domains.ts).
+func TestGuestSeamNoiseVectors(t *testing.T) {
+	guestSeamRealm(t)
+	script, err := os.ReadFile("../WASM/tests/noise-vectors.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vectors, err := os.ReadFile("../WASM/tests/fixtures/noise-xx-vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qc.Eval("noise-vectors.js", string(script)); err != nil {
+		t.Fatal("noise-vectors.js:", err)
+	}
+	// A seam granting nothing: every name the handshake needs is an ungated transform.
+	if _, err := qc.Eval("build.js", `__buildGuestSeam([], null);`); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	qc.Global().SetPropertyStr("__noiseVectors", qc.NewString(string(vectors)))
+	out, err := callRealm(`(async () => {
+		const r = await runNoiseVectors(__callSeam, JSON.parse(__noiseVectors).vectors);
+		return new TextEncoder().encode(JSON.stringify(r));
+	})`, 30*time.Second)
+	if err != nil {
+		t.Fatal("run:", err)
+	}
+	var r struct {
+		Ran      int      `json:"ran"`
+		Failures []string `json:"failures"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		t.Fatalf("result %q: %v", out, err)
+	}
+	if r.Ran != 2 || len(r.Failures) != 0 {
+		t.Fatalf("ran %d vector(s), failures: %v", r.Ran, r.Failures)
+	}
 }

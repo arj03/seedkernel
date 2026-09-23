@@ -72,12 +72,12 @@ The host provides four **host services** — `node`, `fs`, `timer`, `link` (`HOS
 | `fs` | `fs/get`, `fs/put`, `fs/list`, `fs/delete`, `fs/stat`, `fs/size` | Raw bytes under an opaque, flat key, scoped to the app label (§12.1). |
 | `timer` | `timer/arm`, `timer/clear` | The realm's one wake (§12.3). |
 | `link` | `link/open`, `link/send`, `link/close`, `link/deliver` | Raw links over opaque link ids, and attributed inbound delivery. **The link owner only** (§12.5). |
-| `crypto/*` | `blake2b-256`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries. `random` is host entropy. **Not a grant.** |
+| `crypto/*` | `blake2b`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries, each over its algorithm's whole standard interface (§12.2). `random` is host entropy. **Not a grant.** |
 | *bare names* | the bundle's own module names | The asking bundle's private WASM modules. **Not a grant.** |
 
 - **A grant is a service.** `guest.requires` (§12.4) lists everything a guest reaches: host services, and the local service ids it calls (§12.10). Which of the two a name is, is one closed-table lookup (`isService`), never a spelling convention. Host services are named by service, never by method; declaring `node` grants `node/sign` and `node/verify` together. Install refuses a method name (`fs/get`) with the service to declare instead, and refuses an unknown service. The seam refuses any host method whose service (`serviceOf`, the text before the first `/`) is not declared.
 - **An undeclared service is not wired.** An fs-less bundle gets no fs backend at all, not a backend behind a check.
-- **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms.
+- **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms. A name it does hold takes its algorithm's whole standard interface — BLAKE2b's output length and key, the AEAD's associated data — never the subset one bundle uses, so a standard protocol over these algorithms is a bundle, not a host release (`tests/noise-vectors.js` replays published Noise XX vectors through them on both targets).
 - **Time is not a service.** Every realm reads `Date.now()` and `performance.now()` as ordinary ECMAScript intrinsics.
 - **Anything with structure is a pure module**, never host code: WebSocket framing is `ws.wasm` in the transport bundle, erasure coding is an app's `codec.wasm`.
 
@@ -109,7 +109,10 @@ Install keeps the three disjoint: every host name contains `/`, a module name ma
 
 | Name | Request | Response |
 | --- | --- | --- |
-| `crypto/<host-transform>` | argument bytes | output of the frozen transform; an unknown name throws |
+| `crypto/blake2b` | `[outLen u8][keyLen u8][key][msg ..]`, `outLen` 1..64, `keyLen` 0..64 | `outLen` bytes of BLAKE2b (RFC 7693), keyed when `keyLen` > 0 |
+| `crypto/chacha20poly1305-ietf/seal` | `[npub 12][key 32][adLen u32][ad][msg ..]` | `ciphertext ‖ tag 16` (RFC 8439), binding `ad` |
+| `crypto/chacha20poly1305-ietf/open` | `[npub 12][key 32][adLen u32][ad][ciphertext ‖ tag ..]` | `[1][plaintext ..]` | `[0]` when the tag does not verify |
+| `crypto/x25519/dh` | `[sk 32][pk 32]` | `[1][shared 32]` | `[0]` for a low-order point. Against the base point it derives a public key. |
 | `crypto/random` | `[n u32]` | `n` bytes of host entropy |
 | `node/sign` | message bytes | 64-byte Ed25519 signature under the node identity over `domain ‖ scope ‖ msg` (§12.2) |
 | `node/verify` | `[pk 32][sig 64][msg ..]` | `[ok u8]`: 1 iff `sig` verifies over `domain ‖ scope ‖ msg` under `pk`. A payload shorter than 96 bytes throws. |
@@ -328,6 +331,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 
 - **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade and address book. Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
+- **What a replacement changes without a host release.** Everything in this section: the handshake, key schedule, suite byte, record layer, framing, address grammar and config keys. The host sees no handshake width, the shell passes `--peers` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's one call into a transport is `ready` on its service id, made when `--peers` is given (§12.8).
 
 #### Framing
 
@@ -435,7 +439,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - The transport reads `networkKey` and `contactSecret` from `LOCAL` as 64 lowercase hex, rejects malformed values at load, and defaults each to 32 zero bytes (the public network, an open node).
 - Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ transport: { config } })` passes operator overrides as that load's `localConfig`.
 - Its identity comes from `HOST.identity`, never from config.
-- Peers arrive in `transport.config.peers` and through `addr` calls.
+- Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings — this transport's own grammar (`peerRef`, `core.js`), refused at load when malformed — and through `addr` calls.
 - The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate and the value host-announced dials present, without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A guest-dialed link presents the **peer's** secret from the address book.
 
 ### 12.7 Browser↔console WebRTC
@@ -465,9 +469,9 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 - **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order — remedies, then the bundle, then the one-shots, then serve — and every printed line. A target supplies a `CliHost` of five members: files, one console line, raw stdout, entropy, and "stand a node up on this platform". Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one.
-- **`--contact-secret`** names a file holding 64 hex characters, never the secret itself.
+- **`--contact-secret`** names a file, never the secret itself; its contents, less the line ending, become `transport.config.contactSecret` unread.
 - **`--local-config`** requires `--bundle` and is that load's `LOCAL`; it never reaches the transport.
-- **`--peers`** becomes `transport.config.peers` on the automatic transport load; a malformed reference fails before anything listens. Once up, the CLI waits for the cohort through `Shell.call` on the transport's service id; `null` means no transport is installed.
+- **`--peers`** becomes `transport.config.peers` on the automatic transport load, as typed: the shell parses neither flag, so a replacement transport can spell addresses and secrets its own way, and the transport's load refuses a malformed one. Once up, the CLI waits for the cohort with the transport's `ready` op on its service id; `null` means no transport is installed.
 - **`--op name`** invokes the app `--bundle` just loaded, through that load's handle: stdin is the argument, stdout the response, framed as `[opLen u8][op][args]`. Logs go to stderr on both targets.
 
 **The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
@@ -512,4 +516,4 @@ A frame names a **protocol id**, never an app, author or module. Each installed 
 - **One slot per name.** There is no fan-out.
 - A claim grants no authority, but selects which admitted app receives decrypted input (§14).
 
-**Transport replacement** is ordinary slot replacement of the link owner. The candidate loads complete and offside; the host passes its own `LOCAL` unchanged, so the embedder re-supplies the network key (omission selects the public network) and peers — in the replacement's `transport.config.peers` (`pk[.secret]@dest` hex, `peersConfig` in `services/peer-addr.ts`) or afterwards by an `addr` call through `Shell.call`. At commit the host swaps the slot, its claims and the binding together. The driver keeps its listeners, so inbound links work at once; session keys and the address book are discarded, so peers reconnect.
+**Transport replacement** is ordinary slot replacement of the link owner. The candidate loads complete and offside; the host passes its own `LOCAL` unchanged, so the embedder re-supplies the network key (omission selects the public network) and peers — in the replacement's `transport.config.peers` (in that transport's own grammar) or afterwards by an `addr` call through `Shell.call`. At commit the host swaps the slot, its claims and the binding together. The driver keeps its listeners, so inbound links work at once; session keys and the address book are discarded, so peers reconnect.

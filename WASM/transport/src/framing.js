@@ -114,6 +114,9 @@ class LengthFramer {
 
   raiseCap() { this.cap = maxFrameBytes; }
 
+  /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
+  discard() { this.parts = new ByteParts(); }
+
   /** Feed inbound bytes, delivering each whole message. Returns false when the peer
    *  declared an over-cap frame — a protocol violation the caller answers by tearing
    *  the link down, never by growing the buffer — and true when it waits for more; before
@@ -212,6 +215,9 @@ class WsFramer {
   }
 
   raiseCap() { this.cap = maxFrameBytes; }
+
+  /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
+  discard() { this.parts = new ByteParts(); this.frags = []; this.fragBytes = 0; }
 
   async mask() { return this.client ? await randomBytes(4) : null; }
 

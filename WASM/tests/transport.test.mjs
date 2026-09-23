@@ -7,7 +7,7 @@
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
 import { MAX_LINK_READ_BYTES } from "../build/services/net-limits.js";
 import { MAX_FRAME_BYTES } from "../scripts/transport-config.mjs";
-import { parsePeerRef, parseDest, peersConfig } from "../build/services/peer-addr.js";
+import { parsePeerRef, parseDest } from "../build/services/peer-addr.js";
 import { testkit } from "./testkit.mjs";
 import { readFileSync } from "node:fs";
 import { toHex } from "../build/services/util.js";
@@ -177,16 +177,6 @@ test("peer refs: a malformed destination fails at the reference, not at the dial
   assert(parseDest("host:9") === null, "a destination with no scheme is unroutable");
   assert(parseDest("quic://host:9") === null, "a scheme no factory speaks is unroutable");
   assert(parseDest("tcp://host:abc") === null, "a destination with no usable port is unroutable");
-});
-
-test("peer refs: the config form spells the same reference in hex", () => {
-  // What an embedder puts in `transportConfig.peers` — the boot-time half of the address
-  // book, since the book itself is the transport guest's and dies with its realm (§12.10).
-  const [withSecret, open] = peersConfig([`${PK}.${SEC}@1.2.3.4:9`, `${PK}@ws://h:1/p`]);
-  assert(withSecret.peerId === PK && withSecret.dest === "tcp://1.2.3.4:9" && withSecret.contactSecret === SEC,
-    `the credential half must survive the JSON form, got ${JSON.stringify(withSecret)}`);
-  assert(open.dest === "ws://h:1/p" && !("contactSecret" in open),
-    `an open peer must state no secret at all, got ${JSON.stringify(open)}`);
 });
 
 summary("RFC 6455 module conformance");

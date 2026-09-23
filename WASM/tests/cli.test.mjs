@@ -253,13 +253,19 @@ for (const flag of ["--transport", "--contact-secret"]) {
   ok(host.stood.transport.config.contactSecret === good,
     "--contact-secret is read from the file it names, into the transport's own config");
 }
+// Both transport flags pass through UNREAD: the reference grammar and the secret's encoding
+// belong to the transport, which refuses a malformed one at its load
+// (tests/transport-bundle.test.mjs) — so a replacement transport needs no new binary.
 {
   const badPath = join(work, "bad.hex");
-  writeFileSync(badPath, "not a secret");
-  const host = fakeHost(["--key", join(work, "c2.key"), "--peers", "", "--contact-secret", badPath]);
-  let threw = false;
-  try { await runCli(host); } catch { threw = true; }
-  ok(threw, "a malformed contact secret fails at startup, where an operator can still be told");
+  writeFileSync(badPath, "not a secret\n");
+  const ref = `${good}.${good}@ws://h:1/p`;
+  const host = fakeHost(["--key", join(work, "c2.key"), "--peers", `${ref},not-a-ref`, "--contact-secret", badPath]);
+  await runCli(host);
+  ok(host.stood.transport.config.contactSecret === "not a secret",
+    "--contact-secret reaches the transport as the file says it, less its line ending");
+  ok(JSON.stringify(host.stood.transport.config.peers) === JSON.stringify([ref, "not-a-ref"]),
+    "--peers reaches the transport as typed");
 }
 {
   const host = fakeHost(["--key", join(work, "c3.key"), "--peers", "", "--contact-secret", join(work, "nope.hex")]);

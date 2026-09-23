@@ -26,9 +26,14 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  already ships, and a module cannot borrow the host's copy without exporting the linear
  *  memory the node key lives in (docs/SECURITY.md). `random` is the host's entropy source:
  *  ungated like the rest, because random bytes reach nothing and a guest needing a nonce
- *  should not have to be granted the node key to get one. */
+ *  should not have to be granted the node key to get one.
+ *
+ *  Each name takes its algorithm's WHOLE standard interface — BLAKE2b's output length and
+ *  key (RFC 7693), the AEAD's associated data (RFC 8439) — never the subset one bundle
+ *  happens to use: a replacement transport or app must be able to build a standard
+ *  protocol on these without a host release (tests/noise-vectors.js). */
 export const HOST_TRANSFORM_NAMES = [
-  "blake2b-256",
+  "blake2b",
   "chacha20poly1305-ietf/seal",
   "chacha20poly1305-ietf/open",
   "x25519/dh",

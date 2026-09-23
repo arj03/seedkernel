@@ -24,7 +24,7 @@ export interface SignScope {
 
 /** The libsodium surface the remaining host crypto names use. */
 export interface SeamCrypto {
-  crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
+  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
   randombytes_buf(n: number): Uint8Array;
@@ -212,21 +212,35 @@ type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Pro
 /** Residual host-transform table (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
-    "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
+    // [outLen u8][keyLen u8][key][msg] -> outLen bytes. RFC 7693's whole interface: any
+    // output length 1..64, keyed (MAC) or not. A mis-framed call throws.
+    "crypto/blake2b": (a) => {
+      const outLen = a[0], keyLen = a[1];
+      if (a.length < 2 || outLen < 1 || outLen > 64 || keyLen > 64 || a.length < 2 + keyLen) {
+        throw new Error("guest-seam: crypto/blake2b wants [outLen 1..64][keyLen 0..64][key][msg]");
+      }
+      return sodium.crypto_generichash(outLen, a.subarray(2 + keyLen), keyLen === 0 ? null : a.subarray(2, 2 + keyLen));
+    },
     // [n u32] -> n bytes of host entropy.
     "crypto/random": (a) => {
       const n = readU32BE(a, 0);
       if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: crypto/random size over cap");
       return sodium.randombytes_buf(n);
     },
-    // `subarray`, not `slice`: every primitive below reads its arguments into its own
-    // storage before it returns, so a view is enough — and on the record layer's hot path
-    // `slice` copied the whole payload once more on the way in, for nothing.
-    "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.subarray(44), null, null, a.subarray(0, 12), a.subarray(12, 44)),
+    // [npub 12][key 32][adLen u32][ad][msg] -> msg ‖ tag 16. `subarray`, not `slice`:
+    // every primitive below reads its arguments into its own storage before it returns,
+    // so a view is enough — and on the record layer's hot path `slice` copied the whole
+    // payload once more on the way in, for nothing.
+    "crypto/chacha20poly1305-ietf/seal": (a) => {
+      const { npub, key, ad, body } = aeadArgs(a, "seal");
+      return sodium.crypto_aead_chacha20poly1305_ietf_encrypt(body, ad, null, npub, key);
+    },
+    // [npub 12][key 32][adLen u32][ad][ct ‖ tag] -> [1][pt] | [0]. A tag that does not
+    // verify is an answer; a call too short to hold its own framing throws.
     "crypto/chacha20poly1305-ietf/open": (a) => {
+      const { npub, key, ad, body } = aeadArgs(a, "open");
       try {
-        const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, a.subarray(44), null, a.subarray(0, 12), a.subarray(12, 44));
-        return concatBytes([ONE, pt]);
+        return concatBytes([ONE, sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, body, ad, npub, key)]);
       } catch {
         return ZERO;
       }
@@ -412,6 +426,20 @@ export function slotSignScope(node: { identity: Keypair }, app: string, links: b
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
 // does not cover host allocations the guest requests, so the seam caps them itself.
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per crypto/random call
+
+/** The AEAD names' shared framing, `[npub 12][key 32][adLen u32][ad][body]`. Empty `ad`
+ *  goes to the primitive as `null`, which both targets read as "no associated data". */
+function aeadArgs(a: Uint8Array, op: string): { npub: Uint8Array; key: Uint8Array; ad: Uint8Array | null; body: Uint8Array } {
+  if (a.length < 48) throw new Error(`guest-seam: chacha20poly1305-ietf/${op} wants [npub 12][key 32][adLen u32][ad][bytes]`);
+  const adLen = readU32BE(a, 44);
+  if (adLen > a.length - 48) throw new Error(`guest-seam: chacha20poly1305-ietf/${op} associated data runs past the call`);
+  return {
+    npub: a.subarray(0, 12),
+    key: a.subarray(12, 44),
+    ad: adLen === 0 ? null : a.subarray(48, 48 + adLen),
+    body: a.subarray(48 + adLen),
+  };
+}
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);

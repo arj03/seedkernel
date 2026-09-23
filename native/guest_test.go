@@ -373,7 +373,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 // the realm is zero-authority — the host services are not reachable by name.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
-// put hashes the data (crypto/blake2b-256, by name) and stores it under that id
+// put hashes the data (crypto/blake2b, by name) and stores it under that id
 // (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals. One
 // entrypoint, and the ops are the guest's own framing after the caller id.
 const storeGuestSource = `
@@ -395,7 +395,8 @@ function handle(arg) {
   if (op === "put") {
     // A primitive is reached BY NAME through the crypto/ prefix — the name is the
     // seam, not an op number — and it answers a Promise like every name now.
-    return host.call("crypto/blake2b-256", data).then((id) =>
+    const hashArg = new Uint8Array(2 + data.length); hashArg[0] = 32; hashArg.set(data, 2);
+    return host.call("crypto/blake2b", hashArg).then((id) =>
       host.call("fs/put", fsPutArg(hex(id), data)).then(() => id));
   }
   if (op === "get") {

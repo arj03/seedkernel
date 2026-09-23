@@ -108,8 +108,7 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 	}
 }
 
-// --contact-secret validation moved with the flag itself: it names a FILE of 64 hex
-// characters now (matching the JS shell, and keeping the secret out of `ps` output), and
-// `parseHex32` in the shared CLI refuses a corrupt or wrong-length one loudly — which is
-// the only place an operator can be told, since a gated node refuses callers in silence
-// (§12.6.2). Covered in WASM/tests/cli.test.mjs.
+// --contact-secret names a FILE (keeping the secret out of `ps` output) whose contents the
+// shared CLI passes to the transport unread; the transport refuses a malformed one at its
+// load — the only place an operator can be told, since a gated node refuses callers in
+// silence (§12.6.2). Covered in WASM/tests/cli.test.mjs and transport-bundle.test.mjs.

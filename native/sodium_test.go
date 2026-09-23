@@ -27,7 +27,7 @@ func newSodium(t *testing.T) *libsodium {
 func TestSodiumGenericHash(t *testing.T) {
 	s := newSodium(t)
 	for _, msg := range [][]byte{nil, []byte("hello"), bytes.Repeat([]byte{1}, 333)} {
-		got, want := s.genericHash(32, msg), blake2b.Sum256(msg)
+		got, want := s.genericHash(32, msg, nil), blake2b.Sum256(msg)
 		if !bytes.Equal(got, want[:]) {
 			t.Fatalf("generichash(%q): got %x want %x", msg, got, want)
 		}
@@ -38,7 +38,7 @@ func TestSodiumGenericHash(t *testing.T) {
 		{"", "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"},
 		{"abc", "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"},
 	} {
-		if g := hex.EncodeToString(s.genericHash(32, []byte(kat.msg))); g != kat.hex {
+		if g := hex.EncodeToString(s.genericHash(32, []byte(kat.msg), nil)); g != kat.hex {
 			t.Fatalf("blake2b256(%q) = %s, want %s (native vs libsodium drift?)", kat.msg, g, kat.hex)
 		}
 	}
@@ -57,20 +57,20 @@ func TestSodiumAead(t *testing.T) {
 	// The wrapper is its own inverse; any bit flip in the tag, or a wrong key, fails
 	// the open (ok=false) rather than returning garbage.
 	for _, msg := range [][]byte{nil, []byte("abc"), bytes.Repeat([]byte{0x5a}, 4096)} {
-		ct := s.aeadEncrypt(msg, npub, key)
+		ct := s.aeadEncrypt(msg, nil, npub, key)
 		if len(ct) != len(msg)+16 {
 			t.Fatalf("seal length = %d, want %d", len(ct), len(msg)+16)
 		}
-		pt, ok := s.aeadDecrypt(ct, npub, key)
+		pt, ok := s.aeadDecrypt(ct, nil, npub, key)
 		if !ok || !bytes.Equal(pt, msg) {
 			t.Fatalf("aead round trip: ok=%v pt=%x want %x", ok, pt, msg)
 		}
 		bad := append([]byte(nil), ct...)
 		bad[len(bad)-1] ^= 1 // flip a tag bit
-		if _, ok := s.aeadDecrypt(bad, npub, key); ok {
+		if _, ok := s.aeadDecrypt(bad, nil, npub, key); ok {
 			t.Fatal("aead opened a tampered tag")
 		}
-		if _, ok := s.aeadDecrypt(ct, npub, bytes.Repeat([]byte{0x43}, 32)); ok {
+		if _, ok := s.aeadDecrypt(ct, nil, npub, bytes.Repeat([]byte{0x43}, 32)); ok {
 			t.Fatal("aead opened under the wrong key")
 		}
 	}
@@ -83,7 +83,7 @@ func TestSodiumAead(t *testing.T) {
 		{"abc", "8565e611f66e1a31314e67413c37a2b2ef7474"},
 		{"the quick brown fox", "906fe02e9aab31cbee4beaf98b6073b899a63132dc8f227697aa57eb0d9c797f19636c"},
 	} {
-		if g := hex.EncodeToString(s.aeadEncrypt([]byte(kat.msg), npub, key)); g != kat.hex {
+		if g := hex.EncodeToString(s.aeadEncrypt([]byte(kat.msg), nil, npub, key)); g != kat.hex {
 			t.Fatalf("aead(%q) = %s, want %s (native vs libsodium drift?)", kat.msg, g, kat.hex)
 		}
 	}

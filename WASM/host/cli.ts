@@ -10,7 +10,7 @@ import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subk
 import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
 import { OpArgs, writeOp } from "../services/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
-import { parseHostPort, peersConfig } from "../services/peer-addr.js";
+import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
@@ -144,19 +144,12 @@ function wholeNumberFlag(args: Map<string, string>, flag: string): number | unde
 
 /** Parse 64 hex characters into the 32 bytes they name. Validated rather than decoded
  *  loosely, because `fromHex` maps a non-hex pair to 0: a corrupt key file would boot the
- *  node under a *different* identity, and a typo'd contact secret would produce a node
- *  that looks healthy and is reachable by nobody (§12.6.2). Parse time is the only place
- *  an operator can still be told. */
+ *  node under a *different* identity. Parse time is the only place an operator can still
+ *  be told. */
 export function parseHex32(hex: string, label: string): Uint8Array {
   const trimmed = hex.trim();
   if (!isHex64(trimmed)) throw new Error(`${label} must hold 32 bytes as 64 hex characters`);
   return fromHex(trimmed);
-}
-
-/** A 32-byte secret from a file — the master seed (`--key`) and the deployment secret
- *  (`--contact-secret`) are the same shape, read the same way, and fail the same way. */
-function loadHex32(files: CliFiles, path: string, label: string): Uint8Array {
-  return parseHex32(dec.decode(mustRead(files, path, label)), label);
 }
 
 /** Load the node's MASTER SEED from `--key`, or mint one and persist it 0600, and derive
@@ -235,14 +228,16 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     localConfig = parsed;
   }
 
-  // The transport's own configuration (§12.10): cohort peers — parsed BEFORE the node
-  // stands up, so a malformed reference fails before anything is listening — and the
-  // contact secret that gates this node's door.
+  // The transport's own configuration (§12.10): cohort peers and the contact secret that
+  // gates this node's door, both passed through UNREAD. Their grammar and encoding are the
+  // transport's, which checks them at its load, so a replacement transport can spell them
+  // its own way without a new binary. The secret comes from a file to keep it out of `ps`;
+  // trimming the file's line ending is file handling, not parsing.
   const peers = list(args.get("peers"));
   const transportConfig: JsonObject = {};
-  if (peers.length > 0) transportConfig.peers = peersConfig(peers);
+  if (peers.length > 0) transportConfig.peers = peers;
   if (contactSecretPath !== undefined) {
-    transportConfig.contactSecret = toHex(loadHex32(host, contactSecretPath, "--contact-secret"));
+    transportConfig.contactSecret = dec.decode(mustRead(host, contactSecretPath, "--contact-secret")).trim();
   }
 
   const { shell, transport: net } = await host.standUp({

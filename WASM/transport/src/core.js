@@ -51,22 +51,28 @@ const connsPerPeer = Math.max(1, policy("connsPerPeer"));
 const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
-// Validate the guest-owned address book during load. Missing peer secrets mean open nodes
-// (§12.10).
+/** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is THAT
+ *  peer's contact secret (absent: an open peer) and `dest` is what `link/open` carries,
+ *  `scheme://host:port[/path]`, a bare `host:port` meaning tcp. The grammar is this
+ *  program's — the host passes the strings through unread (§12.8), so a replacement
+ *  transport spells its addresses its own way. Checked at load, so a typo fails the load
+ *  rather than reading as a peer that never answers. */
+function peerRef(spec) {
+  const bad = (why) => new Error(`transport: config peers entry ${JSON.stringify(spec)}: ${why}`);
+  if (typeof spec !== "string" || spec.indexOf("@") < 0) throw bad("want pk[.secret]@dest");
+  const at = spec.indexOf("@");
+  const [pk, secret, ...extra] = spec.slice(0, at).trim().toLowerCase().split(".");
+  if (!hex32(pk) || extra.length > 0) throw bad("the key must be 64 hex characters");
+  if (secret !== undefined && !hex32(secret)) throw bad("the contact secret must be 64 hex characters");
+  const where = spec.slice(at + 1).trim();
+  const dest = where.includes("://") ? where : "tcp://" + where;
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^\s:/[\]]+):(\d{1,5})(?:\/\S*)?$/i.exec(dest);
+  if (!m || Number(m[1]) < 1 || Number(m[1]) > 65535) throw bad("the destination must be [scheme://]host:port[/path]");
+  return { peer: fromHex(pk), secret: secret === undefined ? ZERO32 : fromHex(secret), dest };
+}
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
-const cohort = configuredPeers.map((p) => {
-  if (!p || !hex32(p.peerId)) throw new Error("transport: config peers[].peerId must be 64 lowercase hex characters");
-  if (p.contactSecret !== undefined && !hex32(p.contactSecret)) {
-    throw new Error("transport: config peers[].contactSecret must be 64 lowercase hex characters");
-  }
-  if (p.dest !== undefined && typeof p.dest !== "string") throw new Error("transport: config peers[].dest must be a string");
-  return {
-    peer: fromHex(p.peerId),
-    secret: p.contactSecret === undefined ? ZERO32 : fromHex(p.contactSecret),
-    dest: p.dest ?? "",
-  };
-});
+const cohort = configuredPeers.map(peerRef);
 // These policies and their defaults belong to this signed program. LOCAL is the
 // installation's general override path; APP is the author's signed fallback.
 const maxFrameBytes = policy("maxFrameBytes");

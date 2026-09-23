@@ -73,7 +73,36 @@ async function testGuestSeam() {
     // what a cipher suite is.
     const prim = (name, argBytes) => seam(`crypto/${name}`, argBytes);
     const msg = U(1, 2, 3, 4, 5);
-    assert(bytesEqual(await prim("blake2b-256", msg), sodium.crypto_generichash(32, msg)), "crypto/blake2b-256, by name");
+    // crypto/blake2b takes RFC 7693's whole interface — [outLen][keyLen][key][msg] — and
+    // the AEAD names take associated data (RFC 8439): a standard protocol must be buildable
+    // on them without a host release (tests/noise-vectors.js runs one).
+    assert(bytesEqual(await prim("blake2b", concatBytes([U(32, 0), msg])), sodium.crypto_generichash(32, msg, null)), "crypto/blake2b, by name");
+    const hex = (b) => Buffer.from(b).toString("hex");
+    assertEqual(hex(await prim("blake2b", concatBytes([U(64, 0), new TextEncoder().encode("abc")]))),
+      "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
+      "crypto/blake2b: RFC 7693 Appendix A, 64-byte output");
+    assertEqual(hex(await prim("blake2b", concatBytes([U(64, 64), Uint8Array.from({ length: 64 }, (_, i) => i)]))),
+      "10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568",
+      "crypto/blake2b: BLAKE2's keyed KAT, first entry");
+    for (const bad of [U(), U(0, 0), U(65, 0), U(32, 65), U(32, 8, 1, 2)]) {
+      let refused = false;
+      try { await prim("blake2b", bad); } catch { refused = true; }
+      assert(refused, `crypto/blake2b refuses the mis-framed call [${[...bad]}]`);
+    }
+    const npub = new Uint8Array(12).fill(7), aeadKey = new Uint8Array(32).fill(9), ad = U(1, 2, 3);
+    const aead = (adBytes, body) => {
+      const len = new Uint8Array(4); new DataView(len.buffer).setUint32(0, adBytes.length);
+      return concatBytes([npub, aeadKey, len, adBytes, body]);
+    };
+    const sealed = await prim("chacha20poly1305-ietf/seal", aead(ad, msg));
+    assert(bytesEqual(sealed, sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, aeadKey)),
+      "chacha20poly1305-ietf/seal binds its associated data exactly as libsodium does");
+    assert(bytesEqual((await prim("chacha20poly1305-ietf/open", aead(ad, sealed))).subarray(1), msg), "…and open takes it back");
+    assertEqual((await prim("chacha20poly1305-ietf/open", aead(U(1, 2, 4), sealed)))[0], 0,
+      "a different associated data does not open");
+    let shortAead = false;
+    try { await prim("chacha20poly1305-ietf/open", concatBytes([npub, aeadKey, U(0, 0, 0, 9), msg])); } catch { shortAead = true; }
+    assert(shortAead, "associated data longer than the call is mis-framed, not a failed open");
     // node/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
     // node/verify applies the SAME scope host-side, so a guest checks a signature by
     // naming the key, never by reconstructing the prefix the host owns.
@@ -123,7 +152,7 @@ async function testGuestSeam() {
     // primitive included — answers a Promise the guest awaits. A forgotten `await`
     // reads a Promise where bytes were expected for ALL names alike, which is why no
     // manifest field is needed to catch it any more.
-    assert(prim("blake2b-256", msg) instanceof Promise, "a catalog primitive answers a Promise like every name");
+    assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Promise, "a catalog primitive answers a Promise like every name");
     assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise");
     assert(prim("random", U(0, 0, 0, 1)) instanceof Promise, "crypto/random returns a Promise");
 
@@ -326,7 +355,7 @@ async function testGuestAbi() {
     assert(verifyTestBundle(sodium, mk({ requires: ["fs", "_backup"] })) !== null,
       "a host service and a local service id sit in the one requires list");
     let crypto = "";
-    try { verifyTestBundle(sodium, mk({ requires: ["crypto/blake2b-256"] })); }
+    try { verifyTestBundle(sodium, mk({ requires: ["crypto/blake2b"] })); }
     catch (e) { crypto = e.message; }
     assert(crypto.includes("host method"),
       `a local id in the ungated crypto/ namespace is refused, so it cannot shadow a host transform (got: ${crypto})`);
@@ -622,8 +651,8 @@ async function testSeamGating() {
   // nothing, so there is nothing to grant. A seam built for a bundle declaring NO
   // names still hashes.
   const timerOnly = mk(["timer"]);
-  assertEqual((await timerOnly("crypto/blake2b-256", U(1, 2))).length, 32,
-    "crypto/blake2b-256 resolves for a bundle declaring no crypto name — a pure transform is not a grant");
+  assertEqual((await timerOnly("crypto/blake2b", U(32, 0, 1, 2))).length, 32,
+    "crypto/blake2b resolves for a bundle declaring no crypto name — a pure transform is not a grant");
   threw = false;
   try { await timerOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
@@ -908,14 +937,16 @@ async function testModuleCallChargedToGuestBudget() {
 async function testPreviousAbiRefused() {
   console.log("Test: every host.call answers a Promise — no name sits on a sync line");
 
-  const NAMES = ["crypto/blake2b-256", "crypto/random"];
+  const NAMES = ["crypto/blake2b", "crypto/random"];
+  // A well-formed argument per name, so each probe settles by resolving.
+  const ARGS = [[32, 0, 0, 0], [0, 0, 0, 4]];
   // One byte per probed name: 1 when the un-awaited call handed back a thenable.
   const source = `
-    const names = ${JSON.stringify(NAMES)};
+    const names = ${JSON.stringify(NAMES)}, args = ${JSON.stringify(ARGS)};
     function handle() {
       const out = new Uint8Array(names.length);
       for (let i = 0; i < names.length; i++) {
-        const r = host.call(names[i], new Uint8Array(4));
+        const r = host.call(names[i], new Uint8Array(args[i]));
         out[i] = typeof r.then === "function" ? 1 : 0;
       }
       return out;
@@ -1106,9 +1137,30 @@ async function testOwnTurns() {
   console.log("  OK\n");
 }
 
+// ─── Test: a standard handshake is buildable on the host names (Noise XX vectors) ───
+// The host's crypto/ names must carry their algorithms' whole standard interface, or a
+// replacement transport stops being a bundle update (services/domains.ts). Published
+// Noise_XX vectors, replayed byte for byte through a seam that grants nothing — the same
+// script native/guestseam_test.go runs against the Go primitives.
+async function testNoiseVectors() {
+  console.log("Test: the published Noise XX vectors replay through the crypto/ names alone");
+  await import("./noise-vectors.js");
+  const { vectors } = JSON.parse(readFileSync(join(root, "tests", "fixtures", "noise-xx-vectors.json"), "utf8"));
+  const seam = withTestBudget(createGuestSeam({
+    platform: { sodium },
+    grants: { names: [], calls: TEST_CALLS, timers: TEST_TIMERS },
+    modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
+  }));
+  const { ran, failures } = await globalThis.runNoiseVectors((name, bytes) => seam(name, bytes), vectors);
+  assertEqual(ran, 2, "both vectors ran");
+  assertEqual(failures, [], "every handshake message, handshake hash and transport message matches");
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testGuestSeam();
+await testNoiseVectors();
 await testPolicy();
 await testSigningScopeFollowsSlot();
 await testGuestAbi();
