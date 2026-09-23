@@ -358,12 +358,15 @@ maps it once. Concealment defeats probing and flow attribution, not an observer 
 knows where to look.
 
 **A recorded msg1 can be replayed once.** Anyone who captures a valid msg1 can replay it and
-draw a msg2. They cannot open it — no ephemeral private key — so they learn only that
-something answered. A responder remembers the initiator's ephemeral key and stalls every
-later copy before promotion or asymmetric work, so the recording is worth one answer rather
-than one per copy sent. That memory is bounded and per-realm: a restart, or 4,096 further
-proved handshakes, makes an old recording good for one more. Closing it outright needs the
-first message to be challenge-bound, which costs a round trip; Noise has the same property.
+draw a msg2. They cannot open it — no ephemeral private key — but the answer itself says
+the holder of that contact secret is at the address replayed to, so a recording tracks the
+node across address changes. A responder remembers the initiator's ephemeral key and stalls
+every later copy before promotion or asymmetric work, so the recording is worth one answer
+rather than one per copy sent. That memory is bounded and per-realm: a restart, or 4,096
+further proved handshakes, makes an old recording good for one more. Closing it outright
+needs freshness in msg1 — a challenge (a round trip), a clock (WireGuard's timestamp) or a
+seen-set that survives restarts — and none is taken: this is the replay linkability Noise
+grades `XK` down for (§8.1).
 
 **The protocol is fingerprintable.** A cleartext `0x03` at offset 0 says "seedkernel". That
 identifies the protocol, not the peer, and hiding it would cost the self-describing format
