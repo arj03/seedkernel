@@ -1,4 +1,4 @@
-# Seedkernel: a sandboxed app runtime that grows from signed bundles
+# seedkernel: a sandboxed app runtime that grows from signed bundles
 
 Seedkernel runs signed apps in a sandbox (JavaScript or WebAssembly) across browsers, Node and a small native executable. It gives an app controlled access to storage and to authenticated, encrypted peer connections. Every app, the transport included, arrives as a signed bundle on top of a minimal host.
 
