@@ -5,8 +5,10 @@
 class Router {
   constructor(ownPubkey) {
     this.ownPubkey = ownPubkey;
-    // peerId → { links: Link[] (authenticated, routable), next: round-robin cursor }. A peer
-    // is here exactly while it holds a link, so this map IS the cohort `peers` reports.
+    // peerId → { links: Link[] (authenticated, routable), held: Link[] (tie-break losers
+    // the peer has yet to close, read but never routed to), next: round-robin cursor }. A
+    // peer is here exactly while it holds a routable link, so this map IS the cohort `peers`
+    // reports.
     this.pools = new Map();
   }
 
@@ -22,22 +24,32 @@ class Router {
   }
 
   // Install a freshly-authenticated link: the double-connect tie-break, and the up edge on
-  // a peer's first link. A link that loses the tie-break is closed instead.
+  // a peer's first link. A link that loses the tie-break is retired instead (`retire`).
   // The peer lint already ran at msg3/msg2 (`admits`, ake.js).
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
     const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed);
     if (rival) {
-      // A losing link's queue goes to the winner as it closes (core.js `forget`).
-      if (!this.canonicalKeep(link)) { link.close(); return; }
-      // Out of the pool before it closes, so nothing more is routed to a link on its way down.
+      if (!this.canonicalKeep(link)) { this.retire(pool, link); return; }
+      // Out of the pool before it retires, so nothing more is routed to it.
       pool.links.splice(pool.links.indexOf(rival), 1);
-      rival.close();
+      this.retire(pool, rival);
     }
     const up = !pool;
-    if (up) { pool = { links: [], next: 0 }; this.pools.set(peerId, pool); }
+    if (up) { pool = { links: [], held: [], next: 0 }; this.pools.set(peerId, pool); }
     pool.links.push(link);
     if (up) core.checkReady();
+  }
+
+  // Only the end that DIALED a losing link closes it. A dialer is authenticated at msg2 and
+  // sends behind msg3, before the far end has run this tie-break, so records may already be
+  // in flight on the loser; closing it from the accepting end would drop them unread. The
+  // dialer's goodbye follows everything it sent there, so the accepting end holds the link
+  // out of routing (`held`) and keeps reading until it arrives. A losing dial's queue goes
+  // to the winner as it closes (core.js `forget`).
+  retire(pool, loser) {
+    if (loser.weDialed) loser.close();
+    else pool.held.push(loser);
   }
 
   // Keep the link whose *dialer* is the lexicographically smaller identity. The two are
@@ -54,10 +66,17 @@ class Router {
     const pid = link.peerId;
     const pool = this.pools.get(pid);
     if (!pool) return;
+    const h = pool.held.indexOf(link);
+    if (h >= 0) { pool.held.splice(h, 1); return; }
     const i = pool.links.indexOf(link);
     if (i < 0) return;
     pool.links.splice(i, 1);
-    if (pool.links.length === 0) { this.pools.delete(pid); reqres.peerDown(pid); }
+    if (pool.links.length > 0) return;
+    // The winner went before the peer retired a held loser: that loser is now the only
+    // way to this peer, and the peer is still sending on it, so it routes again.
+    if (pool.held.length > 0) { pool.links = pool.held; pool.held = []; return; }
+    this.pools.delete(pid);
+    reqres.peerDown(pid);
   }
 }
 

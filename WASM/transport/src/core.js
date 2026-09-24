@@ -301,8 +301,9 @@ class Core {
 
   /** Learn (or re-learn) one peer: where to reach it and the secret its door gates on.
    *  An EMPTY `dest` is a peer we know of but cannot dial — an RTC peer, whose links arrive
-   *  through signaling — which is a real entry and not a missing one: it carries the contact
-   *  secret an inbound link needs without pretending we hold a route. */
+   *  through signaling — which is a real entry and not a missing one: it names a peer `send`
+   *  may address and `ready` waits for, without pretending we hold a route. Its secret goes
+   *  unread, since an RTC link opens under this node's own contact secret (RUNTIME §12.7). */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }

@@ -895,6 +895,41 @@ await test("TIE-BREAK: a dial that loses hands what it queued to the link that w
   assert(got !== null && got.length === 3 && got[2] === 3, "the queued request must be answered over the winning link");
 });
 
+await test("TIE-BREAK: records a losing dial sent behind msg3 are read, not dropped", async (keep) => {
+  // A dialer authenticates at msg2 and sends behind msg3, before the far end has run the
+  // tie-break. In a symmetric double connect the far end has already authenticated its own
+  // (winning) dial by then, so if it closed the loser on sight it would drop those records
+  // unread. Only the loser's dialer may close it; the accepting end reads until its goodbye.
+  let [ia, ib] = [generateKeyPair(), generateKeyPair()];
+  if (Buffer.compare(Buffer.from(ia.publicKey), Buffer.from(ib.publicKey)) < 0) [ia, ib] = [ib, ia];
+  // Stream pairs: a flush hands over several writes as ONE read, which only a framer splits.
+  const losing = wirePair({ stream: true });
+  losing[0].hold(); // A's msg1
+  const st = keep(await linked(losing, { identity: ia }, { identity: ib }));
+  await settle(50);
+  const winning = wirePair({ stream: true, addrA: "10.0.0.3", addrB: "10.0.0.4" });
+  winning[0].hold(); // B's msg1
+  openPair(st.B, st.A, winning); // B dials A, and wins
+  await settle(50);
+  winning[0].flush();
+  winning[0].hold(); // B's msg3 waits, so A has not yet seen the winner
+  await until(() => bUp(st), 4000, "B's dial");
+  const answer = st.A.request(st.B.peerId, PROTO, Uint8Array.of(1, 2, 3), 4000).then((r) => r, () => null);
+  await settle(20);
+  losing[0].flush();
+  losing[0].hold(); // A's msg3 and the request record behind it
+  await until(() => aUp(st), 4000, "A's dial");
+  await settle(50);
+  assert(losing[0].held.length === 2, `msg3 and the record must both be in flight (got ${losing[0].held.length})`);
+  losing[0].flush(); // B authenticates the loser only now, with its own dial already up
+  await settle(50);
+  winning[0].flush(); // A sees the winner and closes its losing dial
+  const got = await answer;
+  assert(got !== null && got.length === 3 && got[2] === 3, "the request sent on the losing link must be answered");
+  await until(async () => losing[0].dead, 4000, "the losing dial closed");
+  assert((await aUp(st)) && (await bUp(st)), "both ends must stay linked over the winner");
+});
+
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {
   const { deriveNodeKey } = await import("../build/services/subkeys.js");
   const master = new Uint8Array(32).fill(5);
