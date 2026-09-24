@@ -39,8 +39,10 @@ async function makeNode(ws = false, extraConfig = {}) {
   }));
   const transportOptions = {
     channels: new NodeChannelFactory(),
-    listen: { host: HOST, port: 0 },
-    ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
+    listen: [
+      { label: "tcp", host: HOST, port: 0 },
+      ...(ws ? [{ label: "ws", host: HOST, port: 0 }] : []),
+    ],
     bundle: transportBlob,
   };
   const transportConfig = { ...extraConfig };
@@ -72,7 +74,7 @@ const a = await makeNode();
 const b = await makeNode();
 const aNet = a.transport, bNet = b.transport;
 
-assert(aNet.port > 0 && bNet.port > 0, "both nodes bound real TCP listeners");
+assert(aNet.portOf("tcp") > 0 && bNet.portOf("tcp") > 0, "both nodes bound real TCP listeners");
 
 // Both nodes run the echo app, which also answers a GENERATOR request with a payload
 // far larger than the pre-auth cap (8 KiB) — it can only cross once the guest has raised
@@ -81,7 +83,7 @@ const BIG = 512 * 1024;
 
 // The listener's port is only known now, so the peer is taught to the running occupant
 // rather than named in its load config — the same `addr` op either path ends in.
-await addr(a, b.peerId, `tcp://${HOST}:${bNet.port}`);
+await addr(a, b.peerId, `tcp://${HOST}:${bNet.portOf("tcp")}`);
 await ready(a, 4000);
 assert((await linkedPeers(a)).includes(b.peerId), "the AKE completed over a real socket");
 
@@ -106,7 +108,7 @@ assert(true, "closing the dialing node did not wedge the listener");
 await bNet.close();
 
 // ── the same thing over RFC 6455 ──────────────────────────────────────────────
-// The browser edge, minus the browser: a node dialing another's --ws-listen endpoint runs
+// The browser edge, minus the browser: a node dialing another's `ws`-labelled listener runs
 // the guest's WsFramer at BOTH ends — client half masking its frames, server half computing
 // the accept value through the bundle's own ws.wasm and refusing unmasked client frames.
 // None of it is host code.
@@ -115,11 +117,12 @@ console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle modu
 const c = await makeNode(true);
 const d = await makeNode(true);
 const cNet = c.transport, dNet = d.transport;
-assert(dNet.wsPort > 0, "the WS listener bound");
+assert(dNet.portOf("ws") > 0, "the WS listener bound");
 
 // The `ws://` scheme is the whole difference: the destination string sends the host's
-// factory at the same kind of TCP socket, which declares a different codec on it.
-await addr(c, d.peerId, `ws://${HOST}:${dNet.wsPort}`);
+// factory at the same kind of TCP socket, which declares a different codec on it. The path
+// rides the client's request line, as a reverse proxy or a relay room would need it.
+await addr(c, d.peerId, `ws://${HOST}:${dNet.portOf("ws")}/cohort`);
 await ready(c, 4000);
 assert((await linkedPeers(c)).includes(d.peerId), "the AKE completed through the WS upgrade");
 

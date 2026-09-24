@@ -43,7 +43,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.__policy = JSON.stringify({ authors: [%q] });
 		globalThis.__setup = (async () => {
 		  const a = await standUp({ dir: __dir, policyJson: __policy, identity: idA,
-		    transport: { listen: { host: "127.0.0.1", port: 0 } } });
+		    transport: { listen: [{ label: "tcp", host: "127.0.0.1", port: 0 }] } });
 		  const b = await standUp({ dir: __dir, policyJson: __policy, identity: idB, transport: {} });
 		  globalThis.netA = a.transport;
 		  globalThis.netB = b.transport;
@@ -76,10 +76,10 @@ func TestAsyncNetInitiator(t *testing.T) {
 		t.Fatal("loadProbe:", err)
 	}
 
-	// Bind A's listener (sets netA.port), then point B at A.
+	// Bind A's listener (sets its port), then point B at A.
 	awaitOK(t, "start", "(async () => { await __setup; globalThis.__nodeBApp = await __nodeB.shell.install(__probe); await netA.start(); await __nodeA.shell.install(__probe); return new Uint8Array(0); })()", 5*time.Second)
 	// Eval would block on the promise without advancing the event loop.
-	awaitOK(t, "addr", `teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.port)`, 5*time.Second)
+	awaitOK(t, "addr", `teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"))`, 5*time.Second)
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and
 	// await the response. The await is the whole point — it suspends until the host

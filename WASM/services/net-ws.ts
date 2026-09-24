@@ -1,12 +1,12 @@
 // The browser end of the socket seam (README §12.6): a `ChannelFactory` that dials
 // platform WebSockets. A browser cannot open raw TCP, and WebRTC (net-rtc.ts) needs a
 // signaling relay plus STUN; when a node is directly reachable, the simplest path is a
-// WebSocket straight at its --ws-listen endpoint.
+// WebSocket straight at a listener whose label its transport reads as WebSocket.
 //
-// The peer this factory dials is named by `link/open`, out of the address book the
-// transport GUEST holds — so which peers, when, and how many times are all its signed
-// policy (`connsPerPeer`), not this file's. Everything above the socket — the handshake,
-// the record layer, the routing — is the transport bundle's, identical to the TCP path.
+// Every destination this factory dials is named by `link/open` — a peer out of the address
+// book the transport GUEST holds, or the relay its WebRTC signaling rides — so what, when,
+// and how many times are all its signed policy, not this file's. Everything above the
+// socket — the handshake, the record layer, the routing — is the transport bundle's.
 // The WebSocket global is touched only inside `connect` (or an injected factory), so
 // importing it where WebSocket is absent is safe.
 import type { ChannelFactory, ListenAddress, RawLink } from "./socket-seam.js";
@@ -43,12 +43,8 @@ export class WsNetwork implements ChannelFactory {
 
   /** A browser binds nothing: every inbound link here is dialed by the far end at us as
    *  a client, never accepted by this factory. */
-  async listen(
-    _tcp: ListenAddress | undefined,
-    _ws: ListenAddress | undefined,
-    _onAccept: (channel: RawLink) => void,
-  ): Promise<{ port: number; wsPort: number }> {
-    return { port: 0, wsPort: 0 };
+  async listen(addrs: readonly ListenAddress[]): Promise<number[]> {
+    return addrs.map(() => 0);
   }
 
   /** Nothing to release: the driver closes the channels it holds. */

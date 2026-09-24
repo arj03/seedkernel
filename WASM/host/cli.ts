@@ -12,6 +12,7 @@ import { OpArgs, writeOp } from "../services/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
+import type { ListenAddress } from "../services/socket-seam.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted. One value on every target, so
@@ -25,7 +26,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
  *  node that refuses ordinary apps — which looks exactly like a
  *  node whose policy is doing its job. The allowlist makes the typo say so. */
 const FLAGS = new Set([
-  "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
+  "policy", "dir", "key", "listen", "peers", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
@@ -116,6 +117,23 @@ export function parseArgs(argv: string[], known: ReadonlySet<string> = FLAGS): M
 /** A comma-separated flag as a list, empty when the flag is absent. */
 function list(v: string | undefined): string[] {
   return v === undefined ? [] : v.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** The label a `--listen` entry without one gets. Passed to the transport unread like any
+ *  other label; the shipped transport reads every label but `ws` as length framing. */
+export const DEFAULT_LISTEN_LABEL = "tcp";
+
+/** `--listen [label=]host:port,…`: one listener per entry, its label handed to the transport
+ *  with every link it accepts. The label is checked for shape only — what it means is the
+ *  transport's — so an address can never be read as a label or the other way round. */
+export function parseListen(v: string): ListenAddress[] {
+  return list(v).map((entry) => {
+    const eq = entry.indexOf("=");
+    const label = eq < 0 ? DEFAULT_LISTEN_LABEL : entry.slice(0, eq);
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(label)) throw new Error(`--listen: bad label in ${JSON.stringify(entry)}`);
+    const at = parseHostPort(entry.slice(eq + 1), { defaultHost: "0.0.0.0", allowEphemeral: true });
+    return { label, ...at };
+  });
 }
 
 /** Read a file the operator named, failing with the flag rather than the errno — a
@@ -214,12 +232,13 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     throw new Error("--local-config requires --bundle so the configuration has one app scope");
   }
   // Transport-only flags on a node with no network would be read and silently dropped.
-  const network = args.has("listen") || args.has("ws-listen") || args.has("peers");
+  const network = args.has("listen") || args.has("peers");
   for (const flag of ["transport", "contact-secret"]) {
     if (args.has(flag) && !network) {
-      throw new Error(`--${flag} requires --listen, --ws-listen or --peers, which enable the network it configures`);
+      throw new Error(`--${flag} requires --listen or --peers, which enable the network it configures`);
     }
   }
+  const listen = args.has("listen") ? parseListen(args.get("listen")!) : [];
   // Checked here, not at the load, so a malformed file fails before a node is listening.
   let localConfig: JsonObject | undefined;
   if (args.has("local-config")) {
@@ -246,12 +265,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     identity: key,
     // The network flags are what enable a network; the rest of these configure it.
     transport: network ? {
-      listen: args.has("listen")
-        ? parseHostPort(args.get("listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
-        : undefined,
-      wsListen: args.has("ws-listen")
-        ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
-        : undefined,
+      listen,
       bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
       config: transportConfig,
     } : false,
@@ -272,8 +286,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  if (net?.port) host.log(`  tcp    listening on :${net.port}`);
-  if (net?.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
+  for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
 
   // Operator remedies (§12.5), deliberately BEFORE the bundle: a node booting with both
   // should never briefly install what it was told to refuse. --revoke is the whole remedy
@@ -323,7 +336,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   const close = () => shell.close();
-  if (!net?.port && !net?.wsPort) return { serving: false, close };
+  if (!net?.listening.some((l) => l.port > 0)) return { serving: false, close };
   // A serving node with an app loaded also answers for the cohort: inbound requests route
   // by protocol id to whichever app claims it, answered from its own confined realm — no
   // app-specific host code, no second dispatch (§12.8, §12.10). Nothing to arm: the load

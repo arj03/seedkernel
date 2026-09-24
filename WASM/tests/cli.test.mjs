@@ -50,7 +50,7 @@ throws(() => parseHex32("ab".repeat(64), "--key"), "a 64-byte ed25519 secret key
 console.log("\n— the operator flow —");
 
 /** A CliHost over in-memory files and a stubbed node, recording everything printed. */
-function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true } = {}) {
+function fakeHost(argv, { listening = [], shell = {}, linkAvailable = true } = {}) {
   const lines = [];
   const written = new Map();
   const host = {
@@ -85,7 +85,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
-      }, transport: cfg.transport ? { port, wsPort } : null };
+      }, transport: cfg.transport ? { listening } : null };
     },
   };
   return host;
@@ -123,7 +123,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
 }
 
 // Network activation is independent of policy and requires an explicit network flag.
-for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--ws-listen", "127.0.0.1:0"], ["--peers", ""]]) {
+for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1:0"], ["--peers", ""]]) {
   const host = fakeHost(["--key", join(work, "network.key"), ...flags]);
   await runCli(host);
   ok(Boolean(host.stood.transport) === (flags.length > 0), `network opt-in: ${JSON.stringify(flags)}`);
@@ -306,13 +306,25 @@ for (const flag of ["--transport", "--contact-secret"]) {
   ok(host.closed === true, "and the shell is closed");
 }
 {
-  const host = fakeHost(["--key", join(work, "s1.key"), "--listen", "127.0.0.1:0"], { port: 7777 });
+  const host = fakeHost(["--key", join(work, "s1.key"), "--listen", "127.0.0.1:0,ws=:7001"],
+    { listening: [{ label: "tcp", host: "127.0.0.1", port: 7777 }, { label: "ws", host: "0.0.0.0", port: 7001 }] });
   const r = await runCli(host);
   ok(r.serving === true, "a bound port ⇒ serving");
-  ok(host.stood.transport.listen.host === "127.0.0.1" && host.stood.transport.listen.port === 0,
-    "--listen is parsed as host:port");
+  const [plain, ws] = host.stood.transport.listen;
+  ok(plain.label === "tcp" && plain.host === "127.0.0.1" && plain.port === 0,
+    "--listen is parsed as host:port, labelled tcp when it names no label");
+  ok(ws.label === "ws" && ws.host === "0.0.0.0" && ws.port === 7001,
+    "a label= prefix is the listener's label, and a bare :port binds every interface");
   ok(host.lines.includes("  tcp    listening on :7777"), "the console reports the port actually bound");
+  ok(host.lines.includes("  ws     listening on :7001"), "one line per listener, under its label");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
+}
+// A label is checked for shape, so an address can never be read as a label.
+{
+  const host = fakeHost(["--key", join(work, "s2.key"), "--listen", "b@d=127.0.0.1:0"]);
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.includes("bad label"), "a malformed --listen label is refused by name");
 }
 // --peers with nothing claiming the transport's service id says what is wrong rather than
 // letting the flag pass silently on a node with no network.

@@ -29,9 +29,6 @@ const { DEFAULT_MEMORY_FS_MAX_BYTES } = await imp("build/services/fs-memory.js")
 const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES,
   MAX_NODE_OUTBOUND_QUEUE_BYTES, MAX_INBOUND_HOLD_BYTES }
   = await imp("build/services/net-limits.js");
-const { MAX_QUEUED_SIGNAL_BYTES, MAX_QUEUED_SIGNALS, MAX_UNESTABLISHED_PEERS,
-  MAX_PENDING_ICE_BYTES, MAX_SDP_BYTES }
-  = await imp("build/services/net-rtc.js");
 const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
@@ -438,20 +435,13 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
     + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, over every link
     + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — native staging and the driver window hold the
-  // same read at once, by design (native/sock.go)
-    + MAX_QUEUED_SIGNAL_BYTES       // §12.6 — the WebRTC signaling lane, one per node
-    + MAX_UNESTABLISHED_PEERS * MAX_PENDING_ICE_BYTES // and one ICE queue per speculative peer
+  // same read at once, by design (native/sock.go). WebRTC negotiation rides these same
+  // link windows (§12.7): it has no owner of its own to add.
     + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
   // Not circular: the sum is measured against a real machine, so growing any owner has to
   // be a deliberate choice rather than a number nobody added up.
   ok(nodeMemoryCeiling <= 2 * 1024 * 1024 * 1024,
     "the summed worst case of every node-scoped owner still fits a modest machine");
-  // Every window in the sum is a byte bound with a count companion or the reverse. The
-  // signaling lane is the one whose count admits a 256 KiB message, so it is checked
-  // directly: a count alone there would put the node's largest single allowance — bigger
-  // than a whole confined heap — behind a bound nobody wrote down.
-  ok(MAX_QUEUED_SIGNAL_BYTES < MAX_QUEUED_SIGNALS * MAX_SDP_BYTES,
-    "the signaling lane's byte companion binds before its count does");
 }
 
 console.log("\n§12.3 — guest-created invocation roots have a bounded clock share");
@@ -957,7 +947,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
     channel.close = (graceful) => { ownerClosed = true; closeChannel(graceful); };
     const channels = {
       connect: () => channel,
-      listen: async () => ({ port: 0, wsPort: 0 }),
+      listen: async (addrs) => addrs.map(() => 0),
       close() {},
     };
     const driver = new TransportHost({ channels, ...limits });
@@ -1070,7 +1060,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
   const parentDriver = new TransportHost({
     channels: {
       connect: () => parentLinks[parentNext++],
-      listen: async () => ({ port: 0, wsPort: 0 }),
+      listen: async (addrs) => addrs.map(() => 0),
       close() {},
     },
     maxOutboundBytes: 6,

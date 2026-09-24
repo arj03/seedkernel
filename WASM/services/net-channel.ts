@@ -23,8 +23,8 @@ export interface MessageTransport {
 
 /** RawLink over any whole-message binary transport: a WebSocket (net-ws) and RtcChannel
  *  (net-rtc) are both this class — the transport's own event wiring is identical, so it is
- *  written once here. A string frame is never ours (a host may multiplex renegotiation
- *  signaling over the same channel); only binary frames are transport messages. */
+ *  written once here. The seam carries bytes, so only binary frames are delivered; a
+ *  string frame is dropped rather than re-encoded. */
 export class MessageChannel {
   private onMsg: ((bytes: Uint8Array) => void) | null = null;
   private onCls: (() => void) | null = null;

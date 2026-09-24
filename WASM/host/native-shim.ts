@@ -10,7 +10,7 @@ import { parseDest } from "../services/peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
 import { CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
-import { LISTENER, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
+import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
@@ -322,10 +322,8 @@ const channels: ChannelFactory = {
       return null;
     return netConnectRaw(d.host, d.port);
   },
-  listen: (tcp, ws, onAccept) => Promise.resolve({
-    port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(s, { listener: LISTENER.TCP })) : 0,
-    wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(s, { listener: LISTENER.WS })) : 0,
-  }),
+  listen: (addrs, onAccept) => Promise.resolve(addrs.map((a) =>
+    netListenRaw(a.host, a.port, (s) => onAccept(s, { listener: a.label })))),
   // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
   close: () => { netCloseListeners(); },
 };

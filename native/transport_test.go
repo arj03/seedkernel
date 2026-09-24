@@ -26,7 +26,7 @@ import (
 // assembling the stack a second way.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
-	runTwoNode(t, "ws", "wsPort", `wsListen: { host: "127.0.0.1", port: 0 },`)
+	runTwoNode(t, "ws", `portOf("ws")`, `listen: [{ label: "ws", host: "127.0.0.1", port: 0 }],`)
 }
 
 // TestNativeAcceptedLinksShareRemoteSourceBudget proves the native accept bridge carries
@@ -40,7 +40,7 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 		  globalThis.__sourceCapNode = await standUp({
 		    dir: __dir,
 		    identity: sodium.crypto_sign_keypair(),
-		    transport: { listen: { host: "127.0.0.1", port: 0 } },
+		    transport: { listen: [{ label: "tcp", host: "127.0.0.1", port: 0 }] },
 		  });
 		  return new Uint8Array(0);
 		};
@@ -55,7 +55,7 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 		t.Fatal("start:", err)
 	}
 	defer func() { _, _ = callRealm("__stopSourceCapTest", 5*time.Second) }()
-	port, err := strconv.Atoi(evalString(t, "String(__sourceCapNode.transport.port)"))
+	port, err := strconv.Atoi(evalString(t, "String(__sourceCapNode.transport.portOf('tcp'))"))
 	if err != nil || port == 0 {
 		t.Fatalf("listener port = %d, err = %v", port, err)
 	}

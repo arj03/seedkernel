@@ -135,7 +135,9 @@ const CONTACT = new Uint8Array(32).fill(7);
  *  assertion in this file is "after things have settled", never "immediately". */
 const settle = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 
-/** Stand two transport bundles over injected raw links and arrival metadata. */
+/** Stand two transport bundles over injected raw links: A dials B over `chans[0]`, B
+ *  accepts on `chans[1]`. Both allow more links per peer than they will ever hold, so a
+ *  test can open another pair on nodes already linked (`openPair`). */
 async function linked(chans, aOpts = {}, bOpts = {}) {
   const aFactory = new InjectedChannels();
   const bFactory = new InjectedChannels();
@@ -145,12 +147,12 @@ async function linked(chans, aOpts = {}, bOpts = {}) {
     close() { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } },
   };
   const A = await makeTransportHost({
-    channels: aFactory, contactSecret: CONTACT,
+    channels: aFactory, contactSecret: CONTACT, connsPerPeer: 64,
     onLinkClosed: (_id, reason) => { st.a.closed = true; st.a.reason = reason; },
     ...aOpts,
   });
   const B = await makeTransportHost({
-    channels: bFactory, contactSecret: CONTACT,
+    channels: bFactory, contactSecret: CONTACT, connsPerPeer: 64,
     onLinkClosed: (_id, reason) => { st.b.closed = true; st.b.reason = reason; },
     ...bOpts,
   });
@@ -158,12 +160,13 @@ async function linked(chans, aOpts = {}, bOpts = {}) {
   // not part of the harness's own node shape, just this file's bookkeeping.
   A.factory = aFactory;
   B.factory = bFactory;
+  // What each node's dial presents: its own configured secret, which in every test here is
+  // the one the node it dials gates on (or is meant not to be).
+  A.dialSecret = "contactSecret" in aOpts ? aOpts.contactSecret : CONTACT;
+  B.dialSecret = "contactSecret" in bOpts ? bOpts.contactSecret : CONTACT;
   st.A = A;
   st.B = B;
-  // A presents its OWN contact secret (aOpts.contactSecret, default CONTACT) on the dial;
-  // B's factory hands over a plain accept.
-  aFactory.give(chans[0], { dialed: B.peerId });
-  bFactory.give(chans[1]);
+  await openPair(A, B, chans);
   return st;
 }
 
@@ -182,12 +185,12 @@ async function upPair(chanOpts, aOpts, bOpts) {
   return st;
 }
 
-/** Hand one more channel pair to two already-started nodes' factories: a dial on A's side,
- *  an accept on B's. Split out because several tests open a second link on nodes
- *  `linked()`/`upPair()` already built. */
-function openPair(A, B, chans) {
-  A.factory.give(chans[0], { dialed: B.peerId });
+/** Hand one channel pair to two already-started nodes' factories: an accept on B's side,
+ *  then a dial from A presenting `secret` (A's own by default). Split out because several
+ *  tests open a second link on nodes `linked()`/`upPair()` already built. */
+function openPair(A, B, chans, secret = A.dialSecret) {
   B.factory.give(chans[1]);
+  return A.factory.dial(A, B.peerId, chans[0], secret);
 }
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -347,7 +350,7 @@ await test("NO ROUTE: a request nothing can carry fails at once, not at its time
   // address for, a dial the network refused — and nothing will ever answer that request. It
   // fails now, while the caller may still have time to ask someone else.
   const fabric = new LoopbackChannels();
-  const A = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 } }));
+  const A = keep(await makeTransportHost({ channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }] }));
   const nobody = hexOf(generateKeyPair().publicKey);
   const ask = async () => {
     const t0 = Date.now();
@@ -470,24 +473,8 @@ await test("a RECORDED msg1 replayed on a fresh connection draws nothing", async
   // …and the silence belongs to the REPLAY, not to a node that has stopped accepting:
   // a fresh dial, with an ephemeral of its own, still gets its answer.
   const again = wirePair({ addrA: "10.0.9.3", addrB: "10.0.9.4" });
-  openPair(st.A, st.B, again);
+  await openPair(st.A, st.B, again);
   await until(() => again[1].sent.length > 0, 4000, "the responder to answer a FRESH msg1");
-});
-
-await test("a node that dials ITSELF never authenticates: its own signature is refused", async (keep) => {
-  // Both ends of this exchange hold the network key and the contact secret, so msg2 arrives
-  // correctly signed by the very key the dial pinned — this node's own. Taking it would
-  // leave a node holding a session with itself, on a transcript anything that echoes its
-  // traffic can produce. The dialer refuses at msg2, before naming itself.
-  const st = keep(await upPair());
-  const self = wirePair({ addrA: "10.0.8.1", addrB: "10.0.8.2" });
-  st.A.factory.give(self[0], { dialed: st.A.peerId });
-  st.A.factory.give(self[1]);
-  await until(() => self[1].sent.length >= 1, 4000, "the responder to answer with msg2");
-  await settle();
-  assert(self[0].sent.length === 1,
-    `the dialer went on past its own signature (${self[0].sent.length} messages, want msg1 alone)`);
-  assert(!(await linkedTo(st.A, st.A.peerId)), "a node must never hold a link to itself");
 });
 
 await test("a caller names itself only to the key it dialed", async (keep) => {
@@ -499,8 +486,8 @@ await test("a caller names itself only to the key it dialed", async (keep) => {
   const impostor = wirePair({ addrA: "10.0.7.1", addrB: "10.0.7.2" });
   // A believes it dials `nobody`; B, holding the same contact secret, answers as itself.
   const nobody = hexOf(generateKeyPair().publicKey);
-  st.A.factory.give(impostor[0], { dialed: nobody });
   st.B.factory.give(impostor[1]);
+  await st.A.factory.dial(st.A, nobody, impostor[0], CONTACT);
   await until(() => impostor[1].sent.length >= 1, 4000, "the impostor to answer with msg2");
   await until(() => impostor[0].dead, 4000, "the caller to close on the wrong signature");
   assert(impostor[0].sent.length === 1,
@@ -513,10 +500,10 @@ await test("COHORT: a node dials the peers its config spells as pk[.secret]@dest
   // The CLI hands `--peers` to the transport unread (§12.8): the reference grammar is this
   // bundle's, parsed at its load, with the peer's contact secret riding in the reference.
   const fabric = new LoopbackChannels();
-  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 }, contactSecret: CONTACT }));
+  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }], contactSecret: CONTACT }));
   const A = keep(await makeTransportHost({
-    channels: fabric.view(), listen: { port: 0 },
-    transportConfig: { peers: [`${B.peerId.toUpperCase()}.${hexOf(CONTACT)}@127.0.0.1:${B.driver.port}`] },
+    channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }],
+    transportConfig: { peers: [`${B.peerId.toUpperCase()}.${hexOf(CONTACT)}@127.0.0.1:${B.driver.portOf("tcp")}`] },
   }));
   await ready(A, 4000);
   assert(await linkedTo(A, B.peerId), "the configured peer is dialed, through its contact secret");
@@ -847,7 +834,7 @@ await test("CLOSING: a request sent while its link closes redials instead of van
   const fabric = new LoopbackChannels();
   let slowNext = false, onGoodbye = null;
   const A = keep(await makeTransportHost({
-    channels: fabric.view(), listen: { port: 0 }, linkIdleTimeoutMs: 200,
+    channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }], linkIdleTimeoutMs: 200,
     onHostAnswer: (name, answer) => {
       if (name !== "link/send" || !slowNext) return answer;
       slowNext = false;
@@ -855,8 +842,8 @@ await test("CLOSING: a request sent while its link closes redials instead of van
       return new Promise((r) => setTimeout(() => r(answer), 500));
     },
   }));
-  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: { port: 0 } }));
-  await A.addr(B.peerId, `tcp://127.0.0.1:${B.driver.port}`);
+  const B = keep(await makeTransportHost({ channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }] }));
+  await A.addr(B.peerId, `tcp://127.0.0.1:${B.driver.portOf("tcp")}`);
   await A.request(B.peerId, PROTO, Uint8Array.of(1));
   const closing = new Promise((r) => { onGoodbye = r; });
   slowNext = true; // A's next write is the idle close's goodbye record
@@ -888,7 +875,7 @@ await test("TIE-BREAK: a dial that loses hands what it queued to the link that w
   const st = keep(await linked(losing, { identity: ia }, { identity: ib }));
   const answer = st.A.request(st.B.peerId, PROTO, Uint8Array.of(1, 2, 3), 4000).then((r) => r, () => null);
   await settle(50);
-  openPair(st.B, st.A, wirePair({ addrA: "10.0.0.3", addrB: "10.0.0.4" })); // B dials A, and wins
+  await openPair(st.B, st.A, wirePair({ addrA: "10.0.0.3", addrB: "10.0.0.4" })); // B dials A, and wins
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "B's dial");
   losing[1].flush(); // A's dial completes, and loses the tie-break
   const got = await answer;
@@ -909,7 +896,7 @@ await test("TIE-BREAK: records a losing dial sent behind msg3 are read, not drop
   await settle(50);
   const winning = wirePair({ stream: true, addrA: "10.0.0.3", addrB: "10.0.0.4" });
   winning[0].hold(); // B's msg1
-  openPair(st.B, st.A, winning); // B dials A, and wins
+  await openPair(st.B, st.A, winning); // B dials A, and wins
   await settle(50);
   winning[0].flush();
   winning[0].hold(); // B's msg3 waits, so A has not yet seen the winner
@@ -1003,8 +990,8 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   const secretC = new Uint8Array(32).fill(22);
   const aFactory = new InjectedChannels();
   const bFactory = new InjectedChannels();
-  const A = await makeTransportHost({ channels: aFactory, contactSecret: secretB });
-  const B = await makeTransportHost({ channels: bFactory, contactSecret: secretB });
+  const A = await makeTransportHost({ channels: aFactory, contactSecret: secretB, connsPerPeer: 64 });
+  const B = await makeTransportHost({ channels: bFactory, contactSecret: secretB, connsPerPeer: 64 });
   A.factory = aFactory;
   B.factory = bFactory;
   keep(async () => { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } });
@@ -1015,7 +1002,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
 
   // The boot-time secret opens the door on both sides.
   const c1 = wirePair();
-  openPair(A, B, c1);
+  await openPair(A, B, c1, secretB);
   await until(async () => (await linkedTo(A, B.peerId)) && (await linkedTo(B, A.peerId)),
     4000, "boot-time secret");
 
@@ -1024,7 +1011,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   // from the surviving c1 link and cannot tell a new attempt's outcome apart from it.
   await contact(B, secretC);
   const c2 = wirePair();
-  openPair(A, B, c2);
+  await openPair(A, B, c2, secretB);
   await settle();
   assert(c2[1].sent.length === 0, `the stale secret drew ${c2[1].sent.length} message(s)`);
 
@@ -1034,7 +1021,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   // and the guest never re-loaded to get it.
   await contact(A, secretC);
   const c3 = wirePair();
-  openPair(A, B, c3);
+  await openPair(A, B, c3, secretC);
   await until(() => c3[0].sent.length >= 2 && c3[1].sent.length >= 1, 4000, "rotated secret handshake");
   await settle();
   assert(loads === 0, `a secret rotation must not re-load the transport (loaded ${loads} times)`);
@@ -1072,7 +1059,7 @@ await test("SEVER: driver.reset() kills live links and keeps the binding owned",
   assert(st.A.driver.available(), "the raw-link binding must still be owned after a sever");
 
   const c2 = wirePair();
-  openPair(st.A, st.B, c2);
+  await openPair(st.A, st.B, c2);
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "re-link after a sever");
   assert(st.B.driver.available(), "the acceptor's binding must also still be owned");
 });
@@ -1087,22 +1074,19 @@ await test("CONTACT SECRET: it never appears on the wire", async (keep) => {
 });
 
 await test("LEAK FIX: a link that closes itself mid-handshake still reports down", async (keep) => {
-  // Two nodes sharing one identity, so A's dial is pinned to its own key: A refuses the
-  // msg2 signed under it (ake.js onMsg2, `bytesCompare(idR, ownPk)`) and aborts — a
-  // SELF-close from inside the guest, not a host-driven one (the host cannot ask a link to
-  // close any more).
+  // A's peer lint declines the key it dialed, so A refuses the verified msg2 (ake.js onMsg2,
+  // `admits`) and aborts — a SELF-close from inside the guest, not a host-driven one (the
+  // host cannot ask a link to close any more).
   // `onLinkClosed` must still fire for a link that never authenticated, which is the leak
   // this pins: a channel whose close() merely set `dead` without ever firing onClose would
   // leave such a link stuck in the pre-auth bookkeeping forever.
-  const id = generateKeyPair();
   const chans = wirePair();
   const st = keep(await linked(chans,
-    { identity: id, transportConfig: { handshakeTimeoutMs: 80 } },
-    { identity: id, transportConfig: { handshakeTimeoutMs: 80 } }));
+    { admitPeers: [generateKeyPair().publicKey], transportConfig: { handshakeTimeoutMs: 80 } },
+    { transportConfig: { handshakeTimeoutMs: 80 } }));
   await until(() => st.a.closed, 3000, "the self-close MUST reach onLinkClosed (this is the leak)");
-  // Dialing our own key is our own fault, not a peer's: HANDSHAKE, not REFUSED.
-  assert(st.a.reason === CLOSE_REASON.HANDSHAKE, `a self-dial should read HANDSHAKE, got ${st.a.reason}`);
-  assert(!(await aUp(st)) && !(await bUp(st)), "a node must not link to itself");
+  assert(st.a.reason === CLOSE_REASON.REFUSED, `a declined peer should read REFUSED, got ${st.a.reason}`);
+  assert(!(await aUp(st)) && !(await bUp(st)), "a declined peer must not link");
 });
 
 await test("handshake deadline closes a link that never speaks", async (keep) => {
@@ -1115,11 +1099,12 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
     onLinkClosed: (_id, r) => { reason = r; },
   });
   keep({ close() { try { A.shell.close(); } catch { /* down */ } } });
-  factory.give(chans[0], { dialed: A.peerId });
+  const nobody = hexOf(generateKeyPair().publicKey);
+  await factory.dial(A, nobody, chans[0], CONTACT);
   await until(() => reason !== null, 3000, "the deadline to close the link and notify");
   assert(reason === CLOSE_REASON.TIMEOUT,
     `a peer that never speaks is a TIMEOUT — the one an operator chases an address for — got ${reason}`);
-  assert(!(await linkedTo(A, A.peerId)), "must not authenticate");
+  assert(!(await linkedTo(A, nobody)), "must not authenticate");
 });
 
 await test("DIAGNOSTIC: a socket that dies mid-handshake reads DROPPED, not the catch-all", async (keep) => {

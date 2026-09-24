@@ -93,7 +93,7 @@ const netBenchHarness = `
 	globalThis.__benchPolicy = JSON.stringify({ authors: [%q] });
 	globalThis.__netSetup = (async () => {
 	  const a = await standUp({ dir: __dir, policyJson: __benchPolicy, identity: idA,
-	    transport: { listen: { host: "127.0.0.1", port: 0 } } });
+	    transport: { listen: [{ label: "tcp", host: "127.0.0.1", port: 0 }] } });
 	  const b = await standUp({ dir: __dir, policyJson: __benchPolicy, identity: idB, transport: {} });
 	  globalThis.netA = a.transport;
 	  globalThis.netB = b.transport;
@@ -147,7 +147,7 @@ const netBenchHarness = `
 	  // guest boundary.
 	  const localArg = new Uint8Array(34);
 	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await bApp.invoke(opFrame("echo", localArg)); return new Uint8Array(0); };
-	  teachAddr(b.shell, aId, "tcp://127.0.0.1:" + netA.port);
+	  teachAddr(b.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"));
 	})();
 `
 

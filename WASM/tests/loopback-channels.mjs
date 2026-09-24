@@ -2,7 +2,6 @@
 // Test infrastructure, so it stays out of the shared bundle every target ships: tests
 // drive the transport through this ChannelFactory the way a node drives real sockets.
 
-import { LISTENER } from "../build/services/socket-seam.js";
 import { parseDest } from "../build/services/peer-addr.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
@@ -59,18 +58,9 @@ export class LoopbackChannels {
   listeners = new Map();
   nextPort = 10000;
 
-  /** The bound ports (set by a driver's start()). */
-  port = 0;
-  wsPort = 0;
-
-  async listen(tcp, ws, onAccept) {
-    let port = 0, wsPort = 0;
-    // Match the production listener labels used to select framing.
-    if (tcp) { port = this.bind(tcp.port, (ch) => onAccept(ch, { listener: LISTENER.TCP })); }
-    if (ws) { wsPort = this.bind(ws.port, (ch) => onAccept(ch, { listener: LISTENER.WS })); }
-    this.port = port;
-    this.wsPort = wsPort;
-    return { port, wsPort };
+  /** One port per address; every channel it accepts carries that listener's label. */
+  async listen(addrs, onAccept) {
+    return addrs.map((a) => this.bind(a.port, (ch) => onAccept(ch, { listener: a.label })));
   }
 
   bind(requested, onAccept) {
@@ -114,11 +104,10 @@ export class LoopbackChannels {
     const mine = [];
     return {
       connect: (dest) => fabric.connect(dest),
-      async listen(tcp, ws, onAccept) {
-        const r = await fabric.listen(tcp, ws, onAccept);
-        if (r.port) mine.push(r.port);
-        if (r.wsPort) mine.push(r.wsPort);
-        return r;
+      async listen(addrs, onAccept) {
+        const ports = await fabric.listen(addrs, onAccept);
+        mine.push(...ports);
+        return ports;
       },
       close() {
         for (const p of mine.splice(0)) fabric.unbind(p);

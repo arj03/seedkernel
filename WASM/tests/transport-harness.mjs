@@ -31,22 +31,41 @@ export const CLOSE_REASON = {
 
 /** A `ChannelFactory` that hands the driver channels the TEST built, so a test keeps the
  *  instrumented object it is asserting on (`wirePair`'s recorder, tamperer and backlog).
- *
- *  It is the WebRTC shape, not a fabric: the platform says "here is a socket" and the link
- *  states on itself whether we dialed it and who it expects. There is deliberately no
- *  `connect` — a factory that only accepts is a real configuration, and it is the one that
- *  lets a test hold both ends of a pair. */
+ *  Not a fabric: a test holds both ends of a pair, hands one end in as an accept (`give`)
+ *  and the other as the socket a node's transport opens when it dials (`dial`). */
 export class InjectedChannels {
   #accept = null;
+  /** Channels queued per destination, handed out one per `connect`. */
+  #dials = new Map();
   /** Binds nothing; the driver's `start()` calls this and gets its accept sink in. */
-  async listen(_tcp, _ws, onAccept) {
+  async listen(addrs, onAccept) {
     this.#accept = onAccept;
-    return { port: 0, wsPort: 0 };
+    return addrs.map(() => 0);
   }
   close() { this.#accept = null; }
+  /** The next channel queued for `dest`, or no route. */
+  connect(dest) {
+    const queue = this.#dials.get(dest);
+    const channel = queue?.shift() ?? null;
+    if (queue?.length === 0) this.#dials.delete(dest);
+    return channel;
+  }
   give(channel, arrival = {}) {
     if (!this.#accept) throw new Error("InjectedChannels: the driver has not started yet");
     this.#accept(channel, arrival);
+    return channel;
+  }
+  /** A link `node`'s transport DIALS to `peerHex` — through its own address book, as every
+   *  dial is: the peer is taught at a destination this factory answers with `channel`, under
+   *  the contact secret the dial presents, and `ready` sets the dial off. The node needs a
+   *  `connsPerPeer` above its live links to that peer for a second dial to open. */
+  async dial(node, peerHex, channel, secret) {
+    const dest = `inject://${peerHex}`;
+    const queue = this.#dials.get(dest) ?? [];
+    queue.push(channel);
+    this.#dials.set(dest, queue);
+    await addr(node, peerHex, dest, secret);
+    void ready(node, 1).catch(() => {});
     return channel;
   }
 }

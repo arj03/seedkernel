@@ -178,7 +178,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
 console.log("Test: transport bundle drives two nodes over loopback");
 
 const fabric = new LoopbackChannels();
-const listen = { host: "loopback", port: 0 };
+const listen = [{ label: "tcp", host: "loopback", port: 0 }];
 // A per-node VIEW of the shared fabric, not the fabric itself: an upgrade closes the
 // outgoing driver, and a whole-fabric close would unbind the other node's listener too.
 const a = await makeNode(fabric.view(), listen);
@@ -191,11 +191,11 @@ const cNet = c.transport;
 const cId = c.peerId;
 
 console.log("  starting listeners…");
-assert(aNet.port > 0 && bNet.port > 0 && cNet.port > 0, "all nodes bound loopback listeners");
+assert(aNet.portOf("tcp") > 0 && bNet.portOf("tcp") > 0 && cNet.portOf("tcp") > 0, "all nodes bound loopback listeners");
 
 // Each node runs the echo app, so both directions work — the upgrade below has to be
 // checked both ways: A dialing out through the new transport, and B reaching A.
-const bDest = `tcp://loopback:${bNet.port}`;
+const bDest = `tcp://loopback:${bNet.portOf("tcp")}`;
 await addr(a, bId, bDest);
 await ready(a, 2000);
 assert((await linkedPeers(a)).includes(bId), "A authenticated B over loopback (AKE ran)");
@@ -207,7 +207,7 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 // An update replaces its own complete slot atomically: the claim and host adapter stay
 // stable while the realm and its private session state are replaced.
 console.log("  upgrading A's transport in place…");
-const oldPort = aNet.port;
+const oldPort = aNet.portOf("tcp");
 let candidateConfigured;
 const configured = new Promise((resolve) => { candidateConfigured = resolve; });
 let publishCandidate;
@@ -220,7 +220,7 @@ await configured;
 // still the incumbent, since the candidate's realm stands but is unpublished. Nothing
 // host-side holds it, so the entry dies with that realm; the assertion below is that it is
 // GONE rather than replayed.
-await addr(a, cId, `tcp://loopback:${cNet.port}`);
+await addr(a, cId, `tcp://loopback:${cNet.portOf("tcp")}`);
 publishCandidate();
 const upgraded = await upgrading;
 
@@ -228,7 +228,7 @@ assert(Buffer.from(upgraded.author).toString("hex") === Buffer.from(replacementK
   a.shell.resolve(TRANSPORT_SERVICE) === upgraded.manifest.app,
   "the new author took over the transport claim");
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
-assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
+assert(aNet.portOf("tcp") === oldPort, "the node stayed on the SAME port its peers hold");
 
 // The COST of the address book living in the guest, stated as a test rather than left
 // implicit: neither the peer A was linked to nor the one taught mid-window survives the

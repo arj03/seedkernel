@@ -26,7 +26,7 @@ Beta: it works, on all three targets, and everything measured below was measured
 - **The native node is one 7.5 MB file.** A cgo-free, cross-compiled Go binary with embedded QuickJS and a wasm engine. It is a tenth of what a Bun binary alone costs (~70 MB). The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
 - **Bundles are sandboxed on every target.** Modules receive no I/O at all. A guest can access only the host services and local calls declared in its signed manifest, its private modules, and a fixed set of host transforms. The module bound has a measured cost on each target ([the overhead, measured](#the-overhead-measured)).
 - **Confinement has workload-dependent overhead.** The measured storage workload encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and reads back at ~2.6 GiB/s. Its tested network configurations were limited by transfer rate and latency ([the overhead, measured](#the-overhead-measured)).
-- **Network buffers have explicit limits.** Socket write backlogs, reads waiting on a busy guest, and queued signaling messages are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it drops signaling messages or closes the affected link ([every host-side byte has an owner](#the-shape-of-it)).
+- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([every host-side byte has an owner](#the-shape-of-it)).
 - **Code really does arrive only as a bundle.** Even the transport is one, so that it can be upgraded: it opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)). The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
 - **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
 - **Channels combine hybrid key establishment with Ed25519 authentication.** X25519 + ML-KEM-768 protects recorded traffic under the hybrid scheme's assumptions. Breaking Ed25519 later does not reveal earlier session keys, but peer authentication must be upgraded before attackers can forge live handshakes. That requires updating the host's signing interface and the transport bundle. The runtime's `node/sign` operation also remains Ed25519; long-lived signed app records need separate consideration ([security limits](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)).
@@ -114,16 +114,16 @@ The host limits guest access, execution time and retained memory. Buffered data 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — compiled once, run by all three targets (2,349 LOC)**
+**Shared — compiled once, run by all three targets (2,354 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 463 |
-| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 329 |
+| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 333 |
 | Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 660 |
 | Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 367 |
-| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 193 |
-| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), peer-address parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 337 |
+| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 199 |
+| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 332 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
@@ -131,10 +131,10 @@ Sharing this code keeps admission and confinement rules consistent across target
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,471 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (295) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,250 Go + 362 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,291 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (293) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,250 Go + 360 TS |
 
-The transport bundle sits outside these host totals: 1,478 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing and RFC 6455 across the targets that support those transports.
+The transport bundle sits outside these host totals: 1,697 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing, RFC 6455 and WebRTC signaling across the targets that support them.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 
@@ -156,7 +156,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seedstore also points at — and its host seam carries only opaque encoded strings, never JavaScript message objects.
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seedstore also points at. The transport bundle speaks its wire; the host holds only the peer connections (§12.7).
 
 ## The rest of the spec
 

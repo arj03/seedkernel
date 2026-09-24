@@ -16,6 +16,10 @@
       "types": "./build/services/peer-addr.d.ts",
       "default": "./build/services/peer-addr.js"
     },
+    "./socket-seam": {
+      "types": "./build/services/socket-seam.d.ts",
+      "default": "./build/services/socket-seam.js"
+    },
     "./net-rtc": {
       "types": "./build/services/net-rtc.d.ts",
       "default": "./build/services/net-rtc.js"

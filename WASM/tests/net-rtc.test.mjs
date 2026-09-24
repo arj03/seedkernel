@@ -1,593 +1,376 @@
-// net-rtc.test.mjs — RtcNetwork's untrusted signaling boundary and speculative-entry cap
-// (§12.7). A signaling endpoint can name arbitrary `from` values in hellos AND in SDP
-// offers, and every entry carries an RTCPeerConnection — so decoding precedes policy and
-// every path that CREATES an entry answers to the same MAX_UNESTABLISHED_PEERS bound. Pinned with
-// stubs: the browser globals are referenced only inside methods, so net-rtc runs under Node.
-// Run after `npm run build`.
+// net-rtc.test.mjs — WebRTC (§12.7): the host's `rtc:` socket seam, which holds the
+// RTCPeerConnection and passes the W3C verbs through as bytes, and the transport bundle's
+// side of it — the relay, who offers, the negotiation links and their bounds. The seam is
+// pinned with stub peer connections (the platform global is referenced only inside
+// `connect`, so it runs under Node); the transport with an in-process relay room and a fake
+// WebRTC world whose data channels are loopback pairs. Run after `npm run build`.
 
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { importBuilt, testkit } from "./testkit.mjs";
+import {
+  makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
+} from "./transport-harness.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const imp = (p) => import(pathToFileURL(join(root, p)).href);
-const rtc = await imp("build/services/net-rtc.js");
-const {
-  RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, MAX_UNESTABLISHED_PEERS,
-  MAX_SDP_BYTES, MAX_PENDING_ICE_CANDIDATES, MAX_PENDING_ICE_BYTES,
-  UNESTABLISHED_PEER_TTL_MS, MAX_QUEUED_SIGNALS, MAX_QUEUED_SIGNAL_BYTES,
-} = rtc;
-import { testkit } from "./testkit.mjs";
+const imp = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
+const { RtcChannel, RtcNetwork, RTC_CHUNK_BYTES, RTC_TAG } = await imp("build/services/net-rtc.js");
+const { combineChannels } = await imp("build/services/socket-seam.js");
 
 const { test, assert, summary } = testkit();
-
-// The cap the transport relay is bound to (net-rtc.ts). An entry stops counting once its
-// peer connection ESTABLISHES — DTLS/ICE completes (`PeerEntry.established`) — not once the
-// transport link above it authenticates, so a genuine fleet is unconstrained; only NEW
-// speculative entries are.
-const peerId = (n) => String(n).padStart(64, "0");
-const wire = (msg) => {
-  const tag = msg.type === "hello" ? "h"
-    : msg.type === "ice" ? "i"
-    : msg.sdp.type === "offer" ? "o" : "a";
-  const fields = [tag, msg.from, msg.to ?? ""];
-  if (msg.type === "hello") return fields.join("\0");
-  if (msg.type === "sdp") return [...fields, msg.sdp.sdp].join("\0");
-  const c = msg.candidate;
-  return [...fields, c.candidate, c.sdpMid ?? "", c.sdpMLineIndex?.toString() ?? "",
-    c.usernameFragment ?? ""].join("\0");
+const enc = new TextEncoder(), dec = new TextDecoder();
+const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+const msg = (tag, text = "") => {
+  const b = enc.encode(text);
+  const out = new Uint8Array(1 + b.length);
+  out[0] = tag;
+  out.set(b, 1);
+  return out;
 };
 
-function stubPeerConnection() {
-  const listeners = new Map();
-  const pc = {
-    signalingState: "stable", connectionState: "new", remoteDescription: null,
-    closed: false,
-    addEventListener(type, cb) { listeners.set(type, cb); },
-    createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
-    async setRemoteDescription(sdp) { this.remoteDescription = sdp; },
-    async setLocalDescription() {},
-    async addIceCandidate() {},
-    close() { this.closed = true; },
+// ── the socket seam, over stubs ──────────────────────────────────────────────
+
+/** Listeners by type, several per type as the platform allows. */
+function emitter() {
+  const on = new Map();
+  return {
+    addEventListener(type, cb) { (on.get(type) ?? on.set(type, []).get(type)).push(cb); },
+    emit(type, ev = {}) { for (const cb of on.get(type) ?? []) cb(ev); },
   };
-  return { pc, listeners };
 }
 
-console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.7)\n");
+function stubDataChannel(opts) {
+  const e = emitter();
+  return { ...e, opts, binaryType: "", bufferedAmount: 0, sent: [], closed: false,
+    send(b) { this.sent.push(Uint8Array.from(b)); }, close() { this.closed = true; } };
+}
 
-await test("net-rtc exports the signaling seam, not a WebSocket relay implementation", async () => {
-  assert(!("relaySignaling" in rtc), "the host must not ship a rendezvous wire implementation");
-});
-
-await test("RtcNetwork validates encoded signaling strings before admitting them", async () => {
-  let receive = () => {};
-  let admitted = 0;
-  let pcs = 0;
-  const sent = [];
-  const signaling = {
-    send(msg) { sent.push(msg); },
-    onMessage(cb) { receive = cb; },
-    close() {},
+function stubPeerConnection() {
+  const e = emitter();
+  const pc = {
+    ...e, calls: [], localDescription: null, connectionState: "new", closed: false, dc: null,
+    createDataChannel(label, opts) { this.dc = stubDataChannel(opts); return this.dc; },
+    async setLocalDescription() {
+      const type = this.calls.some((c) => c[0] === "remote" && c[1] === "offer") ? "answer" : "offer";
+      this.calls.push(["local", type]);
+      this.localDescription = { type, sdp: `sdp-${type}` };
+    },
+    async setRemoteDescription(d) { this.calls.push(["remote", d.type, d.sdp]); },
+    async addIceCandidate(c) { this.calls.push(["candidate", c]); },
+    restartIce() { this.calls.push(["restart"]); },
+    close() { this.closed = true; },
   };
-  const ownId = peerId(0);
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling,
-    admitPeer() { admitted++; return true; },
-    peerConnectionFactory: () => {
-      pcs++;
-      return {
-        signalingState: "stable",
-        remoteDescription: null,
-        addEventListener() {},
-        createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
-        async setRemoteDescription() {},
-        async setLocalDescription() {},
-        async addIceCandidate() {},
-        close() {},
-      };
-    },
-  });
+  return pc;
+}
 
-  const malformed = [
-    null,
-    [],
-    {},
-    "hello",
-    wire({ type: "hello", from: "not-a-peer" }),
-    wire({ type: "hello", from: peerId(1), to: "not-a-peer" }),
-    wire({ type: "sdp", from: peerId(1), sdp: { type: "offer", sdp: "x\0y" } }),
-    wire({ type: "ice", from: peerId(1), candidate: { candidate: "x", sdpMLineIndex: -1 } }),
-    `h${peerId(1)}trailing`,
-    `H${peerId(1)}`,
-    `x${peerId(1)}`,
-    `i${peerId(1)}00000005x`,
-    `i${peerId(1)}ffffffffffffffffffffffffffffffff`,
-  ];
-  for (const msg of malformed) await receive(msg);
-  assert(admitted === 0, `malformed messages must be dropped before policy (got ${admitted})`);
-  assert(pcs === 0 && net.peers.size === 0, "malformed messages must not allocate peer connections");
-
-  await receive(wire({ type: "hello", from: peerId(1) }));
-  assert(admitted === 1 && pcs === 1, "a valid encoded hello must reach policy and create one peer");
-  assert(sent.length === 1 && typeof sent[0] === "string"
-      && sent[0] === wire({ type: "hello", from: ownId, to: peerId(1) }),
-  "a broadcast hello must receive one byte-exact encoded-string reply");
-  net.close();
-});
-
-await test("RtcNetwork rejects oversized SDP before policy or WebRTC", async () => {
-  let receive = () => {};
-  let admitted = 0;
-  let pcs = 0;
-  const ownId = peerId(0);
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
-    admitPeer() { admitted++; return true; },
-    peerConnectionFactory: () => {
-      pcs++;
-      return stubPeerConnection().pc;
-    },
-  });
-  const overLimit = "x".repeat(MAX_SDP_BYTES / 2 + 1);
-  await receive(wire({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: overLimit } }));
-  assert(admitted === 0 && pcs === 0 && net.peers.size === 0,
-    "oversized SDP must be dropped at decoding, before policy and connection allocation");
-
-  const atLimit = "x".repeat(MAX_SDP_BYTES / 2);
-  await receive(wire({ type: "sdp", from: peerId(1), to: ownId, sdp: { type: "offer", sdp: atLimit } }));
-  assert(admitted === 1 && pcs === 1 && net.peers.size === 1,
-    "SDP at the documented UTF-16 storage ceiling must remain admitted");
-  net.close();
-});
-
-await test("inbound signaling handlers run in arrival order", async () => {
-  let receive = () => {};
-  let remoteStartedResolve, releaseRemote;
-  const remoteStarted = new Promise((resolve) => { remoteStartedResolve = resolve; });
-  const remoteBlocked = new Promise((resolve) => { releaseRemote = resolve; });
-  let pcs = 0;
-  const ownId = peerId(0);
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
-    peerConnectionFactory: () => {
-      const made = stubPeerConnection();
-      pcs++;
-      if (pcs === 1) {
-        made.pc.setRemoteDescription = async function (sdp) {
-          remoteStartedResolve();
-          await remoteBlocked;
-          this.remoteDescription = sdp;
-        };
-      }
-      return made.pc;
-    },
-  });
-  const offer = receive(wire({
-    type: "sdp", from: peerId(1), to: ownId,
-    sdp: { type: "offer", sdp: "offer" },
-  }));
-  await remoteStarted;
-  const hello = receive(wire({ type: "hello", from: peerId(2), to: ownId }));
-  await Promise.resolve();
-  assert(pcs === 1, "a later message must not start while an earlier WebRTC operation is in flight");
-  releaseRemote();
-  await Promise.all([offer, hello]);
-  assert(pcs === 2, "the queued message must run after the earlier handler completes");
-  net.close();
-});
-
-await test("post-description ICE candidates drain one at a time", async () => {
-  let firstStartedResolve, secondStartedResolve, releaseFirst;
-  const firstStarted = new Promise((resolve) => { firstStartedResolve = resolve; });
-  const secondStarted = new Promise((resolve) => { secondStartedResolve = resolve; });
-  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
-  let calls = 0, active = 0, maxActive = 0;
-  const made = stubPeerConnection();
-  made.pc.addIceCandidate = async () => {
-    calls++;
-    active++;
-    maxActive = Math.max(maxActive, active);
-    if (calls === 1) {
-      firstStartedResolve();
-      await firstBlocked;
-    } else {
-      secondStartedResolve();
-    }
-    active--;
+/** One seam and the links it hands the driver, recorded. */
+async function seam() {
+  const pcs = [];
+  const net = new RtcNetwork({ peerConnectionFactory: () => { const pc = stubPeerConnection(); pcs.push(pc); return pc; } });
+  const accepted = [];
+  await net.listen([], (channel, arrival) => accepted.push({ channel, arrival }));
+  const open = (dest) => {
+    const link = net.connect(dest);
+    if (!link) return null;
+    const up = [];
+    let closed = 0;
+    link.onData((b) => up.push([b[0], dec.decode(b.subarray(1))]));
+    link.onClose(() => { closed++; });
+    return { link, up, pc: pcs[pcs.length - 1], closed: () => closed };
   };
-  const ownId = peerId(0);
-  const remote = peerId(1);
-  let receive = () => {};
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
-    peerConnectionFactory: () => made.pc,
-  });
-  const entry = net.ensurePeer(remote);
-  entry.pc.remoteDescription = { type: "offer", sdp: "ready" };
+  return { net, pcs, accepted, open };
+}
 
-  // Through the inbound boundary, the only way a candidate arrives: one signaling lane
-  // serializes every handler, so a drain cannot start while another is mid-candidate and
-  // there is no second per-entry lane to keep in step with this one.
-  const first = receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "first" } }));
-  const second = receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "second" } }));
-  await firstStarted;
-  assert(calls === 1 && maxActive === 1,
-    "a later candidate must wait while the preceding addIceCandidate is in flight");
-  releaseFirst();
-  await secondStarted;
-  await Promise.all([first, second]);
-  assert(calls === 2 && maxActive === 1, "candidate operations must remain strictly serialized");
+console.log("\nWebRTC: the rtc: socket seam (§12.7)\n");
+
+await test("only rtc:offer and rtc:answer route, with an optional JSON configuration", async () => {
+  const { net, pcs, open } = await seam();
+  for (const dest of ["ws://relay:1/room", "rtc:", "rtc:offerx", "rtc:offer?{bad", "rtc:answer?[1]"]) {
+    assert(open(dest) === null, `${dest} must be no route`);
+  }
+  assert(pcs.length === 0, "an unrouted destination must not allocate a peer connection");
+  assert(open("rtc:offer") && open(`rtc:answer?${JSON.stringify({ iceServers: [{ urls: "stun:x" }] })}`),
+    "both roles route, with or without a configuration");
+  assert(pcs.length === 2 && pcs.every((pc) => pc.dc.opts.negotiated === true && pc.dc.opts.id === 0),
+    "every peer connection carries the one pre-agreed data channel, so neither side is the dialer");
+  net.close();
+  assert(pcs.every((pc) => pc.closed), "closing the factory closes every peer connection");
+});
+
+await test("the data link is announced once its channel opens, naming the negotiation link", async () => {
+  const { net, accepted, open } = await seam();
+  const n = open("rtc:offer");
+  await settle(5);
+  assert(accepted.length === 0, "no data link before the channel opens");
+  n.pc.dc.emit("open");
+  assert(accepted.length === 1 && accepted[0].arrival.via === n.link,
+    "the open channel is announced with the negotiation link as its via");
+  assert(accepted[0].channel.stream === true, "the data link is a byte stream the occupant frames");
   net.close();
 });
 
-await test("a duplicate RTC data channel is actively closed", async () => {
-  const ownId = peerId(0);
-  const remote = peerId(1);
-  const made = stubPeerConnection();
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling: { send() {}, onMessage() {}, close() {} },
-    peerConnectionFactory: () => made.pc,
-  });
-  let accepted = 0;
-  await net.listen(undefined, undefined, () => { accepted++; });
-  const channel = () => ({
-    binaryType: "", bufferedAmount: 0, closes: 0,
-    send() {},
-    close() { this.closes++; },
-    addEventListener() {},
-  });
-  const first = channel();
-  const duplicate = channel();
-  const entry = net.ensurePeer(remote);
-  net.bindLink(remote, entry, first, false);
-  net.bindLink(remote, entry, duplicate, false);
-  assert(accepted === 1, "only the first data channel may be handed to the transport");
-  assert(first.closes === 0 && duplicate.closes === 1,
-    "the duplicate data channel must be closed instead of left live and unowned");
+await test("only the offering side offers; the answering side answers what it is given", async () => {
+  const { net, open } = await seam();
+  const offerer = open("rtc:offer");
+  const answerer = open("rtc:answer");
+  offerer.pc.emit("negotiationneeded");
+  answerer.pc.emit("negotiationneeded");
+  await settle(5);
+  assert(offerer.up.length === 1 && offerer.up[0][0] === RTC_TAG.OFFER && offerer.up[0][1] === "sdp-offer",
+    "the offering side's negotiationneeded goes up as its local offer");
+  assert(answerer.up.length === 0, "the answering side never offers");
+
+  answerer.link.send(msg(RTC_TAG.OFFER, "their-offer"));
+  await settle(5);
+  assert(answerer.up.length === 1 && answerer.up[0][0] === RTC_TAG.ANSWER, "a remote offer is answered");
+  assert(answerer.pc.calls[0][0] === "remote" && answerer.pc.calls[0][2] === "their-offer",
+    "the offer reaches the platform verbatim");
+  let refused = false;
+  try { offerer.link.send(msg(RTC_TAG.OFFER, "x")); } catch { refused = true; }
+  assert(refused, "an offer for the offering side is refused, not applied");
+  net.close();
+});
+
+await test("a candidate gathered before its description goes up after it", async () => {
+  const { net, open } = await seam();
+  const n = open("rtc:offer");
+  const cand = (c) => ({ candidate: { toJSON: () => ({ candidate: c, sdpMid: "0", sdpMLineIndex: 0 }) } });
+  n.pc.emit("icecandidate", cand("candidate:early"));
+  n.pc.emit("negotiationneeded");
+  await settle(5);
+  n.pc.emit("icecandidate", cand("candidate:late"));
+  assert(n.up.map((u) => u[0]).join() === [RTC_TAG.OFFER, RTC_TAG.CANDIDATE, RTC_TAG.CANDIDATE].join(),
+    `the description must lead its candidates, got ${JSON.stringify(n.up)}`);
+  assert(n.up[1][1].startsWith("candidate:early\0") && n.up[2][1].startsWith("candidate:late\0"),
+    "held candidates keep their order");
+  net.close();
+});
+
+await test("guest writes apply in order, and what waits is outbound custody", async () => {
+  const { net, open } = await seam();
+  const n = open("rtc:answer");
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const setRemote = n.pc.setRemoteDescription;
+  n.pc.setRemoteDescription = async function (d) { await gate; return setRemote.call(this, d); };
+  const offer = msg(RTC_TAG.OFFER, "o");
+  const cand = msg(RTC_TAG.CANDIDATE, "candidate:1\0" + "0\0" + "0\0" + "uf");
+  n.link.send(offer);
+  n.link.send(cand);
+  await settle(5);
+  assert(n.pc.calls.length === 0, "a candidate must not overtake the description it belongs to");
+  assert(n.link.buffered() === offer.length + cand.length, "unapplied writes are the link's backlog");
+  release();
+  await settle(5);
+  assert(n.pc.calls.map((c) => c[0]).join() === "remote,local,candidate", "applied in the order written");
+  assert(n.pc.calls[2][1].sdpMLineIndex === 0 && n.pc.calls[2][1].usernameFragment === "uf",
+    "the candidate's fields survive");
+  assert(n.link.buffered() === 0, "the backlog drains as the platform answers");
+  for (const bad of [msg(RTC_TAG.CANDIDATE, "c\0\0-1\0"), msg(RTC_TAG.CANDIDATE, "only-one-field"), msg(0x7a), new Uint8Array(0)]) {
+    let threw = false;
+    try { n.link.send(bad); } catch { threw = true; }
+    assert(threw, `a malformed write is refused: ${JSON.stringify([...bad])}`);
+  }
+  n.link.send(msg(RTC_TAG.RESTART));
+  assert(n.pc.calls.at(-1)[0] === "restart", "a restart reaches the platform");
+  net.close();
+});
+
+await test("the connection ending closes both links; closing the negotiation closes the data link", async () => {
+  const { net, accepted, open } = await seam();
+  const a = open("rtc:offer");
+  a.pc.dc.emit("open");
+  let dataClosed = 0;
+  accepted[0].channel.onClose(() => { dataClosed++; });
+  a.pc.connectionState = "failed";
+  a.pc.emit("connectionstatechange");
+  assert(a.up.at(-1)[0] === RTC_TAG.STATE && a.up.at(-1)[1] === "failed", "the state goes up first");
+  assert(a.closed() === 1 && dataClosed === 1 && a.pc.closed, "a failed connection ends both links and the pc");
+
+  const b = open("rtc:answer");
+  b.pc.dc.emit("open");
+  let bData = 0;
+  accepted[1].channel.onClose(() => { bData++; });
+  b.link.close();
+  assert(bData === 1 && b.pc.closed && b.pc.dc.closed, "a closed negotiation takes its data link down, heard by its owner");
   net.close();
 });
 
 await test("RtcChannel exposes a length-framed stream and caps physical messages", async () => {
-  const listeners = new Map();
-  const sent = [];
-  const dc = {
-    binaryType: "",
-    bufferedAmount: 0,
-    send(bytes) { sent.push(Uint8Array.from(bytes)); },
-    close() {},
-    addEventListener(type, cb) { listeners.set(type, cb); },
-  };
+  const dc = stubDataChannel({});
   const channel = new RtcChannel(dc);
   assert(channel.stream === true, "RTC bytes are a byte duplex the guest must frame itself");
-  listeners.get("open")();
+  dc.emit("open");
   const bytes = new Uint8Array(RTC_CHUNK_BYTES * 2 + 7).fill(0x5a);
   channel.send(bytes);
-  assert(sent.length === 3, `a two-chunk-plus-tail write must make 3 messages, got ${sent.length}`);
-  assert(sent[0].length === RTC_CHUNK_BYTES && sent[1].length === RTC_CHUNK_BYTES && sent[2].length === 7,
+  assert(dc.sent.length === 3, `a two-chunk-plus-tail write must make 3 messages, got ${dc.sent.length}`);
+  assert(dc.sent[0].length === RTC_CHUNK_BYTES && dc.sent[1].length === RTC_CHUNK_BYTES && dc.sent[2].length === 7,
     `physical messages must be capped at ${RTC_CHUNK_BYTES} bytes`);
-  assert(sent.every((part) => part.every((byte) => byte === 0x5a)), "chunking must preserve every byte");
+  assert(dc.sent.every((part) => part.every((byte) => byte === 0x5a)), "chunking must preserve every byte");
   channel.close();
 });
 
 await test("RtcChannel fails closed when a chunked write throws after a prefix", async () => {
-  const listeners = new Map();
   let writes = 0, closes = 0, failed = 0;
-  const dc = {
-    binaryType: "",
-    bufferedAmount: 0,
-    send() {
-      writes++;
-      if (writes === 2) throw new Error("SCTP buffer full");
-    },
-    close() { closes++; },
-    addEventListener(type, cb) { listeners.set(type, cb); },
-  };
+  const dc = stubDataChannel({});
+  dc.send = () => { writes++; if (writes === 2) throw new Error("SCTP buffer full"); };
+  dc.close = () => { closes++; };
   const channel = new RtcChannel(dc);
   channel.onClose(() => { failed++; });
-  listeners.get("open")();
+  dc.emit("open");
   channel.send(new Uint8Array(RTC_CHUNK_BYTES * 2 + 1));
   assert(writes === 2, `the throwing second chunk must stop the write, got ${writes} attempts`);
   assert(closes === 1 && failed === 1, "a partial RTC write must close and fail the channel exactly once");
-  // A dead channel's send() throws rather than silently dropping the write (net-channel.ts
-  // MessageChannel), so the caller — TransportHost's own outbound owner in production —
-  // learns immediately rather than believing an admitted write actually left.
   let refused = false;
   try { channel.send(Uint8Array.of(9)); } catch { refused = true; }
   assert(refused, "a failed channel must refuse rather than silently accept a further write");
   assert(writes === 2, "a failed channel must never append bytes after the truncated frame");
 });
 
-await test("offers cannot force more than MAX_UNESTABLISHED_PEERS peer entries", async () => {
-  // The old cap applied to the broadcast-hello path only: an offer from an
-  // arbitrary `from` created an entry (and an RTCPeerConnection) unconditionally.
-  const signaling = { send() {}, onMessage() {}, close() {} };
-  const pcs = { n: 0 };
-  const ownId = peerId(0);
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling,
-    peerConnectionFactory: () => {
-      pcs.n++;
-      return {
-        signalingState: "stable",
-        remoteDescription: null,
-        addEventListener() {},
-        createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
-        async setRemoteDescription() {},
-        async setLocalDescription() {},
-        async addIceCandidate() {},
-        close() {},
-      };
-    },
-  });
+// ── the transport over a relay and a fake WebRTC world ───────────────────────
 
-  // A flood of offers naming distinct strangers: the 256th entry may be created,
-  // the rest must be dropped without allocating a connection.
-  const offer = (from) => ({ type: "sdp", from, sdp: { type: "offer", sdp: "x" } });
-  for (let i = 1; i <= 300; i++) await net.onSignal(offer(peerId(i)));
-  assert(net.peers.size === MAX_UNESTABLISHED_PEERS,
-    `offers must cap peer entries at ${MAX_UNESTABLISHED_PEERS}, got ${net.peers.size}`);
-  assert(pcs.n === MAX_UNESTABLISHED_PEERS,
-    `the connection factory must be reached exactly as many times, got ${pcs.n}`);
-
-  // An entry that already exists is still served — the cap is on creation.
-  await net.onSignal(offer(peerId(1)));
-  assert(net.peers.size === MAX_UNESTABLISHED_PEERS, "a repeat offer must not create a second entry");
-  assert(pcs.n === MAX_UNESTABLISHED_PEERS, "a repeat offer must not open a second connection");
-
-  // The hello path answers to the same cap — including DIRECTED hellos, which name
-  // us too and could spam a slot just as well as broadcast ones.
-  for (let i = 301; i <= 350; i++) {
-    await net.onSignal({ type: "hello", from: peerId(i), to: ownId });
+/** A signaling room: every frame one member sends reaches every other member, verbatim. */
+class RelayRoom {
+  members = new Set();
+  frames = [];
+  link() {
+    const m = { msg: null, cls: null, dead: false };
+    const room = this;
+    const link = {
+      send(b) {
+        room.frames.push(dec.decode(b));
+        for (const o of room.members) if (o !== m) queueMicrotask(() => { if (!o.dead) o.msg?.(Uint8Array.from(b)); });
+      },
+      onData(cb) { m.msg = cb; },
+      onClose(cb) { m.cls = cb; },
+      close() { m.dead = true; room.members.delete(m); },
+      buffered: () => 0,
+    };
+    m.kill = () => { if (m.dead) return; m.dead = true; room.members.delete(m); m.cls?.(); };
+    this.members.add(m);
+    return link;
   }
-  assert(net.peers.size === MAX_UNESTABLISHED_PEERS, `hellos must not exceed the same cap (got ${net.peers.size})`);
-  assert(pcs.n === MAX_UNESTABLISHED_PEERS, "and no further connections may have been opened");
-
-  net.close();
-});
-
-await test("pending ICE is normalized and bounded by candidate count", async () => {
-  let receive = () => {};
-  const made = [];
-  const net = new RtcNetwork({
-    peerId: peerId(0),
-    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
-    peerConnectionFactory: () => {
-      const madePc = stubPeerConnection();
-      made.push(madePc);
-      return madePc.pc;
-    },
-  });
-  const remote = peerId(1);
-  await receive(wire({ type: "hello", from: remote, to: peerId(0) }));
-  const original = {
-    candidate: "candidate:1", sdpMid: "0", sdpMLineIndex: 0,
-    usernameFragment: "u", extra: { retained: new Uint8Array(1024) },
-  };
-  await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: original }));
-  const entry = net.peers.get(remote);
-  assert(entry.pendingIce.size === 1, "a valid early candidate must be queued");
-  assert(entry.pendingIce.peek() !== original && !("extra" in entry.pendingIce.peek()),
-    "the pending queue must retain a normalized candidate, never the signaling object");
-
-  for (let i = 1; i < MAX_PENDING_ICE_CANDIDATES; i++) {
-    await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: `candidate:${i}` } }));
-  }
-  assert(entry.pendingIce.size === MAX_PENDING_ICE_CANDIDATES && !made[0].pc.closed,
-    "the exact pending-candidate count ceiling must remain admitted");
-  await receive(wire({ type: "ice", from: remote, to: peerId(0), candidate: { candidate: "one-too-many" } }));
-  assert(!net.peers.has(remote) && made[0].pc.closed,
-    "crossing the pending-candidate count ceiling must release the speculative peer");
-  net.close();
-});
-
-await test("pending ICE is bounded by aggregate string bytes", async () => {
-  let receive = () => {};
-  const made = stubPeerConnection();
-  const ownId = peerId(0);
-  const remote = peerId(1);
-  const net = new RtcNetwork({
-    peerId: ownId,
-    signaling: { send() {}, onMessage(cb) { receive = cb; }, close() {} },
-    peerConnectionFactory: () => made.pc,
-  });
-  await receive(wire({ type: "hello", from: remote, to: ownId }));
-  // Candidate accounting uses the worst-case two bytes per JS string code unit.
-  const full = "x".repeat(MAX_PENDING_ICE_BYTES / 2);
-  await receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: full } }));
-  assert(net.peers.get(remote).pendingIceBytes === MAX_PENDING_ICE_BYTES,
-    "the exact pending ICE byte ceiling must remain admitted");
-  await receive(wire({ type: "ice", from: remote, to: ownId, candidate: { candidate: "x" } }));
-  assert(!net.peers.has(remote) && made.pc.closed,
-    "crossing the pending ICE byte ceiling must release the speculative peer");
-  net.close();
-});
-
-await test("an unestablished peer expires on a host-owned deadline", async () => {
-  const realSetTimeout = globalThis.setTimeout;
-  const realClearTimeout = globalThis.clearTimeout;
-  const timers = [];
-  globalThis.setTimeout = (fn, ms) => {
-    const timer = { fn, ms, cleared: false, unref() {} };
-    timers.push(timer);
-    return timer;
-  };
-  globalThis.clearTimeout = (timer) => { timer.cleared = true; };
-  let net;
-  try {
-    const made = stubPeerConnection();
-    net = new RtcNetwork({
-      peerId: peerId(0),
-      signaling: { send() {}, onMessage() {}, close() {} },
-      peerConnectionFactory: () => made.pc,
-    });
-    const remote = peerId(1);
-    await net.onSignal({ type: "hello", from: remote, to: peerId(0) });
-    assert(timers.length === 1 && timers[0].ms === UNESTABLISHED_PEER_TTL_MS,
-      "creating a speculative peer must arm the documented establishment deadline");
-    timers[0].fn();
-    assert(!net.peers.has(remote) && made.pc.closed,
-      "the establishment deadline must close and forget a zombie peer");
-  } finally {
-    net?.close();
-    globalThis.setTimeout = realSetTimeout;
-    globalThis.clearTimeout = realClearTimeout;
-  }
-});
-
-await test("a peer that establishes but never carries a channel expires too", async () => {
-  // Establishing leaves the speculative-entry CAP, which is all `established` was ever
-  // about. It is not a reason to drop the deadline: the polite side never opens the data
-  // channel, so a peer that completes DTLS/ICE and then stays silent arms no channel watch
-  // — with the deadline cleared at "connected" nothing would ever reap it, and a relay
-  // could hold peer connections without limit outside the cap that counts them.
-  const realSetTimeout = globalThis.setTimeout;
-  const realClearTimeout = globalThis.clearTimeout;
-  const timers = [];
-  globalThis.setTimeout = (fn, ms) => {
-    const timer = { fn, ms, cleared: false, unref() {} };
-    timers.push(timer);
-    return timer;
-  };
-  globalThis.clearTimeout = (timer) => { timer.cleared = true; };
-  let net;
-  try {
-    const made = stubPeerConnection();
-    // The factory is resolved once, at construction, so the connection each peer gets is
-    // chosen through this cell rather than by reassigning the option.
-    let next = made;
-    // Ours sorts ABOVE theirs, so this node is the POLITE side and never opens a channel.
-    const ownId = peerId(9);
-    net = new RtcNetwork({
-      peerId: ownId,
-      signaling: { send() {}, onMessage() {}, close() {} },
-      peerConnectionFactory: () => next.pc,
-    });
-    await net.listen(undefined, undefined, () => {});
-    const remote = peerId(1);
-    await net.onSignal({ type: "hello", from: remote, to: ownId });
-    const entry = net.peers.get(remote);
-    assert(entry && entry.polite && !entry.linked, "the polite side must not open a channel of its own");
-    made.pc.connectionState = "connected";
-    made.listeners.get("connectionstatechange")();
-    assert(entry.established, "a completed DTLS/ICE connection leaves the speculative cap");
-    assert(!timers[0].cleared, "leaving the cap must not disarm the entry's deadline");
-    timers[0].fn();
-    assert(!net.peers.has(remote) && made.pc.closed,
-      "an established peer with no data channel must still expire");
-
-    // The control: both facts true is the one state the deadline lets stand.
-    const linkedPeer = stubPeerConnection();
-    next = linkedPeer;
-    const other = peerId(2);
-    await net.onSignal({ type: "hello", from: other, to: ownId });
-    const liveEntry = net.peers.get(other);
-    linkedPeer.pc.connectionState = "connected";
-    linkedPeer.listeners.get("connectionstatechange")();
-    linkedPeer.listeners.get("datachannel")({
-      channel: { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} },
-    });
-    assert(liveEntry.established && liveEntry.linked, "the control peer is established and linked");
-    timers[timers.length - 1].fn();
-    assert(net.peers.get(other) === liveEntry, "a peer that is both must survive its deadline");
-  } finally {
-    net?.close();
-    globalThis.setTimeout = realSetTimeout;
-    globalThis.clearTimeout = realClearTimeout;
-  }
-});
-
-await test("the signaling lane bounds how many decoded signals may wait on it", async () => {
-  // The lane exists to keep a later SDP from overtaking an operation in flight — and a
-  // lane is a queue. Nothing else counts it: the per-peer caps are only reached once a
-  // message is ACTED on, so without this bound a relay can park unbounded SDP here.
-  let deliver = null;
-  const signaling = { send() {}, onMessage(cb) { deliver = cb; }, close() {} };
-  let admitted = 0;
-  let releaseHead;
-  const held = new Promise((resolve) => { releaseHead = resolve; });
-  const net = new RtcNetwork({
-    peerId: peerId(0),
-    signaling,
-    admitPeer: () => { admitted++; return true; },
-    peerConnectionFactory: () => ({
-      signalingState: "stable",
-      remoteDescription: null,
-      addEventListener() {},
-      createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
-      // The head of the lane parks here, so everything behind it has to wait.
-      setRemoteDescription: () => held,
-      async setLocalDescription() {},
-      async addIceCandidate() {},
+  /** A frame from someone who is not a node: a spoofer, or a stranger. */
+  inject(text) { for (const o of this.members) queueMicrotask(() => o.msg?.(enc.encode(text))); }
+  factory() {
+    return {
+      connect: (dest) => (dest.startsWith("ws://relay/") ? this.link() : null),
+      listen: async (addrs) => addrs.map(() => 0),
       close() {},
-    }),
-  });
-  try {
-    // Small offers on purpose: this is the COUNT bound's test, and a maximum-sized one
-    // would be stopped by the byte companion first (the test below).
-    const big = "s".repeat(64);
-    const sent = MAX_QUEUED_SIGNALS + 64;
-    for (let i = 1; i <= sent; i++) {
-      deliver(wire({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } }));
-    }
-    await new Promise((r) => setTimeout(r, 0));
-    assert(admitted === 1, `only the head of the lane may run while it is parked, got ${admitted}`);
-    releaseHead();
-    // Drain: every signal the lane accepted now runs, and nothing more.
-    for (let i = 0; i < sent + 8; i++) await new Promise((r) => setTimeout(r, 0));
-    assert(admitted <= MAX_QUEUED_SIGNALS + 1,
-      `the lane must drop past ${MAX_QUEUED_SIGNALS} waiting signals, ran ${admitted} of ${sent}`);
-    assert(admitted < sent, "an unbounded lane would have run every one of them");
-  } finally {
-    net.close();
+    };
   }
+}
+
+/** Peer connections that connect once both descriptions are set, their negotiated data
+ *  channels becoming an in-process pair. A description's SDP names its connection. */
+class FakeWebRtc {
+  pcs = new Map();
+  made = [];
+  next = 1;
+  factory = () => {
+    const world = this;
+    const e = emitter();
+    const id = this.next++;
+    const pc = {
+      ...e, id, peer: null, closed: false, connectionState: "new", localDescription: null, remote: null, dc: null,
+      candidates: [],
+      createDataChannel() {
+        const d = emitter();
+        const dc = { ...d, binaryType: "", bufferedAmount: 0, peer: null, open: false, closed: false,
+          send(b) { const p = this.peer; const copy = Uint8Array.from(b).buffer; queueMicrotask(() => { if (p && !p.closed) p.emit("message", { data: copy }); }); },
+          close() { if (this.closed) return; this.closed = true; const p = this.peer; queueMicrotask(() => { this.emit("close"); if (p && !p.closed) p.close(); }); } };
+        this.dc = dc;
+        queueMicrotask(() => e.emit("negotiationneeded"));
+        return dc;
+      },
+      async setLocalDescription() {
+        const type = this.remote?.type === "offer" ? "answer" : "offer";
+        this.localDescription = { type, sdp: `fake:${id}` };
+        queueMicrotask(() => e.emit("icecandidate", { candidate: { toJSON: () => ({ candidate: `candidate:${id}`, sdpMid: "0", sdpMLineIndex: 0 }) } }));
+        world.maybeConnect(this);
+      },
+      async setRemoteDescription(d) {
+        this.remote = d;
+        this.peer = world.pcs.get(Number(d.sdp.slice(5)));
+        world.maybeConnect(this);
+      },
+      async addIceCandidate(c) { this.candidates.push(c.candidate); },
+      restartIce() {},
+      close() { if (this.closed) return; this.closed = true; this.dc?.close(); },
+    };
+    this.pcs.set(id, pc);
+    this.made.push(pc);
+    return pc;
+  };
+  maybeConnect(pc) {
+    const other = pc.peer;
+    if (!other || other.peer !== pc || !pc.localDescription || !other.localDescription || pc.connectionState === "connected") return;
+    for (const p of [pc, other]) p.connectionState = "connected";
+    pc.dc.peer = other.dc;
+    other.dc.peer = pc.dc;
+    setTimeout(() => {
+      for (const p of [pc, other]) { p.emit("connectionstatechange"); p.dc.emit("open"); }
+    }, 5);
+  }
+}
+
+const relayState = async (node) => (await transportOp(node, new OpArgs("relayState")))[0];
+const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));
+
+/** A node whose sockets are the room and the fake world, and nothing else. */
+function rtcNode(room, world, opts = {}) {
+  const channels = combineChannels(room.factory(), new RtcNetwork({ peerConnectionFactory: world.factory }));
+  return makeTransportHost({ channels, ...opts });
+}
+
+await test("two nodes in one room link over WebRTC and carry a request", async (keep) => {
+  const room = new RelayRoom(), world = new FakeWebRtc();
+  const A = keep(await rtcNode(room, world));
+  const B = keep(await rtcNode(room, world));
+  assert(await relayState(A) === 0, "no relay before one is joined");
+  await joinRelay(A, "ws://relay/room");
+  await joinRelay(B, "ws://relay/room");
+  assert(await relayState(A) === 1, "the relay link is up once joined");
+  await until(async () => (await linkedPeers(A)).includes(B.peerId) && (await linkedPeers(B)).includes(A.peerId),
+    4000, "the WebRTC link");
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
+  assert(resp.length === 3 && resp[2] === 9, "a request crosses the data channel");
+  assert(world.made.length === 2, `one peer connection per side, got ${world.made.length}`);
+  assert(world.made.every((pc) => pc.candidates.length >= 1), "candidates went through the relay and in");
+  assert(room.frames.every((f) => f.split("\0").length >= 3), "every relay frame is the NUL-separated wire");
 });
 
-await test("the signaling lane bounds the BYTES waiting on it, not only the count", async () => {
-  // A count alone is half a bound: one relay carries every peer and the per-message caps
-  // admit a 256 KiB offer, so MAX_QUEUED_SIGNALS of them would make this lane the largest
-  // single allowance on the node — bigger than a confined guest heap.
-  let deliver = null;
-  let admitted = 0;
-  let releaseHead;
-  const held = new Promise((resolve) => { releaseHead = resolve; });
-  const net = new RtcNetwork({
-    peerId: peerId(0),
-    signaling: { send() {}, onMessage(cb) { deliver = cb; }, close() {} },
-    admitPeer: () => { admitted++; return true; },
-    peerConnectionFactory: () => ({
-      signalingState: "stable",
-      remoteDescription: null,
-      addEventListener() {},
-      createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
-      setRemoteDescription: () => held,
-      async setLocalDescription() {},
-      async addIceCandidate() {},
-      close() {},
-    }),
-  });
-  try {
-    const big = "s".repeat(MAX_SDP_BYTES / 2);
-    // Worst-case UTF-16 storage of one decoded offer: the description plus the sender id.
-    const perSignal = 2 * (big.length + 64);
-    const fits = Math.floor(MAX_QUEUED_SIGNAL_BYTES / perSignal);
-    const sent = MAX_QUEUED_SIGNALS + 64;
-    for (let i = 1; i <= sent; i++) {
-      deliver(wire({ type: "sdp", from: peerId(i), sdp: { type: "offer", sdp: big } }));
-    }
-    releaseHead();
-    for (let i = 0; i < sent + 8; i++) await new Promise((r) => setTimeout(r, 0));
-    assert(admitted <= fits + 1,
-      `the lane must drop past ${MAX_QUEUED_SIGNAL_BYTES} waiting bytes, ran ${admitted} (fits ${fits})`);
-    assert(admitted < MAX_QUEUED_SIGNALS,
-      "the byte companion must bite before the count does on maximum-sized offers");
-  } finally {
-    net.close();
-  }
+await test("a relay that drops is redialed, and a spoofed offer cannot take a live link down", async (keep) => {
+  const room = new RelayRoom(), world = new FakeWebRtc();
+  const A = keep(await rtcNode(room, world));
+  const B = keep(await rtcNode(room, world));
+  await joinRelay(A, "ws://relay/room");
+  await joinRelay(B, "ws://relay/room");
+  await until(async () => (await linkedPeers(A)).includes(B.peerId), 4000, "the WebRTC link");
+  // Someone in the room claims to be whichever of the two answers, with a new negotiation.
+  const [small, large] = A.peerId < B.peerId ? [A, B] : [B, A];
+  room.inject(["o", small.peerId, large.peerId, "00".repeat(8), "fake:999"].join("\0"));
+  await settle(100);
+  assert((await linkedPeers(large)).includes(small.peerId), "a live link survives a fresh offer in its name");
+  assert(world.made.length === 2, "the spoofed offer allocated no peer connection");
+
+  for (const m of [...room.members]) m.kill();
+  await until(async () => (await relayState(A)) === 2, 2000, "the dropped relay to read as redialing");
+  await until(async () => (await relayState(A)) === 1, 4000, "the relay to be redialed");
 });
 
-summary("net-rtc signaling boundary and speculative-entry cap");
+await test("negotiations are capped, and one that never connects is dropped on its deadline", async (keep) => {
+  const room = new RelayRoom();
+  // A world where nothing ever connects: descriptions are set and never paired.
+  const world = new FakeWebRtc();
+  world.maybeConnect = () => {};
+  const A = keep(await rtcNode(room, world, { transportConfig: { maxRtcNegotiating: 2, rtcConnectTimeoutMs: 150 } }));
+  await joinRelay(A, "ws://relay/room");
+  // Strangers larger than A, so A is the side that offers to each.
+  for (let i = 0; i < 5; i++) room.inject(["h", "ff".repeat(31) + (16 + i).toString(16), ""].join("\0"));
+  await until(() => world.made.length === 2, 2000, "two negotiations");
+  await settle(50);
+  assert(world.made.length === 2, `the cap bounds the peer connections a room can make us open, got ${world.made.length}`);
+  await until(() => world.made.every((pc) => pc.closed), 2000, "the stalled negotiations to be dropped");
+});
+
+summary("WebRTC");

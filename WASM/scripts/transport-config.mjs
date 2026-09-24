@@ -38,4 +38,11 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   unverifiedTimeoutMs: 2_000,
   // Frames per direction between key ratchets.
   rekeyAfterFrames: 1 << 24,
+  // WebRTC (rtc.js): negotiations held at once without an authenticated link, and how long
+  // one may take to open its data channel — ICE, DTLS and SCTP, which a NAT can make slow.
+  maxRtcNegotiating: 256,
+  rtcConnectTimeoutMs: 30_000,
+  // STUN/TURN servers, as RTCConfiguration.iceServers takes them. Empty offers host
+  // candidates only — a LAN — so a deployment crossing NATs names its own.
+  iceServers: Object.freeze([]),
 });

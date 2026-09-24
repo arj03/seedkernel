@@ -22,6 +22,8 @@
 
 **Wrapping sockets is host code on every target.** A confined guest never holds a socket, so whoever owns the platform's object wraps it. The browser's only socket objects are `WebSocket` and `RTCPeerConnection`; because the browser has no raw TCP, WebSocket is a codec over a raw listener, which is why a node answers a browser's WS with no extra host code. Go wraps nothing — raw sockets are native there. WebRTC has no Go adapter because RTC exists for the browser's NAT traversal, and a native node is a reachable server. Whatever the object, the bundle cannot tell transports apart.
 
+**Listeners are labelled, not typed.** Which codec a listener speaks is the transport's choice, not a property of the socket: every listener on every target is the same raw byte stream. A host that named kinds — a flag or an option per codec — would carry one transport's vocabulary, and a replacement speaking a third codec would need a host release to be listened for. A label is a string the host hands over unread, so the flag and the transport agree without the host in between.
+
 **A `RawLink` states only what the guest cannot know.** The guest named the destination, so it already holds the codec and the authority; what it cannot derive is whether the socket under that name frames messages, since the same `ws://` string is a platform `WebSocket` on one target and a byte stream on another.
 
 ## 12.2 The guest seam: the guest name ABI
@@ -119,7 +121,6 @@
 **Each driver owner fails the way its situation allows.**
 
 - *Inbound reads* fail the link that crosses the window, because 4,096 raw links must not each buy an independent realm invocation. The native reader goroutine waits instead: it is the one place backpressure costs nothing, and the socket's receive window carries it to the peer, whereas failing there would put a capacity cliff far below the link ceiling.
-- *Signals* drop rather than tear down: one relay carries every peer, so a dropped signal costs one redial where a failed channel costs all of them. Byte and count limits are paired because the per-message caps admit a 256 KiB session description, so a count alone would make this lane the node's largest single allowance.
 - *Outbound writes* fail the whole link, never one write: a record sealed and never sent is a hole in a nonce-ordered stream, and the peer's next decrypt would tear the link down as a forgery, blaming it for our own backpressure. Custody spans the adapter's buffer and the platform's backlog because both are bytes that link made the host retain. Retiring the drained *prefix* of admitted sizes, rather than waiting for an empty backlog a busy link may never reach, relies on ordering every transport already has.
 
 **Teardown must not queue behind the wire it is ending.** The occupant runs one work chain per link so a teardown cannot overtake a record being sealed. But the WebSocket codec parks every write until its upgrade completes, so a peer that dribbles a partial head and stops would park msg1 forever, with the handshake deadline's own abort queued behind it. Severing the wire synchronously first breaks that.
@@ -128,9 +129,21 @@
 
 ## 12.7 Browser↔console WebRTC
 
-**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding — stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A MITM relay can splice SDP and bring DTLS up to itself, but cannot produce the transcript signature without the peer's key, so the link never authenticates and never delivers a byte. That is also why signaling needs no signature and carries no credential: an RTC link opens under the node's own contact secret, so signaling has no secret to leak.
+**The seam is the platform object and nothing else.** A browser's only peer-to-peer primitive is an object a confined guest cannot hold, so the host holds it — and only it. Which peers to connect, how to find them, who offers and how long to wait are a transport's decisions; a host that made them — a relay wire, a full-mesh policy, a key comparison — would need a release for a transport to change them. The negotiation link passes the W3C verbs through as bytes, so what the host carries changes only if WebRTC does.
 
-**Signaling is measured before it is believed.** Charging a description at the boundary means nothing oversized is retained across the async negotiation that follows. A peer that establishes and never carries a data channel is reaped by the same deadline as one that never establishes, because leaving the speculative cap is not the same as being a live link.
+**`via` rather than a dialed peer.** The occupant opened the negotiation, so it already knows which peer a data channel is for; the host names the link the channel arrived through and never a key. A host-side "dialed" field would be a peer identity in the host with WebRTC as its only writer.
+
+**Roles instead of perfect negotiation.** With only one side ever offering, glare cannot happen, so the seam needs no rollback and the occupant no view of the signaling state. The pre-agreed data channel makes the two ends symmetric below the handshake: neither is a dialer to the host.
+
+**The data link arrives with its channel.** A handshake clock started at `link/open` would spend itself on ICE; announcing the link once its channel opens keeps the handshake deadlines meaning what they mean on TCP, and connecting gets a deadline of its own.
+
+**No bounds of its own.** Every byte of negotiation crosses a link, so the driver's link table, outbound custody and read windows already own it. A second set of caps would bound the same bytes twice, in a place a transport cannot tune.
+
+**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding — stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A MITM relay can splice SDP and bring DTLS up to itself, but cannot produce the transcript signature without the peer's key, so the link never authenticates and never delivers a byte. That is also why signaling needs no signature and carries no credential: a room shares one contact secret, which never goes near the relay.
+
+**A room member is not a peer.** The relay is unauthenticated, so anyone in a room can claim any key. That is why a fresh offer in the name of a peer with a live link is ignored rather than obeyed, and why a lost link is renegotiated rather than waited for: a reloaded peer gets back without a relay member being able to take a working link down.
+
+**Media is the app's own connection.** Audio and video need a peer connection an app can add tracks to. Lending the transport's would put a platform object back across the seam and its renegotiation back into the host, so an app that wants media opens its own and signals it over its own protocol, authenticated by the channel.
 
 **The peer-connection factory is the app's.** The seam the runtime owns is a byte duplex; an ICE/DTLS/SCTP implementation is one way to produce one, so the runtime depends on none. A console peer wants a pure-JS library, since it must bundle into `bun --compile`, where a native binding like `node-datachannel` segfaults.
 

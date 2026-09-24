@@ -44,7 +44,7 @@ function countingSodium(base) {
 /** A listening node, with its half-open budgets set for the test. */
 async function server(fabric, halfOpen, opts = {}) {
   const n = await makeTransportHost({
-    channels: fabric.view(), listen: { host: "loopback", port: 0 },
+    channels: fabric.view(), listen: [{ label: "tcp", host: "loopback", port: 0 }],
     contactSecret: CONTACT, transportHalfOpen: halfOpen, ...opts,
   });
   return n;
@@ -67,7 +67,7 @@ async function member(fabric, serverNode, host) {
   // The server's port is only known once it is listening, so the peer is taught to the
   // running occupant rather than named in its load config. `host` is what the fabric hands
   // back as `remoteAddr`, which is what the per-source cap buckets on (§12.6.2).
-  m.addr(serverNode.peerId, `tcp://${host}:${serverNode.driver.port}`, CONTACT);
+  m.addr(serverNode.peerId, `tcp://${host}:${serverNode.driver.portOf("tcp")}`, CONTACT);
   return m;
 }
 
@@ -87,7 +87,7 @@ await test("a silent stranger costs NO asymmetric crypto", async () => {
   c.reset(); // boot (manifest verify, hashing) is not what we are measuring
   const t0 = process.hrtime.bigint();
   const dials = [];
-  for (let i = 0; i < N; i++) dials.push(silentDial(fabric, s.driver.port, `10.0.${(i >> 8) & 255}.${i & 255}`));
+  for (let i = 0; i < N; i++) dials.push(silentDial(fabric, s.driver.portOf("tcp"), `10.0.${(i >> 8) & 255}.${i & 255}`));
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   await sleep(300); // let every accept reach the guest before reading the bill
   note(`${N} silent connections accepted in ${ms.toFixed(0)}ms (${(ms * 1000 / N).toFixed(1)}µs each)`);
@@ -108,7 +108,7 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
   c.reset();
   const dials = [];
   for (let i = 0; i < N; i++) {
-    const d = silentDial(fabric, s.driver.port, `10.1.${(i >> 8) & 255}.${i & 255}`);
+    const d = silentDial(fabric, s.driver.portOf("tcp"), `10.1.${(i >> 8) & 255}.${i & 255}`);
     // A well-formed-looking msg1 — right suite byte, right length, wrong everything
     // else. The suite byte matters: get it wrong and the guest refuses on the byte
     // alone, and this measures a cheaper path than a real attacker gets.
@@ -137,7 +137,7 @@ await test("an outside flood CANNOT keep members out", async () => {
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: UNVER, perSource: UNVER, verified: 8 }));
   const flood = [];
-  for (let i = 0; i < UNVER; i++) flood.push(silentDial(fabric, s.driver.port, `10.2.${i}.1`));
+  for (let i = 0; i < UNVER; i++) flood.push(silentDial(fabric, s.driver.portOf("tcp"), `10.2.${i}.1`));
   await sleep(300);
   assert(flood.every((d) => !d.closed), "the unverified budget should be saturated, not shedding");
 
@@ -160,7 +160,7 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: UNVER, perSource: UNVER, verified: 16 }));
   let n = 0;
-  const flood = () => silentDial(fabric, s.driver.port, `10.5.${(n++) % 250}.1`);
+  const flood = () => silentDial(fabric, s.driver.portOf("tcp"), `10.5.${(n++) % 250}.1`);
   for (let i = 0; i < UNVER; i++) flood();
 
   let authed = 0;
@@ -183,15 +183,15 @@ await test("a leaked contact secret cannot lock members out of the verified budg
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: VER }));
   for (let i = 0; i < VER * 3; i++) {
-    const d = silentDial(fabric, s.driver.port, `10.6.6.${i}`);
+    const d = silentDial(fabric, s.driver.portOf("tcp"), `10.6.6.${i}`);
     // A dialer that opens under the real secret and then stalls needs a real msg1, which
     // only a real node can build — so borrow one and cut its socket after the first write.
-    // Its raw link arrives the way every link does: an `InjectedChannels` factory hands the
-    // driver the gated wrapper as a host-announced dial, exactly as a real factory would.
+    // Its raw link is the one its own transport opens when it dials: an `InjectedChannels`
+    // factory answers that dial with the gated wrapper, exactly as a real factory would.
     const factory = new InjectedChannels();
     const a = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT }));
     let wrote = 0;
-    const raw = fabric.connect(`tcp://10.6.7.${i}:${s.driver.port}`);
+    const raw = fabric.connect(`tcp://10.6.7.${i}:${s.driver.portOf("tcp")}`);
     const gated = {
       remoteAddr: raw.remoteAddr,
       send: (b) => { if (++wrote <= 1) raw.send(b); },
@@ -201,7 +201,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),
     };
-    factory.give(gated, { dialed: s.peerId });
+    await factory.dial(a, s.peerId, gated, CONTACT);
     d.ch.onClose(() => {});
   }
   await sleep(500);
@@ -270,8 +270,8 @@ await test("the per-source cap still bites under flood", async () => {
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: PER, verified: 256 }));
   const noisy = [];
-  for (let i = 0; i < PER + 5; i++) noisy.push(silentDial(fabric, s.driver.port, "10.3.3.3"));
-  const quiet = silentDial(fabric, s.driver.port, "10.3.3.4");
+  for (let i = 0; i < PER + 5; i++) noisy.push(silentDial(fabric, s.driver.portOf("tcp"), "10.3.3.3"));
+  const quiet = silentDial(fabric, s.driver.portOf("tcp"), "10.3.3.4");
   await sleep(400);
   const refused = noisy.filter((d) => d.closed).length;
   note(`one source opened ${PER + 5}; ${refused} refused, ${PER + 5 - refused} held`);
@@ -290,7 +290,7 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256 }, { maxRawLinks: RAW }));
   const dials = [];
-  for (let i = 0; i < RAW * 3; i++) dials.push(silentDial(fabric, s.driver.port, `10.11.${i}.1`));
+  for (let i = 0; i < RAW * 3; i++) dials.push(silentDial(fabric, s.driver.portOf("tcp"), `10.11.${i}.1`));
   await sleep(300);
   const held = dials.filter((d) => !d.closed).length;
   note(`${RAW * 3} connections against a ${RAW}-link driver ceiling; ${held} held`);
@@ -305,7 +305,7 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
   // first burst would blackhole the node permanently.
   for (const d of dials.slice(0, RAW)) d.ch.close(false);
   await sleep(200);
-  const after = silentDial(fabric, s.driver.port, "10.12.0.1");
+  const after = silentDial(fabric, s.driver.portOf("tcp"), "10.12.0.1");
   await sleep(200);
   assert(!after.closed, "a released raw link must free its slot for the next connection");
 });
@@ -367,7 +367,7 @@ await test("an unverified connection is dropped on the SHORT deadline", async ()
   // number copied out of it here would be drift waiting to happen.
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 8, perSource: 8, verified: 8 }));
-  const d = silentDial(fabric, s.driver.port, "10.4.4.4");
+  const d = silentDial(fabric, s.driver.portOf("tcp"), "10.4.4.4");
   const t0 = Date.now();
   await until(() => d.closed, 15000, "an unproven connection to be dropped on its deadline");
   const unverifiedMs = Date.now() - t0;

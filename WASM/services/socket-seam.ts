@@ -1,4 +1,5 @@
-// Raw socket ABI (§12.1). Framing and routing belong to the transport bundle.
+// Raw socket ABI (§12.1). Framing, routing and every peer-shaped decision belong to the
+// transport bundle.
 
 export interface RawLink {
   send(bytes: Uint8Array): void;
@@ -24,36 +25,56 @@ export interface RawLink {
   readonly stream?: boolean;
 }
 
-/** Metadata for a platform-opened socket. Guest-opened links have none. */
+/** Metadata for a platform-opened link. Guest-opened links have none. */
 export interface Arrival {
-  /** Opaque listener label used by the bundle to select framing. */
+  /** The label of the listener that accepted it, passed to the occupant unread. */
   readonly listener?: string;
-  /** The peer the PLATFORM dialed this link for (hex), when it dialed on the node's behalf —
-   *  WebRTC, whose signaling picks the initiator. Absent for an accepted socket. The link's
-   *  handshake must prove this identity. */
-  readonly dialed?: string;
+  /** The link this one arrived through — a WebRTC data channel names the negotiation link
+   *  the occupant opened for it. The driver passes the id; what it means is the occupant's. */
+  readonly via?: RawLink;
 }
 
-/** Standard listener labels interpreted by the transport bundle. */
-export const LISTENER = { TCP: "tcp", WS: "ws" } as const;
-
-/** Where a listener binds: a host and a port, with port 0 meaning "ask the OS". One shape
- *  from the operator's `--listen`/`--ws-listen` through the node config and the driver
- *  down to this seam, so a bind address cannot mean one thing at one end of that chain and
- *  something else at the other. Not a destination: dialing takes a STRING whose scheme the
- *  factory interprets (`connect`, peer-addr.ts `parseDest`). */
+/** Where a listener binds: a label, a host and a port, with port 0 meaning "ask the OS".
+ *  The label reaches the occupant with every link the listener accepts, unread here, so
+ *  what a listener is for — which codec it speaks — is the transport's to decide. Not a
+ *  destination: dialing takes a STRING whose scheme the factory interprets (`connect`,
+ *  peer-addr.ts `parseDest`). */
 export interface ListenAddress {
+  label: string;
   host: string;
   port: number;
 }
 
 export interface ChannelFactory {
   connect?(dest: string): RawLink | null;
+  /** Bind each address this factory can bind and hand every platform-opened link to
+   *  `onAccept`. Answers the bound port of each address, in order: 0 for one it does not
+   *  bind. A factory that binds nothing still gets the sink — a WebRTC data channel is
+   *  platform-opened too. */
   listen(
-    tcp: ListenAddress | undefined,
-    ws: ListenAddress | undefined,
+    addrs: readonly ListenAddress[],
     onAccept: (channel: RawLink, arrival?: Arrival) => void,
-  ): Promise<{ port: number; wsPort: number }>;
+  ): Promise<number[]>;
   /** Stop the listeners. Open channels are closed by the core. */
   close(): void;
+}
+
+/** Several factories as one: a destination goes to the first that routes it, and every
+ *  factory gets the addresses and the accept sink. How a browser node reaches a WebRTC
+ *  relay over a WebSocket and its peers over data channels. */
+export function combineChannels(...factories: ChannelFactory[]): ChannelFactory {
+  return {
+    connect(dest) {
+      for (const f of factories) {
+        const link = f.connect?.(dest) ?? null;
+        if (link) return link;
+      }
+      return null;
+    },
+    async listen(addrs, onAccept) {
+      const bound = await Promise.all(factories.map((f) => f.listen(addrs, onAccept)));
+      return addrs.map((_, i) => bound.reduce((port, b) => port || (b[i] ?? 0), 0));
+    },
+    close() { for (const f of factories) f.close(); },
+  };
 }

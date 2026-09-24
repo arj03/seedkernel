@@ -167,6 +167,7 @@ function onWake() {
     const t = now();
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
+    wakeBy(rtc.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
     walking = false;
@@ -300,10 +301,9 @@ class Core {
   }
 
   /** Learn (or re-learn) one peer: where to reach it and the secret its door gates on.
-   *  An EMPTY `dest` is a peer we know of but cannot dial — an RTC peer, whose links arrive
-   *  through signaling — which is a real entry and not a missing one: it names a peer `send`
-   *  may address and `ready` waits for, without pretending we hold a route. Its secret goes
-   *  unread, since an RTC link opens under this node's own contact secret (RUNTIME §12.7). */
+   *  An EMPTY `dest` is a peer we know of but cannot dial — one whose links only arrive, such
+   *  as a WebRTC peer met through the relay — which is a real entry and not a missing one: it
+   *  names a peer `ready` waits for, without pretending we hold a route. */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }
@@ -321,7 +321,7 @@ class Core {
   async dialNow(peerId) {
     const addr = this.addrs.get(peerId);
     // Unknown, or known and not dialable BY US: an entry with no destination is a peer whose
-    // links can only arrive (signaling brought it), so there is nothing to open here. Both
+    // links can only arrive, so there is nothing to open here. Both
     // read the same at every caller — the frame waits for an inbound link or is dropped.
     if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
@@ -437,6 +437,7 @@ class Core {
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
+const rtc = new Rtc();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
@@ -448,7 +449,8 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
 //   the HOST  32 zero bytes — the platform's events: sockets opening, bytes
-//              arriving, an address, a wake, and the operator's `ready`/`peers`.
+//              arriving, an address, a wake, a relay to join, and the operator's
+//              `ready`/`peers`.
 //   an APP    its app key, exactly as an inbound frame carries the authenticated
 //              sender's key. `send` is the only op an app may name.
 //
@@ -491,24 +493,24 @@ function handle(argBytes) {
 /** The realm's one wake (§12.3): walk the deadlines (`onWake`). */
 entry("wake", () => { onWake(); });
 
-/** Platform-opened link event (§12.1). */
+/** Platform-opened link event (§12.2): an accepted socket, or a WebRTC data channel that
+ *  arrived through the negotiation link named by `via`. */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
   const stream = r.u8() === 1;
   const listener = r.blob();
-  // The peer the platform dialed for, or empty for an accepted socket.
-  const dialed = r.blob();
+  const via = r.u32();
   const source = r.blob();
-  const weDialed = dialed.length > 0;
+  if (via !== 0) { rtc.bindData(via, linkId, stream); return; }
   core.openLink({
-    linkId, weDialed, stream,
+    linkId, weDialed: false, stream,
     listener: listener.length > 0 ? utf8Decode(listener) : "",
     dest: "",
     linkSecret: null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
-    // Only an accept spends half-open budget; a dial is our own decision to make.
-    limiter: weDialed ? null : core.limiter,
-    dialedPeerId: weDialed ? toHex(dialed) : null,
+    // An accept spends half-open budget; a dial is our own decision to make.
+    limiter: core.limiter,
+    dialedPeerId: null,
   });
 });
 
@@ -572,6 +574,16 @@ entry("addr", (r) => {
   const secret = r.blob();
   core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
+
+/** Join the WebRTC signaling relay at this URL — a `ws://`/`wss://` room — leaving any
+ *  other; empty leaves. Peers met there are connected as they say hello (rtc.js). */
+entry("relay", async (r) => {
+  await rtc.join(utf8Decode(r.blob()));
+  return NOTHING;
+});
+
+/** `[state u8]`: 0 no relay joined, 1 its link is up, 2 joined and waiting to redial. */
+entry("relayState", () => Uint8Array.of(rtc.state()));
 
 /** Rotate the inbound contact secret (§12.6.3). */
 entry("contact", (r) => {

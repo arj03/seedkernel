@@ -1,7 +1,7 @@
 // Socket driver: owns links and listeners; protocol and peer state stay in the signed guest
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
-import { errMessage, fromHex, Fifo } from "../services/util.js";
+import { errMessage, Fifo } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -75,11 +75,10 @@ export interface TransportHostOptions {
   maxOutboundSlices?: number;
   /** The socket seam: dialing and listening live here, and so does every judgement about
    *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
-   *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
-   *  and its `link/open` calls answer "no route". */
+   *  factory with no `connect` is accept-only, and its `link/open` calls answer "no route". */
   channels?: ChannelFactory;
-  listen?: ListenAddress;
-  wsListen?: ListenAddress;
+  /** The listeners to bind, each labelled for the occupant (socket-seam.ts `ListenAddress`). */
+  listen?: readonly ListenAddress[];
   /** One link went down, with the occupant's one-byte reason (transport/src/ake.js
    *  `REASON_*`) — a peer that never finished the handshake, a defensive teardown, a clean
    *  farewell, a cut stream. NODE-level and observation only: nothing here can change what the
@@ -186,12 +185,15 @@ class LinkOutboundOwner {
  *  private memory (§4.3) — and neither can the address book, which is now that guest's too.
  *  So an upgrade is a reconnect, and the embedder re-supplies the addresses (§12.10). */
 export class TransportHost {
-  port = 0;
-  wsPort = 0;
+  /** The listeners as bound: each requested address with the port the platform gave it. */
+  listening: readonly ListenAddress[] = [];
 
   private readonly opts: TransportHostOptions;
   /** Every live link, by the id the occupant names it with. */
   private readonly links = new Map<number, LinkOutboundOwner>;
+  /** The id each live channel is registered under, for an arrival that names another
+   *  channel as its `via`. */
+  private readonly idOf = new WeakMap<RawLink, number>();
   private nextLinkId = 1;
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
@@ -298,6 +300,11 @@ export class TransportHost {
    *  driver that is merely dereferenced still holds its listener. */
   get isClosed(): boolean { return this.closed; }
 
+  /** The port the first listener labelled `label` bound, or 0 for none. */
+  portOf(label: string): number {
+    return this.listening.find((a) => a.label === label)?.port ?? 0;
+  }
+
   // ── reaching the transport ──────────────────────────────────────────────────
   //
   // `OpArgs` (services/op-frame.ts) encodes the host's raw-link event ABI (RUNTIME §12.2).
@@ -400,6 +407,7 @@ export class TransportHost {
       (bytes, slices) => this.releaseOutbound(bytes, slices),
     );
     this.links.set(linkId, link);
+    this.idOf.set(channel, linkId);
     // Admit one read per link into the serialized realm at a time. An adapter that can be
     // paused is paused at the socket, where the peer's own transport pushes back; one that
     // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
@@ -512,27 +520,28 @@ export class TransportHost {
     );
   }
 
-  /** Tell the transport about a link the HOST hands over: an accepted socket, or one a
-   *  factory dialed on its own initiative (WebRTC). A link the guest opened itself through
-   *  `link/open` is not here.
-   *
-   *  Contact policy remains in guest config (§12.6.3). */
+  /** Tell the transport about a link the HOST hands over: an accepted socket, or one that
+   *  arrived through a link the guest opened (a WebRTC data channel). A link the guest opened
+   *  itself through `link/open` is not here. `via` is that other link's id, 0 when there is
+   *  none or it is no longer live. */
   private announce(linkId: number, channel: RawLink, arrival?: Arrival): void {
+    const via = arrival?.via ? this.idOf.get(arrival.via) ?? 0 : 0;
     this.tell(ev("linkOpen")
       .u32(linkId)
       .u8(channel.stream ? 1 : 0)
       .text(arrival?.listener ?? "")
-      .blob(arrival?.dialed ? fromHex(arrival.dialed) : EMPTY)
+      .u32(via && this.links.has(via) ? via : 0)
       .text(channel.remoteAddr ?? ""));
   }
 
   // ── listening ───────────────────────────────────────────────────────────────
 
-  /** Bind the listeners (if any) through the channel factory. */
+  /** Bind the listeners (if any) through the channel factory, and take its accept sink. */
   async start(): Promise<void> {
     if (!this.opts.channels) return;
-    const { port, wsPort } = await this.opts.channels.listen(
-      this.opts.listen, this.opts.wsListen,
+    const addrs = this.opts.listen ?? [];
+    const ports = await this.opts.channels.listen(
+      addrs,
       (channel, arrival) => {
         if (!this.available()) {
           this.shut(channel);
@@ -546,8 +555,7 @@ export class TransportHost {
         this.announce(linkId, channel, arrival);
       },
     );
-    this.port = port;
-    this.wsPort = wsPort;
+    this.listening = addrs.map((a, i) => ({ ...a, port: ports[i] ?? 0 }));
   }
 
   // ── lifecycle ───────────────────────────────────────────────────────────────

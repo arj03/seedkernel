@@ -3,12 +3,12 @@
 // nothing else. The handshake, link routing and request/response layer run in the transport
 // bundle's guest, driven by TransportHost.
 //
-// TCP and WebSocket listeners expose the same byte stream; the transport bundle selects
-// framing from the destination or listener label (§12.1).
+// Every listener exposes the same byte stream; the transport bundle selects framing from
+// the destination or the listener's label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { errMessage } from "./util.js";
-import { LISTENER, type Arrival, type ListenAddress, type RawLink } from "./socket-seam.js";
+import { type Arrival, type ListenAddress, type RawLink } from "./socket-seam.js";
 import { TCP_LINGER_MS } from "./net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
@@ -68,8 +68,7 @@ function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
 // The node:net ChannelFactory: every socket the transport driver opens or accepts is
 // created here, behind the RawLink shape.
 export class NodeChannelFactory {
-  private tcpServer: TcpServer | null = null;
-  private wsServer: TcpServer | null = null;
+  private readonly servers: TcpServer[] = [];
   /** Takes no crypto: the WebSocket client key and the frame masks are the transport
    *  bundle's, which draws entropy from the ungated `crypto/random`. */
   constructor() {}
@@ -79,30 +78,18 @@ export class NodeChannelFactory {
     if (!d || d.scheme === "wss") return null;
     return nodeRawStream(tcpConnect(d.port, d.host));
   }
-  async listen(
-    tcp: ListenAddress | undefined,
-    ws: ListenAddress | undefined,
+  /** One TCP server per address; every socket it accepts carries that listener's label. */
+  listen(
+    addrs: readonly ListenAddress[],
     onAccept: (channel: RawLink, arrival?: Arrival) => void,
-  ): Promise<{ port: number; wsPort: number }> {
-    let port = 0, wsPort = 0;
-    const tasks: Promise<void>[] = [];
-    if (tcp) {
-      const server = createTcpServer((s) => onAccept(nodeRawStream(s), { listener: LISTENER.TCP }));
-      this.tcpServer = server;
-      tasks.push(listenOn(server, tcp).then((p) => { port = p; }));
-    }
-    if (ws) {
-      const server = createTcpServer((s) => onAccept(nodeRawStream(s), { listener: LISTENER.WS }));
-      this.wsServer = server;
-      tasks.push(listenOn(server, ws).then((p) => { wsPort = p; }));
-    }
-    await Promise.all(tasks);
-    return { port, wsPort };
+  ): Promise<number[]> {
+    return Promise.all(addrs.map((a) => {
+      const server = createTcpServer((s) => onAccept(nodeRawStream(s), { listener: a.label }));
+      this.servers.push(server);
+      return listenOn(server, a);
+    }));
   }
   close(): void {
-    this.tcpServer?.close();
-    this.tcpServer = null;
-    this.wsServer?.close();
-    this.wsServer = null;
+    for (const server of this.servers.splice(0)) server.close();
   }
 }

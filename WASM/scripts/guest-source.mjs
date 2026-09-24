@@ -1,5 +1,5 @@
 // The transport bundle's guest program: transport/src/*.js concatenated in a FIXED order
-// (util → ake → framing → router → core). Order is load-bearing (parts share one scope,
+// (util → ake → framing → router → rtc → core). Order is load-bearing (parts share one scope,
 // "use strict" leads), and the parts live ONLY here. The canonical op-frame fragment
 // replaces the marker util.js carries. Dependency-free so loc.mjs can use its path list.
 
@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 
 const wasmDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-export const GUEST_PARTS = ["util.js", "ake.js", "framing.js", "router.js", "core.js"];
+export const GUEST_PARTS = ["util.js", "ake.js", "framing.js", "router.js", "rtc.js", "core.js"];
 const OP_FRAME_MARKER = "/* @seedkernel-op-frame */";
 
 /** Absolute paths to the parts, in concatenation order. */

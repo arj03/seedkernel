@@ -33,16 +33,19 @@ const nativeHandleHarness = `
       policyJson: cfg.policyJson ?? undefined,
       identity,
       transport: {
-        listen: cfg.listen,
-        wsListen: cfg.wsListen,
+        // This harness's two listener slots, under the labels the shipped transport reads.
+        listen: [
+          ...(cfg.listen ? [{ label: "tcp", ...cfg.listen }] : []),
+          ...(cfg.wsListen ? [{ label: "ws", ...cfg.wsListen }] : []),
+        ],
         // Contact policy is transport config (§12.6.3).
         config: cfg.contactSecretHex ? { contactSecret: cfg.contactSecretHex } : undefined,
       },
     });
     return new TextEncoder().encode(JSON.stringify({
       peerId: toHex(identity.publicKey),
-      port: node.transport?.port ?? 0,
-      wsPort: node.transport?.wsPort ?? 0,
+      port: node.transport?.portOf("tcp") ?? 0,
+      wsPort: node.transport?.portOf("ws") ?? 0,
     }));
   };
   globalThis.cliLoadBundle = async (path) => {

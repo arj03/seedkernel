@@ -162,9 +162,9 @@ function wsCall(req) {
 }
 
 class WsFramer {
-  /** `authority` is the `host:port` this link was dialed at, for the client's Host
-   *  header — empty on the accepting side, which never sends one. */
-  constructor(put, weDialed, authority) {
+  /** `authority` and `path` are where this link was dialed, for the client's request line
+   *  and Host header — unused on the accepting side, which never sends one. */
+  constructor(put, weDialed, authority, path = "/") {
     this.put = put;
     this.client = weDialed;
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
@@ -204,7 +204,7 @@ class WsFramer {
         this.key = utf8Decode(r);
         this.expectAccept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
         this.put(utf8Encode(
-          "GET / HTTP/1.1\r\nHost: " + authority + "\r\n" +
+          "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\n" +
           "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
           "Sec-WebSocket-Key: " + this.key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"));
       })();
@@ -432,7 +432,8 @@ function headerValue(head, name) {
   return m ? m[1] : null;
 }
 
-/** Must match `LISTENER.WS` in services/socket-seam.ts. */
+/** The listener label this program reads as WebSocket; every other label is length
+ *  framing. The operator chooses labels (`--listen ws=host:port`); the host never reads them. */
 const LISTENER_WS = "ws";
 
 function makeFramer(stream, linkId, dest, listener) {
@@ -441,11 +442,11 @@ function makeFramer(stream, linkId, dest, listener) {
   if (dest) {
     // The socket factory already accepted the destination; framing needs only its codec
     // and, for WebSocket, the HTTP Host value.
-    const ws = /^wss?:\/\/([^/]+)/i.exec(dest);
-    if (ws) return new WsFramer(put, true, ws[1]);
+    const ws = /^wss?:\/\/([^/]+)(\/\S*)?$/i.exec(dest);
+    if (ws) return new WsFramer(put, true, ws[1], ws[2] ?? "/");
     return new LengthFramer(put);
   }
-  // Unlabelled platform dials, such as RTC, use length framing.
+  // Every other accepted link — a TCP listener, a WebRTC data channel — is length framing.
   if (listener === LISTENER_WS) return new WsFramer(put, false, "");
   return new LengthFramer(put);
 }

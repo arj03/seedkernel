@@ -44,14 +44,15 @@ This is the one place these figures live.
 
 ## 11. Example app layer: chat ([seedchat](https://github.com/arj03/seedchat))
 
-Chat is the smallest complete app, and lives in [seedchat](https://github.com/arj03/seedchat), a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
+Chat is the smallest complete app, and lives in [seedchat](https://github.com/arj03/seedchat), a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `net-ws`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
 
 - **The bundle** is a guest of a handful of lines whose `handle` forwards its input to one restartable module by name and returns the render bytes. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. Seedchat derives its consent key by hashing the verified WASM bytes it holds.
 - **The page** generates an Ed25519 channel identity, constructs a host (§3), installs a policy approving the authors the user trusts (§12.5), and starts with an empty table. `v1 — text only` and `v2 — text + image + nick` are two bundles under one `(author, app)`; v1→v2 is an install naming that slot, re-stating the `chat` protocol claim (§12.10).
-- **Peers** connect over a WebRTC mesh from `RtcNetwork` (§12.7); chat rides the transport request plane as `[req][protocolId][type][chatType‖body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
+- **Peers** connect over a WebRTC mesh the transport bundle negotiates through a signaling relay (§12.7); chat rides the transport request plane as `[req][protocolId][type][chatType‖body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
 - **Relayed bundles** travel in an `OFFER` frame; the recipient re-verifies both author signatures and applies its own policy (§12.4).
 - **Rendering** leaves the host: the guest returns render bytes to the page, which `postMessage`s them to an iframe sandboxed `allow-scripts allow-forms` with no same-origin access to the page's keys.
-- **The relay** partitions signaling into rooms by URL path (`ws://host:8080/<room>`, default `global`, `[A-Za-z0-9._-]`, ≤128 chars). A room is not authenticated: its members see its SDP metadata, but cannot impersonate a peer (§12.7).
+- **The relay** partitions signaling into rooms by URL path (`ws://host:8080/<room>`, default `global`, `[A-Za-z0-9._-]`, ≤128 chars); the page joins one with the transport's `relay` op. A room is not authenticated: its members see its SDP metadata, but cannot impersonate a peer (§12.7).
+- **Calls** are chat's own: the page opens a separate `RTCPeerConnection` per peer for audio and video and signals it over the authenticated transport, under a protocol a small boot bundle claims.
 - **`ui` and `app_meta`** WASM custom sections are seedchat conventions; the host reads neither.
 
 To run it: `npm run build:browser` here, then follow seedchat's build steps (`npm run relay` runs the rendezvous).
@@ -92,8 +93,9 @@ The host provides four **host services** — `node`, `fs`, `timer`, `link` (`HOS
 #### Links
 
 - **A `RawLink`** reports `stream` (1: a byte duplex the caller frames itself; 0: the platform delivers whole messages), and `buffered()` — the bytes it still holds. It carries no codec and no authority. Every `RawLink` is ordered.
-- **An `Arrival`** accompanies a platform-opened link: the listener label and, for a link the platform dialed on the node's behalf, `dialed` — the peer it was dialed for. WebRTC sets `dialed` on the side signaling chose to initiate. Guest-opened links have no `Arrival`.
-- **Socket seams**, each handing a `RawLink` to the driver (`host/transport-host.ts`) through the one `ChannelFactory` seam: `services/net-node.ts` (node:net — TCP, and WebSocket behind a listener labelled `LISTENER.WS`), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7); on the native target `net.go`/`sock.go`. The flood bounds are `services/net-limits.ts` (§12.6).
+- **An `Arrival`** accompanies a platform-opened link: the label of the listener that accepted it, or `via` — the link it arrived through, which is how a WebRTC data channel names the negotiation link the occupant opened for it (§12.7). Guest-opened links have no `Arrival`.
+- **Listeners are labelled.** A `ListenAddress` is `{ label, host, port }`; the label reaches the occupant with every link that listener accepts, and the host never reads it. The shipped transport reads `ws` as RFC 6455 and any other label as length framing.
+- **Socket seams**, each handing a `RawLink` to the driver (`host/transport-host.ts`) through the one `ChannelFactory` seam: `services/net-node.ts` (node:net — one TCP listener per address), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7), and `combineChannels` (`services/socket-seam.ts`) to put several behind one driver; on the native target `net.go`/`sock.go`. The flood bounds are `services/net-limits.ts` (§12.6).
 
 ### 12.2 The guest seam: the guest name ABI
 
@@ -156,12 +158,12 @@ The host enters a realm with its own events. A realm that armed a wake receives 
 | Event | `opLen` | `args`, in byte order | Return body |
 | --- | --- | --- | --- |
 | `wake` | 4 | none | ignored |
-| `linkOpen` | 8 | `[linkId u32][stream u8][listener text][dialed blob][remoteAddr text]` | ignored |
+| `linkOpen` | 8 | `[linkId u32][stream u8][listener text][via u32][remoteAddr text]` | ignored |
 | `linkBytes` | 9 | `[linkId u32][bytes blob]` | ignored; the driver awaits completion before admitting the next read on this link |
 | `linkClosed` | 10 | `[linkId u32]` | `[reason u8]`, bare; an absent, malformed or rejected answer reads as `0` |
 
 - `linkId` 0 is never a live link. `linkOpen` announces a platform-accepted or platform-initiated socket; a guest-opened link gets its id and `stream` from `link/open` instead, with no event.
-- Missing arrival metadata encodes as an empty listener and an empty `dialed` blob, which is an accepted socket. A `dialed` peer is its 32 key bytes and makes this end the handshake's initiator. A missing source address is empty text. Listener and address are platform metadata, not authenticated identity.
+- Missing arrival metadata encodes as an empty listener and `via` 0. A `via` names the live link this one arrived through, 0 when there is none or it has already gone. A missing source address is empty text. Listener, `via` and address are platform metadata, not authenticated identity.
 - `stream = 1` makes each `linkBytes` an arbitrary byte-stream slice; `0` makes it one platform-framed message. The bytes inside the blob are opaque to the host.
 
 **The close reason** is a local fact; it never goes on the wire. The shipped vocabulary (`transport/src/ake.js` `REASON_*`):
@@ -303,7 +305,7 @@ The predicate is not re-asked at commit. Atomicity is specified in Atomic load a
 
 #### Boot transport
 
-`bootShell`'s `transport.bundle` defaults to the embedded artifact; selecting it authorizes its `link` independently of app policy, and it must declare `link`. `transport: false` (the `bootShell` default) creates none. The CLI enables networking only with `--listen`, `--ws-listen` or `--peers`; `--transport` selects the boot blob, and it and `--contact-secret` are refused without one of those. After the transport is uninstalled or replaced by an ordinary app, starting another requires a new boot.
+`bootShell`'s `transport.bundle` defaults to the embedded artifact; selecting it authorizes its `link` independently of app policy, and it must declare `link`. `transport: false` (the `bootShell` default) creates none. The CLI enables networking only with `--listen` or `--peers`; `--transport` selects the boot blob, and it and `--contact-secret` are refused without one of those. After the transport is uninstalled or replaced by an ordinary app, starting another requires a new boot.
 
 #### Policy file
 
@@ -329,9 +331,9 @@ Sensitive protocol and service names are pinned to approved owners (author and `
 
 Everything in this section is the **shipped transport bundle's guest program** (`transport/src/*.js`, with private modules `ws.wasm` and `mlkem768.wasm`), not host code. A replacement transport may differ; this is what ships. The first transport is embedded in the host artifact (`TRANSPORT_BUNDLE_B64`).
 
-- **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade and address book. Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
+- **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book and WebRTC signaling (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
-- **What a replacement changes without a host release.** Everything in this section: the handshake, key schedule, suite byte, record layer, framing, address grammar and config keys. The host sees no handshake width, the shell passes `--peers` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's one call into a transport is `ready` on its service id, made when `--peers` is given (§12.8).
+- **What a replacement changes without a host release.** Everything in this section and §12.7's signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's one call into a transport is `ready` on its service id, made when `--peers` is given (§12.8).
 
 #### Framing
 
@@ -413,7 +415,7 @@ The host driver keeps its own coarse bounds beneath the transport's, on structur
 - **`MAX_LINK_READ_BYTES` (2 MiB)** caps one read handed to the occupant — a platform-framed message whole — and fails the link past it, before the copy into the realm. The occupant's frame cap must fit under it. The byte windows below are sized in it.
 - **`DEFAULT_MAX_RAW_LINKS` (4096)** bounds the link table on the one path that mints a link id, and **refuses** rather than evicts (`TransportHostOptions.maxRawLinks`).
 - **`MAX_INBOUND_HOLD_BYTES` / `MAX_INBOUND_HOLD_SLICES`** are one driver-wide budget for reads admitted toward the transport realm, charged while held and while dispatched. The link whose next read crosses a ceiling is failed; reservations release when the dispatched call settles or held input is dropped. The native reader goroutine charges the same ceiling again on its staging copy and **waits** instead of failing, so native inbound memory is bounded at twice this figure.
-- **`MAX_QUEUED_SIGNAL_BYTES` (4 MiB) / `MAX_QUEUED_SIGNALS` (256)** bound the one ordered WebRTC signaling lane, node-wide; overflow **drops** the newcomer. Per peer, `MAX_PENDING_ICE_BYTES` (256 KiB) and `MAX_PENDING_ICE_CANDIDATES` (256); across peers, `MAX_UNESTABLISHED_PEERS` (256), each entry reaped by `UNESTABLISHED_PEER_TTL_MS` unless it both connects and binds a data channel.
+- **WebRTC negotiation** has no bound of its own: each peer connection is two entries under `DEFAULT_MAX_RAW_LINKS`, what the occupant writes to one is outbound custody, and what the platform emits is an ordinary read (§12.7).
 - **`MAX_OUTBOUND_QUEUE_BYTES` / `_SLICES`** per link and **`MAX_NODE_OUTBOUND_QUEUE_BYTES` / `_SLICES`** (4× each) node-wide bound authenticated writes waiting below the transport; the guest applies the same window to frames on its encryption chain. One custody period per link spans the adapter's pre-open buffer and the platform's send backlog: the charge is `RawLink.buffered()` (`writableLength` on Node, `bufferedAmount` in the browser, an exact queue on native), and the driver retires the drained prefix of the admitted sizes at each write. An adapter that cannot report fails its link. Crossing any ceiling — or the occupant's own `host.call` budget refusing a write — fails the whole link, never one record.
 - **Teardown severs the wire first.** `close`/`abort` cut the wire synchronously, failing any parked write, then run the queued teardown; the link leaves routing at once.
 
@@ -439,17 +441,36 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ transport: { config } })` passes operator overrides as that load's `localConfig`.
 - Its identity comes from `HOST.identity`, never from config.
 - Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings — this transport's own grammar (`peerRef`, `core.js`), refused at load when malformed — and through `addr` calls.
-- The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate and the value host-announced dials present, without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A guest-dialed link presents the **peer's** secret from the address book.
+- The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret from the address book; a WebRTC link presents this node's own, since the members of a room share one (§12.7).
+- The host-only `relay` op (one text: a `ws://`/`wss://` room URL, empty to leave) joins a WebRTC signaling room, and `relayState` answers `[u8]`: 0 none joined, 1 its link is up, 2 redialing. `iceServers` (`RTCConfiguration.iceServers` as JSON, `LOCAL ?? APP`, empty by default) is handed to every peer connection.
 
 ### 12.7 Browser↔console WebRTC
 
-`RtcNetwork` (`services/net-rtc.ts`) is the browser's socket seam: a `ChannelFactory` handing each established `RTCDataChannel` to the driver as an ordinary `RawLink`, with the transport's handshake and records running inside it.
+A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCPeerConnection`, and a confined guest cannot hold a platform object. `RtcNetwork` (`services/net-rtc.ts`) holds it and decides nothing: which peers to connect, the relay and its wire, who offers, when to restart ICE and how long connecting may take are the transport bundle's (`transport/src/rtc.js`).
 
-- **Signaling only.** Peers connect directly; the app-neutral [`seedrelay`](https://github.com/arj03/seedrelay) server is the SDP/ICE rendezvous and can be killed once channels are open. The `Signaling` seam is pluggable and carries one opaque encoded string each way; the compact NUL-separated frame is decoded once inside `RtcNetwork`, before policy or allocation. Signaling carries no SDP-fingerprint signature and no credential.
-- **One ordered binary channel per peer.** Its `Arrival` carries `dialed` on the side signaling chose to initiate, and no listener. An RTC link opens under the node's own contact secret.
-- **Bounds.** `MAX_SDP_BYTES` (worst-case UTF-16 storage) is charged at the signaling boundary before policy runs; an oversized description is dropped. Candidates queued before a remote description are normalized to the four standard scalar fields and capped per peer; crossing a cap tears the speculative peer down. A peer connection that does not reach `connected` with a bound data channel within 30 s is closed (§12.6).
+- **Two links per peer connection.** `link/open("rtc:offer")` or `"rtc:answer"`, optionally followed by `?` and an `RTCConfiguration` as JSON, opens the *negotiation link*: message-framed, each message `[tag u8][UTF-8 text]`. The pre-agreed data channel (`negotiated`, id 0, on both sides) arrives once it opens as the *data link*, a byte stream announced with the negotiation link as its `via` (§12.2). Closing either closes both.
+
+| Tag | Up (host → occupant) | Down (occupant → host) |
+| --- | --- | --- |
+| `o` | the local offer's SDP | a remote offer's SDP — answering side only |
+| `a` | the local answer's SDP | the remote answer's SDP — offering side only |
+| `c` | a local candidate | a remote candidate |
+| `s` | the connection state | — |
+| `r` | — | restart ICE (empty) |
+
+- A candidate is its `candidate`, `sdpMid`, `sdpMLineIndex` and `usernameFragment`, NUL-separated, an absent one empty.
+- **Only the offering side offers.** Its `negotiationneeded` sets and sends a local offer; the answering side answers what it is given and never offers, so there is no glare. Down messages apply in order, a candidate never ahead of its description; up, a candidate gathered while a description is being set follows it. A malformed or out-of-role message fails the link.
+- **Bounds are the driver's.** Each link is an entry under `DEFAULT_MAX_RAW_LINKS`; down messages not yet applied are the negotiation link's `buffered()` backlog, so outbound custody bounds them (§12.6); up messages are ordinary reads.
 - **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. Seedstore's `scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
-- DTLS on the data channel is a second, redundant encryption layer.
+
+#### The shipped transport's signaling
+
+- **One room.** The `relay` op (§12.6) opens a `ws://`/`wss://` link to the room — through `WsNetwork` in a browser, or a raw socket and the bundle's own RFC 6455 framing elsewhere — and says hello; a relay that drops is redialed. The relay forwards every binary frame verbatim to the rest of the room.
+- **The relay wire**, UTF-8, NUL-separated: `h from to` (a hello; `to` empty broadcasts), `o`/`a from to sid sdp`, `i from to sid candidate sdpMid sdpMLineIndex usernameFragment`. A broadcast hello is answered once, directed. A frame over `MAX_SIGNAL_BYTES` closes the relay link; a sender outside `admitPeers` is ignored.
+- **Who offers.** The smaller key, as the smaller key's dial wins a TCP double connect. `sid` is the offering side's name for one negotiation, so a new negotiation is told apart from an ICE restart without reading the SDP. On `disconnected` the offering side restarts ICE.
+- **The data link.** The offering side's is the handshake's initiator, pinned to the key the relay named; the answering side's is an accept, under the half-open budgets. Both present this node's own contact secret, which the members of a room share.
+- **Bounds.** `maxRtcNegotiating` caps negotiations without an authenticated link; `rtcConnectTimeoutMs` drops one whose data channel has not opened, and the handshake deadlines start when it does. A fresh offer in the name of a peer with a live link is ignored; a lost link is renegotiated.
+- **Signaling carries no credential.** Identity is proven in the channel (§12.6), and DTLS on the data channel is a second, redundant encryption layer.
 
 ### 12.8 The shell: node assembly and the CLI
 
@@ -457,7 +478,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 
 ```sh
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
-     --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
+     --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
      [--contact-secret ./contact.hex] [--local-config ./app.json] \
      [--revoke <hex,…>] [--uninstall <app,…>] \
@@ -467,6 +488,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 
 - **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order — remedies, then the bundle, then the one-shots, then serve — and every printed line. A target supplies a `CliHost` of five members: files, one console line, raw stdout, entropy, and "stand a node up on this platform". Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
+- **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. The label reaches the transport with every link the listener accepts, unread (§12.1).
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one.
 - **`--contact-secret`** names a file, never the secret itself; its contents, less the line ending, become `transport.config.contactSecret` unread.
 - **`--local-config`** requires `--bundle` and is that load's `LOCAL`; it never reaches the transport.
@@ -488,7 +510,7 @@ The Go/native target (`native/`) is the recommended non-browser deployment: one 
 
 ```sh
 seedkernel --policy ./allowed-keys.json --dir ./data --key ./node.key \
-     --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
+     --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--local-config ./app.json] [--peers <pk>@host:port,…] \
      [--op name  < argument > response]
 ```
