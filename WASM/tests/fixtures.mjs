@@ -50,7 +50,7 @@ export { bytesEqual } from "./bytes.mjs";
 // rather than a parallel copy of it.
 export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
-export const { guestOpFraming, authorBundle } = await imp("build/host/bundle-author.js");
+export const { guestOpFraming, authorBundle } = await imp("build/scripts/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
 export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 

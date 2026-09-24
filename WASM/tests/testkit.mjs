@@ -74,7 +74,7 @@ export function testkit({ verbose = true } = {}) {
 // Resolved from this file's location; every suite runs after `npm run build`.
 const impBuilt = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
 const { hybridAuthorId } = await impBuilt("build/host/bundle.js");
-const { hybridAuthorKeysFromSeed } = await impBuilt("build/host/bundle-author.js");
+const { hybridAuthorKeysFromSeed } = await impBuilt("build/scripts/bundle-author.js");
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
  *  the two derive — built through the SHIPPED seed→key-set derivation, so a suite that

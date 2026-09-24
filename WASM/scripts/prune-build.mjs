@@ -7,7 +7,7 @@
 // destination first, so it cannot inherit one; `build/` is the tree that needs the sweep.
 // That is how `host/kem.js` outlived the move of ML-KEM into the transport bundle.
 //
-// Scoped to `host/` and `services/`, the two subtrees tsconfig.json owns (rootDir "."), so
+// Scoped to `host/`, `services/` and `scripts/`, the subtrees tsconfig.json owns (rootDir "."), so
 // the asc outputs and `transport.skb` that share `build/` are never candidates.
 
 import { readdirSync, statSync, existsSync, rmSync, rmdirSync } from "node:fs";
@@ -47,7 +47,7 @@ function prune(dir) {
   return removed;
 }
 
-const removed = [...prune(join(buildDir, "host")), ...prune(join(buildDir, "services"))];
+const removed = ["host", "services", "scripts"].flatMap((d) => prune(join(buildDir, d)));
 if (removed.length > 0) {
   console.log(`pruned ${removed.length} orphaned build file(s): ${removed.join(", ")}`);
 }

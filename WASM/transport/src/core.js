@@ -525,9 +525,9 @@ entry("linkBytes", async (r) => {
   return NOTHING;
 });
 
-/** The socket is gone. The return is the one-byte reason (`closeReason`, ake.js) — a fact
- *  only this program ever held, since it is the end with the session keys, and the driver
- *  prints the non-routine ones so a node that cannot reach its cohort says why. It carries
+/** The socket is gone. The return is `[severity u8][reason utf8]` (`closeReason`, ake.js) — a
+ *  fact only this program ever held, since it is the end with the session keys, and the
+ *  driver prints any above severity 0 so a node that cannot reach its cohort says why. It carries
  *  no link id: the event names the link, so a return cannot speak about another socket, and
  *  a link already reported is off `linksById` and answers nothing a second time. */
 entry("linkClosed", (r) => {
@@ -536,7 +536,8 @@ entry("linkClosed", (r) => {
   if (!link) return NOTHING;
   link.onChannelClosed();
   linksById.delete(linkId);
-  return Uint8Array.of(link.closeReason);
+  const why = link.closeReason;
+  return concatBytes([Uint8Array.of(ROUTINE_REASONS.has(why) ? 0 : 1), utf8Encode(why)]);
 });
 
 /** App-facing send: deferred because the peer's response is another invocation of this

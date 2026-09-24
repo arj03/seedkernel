@@ -1,7 +1,7 @@
 // Socket driver: owns links and listeners; protocol and peer state stay in the signed guest
 // (§12.1). Destinations remain opaque, and events target the current link occupant (§12.10).
 
-import { errMessage, Fifo } from "../services/util.js";
+import { dec, errMessage, Fifo } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -22,30 +22,6 @@ const EMPTY = new Uint8Array(0);
 
 /** Link id 0 means no route; its `stream` bit is ignored. */
 const NO_ROUTE = { linkId: 0, stream: false } as const;
-
-/** The shipped transport's close-reason vocabulary (transport/src/ake.js `REASON_*`),
- *  mirrored here for ONE purpose: turning the occupant's byte into a readable diagnostic
- *  line. Nothing in this driver branches on a link's behaviour because of it, and a
- *  replacement occupant with its own vocabulary is not wrong — its codes simply print as
- *  numbers. That is the whole extent of the coupling. */
-export const REASON_NAMES = [
-  "open", "handshake", "clean", "aborted", "local", "truncated", "refused", "timeout",
-  "dropped",
-];
-
-/** Reasons that say nothing worth reading: `clean` and `local`, which a healthy node
- *  produces constantly (the peer said goodbye, or we retired the link ourselves), and `0` —
- *  a vacant binding, an occupant that answered nothing, or a rejected event, none of which
- *  is a diagnosis and the last of which `reportOpError` has already printed properly.
- *  Everything else — a peer that never finished the handshake, one whose bytes were wrong, a
- *  stream that was cut — is printed.
- *
- *  Anomaly-only is what makes this safe to leave on with no flag: a working network is
- *  silent, so anything on stderr is a fact worth reading, and a node whose links really are
- *  failing is exactly the node that should be saying so. It is the only place a teardown
- *  reason surfaces without an embedder wiring `onLinkClosed` itself — which is why it lives
- *  in the driver and not in any one shell's CLI. */
-const QUIET_REASONS = new Set([0 /* unanswered */, 2 /* clean */, 4 /* local */]);
 
 const ev = (name: LinkEvent) => new OpArgs(name);
 
@@ -79,19 +55,19 @@ export interface TransportHostOptions {
   channels?: ChannelFactory;
   /** The listeners to bind, each labelled for the occupant (socket-seam.ts `ListenAddress`). */
   listen?: readonly ListenAddress[];
-  /** One link went down, with the occupant's one-byte reason (transport/src/ake.js
-   *  `REASON_*`) — a peer that never finished the handshake, a defensive teardown, a clean
-   *  farewell, a cut stream. NODE-level and observation only: nothing here can change what the
+  /** One link went down, with the occupant's reason — for the shipped transport a word
+   *  from transport/src/ake.js `REASON_*`: a peer that never finished the handshake, a
+   *  defensive teardown, a clean farewell, a cut stream. Empty when the occupant said nothing. NODE-level and observation only: nothing here can change what the
    *  occupant does, and an app that wants the peer set asks the transport for it.
    *
    *  DELIBERATELY has no caller in this repo's own shells, and that is not a reason to delete
    *  it. It is how `tests/transport-link.test.mjs` pins what each reason MEANS — every
-   *  `CLOSE_REASON` assertion in that file reads this callback, and without it those
+   *  reason assertion in that file reads this callback, and without it those
    *  properties can only be checked through the in-process channel pair, which pins nothing
    *  for the case the reason exists for (the other end being another machine). It is also the
    *  escape hatch for a host that needs the fact programmatically rather than on stderr.
    *  Routine debugging needs neither: `logLinkDown` already prints the anomalous ones. */
-  onLinkClosed?: (linkId: number, reason: number) => void;
+  onLinkClosed?: (linkId: number, reason: string) => void;
   /** Silence the link-down diagnostic. For a node whose teardown churn is normal and
    *  expected — a relay — or a test that would otherwise print a page of deliberate
    *  failures. Teardowns still reach `onLinkClosed`. */
@@ -484,39 +460,41 @@ export class TransportHost {
     return linkId;
   }
 
-  /** One link went down for a reason worth an operator's attention. The socket's own
-   *  `remoteAddr` goes with it, unauthenticated and stated as such — it is the only thing
-   *  the driver knows that says WHICH machine, and on a link that never authenticated there
-   *  is no identity to name instead. `suppressLinkLog` silences the whole line for a node
-   *  whose churn is normal (a relay). */
-  private logLinkDown(linkId: number, channel: RawLink, reason: number): void {
-    if (this.opts.suppressLinkLog || QUIET_REASONS.has(reason)) return;
-    const why = REASON_NAMES[reason] ?? `reason ${reason}`;
+  /** One link went down for a reason the occupant ranked above severity 0,
+   *  printed as it gave it. The socket's own `remoteAddr` goes with it, unauthenticated and
+   *  stated as such — it is the only thing the driver knows that says WHICH machine, and on a
+   *  link that never authenticated there is no identity to name instead. `suppressLinkLog`
+   *  silences the whole line for a node whose churn is normal (a relay). */
+  private logLinkDown(linkId: number, channel: RawLink, reason: string): void {
+    if (this.opts.suppressLinkLog) return;
     const from = channel.remoteAddr ? ` from ${channel.remoteAddr}` : "";
-    console.error(`[transport] link ${linkId}${from} down: ${why}`);
+    console.error(`[transport] link ${linkId}${from} down: ${reason}`);
   }
 
   /** One raw channel became unusable: drop it from the table, tell the guest, and report
-   *  the reason it answers with. That one byte is the whole of what the occupant tells the
+   *  the reason it answers with. That answer is the whole of what the occupant tells the
    *  host about a link, and the only thing here that could not be worked out from the
    *  socket: a descriptor closing looks identical whether it carried a farewell, a
    *  defensive teardown or a cut stream. The event names the link, so the return carries
-   *  no link id and cannot be redirected at another socket; a malformed or absent answer
-   *  reads as `0` rather than guessing. */
+   *  no link id and cannot be redirected at another socket. It is `[severity u8][reason utf8]`:
+   *  the driver prints any reason above severity 0 and never reads the words, so the
+   *  vocabulary, and how much each matters, is the occupant's. An absent answer is an empty
+   *  reason at severity 0 rather than a guess. */
   private channelClosed(linkId: number, link: LinkOutboundOwner): void {
     if (this.links.get(linkId) !== link) return;
     this.links.delete(linkId);
     link.releaseAll();
-    const report = (reason: number) => {
-      this.logLinkDown(linkId, link.channel, reason);
+    const report = (ret: Uint8Array) => {
+      const reason = dec.decode(ret.subarray(1));
+      if (ret.length > 0 && ret[0] > 0) this.logLinkDown(linkId, link.channel, reason);
       try { this.opts.onLinkClosed?.(linkId, reason); }
       catch { /* a platform callback cannot corrupt this driver's link table */ }
     };
     const r = this.toTransport(ev("linkClosed").u32(linkId));
-    if (!r) { report(0); return; }
+    if (!r) { report(EMPTY); return; }
     void r.then(
-      (ret) => report(ret.length === 1 ? ret[0] : 0),
-      (err: unknown) => { report(0); this.reportOpError("linkClosed", err); },
+      report,
+      (err: unknown) => { report(EMPTY); this.reportOpError("linkClosed", err); },
     );
   }
 

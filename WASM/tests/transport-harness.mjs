@@ -21,14 +21,6 @@ export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { OpArgs } = await imp("build/services/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
-/** The link close-reason codes the transport guest returns from `linkClosed`
- *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
- *  lives with the occupant and here, where the tests assert it. */
-export const CLOSE_REASON = {
-  OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5, REFUSED: 6, TIMEOUT: 7,
-  DROPPED: 8,
-};
-
 /** A `ChannelFactory` that hands the driver channels the TEST built, so a test keeps the
  *  instrumented object it is asserting on (`wirePair`'s recorder, tamperer and backlog).
  *  Not a fabric: a test holds both ends of a pair, hands one end in as an accept (`give`)
@@ -71,7 +63,7 @@ export class InjectedChannels {
 }
 
 export const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
-export const { authorBundle } = await imp("build/host/bundle-author.js");
+export const { authorBundle } = await imp("build/scripts/bundle-author.js");
 export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
 
@@ -252,7 +244,7 @@ export async function makeTransportHost(opts = {}) {
     listen: opts.listen,
     // The DRIVER's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
-    // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
+    // The occupant's reason per link teardown (transport/src/ake.js `REASON_*`) — the node's
     // own observation seam, and the only place a test can read WHY a link went down.
     onLinkClosed: opts.onLinkClosed,
     // Most of this suite tears links down on purpose, so the driver's diagnostic would bury

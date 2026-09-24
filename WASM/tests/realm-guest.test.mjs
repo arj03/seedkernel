@@ -4,7 +4,7 @@
 // out of the former single-file run.mjs; bundle-install.test.mjs covers the bundle/manifest
 // verify → admit → install lifecycle, crypto.test.mjs the manifest-suite and ACVP suites.
 //
-// Positive-path bundle fixtures go through `authorBundle` (host/bundle-author.ts) rather
+// Positive-path bundle fixtures go through `authorBundle` (scripts/bundle-author.ts) rather
 // than hand-rolled `signTestBundle` — see bundle-install.test.mjs's header for
 // why a handful of cases keep the manual form instead.
 

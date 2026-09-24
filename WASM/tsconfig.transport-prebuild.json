@@ -9,7 +9,7 @@
     "services/net-limits.ts",
     "host/wasm-limits.ts",
     "host/bundle.ts",
-    "host/bundle-author.ts",
+    "scripts/bundle-author.ts",
     "services/op-frame.ts",
     "host/pq.ts"
   ],

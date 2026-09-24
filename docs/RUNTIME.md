@@ -160,13 +160,13 @@ The host enters a realm with its own events. A realm that armed a wake receives 
 | `wake` | 4 | none | ignored |
 | `linkOpen` | 8 | `[linkId u32][stream u8][listener text][via u32][remoteAddr text]` | ignored |
 | `linkBytes` | 9 | `[linkId u32][bytes blob]` | ignored; the driver awaits completion before admitting the next read on this link |
-| `linkClosed` | 10 | `[linkId u32]` | `[reason u8]`, bare; an absent, malformed or rejected answer reads as `0` |
+| `linkClosed` | 10 | `[linkId u32]` | `[severity u8][reason utf8 ..]`; the driver prints a reason above severity 0. An absent or rejected answer reads as an empty reason at severity 0 |
 
 - `linkId` 0 is never a live link. `linkOpen` announces a platform-accepted or platform-initiated socket; a guest-opened link gets its id and `stream` from `link/open` instead, with no event.
 - Missing arrival metadata encodes as an empty listener and `via` 0. A `via` names the live link this one arrived through, 0 when there is none or it has already gone. A missing source address is empty text. Listener, `via` and address are platform metadata, not authenticated identity.
 - `stream = 1` makes each `linkBytes` an arbitrary byte-stream slice; `0` makes it one platform-framed message. The bytes inside the blob are opaque to the host.
 
-**The close reason** is a local fact; it never goes on the wire. The shipped vocabulary (`transport/src/ake.js` `REASON_*`):
+**The close reason** is a local fact; it never goes on the wire. Its words, and how much each matters, are the occupant's; the host reads neither. The shipped vocabulary (`transport/src/ake.js` `REASON_*`), severity 1 but for `clean` and `local` at 0:
 
 | Phase | Reason | Meaning |
 | --- | --- | --- |
@@ -179,7 +179,7 @@ The host enters a realm with its own events. A realm that armed a wake receives 
 | | `local` | our own deliberate shutdown |
 | | `truncated` | the stream just stopped |
 
-The driver prints every reason but `clean` and `local` as `[transport] link N from <addr> down: <reason>` (`TransportHost.suppressLinkLog` silences it). Printing is the only place the driver reads the vocabulary; a replacement transport's own codes print as numbers.
+The driver prints a reason above severity 0 verbatim as `[transport] link N from <addr> down: <reason>` (`TransportHost.suppressLinkLog` silences it) and hands every reason to `TransportHostOptions.onLinkClosed`.
 
 ### 12.3 Zero-authority JS realms
 
@@ -240,7 +240,7 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 - **Both signatures** — Ed25519 and ML-DSA-65 — are over `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ BLAKE2b-256(body)`; `DOMAIN_manifest` is prepended, not stored. **Both must verify.** The verifier authenticates the body before interpreting any of it.
 - **Suite.** Only `0x02` is supported. Another id is refused with its own error, distinct from a bad signature. Suite ids are never reused.
 - **Author id** = `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`, 32 bytes. Policy entries, revocations and freshness marks are written against it.
-- **Author keys from one seed.** `hybridAuthorKeysFromSeed` (offline-only `host/bundle-author.ts`) derives the Ed25519 half from a 32-byte seed and the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)`. The label is frozen. Pass the 32-byte seed, not libsodium's 64-byte secret key.
+- **Author keys from one seed.** `hybridAuthorKeysFromSeed` (offline-only `scripts/bundle-author.ts`) derives the Ed25519 half from a 32-byte seed and the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)`. The label is frozen. Pass the 32-byte seed, not libsodium's 64-byte secret key.
 - **The ML-DSA verifier** is `browser/mldsa65.wasm`, an import-free module built from the pinned `pq/mldsa-native` submodule (`scripts/build-mldsa.mjs`; `npm run build:pq` rebuilds it and `mlkem768.wasm`, given the submodules and a clang with the wasm32 target). All targets run the same bytes. `bundle.ts` calls `ml_dsa65_verify_detached` on the crypto object; a host that supplies none refuses `0x02`.
 
 #### Manifest

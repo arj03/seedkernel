@@ -32,7 +32,7 @@ const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES,
 const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
-const { guestOpFraming } = await imp("build/host/bundle-author.js");
+const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
 // is signed and verified with both halves of the author's key set (§12.4), so a bare
 // libsodium cannot sign one.

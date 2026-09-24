@@ -39,15 +39,20 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 // for its client to speak. The peer learns nothing; our own operator learns which of the two
 // questions they are looking at.
 //
-// WHERE THIS ENDS UP, so it does not read as a value nobody consumes: the driver prints
-// every non-routine one on stderr (`host/transport-host.ts` `logLinkDown`), which is the
-// only thing that tells an embedder wiring nothing at all — seedstore's p2p CLI boots
-// `bootShell` itself — that its links are failing and from which address. That file mirrors
-// these names in `REASON_NAMES` for the line; a code added here and not there prints as a
-// bare number. `tests/transport-link.test.mjs` pins each value by name.
-const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
-  REASON_LOCAL = 4, REASON_TRUNCATED = 5, REASON_REFUSED = 6, REASON_TIMEOUT = 7,
-  REASON_DROPPED = 8;
+// WHERE THIS ENDS UP, so it does not read as a value nobody consumes: the driver prints the
+// word on stderr when `linkClosed` gives it a severity above 0 (`host/transport-host.ts` `logLinkDown`),
+// which is the only thing that tells an embedder wiring nothing at all — seedstore's p2p CLI
+// boots `bootShell` itself — that its links are failing and from which address. The words
+// and how much each matters are this program's alone; the driver reads neither.
+// `tests/transport-link.test.mjs` pins each by name.
+const REASON_NONE = "", REASON_HANDSHAKE = "handshake", REASON_CLEAN = "clean",
+  REASON_ABORTED = "aborted", REASON_LOCAL = "local", REASON_TRUNCATED = "truncated",
+  REASON_REFUSED = "refused", REASON_TIMEOUT = "timeout", REASON_DROPPED = "dropped";
+/** What a healthy node produces constantly — the peer said goodbye, or we retired the link
+ *  ourselves — and so goes back at severity 0, unprinted; every other reason at 1. A working network is silent, so anything on stderr is
+ *  a fact worth reading, and a node whose links really are failing is exactly the node that
+ *  should be saying so. */
+const ROUTINE_REASONS = new Set([REASON_NONE, REASON_CLEAN, REASON_LOCAL]);
 
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
 
@@ -294,7 +299,7 @@ class Link {
     // whether a deadline is what retired it. Each is set once, on the way down, and read
     // once by `closeReason` — one read is the whole point, not a sign of dead state: these
     // three booleans ARE the diagnosis the driver prints, and dropping any of them collapses
-    // two different operator problems into one code (see REASON_* above).
+    // two different operator problems into one reason (see REASON_* above).
     this.closedLocally = false;
     this.aborted = false;
     this.timedOut = false;
@@ -515,7 +520,7 @@ class Link {
   // end-of-stream record, so "the peer said goodbye" means "the peer chose to stop".
   abort(defensive) { this.end(false, defensive); }
 
-  /** Why this link ended, as the occupant alone can say it. A REASON_* code returned
+  /** Why this link ended, as the occupant alone can say it. A REASON_* word returned
    *  from `linkClosed`, printed by the driver — the node's one answer to "is it me, them, or
    *  the network?" when the other end is another machine.
    *
@@ -539,7 +544,7 @@ class Link {
    *  and an attacker who could induce a farewell could make an arbitrary cut look like a
    *  clean shutdown to the far end. */
   get closeReason() {
-    if (!this.closed) return REASON_OPEN;
+    if (!this.closed) return REASON_NONE;
     if (!this.authed) {
       if (this.aborted) return REASON_REFUSED;
       if (this.timedOut) return REASON_TIMEOUT;

@@ -6,7 +6,7 @@
 // host-managed link spends none), so those tests live in transport-load.test.mjs.
 
 import {
-  makeTransportHost, generateKeyPair, sodium, InjectedChannels, CLOSE_REASON, until, PROTO,
+  makeTransportHost, generateKeyPair, sodium, InjectedChannels, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
   transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
   LoopbackChannels, generatorRequest,
@@ -14,7 +14,6 @@ import {
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
-import { REASON_NAMES } from "../build/host/transport-host.js";
 import { HOST_CALLER_ID } from "../build/host/guest-seam.js";
 
 /** Read a link event the way the realm behind the binding does. The driver hands an
@@ -587,7 +586,7 @@ await test("FRAME CAP: an over-cap pre-auth frame draws the silence every refusa
     await until(() => reason !== null, 3000, "the unverified deadline to retire it");
     // REFUSED, not TIMEOUT: the peer sent something wrong, which is a different thing to go
     // fix than a caller that went quiet. The distinction is LOCAL, never on the wire.
-    assert(reason === CLOSE_REASON.REFUSED, `${shape} should read REFUSED, got ${REASON_NAMES[reason]}`);
+    assert(reason === "refused", `${shape} should read REFUSED, got ${reason}`);
   }
 });
 
@@ -798,7 +797,7 @@ await test("OUTBOUND QUEUE: authenticated encryption work is bounded", async (ke
   releaseSeal = null;
   releaseFirstSeal();
   await until(() => st.a.closed, 3000, "the outbound encryption queue to close its link");
-  assert(st.a.reason === CLOSE_REASON.LOCAL,
+  assert(st.a.reason === "local",
     `an outbound queue overflow must be a local abort, got reason ${st.a.reason}`);
 });
 
@@ -809,7 +808,7 @@ await test("IDLE: an authenticated link carrying no traffic is retired", async (
   // far end reads a clean close, not a truncation.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 60 }, { linkIdleTimeoutMs: 60 }));
   await until(() => st.a.closed, 4000, "the idle clock to retire a silent link");
-  assert(st.a.reason === CLOSE_REASON.LOCAL || st.a.reason === CLOSE_REASON.CLEAN,
+  assert(st.a.reason === "local" || st.a.reason === "clean",
     `an idle retirement is a deliberate close, got reason ${st.a.reason}`);
 });
 
@@ -1085,7 +1084,7 @@ await test("LEAK FIX: a link that closes itself mid-handshake still reports down
     { admitPeers: [generateKeyPair().publicKey], transportConfig: { handshakeTimeoutMs: 80 } },
     { transportConfig: { handshakeTimeoutMs: 80 } }));
   await until(() => st.a.closed, 3000, "the self-close MUST reach onLinkClosed (this is the leak)");
-  assert(st.a.reason === CLOSE_REASON.REFUSED, `a declined peer should read REFUSED, got ${st.a.reason}`);
+  assert(st.a.reason === "refused", `a declined peer should read REFUSED, got ${st.a.reason}`);
   assert(!(await aUp(st)) && !(await bUp(st)), "a declined peer must not link");
 });
 
@@ -1102,7 +1101,7 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
   const nobody = hexOf(generateKeyPair().publicKey);
   await factory.dial(A, nobody, chans[0], CONTACT);
   await until(() => reason !== null, 3000, "the deadline to close the link and notify");
-  assert(reason === CLOSE_REASON.TIMEOUT,
+  assert(reason === "timeout",
     `a peer that never speaks is a TIMEOUT — the one an operator chases an address for — got ${reason}`);
   assert(!(await linkedTo(A, nobody)), "must not authenticate");
 });
@@ -1119,35 +1118,13 @@ await test("DIAGNOSTIC: a socket that dies mid-handshake reads DROPPED, not the 
   await until(() => chans[0].sent.length > 0, 4000, "msg1 on the wire");
   chans[0].kill(); // the socket goes away with the handshake unfinished
   await until(() => reason !== null, 3000, "the dead socket to report down");
-  assert(reason === CLOSE_REASON.DROPPED,
-    `a socket lost mid-handshake should read DROPPED, got ${REASON_NAMES[reason]}`);
+  assert(reason === "dropped",
+    `a socket lost mid-handshake should read DROPPED, got ${reason}`);
   assert(!(await aUp(st)), "and nothing may be linked");
 });
 
-await test("DIAGNOSTIC: the host's reason names cover every code the guest can return", async () => {
-  // The one drift this arrangement can suffer: a reason added to the transport guest and
-  // not to the driver's name table degrades silently to `down: reason 8`. The guest is a
-  // signed blob the host cannot introspect, so the two lists are compared at their SOURCE —
-  // which is enough, because both ship from this repo together.
-  const { readFileSync } = await import("node:fs");
-  const src = readFileSync(new URL("../transport/src/ake.js", import.meta.url), "utf8");
-  const declared = [...src.matchAll(/REASON_([A-Z]+)\s*=\s*(\d+)/g)]
-    .map(([, name, code]) => ({ name: name.toLowerCase(), code: Number(code) }));
-  assert(declared.length >= 8, `expected to find the REASON_* table in ake.js, got ${declared.length}`);
-  for (const { name, code } of declared) {
-    assert(REASON_NAMES[code] === name,
-      `ake.js REASON_${name.toUpperCase()} = ${code}, but the driver prints ` +
-      `${JSON.stringify(REASON_NAMES[code])} — add it to REASON_NAMES (transport-host.ts)`);
-  }
-  // And the harness's own copy, which every reason assertion in this file reads.
-  for (const { name, code } of declared) {
-    assert(CLOSE_REASON[name.toUpperCase()] === code,
-      `CLOSE_REASON.${name.toUpperCase()} is stale against ake.js (expected ${code})`);
-  }
-});
-
 await test("DIAGNOSTIC: the driver prints a failing link and stays quiet about a healthy one", async (keep) => {
-  // The reason byte's whole point on a real deployment: an embedder that wired nothing —
+  // The close reason's whole point on a real deployment: an embedder that wired nothing —
   // seedstore's p2p CLI boots `bootShell` itself and never touches `onLinkClosed` — still
   // learns that its links are failing, and which address they were failing from. A healthy
   // node must print nothing, or the signal is worthless.
@@ -1168,6 +1145,44 @@ await test("DIAGNOSTIC: the driver prints a failing link and stays quiet about a
   } finally {
     console.error = realError;
   }
+});
+
+await test("DIAGNOSTIC: the driver prints a reason above severity 0 as given, and only that", async (keep) => {
+  // The words, and how much each matters, are the occupant's: a replacement transport's own
+  // vocabulary prints verbatim at any severity above 0, severity 0 prints nothing, and an
+  // empty answer is an empty reason at severity 0.
+  class ManualChannel { send() {} onData() {} onClose() {} close() {} }
+  const word = (severity, s) => Uint8Array.of(severity, ...new TextEncoder().encode(s));
+  const answers = [word(1, "gone fishing"), word(0, "bye"), word(7, "on fire"), new Uint8Array()];
+  const opened = [];
+  const downs = [];
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost(
+    { channels: factory, suppressLinkLog: false, onLinkClosed: (_id, r) => downs.push(r) },
+  ));
+  driver.activate(async (input) => {
+    const { op, args } = opOf(input);
+    if (op === "linkOpen") opened.push(new DataView(args.buffer, args.byteOffset).getUint32(0));
+    return op === "linkClosed" ? answers.shift() : new Uint8Array();
+  });
+  await driver.start();
+  const lines = [];
+  const realError = console.error;
+  console.error = (...a) => { lines.push(a.join(" ")); };
+  try {
+    for (let i = 0; i < 4; i++) factory.give(new ManualChannel());
+    for (const id of opened) {
+      driver.rawNet().close(id, false);
+      await until(() => downs.length === opened.indexOf(id) + 1, 1000, `link ${id} to report down`);
+    }
+  } finally {
+    console.error = realError;
+  }
+  assert(JSON.stringify(downs) === JSON.stringify(["gone fishing", "bye", "on fire", ""]),
+    `onLinkClosed must see each reason as given, got ${JSON.stringify(downs)}`);
+  assert(JSON.stringify(lines) === JSON.stringify([
+    `[transport] link ${opened[0]} down: gone fishing`, `[transport] link ${opened[2]} down: on fire`]),
+    `only reasons above severity 0 print, verbatim, got ${JSON.stringify(lines)}`);
 });
 
 await test("rekey: the ratchet keeps frames flowing across an epoch boundary", async (keep) => {
@@ -1201,14 +1216,14 @@ await test("goodbye: a clean close is distinguishable from a truncation", async 
   // mechanism IDLE's tests use: silence for the timeout, then the authenticated goodbye.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 60 }));
   await until(() => st.b.closed, 3000, "B to see the authenticated end-of-stream");
-  assert(st.b.reason === CLOSE_REASON.CLEAN, `a clean close must read CLEAN, got ${st.b.reason}`);
+  assert(st.b.reason === "clean", `a clean close must read CLEAN, got ${st.b.reason}`);
 });
 
 await test("goodbye: a cut connection reads as truncated", async (keep) => {
   const st = keep(await upPair());
   st.chans[0].kill(); // the socket dies with no goodbye
   await until(() => st.b.closed, 3000, "B to notice the cut");
-  assert(st.b.reason === CLOSE_REASON.TRUNCATED, `B must report a truncation, got ${st.b.reason}`);
+  assert(st.b.reason === "truncated", `B must report a truncation, got ${st.b.reason}`);
 });
 
 await test("goodbye is not delivered to the application as a frame", async (keep) => {
@@ -1232,8 +1247,8 @@ await test("goodbye: the CLOSER reports a local shutdown, not a truncation", asy
   // a routine event as a cut stream.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 60 }));
   await until(() => st.a.closed && st.b.closed, 3000, "both ends to close");
-  assert(st.a.reason === CLOSE_REASON.LOCAL, `closer should read LOCAL, got ${st.a.reason}`);
-  assert(st.b.reason === CLOSE_REASON.CLEAN, `peer should read CLEAN, got ${st.b.reason}`);
+  assert(st.a.reason === "local", `closer should read LOCAL, got ${st.a.reason}`);
+  assert(st.b.reason === "clean", `peer should read CLEAN, got ${st.b.reason}`);
 });
 
 await test("goodbye: an injected junk record must NOT produce a farewell", async (keep) => {
@@ -1258,8 +1273,8 @@ await test("goodbye: an injected junk record must NOT produce a farewell", async
   st.A.sendNoReply(st.B.peerId, PROTO, new TextEncoder().encode("payload"));
   await until(() => st.a.closed && st.b.closed, 3000, "both ends to tear down");
   assert(corrupted, "the test did not actually corrupt a record");
-  assert(st.b.reason === CLOSE_REASON.ABORTED, `victim should read ABORTED, got ${st.b.reason}`);
-  assert(st.a.reason === CLOSE_REASON.TRUNCATED, `far end should read TRUNCATED, got ${st.a.reason}`);
+  assert(st.b.reason === "aborted", `victim should read ABORTED, got ${st.b.reason}`);
+  assert(st.a.reason === "truncated", `far end should read TRUNCATED, got ${st.a.reason}`);
 });
 
 await test("a graceful close asks the transport to flush; an abort does not", async (keep) => {
@@ -1273,7 +1288,7 @@ await test("a graceful close asks the transport to flush; an abort does not", as
   const st2 = keep(await upPair());
   st2.chans[0].close(false);
   await until(() => st2.b.closed, 3000, "the far end to notice");
-  assert(st2.b.reason === CLOSE_REASON.TRUNCATED, `an abort must read as a cut, got ${st2.b.reason}`);
+  assert(st2.b.reason === "truncated", `an abort must read as a cut, got ${st2.b.reason}`);
 });
 
 await test("the farewell survives a transport that discards unflushed writes", async (keep) => {
@@ -1283,7 +1298,7 @@ await test("the farewell survives a transport that discards unflushed writes", a
   // itself is the idle clock's now.
   const st = keep(await upPair({ destructive: true }, { linkIdleTimeoutMs: 60 }));
   await until(() => st.b.closed, 3000, "the farewell to arrive");
-  assert(st.b.reason === CLOSE_REASON.CLEAN, `expected CLEAN, got ${st.b.reason} (the farewell was discarded)`);
+  assert(st.b.reason === "clean", `expected CLEAN, got ${st.b.reason} (the farewell was discarded)`);
 });
 
 await test("WHITELIST: absent by default, and an absent hook admits everyone", async (keep) => {
@@ -1304,7 +1319,7 @@ await test("GUARD: a refused caller is closed at msg3 and never sees the receive
   // host per link — see the note there for why the host was never gating this anyway.
   const st = keep(await linked(chans, {}, { admitPeers: [new Uint8Array(32).fill(1)] }));
   await until(() => st.b.closed && st.a.closed, 4000, "the refusal to close both ends");
-  assert(st.b.reason === CLOSE_REASON.REFUSED, `the receiver should read REFUSED, got ${REASON_NAMES[st.b.reason]}`);
+  assert(st.b.reason === "refused", `the receiver should read REFUSED, got ${st.b.reason}`);
   assert(!(await bUp(st)), "a refused caller must not be authenticated by the receiver");
   assert(!(await aUp(st)), "a refused caller must not keep a link");
   // msg2 is all the receiver ever sends, and its key is never in it.
@@ -1715,7 +1730,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   driver.activate(async (input) => {
     const { op, args } = opOf(input);
     if (op === "linkBytes" || op === "linkOpen") events.push({ op, linkId: readU32(args, 0) });
-    if (op === "linkClosed") { events.push({ op, linkId: readU32(args, 0) }); return Uint8Array.of(CLOSE_REASON.LOCAL); }
+    if (op === "linkClosed") { events.push({ op, linkId: readU32(args, 0) }); return Uint8Array.of(0, ...new TextEncoder().encode("local")); }
     return new Uint8Array();
   });
   await driver.start();
@@ -1747,7 +1762,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   // now at the driver's own close/backend-callback boundary instead of a per-link handle.
   driver.rawNet().close(aLinkId, false);
   await until(() => downs.length === 1, 1000, "A's close to report down");
-  assert(downs[0].linkId === aLinkId && downs[0].reason === CLOSE_REASON.LOCAL,
+  assert(downs[0].linkId === aLinkId && downs[0].reason === "local",
     `A's close must report down once with LOCAL, got ${JSON.stringify(downs)}`);
   aChannel.fail();
   await settle();
@@ -1764,7 +1779,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   await until(() => downs.some((d) => d.linkId === cLinkId), 1000, "the throwing channel's close to report down");
   assert(cChannel.stops === 1, `a throwing raw send must close the backend once, got ${cChannel.stops}`);
   const cDowns = downs.filter((d) => d.linkId === cLinkId);
-  assert(cDowns.length === 1 && cDowns[0].reason === CLOSE_REASON.LOCAL,
+  assert(cDowns.length === 1 && cDowns[0].reason === "local",
     `the throwing channel's link must be failed exactly once with LOCAL, got ${JSON.stringify(cDowns)}`);
 });
 
@@ -1783,7 +1798,7 @@ await test("DRIVER HANDOVER: an outgoing occupant hears nothing about the links 
   const downs = [];
   const occupant = (who) => (input) => {
     heard[who].push(opOf(input).op);
-    return Promise.resolve(Uint8Array.of(CLOSE_REASON.LOCAL));
+    return Promise.resolve(Uint8Array.of(0, ...new TextEncoder().encode("local")));
   };
   const factory = new InjectedChannels();
   const driver = keep(new TransportHost(
@@ -1800,7 +1815,7 @@ await test("DRIVER HANDOVER: an outgoing occupant hears nothing about the links 
   assert(heard.old.length === 0, `the outgoing occupant must hear nothing, heard ${JSON.stringify(heard.old)}`);
   assert(heard.new.length === 0, `the incoming occupant must hear nothing, heard ${JSON.stringify(heard.new)}`);
   assert(channels.every((c) => c.closes === 1), "every socket the outgoing occupant held is closed");
-  assert(downs.length === 2 && downs.every((r) => r === 0),
+  assert(downs.length === 2 && downs.every((r) => r === ""),
     `each link reports down once, unanswered, got ${JSON.stringify(downs)}`);
 });
 

@@ -37,7 +37,7 @@ class RelayLink {
     this.onSignal = onSignal;
     this.onGone = null;
     // Routine either way — a relay is a rendezvous, not a peer — so nothing is printed.
-    this.closeReason = REASON_OPEN;
+    this.closeReason = REASON_NONE;
   }
   send(bytes) {
     try {
@@ -64,7 +64,7 @@ class RtcCtlLink {
     this.linkId = linkId;
     this.e = e;
     this.owner = owner;
-    this.closeReason = REASON_OPEN;
+    this.closeReason = REASON_NONE;
   }
   async onWire(bytes) { if (bytes.length > 0) this.owner.up(this.e, bytes[0], utf8Decode(bytes.subarray(1))); }
   onChannelClosed() { this.owner.gone(this.e); }

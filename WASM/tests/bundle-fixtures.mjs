@@ -1,4 +1,4 @@
-import { signBundle } from "../build/host/bundle-author.js";
+import { signBundle } from "../build/scripts/bundle-author.js";
 import { verifyBundle } from "../build/host/bundle.js";
 
 // Manifest shape tests need signed bodies, but never instantiate their empty programs.

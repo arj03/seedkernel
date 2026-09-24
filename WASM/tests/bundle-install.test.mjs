@@ -4,7 +4,7 @@
 // covers the guest seam, bundle-replacement.test.mjs explicit slot replacement, and
 // crypto.test.mjs the manifest-suite and ACVP vector suites.
 //
-// Positive-path bundle fixtures go through `authorBundle` (host/bundle-author.ts), which
+// Positive-path bundle fixtures go through `authorBundle` (scripts/bundle-author.ts), which
 // assembles, validates and signs in one call — the same path a real publisher
 // uses. A handful of tests build a manifest or envelope by hand instead, because what they
 // assert on is deliberately malformed or corrupted: duplicate module names,

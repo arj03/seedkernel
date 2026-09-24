@@ -15,6 +15,6 @@
     "outDir": "build",
     "rootDir": "."
   },
-  "include": ["services/**/*.ts", "host/**/*.ts"],
+  "include": ["services/**/*.ts", "host/**/*.ts", "scripts/**/*.ts"],
   "exclude": []
 }

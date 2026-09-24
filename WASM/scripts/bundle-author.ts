@@ -13,7 +13,7 @@ import {
   type BundleModule,
   type JsonObject,
   type ManifestVerifier,
-} from "./bundle.js";
+} from "../host/bundle.js";
 
 /** The surface *signing* a manifest needs — the build-side of the format. */
 export interface ManifestCrypto extends ManifestVerifier {

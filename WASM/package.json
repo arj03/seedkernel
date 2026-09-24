@@ -69,8 +69,8 @@
       "default": "./build/host/bundle.js"
     },
     "./bundle-author": {
-      "types": "./build/host/bundle-author.d.ts",
-      "default": "./build/host/bundle-author.js"
+      "types": "./build/scripts/bundle-author.d.ts",
+      "default": "./build/scripts/bundle-author.js"
     },
     "./quickjs": {
       "types": "./quickjs/dist/variant.d.mts",
