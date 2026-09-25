@@ -1,13 +1,6 @@
-// sodium.go — the Go target's crypto *primitive*: the same browser/libsodium.wasm, driven
-// over wazero, so this file is the FFI seam over the emscripten ABI plus a `sodium` object
-// carrying libsodium-wrappers method names — the shared host JS calls `sodium.*` unchanged
-// and a Go node's output is byte-identical to a Bun node's. Under the native fast-path
-// rule (§12.9), genericHash (BLAKE2b, pinned by TestSodiumGenericHash — the one hash
-// wazero runs slower than V8) and the ChaCha20-Poly1305-IETF record layer (RFC 8439,
-// pinned by TestSodiumAead from this build's own binary; ~8× faster, no scratch lock) run
-// on native Go. Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm: a verifier's
-// accept/reject boundary is consensus, and X25519 is handshake-only, amortized over the
-// link.
+// The crypto primitive: the shared browser/libsodium.wasm driven over wazero, exposed with
+// libsodium-wrappers method names. BLAKE2b and ChaCha20-Poly1305-IETF run on native Go
+// (§12.9); Ed25519 stays on the shared wasm, since its accept/reject boundary is consensus.
 package main
 
 import (
@@ -29,27 +22,22 @@ import (
 //go:embed wasm/libsodium.wasm
 var sodiumWasm []byte
 
-// libsodium drives the embedded emscripten build. Its exports are minified; the
-// real-name → minified-export map (and the two EM_JS entropy code addresses below) are
-// read from browser/libsodium-core.mjs — re-derive both if libsodium.wasm is rebuilt.
+// libsodium drives the embedded emscripten build. The minified export names and the
+// EM_JS entropy addresses below come from browser/libsodium-core.mjs; re-derive both if
+// libsodium.wasm is rebuilt.
 type libsodium struct {
 	mem api.Memory
 	fns map[string]api.Function
-	// One shared scratch heap and allocator, so an op is a malloc/call/read sequence that
-	// must not interleave with another (sign/verify run on per-connection goroutines).
-	// Held for one op only, never across a callback into JS or Go.
+	// Serializes ops over the shared scratch arena; held for one op only.
 	mu sync.Mutex
 
-	// Scratch arena reused across ops, replacing the 2–4 malloc/free pairs each one made:
-	// ops are serialized by mu, so one grow-on-demand block with a per-op bump allocator
-	// suffices.
+	// A grow-on-demand scratch block, bump-allocated per op.
 	arena    uint32 // wasm ptr to the scratch block (0 until first grown)
 	arenaCap int    // its size in bytes; grows to the high-water op need, never shrinks
 	bump     int    // next free offset within the arena, rewound to 0 per op
 }
 
-// scratchAlign matches the wasm allocator's alignment, so a bump-allocated buffer sits
-// exactly where a malloc'd one would — keeping libsodium's memory layout identical.
+// scratchAlign matches the wasm allocator's alignment.
 const scratchAlign = 16
 
 func alignUp(n int) int {
@@ -59,7 +47,7 @@ func alignUp(n int) int {
 	return (n + scratchAlign - 1) &^ (scratchAlign - 1)
 }
 
-var sd *libsodium // the process-wide libsodium instance (genesis verify + sodium.*)
+var sd *libsodium
 
 // real libsodium name → minified wasm export, for the pinned browser/libsodium.wasm.
 var sodiumExports = map[string]string{
@@ -70,31 +58,26 @@ var sodiumExports = map[string]string{
 	"crypto_sign_verify_detached": "xd",
 	"crypto_sign_keypair":         "td",
 	"crypto_sign_seed_keypair":    "sd",
-	// One export covers the §12.6 AKE's X25519: the transport bundle reaches scalarmult
-	// through the guest seam's `x25519/dh` and derives its ephemeral PUBLIC key with the
-	// same entry against the base point — no keypair primitive to export.
+	// X25519 for the §12.6 AKE; against the base point it also derives public keys.
 	"crypto_scalarmult": "Jc",
 }
 
-// EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes routes
-// through the asm-const import `a.b`, and these are the only two snippets in this build,
-// satisfied from crypto/rand (the source need not match across nodes).
+// The EM_JS entropy snippets randombytes reaches through import `a.b`, served from
+// crypto/rand.
 const (
 	sodiumRandU32  = 40216 // ()->u32: one random word
 	sodiumRandInit = 40252 // ()->void: lazy RNG init (a no-op here)
 )
 
-// bootSodium wires the four emscripten host imports (module "a"), instantiates
-// libsodium.wasm, binds the exports used, and runs sodium_init — what libsodium-wrappers
-// does after load.
+// bootSodium wires the emscripten imports, instantiates libsodium.wasm and runs
+// sodium_init.
 func bootSodium(rt wazero.Runtime) *libsodium {
 	a := rt.NewHostModuleBuilder("a")
 	// a.a — __assert_fail(cond,file,line,func): only reached on a libsodium bug.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) {
 		panic("libsodium: assertion failed")
 	}).Export("a")
-	// a.b — _emscripten_asm_const_int: the EM_JS dispatcher, which in this build only
-	// ever runs the two argument-free entropy snippets.
+	// a.b — _emscripten_asm_const_int: only the two entropy snippets.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, code, _, _ uint32) uint32 {
 		switch code {
 		case sodiumRandU32:
@@ -159,9 +142,8 @@ func (s *libsodium) malloc(n int) uint32 {
 
 func (s *libsodium) free(p uint32) { s.fns["free"].Call(ctx, uint64(p)) }
 
-// arenaReset ensures the arena can hold total bytes and rewinds the bump allocator: call
-// once at the top of an op with Σ alignUp(each buffer), then take/takeIn the buffers —
-// growing happens only here, never mid-op, so pointers cannot dangle.
+// arenaReset sizes the arena for total bytes (Σ alignUp of each buffer) and rewinds it.
+// Call once at the top of an op; growth happens only here, so pointers cannot dangle.
 func (s *libsodium) arenaReset(total int) {
 	if total > s.arenaCap {
 		if s.arena != 0 {
@@ -173,8 +155,7 @@ func (s *libsodium) arenaReset(total int) {
 	s.bump = 0
 }
 
-// take sub-allocates n bytes (min 1, scratchAlign-aligned) from the arena at the current
-// bump. The op must have reserved room via arenaReset; take never grows.
+// take sub-allocates n bytes (min 1, aligned) from room reserved by arenaReset.
 func (s *libsodium) take(n int) uint32 {
 	if n < 1 {
 		n = 1
@@ -184,8 +165,7 @@ func (s *libsodium) take(n int) uint32 {
 	return s.arena + uint32(off)
 }
 
-// takeIn is take plus a copy of b into the sub-allocation (min 1 byte, so an empty input
-// still yields a valid non-null pointer).
+// takeIn is take plus a copy of b.
 func (s *libsodium) takeIn(b []byte) uint32 {
 	p := s.take(len(b))
 	if len(b) > 0 {
@@ -199,8 +179,7 @@ func (s *libsodium) read(p uint32, n int) []byte {
 	return append([]byte(nil), b...)
 }
 
-// call invokes a bound export; the single i32 result (0 for void exports) is
-// returned as int32, since libsodium's convention is 0 = ok / -1 = failure.
+// call invokes a bound export and returns its i32 result (0 ok, -1 failure; 0 for void).
 func (s *libsodium) call(name string, args ...uint64) int32 {
 	r, err := s.fns[name].Call(ctx, args...)
 	if err != nil {
@@ -212,30 +191,21 @@ func (s *libsodium) call(name string, args ...uint64) int32 {
 	return int32(uint32(r[0]))
 }
 
-// mustCall is call for a PRODUCING op whose failure is an invariant violation — a key or
-// nonce of the wrong length, an arena too small for the output. libsodium signals that
-// with -1 and leaves the output buffer UNTOUCHED, and the arena is reused across ops, so
-// reading it anyway would hand the caller whatever the previous op left there (a secret
-// key, a plaintext). Panic rather than an error return, because these callers pass lengths
-// this process derived itself; an op that can fail on its INPUTS (crypto_scalarmult, the
-// ed→curve conversions) checks the code itself and answers ok=false.
+// mustCall is call for a producing op whose failure is an invariant violation. It panics:
+// a failed op leaves the reused arena holding the previous op's output.
 func (s *libsodium) mustCall(name string, args ...uint64) {
 	if r := s.call(name, args...); r != 0 {
 		panic(fmt.Sprintf("libsodium: %s returned %d (output not written)", name, r))
 	}
 }
 
-// 64-bit length args are legalized to (lo, hi) i32 pairs in this build; our buffers
-// are far under 4 GiB, so hi is always 0.
+// lenArgs splits a 64-bit length into this build's (lo, hi) i32 pair.
 func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 
 // ───────────────────────── the crypto ops ─────────────────────────
 
-// genericHash is native Go BLAKE2b (see the file header): the one system hash — the
-// content-address block-id and the host's genesis hash (§12.4) — and the guest's
-// `crypto/blake2b` over RFC 7693's whole interface, output 1..64 bytes, keyed or not, as
-// libsodium's crypto_generichash takes it. The seam checks the ranges before a guest's
-// call gets here, so an out-of-range argument is an invariant violation and panics.
+// genericHash is BLAKE2b, the system hash (§12.4): 1..64 output bytes, keyed or not.
+// Callers check the ranges first.
 func (s *libsodium) genericHash(outLen int, msg, key []byte) []byte {
 	if outLen == 32 && len(key) == 0 {
 		sum := blake2b.Sum256(msg)
@@ -263,8 +233,7 @@ func (s *libsodium) signDetached(msg, sk []byte) []byte {
 }
 
 func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
-	// These wasm exports take pointers without lengths for fixed-width inputs.
-	// Reject before staging: a short input would read adjacent arena contents.
+	// Fixed widths are passed without lengths, so check them before staging.
 	if len(sig) != 64 || len(pk) != 32 {
 		return false
 	}
@@ -275,10 +244,6 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	lo, hi := lenArgs(len(msg))
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
 }
-
-// There is no separate public-key point check: Ed25519 verification is the one gate on
-// every target, and a second one here alone would be the exact disagreement such a check
-// exists to prevent (§12.6).
 
 func (s *libsodium) signKeypair() (pk, sk []byte) {
 	s.mu.Lock()
@@ -303,10 +268,7 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 
 // ── §12.6 transport AKE primitives ──
 
-// scalarmult computes the X25519 shared point q = n·p. Against the base point it is also
-// the ephemeral public-key derivation, which is why the AKE needs no keypair primitive.
-// ok=false on a low-order / all-zero result, which the handshake treats as failed —
-// mirroring libsodium-wrappers throwing there.
+// scalarmult computes the X25519 point q = n·p, or ok=false on a low-order result.
 func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	if len(n) != 32 || len(p) != 32 {
 		return nil, false
@@ -321,11 +283,8 @@ func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	return s.read(q, 32), true
 }
 
-// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, binding ad (nil for
-// none); the result is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header).
-// The seam frames npub and key to their widths, so New/Seal can only fail on an invariant
-// violation — panic, like the other primitives. No wasm scratch means no lock:
-// per-connection goroutines seal concurrently.
+// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, binding ad; the
+// result is ciphertext ‖ tag. A wrong key width is an invariant violation.
 func (s *libsodium) aeadEncrypt(msg, ad, npub, key []byte) []byte {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -334,10 +293,7 @@ func (s *libsodium) aeadEncrypt(msg, ad, npub, key []byte) []byte {
 	return aead.Seal(nil, npub, msg, ad)
 }
 
-// aeadDecrypt opens a ChaCha20-Poly1305-IETF record (native Go, see aeadEncrypt).
-// ct is attacker-controlled, so a bad tag or a short ct is an ordinary open failure
-// (ok=false, and PeerLink tears the link down); npub/key are ours, so a wrong length there
-// is an invariant violation and panics.
+// aeadDecrypt opens a ChaCha20-Poly1305-IETF record; a bad tag or short ct is ok=false.
 func (s *libsodium) aeadDecrypt(ct, ad, npub, key []byte) ([]byte, bool) {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -352,12 +308,8 @@ func (s *libsodium) aeadDecrypt(ct, ad, npub, key []byte) ([]byte, bool) {
 
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
-// argView BORROWS the i-th call argument's bytes; an argument that is not bytes yields
-// nil, which the handlers below treat as absent. Every primitive below reads its arguments
-// into its own storage — libsodium's wasm memory, a Go hash, a Go AEAD — and finishes with
-// them before this engine runs again, which is what a view requires (qjs.Value.View). The
-// one caller is wrapNativeSodium (host/native-shim.ts), typed to hand each of them a
-// Uint8Array.
+// argView borrows the i-th argument's bytes, or nil if it is not bytes. Every primitive
+// below is done with them before the engine runs again (qjs.Value.View).
 func argView(args []*qjs.Value, i int) []byte {
 	b, _ := args[i].View()
 	return b
@@ -371,18 +323,12 @@ func optView(args []*qjs.Value, i int) []byte {
 	return argView(args, i)
 }
 
-// exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and the
-// whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the shared
-// code consumes is `wrapNativeSodium` in host/native-shim.ts, where it is typechecked
-// against `ShellSodium`.
-//
-// Only what JS actually reaches is registered.
+// exposeSodium installs `__sodium`, shaped by `wrapNativeSodium` (host/native-shim.ts).
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("crypto_generichash", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// crypto_generichash(hashLength, message, key): libsodium's ranges, 1..64 out and a
-		// key of at most 64 bytes, answered as a JS error like the wrappers throw.
+		// crypto_generichash(hashLength, message, key), with libsodium's ranges.
 		outLen, key := int(args[0].Int32()), optView(args, 2)
 		if outLen < 1 || outLen > 64 || len(key) > 64 {
 			return nil, fmt.Errorf("crypto_generichash: output 1..64 and key 0..64 bytes, got %d and %d", outLen, len(key))
@@ -425,8 +371,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		crand.Read(b)
 		return qc.NewArrayBuffer(b), nil
 	}))
-	// The PQ half of the manifest suite hangs off the same object. It is part of the host
-	// trust root because it verifies the bundles that deliver everything else.
 	exposeMlDsa(qc, o, md)
 	qc.Global().SetPropertyStr("__sodium", o)
 }

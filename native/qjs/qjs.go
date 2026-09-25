@@ -1,15 +1,9 @@
-// Package qjs is a thin, in-repo bridge to the quickjs-ng engine running on wazero — the
-// Go counterpart of sodium.go's raw-wasm-over-wazero pattern. The engine is qjs.wasm:
-// quickjs-ng plus csrc/shim.c, a flat QJS_* ABI (README.md), driven directly over wazero
-// linear memory with one host import, env.callGo, for JS→Go calls.
+// Package qjs is a thin bridge to quickjs-ng running on wazero: qjs.wasm is quickjs-ng
+// plus csrc/shim.c, a flat QJS_* ABI (README.md), with one host import, env.callGo, for
+// JS→Go calls. It covers only the synchronous surface the native host uses.
 //
-// The native host needs only a small synchronous slice of the API — objects, strings,
-// ArrayBuffers, function callbacks, eval, invoke — so this mirrors exactly that surface
-// and nothing more.
-//
-// JSValue ABI: the wasm is built with NaN-boxed JSValues, so every JSValue crosses as one
-// i64 and a *Value wraps that handle. An export that answers an address and a length packs
-// both into its i64 result as (addr<<32 | len).
+// JSValues are NaN-boxed, so each crosses as one i64 that a *Value wraps. An export
+// returning an address and a length packs them as (addr<<32 | len).
 package qjs
 
 import (
@@ -27,15 +21,12 @@ import (
 //go:embed qjs.wasm
 var wasmBytes []byte
 
-// goFunc is a Go function exposed to JS via (*Context).Function, called with the context
-// that created it and the call's arguments. It indexes the arguments it requires straight
-// out of that slice: a call short of one panics, and callGo answers the panic as a JS
-// exception.
+// goFunc is a Go function exposed to JS via (*Context).Function. A call short of an
+// argument it indexes panics, which callGo turns into a JS exception.
 type goFunc = func(*Context, []*Value) (*Value, error)
 
-// Runtime owns one engine: the wazero runtime, the instantiated qjs module, and the QuickJS
-// runtime and context inside it. Single-threaded: the native host drives every realm from one
-// goroutine, so engine calls need no locking.
+// Runtime owns one engine: the wazero runtime, the qjs module, and the QuickJS runtime and
+// context inside it. Single-threaded.
 type Runtime struct {
 	ctx     context.Context
 	wrt     wazero.Runtime
@@ -45,74 +36,53 @@ type Runtime struct {
 	funcs   []goFunc           // exposed Go funcs, indexed by callback id; see Function
 	fnPools map[string]*fnPool // per-name free list of resolved exports; see call
 
-	// JS_UNDEFINED and JS_NULL as this engine encodes them, asked for once in New. Both are
-	// immediates — no heap object, no refcount — so minting, testing or freeing one needs
-	// no engine call (Context.NewUndefined, Value.IsUndefined, Value.Free).
+	// JS_UNDEFINED and JS_NULL as this engine encodes them: immediates, so handling one
+	// needs no engine call.
 	undefined, null uint64
 }
 
-// fnPool is one export's free list of resolved instances. A POINTER in the map, not a
-// slice value: a slice value has to be read and written back to pop and again to push, so
-// every engine call — and a *Value operation is one — hashed the name four times. Through
-// the pointer it is one lookup, and the pop and the push mutate in place. The signature is
-// the export's, read once when the pool is minted.
+// fnPool is one export's free list of resolved instances, held by pointer so an engine
+// call does one map lookup.
 type fnPool struct {
 	free      []pooledFn
 	params    int
 	hasResult bool
 }
 
-// pooledFn is one resolved instance and the value stack it is called with. The stack
-// travels with the instance, so a nested call never shares one, and CallWithStack reuses
-// it where Call allocated an argument slice and a result slice on every engine crossing.
+// pooledFn is one resolved instance and its own value stack, reused by CallWithStack.
 type pooledFn struct {
 	fn    api.Function
 	stack []uint64
 }
 
-// Option configures a Runtime at creation, for what QuickJS takes only when it creates the
-// runtime.
+// Option configures a Runtime at creation.
 type Option func(*config)
 
 type config struct {
 	memoryLimit     uint64       // bytes; 0 = unbounded
 	trackRejections bool         // TrackRejections
-	wasiProbe       func(string) // set by package tests only; records WASI import calls
+	wasiProbe       func(string) // tests only: records WASI import calls
 }
 
-// WithMemoryLimit caps the runtime's total heap. An allocation past the cap fails
-// inside QuickJS and surfaces as a catchable JS "out of memory" error, so a runaway
-// realm hits its own ceiling instead of the host's. Used for the confined guest realm
-// (guest.go), which mirrors safe-js.ts's setMemoryLimit on the node/browser target.
+// WithMemoryLimit caps the runtime's total heap; past it, allocation throws a catchable
+// "out of memory".
 func WithMemoryLimit(bytes uint64) Option {
 	return func(c *config) { c.memoryLimit = bytes }
 }
 
-// TrackRejections makes Pump fail on a promise that was rejected with no handler and still
-// has none once the job queue is empty — Node's rule for an unhandled rejection, which ends
-// a Node process. It is for the trusted host realm, where one is a host bug; a guest's own
-// rejections are its business.
+// TrackRejections makes Pump fail on a rejection still unhandled once the job queue is
+// empty, Node's rule. For the host realm.
 func TrackRejections() Option {
 	return func(c *config) { c.trackRejections = true }
 }
 
-// Budget bounds the wall time of guest execution on this runtime until the returned
-// restore func runs, by arming QuickJS's own interrupt handler (QJS_SetDeadline in the
-// shim), which the interpreter consults every ~10k bytecodes and then throws.
-//
-// So the kill is an ordinary catchable JS exception and the runtime stays USABLE: the
-// caller sees an error from the call that overran, and the next call works. The
-// alternative — wazero's WithCloseOnContextDone — had to close the module to stop it, and
-// cost ~2.3x on a guest realm dispatch and ~2x on every network round trip for a bound
-// that also destroyed the realm it enforced.
-//
-// A non-positive d leaves the runtime unbounded.
+// Budget bounds execution wall time until the returned restore func runs, through
+// QuickJS's interrupt handler. An overrun is a catchable JS exception and the runtime
+// stays usable. A non-positive d is unbounded.
 func (r *Runtime) Budget(d time.Duration) func() {
 	if d <= 0 {
 		return func() {}
 	}
-	// The module resolves the deadline against its own monotonic clock, so the host
-	// never has to share a clock origin with it — it passes a duration, not an instant.
 	r.call("QJS_SetDeadline", uint64(d.Nanoseconds()))
 	return func() {
 		if r.Alive() {
@@ -121,11 +91,8 @@ func (r *Runtime) Budget(d time.Duration) func() {
 	}
 }
 
-// TookInterrupt reports whether the Budget deadline fired since it was last asked, and
-// clears the flag. It is the only way to know: an interrupt throws into whatever guest
-// frame was running, and when that frame is a promise-reaction job the job loop consumes
-// the exception — so the host's call (a pump) returns success and a guest that ran out of
-// budget is indistinguishable from one that finished. Every entry into guest code asks.
+// TookInterrupt reports and clears whether the Budget deadline fired. A pump can swallow
+// the exception inside a job, so this is the only reliable signal.
 func (r *Runtime) TookInterrupt() bool {
 	if !r.Alive() {
 		return false
@@ -133,14 +100,11 @@ func (r *Runtime) TookInterrupt() bool {
 	return r.call("QJS_TakeInterrupted") != 0
 }
 
-// Alive reports whether the underlying module is still usable — false only once the
-// runtime has been closed. A Budget overrun does not end it: the engine throws and the
-// runtime keeps running.
+// Alive reports whether the runtime has not been closed.
 func (r *Runtime) Alive() bool { return r.mod != nil && !r.mod.IsClosed() }
 
-// New instantiates a fresh QuickJS runtime and context: the engine's ECMAScript intrinsics
-// and nothing else — no quickjs-libc, no module loader, and WASI imports that answer only the
-// clock (instantiateWASI). Whatever else a realm can reach, its creator installs.
+// New instantiates a QuickJS runtime and context holding only ECMAScript intrinsics; WASI
+// answers only the clock (instantiateWASI).
 func New(opts ...Option) (rt *Runtime, err error) {
 	var cfg config
 	for _, o := range opts {
@@ -149,8 +113,7 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	ctx := context.Background()
 	rt = &Runtime{ctx: ctx, fnPools: map[string]*fnPool{}}
 
-	// On any failure after the wazero runtime is created but before the module is live,
-	// close it: the runtime holds this instance's compiled machine code.
+	// On failure, close the wazero runtime and its compiled code.
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qjs.New: %v", r)
@@ -162,16 +125,11 @@ func New(opts ...Option) (rt *Runtime, err error) {
 			rt = nil
 		}
 	}()
-	// A CompiledModule is bound to the runtime that compiled it, so each runtime compiles
-	// its own; the shared cache is what keeps that cheap when several are created.
-	//
-	// Nothing here arms an execution bound — the engine carries its own (see Budget) — so
-	// the compiled code pays no termination check.
+	// Each runtime compiles its own module; the shared cache keeps that cheap.
 	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
-	// A GoModuleFunc, not WithFunc: WithFunc dispatches through reflection, which cost every
-	// JS→Go call about a microsecond and a dozen allocations before the callback ran.
+	// A GoModuleFunc: WithFunc's reflection cost ~1µs per JS→Go call.
 	i32, i64 := api.ValueTypeI32, api.ValueTypeI64
 	if _, err := rt.wrt.NewHostModuleBuilder("env").
 		NewFunctionBuilder().
@@ -209,12 +167,9 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		return rt, errors.New("qjs.New: the engine could not create a runtime")
 	}
 	rt.ctxt = &Context{rt: rt, handle: handle}
-	// The engine's stack limit — its default, under the shadow stack csrc/qjswasm.cmake
-	// sizes — is measured down from a stack top it read inside QJS_New, a few frames deep.
-	// Read it again from here, the depth every top-level call enters at (each call leaves
-	// the stack pointer where it found it), so deep recursion throws a RangeError before it
-	// can run off the shadow stack into a trap that leaves the engine unusable. ONCE, never
-	// per call: a re-entrant call must count against this top, not its own deeper one.
+	// Re-read the stack top at the depth every top-level call enters at, so deep recursion
+	// throws a RangeError before it overruns the shadow stack. Once, not per call, so
+	// re-entrant calls count against it.
 	rt.call("QJS_UpdateStackTop", handle)
 	return rt, nil
 }
@@ -224,8 +179,7 @@ var (
 	cache     wazero.CompilationCache
 )
 
-// sharedCache returns a process-wide compilation cache so repeated runtime
-// creation reuses compiled machine code.
+// sharedCache returns the process-wide compilation cache.
 func sharedCache() wazero.CompilationCache {
 	cacheOnce.Do(func() { cache = wazero.NewCompilationCache() })
 	return cache
@@ -235,9 +189,7 @@ func sharedCache() wazero.CompilationCache {
 
 const wasiModule = "wasi_snapshot_preview1"
 
-// WASI preview1 errno values the stubs answer with. They are the spec's numbers
-// (ENOSYS 52, EINVAL 28, EFAULT 21), not the host OS's: a stub writes the result stack
-// directly, so it must not route through wazero's POSIX-to-WASI mapping.
+// WASI preview1 errno values, the spec's numbers rather than the host OS's.
 const (
 	wasiErrnoFault = 21
 	wasiErrnoInval = 28
@@ -247,12 +199,9 @@ const (
 // monotonicEpoch is the origin a realm's CLOCK_MONOTONIC reads from.
 var monotonicEpoch = time.Now()
 
-// instantiateWASI builds the wasi_snapshot_preview1 module the engine imports, holding no
-// host authority: every import refuses, except clock_time_get, which stays real because the
-// engine's own clock reads it — js__hrtime_ns drives the Budget interrupt and
-// performance.now, and Date and the Math.random seed read the wall clock. The signatures
-// come from the compiled module's imports, so an import a future build adds is refused by
-// construction rather than linked to a real host module.
+// instantiateWASI builds the WASI module the engine imports: every import refuses except
+// clock_time_get, which the Budget interrupt, performance.now and Date read. Signatures
+// come from the module's own imports, so a new import is refused by construction.
 func instantiateWASI(ctx context.Context, r wazero.Runtime, probe func(string), imports []api.FunctionDefinition) error {
 	b := r.NewHostModuleBuilder(wasiModule)
 	for _, fn := range imports {
@@ -268,11 +217,8 @@ func instantiateWASI(ctx context.Context, r wazero.Runtime, probe func(string), 
 	return err
 }
 
-// wasiFunc is one syscall, chosen once per import: clock_time_get is implemented, every
-// other import refuses with ENOSYS. A void import (proc_exit) panics instead of returning,
-// so an exit that somehow reached the host can never look like a successful one. probe,
-// when set, wraps the choice as the package tests' witness of which imports JS reaches;
-// production calls pay nothing for it.
+// wasiFunc is one syscall: clock_time_get, ENOSYS, or a panic for a void import
+// (proc_exit). probe, when set, records the call.
 func wasiFunc(name string, hasResult bool, probe func(string)) api.GoModuleFunc {
 	var fn api.GoModuleFunc
 	switch {
@@ -294,10 +240,7 @@ func wasiFunc(name string, hasResult bool, probe func(string)) api.GoModuleFunc 
 	}
 }
 
-// clockTimeGet implements clock_time_get against Go's clocks: CLOCK_REALTIME (0) from the
-// wall clock, CLOCK_MONOTONIC (1) from a process-stable origin. js__hrtime_ns aborts the
-// engine on any failure, so a bad id is EINVAL and an unwritable result cell EFAULT —
-// never a success with untouched memory.
+// clockTimeGet implements clock_time_get for CLOCK_REALTIME and CLOCK_MONOTONIC.
 func clockTimeGet(_ context.Context, mod api.Module, stack []uint64) {
 	clockID := api.DecodeU32(stack[0])
 	out := api.DecodeU32(stack[2])
@@ -321,9 +264,7 @@ func clockTimeGet(_ context.Context, mod api.Module, stack []uint64) {
 // Context returns the runtime's JS execution context.
 func (r *Runtime) Context() *Context { return r.ctxt }
 
-// Close tears down the engine: both the module instance and the wazero runtime that
-// compiled it, since the runtime holds this instance's compiled machine code. The
-// process-wide compilation cache is intentionally left open.
+// Close tears down the module and its wazero runtime; the shared cache stays open.
 func (r *Runtime) Close() {
 	if r == nil || r.mod == nil {
 		return
@@ -338,15 +279,10 @@ func (r *Runtime) Close() {
 
 // ── low-level engine plumbing ─────────────────────────────────────────────────
 
-// call invokes an exported wasm function and returns its single i64 result (0 if
-// the function is void). Panics on a wasm trap — the native host treats engine faults
-// as fatal, same as the rest of main.go.
+// call invokes an export and returns its i64 result (0 if void). Panics on a trap.
 func (r *Runtime) call(name string, args ...uint64) uint64 {
-	// wazero's api.Function lazily allocates and reuses a per-instance execution stack, so
-	// one cached instance corrupts under re-entrancy (a host import calling back into
-	// JS→wasm), while resolving fresh per call pays a lookup and an allocation every time.
-	// The per-name free list keeps both: each in-flight (possibly nested) call pops its own
-	// instance and returns it after. Single-threaded, so the pool needs no locking.
+	// An api.Function reuses one execution stack, so each in-flight (possibly nested)
+	// call takes its own instance from the pool.
 	p := r.pool(name)
 	if len(args) != p.params {
 		panic(fmt.Errorf("qjs: call %s: %d arguments for %d parameters", name, len(args), p.params))
@@ -365,8 +301,7 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	return res
 }
 
-// pool returns name's free list, minting it — and reading the export's signature — on
-// first use. The one map lookup an engine call makes.
+// pool returns name's free list, minting it on first use.
 func (r *Runtime) pool(name string) *fnPool {
 	p := r.fnPools[name]
 	if p == nil {
@@ -382,14 +317,12 @@ func (r *Runtime) pool(name string) *fnPool {
 	return p
 }
 
-// instance pairs a resolved export with a stack wide enough for its parameters and its
-// result (the shim's exports answer at most one).
+// instance pairs a resolved export with a stack wide enough for its params and result.
 func (p *fnPool) instance(fn api.Function) pooledFn {
 	return pooledFn{fn: fn, stack: make([]uint64, max(p.params, 1))}
 }
 
-// acquire hands out a resolved export instance: a pooled one if free, so a nested
-// re-entrant call gets a distinct instance and stack from the one in flight.
+// acquire hands out a free instance, or resolves a new one.
 func (p *fnPool) acquire(r *Runtime, name string) pooledFn {
 	if n := len(p.free); n > 0 {
 		f := p.free[n-1]
@@ -414,8 +347,7 @@ func (r *Runtime) freeAt(ptr uint64) {
 	r.call("free", ptr)
 }
 
-// writeCStr allocates a NUL-terminated copy of s in wasm memory and returns the
-// pointer. Caller owns it (the QJS_* string entry points copy the bytes).
+// writeCStr allocates a NUL-terminated copy of s in wasm memory; the caller frees it.
 func (r *Runtime) writeCStr(s string) uint64 {
 	ptr := r.mallocN(len(s) + 1)
 	r.mem.Write(uint32(ptr), []byte(s))
@@ -423,30 +355,25 @@ func (r *Runtime) writeCStr(s string) uint64 {
 	return ptr
 }
 
-// readString reads a string QJS_ToCString packed, and releases it. The address is not a
-// malloc block: it points into a refcounted JSString that QJS_ToCString retained, and the
-// only correct release is JS_FreeCString — a plain free corrupts the heap, and no release
-// leaks the string.
+// readString copies out a string QJS_ToCString packed and releases it with
+// JS_FreeCString, never free: it points into a retained JSString.
 func (r *Runtime) readString(packed uint64) string {
 	if packed == 0 {
 		return ""
 	}
 	addr, size := uint32(packed>>32), uint32(packed)
 	buf, _ := r.mem.Read(addr, size)
-	s := string(buf) // copy out before releasing
+	s := string(buf)
 	r.call("JS_FreeCString", r.ctxt.handle, uint64(addr))
 	return s
 }
 
-// callGo is the env.callGo host import: a JS call to the Go function registered under id.
-// The arguments are borrowed handles, valid only for the call. The JS `this` crosses in the
-// import's signature and is dropped here: no callback has ever read one, and wrapping it
-// would allocate a *Value on every JS→Go call. The stack is the signature New registers:
-// (ctx i32, this i64, argc i32, argv i32, id i32) → i64.
+// callGo is the env.callGo import, (ctx i32, this i64, argc i32, argv i32, id i32) → i64:
+// a JS call to the Go function registered under id. The arguments are borrowed for the
+// call; `this` is ignored.
 func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 	c := r.ctxt
-	// Deferred before any arg processing, so a panic below (a malformed argv, a panicking
-	// callback) surfaces as a catchable JS exception rather than a wasm trap killing the node.
+	// A panic becomes a JS exception rather than a trap.
 	defer func() {
 		if rec := recover(); rec != nil {
 			stack[0] = c.throwError(fmt.Errorf("%v", rec))
@@ -455,7 +382,6 @@ func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 
 	argc, argv, id := api.DecodeU32(stack[2]), api.DecodeU32(stack[3]), api.DecodeU32(stack[4])
 	fn := r.funcs[id]
-	// One backing array for the arguments rather than an allocation per *Value.
 	vals := make([]Value, argc)
 	args := make([]*Value, argc)
 	for i := range args {

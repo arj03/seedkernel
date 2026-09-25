@@ -1,9 +1,6 @@
-// loop.go — the Go-owned JavaScript event loop. QuickJS cannot drive I/O and wazero is
-// single-threaded, so Go owns the loop: the timer heap, the JS job queue, and re-entry
-// into JS to deliver an event. The engine has no timers of its own — setTimeout is Go's
-// (install) — so draining the job queue never blocks, which lets the shared host JS run
-// unmodified. Every QuickJS call happens on the loop goroutine; socket readers hand work
-// in via post(), so the timer heap needs no lock.
+// The Go-owned JavaScript event loop: the timer heap, the JS job queue, and re-entry into
+// JS to deliver an event. Every QuickJS call happens on the loop goroutine; other
+// goroutines hand work in via post().
 package main
 
 import (
@@ -24,30 +21,21 @@ type eventLoop struct {
 	tasks   chan func()
 	stopped bool
 
-	// extra contexts pumped alongside el.c — a confined guest realm sharing this loop, so
-	// a host-call result settling on the host realm can resume the guest. A guest realm's
-	// pump runs under its execution budget (guestRealm.pump), since a plain `await`
-	// continuation is guest code like any other.
+	// extra are the guest realms pumped alongside el.c, each through its budgeted pump.
 	extra []pumpEntry
 
-	// onSettle is the in-flight await's result sink, which install()'s persistent __settle
-	// routes into; a fresh resolver per await would leak (no unregister).
+	// onSettle is the in-flight await's result sink, which __settle routes into.
 	onSettle func(kind int, bytes []byte, msg string)
 
-	// awaitGen tags each await run and is the token its wrapped promise settles with.
-	// Both of the ways a finished run can reach back into the next one read it: a safety
-	// timer that already fired (Stop cannot unschedule an AfterFunc mid-flight), and the
-	// abandoned promise of a timed-out await, which resolves into a __settle that is still
-	// installed and would otherwise settle whichever await is now in flight.
+	// awaitGen tags each await, so a stale safety timer or a timed-out await's late
+	// promise cannot settle the one now in flight.
 	awaitGen int64
 
-	// stepTimer is step()'s single reusable wait timer, Reset per turn — a fresh timer
-	// per turn was per-frame GC churn in the tight pump loop.
+	// stepTimer is step()'s reusable wait timer.
 	stepTimer *time.Timer
 
-	// err is a host-realm drain that failed: a job that threw, or a rejection nothing
-	// handled (qjs.TrackRejections) — what ends a Node process. It stops the loop, and
-	// whoever ran the loop reports it: await to its caller, main by exiting.
+	// err is a failed host-realm drain: a job that threw, or an unhandled rejection
+	// (qjs.TrackRejections). It stops the loop; await returns it, main exits on it.
 	err error
 }
 
@@ -75,31 +63,25 @@ func (h *timerHeap) Pop() any {
 	return t
 }
 
-// newEventLoop binds a loop to a QuickJS context and installs the setTimeout/clearTimeout
-// surface the shared JS expects, which only a Go-owned loop can back.
+// newEventLoop binds a loop to a QuickJS context and installs setTimeout/clearTimeout.
 func newEventLoop(c *qjs.Context) *eventLoop {
 	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256)}
 	el.install()
 	return el
 }
 
-// pumpEntry pairs a registered context with the func that drains it, so removeContext
-// can still identify the entry by context while pumpAll goes through the realm's guard.
+// pumpEntry pairs a registered context with the func that drains it.
 type pumpEntry struct {
 	c    *qjs.Context
 	pump func()
 }
 
-// addContext registers another QuickJS context to be pumped alongside el.c, so a promise
-// reaction in that realm runs as part of this loop. A guest realm uses native Promises
-// only, so it needs no separate loop — just its job queue drained, through the
-// budget-guarded pump it hands over: a queued job is guest code (guestRealm.pump).
+// addContext registers another context to be drained by `pump` alongside el.c.
 func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
 	el.extra = append(el.extra, pumpEntry{c: c, pump: pump})
 }
 
-// removeContext drops a context registered with addContext, so pumpAll stops touching it
-// once its realm is closed. A no-op for a context that was never added.
+// removeContext drops a context registered with addContext; a no-op otherwise.
 func (el *eventLoop) removeContext(c *qjs.Context) {
 	for i, x := range el.extra {
 		if x.c == c {
@@ -111,11 +93,9 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 	}
 }
 
-// pumpAll drains the job queue of el.c and every registered extra context, el.c first, so
-// a host job that schedules a guest job runs it in the same round. The reverse direction
-// deliberately does not fit in one round: every parked `host.call` queues a host job after
-// el.c has drained, so something has to wake the loop (__host_call, see guest.go). A host
-// drain that fails stops the loop (eventLoop.err); a guest realm's pump answers for its own.
+// pumpAll drains el.c, then every extra context, so a host job that schedules guest work
+// runs it in the same round; guest-to-host work needs a wake. A failed host drain stops
+// the loop (eventLoop.err).
 func (el *eventLoop) pumpAll() {
 	if err := el.c.Pump(); err != nil && el.err == nil {
 		el.err = err
@@ -151,11 +131,7 @@ func (el *eventLoop) install() {
 		}
 		return nil, nil
 	}))
-	// __settle is what an await's wrapped promise calls, carrying as its first argument the
-	// awaitGen it was written under, and it routes into el.onSettle. A settle with no await
-	// in flight is ignored, and so is one bearing any other token: the resolver outlives the
-	// await that wrote it, so a timed-out call whose promise lands during a later await must
-	// not settle that one.
+	// __settle(gen, kind, value) settles the await tagged `gen`, and is ignored otherwise.
 	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		if el.onSettle == nil || args[0].Int64() != el.awaitGen {
 			return nil, nil
@@ -170,20 +146,15 @@ func (el *eventLoop) install() {
 		el.onSettle(int(args[1].Int64()), bytes, msg)
 		return nil, nil
 	}))
-	// The realm's other loop-adjacent globals are the engine's own: quickjs-ng defines
-	// queueMicrotask, and a performance.now over the monotonic clock its WASI import answers
-	// — sub-millisecond, which TestHostClockIsSubMillisecond pins and explains. Only the
-	// timers need a Go-owned loop behind them.
+	// queueMicrotask and performance.now are the engine's own.
 }
 
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
 func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 
-// wake nudges the loop into another pump round. With no timer and no deadline, step()
-// blocks in its select, so a microtask queued *during* a pump sits there until something
-// else wakes the loop — which to a caller awaiting that promise looks like a hang. Any
-// Go-side promise settlement outside a task/timer path must call this. Non-blocking on
-// purpose: safe from the loop goroutine, and a full buffer means work is already queued.
+// wake nudges the loop into another pump round, so a microtask queued during a pump is
+// not stranded behind a blocking select. Any Go-side settlement outside a task or timer
+// must call it. Non-blocking: a full buffer means work is already queued.
 func (el *eventLoop) wake() {
 	select {
 	case el.tasks <- func() {}:
@@ -191,9 +162,7 @@ func (el *eventLoop) wake() {
 	}
 }
 
-// armTimer (re)arms the loop's single reusable wait timer for duration d. step() runs only
-// on the loop goroutine and never re-entrantly, so one shared timer is safe, and Go 1.23+
-// timer semantics make Stop/Reset safe without the drain dance.
+// armTimer (re)arms the loop's reusable wait timer for d; step() never re-enters.
 func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 	if el.stepTimer == nil {
 		el.stepTimer = time.NewTimer(d)
@@ -212,15 +181,11 @@ func (el *eventLoop) callJS(cb *qjs.Value) {
 	}
 }
 
-// step drives one turn of the loop, phased as Node's is: the timers due when the turn
-// began, then (after draining ready microtasks and blocking until a posted task or the
-// next timer) the tasks queued by then. Each phase takes only what was ready as it began,
-// so neither a timer that re-arms at zero delay nor a peer that keeps the queue full can
-// hold the other phase off. Every realm advances on every pump, which is how a host-call
-// result settling on the host realm resumes a suspended guest.
+// step drives one turn, phased as Node's is: the timers due when the turn began, then the
+// tasks queued by then. Each phase takes only what was ready as it began, so neither can
+// starve the other.
 func (el *eventLoop) step() {
-	// Fire the timers due now, pumping after each so its reactions run before the next.
-	// One armed meanwhile waits for the next turn, however short its delay.
+	// Fire the timers due now, pumping after each; one armed meanwhile waits a turn.
 	now := time.Now()
 	for len(el.timers) > 0 && !el.timers[0].deadline.After(now) {
 		t := heap.Pop(&el.timers).(*jsTimer)
@@ -232,13 +197,11 @@ func (el *eventLoop) step() {
 			return
 		}
 	}
-	// Drain ready microtasks before blocking on I/O — e.g. a settled __settle from a
-	// fully-synchronous guest entrypoint — so we don't wait for an event that won't come.
+	// Drain ready microtasks before blocking.
 	el.pumpAll()
 	if el.stopped {
 		return
 	}
-	// Block until a posted task or the next timer, whichever comes first.
 	var wait <-chan time.Time
 	if len(el.timers) > 0 {
 		d := time.Until(el.timers[0].deadline)
@@ -254,10 +217,9 @@ func (el *eventLoop) step() {
 	case <-wait:
 	}
 	if wait != nil {
-		el.stepTimer.Stop() // disarm (Go 1.23+ needs no drain); reused next turn via Reset
+		el.stepTimer.Stop()
 	}
-	// Then the tasks already queued, pumping after each: a burst of socket frames lands in
-	// this one turn, and what is posted meanwhile waits behind the next timer phase.
+	// Then the tasks already queued, pumping after each; later posts wait a turn.
 	for n := len(el.tasks); n > 0 && !el.stopped; n-- {
 		task := <-el.tasks
 		task()
@@ -265,18 +227,15 @@ func (el *eventLoop) step() {
 	}
 }
 
-// run drives the loop on the current goroutine until stopped, one step() per turn. Its
-// callers set up an exit signal that flips el.stopped and then drive the loop through here.
+// run drives the loop on the current goroutine until stopped.
 func (el *eventLoop) run() {
 	for !el.stopped {
 		el.step()
 	}
 }
 
-// armSafety arms a gen-guarded safety timer for the await now in flight: onFire runs on the
-// loop goroutine only if no newer await has bumped awaitGen (Stop cannot unschedule an
-// already-fired AfterFunc) and this one has not completed — so a stale timeout can neither
-// abort the next await nor clobber a late settle.
+// armSafety arms a timeout for the await in flight; onFire runs on the loop goroutine
+// only while that await is still the current one.
 func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func() bool) {
 	gen := el.awaitGen
 	safety := time.AfterFunc(timeout, func() {
@@ -289,13 +248,9 @@ func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func(
 	return safety.Stop
 }
 
-// await evaluates an async JS expression in the host realm and drives the whole loop until
-// it settles: kind 0 (fulfilled, with the resolved bytes) or kind 1 (rejected, with the
-// error string), with timeout as a safety net. Every realm is pumped meanwhile, which is
-// how a guest suspended on a host call resumes. Sequential awaits are isolated by awaitGen;
-// nesting is not, since el.onSettle is a single shared slot and a nested await would orphan
-// the outer one. The native host never nests it (a guest's net call settles through guest.go's
-// own callbacks, which don't touch onSettle).
+// await evaluates an async JS expression in the host realm and drives the loop until it
+// settles: kind 0 (fulfilled, bytes), 1 (rejected, message) or 2 (timed out). Awaits
+// must not nest: el.onSettle is a single slot.
 func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1
 	el.awaitGen++
@@ -304,11 +259,8 @@ func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, va
 		kind, value, msg = k, bytes, m
 		el.stopped = true
 	}
-	defer func() { el.onSettle = nil }() // release the in-flight result (and its payload)
+	defer func() { el.onSettle = nil }()
 
-	// The kick is an IIFE, so the eval's completion value is undefined and there is nothing
-	// to free: the call's promise is reached only through the handlers it attaches, which
-	// run when the loop pumps.
 	wrap := `(function(){ Promise.resolve(` + callExpr + `).then(` +
 		`(v) => __settle(` + gen + `, 0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
 		`(e) => __settle(` + gen + `, 1, String(e && e.message || e))); })();`
@@ -323,8 +275,6 @@ func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, va
 	}
 	el.run()
 	if el.err != nil {
-		// A failed host drain stopped the loop, which fails the await whatever it was
-		// waiting on (eventLoop.err).
 		err, el.err = el.err, nil
 	}
 	return

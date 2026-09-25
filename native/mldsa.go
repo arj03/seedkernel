@@ -1,13 +1,6 @@
-// mldsa.go — ML-DSA-65 (FIPS 204) for the native binary: the PQ half of manifest suite
-// 0x02 (§12.4, §14.1).
-//
-// Deliberately NOT a Go implementation. It drives wasm/mldsa65.wasm — the same artifact the
-// browser fetches and Node reads — through wazero, for the reason sodium.go's header gives
-// for keeping Ed25519 on wasm: a verifier's accept/reject boundary is consensus, and two
-// independent implementations of a lattice scheme can disagree at the edges while both pass
-// their own test suites. Unlike libsodium.wasm this module has NO imports — randomness is
-// an argument — so instantiation is the whole wiring.
-
+// ML-DSA-65 (FIPS 204) verification, the PQ half of manifest suite 0x02 (§12.4, §14.1).
+// It runs the same wasm/mldsa65.wasm the JS target does: the accept/reject boundary is
+// consensus, so it must not be a second implementation.
 package main
 
 import (
@@ -23,8 +16,7 @@ import (
 //go:embed wasm/mldsa65.wasm
 var mldsaWasm []byte
 
-// FIPS 204 ML-DSA-65 field widths — format constants of the manifest envelope
-// (§12.4), cross-checked against the module's own exports at boot.
+// ML-DSA-65 widths (§12.4), cross-checked against the module's exports at boot.
 const (
 	mldsaPkBytes  = 1952
 	mldsaSigBytes = 3309
@@ -35,11 +27,10 @@ type mldsa struct {
 	verify api.Function
 }
 
-var md *mldsa // the process-wide ML-DSA-65 instance (manifest suite 0x02)
+var md *mldsa
 
-// bootMlDsa instantiates mldsa65.wasm and binds the exports the binary uses. Verification
-// is all it needs: signing manifests is a build-side job, and a binary that cannot sign
-// cannot be turned into a signing oracle (§12.4).
+// bootMlDsa instantiates mldsa65.wasm. The binary only verifies; signing is build-side
+// (§12.4).
 func bootMlDsa(rt wazero.Runtime) *mldsa {
 	m := newWasmModule(rt, "mldsa65", mldsaWasm, map[string]uint64{
 		"mldsa65_publickeybytes": mldsaPkBytes,
@@ -53,10 +44,8 @@ func bootMlDsa(rt wazero.Runtime) *mldsa {
 }
 
 // verifyDetached reports whether sig is a valid ML-DSA-65 signature over msg under pk,
-// with an empty FIPS 204 context — the runtime's only mode, since domain separation is the
-// DOMAIN_manifest prefix inside the preimage (§16.1). Wrong-width inputs are `false`, not
-// an error: that is what crypto_sign_verify_detached answers, and one suite must not report
-// a structural failure through a different channel than the other.
+// with an empty context: domain separation is in the preimage (§16.1). Wrong widths are
+// false, as in crypto_sign_verify_detached.
 func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 	if len(sig) != mldsaSigBytes || len(pk) != mldsaPkBytes {
 		return false
@@ -73,9 +62,7 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 	return r[0] == 1
 }
 
-// exposeMlDsa adds ml_dsa65_verify_detached to the realm's `__sodium` object. bundle.ts
-// feature-detects on exactly this method: absent, it refuses suite 0x02 bundles rather
-// than falling back to the Ed25519 half alone.
+// exposeMlDsa adds ml_dsa65_verify_detached to the realm's `__sodium` object.
 func exposeMlDsa(qc *qjs.Context, o *qjs.Value, m *mldsa) {
 	o.SetPropertyStr("ml_dsa65_verify_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		return qc.NewBool(m.verifyDetached(argView(args, 0), argView(args, 1), argView(args, 2))), nil

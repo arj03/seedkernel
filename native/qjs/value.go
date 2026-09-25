@@ -42,19 +42,15 @@ func (v *Value) Free() {
 	if v == nil || v.raw == 0 {
 		return
 	}
-	// undefined and null hold no reference, so there is nothing for the engine to release.
-	// And a closed runtime has had its linear memory reclaimed by wazero, so there is
-	// nothing to free and the call would panic. A killed call path is full of deferred
-	// Free()s, and they must not turn a clean error into a panic.
+	// Immediates hold no reference, and a closed runtime has nothing left to free.
 	if !v.IsUndefined() && !v.IsNull() && v.c.rt.Alive() {
 		v.c.rt.call("QJS_FreeValue", v.c.handle, v.raw)
 	}
 	v.raw = 0
 }
 
-// Dup retains an extra reference, so a JS value handed to a host callback can outlive that
-// synchronous call — the event loop holds JS callbacks this way. The returned *Value must
-// be Free()d once.
+// Dup retains an extra reference, so a value can outlive the call that handed it over.
+// Free the result once.
 func (v *Value) Dup() *Value {
 	if v == nil || v.raw == 0 {
 		return nil
@@ -88,23 +84,20 @@ func (c *Context) NewInt32(v int32) *Value {
 }
 func (c *Context) NewInt64(v int64) *Value { return c.callV("QJS_NewInt64", c.handle, uint64(v)) }
 
-// NewFloat64 makes a JS number carrying the full double. The shim takes the bits rather
-// than an f64 so the flat QJS_* ABI stays integer-only across the wasm boundary.
+// NewFloat64 makes a JS number; it crosses as bits, keeping the ABI integer-only.
 func (c *Context) NewFloat64(v float64) *Value {
 	return c.callV("QJS_NewFloat64", c.handle, math.Float64bits(v))
 }
 
-// NewString makes a JS string from s, which crosses with its length: a NUL inside it is a
-// character like any other.
+// NewString makes a JS string from s; it crosses with its length, so NULs survive.
 func (c *Context) NewString(s string) *Value {
 	ptr := c.rt.writeCStr(s)
-	defer c.rt.freeAt(ptr) // QJS_NewString copies into a JS string
+	defer c.rt.freeAt(ptr)
 	return c.callV("QJS_NewString", c.handle, ptr, uint64(len(s)))
 }
 
-// NewArrayBuffer creates a JS ArrayBuffer holding a copy of b, written straight into the
-// buffer's own storage. When the engine cannot allocate it, the result is the engine's
-// exception value, with the out-of-memory error left pending for the caller's next check.
+// NewArrayBuffer creates a JS ArrayBuffer holding a copy of b. On allocation failure it
+// returns the exception value with the error left pending.
 func (c *Context) NewArrayBuffer(b []byte) *Value {
 	v := c.callV("QJS_NewArrayBuffer", c.handle, uint64(len(b)))
 	if len(b) > 0 {
@@ -115,8 +108,7 @@ func (c *Context) NewArrayBuffer(b []byte) *Value {
 	return v
 }
 
-// Function wraps a Go func as a JS function: an engine function carrying the Go func's
-// index in the runtime's funcs, which env.callGo resolves.
+// Function wraps a Go func as a JS function, dispatched through env.callGo.
 func (c *Context) Function(fn goFunc) *Value {
 	id := len(c.rt.funcs)
 	c.rt.funcs = append(c.rt.funcs, fn)
@@ -130,7 +122,7 @@ func (v *Value) SetPropertyStr(name string, val *Value) {
 		return
 	}
 	ptr := v.c.rt.writeCStr(name)
-	defer v.c.rt.freeAt(ptr) // JS_SetPropertyStr interns the name, does not own it
+	defer v.c.rt.freeAt(ptr)
 	v.c.rt.call("JS_SetPropertyStr", v.c.handle, v.raw, ptr, val.raw)
 }
 
@@ -140,12 +132,8 @@ func (v *Value) GetPropertyStr(name string) *Value {
 	return v.c.callV("JS_GetPropertyStr", v.c.handle, v.raw, ptr)
 }
 
-// String renders the value as a string, "" when the conversion throws — and the throw is
-// TAKEN by the shim rather than left pending, so a value nothing can convert (a Symbol, a
-// throwing toString) cannot surface as the failure of the next, unrelated call on this
-// context. Int64 and Int32 answer 0 the same way. All three are reached with arguments a
-// guest chose (guest.go's __host_call), so the clean-context invariant is not the caller's
-// to keep.
+// String renders the value as a string, or "" if the conversion throws; the shim clears
+// the exception so it cannot fail the next call. Int64 and Int32 answer 0 the same way.
 func (v *Value) String() string {
 	return v.c.rt.readString(v.c.rt.call("QJS_ToCString", v.c.handle, v.raw))
 }
@@ -162,8 +150,7 @@ func (v *Value) boolCall(name string, args ...uint64) bool {
 	return int32(v.c.rt.call(name, args...)) != 0
 }
 
-// IsUndefined and IsNull compare tags, which is what JS_IsUndefined and JS_IsNull do: a
-// NaN-boxed JSValue carries its tag in the high word (JS_VALUE_GET_TAG).
+// IsUndefined and IsNull compare the tag in a NaN-boxed JSValue's high word.
 func (v *Value) IsUndefined() bool { return v.raw>>32 == v.c.rt.undefined>>32 }
 func (v *Value) IsNull() bool      { return v.raw>>32 == v.c.rt.null>>32 }
 func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
@@ -181,12 +168,8 @@ func (v *Value) window() (addr, size uint32, ok bool) {
 	return uint32(packed >> 32), uint32(packed), true
 }
 
-// Bytes returns the bytes of an ArrayBuffer or a TypedArray as an independent Go copy —
-// for a view, just its window. The shape comes from the engine's own slots, never from
-// properties, so no JS runs and nothing a caller defined on the object is believed;
-// anything else (a DataView, an object that only looks like a view, a detached buffer) is
-// refused, and the engine's error is taken so the next call does not inherit it. The value
-// is left intact, so it can be read any number of times.
+// Bytes copies out the bytes of an ArrayBuffer or TypedArray. The shape comes from the
+// engine's internal slots, so no JS runs; anything else is refused and the error cleared.
 func (v *Value) Bytes() ([]byte, error) {
 	addr, size, ok := v.window()
 	if !ok {
@@ -203,16 +186,10 @@ func (v *Value) Bytes() ([]byte, error) {
 	return out, nil
 }
 
-// View BORROWS the bytes of an ArrayBuffer or a TypedArray: the engine's own storage,
-// with nothing copied. It is valid only until this Value's runtime next runs — any call
-// into that engine may grow its wasm memory, after which the window describes a buffer
-// the engine has moved on from — so a caller must read EVERY other argument first, take
-// the view last, and consume it before returning to the engine.
-//
-// What consuming it means: handing the bytes to something OUTSIDE this runtime — the
-// other realm's engine, a wazero module's memory, a hash, a file — which copies or
-// finishes with them in the same breath. Anything that outlives that window, such as a
-// slice queued for another goroutine, takes Bytes() instead.
+// View borrows the bytes of an ArrayBuffer or TypedArray without copying. It is valid
+// only until this runtime next runs, since any engine call may grow its memory: read
+// every other argument first, take the view last, and hand it to something outside this
+// runtime before returning. Anything that must outlive that takes Bytes().
 func (v *Value) View() ([]byte, error) {
 	addr, size, ok := v.window()
 	if !ok {
@@ -228,8 +205,7 @@ func (v *Value) View() ([]byte, error) {
 	return buf, nil
 }
 
-// ByteLength answers the width Bytes would copy, without copying it: resource gates admit
-// against it before the copy.
+// ByteLength returns the width Bytes would copy, without copying.
 func (v *Value) ByteLength() (int64, error) {
 	_, size, ok := v.window()
 	if !ok {
@@ -244,9 +220,8 @@ func notBytes(c *Context) error {
 
 // ── errors ────────────────────────────────────────────────────────────────────
 
-// asError renders a thrown or rejected value as a Go error: its string form, plus its stack
-// when it has one. Only an object is asked for a stack — reading a property of undefined or
-// null would itself throw, and leave that exception for the next call to inherit.
+// asError renders a thrown value as a Go error, with its stack if it is an object that
+// has one.
 func (v *Value) asError() error {
 	cause := v.String()
 	if !v.IsObject() {
@@ -292,8 +267,7 @@ func (c *Context) Invoke(fn, this *Value, args ...*Value) (*Value, error) {
 	return c.normalize(res)
 }
 
-// marshalArgs writes the JSValue args contiguously into wasm memory, straight into the
-// malloc'd region rather than through a Go-side staging slice — this runs on every Invoke.
+// marshalArgs writes the args contiguously into wasm memory.
 func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	if len(args) == 0 {
 		return 0, 0
@@ -305,9 +279,8 @@ func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	return uint64(len(args)), ptr
 }
 
-// normalize converts a pending JS exception into a Go error. The context's exception flag
-// is the only failure signal: an Error *value* is deliberately not one, since a JS function
-// may legitimately return an Error as data, which must round-trip.
+// normalize converts a pending exception into a Go error. A returned Error value is data,
+// not a failure.
 func (c *Context) normalize(v *Value) (*Value, error) {
 	if c.hasException() {
 		v.Free()
@@ -318,26 +291,19 @@ func (c *Context) normalize(v *Value) (*Value, error) {
 
 // ── eval ──────────────────────────────────────────────────────────────────────
 
-// Eval evaluates src as strict global code under the given filename, and answers its
-// completion value as it stands: a promise is returned, not awaited, and the jobs the code
-// queued wait for Pump.
+// Eval evaluates src as strict global code and returns its completion value unawaited;
+// queued jobs wait for Pump.
 func (c *Context) Eval(file, src string) (*Value, error) {
 	filePtr := c.rt.writeCStr(file)
 	defer c.rt.freeAt(filePtr)
-	// NUL-terminated because JS_Eval requires it, with the length passed alongside, so a
-	// NUL inside the source is source like any other byte.
+	// NUL-terminated for JS_Eval, with the length alongside.
 	codePtr := c.rt.writeCStr(src)
 	defer c.rt.freeAt(codePtr)
 	return c.normalize(c.callV("QJS_Eval", c.handle, codePtr, uint64(len(src)), filePtr))
 }
 
-// Pump runs the job queue (microtasks and settled-promise reactions) to completion and
-// reports what went wrong on the way: a job that threw, or — for a runtime made with
-// TrackRejections — the promises still rejected with no handler once the queue is empty.
-// The native host supplies Go-backed timers, so there is nothing to wait on and this returns as
-// soon as the queue is empty. The event loop calls it after every re-entry into JS so
-// promise chains advance, and guest.go calls it once per invocation and per settlement to
-// keep the causal clock on the stack. Verified by TestQjsPumpModel.
+// Pump runs the job queue to completion and reports a job that threw, or, with
+// TrackRejections, the rejections left unhandled. It never waits.
 func (c *Context) Pump() error {
 	n := int32(c.rt.call("QJS_RunJobs", c.handle))
 	if n == 0 {

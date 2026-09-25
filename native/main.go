@@ -1,8 +1,6 @@
-// seedkernel native shell. The shell itself — verify/admit/install, the guest seam, and
-// the operator flow (host/cli.ts) — is the shared host TS, embedded as host-shell.gen.js
-// and run in QuickJS (README §12.9). The Go layer is only the bridge: module table (§3),
-// crypto, fs, sockets, the confined QuickJS realm an app runs in (guest.go). Pure Go, no
-// cgo → one static binary.
+// seedkernel native shell (§12.9). The shell is the shared host TS, embedded as
+// host-shell.gen.js and run in QuickJS; Go is only the bridge: module table (§3), crypto,
+// fs, sockets, and the confined guest realms (guest.go). Pure Go, one static binary.
 package main
 
 import (
@@ -24,32 +22,26 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
-// hostShellJS is the shared shell plus the native platform binding (host/native-shim.ts)
-// — the same TS the Node shell runs, so no rule of the protocol is re-derived in a second
-// language (README §12.9). Bundled by scripts/bundle-native-host.mjs, never hand-edited.
+// hostShellJS is the shared shell plus host/native-shim.ts, bundled by
+// scripts/bundle-native-host.mjs.
 //
 //go:embed host-shell.gen.js
 var hostShellJS string
 
 var (
 	ctx = context.Background()
-	// rtCore is the TCB's own runtime (libsodium, ML-DSA), deliberately not armed:
-	// a wedged libsodium is a host bug, not a confinement breach.
+	// rtCore is the TCB's own runtime (libsodium, ML-DSA), not budget-armed.
 	rtCore wazero.Runtime
 	qc     *qjs.Context
 	qrt    *qjs.Runtime
-	// el drives the host realm and every confined realm attached to it (loop.go).
-	el *eventLoop
-	// nh owns the booted network's listeners and sockets (sock.go). Package-level rather
-	// than boot()-local because shutdown() has to close them; they outlive the realm.
-	nh *netHost
+	el     *eventLoop
+	nh     *netHost
 )
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
-// boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
-// event loop, the platform primitives, then the ONE shared bundle. No node yet — `--dir`
-// is the operator's (§12.9). Idempotent: each boot releases the previous one's engines.
+// boot stands up the engines, the host realm and its primitives, then the shared bundle.
+// Each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
 	var err error
@@ -60,15 +52,13 @@ func boot() error {
 	sd = bootSodium(rtCore)
 	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
 
-	// Rejections are tracked because Node ends the process on one nothing handles, and the
-	// shell is the same TS: an unhandled rejection is a shell bug on either target (loop.go).
+	// An unhandled rejection ends the process, as on Node.
 	if qrt, err = qjs.New(qjs.TrackRejections()); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
 	}
 	qc = qrt.Context()
 	el = newEventLoop(qc)
-	// The shared bundle evaluates LAST: its module scope already reaches for the
-	// primitives above, and its load-time Web globals come from host/native-polyfills.ts.
+	// The bundle's module scope reaches for these primitives, so it evaluates last.
 	exposeSodium(qc, sd)
 	exposeFs(qc)
 	nh = exposeNet(qc, el)
@@ -78,26 +68,22 @@ func boot() error {
 		return fmt.Errorf("shell bundle: %w", err)
 	}
 	done.Free()
-	// The shim defines the __net dispatchers at the bundle's module scope
-	// (host/native-shim.ts); retain them now that it has evaluated (sock.go).
+	// The shim defined the __net dispatchers; retain them.
 	if err := nh.retain(); err != nil {
 		return fmt.Errorf("net retain: %w", err)
 	}
 	return nil
 }
 
-// shutdown releases a previous boot's engines: every confined realm, the host realm, and
-// the wazero runtimes holding each module's compiled code — plus the network's listeners
-// and sockets, which are not engines but outlive one just as badly.
+// shutdown releases a previous boot: the network, every realm, and the wazero runtimes.
 func shutdown() {
-	// The network first: the reader goroutines it stops would otherwise keep posting into
-	// the loop and dispatching into the host realm freed below.
+	// The network first, so its readers stop posting into the realm freed below.
 	if nh != nil {
 		nh.close()
 		nh = nil
 	}
 	for _, g := range realms {
-		g.discard() // guest runtime only — the host realm it borrowed values from dies below
+		g.discard()
 	}
 	realms = map[int64]*guestRealm{}
 	realmSeq = 0
@@ -112,19 +98,15 @@ func shutdown() {
 	}
 }
 
-// exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
-// reach. The shape is declared — and so typechecked — in host/native-shim.ts.
+// exposeBridge installs `bridge`, typed in host/native-shim.ts.
 func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
-	installModuleBridge(qc, b) // the private module table (§3) — module.go
+	installModuleBridge(qc, b) // module.go
 
-	// ── the operator's world (host/cli.ts) ──
-	// Files, arguments and stdout: which files get read and what gets printed is the
-	// shared CLI's, the same module the Node shell runs.
+	// The operator's world (host/cli.ts): arguments, files, stdio.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// JSON rather than a joined string: an argument may contain any byte, including
-		// whatever separator a join would pick.
+		// JSON, since an argument may contain any separator.
 		j, err := json.Marshal(os.Args[1:])
 		if err != nil {
 			return nil, err
@@ -134,8 +116,7 @@ func exposeBridge(qc *qjs.Context) {
 	b.SetPropertyStr("readFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		fb, err := os.ReadFile(args[0].String())
 		if err != nil {
-			// Only absence maps to null. Permission errors, directories and I/O failures
-			// must remain visible to guard-bearing callers such as the freshness store.
+			// Only absence maps to null; every other failure surfaces.
 			if errors.Is(err, os.ErrNotExist) {
 				return qc.NewNull(), nil
 			}
@@ -144,23 +125,20 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewArrayBuffer(fb), nil
 	}))
 	b.SetPropertyStr("writeFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// Path and mode first, bytes BORROWED last: the write consumes them before this
-		// engine runs again (qjs.Value.View).
+		// Bytes borrowed last (qjs.Value.View).
 		path, mode := args[0].String(), os.FileMode(args[2].Int64())
 		bytes, err := args[1].View()
 		if err != nil {
 			return nil, err
 		}
-		// Atomic for every caller: a truncated freshness file must never replace the last
-		// readable guard state (and is refused on read if one exists out of band).
+		// Atomic, so a torn write never replaces the freshness state.
 		if err := writeFileAtomic(path, bytes, ".seedkernel-", mode); err != nil {
 			return nil, err
 		}
 		return qc.NewUndefined(), nil
 	}))
 	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// The realm's console is this, by way of host/native-polyfills.ts — the engine has
-		// none — and it writes to stderr, because stdout is `--op`'s raw data channel.
+		// The realm's console; stderr, since stdout is `--op`'s data channel.
 		fmt.Fprintln(os.Stderr, args[0].String())
 		return qc.NewUndefined(), nil
 	}))
@@ -175,8 +153,7 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewUndefined(), nil
 	}))
 	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// `--op`'s argument, read whole; cli.ts calls this lazily, so a serving node never
-		// waits on stdin. A read failure must not turn into an empty operation payload.
+		// `--op`'s argument, read whole and only on demand.
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return nil, err
@@ -184,15 +161,14 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewArrayBuffer(bytes), nil
 	}))
 
-	installRealmBridge(qc, b) // the confined realm (§12.3) — guest.go
+	installRealmBridge(qc, b) // guest.go
 	qc.Global().SetPropertyStr("bridge", b)
 }
 
 // ───────────────────────── driving the shell ─────────────────────────
 
-// callRealm drives one of the shim's entry points (host/native-shim.ts): it stages the
-// arguments as __a0…__aN, evaluates `name(__a0, …)`, and pumps the loop until the
-// promise settles. Every Go→shell call goes through here.
+// callRealm calls one of the shim's entry points with args staged as __a0…__aN, and pumps
+// the loop until its promise settles.
 func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, error) {
 	if qc == nil {
 		return nil, errors.New("seedkernel: boot has not run")
@@ -200,11 +176,9 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 	slots := make([]string, len(args))
 	for i, a := range args {
 		slots[i] = "__a" + strconv.Itoa(i)
-		qc.Global().SetPropertyStr(slots[i], a) // SetPropertyStr takes the reference
+		qc.Global().SetPropertyStr(slots[i], a) // takes the reference
 	}
 	defer func() {
-		// Release the staged arguments: SetPropertyStr took their references and a slot
-		// is only re-set by the next callRealm, so a one-shot --op would leak payloads.
 		undef := qc.NewUndefined()
 		for _, slot := range slots {
 			qc.Global().SetPropertyStr(slot, undef)
@@ -222,13 +196,11 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 
 // ───────────────────────── entry ─────────────────────────
 
-// main is the whole of this target's startup: stand the engines up, evaluate the one
-// shared bundle, run the operator flow inside it. No CLI — the flags and the lines it
-// prints are host/cli.ts. The only Go decision is whether to keep the loop running.
+// main boots and runs the operator flow (host/cli.ts); Go only decides whether to keep
+// the loop running.
 func main() {
-	// One P by default: all QuickJS/wasm work already runs on the event-loop goroutine,
-	// so extra Ps serve only socket goroutines and cost idle-P wakeups per message (2–3
-	// Ps is the pathological setting, +30–50% on measured cohorts). Not a cap.
+	// One P by default: all engine work is on the loop goroutine, and extra Ps only add
+	// wakeups per message. GOMAXPROCS overrides.
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(1)
 	}
@@ -236,9 +208,7 @@ func main() {
 		fatal("boot", err)
 		return
 	}
-	// runMain resolves once the node is up and any `--op` has run; operator errors arrive
-	// here as errors a driving script must see. No watchdog (timeout 0): the hanging steps
-	// carry their own deadlines, and the Node shell is unbounded here too.
+	// No watchdog: the steps that can hang carry their own deadlines.
 	out, err := callRealm("runMain", 0)
 	if err != nil {
 		fatal("seedkernel", err)
@@ -257,14 +227,12 @@ func main() {
 	go func() { <-sig; os.Exit(0) }()
 	el.stopped = false
 	el.run()
-	// A failed host drain stops the loop, and ends the node as it ends a Node one.
 	if el.err != nil {
 		fatal("seedkernel", el.err)
 	}
 }
 
-// fatal reports a failure that ends the node and exits non-zero, so a script driving the
-// binary sees it.
+// fatal reports a failure and exits non-zero.
 func fatal(stage string, err error) {
 	fmt.Fprintln(os.Stderr, "ERROR: "+stage+": "+err.Error())
 	os.Exit(1)

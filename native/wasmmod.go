@@ -1,9 +1,6 @@
-// wasmmod.go — the driver for the no-import ML-DSA wasm module: instantiate the artifact,
-// cross-check its constant-width exports, and hand out buffers from its own linear memory
-// with a bump pointer. The module does not allocate or retain anything across a call, so
-// a rewind at the start of each op is the whole memory manager and there is no free list
-// to corrupt. Ops are serialized by mu — held for one
-// call, never across a callback into JS or Go.
+// The driver for the no-import ML-DSA wasm module: instantiate, cross-check its widths,
+// and bump-allocate from its linear memory, rewound at the start of each op. Ops are
+// serialized by mu.
 package main
 
 import (
@@ -15,7 +12,6 @@ import (
 )
 
 // wasmModule is a no-import wasm module plus the bump allocator over its memory.
-// name feeds the error messages ("mldsa65").
 type wasmModule struct {
 	mod      api.Module
 	mem      api.Memory
@@ -25,10 +21,8 @@ type wasmModule struct {
 	name     string
 }
 
-// newWasmModule compiles and instantiates wasm under name (no imports, no start functions)
-// and cross-checks the constant-width exports against want. A module built for another
-// parameter set would otherwise look like a working implementation until a real bundle
-// arrived, so it fails at boot instead.
+// newWasmModule instantiates wasm under name and checks each width export, so a module
+// built for another parameter set fails at boot.
 func newWasmModule(rt wazero.Runtime, name string, wasm []byte, widths map[string]uint64) *wasmModule {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
@@ -60,10 +54,9 @@ func newWasmModule(rt wazero.Runtime, name string, wasm []byte, widths map[strin
 // reset rewinds the bump pointer. Call once at the top of every op, under mu.
 func (m *wasmModule) reset() { m.top = m.heapBase }
 
-// alloc sub-allocates n 16-aligned bytes from the module's own heap, growing
-// linear memory if needed.
+// alloc sub-allocates n 16-aligned bytes, growing linear memory if needed.
 func (m *wasmModule) alloc(n int) uint32 {
-	// Widen before alignment/addition so neither operation can wrap into live data.
+	// Widened, so neither the align nor the add can wrap.
 	p := (uint64(m.top) + 15) &^ 15
 	if n < 0 || p > uint64(^uint32(0)) || uint64(n) > uint64(^uint32(0))-p {
 		panic(fmt.Sprintf("%s: allocation out of range", m.name))
