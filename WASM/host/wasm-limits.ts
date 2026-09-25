@@ -5,94 +5,65 @@
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
 
-/** Host bytes charged per table element (§4.3). A table is host memory a module allocates
- *  by declaring it — the engine reserves every element at instantiation — so admission
- *  charges it against the same budget as linear memory. Measured at ~28 bytes per funcref
- *  entry on V8 and 8 in wazero; the charge is the conservative one, and one number on every
- *  target for the reason `DEFAULT_SCRATCH_SIZE` is. */
+/** Host bytes charged per table element (§4.3), against the same budget as linear memory.
+ *  Measured ~28 bytes per funcref on V8 and 8 in wazero; one conservative number for
+ *  every target. */
 export const WASM_TABLE_ELEMENT_BYTES = 32;
 
-/** The I/O region a module reserves at its `scratch` export when it declares no
- *  `scratchSize` (§4.1). One number on every target: a payload the JS table admits and the
- *  Go one refuses is a module that loads on one node and not another. The Go side receives
- *  it from the shared shim at every slot build. */
+/** The `scratch` I/O region when a module declares no `scratchSize` (§4.1). One number on
+ *  every target, or a module would load on one node and not another; Go receives it from
+ *  the shim. */
 export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
-/** Default heap cap for a confined guest realm (§12.3). Deliberately equal to
- *  `DEFAULT_MAX_MODULE_MEMORY_BYTES` below, so the two kinds of untrusted code a bundle can
- *  ship are held to one number rather than two that drift. */
+/** Default heap cap for a guest realm (§12.3); equal to `DEFAULT_MAX_MODULE_MEMORY_BYTES`
+ *  on purpose. */
 export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
 
-/** Default budget per entrypoint invocation (§12.3): guest execution AND the wall clock of
- *  every handoff the invocation makes — queue wait, a parked host call, socket backlog, a
- *  deferred answer. Generous for any real request, and short enough that a wedged guest
- *  frees the host thread. */
+/** Default budget per entrypoint invocation (§12.3): guest execution and the wall clock of
+ *  every handoff it makes (queue wait, parked host calls, a deferred answer). */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
 
-/** Unresolved `host.call`s one realm may hold at once. Every call crosses a copy boundary
- *  and retains host-side promise state, so fire-and-forget calls need their own count bound
- *  independent of the guest heap. Paired with the byte ceiling below: neither bound is a
- *  substitute for the other. */
+/** Unresolved `host.call`s one realm may hold. Each retains host-side state outside the
+ *  guest heap, so fire-and-forget calls need a count bound as well as the byte bound below. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
 
-/** Aggregate copied input bytes retained by unresolved `host.call`s in one realm. Eight
- *  maximum-sized network frames leave useful concurrency for ordinary calls while keeping
- *  a stalled destination from turning the caller's confined heap into unbounded host
- *  memory. Applies to every host call, not only networking. */
+/** Copied input bytes retained by one realm's unresolved `host.call`s, so a stalled
+ *  destination cannot turn a confined heap into unbounded host memory. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
-/** Confined realms one node may hold at once (`slots`, shell-core.ts). The MULTIPLICAND:
- *  every per-realm ceiling here is one of these times this number, which is what makes the
- *  node total a ceiling rather than a floor — that sum is added up and measured against a
- *  real machine in tests/verify-hardening.mjs (§12.3). Bounding the count is also
- *  why nothing here is pooled BETWEEN realms: an allowance apps draw on in common is one
- *  app's standing way to refuse another's calls by being busy, while a quota per tenant
- *  times a bounded tenant count reaches the same total with no such channel. Slots are the
- *  operator's own admin path (§12.4), so this bounds an install list, never a peer's reach. */
+/** Realms one node may hold. Every per-realm ceiling is multiplied by it, which makes the
+ *  node total a ceiling (measured in tests/verify-hardening.mjs, §12.3). Per-realm quotas
+ *  rather than a shared pool, so no app can refuse another's calls by being busy. */
 export const DEFAULT_MAX_APP_SLOTS = 8;
 
-/** One realm's clock share for fresh invocation roots the guest creates ITSELF (§12.3).
- *  Calls descended from existing work inherit its absolute deadline; a fired timer starts
- *  a new one and can re-arm its successor forever. `createRealmTimers` gives that root a
- *  causal clock which follows continuations and cross-realm descendants, debiting measured
- *  execution rather than I/O wait. Twice the slot count keeps those self-created roots to
- *  half a CPU in steady state after the initial bank. It does not cap the rate of peer- or
- *  host-created roots and is therefore not a node-wide CPU total. */
+/** One realm's clock share for work it starts itself (timer roots, §12.3), which could
+ *  otherwise re-arm forever. Twice the slot count holds all such roots to half a CPU in
+ *  steady state. Peer- and host-started work is not paced by it. */
 export const SELF_INITIATED_CLOCK_DIVISOR = 2 * DEFAULT_MAX_APP_SLOTS;
 
-/** Ceiling on a module's declared footprint — linear memory AND the tables it declares,
- *  which are host memory bought with a declaration just as pages are. Applied at the shared
- *  admission path (§3), so every target holds its isolates to the same number. */
+/** Ceiling on a module's declared memory plus tables, applied at shared admission (§3). */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
-/** Metadata bound for one signed bundle. Aggregate module memory normally binds first, but
- *  zero-memory declarations must not turn admission into an unbounded module-array walk. */
+/** Modules per bundle, so zero-memory modules cannot make admission an unbounded walk. */
 export const DEFAULT_MAX_BUNDLE_MODULES = 256;
 
 export interface MemoryLimits {
-  /** Initial size in pages — allocated eagerly at instantiation, so it decides whether
-   *  instantiating the module is itself an attack. */
+  /** Initial size in pages, allocated eagerly at instantiation. */
   initialPages: number;
-  /** Declared maximum in pages, or null when the module declares none — an undeclared
-   *  maximum is an unbounded one, so the host refuses it (see `checkModuleLimits`). */
+  /** Declared maximum in pages, or null (unbounded, refused by `checkModuleLimits`). */
   maxPages: number | null;
 }
 
-/** Everything one module can make a host allocate by declaring it: linear memory, and the
- *  elements of the tables its language runtime uses for indirect calls. Both are read on
- *  one walk and charged to one budget — a table is real host memory (§4.3), so bounding
- *  only the pages would leave the same exhaustion open under another section header. */
+/** Everything a module makes the host allocate by declaring it — linear memory and table
+ *  elements — charged to one budget (§4.3). */
 export interface ModuleLimits {
-  /** The module's own linear memory, or null when it declares none. Null is not a pass —
-   *  it means the module exports no memory of its own, which module-table's `memory`
-   *  export check then refuses with its own message. */
+  /** The module's own linear memory, or null (then refused by module-table's `memory`
+   *  export check). */
   memory: MemoryLimits | null;
-  /** Elements summed over the module's tables at their initial size, reserved eagerly at
-   *  instantiation exactly as initial memory pages are. */
+  /** Elements over all tables at initial size, reserved at instantiation. */
   initialTableElements: number;
-  /** The same at their declared maxima, or null when any table declares none — `table.grow`
-   *  makes that unbounded, refused for the reason an undeclared memory maximum is. */
+  /** The same at declared maxima, or null when any table declares none (refused). */
   maxTableElements: number | null;
 }
 
@@ -119,10 +90,8 @@ function skipName(c: Cursor): void {
   if (c.i > c.b.length) throw new Error("wasm: truncated name");
 }
 
-/** A `limits` record: flags byte, then the initial size, then the maximum if declared.
- *  Flags above 0x01 mean a shared memory or table (0x02/0x03) or a 64-bit index type
- *  (0x04+), both outside the §4 pure-transform contract — refused by name so the message
- *  says why. */
+/** A `limits` record: flags, initial, then maximum if declared. Shared (0x02) and 64-bit
+ *  (0x04+) are outside the §4 contract and refused by name. */
 function readLimits(c: Cursor, what: "memory" | "table"): { initial: number; max: number | null } {
   if (c.i >= c.b.length) throw new Error(`wasm: truncated ${what} limits`);
   const flags = c.b[c.i++];
@@ -133,10 +102,8 @@ function readLimits(c: Cursor, what: "memory" | "table"): { initial: number; max
   return { initial, max };
 }
 
-/** A table type: element reference type, then a `limits` record. Only the two reference
- *  types a §4 module's toolchain emits are read — a typed function reference or the
- *  table-with-initializer form would have to be guessed at, and a table this walk misreads
- *  is a table it fails to charge. */
+/** A table type: reftype, then `limits`. Only funcref/externref are read; anything else
+ *  would be guessed at, and a misread table is an uncharged one. */
 function readTableType(c: Cursor): { initial: number; max: number | null } {
   if (c.i >= c.b.length) throw new Error("wasm: truncated table type");
   const reftype = c.b[c.i++];
@@ -164,9 +131,8 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
     const end = c.i + size;
     if (end > wasm.length) throw new Error("wasm: truncated section");
     if (id === 2) {
-      // Import section. A module imports nothing from the runtime but its own language
-      // runtime's shims, which are functions (§4.2); an imported memory or table would hand
-      // a pure transform storage it did not declare, so it is refused rather than counted.
+      // Imports: functions only (§4.2). An imported memory or table is storage the module
+      // did not declare, so it is refused.
       const count = readVarU32(c);
       for (let k = 0; k < count; k++) {
         skipName(c);
@@ -180,10 +146,7 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
         else throw new Error(`wasm: unknown import kind 0x${kind.toString(16)}`);
       }
     } else if (id === 4) {
-      // Table section. Charged rather than refused: a table is ordinary compiler output for
-      // indirect calls. Its elements are host memory the module never has to touch — the
-      // engine reserves the initial count at instantiation and `table.grow` reaches the
-      // declared maximum — so they are budgeted like pages.
+      // Tables: ordinary compiler output, so charged like pages rather than refused.
       const count = readVarU32(c);
       for (let k = 0; k < count; k++) {
         const t = readTableType(c);
@@ -197,8 +160,7 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
       const m = readLimits(c, "memory");
       memory = { initialPages: m.initial, maxPages: m.max };
     }
-    // Sections this does not read are skipped wholesale, as is any tail left inside one it
-    // does — so a future field appended to a section cannot desynchronise the walk.
+    // Skip to the section end, so an appended field cannot desynchronise the walk.
     c.i = end;
   }
   return { memory, initialTableElements, maxTableElements };
@@ -211,9 +173,8 @@ export function moduleFootprintBytes(limits: ModuleLimits): number {
     + (limits.maxTableElements ?? 0) * WASM_TABLE_ELEMENT_BYTES;
 }
 
-/** Refuse a module whose declared memory and tables do not fit `maxBytes` (§4.3). An
- *  undeclared maximum — memory's or a table's — is unbounded, so it is refused. The two are
- *  charged together: one budget for what the module may allocate, not one budget each. */
+/** Refuse a module whose declared memory plus tables do not fit `maxBytes` (§4.3), or
+ *  that declares no maximum for either. */
 export function checkModuleLimits(wasm: Uint8Array, maxBytes: number): ModuleLimits {
   const limits = readModuleLimits(wasm);
   if (limits.memory && limits.memory.maxPages === null) {

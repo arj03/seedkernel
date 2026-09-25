@@ -1,66 +1,59 @@
 // The realm contract and the per-realm host-side owners both realm factories build on
 // (safe-js.ts, native-shim.ts): serialized entry into one confined realm, and the deadlines
-// that bound it. What a realm's unanswered host calls hold is each target's own to count —
-// after the copy out of the guest heap on JS (safe-js.ts), before it natively
-// (native/hostcalls.go).
+// that bound it. Unanswered host calls are counted per target — after the copy out of the
+// guest heap on JS (safe-js.ts), before it natively (native/hostcalls.go).
 
 import { Fifo } from "../services/util.js";
 import type { HostCall } from "./guest-seam.js";
 
-/** The message a disposed realm fails every caller it can no longer answer with — in flight
- *  or still queued, on every target. One constant, because `TransportHost` also reads it to
- *  tell its own teardown from a failure worth logging. */
+/** What a disposed realm fails every in-flight and queued caller with, on every target.
+ *  `TransportHost` reads it to tell its own teardown from a real failure. */
 export const REALM_DISPOSED = "guest realm disposed";
 
-/** The two ways a host call ends on the clock rather than on an answer, said the same way
- *  by every realm factory: SPENT is a call the caller had no time left to make — thrown at
- *  the guest's call site, since the name was never issued — and LATE is one the handoff
- *  deadline overtook, which arrives as an ordinary failure (`settleByDeadline`). Constants
- *  for the reason REALM_DISPOSED is one: two targets, one contract, and a message that
- *  drifted would describe the same refusal two ways. */
+/** The two clock refusals, one wording on every target. SPENT: no time left to make the
+ *  call, thrown at the guest's call site. LATE: the handoff deadline overtook the call,
+ *  arriving as an ordinary failure (`settleByDeadline`). */
 export const HOST_CALL_SPENT = "guest: handoff deadline exhausted before host.call";
 export const HOST_CALL_LATE = "guest: host.call handoff deadline exceeded";
 
-/** One entrypoint invocation. Settling `result` normally releases the realm for the next
- *  one; a DEFERRED entrypoint (`__deferred`) ended its execution segment before its answer
- *  exists, so it releases the realm at once and answers under the same deadline later. */
+/** One entrypoint invocation. Settling `result` releases the realm; a `deferred` one
+ *  released it when its synchronous segment ended and answers later under the same
+ *  deadline. */
 export interface Invocation {
   result: Promise<Uint8Array>;
   deferred?: boolean;
-  /** The handoff deadline won: drop the host-side settlement state and reject `result`
-   *  with `reason`, so nothing is left holding an answer the queue has stopped waiting for. */
+  /** The handoff deadline won: drop settlement state and reject `result` with `reason`. */
   cancel(reason: Error): void;
 }
 
-/** The clock owner of one causally-related tree of work. A timer fire mints one and
- * realms carry it through every continuation and cross-realm call. Waiting costs
- * nothing; only a realm execution segment or module burn calls `charge`. */
+/** The clock owner of one causally related tree of work. A timer fire mints one and it
+ *  follows every continuation and cross-realm call. Only execution calls `charge`;
+ *  waiting is free. */
 export interface CausalClock {
   charge(ms: number): void;
 }
 
 /** Everything a target needs to construct one confined guest realm. */
 export interface RealmOptions {
-  /** Guest source. Runs in the sandbox; must declare the one `handle(arg)` entrypoint. */
+  /** Guest source. Must declare the one `handle(arg)` entrypoint. */
   source: string;
   /** The seam this realm calls out through — its whole view of the host. */
   hostCall: HostCall;
   /** Hard cap on this realm's heap. Omitted means the target's shared default. */
   memoryLimitBytes?: number;
   /** Guest execution and handoff budget per entrypoint, in ms. `Infinity` disables it;
-   * omitted means the target's shared default. */
+   *  omitted means the target's shared default. */
   deadlineMs?: number;
-  /** Run every invocation on this realm's own ceiling. A caller's remainder still bounds
-   *  that caller's wait, queueing included, but never the turn itself. For the link
-   *  occupant, whose turns write state every caller shares: one caller running out of time
-   *  must not cut a record in half (§12.3). */
+  /** Run every turn on this realm's own ceiling; a caller's remainder still bounds its
+   *  wait. For the link occupant, where one caller running out must not cut a record in
+   *  half (§12.3). */
   ownTurns?: boolean;
 }
 
 /** One confined guest realm, independent of the target that implements it. */
 export interface Realm {
-  /** Invoke the guest's `handle` with `[caller 32][body …]`. Calls are serialized per realm.
-   * An omitted deadline means a host-initiated call and uses this realm's configured ceiling. */
+  /** Invoke `handle` with `[caller 32][body …]`, serialized per realm. An omitted
+   *  deadline is a host-initiated call on this realm's own ceiling. */
   call(payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
   dispose(): void;
 }
@@ -69,7 +62,7 @@ export interface Realm {
 export type RealmFactory = (opts: RealmOptions) => Promise<Realm>;
 
 /** The causal clock active while host code synchronously enters or resumes one realm.
- * Nested entries restore their caller's clock, including when the inner operation throws. */
+ *  Nested entries restore their caller's clock, including when the inner one throws. */
 export class CausalContext {
   private active: CausalClock | undefined;
 
@@ -83,14 +76,11 @@ export class CausalContext {
   }
 }
 
-/** Monotonic milliseconds. A deadline here is the distance between two readings, so a wall
- *  clock is the wrong source: a step backwards expires every live one at once and a step
- *  forwards extends them all. Node, Bun and the browsers answer natively; the native host
- *  realm is given it beside `setTimeout` (native/loop.go). */
+/** Monotonic milliseconds: a wall-clock step would expire or extend every live deadline
+ *  at once. The native host realm gets it beside `setTimeout` (native/loop.go). */
 export const monotonicMs = (): number => performance.now();
 
-/** What a settled queue entry's payload field is replaced by — one shared empty view, so
- *  letting go of borrowed bytes allocates nothing and the field stays non-optional. */
+/** A settled queue entry's payload, so letting go of borrowed bytes allocates nothing. */
 const NO_PAYLOAD = new Uint8Array(0);
 
 /** Convert a live remainder into the absolute deadline that crosses this handoff. */
@@ -102,9 +92,8 @@ const deadlineAt = (remainingMs: number): number => {
   return monotonicMs() + remainingMs;
 };
 
-/** One deadline a realm is holding time against. `expire` settles the thing it guards; it
- *  may not touch this queue's other records, which every caller here honours by rejecting
- *  a promise or posting a microtask rather than reaching back in. */
+/** One deadline a realm holds time against. `expire` must only reject a promise or post a
+ *  microtask, never touch the queue's other records. */
 export interface Deadline {
   at: number;
   expire(): void;
@@ -117,19 +106,14 @@ export interface DeadlineQueue {
   disarmAll(): void;
 }
 
-/** The deadlines a realm has armed for work it has not settled, sharing one physical timer
- *  — the wall-clock half of the custody the active-call registry keeps in bytes (§12.3).
- *  Unsorted: the scan for the earliest runs when the timer fires, never on the call path.
- *  The wake is retained between fires rather than cycled per call — on native, two host
- *  calls through the trampoline for a deadline a fast dispatch never reaches — which is
- *  safe because `timerAt` is only ever EARLIER than anything pending: an unneeded wake
- *  re-arms, and none can fire late.
+/** The deadlines a realm holds for unsettled work, sharing one physical timer (§12.3).
+ *  Unsorted: the earliest is found when the timer fires, never on the call path. The timer
+ *  is kept between fires rather than cycled per call (on native that is two host calls per
+ *  dispatch); that is safe because it is never later than anything pending.
  *
- *  ONE PER TIER — invocations, and the host calls made under them — never folded together.
- *  Those deadlines are NESTED, not peers: a host call is admitted with what is left of its
- *  invocation, so it is always a hair earlier and would jostle the wake the outer deadline
- *  waits on. That one then fires late by the host timer clock's coarseness and loses the
- *  race against the guest budget derived from it, which is what it exists to backstop. */
+ *  One queue per tier, never merged: a host call's deadline is always a hair earlier than
+ *  its invocation's, and sharing a timer would make the outer one fire late by the timer's
+ *  coarseness and lose the race to the guest budget it backstops. */
 export function createDeadlineQueue(): DeadlineQueue {
   const pending = new Set<Deadline>();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -139,12 +123,9 @@ export function createDeadlineQueue(): DeadlineQueue {
     timer = undefined;
     timerAt = Infinity;
   };
-  /** Expire what is due, then re-arm for the earliest that is left — in pieces, since a
-   *  ceiling past `setTimeout`'s range fires at once if handed over whole. "Due" is
-   *  anything inside a millisecond, which is all `setTimeout` resolves: a host whose timer
-   *  clock is not this one's wakes a hair early often enough, and re-arming for that
-   *  remainder buys a whole further tick. Early is the conservative side of a custody bound;
-   *  a tick late hands the guest time it was never granted. */
+  /** Expire what is due, then re-arm for the earliest left, in pieces past `setTimeout`'s
+   *  range. "Due" is within a millisecond, all `setTimeout` resolves: early is the safe side
+   *  of a custody bound, a tick late hands the guest time it was never granted. */
   const arm = (): void => {
     clear();
     const now = monotonicMs();
@@ -160,23 +141,20 @@ export function createDeadlineQueue(): DeadlineQueue {
   return {
     add(deadline) {
       pending.add(deadline);
-      // Only for a wake a whole tick better: re-arming restarts the host's coarser timer,
-      // so a sub-millisecond gain costs the standing wake's accuracy — and a guest calling
-      // out under its invocation's deadline would pay that once per host call.
+      // Re-arm only for a whole tick's gain: re-arming costs the standing wake accuracy,
+      // and a guest would pay that per host call.
       if (timer === undefined || deadline.at < timerAt - 1) arm();
       else (timer as ReturnType<typeof setTimeout> & { ref?(): void }).ref?.();
     },
     drop(deadline) {
       if (!pending.delete(deadline)) return false;
-      // Nothing is waiting on the retained wake now, so it must not hold a process up on
-      // its own account; `add` refs it back. No-op off Node, whose loop is explicit.
+      // An idle retained wake must not hold a Node process up; `add` refs it back.
       if (pending.size === 0) {
         (timer as (ReturnType<typeof setTimeout> & { unref?(): void }) | undefined)?.unref?.();
       }
       return true;
     },
-    /** Disposal ends the wake with the realm (§12.3): nothing is left to consume those
-     *  answers, and a retained one would hold the host's loop for its whole remainder. */
+    /** Disposal ends the wake with the realm (§12.3). */
     disarmAll(): void {
       clear();
       pending.clear();
@@ -184,11 +162,7 @@ export function createDeadlineQueue(): DeadlineQueue {
   };
 }
 
-/** The two queues one realm arms, and the teardown that ends both. Every realm factory
- *  builds this pair and every path that ends a realm — a guest that fails while loading,
- *  dispose — must disarm both of them, so the pair is one value here rather than two
- *  locals and the same comment in each factory. One per tier still: nothing merges them.
- */
+/** The two queues one realm arms, and the teardown every realm-ending path must run. */
 export function createRealmDeadlines(): { hostCall: DeadlineQueue; entry: DeadlineQueue; disarmAll(): void } {
   const hostCall = createDeadlineQueue();
   const entry = createDeadlineQueue();
@@ -199,17 +173,13 @@ export function createRealmDeadlines(): { hostCall: DeadlineQueue; entry: Deadli
   };
 }
 
-/** Settle a host call's `answer` through `settle` — its bytes, or its failure — unless this
- *  deadline lands first, which settles it with `message` instead: exactly once either way,
- *  and expiry reaches the caller as an ordinary failure rather than a second settlement path.
- *  No claim flag: the deadline's place in its queue IS the claim, since expiry takes it out
- *  before firing and an answer that finds it gone (`drop` answering false) lost the race.
+/** Settle a host call's `answer` through `settle`, unless the deadline lands first, which
+ *  settles it with `message`: exactly once either way. The deadline's membership in its
+ *  queue is the claim — an answer that finds it dropped lost the race.
  *
- *  A callback rather than a racing promise because this runs per host call, and on the
- *  native loop every promise and closure is a measured cost; the one promise left is
- *  `answer.then`'s own. Expiry still settles on a later microtask: `add` can expire a
- *  deadline synchronously, inside the guest frame that issued the call, and a settlement
- *  re-enters the realm. */
+ *  A callback rather than a racing promise because every promise costs on the native loop.
+ *  Expiry settles on a microtask: `add` can expire synchronously, inside the guest frame
+ *  that issued the call, and settling re-enters the realm. */
 export function settleByDeadline(deadlines: { add(d: Deadline): void; drop(d: Deadline): boolean },
   remainingMs: number, answer: Promise<Uint8Array>, message: string,
   settle: (bytes: Uint8Array | null, error: unknown) => void): void {
@@ -226,13 +196,10 @@ export function settleByDeadline(deadlines: { add(d: Deadline): void; drop(d: De
   );
 }
 
-/** Serialize realm entry under one deadline that starts at admission.
- *
- * Payload bytes are borrowed from a longer-lived upstream owner. Queue depth is likewise
- * derived from those bounded callers rather than capped by an unrelated number here. The
- * absolute deadline covers queue wait, guest execution, and a deferred answer — or, with
- * `ownTurns` (RealmOptions), queue wait and the answer, while the turn runs on the realm's
- * own ceiling. */
+/** Serialize realm entry under one deadline that starts at admission, covering queue wait,
+ *  execution and a deferred answer — or, with `ownTurns`, wait and answer while the turn
+ *  runs on the realm's own ceiling. Payloads are borrowed from bounded upstream owners, so
+ *  queue depth needs no cap of its own. */
 export function serializeCalls(
   deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
   invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
@@ -249,17 +216,15 @@ export function serializeCalls(
     invocation?: Invocation;
     settled: boolean;
   }
-  // A FIFO and an explicit occupant, not a promise chain: a chain waits by RESOLVING one
-  // promise with another, and each of those hops is a wake of the native target's loop.
+  // A FIFO and an explicit occupant, not a promise chain: each chain hop is a wake of the
+  // native loop.
   const waiting = new Fifo<Entry>();
   let running: Entry | undefined;
   let pumping = false;
   const settled = Promise.resolve();
 
-  /** Settle the caller once, from whichever arm reaches it first, and let go of the payload
-   *  in the same breath: those bytes are BORROWED (§12.3), and an entry the deadline
-   *  overtook stays in the FIFO until the front reaches it — so a predecessor that never
-   *  answers would otherwise root every follower's payload behind it. */
+  /** Settle the caller once and drop the borrowed payload, which an expired entry would
+   *  otherwise root until the queue front reaches it. */
   const finish = (entry: Entry, ok: boolean, value: unknown): void => {
     if (entry.settled) return;
     entry.settled = true;
@@ -274,15 +239,13 @@ export function serializeCalls(
     pumping = true;
     void settled.then(enterNext);
   };
-  /** Hand the realm on. The DEADLINE does this too, so an answer that never comes cannot
-   *  hold the realm past the budget its invocation was admitted under. */
+  /** Hand the realm on. The deadline does this too, so a missing answer cannot hold it. */
   const release = (entry: Entry): void => {
     if (running !== entry) return;
     running = undefined;
     pump();
   };
-  /** Shared by every entry rather than closed over one, so admission allocates the record
-   *  and nothing else. `this` is the entry the queue is expiring. */
+  /** Shared by every entry, so admission allocates only the record. `this` is the entry. */
   function expire(this: Entry): void {
     const err = new Error(LATE);
     finish(this, false, err);
@@ -294,8 +257,7 @@ export function serializeCalls(
     while (running === undefined && waiting.size > 0) {
       const entry = waiting.shift() as Entry;
       if (entry.settled) continue;              // its deadline overtook it while it queued
-      // Read at the FRONT rather than trusting a flag, so a late timer cannot admit an
-      // expired entry — and spent as this invocation's remainder, so it is read only once.
+      // Read at the front, so a late timer cannot admit an expired entry.
       const now = monotonicMs();
       if (now >= entry.at) { entry.expire(); continue; }
       const err = notReady();
@@ -308,8 +270,6 @@ export function serializeCalls(
       entry.invocation.result.then(
         (value) => { finish(entry, true, value); release(entry); },
         (thrown: unknown) => { finish(entry, false, thrown); release(entry); });
-      // A deferred entrypoint ended its execution segment before its answer exists, so the
-      // realm is free now and the answer lands later under this same deadline.
       if (entry.invocation.deferred) void settled.then(() => release(entry));
     }
   };
@@ -319,14 +279,13 @@ export function serializeCalls(
     if (admissionError) return Promise.reject(admissionError);
 
     let at: number;
-    // A callee may tighten its configured ceiling, never mint time for the caller.
+    // A callee may tighten its ceiling, never mint time for the caller.
     try { at = deadlineAt(Math.min(suppliedDeadlineMs ?? defaultDeadlineMs, defaultDeadlineMs)); }
     catch (err) { return Promise.reject(err); }
     return new Promise<Uint8Array>((resolve, reject) => {
       const entry: Entry = { at, payload, causalClock, resolve, reject, settled: false, expire };
       if (at !== Infinity) deadlines.add(entry);
-      // `add` expires a deadline already inside the host timer's one-tick resolution
-      // synchronously. Do not turn that already-settled call into a FIFO tombstone.
+      // `add` may already have expired it; do not queue a tombstone.
       if (!entry.settled) {
         waiting.push(entry);
         pump();

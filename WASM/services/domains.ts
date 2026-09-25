@@ -19,19 +19,14 @@ export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 /** Author ML-DSA seed label (§16.1). KDF tag, not a signing prefix. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
-/** Residual guest-visible host transforms. This is legacy vocabulary, not a menu of computations:
- *  a pure transform belongs in the bundle that uses it. Keep a name here only while the
- *  host itself already carries and calls the same implementation — which is why this list
- *  is at its floor rather than shrinking: dropping a name duplicates code the artifact
- *  already ships, and a module cannot borrow the host's copy without exporting the linear
- *  memory the node key lives in (docs/SECURITY.md). `random` is the host's entropy source:
- *  ungated like the rest, because random bytes reach nothing and a guest needing a nonce
- *  should not have to be granted the node key to get one.
+/** Residual guest-visible host transforms, ungated. Not a menu: a new transform belongs in
+ *  its bundle. A name stays only while the host already ships the implementation, and a
+ *  module cannot borrow the host's copy without exposing the memory the node key lives in
+ *  (docs/SECURITY.md), so this list is at its floor.
  *
- *  Each name takes its algorithm's WHOLE standard interface — BLAKE2b's output length and
- *  key (RFC 7693), the AEAD's associated data (RFC 8439) — never the subset one bundle
- *  happens to use: a replacement transport or app must be able to build a standard
- *  protocol on these without a host release (tests/noise-vectors.js). */
+ *  Each takes its algorithm's whole standard interface (RFC 7693, RFC 8439), so a
+ *  replacement transport can build a standard protocol without a host release
+ *  (tests/noise-vectors.js). */
 export const HOST_TRANSFORM_NAMES = [
   "blake2b",
   "chacha20poly1305-ietf/seal",
@@ -42,9 +37,7 @@ export const HOST_TRANSFORM_NAMES = [
 
 export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
 /** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant.
- *  Only what a confined realm cannot reach for itself: the node key, disk, its wake and
- *  sockets. Time is not here — every realm already reads `Date.now()` and
- *  `performance.now()` as ECMAScript intrinsics — and neither is entropy (`crypto/random`). */
+ *  Only what a confined realm cannot reach for itself; time and entropy are ungated. */
 export const HOST_SERVICES = {
   node: { calls: ["sign", "verify"] },
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
@@ -55,31 +48,26 @@ export const HOST_SERVICES = {
   },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
-/** Services with `events` have an OCCUPANT: the one slot those events enter. One sink, so
- *  requiring one is a claim like any other — one holder per node (slot-table.ts). */
+/** Services with `events` have one occupant per node (slot-table.ts). */
 export function isOccupiedService(name: string): boolean {
   return isService(name) && "events" in HOST_SERVICES[name];
 }
 export const LINK_EVENTS = HOST_SERVICES.link.events;
 export type LinkEvent = (typeof LINK_EVENTS)[number];
-/** The full `service/call` vocabulary as a template-literal union — what the dispatch
- *  table's keys are typed against (guest-seam.ts `HandlerKey`). */
+/** The full `service/call` vocabulary, typing the dispatch table (guest-seam.ts). */
 export type HostMethod = {
   [S in ServiceName]: `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
 }[ServiceName];
-/** Whether a name is a host SERVICE — the vocabulary a manifest's `guest.requires` may
- *  name. An own-property check, never a parse. */
+/** Whether a name is a host service, by own-property check. */
 export function isService(name: string): name is ServiceName {
   return Object.prototype.hasOwnProperty.call(HOST_SERVICES, name);
 }
-/** The host's own `host.call` namespace for the text before a name's first `/`: a service,
- *  or `crypto`, the ungated transform table. A local service id may not live in one, so a
- *  declared name never shadows a host name (bundle.ts `validateManifest`). */
+/** Whether the text before a name's first `/` is a host namespace (a service or `crypto`),
+ *  where a local service id may not live (bundle.ts `validateManifest`). */
 export function isHostNamespace(head: string): boolean {
   return head === "crypto" || isService(head);
 }
-/** The service a host method belongs to, or null. Split at the FIRST `/` and looked up in
- *  the table — what the seam's gate checks a `host.call` name against (guest-seam.ts). */
+/** The service a host method belongs to (text before the first `/`), or null. */
 export function serviceOf(name: string): ServiceName | null {
   const i = name.indexOf("/");
   if (i < 0) return null;

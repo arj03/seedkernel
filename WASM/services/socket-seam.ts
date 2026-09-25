@@ -11,13 +11,9 @@ export interface RawLink {
   onClose(cb: () => void): void;
   /** `graceful` permits flushing queued writes. */
   close(graceful?: boolean): void;
-  /** Bytes awaiting transmission: the only release signal `LinkOutboundOwner`
-   *  (transport-host.ts) has as writes leave this adapter, read
-   *  as a SUFFIX of the writes it admitted — an adapter draining out of send order would
-   *  retire the wrong slices. Omit it only when nothing is retained past `send`; omitting
-   *  it while really buffering grows the link's charge to the ceiling with an empty
-   *  socket. Implemented, it must answer — one that throws fails its link rather than
-   *  reading as "holding nothing". */
+  /** Bytes awaiting transmission, drained in send order: the only release signal
+   *  `LinkOutboundOwner` has. Omit only when nothing is retained past `send`. A throw
+   *  fails the link. */
   buffered?(): number;
   /** Unauthenticated key for per-source limits; never a peer identity. */
   readonly remoteAddr?: string;
@@ -29,16 +25,12 @@ export interface RawLink {
 export interface Arrival {
   /** The label of the listener that accepted it, passed to the occupant unread. */
   readonly listener?: string;
-  /** The link this one arrived through — a WebRTC data channel names the negotiation link
-   *  the occupant opened for it. The driver passes the id; what it means is the occupant's. */
+  /** The link this one arrived through (a data channel's negotiation link). */
   readonly via?: RawLink;
 }
 
-/** Where a listener binds: a label, a host and a port, with port 0 meaning "ask the OS".
- *  The label reaches the occupant with every link the listener accepts, unread here, so
- *  what a listener is for — which codec it speaks — is the transport's to decide. Not a
- *  destination: dialing takes a STRING whose scheme the factory interprets (`connect`,
- *  peer-addr.ts `parseDest`). */
+/** Where a listener binds; port 0 asks the OS. The label reaches the occupant with every
+ *  accepted link, so which codec a listener speaks is the transport's to decide. */
 export interface ListenAddress {
   label: string;
   host: string;
@@ -47,10 +39,8 @@ export interface ListenAddress {
 
 export interface ChannelFactory {
   connect?(dest: string): RawLink | null;
-  /** Bind each address this factory can bind and hand every platform-opened link to
-   *  `onAccept`. Answers the bound port of each address, in order: 0 for one it does not
-   *  bind. A factory that binds nothing still gets the sink — a WebRTC data channel is
-   *  platform-opened too. */
+  /** Bind what this factory can and hand every platform-opened link to `onAccept`.
+   *  Answers each address's bound port in order, 0 for one it does not bind. */
   listen(
     addrs: readonly ListenAddress[],
     onAccept: (channel: RawLink, arrival?: Arrival) => void,
@@ -59,9 +49,8 @@ export interface ChannelFactory {
   close(): void;
 }
 
-/** Several factories as one: a destination goes to the first that routes it, and every
- *  factory gets the addresses and the accept sink. How a browser node reaches a WebRTC
- *  relay over a WebSocket and its peers over data channels. */
+/** Several factories as one: a destination goes to the first that routes it; every
+ *  factory gets the addresses and the accept sink. */
 export function combineChannels(...factories: ChannelFactory[]): ChannelFactory {
   return {
     connect(dest) {

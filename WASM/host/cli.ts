@@ -1,10 +1,7 @@
-// cli.ts — the operator's side of a node, written once for every target. A `CliHost`
-// names the few things that genuinely differ by target — files, a log line, raw stdout,
-// entropy, and "stand a node up here". Tokenizing `--name value` is not what is shared;
-// everything downstream of the split is: the flag SET, the defaults, the deny-all reading
-// of an absent `--policy` (§14), the order (remedies before the bundle, §12.5), which
-// failures are fatal, and the console lines. Those are decisions, and a decision made twice
-// eventually gets made differently.
+// cli.ts — the operator's side of a node, written once for every target: the flag set,
+// defaults, deny-all without `--policy` (§14), remedies before the bundle (§12.5), which
+// failures are fatal, and the console lines. A `CliHost` supplies only what differs by
+// target.
 import { toHex, fromHex, isHex64, errMessage, enc, dec } from "../services/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subkeys.js";
 import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
@@ -15,42 +12,33 @@ import type { TransportHost } from "./transport-host.js";
 import type { ListenAddress } from "../services/socket-seam.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
-/** Where a node's store lives when `--dir` is omitted. One value on every target, so
- *  the same command line runs the same node over the same store wherever it runs. */
+/** Where a node's store lives when `--dir` is omitted, on every target. */
 export const DEFAULT_DIR = "./data";
 /** Where the node's 32-byte master seed lives when `--key` is omitted (§12.6.2b). */
 export const DEFAULT_KEY = "./seedkernel.key";
 
-/** Every flag the shell accepts. An allowlist rather than a parse-and-ignore, because
- *  the failure an unknown flag would hide is silent: a mistyped `--polcy` would build a
- *  node that refuses ordinary apps — which looks exactly like a
- *  node whose policy is doing its job. The allowlist makes the typo say so. */
+/** Every flag the shell accepts. An allowlist, because a mistyped `--polcy` would
+ *  otherwise build a deny-all node that looks like one whose policy works. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "peers", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
 
-/** File access, as the flow needs it. A read answers `null` for "absent" rather than
- *  throwing (the `--key` path takes that branch on a first boot) and throws for anything
- *  else: a file that exists and cannot be read is not a first boot, and reading it as one
- *  mints a new seed over the node's identity. A write is atomic: a half-written key file or
- *  freshness mark is worse than none. */
+/** File access. A read answers `null` only for "absent" and throws otherwise — an
+ *  unreadable key file read as a first boot would mint a new identity over it. A write is
+ *  atomic. */
 export interface CliFiles {
   readFile(path: string): Uint8Array | null;
   writeFile(path: string, bytes: Uint8Array, mode?: number): void;
 }
 
-/** What a node needs to exist, once the flags have been read: the store and who may
- *  install on it, plus the assembly's own options — identity, network and guest bounds —
- *  exactly as `bootShell` takes them. The targets build the rest from very different parts
- *  — `NodeFs` + `node:net` here, a wazero table + Go sockets there — which is why
- *  `standUp` is a member rather than code in this file. */
+/** What a node needs once the flags are read: the store, the policy, and `bootShell`'s
+ *  own options. Each target builds the rest from its own parts (`standUp`). */
 export interface NodeSetup extends Pick<BootShellOptions, "identity" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
   /** Directory backing the `fs` service. */
   dir: string;
-  /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
-   *  accepts no ordinary app installs. */
+  /** Policy file contents (policy.ts). Omit ⇒ deny-all for ordinary apps. */
   policyJson?: string;
 }
 
@@ -62,41 +50,32 @@ export interface NodeRuntime {
 
 /** The platform under the operator flow. */
 export interface CliHost extends CliFiles {
-  /** The first word of the first console line — the artifact you are running
-   *  (`seedkernel-shell` on Node, `seedkernel-native` natively). The only thing on that
-   *  line allowed to differ; the peer id after it is not. */
+  /** The first word of the first console line: `seedkernel-shell` or `seedkernel-native`. */
   banner: string;
   /** Arguments after the program name. */
   argv: string[];
   /** One console line: `console.error` on Node, a Go stderr write natively. */
   log(line: string): void;
-  /** Raw bytes to stdout — `--op` writes the app's response verbatim, so this cannot go
-   *  through `log`, and `log` must not go to stdout either (both targets send it to
-   *  stderr: a diagnostic interleaved into a response corrupts it). */
+  /** Raw bytes to stdout for `--op`'s response; `log` goes to stderr so it cannot
+   *  corrupt it. */
   stdout(bytes: Uint8Array): void;
-  /** Raw bytes from stdin — `--op`'s argument, verbatim; empty when nothing is piped in.
-   *  A function rather than a field so a node that boots and serves never blocks on a
-   *  stdin nobody will write to. */
+  /** `--op`'s argument from stdin; a function so a serving node never blocks on it. */
   stdin(): Uint8Array;
   /** Entropy + the subkey derivation's crypto (§12.9). */
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
-  /** Assemble a node on this platform: the platform seam, `bootShell`, and the
-   *  transport bundle that is its network. */
+  /** Assemble a node on this platform through `bootShell`. */
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
 }
 
-/** What `runCli` leaves behind: whether the node is listening (so the caller knows to
- *  keep the process alive and hook SIGINT) and how to shut it down. Both are the
- *  binding's business — Node exits by returning from `main`, the native target hands
- *  the loop back to Go — so the flow reports rather than decides. */
+/** Whether the node is listening (so the caller keeps the process alive) and how to shut
+ *  it down; each target acts on it its own way. */
 export interface CliResult {
   serving: boolean;
   close(): void;
 }
 
-/** Split `--name value` / `--name=value` pairs, refusing anything else: an unknown flag is
- *  an error rather than an ignored token, and a flag without a value is an error rather
- *  than a `true` that later reads as a path. */
+/** Split `--name value` / `--name=value` pairs. Unknown flags and flags without a value
+ *  are errors. */
 export function parseArgs(argv: string[], known: ReadonlySet<string> = FLAGS): Map<string, string> {
   const out = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
@@ -119,13 +98,12 @@ function list(v: string | undefined): string[] {
   return v === undefined ? [] : v.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/** The label a `--listen` entry without one gets. Passed to the transport unread like any
- *  other label; the shipped transport reads every label but `ws` as length framing. */
+/** The label a `--listen` entry without one gets; the shipped transport reads every label
+ *  but `ws` as length framing. */
 export const DEFAULT_LISTEN_LABEL = "tcp";
 
-/** `--listen [label=]host:port,…`: one listener per entry, its label handed to the transport
- *  with every link it accepts. The label is checked for shape only — what it means is the
- *  transport's — so an address can never be read as a label or the other way round. */
+/** `--listen [label=]host:port,…`: one listener per entry. The label's meaning is the
+ *  transport's; only its shape is checked here. */
 export function parseListen(v: string): ListenAddress[] {
   return list(v).map((entry) => {
     const eq = entry.indexOf("=");
@@ -136,9 +114,7 @@ export function parseListen(v: string): ListenAddress[] {
   });
 }
 
-/** Read a file the operator named, failing with the flag rather than the errno — a
- *  missing `--policy` file is an operator mistake, and the message should say which
- *  flag was wrong. `null` when absent, as `CliFiles` reads it. */
+/** Read a file the operator named, naming the flag on failure; `null` when absent. */
 function readNamed(files: CliFiles, path: string, label: string): Uint8Array | null {
   try { return files.readFile(path); }
   catch (e) { throw new Error(`${label}: cannot read ${path}: ${errMessage(e)}`, { cause: e }); }
@@ -151,8 +127,8 @@ function mustRead(files: CliFiles, path: string, label: string): Uint8Array {
   return b;
 }
 
-/** A flag holding a whole number, refused rather than coerced: `Number` reads "5000ms" as
- *  NaN and "" as 0, and passing either on would quietly lift the bound the flag sets. */
+/** A whole-number flag, refused rather than coerced (`Number("")` is 0, which would lift
+ *  the bound). */
 function wholeNumberFlag(args: Map<string, string>, flag: string): number | undefined {
   const v = args.get(flag);
   if (v === undefined) return undefined;
@@ -160,19 +136,16 @@ function wholeNumberFlag(args: Map<string, string>, flag: string): number | unde
   return Number(v);
 }
 
-/** Parse 64 hex characters into the 32 bytes they name. Validated rather than decoded
- *  loosely, because `fromHex` maps a non-hex pair to 0: a corrupt key file would boot the
- *  node under a *different* identity. Parse time is the only place an operator can still
- *  be told. */
+/** Parse 64 hex characters into 32 bytes. Validated, since `fromHex` maps a bad pair to 0
+ *  and a corrupt key file would boot under a different identity. */
 export function parseHex32(hex: string, label: string): Uint8Array {
   const trimmed = hex.trim();
   if (!isHex64(trimmed)) throw new Error(`${label} must hold 32 bytes as 64 hex characters`);
   return fromHex(trimmed);
 }
 
-/** Load the node's MASTER SEED from `--key`, or mint one and persist it 0600, and derive
- *  the node's keypair from it (§12.9). One 32-byte secret on disk; the master signs
- *  nothing itself, and the node's peer id is the derived channel key's public half. */
+/** Load the master seed from `--key`, or mint and persist one 0600, and derive the node's
+ *  keypair from it (§12.9). The master itself signs nothing. */
 function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   const existing = readNamed(host, keyPath, "--key");
   if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(dec.decode(existing), `--key ${keyPath}`));
@@ -181,10 +154,8 @@ function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   return deriveNodeKey(host.sodium, master);
 }
 
-/** The freshness store (§12.4) a node keeps beside its data directory (`freshnessPathFor`),
- *  over the target's `CliFiles` — one implementation, so the targets cannot disagree about
- *  what an unreadable file means (a failed boot: read as a first one, it would drop every
- *  downgrade mark and every revocation) or how the file is written (atomically, 0600). */
+/** The freshness store (§12.4) beside the data directory. An unreadable file fails the boot
+ *  rather than dropping every mark and revocation; writes are atomic and 0600. */
 export function freshnessStoreFor(files: CliFiles, dir: string): FreshnessMarks {
   const path = freshnessPathFor(dir);
   const raw = readNamed(files, path, "freshness store");
@@ -192,13 +163,8 @@ export function freshnessStoreFor(files: CliFiles, dir: string): FreshnessMarks 
     (json) => files.writeFile(path, enc.encode(json), 0o600));
 }
 
-/** The one console line a successful load prints (§12.4, §12.10): the app label an operator
- *  would pass to `--uninstall`, its version, the author an operator would pass to
- *  `--revoke`, and what the load CLAIMED: what a PEER may reach (`protocols`) always, and
- *  what a co-resident guest may reach (`services`) when there is one — two audiences, so
- *  folding them into one list would leave a reader to guess which name a peer can send to.
- *  All of it comes from the manifest, so a node says what it will and will not answer at
- *  the load rather than at the first frame. */
+/** The console line a load prints (§12.4, §12.10): label, version, author, and its claims —
+ *  `protocols` always, `services` when any, kept apart since their audiences differ. */
 export function loadedLine(b: AppHandle): string {
   const protocols = b.manifest.protocols ?? [];
   const services = b.manifest.services ?? [];
@@ -207,21 +173,16 @@ export function loadedLine(b: AppHandle): string {
     (services.length ? `  locally ${services.join(", ")}` : "");
 }
 
-/** Run the operator flow to completion. Throws on anything the operator got wrong — a bad
- *  flag, an unreadable file, a bundle that will not load — and the caller reports and
- *  exits, because how a target reports a fatal error is the last platform thing here. */
+/** Run the operator flow. Throws on any operator error; the caller reports and exits. */
 export async function runCli(host: CliHost): Promise<CliResult> {
   const args = parseArgs(host.argv);
-  // Guest resource bounds (§12.3), which only widen or tighten the shell's own defaults
-  // (the shell checks their range). `--guest-timeout 0` reads as Infinity — "no budget"
-  // said explicitly, rather than reached by leaving a flag off or mistyping one.
+  // Guest bounds (§12.3); the shell checks their range. `--guest-timeout 0` is Infinity.
   const guestTimeout = wholeNumberFlag(args, "guest-timeout");
   const guestMemory = wholeNumberFlag(args, "guest-memory");
   const dir = args.get("dir") ?? DEFAULT_DIR;
   const keyPath = args.get("key") ?? DEFAULT_KEY;
   const policyPath = args.get("policy");
-  // An absent policy denies ordinary app installs. It does not touch the network: the
-  // boot-selected transport needs no entry in this app-author set.
+  // An absent policy denies ordinary apps; the boot transport needs no entry in it.
   const policyJson = policyPath === undefined
     ? undefined
     : dec.decode(mustRead(host, policyPath, "--policy"));
@@ -247,11 +208,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     localConfig = parsed;
   }
 
-  // The transport's own configuration (§12.10): cohort peers and the contact secret that
-  // gates this node's door, both passed through UNREAD. Their grammar and encoding are the
-  // transport's, which checks them at its load, so a replacement transport can spell them
-  // its own way without a new binary. The secret comes from a file to keep it out of `ps`;
-  // trimming the file's line ending is file handling, not parsing.
+  // Transport config (§12.10), passed through unread: the transport checks it at load.
+  // The contact secret comes from a file to keep it out of `ps`.
   const peers = list(args.get("peers"));
   const transportConfig: JsonObject = {};
   if (peers.length > 0) transportConfig.peers = peers;
@@ -263,7 +221,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     dir,
     policyJson,
     identity: key,
-    // The network flags are what enable a network; the rest of these configure it.
     transport: network ? {
       listen,
       bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
@@ -272,10 +229,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });
-  // The addresses went in with the load above; what is left is to wait for the cohort, on
-  // the id the transport claims — the same door a co-resident guest uses. Best-effort: the
-  // op settles on its own deadline rather than rejecting, so a member that is not up yet
-  // delays the boot but never fails it. `null` is a transport claiming no such id.
+  // Wait for the cohort through the transport's service id. Best-effort: `ready` settles
+  // at its deadline rather than rejecting, so a missing member delays boot, never fails it.
   if (peers.length > 0) {
     const ready = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
     if (!ready) throw new Error("shell: --peers given, but there is nothing to dial from — enable transport first");
@@ -288,9 +243,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  cohort ${peers.length} peer(s)`);
   for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
 
-  // Operator remedies (§12.5), deliberately BEFORE the bundle: a node booting with both
-  // should never briefly install what it was told to refuse. --revoke is the whole remedy
-  // for a compromised key; --uninstall drops an app without writing its author off.
+  // Operator remedies (§12.5) before the bundle, so a node never briefly installs what it
+  // was told to refuse.
   for (const authorHex of list(args.get("revoke"))) {
     const gone = shell.revoke(authorHex);
     host.log(`  revoke ${authorHex}` +
@@ -300,35 +254,23 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     host.log(`  uninstall ${app}${shell.uninstall(app) ? "" : " (nothing bound)"}`);
   }
 
-  // A signed bundle from disk. Reading the file is all the operator flow does: the whole
-  // load — signature, policy, freshness, integrity, binding, claiming the manifest's
-  // protocol ids — is the shared shell's (§12.4, §12.10).
+  // A signed bundle from disk; the whole load is the shell's (§12.4, §12.10).
   if (bundlePath !== undefined) {
     let loaded: AppHandle;
     try {
-      // The file named by --local-config belongs only to this explicit load. It never
-      // reaches the transport bundle stood above or another app loaded into this shell.
+      // --local-config belongs to this load only.
       loaded = await shell.install(
         mustRead(host, bundlePath, "--bundle"),
         localConfig === undefined ? undefined : { localConfig },
       );
     } catch (err) {
-      // Fatal, and labelled: a node whose bundle did not land has no app to run, and a
-      // driving script must see that rather than a silent bundle-less relay.
+      // Fatal: a driving script must not get a silent bundle-less relay.
       throw new Error("bundle: " + errMessage(err));
     }
     host.log("  bundle " + loadedLine(loaded));
 
-    // ONE one-shot op through the loaded guest — "the shell runs the app" as the
-    // *initiator* (§12.8). `handle`'s ABI and nothing more (§12.2): stdin is the argument,
-    // stdout is the response, and the op name is framed here with the app's own
-    // convention (`writeOp`, the leaf client helper) and passed through unread. Nothing
-    // here decodes or knows an app's argument shape, which a flag per operation could not
-    // avoid. A name too long or not ASCII is refused there rather than truncated into a
-    // different frame.
-    //
-    // Addressed through the handle THIS flow's load returned. A node with a network has
-    // the transport loaded too, so no shell-level "the only app" operation exists.
+    // One one-shot op through this load's handle (§12.8): stdin is the argument, stdout the
+    // response, the op name framed by `writeOp` and otherwise unread (§12.2).
     const op = args.get("op");
     if (op !== undefined) {
       host.stdout(await loaded.invoke(writeOp(op, host.stdin())));
@@ -337,10 +279,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
   const close = () => shell.close();
   if (!net?.listening.some((l) => l.port > 0)) return { serving: false, close };
-  // A serving node with an app loaded also answers for the cohort: inbound requests route
-  // by protocol id to whichever app claims it, answered from its own confined realm — no
-  // app-specific host code, no second dispatch (§12.8, §12.10). Nothing to arm: the load
-  // stood the guest, so the app has been answerable since the line above.
+  // Inbound requests already route to the loaded app by protocol id (§12.8, §12.10).
   if (bundlePath !== undefined) {
     host.log("  serving the app's request side from the confined guest");
   }

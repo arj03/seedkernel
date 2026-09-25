@@ -25,63 +25,46 @@ const NO_ROUTE = { linkId: 0, stream: false } as const;
 
 const ev = (name: LinkEvent) => new OpArgs(name);
 
-/** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
- *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
+/** Ceiling on the sockets the driver holds, before the guest has an opinion. */
 export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
 
-/** Active transport entrypoint; `null` means the binding is vacant. `input` is the whole
- *  realm argument, `[caller 32][body …]`, built in one pass here (`OpArgs.build`). */
+/** Active transport entrypoint, called with the whole realm argument `[caller 32][body …]`;
+ *  `null` means the binding is vacant. */
 export type TransportCall = (input: Uint8Array) => Promise<Uint8Array> | null;
 
-/** The claim routing a `link/deliver` call is handed to (§12.10). `null` for a claim no
- *  peer may reach. Inbound attributed delivery costs no grant beyond `link` itself: the
- *  occupant that saw the plaintext is the one that attributes it. `framed` is
- *  `[attribution 32][payload …]`, which the occupant's own call body already spells that
- *  way, so it IS the realm argument and nothing rebuilds it. */
+/** The claim routing `link/deliver` is handed to (§12.10); `null` for a claim no peer may
+ *  reach. `framed` is `[attribution 32][payload …]`, already the realm argument. */
 export type TransportDeliver = (claim: string, framed: Uint8Array,
   deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
-  /** Live raw links this driver will hold at once (default `DEFAULT_MAX_RAW_LINKS`).
-   *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
-   *  the host's own link table, not the occupant's link states. */
+  /** Live raw links this driver holds at once (default `DEFAULT_MAX_RAW_LINKS`). Bounds the
+   *  host's own table; never shipped to the guest. */
   maxRawLinks?: number;
   /** Aggregate write custody across every link in this driver. */
   maxOutboundBytes?: number;
   maxOutboundSlices?: number;
-  /** The socket seam: dialing and listening live here, and so does every judgement about
-   *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
-   *  factory with no `connect` is accept-only, and its `link/open` calls answer "no route". */
+  /** The socket seam, which alone decides what a destination means. A factory with no
+   *  `connect` is accept-only, and `link/open` answers "no route". */
   channels?: ChannelFactory;
-  /** The listeners to bind, each labelled for the occupant (socket-seam.ts `ListenAddress`). */
+  /** The listeners to bind, each labelled for the occupant. */
   listen?: readonly ListenAddress[];
-  /** One link went down, with the occupant's reason — for the shipped transport a word
-   *  from transport/src/ake.js `REASON_*`: a peer that never finished the handshake, a
-   *  defensive teardown, a clean farewell, a cut stream. Empty when the occupant said nothing. NODE-level and observation only: nothing here can change what the
-   *  occupant does, and an app that wants the peer set asks the transport for it.
-   *
-   *  DELIBERATELY has no caller in this repo's own shells, and that is not a reason to delete
-   *  it. It is how `tests/transport-link.test.mjs` pins what each reason MEANS — every
-   *  reason assertion in that file reads this callback, and without it those
-   *  properties can only be checked through the in-process channel pair, which pins nothing
-   *  for the case the reason exists for (the other end being another machine). It is also the
-   *  escape hatch for a host that needs the fact programmatically rather than on stderr.
-   *  Routine debugging needs neither: `logLinkDown` already prints the anomalous ones. */
+  /** One link went down, with the occupant's reason (for the shipped transport, a word
+   *  from ake.js `REASON_*`; empty when it said nothing). Observation only. No shell here
+   *  uses it: it is how tests/transport-link.test.mjs pins what each reason means, and how
+   *  a host gets the fact programmatically. */
   onLinkClosed?: (linkId: number, reason: string) => void;
-  /** Silence the link-down diagnostic. For a node whose teardown churn is normal and
-   *  expected — a relay — or a test that would otherwise print a page of deliberate
-   *  failures. Teardowns still reach `onLinkClosed`. */
+  /** Silence the link-down diagnostic, for a node whose churn is normal (a relay) or a
+   *  test. Teardowns still reach `onLinkClosed`. */
   suppressLinkLog?: boolean;
 }
 
-/** One link's continuous outbound custody (§12.6), spanning adapter pre-open buffering and
- * the platform socket backlog — and the driver's one table entry for that link, channel
- * included. What the adapter still holds IS the charge; the sizes queue is only what turns
- * its one byte total back into the slices that make it up. */
+/** One link's outbound custody (§12.6) across adapter buffering and the socket backlog,
+ *  and the driver's table entry for it. What the adapter still holds is the charge; the
+ *  sizes queue turns that byte total back into slices. */
 class LinkOutboundOwner {
-  /** Admitted write sizes in send order, so a drained PREFIX can be retired without
-   *  waiting for the whole backlog to empty — the node-wide slice count is shared, and one
-   *  busy link that never reaches an idle moment would otherwise hold it to the ceiling. */
+  /** Admitted write sizes in send order, so a drained prefix is retired without waiting
+   *  for the backlog to empty — the node-wide slice count is shared. */
   private readonly queued = new Fifo<number>();
   private charged = 0; // === sum(queued)
   private closed = false;
@@ -92,12 +75,9 @@ class LinkOutboundOwner {
     private readonly releaseParent: (bytes: number, slices: number) => void,
   ) {}
 
-  /** The adapter's own report, or null when it claims to know and cannot answer. No
-   *  `buffered` at all is a static declaration that nothing is retained past `send`, and a
-   *  `buffered()` answering 0 says the same dynamically — both release. One that throws or
-   *  answers nonsense asserts nothing, and reading THAT as 0 would drop the charge while
-   *  the platform still holds the bytes, so it never releases and its next `send` fails
-   *  the link (§12.6). */
+  /** The adapter's backlog, or null when it cannot answer. No `buffered` means nothing is
+   *  retained past `send`. Null never releases, so a lying adapter fails its next send
+   *  rather than dropping a charge the platform still holds (§12.6). */
   private report(): number | null {
     if (!this.channel.buffered) return 0;
     try {
@@ -108,10 +88,9 @@ class LinkOutboundOwner {
     }
   }
 
-  /** Hand back what the platform has drained since the last look. Growth is never taken on
-   *  trust — only writes admitted here are ever charged. Every transport behind this seam is
-   *  ORDERED, so the report is a suffix of what was admitted: a slice is gone once the bytes
-   *  behind it already cover the report, and a partly drained head stays charged in full. */
+  /** Release what the platform drained since the last look. Transports here are ordered,
+   *  so the backlog is a suffix of what was admitted; a partly drained head stays
+   *  charged. */
   private settle(now: number | null): void {
     if (now === null) return;
     let n = 0, bytes = 0;
@@ -153,13 +132,10 @@ class LinkOutboundOwner {
   }
 }
 
-/** The host side of the node's network: sockets and listeners. Nothing on this object is
- *  reached by an app.
+/** The host side of the node's network: sockets and listeners. No app reaches it.
  *
- *  There is no handover of ANY kind across a transport update. The listeners are the
- *  node's and survive, but live links cannot — the session keys are in the outgoing guest's
- *  private memory (§4.3) — and neither can the address book, which is now that guest's too.
- *  So an upgrade is a reconnect, and the embedder re-supplies the addresses (§12.10). */
+ *  A transport update hands nothing over: listeners survive, but links hold the outgoing
+ *  guest's session keys (§4.3), so an upgrade is a reconnect (§12.10). */
 export class TransportHost {
   /** The listeners as bound: each requested address with the port the platform gave it. */
   listening: readonly ListenAddress[] = [];
@@ -167,16 +143,14 @@ export class TransportHost {
   private readonly opts: TransportHostOptions;
   /** Every live link, by the id the occupant names it with. */
   private readonly links = new Map<number, LinkOutboundOwner>;
-  /** The id each live channel is registered under, for an arrival that names another
-   *  channel as its `via`. */
+  /** The id each live channel is registered under, for an arrival's `via`. */
   private readonly idOf = new WeakMap<RawLink, number>();
   private nextLinkId = 1;
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
   private closed = false;
-  // One transport realm sits behind every link in this driver, so its inbound allowance
-  // is aggregate too. Both the invocation currently dispatched per link and any slices
-  // held above unpausable adapters remain charged until released or dropped.
+  // One realm sits behind every link, so the inbound allowance is driver-wide: the read
+  // dispatched per link plus anything held above unpausable adapters.
   private inboundReadSlices = 0;
   private inboundReadBytes = 0;
   private outboundSlices = 0;
@@ -191,9 +165,8 @@ export class TransportHost {
 
   available(): boolean { return !this.closed && this.call !== null; }
 
-  /** Publish the binding, closing links from any previous occupant — released FIRST, so
-   *  those closes find the binding vacant and queue no `linkClosed` into a realm that is on
-   *  its way out (`reset`). */
+  /** Publish the binding. The previous occupant's links are closed first, while the binding
+   *  is vacant, so no `linkClosed` reaches a realm on its way out. */
   activate(call: TransportCall): void {
     this.release();
     this.call = call;
@@ -218,7 +191,6 @@ export class TransportHost {
     this.inboundReadBytes -= length;
   }
 
-  /** The node-wide allowance, as it stands without asking anyone to look again. */
   private outboundFits(length: number): boolean {
     return this.outboundSlices < (this.opts.maxOutboundSlices ?? MAX_NODE_OUTBOUND_QUEUE_SLICES)
       && length <= (this.opts.maxOutboundBytes ?? MAX_NODE_OUTBOUND_QUEUE_BYTES) - this.outboundBytes;
@@ -226,11 +198,8 @@ export class TransportHost {
 
   private reserveOutbound(length: number): boolean {
     if (!this.outboundFits(length)) {
-      // Pull-based adapters report drain only when asked, and the link being written has
-      // already reconciled ITSELF (LinkOutboundOwner.send). Sweeping the others is what
-      // keeps bytes that have already left one link from refusing a write on another — but
-      // only a refusal needs the exact number, so the sweep stays off the per-write path
-      // rather than costing every send a walk of the whole link table.
+      // Pull-based adapters report drain only when asked. Sweep the other links only on a
+      // refusal, so a write never walks the whole table.
       for (const owner of this.links.values()) owner.reconcile();
     }
     if (!this.outboundFits(length)) {
@@ -246,17 +215,11 @@ export class TransportHost {
     this.outboundSlices -= slices;
   }
 
-  /** Release link state owned by a departing link-capable slot, retaining the listeners for
-   *  a replacement. Also the platform's own "sever": closing every live socket without
-   *  moving the binding — the occupant hears one `linkClosed` per link, and the node keeps
-   *  its listeners, which are the node's and not the occupant's. */
+  /** Close every live link, keeping the listeners and the binding. The occupant, if still
+   *  bound, hears one `linkClosed` per link. */
   reset(): void {
-    // Each link through the ordinary down path, rather than clearing the table first: a
-    // cleared table makes `channelClosed`'s liveness guard drop the channel's own callback,
-    // and the occupant would go on holding a link whose socket is already gone. Snapshotted
-    // because `channelClosed` deletes as it goes, and idempotent, so a backend callback
-    // racing this loop is a no-op. On a teardown or a handover the binding is released
-    // before this runs, so only a sever — where the same occupant stays — hears them.
+    // Through the ordinary down path, snapshotted because it deletes as it goes; clearing
+    // the table first would make `channelClosed` skip the occupant's notice.
     for (const [linkId, link] of [...this.links]) this.dropLink(linkId, link);
   }
 
@@ -265,15 +228,15 @@ export class TransportHost {
     try { channel.close(false); } catch { /* already gone */ }
   }
 
-  /** Sever it AND take it out of the table: every hard teardown this driver makes. The
-   *  only close that is not one is the occupant's `link/close`, which may be graceful. */
+  /** Every hard teardown the driver makes; only the occupant's `link/close` may be
+   *  graceful. */
   private dropLink(linkId: number, link: LinkOutboundOwner): void {
     this.shut(link.channel);
     this.channelClosed(linkId, link);
   }
 
-  /** Whether `close` has run. Public because a teardown has to be checkable: a replaced
-   *  driver that is merely dereferenced still holds its listener. */
+  /** Whether `close` has run: a replaced driver merely dereferenced still holds its
+   *  listener. */
   get isClosed(): boolean { return this.closed; }
 
   /** The port the first listener labelled `label` bound, or 0 for none. */
@@ -282,22 +245,16 @@ export class TransportHost {
   }
 
   // ── reaching the transport ──────────────────────────────────────────────────
-  //
-  // `OpArgs` (services/op-frame.ts) encodes the host's raw-link event ABI (RUNTIME §12.2).
-  // Any replacement link occupant must understand this envelope and these event fields.
+  // `OpArgs` (services/op-frame.ts) encodes the raw-link event ABI (RUNTIME §12.2).
 
-  /** Call the transport, caller id and envelope built in the one pass.
-   *
-   *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
-   *  so bytes arriving on one link reach the occupant in arrival order. */
+  /** Call the transport. The realm serializes invocations, so one link's bytes arrive in
+   *  order. */
   private toTransport(args: OpArgs): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
     return this.call(args.build(HOST_CALLER_ID));
   }
 
-  /** A rejected op nobody was waiting on. Logged, except a realm disposed out from under
-   *  it — this driver's own teardown or replacement, which would otherwise print an error
-   *  per ordinary shutdown. */
+  /** Log a rejected op, except a realm disposed by this driver's own teardown. */
   private reportOpError(op: string, err: unknown): void {
     if (errMessage(err) === REALM_DISPOSED) return;
     console.error(`[transport] error in ${op}: ${String(err)}`);
@@ -309,20 +266,15 @@ export class TransportHost {
     if (r) void r.catch((err: unknown) => this.reportOpError(args.op, err));
   }
 
-  // ── the `link` backend the transport guest's seam is wired to ───────────
-
-  /** The raw `link` service: an opaque link id over the platform's sockets, and the whole
-   *  of what the host contributes to the network. */
+  /** The raw `link` service the transport guest's seam is wired to. */
   rawNet(): RawNet {
     const bound = () => this.call !== null;
     return {
       open: (dest) => {
         if (!bound()) return NO_ROUTE;
-        // ChannelFactory alone decides routing (§12.1).
         const channel = this.opts.channels?.connect?.(dest) ?? null;
         if (!channel) return NO_ROUTE;
-        // A full link table reads as "no route" too: the same answer for the same reason —
-        // this driver cannot carry the frame.
+        // A full link table also reads as "no route".
         const linkId = this.register(channel);
         if (linkId === 0) return NO_ROUTE;
         return { linkId, stream: channel.stream === true };
@@ -333,8 +285,8 @@ export class TransportHost {
         if (!link) return;
         try { link.send(bytes); }
         catch {
-          // A throwing backend may already have emitted a prefix (notably an RTC write
-          // split into SCTP-sized chunks). Continuing would desynchronize LENGTH framing.
+          // A throwing backend may already have written a prefix (an RTC write split into
+          // chunks); continuing would desynchronize the framing.
           this.dropLink(linkId, link);
         }
       },
@@ -343,17 +295,11 @@ export class TransportHost {
         const link = this.links.get(linkId);
         if (!link) return;
         try { link.channel.close(graceful); } catch { /* already gone */ }
-        // RawLink implementations disagree about whether a deliberate local close later
-        // fires onClose (native explicitly cannot). The driver owns the table, so it makes
-        // the event universal on a later turn; a backend callback racing it is idempotent.
+        // Backends disagree on whether a local close fires onClose (native cannot), so the
+        // driver makes the event universal on a later turn; a racing callback is a no-op.
         queueMicrotask(() => this.channelClosed(linkId, link));
       },
-      // Inbound attributed delivery (§12.10): one request the occupant decoded, routed
-      // through the shell's claim table and answered back to the occupant, which frames it
-      // and writes it on the wire. Under the same binding check as every op above and no
-      // further grant — the occupant names no link here, and it already chose all three of
-      // these arguments. A claim no peer may reach and a handler that threw both answer
-      // EMPTY, so refusal and silence are one fact at this boundary.
+      // (§12.10) A refused claim and a failed handler both answer empty.
       deliver: (claim, framed, deadlineMs, causalClock) => {
         if (!bound() || !this.deliver) return Promise.resolve(EMPTY);
         const answer = this.deliver(claim, framed, deadlineMs, causalClock);
@@ -365,12 +311,8 @@ export class TransportHost {
 
   // ── channels ────────────────────────────────────────────────────────────────
 
-  /** Mint a link id for a channel and wire its events into the transport. The callbacks fire
-   *  on later turns, which is what lets a channel be registered from inside an op.
-   *
-   *  Returns 0 — never a live id — when the driver already holds `maxRawLinks`, having CLOSED
-   *  the channel it refused: registration is what takes ownership of a socket, so a refusal
-   *  that left it open would strand a descriptor. */
+  /** Mint a link id for a channel and wire its events into the transport. Returns 0 at
+   *  `maxRawLinks`, having closed the channel so no descriptor is stranded. */
   private register(channel: RawLink): number {
     if (this.links.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
       this.shut(channel);
@@ -384,12 +326,9 @@ export class TransportHost {
     );
     this.links.set(linkId, link);
     this.idOf.set(channel, linkId);
-    // Admit one read per link into the serialized realm at a time. An adapter that can be
-    // paused is paused at the socket, where the peer's own transport pushes back; one that
-    // cannot is held HERE. Every admitted read first reserves the driver-wide budget above,
-    // so thousands of links cannot multiply a per-link allowance behind one realm.
-    // The width of the read inside the realm, or -1 for none — one field, not a flag
-    // beside it, since an empty read is still a read in flight and 0 could not say so.
+    // One read per link in the realm at a time. A pausable adapter is paused at the socket;
+    // otherwise reads are held here. Every read reserves the driver-wide budget first.
+    // Width of the read in the realm, or -1 for none (an empty read is still in flight).
     let activeBytes = -1;
     const held = new Fifo<Uint8Array>();
 
@@ -406,10 +345,8 @@ export class TransportHost {
       dropHeld();
       this.dropLink(linkId, link);
     };
-    /** One read has finished (or the link has just been registered): drain what was held
-     *  behind it, oldest first. A LOOP rather than a call back into itself — a vacant
-     *  binding answers every read synchronously, and recursing there would put the whole
-     *  held queue on the stack. */
+    /** A read finished: drain what was held, oldest first. A loop, since a vacant binding
+     *  answers synchronously and recursion would stack the whole queue. */
     const releaseRead = () => {
       releaseActive();
       for (;;) {
@@ -422,9 +359,8 @@ export class TransportHost {
       try { channel.setReadable?.(true); }
       catch { failReadSide(); }
     };
-    /** Hand one read to the realm. Answers false when the read is IN FLIGHT, or the link
-     *  died trying — true only when it was over before it began, which is the vacant
-     *  binding and nothing else. */
+    /** Hand one read to the realm. True only when it was over before it began (vacant
+     *  binding); false when in flight or the link died. */
     const dispatchRead = (bytes: Uint8Array): boolean => {
       activeBytes = bytes.length;
       try { channel.setReadable?.(false); }
@@ -437,19 +373,16 @@ export class TransportHost {
       return false;
     };
 
-    // Inbound bytes are a plain event now — the request the occupant decoded off this
-    // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
       if (this.links.get(linkId) !== link) return;
-      // Refuse an oversized read before OpArgs copies it into a realm invocation. Only a
-      // platform-framed message can reach this; stream backends deliver much smaller slices.
+      // Only a platform-framed message can be this large; refuse it before it is copied.
       if (bytes.length > MAX_LINK_READ_BYTES) { failReadSide(); return; }
       if (!this.reserveInboundRead(bytes.length)) { failReadSide(); return; }
       if (activeBytes < 0) {
-        if (dispatchRead(bytes)) releaseRead(); // over before it began: go back to draining
+        if (dispatchRead(bytes)) releaseRead();
         return;
       }
-      // A custom RawLink may reuse its callback buffer, so what we hold owns its bytes.
+      // A custom RawLink may reuse its callback buffer, so a held read owns its bytes.
       try { held.push(new Uint8Array(bytes)); }
       catch {
         this.releaseInboundRead(bytes.length);
@@ -460,26 +393,17 @@ export class TransportHost {
     return linkId;
   }
 
-  /** One link went down for a reason the occupant ranked above severity 0,
-   *  printed as it gave it. The socket's own `remoteAddr` goes with it, unauthenticated and
-   *  stated as such — it is the only thing the driver knows that says WHICH machine, and on a
-   *  link that never authenticated there is no identity to name instead. `suppressLinkLog`
-   *  silences the whole line for a node whose churn is normal (a relay). */
+  /** Print a link-down reason with the socket's unauthenticated remote address, the only
+   *  thing the driver knows about which machine it was. */
   private logLinkDown(linkId: number, channel: RawLink, reason: string): void {
     if (this.opts.suppressLinkLog) return;
     const from = channel.remoteAddr ? ` from ${channel.remoteAddr}` : "";
     console.error(`[transport] link ${linkId}${from} down: ${reason}`);
   }
 
-  /** One raw channel became unusable: drop it from the table, tell the guest, and report
-   *  the reason it answers with. That answer is the whole of what the occupant tells the
-   *  host about a link, and the only thing here that could not be worked out from the
-   *  socket: a descriptor closing looks identical whether it carried a farewell, a
-   *  defensive teardown or a cut stream. The event names the link, so the return carries
-   *  no link id and cannot be redirected at another socket. It is `[severity u8][reason utf8]`:
-   *  the driver prints any reason above severity 0 and never reads the words, so the
-   *  vocabulary, and how much each matters, is the occupant's. An absent answer is an empty
-   *  reason at severity 0 rather than a guess. */
+  /** A channel became unusable: drop it, tell the occupant, and report its answer,
+   *  `[severity u8][reason utf8]`. The driver prints reasons above severity 0 and never
+   *  reads the words; an absent answer is an empty reason at severity 0. */
   private channelClosed(linkId: number, link: LinkOutboundOwner): void {
     if (this.links.get(linkId) !== link) return;
     this.links.delete(linkId);
@@ -498,10 +422,9 @@ export class TransportHost {
     );
   }
 
-  /** Tell the transport about a link the HOST hands over: an accepted socket, or one that
-   *  arrived through a link the guest opened (a WebRTC data channel). A link the guest opened
-   *  itself through `link/open` is not here. `via` is that other link's id, 0 when there is
-   *  none or it is no longer live. */
+  /** Announce a link the host hands over: an accepted socket, or one that arrived through
+   *  another link (a WebRTC data channel, whose negotiation link is `via`; 0 when none or
+   *  gone). */
   private announce(linkId: number, channel: RawLink, arrival?: Arrival): void {
     const via = arrival?.via ? this.idOf.get(arrival.via) ?? 0 : 0;
     this.tell(ev("linkOpen")
@@ -511,8 +434,6 @@ export class TransportHost {
       .u32(via && this.links.has(via) ? via : 0)
       .text(channel.remoteAddr ?? ""));
   }
-
-  // ── listening ───────────────────────────────────────────────────────────────
 
   /** Bind the listeners (if any) through the channel factory, and take its accept sink. */
   async start(): Promise<void> {
@@ -526,9 +447,7 @@ export class TransportHost {
           return;
         }
         const linkId = this.register(channel);
-        // Dropped at the door, and the occupant never hears of it: the half-open tiers are
-        // policy ABOVE this table, so a connection the driver could not hold is not a link
-        // to have an opinion about. Silent like every other pre-authentication refusal.
+        // Refused at the door without telling the occupant, like every pre-auth refusal.
         if (linkId === 0) return;
         this.announce(linkId, channel, arrival);
       },
@@ -536,16 +455,11 @@ export class TransportHost {
     this.listening = addrs.map((a, i) => ({ ...a, port: ports[i] ?? 0 }));
   }
 
-  // ── lifecycle ───────────────────────────────────────────────────────────────
-
-  /** Tear the driver down. Everything released here is the HOST's — the sockets and the
-   *  listener — and none of it goes through the occupant: the host owns the descriptor for
-   *  the life of the process (§1), so a teardown needing the occupant's cooperation would
-   *  be one a wedged occupant could refuse. */
+  /** Tear the driver down without the occupant's cooperation, which a wedged occupant
+   *  could refuse (§1). */
   close(): void {
     if (this.closed) return;
-    // First, so nothing below re-enters a realm the caller is about to dispose: the
-    // channel closes fire `onClose`, which would otherwise queue a `linkClosed`.
+    // First, so the channel closes below queue no `linkClosed` into a dying realm.
     this.closed = true;
     this.call = null;
     this.reset();

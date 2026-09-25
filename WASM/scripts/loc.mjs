@@ -15,12 +15,23 @@ const readmePath = resolve(repoDir, "README.md");
 
 /** Code lines: blank lines, `//` lines and block comments excluded. Deliberately
  *  crude — it is counting the same way a reader eyeballing the file would, and a
- *  parser here would be a second language implementation to keep correct. */
+ *  parser here would be a second language implementation to keep correct. A block
+ *  comment is one that OPENS a line: a `/*` anywhere else is a `crypto/*` in prose or a
+ *  regex, and treating it as a comment silently drops the code up to the next close. */
 function loc(path) {
   const text = readFileSync(resolve(repoDir, path), "utf8");
-  return text.replace(/\/\*[\s\S]*?\*\//g, "").split(/\r?\n/).filter((l) => {
+  let inBlock = false;
+  return text.split(/\r?\n/).filter((l) => {
     const t = l.trim();
-    return t.length > 0 && !t.startsWith("//") && !t.startsWith("*");
+    if (inBlock) {
+      inBlock = !t.includes("*/");
+      return false;
+    }
+    if (t.startsWith("/*")) {
+      inBlock = !t.includes("*/", 2);
+      return false;
+    }
+    return t.length > 0 && !t.startsWith("//");
   }).length;
 }
 
