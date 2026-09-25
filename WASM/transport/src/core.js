@@ -1,13 +1,9 @@
-// ============================================================================
-// transport/src/core.js — the link bookkeeping, the per-host state, and the
-// entrypoints the host invokes by name. Last part of the concatenation: it declares
-// the state the earlier parts read at runtime.
-// ============================================================================
+// The link bookkeeping, the per-host state and the entrypoint. Last in the
+// concatenation: it declares the state the earlier parts read at runtime.
 
 // ── per-host state, read from the preamble ───────────────────────────────────
-// Identity comes from `HOST`, which the host fills from the keypair `node/sign` signs
-// with, so the two cannot drift (§12.2). Everything here is built during load, so invalid
-// config fails the load (§12.4) and the first invocation finds the program ready.
+// Built during load, so invalid config fails the load (§12.4). Identity is `HOST`'s, the
+// key `node/sign` signs with (§12.2).
 
 const ownId = HOST.identity;            // the node channel public key, hex
 const ownPk = fromHex(ownId);           // the same, 32 bytes
@@ -15,8 +11,7 @@ const ZERO32 = new Uint8Array(32);
 
 const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
 
-// Network separation belongs to the transport's handshake, including its signed root.
-// Absent selects the public network; malformed explicit values fail the load.
+// Network separation, bound into the handshake root. Absent selects the public network.
 if (LOCAL.networkKey !== undefined && !hex32(LOCAL.networkKey)) {
   throw new Error("transport: config networkKey must be 64 lowercase hex characters");
 }
@@ -31,12 +26,8 @@ if (LOCAL.contactSecret !== undefined) {
   contactSecret = fromHex(LOCAL.contactSecret);
 }
 
-/** One policy number: this installation's override, else the author's signed default.
- *  Every one of these bounds a resource, and a bound read as `undefined` does not fail
- *  the comparison that applies it — it makes that comparison always false, which is a
- *  cap silently absent rather than a cap set wrong. So an unresolved or non-finite value
- *  throws HERE, at realm evaluation, and the bundle is refused at load rather than
- *  running unbounded. A bundle carrying no `guest.config` fails on the first name. */
+/** One policy number: the installation's override, else the author's signed default.
+ *  Each bounds a resource, so a missing one fails the load rather than running unbounded. */
 function policy(name) {
   const v = LOCAL[name] ?? APP[name];
   if (!Number.isFinite(v) || v < 0) {
@@ -46,17 +37,13 @@ function policy(name) {
 }
 
 const connsPerPeer = Math.max(1, policy("connsPerPeer"));
-// The operator's peer list as a Set of hex keys, or null for "admit everyone".
-// A lint applied by `admits` (ake.js); LOCAL may override the signed APP default.
+// The admit lint's peers as hex keys, or null to admit everyone (`admits`, ake.js).
 const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
-/** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is THAT
- *  peer's contact secret (absent: an open peer) and `dest` is what `link/open` carries,
- *  `scheme://host:port[/path]`, a bare `host:port` meaning tcp. The grammar is this
- *  program's — the host passes the strings through unread (§12.8), so a replacement
- *  transport spells its addresses its own way. Checked at load, so a typo fails the load
- *  rather than reading as a peer that never answers. */
+/** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is that
+ *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp). The
+ *  host never reads it (§12.8). */
 function peerRef(spec) {
   const bad = (why) => new Error(`transport: config peers entry ${JSON.stringify(spec)}: ${why}`);
   if (typeof spec !== "string" || spec.indexOf("@") < 0) throw bad("want pk[.secret]@dest");
@@ -73,19 +60,13 @@ function peerRef(spec) {
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const cohort = configuredPeers.map(peerRef);
-// These policies and their defaults belong to this signed program. LOCAL is the
-// installation's general override path; APP is the author's signed fallback.
 const maxFrameBytes = policy("maxFrameBytes");
-// Work waiting to be sealed has not reached a socket adapter yet, so its socket-side cap
-// cannot see it. Give it the same eight-frame byte window and tiny-write count ceiling.
+// Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
 const maxOutboundQueueSlices = 4096;
-// A request handed to `link/deliver` holds one of this realm's host calls and its bytes until
-// its claimant answers. Every record open, seal and teardown draws on that same budget (HOST),
-// and one it refuses takes a link down with it, so waiting requests stay below the budget by
-// room for a max-size record open and its plaintext. Each weighs its bytes plus the budget's
-// bytes per call, which bounds both of its ceilings in one sum (router.js `admits`); the
-// widest is a whole frame plus the attribution its delivery adds.
+// A delivered request holds a host call and its bytes until answered, from the same budget
+// every seal and open draws on (HOST). Requests stay below it by room for one max-size
+// record, each weighing its bytes plus the per-call share (router.js `admits`).
 const callWeight = HOST.maxOutstandingHostCallBytes / HOST.maxOutstandingHostCalls;
 const maxRequestWeight = maxFrameBytes + PK_LEN + callWeight;
 const deliveryWindow = HOST.maxOutstandingHostCallBytes - 2 * maxRequestWeight;
@@ -94,36 +75,26 @@ const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");
 const maxVerified = policy("maxHalfOpenVerified");
 const maxAuthed = policy("maxAuthedLinks");
-// How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
+// Deadlines; 0 disables each.
+// How long an authenticated link may carry no traffic.
 const linkIdleTimeoutMs = policy("linkIdleTimeoutMs");
-// How long one open correlation is retained waiting for its peer's response; 0 disables.
-// Not the caller's deadline — the host owns that and no field here can name it — but the
-// transport's bound on its own waiting state. It gives the caller time to ask someone else
-// only when configured shorter than that caller's live remainder; otherwise the host
-// deadline wins and this timer cleans the correlation afterwards.
+// How long an open correlation waits for its response: the transport's bound on its own
+// state, not the caller's deadline, which the host owns.
 const requestTimeoutMs = policy("requestTimeoutMs");
-// How long a link may stay pre-authentication: the dialing side's whole handshake, and
-// the shorter clock an accept runs until a msg1 opens under the contact secret. 0
-// disables, like every other deadline here.
+// The whole pre-auth handshake, and an accept's shorter clock until a msg1 opens.
 const handshakeTimeoutMs = policy("handshakeTimeoutMs");
 const unverifiedTimeoutMs = policy("unverifiedTimeoutMs");
-// Frames per direction between key ratchets — a deployment-wide constant BOTH ends must
-// share; a mismatch desynchronizes the record layer and the link dies.
+// Frames per direction between key ratchets; both ends must agree.
 const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
 
-// Every link by the id the platform names it with. Outlives the link's own teardown on
-// purpose: `linkClosed` arrives a turn later, and its return is the only thing that carries
-// WHY the link went. Bounded — ids are never reused, and the driver answers every link with
-// exactly one `linkClosed`, which drains the entry.
+// Every link by its platform id. An entry outlives teardown until its one `linkClosed`
+// reads why the link went.
 const linksById = new Map();
 
 // ── deadlines ───────────────────────────────────────────────────────────────────
-// Every link, open correlation and `ready` waiter holds the monotonic time it ends on
-// (`performance.now()`; `Infinity` is none), and the host's one wake (§12.3) is armed for the
-// soonest of them — no timer per deadline and no polling: each wake walks them once
-// (`onWake`), retires what is due, and re-arms for what is next. `timer/arm` replaces the
-// armed wake, so moving it earlier is one call; a wake a replacement left in flight walks,
-// finds nothing due, and re-arms.
+// Every link, correlation and `ready` waiter holds the `performance.now()` time it ends on
+// (`Infinity`: none). The host's one wake (§12.3) is armed for the soonest; each wake
+// walks them all (`onWake`) and re-arms.
 const now = () => performance.now();
 /** A refused close is asked again after this long (`Link.closeChannel`). */
 const CLOSE_RETRY_MS = 100;
@@ -158,8 +129,7 @@ function arm(at) {
   try { void host.call(N_TIMER_ARM, args([ms], [])).catch(refused); } catch { refused(); }
 }
 
-/** Retire what is due, and arm for the soonest deadline still standing. A wake that comes
- *  early (a replaced arm's, or one clamped at the timer's range) just re-arms. */
+/** Retire what is due and arm for the soonest deadline left; an early wake just re-arms. */
 function onWake() {
   wakeAt = Infinity;
   walking = true;
@@ -175,24 +145,15 @@ function onWake() {
   if (wakeAt < Infinity) arm(wakeAt);
 }
 
-// The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
-// when a socket is accepted, moves to `verified` when a msg1 opens under the contact
-// secret, and to `authed` once the peer's identity is proved and admitted — HELD there
-// for the link's whole life. Each tier evicts its own stalest occupant when full, so a
-// newcomer that has proved more than the incumbents is never refused at the door. Stalest
-// means longest-waiting in the half-open tiers, where waiting is all an occupant does, and
-// longest-QUIET in `authed`, where the incumbents have all proved the same thing and the
-// one carrying nothing is the one worth losing (`touch`).
-// Per-source is not evictable and spans all three tiers.
+// The link limiter (§12.6.2), in three tiers: `unverified` on accept, `verified` once a
+// msg1 opens, `authed` for the link's whole life once the peer is proved. A full tier
+// evicts its stalest occupant: longest-waiting when half-open, longest-quiet when authed
+// (`touch`). The per-source cap spans all tiers and never evicts.
 class LinkLimiter {
   constructor(maxUnverified, maxPerSource, maxVerified, maxAuthed) {
     this.maxPerSource = maxPerSource;
     this.max = { unverified: maxUnverified, verified: maxVerified, authed: maxAuthed };
-    // One book per tier, whose SIZE is that tier's occupancy; book order is the eviction
-    // policy. A slot carries the id it was booked under, so leaving a tier is a delete
-    // rather than a scan for itself — the scan was O(n) per move, which is O(n²) across
-    // filling and promoting a full tier, and unauthenticated inbound connections are what
-    // drive it.
+    // One book per tier, in eviction order, keyed by the slot's `bookId`.
     this.books = { unverified: new Map(), verified: new Map(), authed: new Map() };
     this.nextId = 0;
     this.perSource = new Map();
@@ -207,17 +168,14 @@ class LinkLimiter {
     return slot;
   }
 
-  /** A msg1 opened under the contact secret: off the contended budget, before the
-   *  expensive work. */
+  /** A msg1 opened: off the contended budget, before the expensive work. */
   promote(slot) { return this.move(slot, "verified"); }
 
   /** The identity is proved and admitted. The slot stays until the link dies. */
   hold(slot) { return this.move(slot, "authed"); }
 
-  /** Something crossed an authenticated link: re-book it at the tail. Eviction takes the
-   *  head, so this makes a full authed tier shed the link that has been quiet longest
-   *  instead of the one admitted longest — without it, anyone who can complete handshakes
-   *  walks established, busy peers off the node one fresh connection at a time. */
+  /** Traffic on an authenticated link re-books it at the tail, so a full tier sheds its
+   *  quietest link rather than its oldest busy one. */
   touch(slot) {
     if (slot.released || slot.tier !== "authed") return;
     this.books.authed.delete(slot.bookId);
@@ -235,8 +193,7 @@ class LinkLimiter {
     return true;
   }
 
-  /** Make one slot's worth of room in a tier, evicting its stalest occupant if it is
-   *  full. False only when the tier's budget is zero — nothing to evict and no room. */
+  /** Make room for one slot, evicting the stalest if full. False only for a zero budget. */
   makeRoom(tier) {
     const book = this.books[tier];
     if (book.size < this.max[tier]) return true;
@@ -247,7 +204,7 @@ class LinkLimiter {
     return true;
   }
 
-  /** Out of its tier and off its source's tally, for good: a slot never returns. */
+  /** Out of its tier and off its source's tally, for good. */
   release(slot) {
     if (slot.released) return;
     this.unbook(slot);
@@ -263,13 +220,9 @@ class LinkLimiter {
   }
 }
 
-// A msg1 that opened under the contact secret, remembered by the initiator's ephemeral
-// key — fresh per link for any honest dialer, so a second sighting is a RECORDING being
-// replayed. Nothing in a msg1 binds it to the connection carrying it, so this memory is
-// what makes the proof single-use: one captured message would otherwise buy promotion out
-// of the contended tier, the DH and encapsulation behind it, and an answer from a node
-// otherwise silent to strangers, as often as it is sent. Only a PROVED msg1 is remembered,
-// so a stranger cannot flush it; the oldest goes at the cap, and a fresh realm starts empty.
+// Proved msg1s, by the initiator's ephemeral key, so a replayed recording is refused: a
+// msg1 is bound to nothing about its connection. Only proved ones are remembered, so a
+// stranger cannot flush it; the oldest goes at the cap.
 const MAX_SEEN_PROBES = 4096;
 const seenProbes = new Set();
 function probeSeen(ephI) { return seenProbes.has(toHex(ephI)); }
@@ -300,16 +253,13 @@ class Core {
     return true;
   }
 
-  /** Learn (or re-learn) one peer: where to reach it and the secret its door gates on.
-   *  An EMPTY `dest` is a peer we know of but cannot dial — one whose links only arrive, such
-   *  as a WebRTC peer met through the relay — which is a real entry and not a missing one: it
-   *  names a peer `ready` waits for, without pretending we hold a route. */
+  /** Learn one peer: where to reach it and its contact secret. An empty `dest` is a peer
+   *  we cannot dial but `ready` still waits for (a WebRTC peer from the relay). */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }
 
-  /** Top a dialed peer up to connsPerPeer outbound links. One dial per peer at a time:
-   *  two callers racing to reach the same peer must not open double the budget. */
+  /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
   dial(peerId) {
     const inFlight = this.dialing.get(peerId);
     if (inFlight) return inFlight;
@@ -320,14 +270,12 @@ class Core {
 
   async dialNow(peerId) {
     const addr = this.addrs.get(peerId);
-    // Unknown, or known and not dialable BY US: an entry with no destination is a peer whose
-    // links can only arrive, so there is nothing to open here. Both
-    // read the same at every caller — the frame waits for an inbound link or is dropped.
+    // Unknown or undialable: the frame waits for an inbound link or is dropped.
     if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
       const opened = await netLinkOpen(addr.dest);
-      if (opened.linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
+      if (opened.linkId === 0) return; // no route
       this.openLink({
         linkId: opened.linkId,
         stream: opened.stream,
@@ -340,9 +288,7 @@ class Core {
     }
   }
 
-  // An inbound (accepted) channel, or a link we just dialed. The spec IS the link's own
-  // description, so it is passed through whole: a field its callers fill is a field `Link`
-  // reads, with no second spelling here to keep in step. Only the callbacks are ours.
+  /** An accepted channel or a fresh dial; `spec` passes through to `Link` whole. */
   openLink(spec) {
     const link = new Link({
       ...spec,
@@ -351,18 +297,13 @@ class Core {
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);
-    // `connecting` is keyed by peer because it is what steers an outbound frame at a link
-    // that has not authenticated yet. An accept, or a dial whose peer we cannot name, steers
-    // nothing, so until it authenticates it is on `linksById` alone. (`spec.weDialed` is
-    // still passed to `Link`; it decides who speaks first.)
+    // `connecting` steers outbound frames at a dial still handshaking.
     if (link.dialedPeerId) Core.push(this.connecting, link.dialedPeerId, link);
     return link;
   }
 
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
-    // The peer lint already answered at msg3/msg2, so a refused peer never reaches the
-    // router. Only routing is left.
     router.promote(peerId, link);
   }
 
@@ -370,10 +311,8 @@ class Core {
   forget(link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
-    // What still waits in its queue never left. Another link to the same peer carries it —
-    // the winner of a double-connect tie-break, or a second dial — and a dial that dies as
-    // the last way to its peer fails what waits on that peer now, not at its retention
-    // timeout. (An authenticated link's last departure is the router's down edge.)
+    // Its queued frames move to another link to the peer. A dial that dies as the last way
+    // to its peer fails what waits on it now, not at its timeout.
     const peerId = link.peerId || link.dialedPeerId;
     if (peerId) {
       for (const frame of link.takeQueued()) this.place(peerId, frame);
@@ -392,11 +331,8 @@ class Core {
     return true;
   }
 
-  // A frame for a peer with no routable link yet: dial, then hand the frame to the
-  // link that lands (it queues pre-auth). The dial is shared per peer (`dial`), so a
-  // burst of frames to one unreachable peer costs one open. Answers whether a link took
-  // the frame: false is a frame dropped for want of a route — no address, or a dial that
-  // opened nothing — as a fabric with no route drops it.
+  /** Send to a peer, dialing first if nothing routes to it. Answers whether a link took
+   *  the frame; false is a frame dropped for want of a route. */
   async sendFrame(to, frame) {
     if (to === ownId) return false;
     if (this.place(to, frame)) return true;
@@ -405,22 +341,17 @@ class Core {
     return this.place(to, frame);
   }
 
-  // Resolve once every known peer is authenticated, or the deadline passes —
-  // event-driven off the router's up edge. Dials are issued fire-and-forget: the
-  // deadline below settles the waiter either way.
+  /** Settle `d` once every known peer is authenticated, or the deadline passes. */
   ready(d, timeoutMs) {
     const targets = [...this.addrs.keys()].filter((p) => p !== ownId);
     for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
-    // A LIST, not a slot: two callers may wait at once, each with its own deferred.
     this.readyWaiters.push({ check: allUp, d, due: dueIn(timeoutMs) });
   }
 
-  /** Settle each waiter whose cohort is up or whose deadline has come. Either way: the
-   *  caller asked to WAIT for the cohort, not to be told whether it arrived — one that cares
-   *  reads `peers`. Run on each up edge and each wake; answers the soonest deadline still
-   *  waiting. */
+  /** Settle each waiter whose cohort is up or whose deadline has come (a caller that cares
+   *  which reads `peers`). Answers the soonest deadline still waiting. */
   checkReady(t = now()) {
     let next = Infinity;
     for (const w of [...this.readyWaiters]) {
@@ -432,8 +363,6 @@ class Core {
   }
 }
 
-// The one router, request/response layer and routing core per host instance, wired
-// during load: none of it asks the host for anything.
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
@@ -442,27 +371,14 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
 //
-// Reached as an app is: `handle([caller 32][body …])`, body an op envelope
-// `[opLen u8][op][args]` (util.js `readOp`) — this bundle's envelope, which is how an
-// app's `send` and the host's own events land on one entrypoint. The op is a NAME, not a
-// tag byte — an unimplemented op fails loud.
-//
-// Two kinds of caller, told apart by those 32 bytes and nothing else:
-//   the HOST  32 zero bytes — the platform's events: sockets opening, bytes
-//              arriving, an address, a wake, a relay to join, and the operator's
-//              `ready`/`peers`.
-//   an APP    its app key, exactly as an inbound frame carries the authenticated
-//              sender's key. `send` is the only op an app may name.
-//
-// Most ops answer with `NOTHING` and work by calling out. Three have an answer, two of
-// which cannot be answered or awaited in the same turn — the events that settle them
-// arrive as further invocations, which would queue behind the frame doing the awaiting
-// (realm-queue.ts). They use `defer()` (below).
+// `handle([caller 32][body …])`, body an op envelope `[opLen u8][op][args]` (util.js
+// `readOp`). The caller is the host (32 zero bytes: platform events and operator ops) or
+// an app (its key), which may name only APP_OPS. Ops whose answer arrives as a later
+// invocation use `defer()`, so they do not hold the realm's queue (realm-queue.ts).
 
 const NOTHING = new Uint8Array(0);
 
-// Answer on a later turn without holding the realm's queue; the host supplies the
-// release marker (`__deferred`), everything else is ours.
+// Answer on a later turn; `__deferred` tells the host the realm is free.
 const defer = () => {
   let settle, fail;
   const promise = new Promise((res, rej) => { settle = res; fail = rej; });
@@ -473,8 +389,7 @@ const defer = () => {
 const ops = Object.create(null);
 function entry(name, fn) { ops[name] = fn; }
 
-/** The ops an app may name. A lookup rather than a chain of `!==`; null-prototype like
- *  `ops` itself, so an inherited `toString` is not an admitted op. */
+/** The ops an app may name; null-prototype, so `toString` is not one. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
 function handle(argBytes) {
@@ -484,8 +399,7 @@ function handle(argBytes) {
   const r = new Reader(args);
   const fn = ops[op];
   if (!fn) throw new Error("transport: no op '" + op + "'");
-  // The platform's events are the host's alone; the caller id is the host's to write,
-  // so this is a real boundary and not a hint.
+  // The caller id is written by the host, so this is a real boundary.
   if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
   return fn(r, caller) || NOTHING;
 }
@@ -508,28 +422,21 @@ entry("linkOpen", (r) => {
     dest: "",
     linkSecret: null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
-    // An accept spends half-open budget; a dial is our own decision to make.
-    limiter: core.limiter,
+    limiter: core.limiter, // accepts spend half-open budget; dials do not
     dialedPeerId: null,
   });
 });
 
-/** Bytes off one socket read. Awaits the READ's own decoding — framing, the handshake
- *  step, the AEAD — but answers nothing: a request it decoded goes to the host as this
- *  program's own `link/deliver` call, on a later turn. */
+/** Bytes off one socket read, answered once decoded; decoded requests go out as their
+ *  own `link/deliver` calls. */
 entry("linkBytes", async (r) => {
   const link = linksById.get(r.u32());
   if (link) await link.onWire(r.blob());
-  // Explicit, because this op is `async`: `handle`'s `|| NOTHING` sees a truthy Promise
-  // and never applies, so a bare `undefined` here would reach the seam's return check.
-  return NOTHING;
+  return NOTHING; // an async op bypasses `handle`'s `|| NOTHING`
 });
 
-/** The socket is gone. The return is `[severity u8][reason utf8]` (`closeReason`, ake.js) — a
- *  fact only this program ever held, since it is the end with the session keys, and the
- *  driver prints any above severity 0 so a node that cannot reach its cohort says why. It carries
- *  no link id: the event names the link, so a return cannot speak about another socket, and
- *  a link already reported is off `linksById` and answers nothing a second time. */
+/** The socket is gone. Answers `[severity u8][reason utf8]` (`closeReason`, ake.js), once
+ *  per link. */
 entry("linkClosed", (r) => {
   const linkId = r.u32();
   const link = linksById.get(linkId);
@@ -540,19 +447,14 @@ entry("linkClosed", (r) => {
   return concatBytes([Uint8Array.of(ROUTINE_REASONS.has(why) ? 0 : 1), utf8Encode(why)]);
 });
 
-/** App-facing send: deferred because the peer's response is another invocation of this
- *  realm. Its deadline is host handoff state, not a field in this content protocol. */
+/** App-facing send, deferred: the response is another invocation of this realm. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
-  // VIEWS of the caller's argument bytes, and they stay views: `buildReq` gathers both
-  // into the frame synchronously, before this handler returns. A defensive copy here
-  // would buy no ownership boundary and walk the payload a second time.
+  // Views, copied into the frame synchronously by `buildReq`.
   const to = r.blob();
   const proto = r.blob();
   const payload = r.blob();
-  // Measured BEFORE anything is copied: a co-resident app naming a 50 MiB payload would
-  // take this realm down before the frame it was refused for existed. A caller error, so
-  // it is LOUD — the silent drop in Link.send is for a frame we chose to build.
+  // Checked before any copy, and loud: a caller error.
   if (to.length !== PK_LEN) throw new Error("transport: send needs a 32-byte peer id");
   if (proto.length > 0xff) throw new Error("transport: protocol id too long");
   if (REQ_HEAD_LEN + proto.length + payload.length > maxFrameBytes - TAG_LEN) {
@@ -567,17 +469,15 @@ entry("send", (r, caller) => {
   return d.promise;
 });
 
-/** One peer, taught by the host on the embedder's behalf: who, the secret its door gates
- *  on, and where to reach it. The destination is opaque to everything between this book and
- *  the host's socket factory, and an EMPTY one is a peer we cannot dial (see `addAddr`). */
+/** Teach one peer: key, contact secret and destination (`addAddr`). */
 entry("addr", (r) => {
   const peer = r.blob();
   const secret = r.blob();
   core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
 
-/** Join the WebRTC signaling relay at this URL — a `ws://`/`wss://` room — leaving any
- *  other; empty leaves. Peers met there are connected as they say hello (rtc.js). */
+/** Join the WebRTC signaling relay at this `ws://`/`wss://` URL, leaving any other; empty
+ *  leaves (rtc.js). */
 entry("relay", async (r) => {
   await rtc.join(utf8Decode(r.blob()));
   return NOTHING;
@@ -595,24 +495,18 @@ entry("contact", (r) => {
   contactSecret = secret.length === 0 ? ZERO32 : secret.slice();
 });
 
-/** Wait until every known peer is linked, or the deadline passes. Deferred for the same
- *  reason `send` is. */
+/** Wait until every known peer is linked, or the deadline passes. */
 entry("ready", (r) => {
   const d = defer();
   core.ready(d, r.u32());
   return d.promise;
 });
 
-/** The peers we hold at least one authenticated link to, as raw 32-byte keys. Answered
- *  in the same turn — a read of this heap, not a question about the wire. An app's to
- *  name as well as the host's: it is what an app placing replicas has to know. */
+/** The peers holding an authenticated link, as raw 32-byte keys. */
 entry("peers", () => {
   const out = [];
   for (const pool of router.pools.values()) out.push(pool.links[0].peerPubkey);
   return concatBytes(out);
 });
 
-// There is deliberately no `shutdown` entrypoint. Teardown releases sockets and timers,
-// both the HOST's, and it closes them itself (transport-host.ts `close`) rather than
-// asking an occupant that must not be able to refuse. What is left is this realm's heap,
-// which dies with the realm.
+// No `shutdown` op: the host closes its own sockets and timers (transport-host.ts `close`).

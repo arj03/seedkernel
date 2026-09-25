@@ -1,15 +1,12 @@
-// Guest-owned framing. Codec derives from stream shape plus destination/listener metadata
-// (§12.1).
+// Link framing. The codec follows the stream shape and the destination or listener (§12.1).
 
-/** Pre-auth frame cap. 8 KiB leaves room for the suite's ML-KEM-768 encapsulation
- *  key (1184 B); unlike the platform ceiling, this is transport-bundle content. */
+/** Pre-auth frame cap, with room for the ML-KEM-768 encapsulation key (1184 B). */
 const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
-// A link message arrives in arbitrarily small slices. Borrow the first small slice;
-// only a second one needs a merging buffer. Grow it by doubling, so a dribbled frame
-// costs linear copies while a complete small frame needs no accumulator allocation.
+// Slices arrive arbitrarily small. The first small one is borrowed; a second starts a
+// doubling accumulator, so a dribbled frame costs linear copies.
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {
@@ -23,8 +20,7 @@ class ByteParts {
   push(chunk) {
     if (chunk.length === 0) return;
     this.length += chunk.length;
-    // A slice big enough to carry its own overhead is kept as it arrived and ends the
-    // accumulator: no copy on the path that matters.
+    // A large slice is kept as it arrived and ends the accumulator.
     if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
     if (this.tail < 0) {
       this.tail = this.parts.length;
@@ -58,10 +54,7 @@ class ByteParts {
     }
     return out;
   }
-  /** The i-th live byte, without materializing anything. Callers check `length` first, so
-   *  an `i` past the end is a bug rather than a case — it reads 0. What `peek` is for when
-   *  only a header field is wanted: peeking allocated and copied on every parse attempt,
-   *  including the ones that go straight back for more bytes. */
+  /** The i-th live byte, without copying; callers check `length` first. */
   byteAt(i) {
     for (let k = this.head; k < this.parts.length; k++) {
       const p = this.parts[k];
@@ -70,9 +63,8 @@ class ByteParts {
     }
     return 0;
   }
-  /** Consume exactly `n` bytes from the front, as one buffer. `prefix` leaves that many
-   *  bytes free IN FRONT of them for the caller to fill — which is what lets a request
-   *  header be written around a frame rather than the frame copied again behind one. */
+  /** Consume exactly `n` bytes from the front, as one buffer with `prefix` free bytes in
+   *  front for the caller to fill. */
   take(n, prefix = 0) {
     const out = new Uint8Array(prefix + n);
     const end = prefix + n;
@@ -84,8 +76,7 @@ class ByteParts {
       else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = end; }
     }
     this.length -= n;
-    // The accumulator stops accumulating once its start is consumed from: the capacity
-    // behind it is no longer ours to append into.
+    // Once consumed from, the accumulator's capacity is no longer ours to append into.
     if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
     // Drop the consumed slices once they outnumber the live ones.
     if (this.head >= 8 && this.head * 2 >= this.parts.length) {
@@ -117,18 +108,15 @@ class LengthFramer {
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
   discard() { this.parts = new ByteParts(); }
 
-  /** Feed inbound bytes, delivering each whole message. Returns false when the peer
-   *  declared an over-cap frame — a protocol violation the caller answers by tearing
-   *  the link down, never by growing the buffer — and true when it waits for more; before
-   *  the cap is raised, a promise of either (`parse`). */
+  /** Feed inbound bytes, delivering each whole message. False for an over-cap frame, true
+   *  when waiting for more; before the cap is raised, a promise of either (`parse`). */
   push(chunk, deliver) {
     this.parts.push(chunk);
     return this.parse(deliver);
   }
 
-  /** Until the cap is raised, one message at a time: the step `deliver` answers may be the
-   *  one that raises it (ake.js `becomeAuthed`), and a frame riding the same read must be
-   *  measured against what that step leaves, so the parse resumes once it has run. */
+  /** Until the cap is raised, one message at a time: its step may raise the cap (ake.js
+   *  `becomeAuthed`) before the next frame in the same read is measured. */
   parse(deliver) {
     for (;;) {
       if (this.parts.length < 4) return true;
@@ -144,10 +132,8 @@ class LengthFramer {
 
 // ── RFC 6455, for the browser edge ────────────────────────────────────────────
 //
-// WebSocket exists here only because browsers cannot open raw TCP: an HTTP upgrade,
-// then length-delimited frames, masked client→server and not server→client. Both ends
-// run this one class. Every byte transform — encode, single-frame decode, the SHA-1 +
-// base64 accept value — runs in `ws.wasm`, a module of this bundle.
+// For browsers, which cannot open raw TCP. Both ends run this one class; every byte
+// transform (encode, decode, the accept value) runs in this bundle's `ws.wasm`.
 const WS_OP_ENCODE = 1, WS_OP_DECODE_ONE = 2, WS_OP_ACCEPT = 3, WS_OP_BASE64 = 4;
 const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
 /** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
@@ -155,50 +141,37 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 /** An HTTP upgrade head is tiny; anything larger is not one. */
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
-/** Run this bundle's own ws.wasm — an ordinary `host.call`, whose failure the seam
- *  already rejects (§12.2). */
+/** Call this bundle's ws.wasm (§12.2). */
 function wsCall(req) {
   return host.call(N_WS, req);
 }
 
 class WsFramer {
-  /** `authority` and `path` are where this link was dialed, for the client's request line
-   *  and Host header — unused on the accepting side, which never sends one. */
+  /** `authority` and `path` are the dialed target, for the client's request. */
   constructor(put, weDialed, authority, path = "/") {
     this.put = put;
     this.client = weDialed;
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
     this.parts = new ByteParts();      // inbound: handshake head, then frames
     this.open = false;
-    // `send` parks here until the upgrade completes, so it must be able to end badly too
-    // or an upgrade that never lands parks every write forever (§12.6, `abort` below).
+    // `send` parks here until the upgrade completes, or fails with it (`abort`, §12.6).
     this.opened = new Promise((resolve, reject) => {
       this.resolveOpen = resolve;
       this.rejectOpen = reject;
     });
     this.opened.catch(() => {}); // no unhandled rejection when nothing was parked
-    // Rolling scan for the one-shot HTTP head terminator, carried across `read()` calls so
-    // a dribbled head is scanned once, not rescanned from the front per chunk. Owned here
-    // rather than by ByteParts: nothing else needs this shape, and it lets `scanHead` bail
-    // exactly at MAX_WS_HANDSHAKE instead of buffering an oversized chunk whole first.
+    // Rolling scan state for the HTTP head terminator (`scanHead`).
     this.headLen = 0;
     this.h0 = -1; this.h1 = -1; this.h2 = -1; this.h3 = -1;
     this.fragOpcode = -1;
     this.frags = [];
     this.fragBytes = 0;
-    // Outbound order: every wire write is a link in this chain, so an async module
-    // call can never let a later frame overtake an earlier one — the record layer
-    // above relies on the byte order.
+    // Writes and reads each run on a chain, so async module calls never reorder bytes:
+    // the record layer counts nonces.
     this.writes = Promise.resolve();
-    // Inbound order, for the same reason: the record layer counts nonces, so a message
-    // delivered out of order is a decrypt failure and a dead link.
     this.reads = Promise.resolve();
     if (this.client) {
-      // The upgrade head needs two module calls, so it is computed on a later turn,
-      // ahead of anything queued behind it. `prepared` is what upgrade() awaits; it
-      // rejects there if the module could not produce a key — a client that never wrote
-      // its GET must abort rather than wait out the idle clock. The bare catch only keeps
-      // a link torn down before anyone awaits it from reporting an unhandled rejection.
+      // The client's GET, built with two module calls; `upgrade` awaits it.
       this.prepared = (async () => {
         const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), await randomBytes(16)]));
         this.key = utf8Decode(r);
@@ -232,8 +205,7 @@ class WsFramer {
     return wsCall(req);
   }
 
-  /** Append one write to the wire chain: frame the message, then put it — in order,
-   *  when its module call answers. */
+  /** Frame one message and put it, in order, on the write chain. */
   enqueue(opcode, payload) {
     return this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => this.put(f));
   }
@@ -243,9 +215,8 @@ class WsFramer {
     await this.enqueue(WS_OP_BINARY, msg);
   }
 
-  /** The close frame rides the same byte stream after the end-of-stream record just
-   *  written, so it cannot overtake it — the ordering that record depends on. On a stream
-   *  that never upgraded a bare CLOSE frame is not a farewell but garbage mid-head. */
+  /** A close frame, after the end-of-stream record on the same chain. None before the
+   *  upgrade, where it would be garbage. */
   goodbye() {
     return this.open ? this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL) : Promise.resolve();
   }
@@ -255,11 +226,7 @@ class WsFramer {
     this.rejectOpen(new Error("ws: link closed before the upgrade completed"));
   }
 
-  /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
-   *  that keeps two parses from running at once, which matters twice: `frames()` takes a
-   *  frame before awaiting its decode, so a second parser would read the frame after it;
-   *  and `raiseCap()` lands only once msg3's step has run, so a second parser would measure
-   *  a frame riding the same segment against the pre-auth cap. */
+  /** One chunk in, parsed on the read chain so two parses never overlap. */
   push(chunk, deliver) {
     const done = this.reads.then(() => this.read(chunk, deliver));
     this.reads = done.catch(() => {});
@@ -283,11 +250,8 @@ class WsFramer {
     try { return await this.frames(deliver); } catch { return false; }
   }
 
-  /** Extend the rolling `\r\n\r\n` scan over one newly arrived pre-open chunk. Returns the
-   *  terminator's start offset in the whole pre-open stream, -1 when not found yet, or -2
-   *  once MAX_WS_HANDSHAKE bytes have been scanned with no terminator (or the terminator
-   *  itself only completes past that ceiling) — the caller refuses without buffering
-   *  whatever is left of an oversized chunk. */
+  /** Extend the rolling `\r\n\r\n` scan over one pre-open chunk. Returns the terminator's
+   *  offset in the stream, -1 if not found yet, or -2 past MAX_WS_HANDSHAKE. */
   scanHead(chunk) {
     let h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, n = this.headLen;
     for (let i = 0; i < chunk.length; i++) {
@@ -309,8 +273,7 @@ class WsFramer {
     await this.prepared;
     const head = utf8Decode(this.parts.peek(sep));
     if (this.client) {
-      // Sec-WebSocket-Accept is base64 and case-significant — compare it byte for byte
-      // rather than lowercasing both sides.
+      // Sec-WebSocket-Accept is case-significant base64.
       if (!/HTTP\/1\.1 101/.test(head) || headerValue(head, "sec-websocket-accept") !== this.expectAccept) {
         throw new Error("ws: upgrade refused");
       }
@@ -326,30 +289,24 @@ class WsFramer {
     return sep + 4;
   }
 
-  /** Parse whatever frames are complete. Delivery is per frame rather than per chunk, and
-   *  until the cap is raised each message's step runs before the next frame is measured
-   *  (`dispatch`): msg3's step raises the cap, and an application frame riding the same TCP
-   *  segment must be measured against the raised cap, not the pre-auth one. */
+  /** Parse whatever frames are complete. Until the cap is raised, each message's step runs
+   *  before the next frame is measured (`dispatch`). */
   async frames(deliver) {
     for (;;) {
       const total = this.frameLength();
       if (total < 0) return true;
       if (total === Infinity) return false;
       if (this.parts.length < total) return true;
-      // Staged with room for the request header in front of it, so the frame is gathered
-      // out of the slice list ONCE instead of again behind a two-byte prefix.
+      // Taken with room for the two-byte request header in front.
       const req = this.parts.take(total, 2);
       req[0] = WS_OP_DECODE_ONE;
       req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
       const r = await wsCall(req);
-      // The module saw exactly one whole frame; anything but "frame" (1) is a protocol
-      // violation — bad mask direction, a fragmented control frame, a bad length.
+      // Anything but 1 is a protocol violation.
       if (r[0] !== 1) return false;
       const fin = (r[1] & 0x80) !== 0;
       const opcode = r[1] & 0x0f;
-      // A VIEW: the seam answers a fresh buffer per call, so nothing else can write over
-      // it, and the 10 header bytes it keeps alive are cheaper than copying the payload
-      // out of it. Retained across calls only when a fragment is held in `frags`.
+      // A view: each call answers a fresh buffer.
       const payload = r.subarray(10, 10 + readU32BE(r, 6));
       if (opcode === WS_OP_CONT) {
         if (this.fragOpcode < 0) return false;
@@ -380,24 +337,18 @@ class WsFramer {
   async dispatch(opcode, payload, deliver) {
     if (opcode === WS_OP_BINARY) {
       const step = deliver(payload);
-      // Until the cap is raised, this message's step may be what raises it (LengthFramer `parse`).
+      // This step may raise the cap (LengthFramer `parse`).
       if (this.cap !== maxFrameBytes) await step;
     } else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
     return true;
   }
 
-  /** Total byte length of the next frame, from the (unvalidated) header: -1 while too few
-   *  bytes are buffered to know, Infinity once its PAYLOAD is over the cap. The cap is on
-   *  the payload, as every other codec's is on its message — the header and mask are this
-   *  codec's own bytes, and a record the sender may send at the cap must cross. All real
-   *  validation is the module's; this only sizes the wait. */
+  /** The next frame's total length from its unvalidated header: -1 if not yet known,
+   *  Infinity once its payload is over the cap. Validation is the module's. */
   frameLength() {
     const p = this.parts;
     if (p.length < 2) return -1;
-    // Read field by field rather than through `peek`: this runs once per parse attempt,
-    // and most attempts are the early returns below — which were each allocating and
-    // filling a ten-byte buffer to look at one or two of its bytes.
     const b1 = p.byteAt(1);
     const masked = (b1 & 0x80) !== 0;
     const len7 = b1 & 0x7f;
@@ -408,7 +359,7 @@ class WsFramer {
       payloadLen = (p.byteAt(2) << 8) | p.byteAt(3);
     } else if (len7 === 127) {
       if (p.length < 10) return -1;
-      // The high half of the 64-bit length: any bit set is > 4 GiB and over any cap.
+      // Any bit in the high half is over any cap.
       if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return Infinity;
       headerLen = 10;
       payloadLen = ((p.byteAt(6) << 24) | (p.byteAt(7) << 16)
@@ -419,34 +370,25 @@ class WsFramer {
   }
 }
 
-/** Case-insensitively pull a header value out of an HTTP head. A field whose value is
- *  empty once its surrounding spaces and tabs are gone is not a field: the line does not
- *  match and the scan goes on to the next, exactly as for a name that never matched.
- *  Without the lookahead the lazy group backtracks into the leading run and hands back one
- *  of those spaces, which is a value nobody wrote — a stranger completes an upgrade with a
- *  blank Sec-WebSocket-Key, and a head carrying a blank line before a real key is answered
- *  with the accept for the blank one. */
+/** Case-insensitively pull a header value out of an HTTP head. A blank value does not
+ *  match; the lookahead stops the lazy group returning a leading space as the value. */
 function headerValue(head, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const m = new RegExp("^" + escaped + ":[ \\t]*(?![ \\t])(.+?)[ \\t]*$", "im").exec(head);
   return m ? m[1] : null;
 }
 
-/** The listener label this program reads as WebSocket; every other label is length
- *  framing. The operator chooses labels (`--listen ws=host:port`); the host never reads them. */
+/** The listener label read as WebSocket (`--listen ws=host:port`); others are length framing. */
 const LISTENER_WS = "ws";
 
 function makeFramer(stream, linkId, dest, listener) {
   const put = (bytes) => netLinkSend(linkId, bytes);
   if (!stream) return null;
   if (dest) {
-    // The socket factory already accepted the destination; framing needs only its codec
-    // and, for WebSocket, the HTTP Host value.
     const ws = /^wss?:\/\/([^/]+)(\/\S*)?$/i.exec(dest);
     if (ws) return new WsFramer(put, true, ws[1], ws[2] ?? "/");
     return new LengthFramer(put);
   }
-  // Every other accepted link — a TCP listener, a WebRTC data channel — is length framing.
   if (listener === LISTENER_WS) return new WsFramer(put, false, "");
   return new LengthFramer(put);
 }

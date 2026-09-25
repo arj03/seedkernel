@@ -1,8 +1,5 @@
-// ============================================================================
-// transport/src/rtc.js — WebRTC peers (§12.7): the signaling relay, who offers, and the
-// negotiation links the host's `rtc:` socket factory drives. Everything peer-shaped about
-// WebRTC is here; the host holds the RTCPeerConnection and passes the W3C verbs through.
-// ============================================================================
+// WebRTC peers (§12.7): the signaling relay, who offers, and the negotiation links the
+// host's `rtc:` socket factory drives. The host holds only the RTCPeerConnection.
 
 // The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`): each message is
 // `[tag u8][UTF-8 text]`. Up: a local description, a local candidate, a connection state.
@@ -15,18 +12,16 @@ const RELAY_RETRY_MS = 2000;
 
 // ── the relay wire ────────────────────────────────────────────────────────────
 //
-// A relay is a room: it forwards every binary frame to every other member, verbatim and
-// unauthenticated, so everything here is a claim until the channel handshake proves it.
-// A frame is UTF-8, NUL-separated — NUL is outside SDP's and ICE's grammar, so a stray one
-// can only change the field COUNT, which every tag pins exactly:
+// A relay is a room forwarding every frame to every other member, unauthenticated, so
+// everything here is a claim until the handshake proves it. A frame is UTF-8,
+// NUL-separated; each tag pins its field count:
 //
 //   h  from  to                      a hello; `to` empty is a broadcast
 //   o  from  to  sid  sdp            an offer, for negotiation `sid`
 //   a  from  to  sid  sdp            its answer
 //   i  from  to  sid  candidate  sdpMid  sdpMLineIndex  usernameFragment
 //
-// `sid` is the offering side's name for one negotiation, so a new one is told apart from an
-// ICE restart of the old without reading the SDP.
+// `sid` names one negotiation, telling a new one from an ICE restart.
 
 /** A link to the relay: WebSocket frames over a raw stream, or whole platform messages. */
 class RelayLink {
@@ -36,14 +31,13 @@ class RelayLink {
     if (this.framer) this.framer.cap = MAX_SIGNAL_BYTES;
     this.onSignal = onSignal;
     this.onGone = null;
-    // Routine either way — a relay is a rendezvous, not a peer — so nothing is printed.
-    this.closeReason = REASON_NONE;
+    this.closeReason = REASON_NONE; // a relay is not a peer: nothing to print
   }
   send(bytes) {
     try {
       const sent = this.framer ? this.framer.send(bytes) : netLinkSend(this.linkId, bytes);
       void Promise.resolve(sent).catch(() => {});
-    } catch { /* refused by this realm's host-call budget: a lost signal, retried by the peer */ }
+    } catch { /* budget: a lost signal, retried by the peer */ }
   }
   async onWire(bytes) {
     if (!this.framer) {
@@ -95,8 +89,7 @@ class Rtc {
     this.retryAt = Infinity; // when a dropped relay is dialed again
     this.byPeer = new Map(); // peer hex → negotiation
     this.byCtl = new Map();  // negotiation link id → negotiation
-    // A data link announced before `open` has filed its negotiation: `open` resumes on the
-    // host call's answer, which may land after the announcement.
+    // Data links announced before `open` has filed their negotiation.
     this.early = new Map();  // negotiation link id → { linkId, stream }
   }
 
@@ -170,8 +163,7 @@ class Rtc {
   weOffer(peer) { return ownId < peer; }
 
   async onHello(from, broadcast) {
-    // Answer a broadcast once, directed, so the newcomer learns we are here; never answer a
-    // directed hello, or the two bounce forever.
+    // Answer a broadcast with a directed hello; never answer a directed one.
     if (broadcast) this.signal("h", from);
     const e = this.byPeer.get(from);
     if (e) {
@@ -187,8 +179,7 @@ class Rtc {
     if (isOffer) {
       if (this.weOffer(from)) return;
       if (e && e.sid !== sid) {
-        // A new negotiation. One that authenticated keeps its link: a room member claiming
-        // this peer's key must not be able to take a live link down with a fresh offer.
+        // An authenticated negotiation keeps its link against a fresh offer.
         if (authedData(e)) return;
         this.drop(e);
         e = undefined;
@@ -269,9 +260,8 @@ class Rtc {
     if (e.ctl !== 0) netLinkClose(e.ctl, false);
   }
 
-  /** A negotiation link went — the peer connection with it. If it had carried an
-   *  authenticated link, the peer is asked again: an offering side opens a fresh
-   *  negotiation, an answering side says hello so the peer does. */
+  /** A negotiation link went. If it carried an authenticated link, renegotiate: the
+   *  offering side offers again, the answering side says hello. */
   gone(e) {
     this.byCtl.delete(e.ctl);
     const lost = !e.gone && authedData(e);
