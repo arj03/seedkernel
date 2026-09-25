@@ -132,7 +132,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,291 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (293) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,250 Go + 360 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (293) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,211 Go + 360 TS |
 
 The transport bundle sits outside these host totals: 1,699 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing, RFC 6455 and WebRTC signaling across the targets that support them.
 
