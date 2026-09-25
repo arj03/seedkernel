@@ -467,17 +467,12 @@ func (g *guestRealm) failInvocation(msg string) {
 // closed realm with continuations outstanding must not leave callers hanging forever,
 // worse than an error since they cannot retry or observe anything went wrong. safe-js.ts
 // does the same with failInvocations. Callbacks are HOST-realm values, so reporting works
-// once the guest runtime is gone.
+// once the guest runtime is gone, and each report wakes the loop.
 func (g *guestRealm) settleAll(msg string) {
-	settled := false
 	for id, c := range g.calls {
 		delete(g.calls, id)
 		g.reportCall(c.onFail, g.hostQc.NewString(msg))
 		c.free()
-		settled = true
-	}
-	if settled {
-		g.loop.wake()
 	}
 }
 
@@ -550,9 +545,7 @@ func (g *guestRealm) settleHostCall(callID int64, bytes []byte, msg string, deta
 		return g.qc.Invoke(settler, g.qc.NewUndefined(), g.qc.NewInt64(callID), arg)
 	})
 	arg.Free()
-	if res != nil {
-		res.Free()
-	}
+	res.Free()
 	if err != nil {
 		// The continuation failed: nobody may be left waiting on a reply that is not
 		// coming — but the realm must NOT end. An overrun is already an ordinary error
@@ -582,9 +575,7 @@ func (g *guestRealm) turnClock() *invocationClock {
 // takeCall consumes an in-flight initiator call, so a duplicate settlement is a no-op.
 func (g *guestRealm) takeCall(id int64) *initiatorCall {
 	c := g.calls[id]
-	if c != nil {
-		delete(g.calls, id)
-	}
+	delete(g.calls, id)
 	return c
 }
 
@@ -594,9 +585,7 @@ func (g *guestRealm) takeCall(id int64) *initiatorCall {
 func (g *guestRealm) reportCall(cb *qjs.Value, arg *qjs.Value) {
 	res, err := g.hostQc.Invoke(cb, g.hostQc.NewUndefined(), arg)
 	arg.Free()
-	if res != nil {
-		res.Free()
-	}
+	res.Free()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "guest: call settlement error:", err)
 	}

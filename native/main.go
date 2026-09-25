@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"seedkernel/qjs"
@@ -195,16 +197,10 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 	if qc == nil {
 		return nil, errors.New("seedkernel: boot has not run")
 	}
-	expr := name + "("
 	slots := make([]string, len(args))
 	for i, a := range args {
-		slot := fmt.Sprintf("__a%d", i)
-		slots[i] = slot
-		qc.Global().SetPropertyStr(slot, a) // SetPropertyStr takes the reference
-		if i > 0 {
-			expr += ","
-		}
-		expr += slot
+		slots[i] = "__a" + strconv.Itoa(i)
+		qc.Global().SetPropertyStr(slots[i], a) // SetPropertyStr takes the reference
 	}
 	defer func() {
 		// Release the staged arguments: SetPropertyStr took their references and a slot
@@ -214,7 +210,7 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 			qc.Global().SetPropertyStr(slot, undef)
 		}
 	}()
-	kind, value, msg, err := el.await(expr+")", timeout)
+	kind, value, msg, err := el.await(name+"("+strings.Join(slots, ",")+")", timeout)
 	if err != nil {
 		return nil, err
 	}

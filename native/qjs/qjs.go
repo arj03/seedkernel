@@ -40,19 +40,35 @@ type Runtime struct {
 	ctx     context.Context
 	wrt     wazero.Runtime
 	mod     api.Module
-	malloc  api.Function
-	free    api.Function
 	mem     api.Memory
 	ctxt    *Context
 	funcs   []goFunc           // exposed Go funcs, indexed by callback id; see Function
 	fnPools map[string]*fnPool // per-name free list of resolved exports; see call
+
+	// JS_UNDEFINED and JS_NULL as this engine encodes them, asked for once in New. Both are
+	// immediates — no heap object, no refcount — so minting, testing or freeing one needs
+	// no engine call (Context.NewUndefined, Value.IsUndefined, Value.Free).
+	undefined, null uint64
 }
 
 // fnPool is one export's free list of resolved instances. A POINTER in the map, not a
 // slice value: a slice value has to be read and written back to pop and again to push, so
 // every engine call — and a *Value operation is one — hashed the name four times. Through
-// the pointer it is one lookup, and the pop and the push mutate in place.
-type fnPool struct{ free []api.Function }
+// the pointer it is one lookup, and the pop and the push mutate in place. The signature is
+// the export's, read once when the pool is minted.
+type fnPool struct {
+	free      []pooledFn
+	params    int
+	hasResult bool
+}
+
+// pooledFn is one resolved instance and the value stack it is called with. The stack
+// travels with the instance, so a nested call never shares one, and CallWithStack reuses
+// it where Call allocated an argument slice and a result slice on every engine crossing.
+type pooledFn struct {
+	fn    api.Function
+	stack []uint64
+}
 
 // Option configures a Runtime at creation, for what QuickJS takes only when it creates the
 // runtime.
@@ -154,9 +170,13 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
+	// A GoModuleFunc, not WithFunc: WithFunc dispatches through reflection, which cost every
+	// JS→Go call about a microsecond and a dozen allocations before the callback ran.
+	i32, i64 := api.ValueTypeI32, api.ValueTypeI64
 	if _, err := rt.wrt.NewHostModuleBuilder("env").
 		NewFunctionBuilder().
-		WithFunc(rt.callGo).
+		WithGoModuleFunction(api.GoModuleFunc(rt.callGo),
+			[]api.ValueType{i32, i64, i32, i32, i32}, []api.ValueType{i64}).
 		Export("callGo").
 		Instantiate(ctx); err != nil {
 		return rt, fmt.Errorf("host module: %w", err)
@@ -178,9 +198,8 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		return rt, fmt.Errorf("instantiate module: %w", err)
 	}
 
-	rt.malloc = rt.mod.ExportedFunction("malloc")
-	rt.free = rt.mod.ExportedFunction("free")
 	rt.mem = rt.mod.Memory()
+	rt.undefined, rt.null = rt.call("QJS_Undefined"), rt.call("QJS_Null")
 	track := uint64(0)
 	if cfg.trackRejections {
 		track = 1
@@ -329,62 +348,70 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	// The per-name free list keeps both: each in-flight (possibly nested) call pops its own
 	// instance and returns it after. Single-threaded, so the pool needs no locking.
 	p := r.pool(name)
-	fn := p.acquire(r, name)
-	res, err := fn.Call(r.ctx, args...)
-	p.free = append(p.free, fn)
+	if len(args) != p.params {
+		panic(fmt.Errorf("qjs: call %s: %d arguments for %d parameters", name, len(args), p.params))
+	}
+	f := p.acquire(r, name)
+	copy(f.stack, args)
+	err := f.fn.CallWithStack(r.ctx, f.stack)
+	res := f.stack[0]
+	p.free = append(p.free, f)
 	if err != nil {
 		panic(fmt.Errorf("qjs: call %s: %w", name, err))
 	}
-	if len(res) == 0 {
+	if !p.hasResult {
 		return 0
 	}
-	return res[0]
+	return res
 }
 
-// pool returns name's free list, minting it on first use. The one map lookup an engine
-// call makes.
+// pool returns name's free list, minting it — and reading the export's signature — on
+// first use. The one map lookup an engine call makes.
 func (r *Runtime) pool(name string) *fnPool {
 	p := r.fnPools[name]
 	if p == nil {
-		p = &fnPool{}
+		fn := r.mod.ExportedFunction(name)
+		if fn == nil {
+			panic(fmt.Errorf("qjs: missing wasm export %q", name))
+		}
+		def := fn.Definition()
+		p = &fnPool{params: len(def.ParamTypes()), hasResult: len(def.ResultTypes()) > 0}
+		p.free = append(p.free, p.instance(fn))
 		r.fnPools[name] = p
 	}
 	return p
 }
 
+// instance pairs a resolved export with a stack wide enough for its parameters and its
+// result (the shim's exports answer at most one).
+func (p *fnPool) instance(fn api.Function) pooledFn {
+	return pooledFn{fn: fn, stack: make([]uint64, max(p.params, 1))}
+}
+
 // acquire hands out a resolved export instance: a pooled one if free, so a nested
-// re-entrant call gets a distinct instance from the one in flight.
-func (p *fnPool) acquire(r *Runtime, name string) api.Function {
+// re-entrant call gets a distinct instance and stack from the one in flight.
+func (p *fnPool) acquire(r *Runtime, name string) pooledFn {
 	if n := len(p.free); n > 0 {
-		fn := p.free[n-1]
+		f := p.free[n-1]
 		p.free = p.free[:n-1]
-		return fn
+		return f
 	}
-	fn := r.mod.ExportedFunction(name)
-	if fn == nil {
-		panic(fmt.Errorf("qjs: missing wasm export %q", name))
-	}
-	return fn
+	return p.instance(r.mod.ExportedFunction(name))
 }
 
 func (r *Runtime) mallocN(n int) uint64 {
-	res, err := r.malloc.Call(r.ctx, uint64(n))
-	if err != nil {
-		panic(fmt.Errorf("qjs: malloc: %w", err))
-	}
-	if res[0] == 0 {
+	ptr := r.call("malloc", uint64(n))
+	if ptr == 0 {
 		panic(fmt.Errorf("qjs: malloc(%d) returned NULL (out of wasm memory)", n))
 	}
-	return res[0]
+	return ptr
 }
 
 func (r *Runtime) freeAt(ptr uint64) {
 	if !r.Alive() { // see Value.Free
 		return
 	}
-	if _, err := r.free.Call(r.ctx, ptr); err != nil {
-		panic(fmt.Errorf("qjs: free: %w", err))
-	}
+	r.call("free", ptr)
 }
 
 // writeCStr allocates a NUL-terminated copy of s in wasm memory and returns the
@@ -414,29 +441,35 @@ func (r *Runtime) readString(packed uint64) string {
 // callGo is the env.callGo host import: a JS call to the Go function registered under id.
 // The arguments are borrowed handles, valid only for the call. The JS `this` crosses in the
 // import's signature and is dropped here: no callback has ever read one, and wrapping it
-// would allocate a *Value on every JS→Go call.
-func (r *Runtime) callGo(_ context.Context, _ api.Module, _ uint32, _ uint64, argc, argv, id uint32) (rs uint64) {
+// would allocate a *Value on every JS→Go call. The stack is the signature New registers:
+// (ctx i32, this i64, argc i32, argv i32, id i32) → i64.
+func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 	c := r.ctxt
 	// Deferred before any arg processing, so a panic below (a malformed argv, a panicking
 	// callback) surfaces as a catchable JS exception rather than a wasm trap killing the node.
 	defer func() {
 		if rec := recover(); rec != nil {
-			rs = c.throwError(fmt.Errorf("%v", rec))
+			stack[0] = c.throwError(fmt.Errorf("%v", rec))
 		}
 	}()
 
+	argc, argv, id := api.DecodeU32(stack[2]), api.DecodeU32(stack[3]), api.DecodeU32(stack[4])
 	fn := r.funcs[id]
+	// One backing array for the arguments rather than an allocation per *Value.
+	vals := make([]Value, argc)
 	args := make([]*Value, argc)
 	for i := range args {
 		h, _ := r.mem.ReadUint64Le(argv + uint32(i)*8)
-		args[i] = c.value(h)
+		vals[i] = Value{c: c, raw: h}
+		args[i] = &vals[i]
 	}
 	res, err := fn(c, args)
-	if err != nil {
-		return c.throwError(err)
+	switch {
+	case err != nil:
+		stack[0] = c.throwError(err)
+	case res == nil:
+		stack[0] = c.NewUndefined().Raw()
+	default:
+		stack[0] = res.Raw()
 	}
-	if res == nil {
-		return c.NewUndefined().Raw()
-	}
-	return res.Raw()
 }

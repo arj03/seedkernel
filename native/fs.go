@@ -106,24 +106,24 @@ func (f *nodeFs) put(key string, b []byte) error {
 	if !ok {
 		return fmt.Errorf("fs: unsafe key %q", key)
 	}
-	// One O(1) stat for the old size, so `used` tracks the delta on an overwrite. New key
-	// ⇒ old = -1 ⇒ the whole write counts.
-	old := int64(-1)
-	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
-		old = fi.Size()
-	}
 	// Atomic: a crash mid-write must not leave a short block size() still reports as held.
 	// No fsync — the property needed is crash-atomicity, not durability (a lost block is
 	// content-addressed and re-fetched), and fsync per put would tax the hot path.
+	old := regularSize(p)
 	if err := writeFileAtomic(p, b, fsTmpPrefix, 0o644); err != nil {
 		return err
 	}
-	if old >= 0 {
-		f.used += int64(len(b)) - old
-	} else {
-		f.used += int64(len(b))
-	}
+	f.used += int64(len(b)) - old
 	return nil
+}
+
+// regularSize is what the regular file at p contributes to `used`: its size, or 0 when there
+// is none — one O(1) stat, so put and delete can keep `used` by delta.
+func regularSize(p string) int64 {
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+		return fi.Size()
+	}
+	return 0
 }
 
 // writeFileAtomic writes b to path via a sibling temp file + rename, so a reader (or a
@@ -134,28 +134,20 @@ func writeFileAtomic(path string, b []byte, tmpPrefix string, mode os.FileMode) 
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
+	_, err = tmp.Write(b)
+	if err == nil && mode != 0 {
+		err = tmp.Chmod(mode)
 	}
-	if mode != 0 {
-		if err := tmp.Chmod(mode); err != nil {
-			tmp.Close()
-			os.Remove(name)
-			return err
-		}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
-		return err
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
 	}
-	if err := os.Rename(name, path); err != nil {
-		os.Remove(name)
-		return err
+	if err != nil {
+		os.Remove(tmp.Name())
 	}
-	return nil
+	return err
 }
 
 func (f *nodeFs) size(key string) int {
@@ -187,7 +179,7 @@ func (f *nodeFs) list(prefix string) []string {
 		if strings.HasPrefix(n, fsTmpPrefix) {
 			continue // an atomic-put temp, not a real key
 		}
-		if prefix == "" || strings.HasPrefix(n, prefix) {
+		if strings.HasPrefix(n, prefix) {
 			out = append(out, n)
 		}
 	}
@@ -199,16 +191,11 @@ func (f *nodeFs) delete(key string) bool {
 	if !ok {
 		return false
 	}
-	sz := int64(-1)
-	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
-		sz = fi.Size()
-	}
+	sz := regularSize(p)
 	if os.Remove(p) != nil {
 		return false
 	}
-	if sz > 0 {
-		f.used -= sz
-	}
+	f.used -= sz
 	return true
 }
 

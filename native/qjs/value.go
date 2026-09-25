@@ -39,17 +39,17 @@ func (v *Value) Context() *Context { return v.c }
 
 // Free releases the JSValue reference.
 func (v *Value) Free() {
-	if v != nil && v.raw != 0 {
-		// A closed runtime has had its linear memory reclaimed by wazero, so there is
-		// nothing to free and the call would panic. A killed call path is full of deferred
-		// Free()s, and they must not turn a clean error into a panic.
-		if !v.c.rt.Alive() {
-			v.raw = 0
-			return
-		}
-		v.c.rt.call("QJS_FreeValue", v.c.handle, v.raw)
-		v.raw = 0
+	if v == nil || v.raw == 0 {
+		return
 	}
+	// undefined and null hold no reference, so there is nothing for the engine to release.
+	// And a closed runtime has had its linear memory reclaimed by wazero, so there is
+	// nothing to free and the call would panic. A killed call path is full of deferred
+	// Free()s, and they must not turn a clean error into a panic.
+	if !v.IsUndefined() && !v.IsNull() && v.c.rt.Alive() {
+		v.c.rt.call("QJS_FreeValue", v.c.handle, v.raw)
+	}
+	v.raw = 0
 }
 
 // Dup retains an extra reference, so a JS value handed to a host callback can outlive that
@@ -72,8 +72,8 @@ func (c *Context) Global() *Value {
 }
 
 func (c *Context) NewObject() *Value    { return c.callV("JS_NewObject", c.handle) }
-func (c *Context) NewNull() *Value      { return c.callV("QJS_Null") }
-func (c *Context) NewUndefined() *Value { return c.callV("QJS_Undefined") }
+func (c *Context) NewNull() *Value      { return c.value(c.rt.null) }
+func (c *Context) NewUndefined() *Value { return c.value(c.rt.undefined) }
 
 func (c *Context) NewBool(b bool) *Value {
 	n := uint64(0)
@@ -162,8 +162,10 @@ func (v *Value) boolCall(name string, args ...uint64) bool {
 	return int32(v.c.rt.call(name, args...)) != 0
 }
 
-func (v *Value) IsUndefined() bool { return v.boolCall("QJS_IsUndefined", v.raw) }
-func (v *Value) IsNull() bool      { return v.boolCall("QJS_IsNull", v.raw) }
+// IsUndefined and IsNull compare tags, which is what JS_IsUndefined and JS_IsNull do: a
+// NaN-boxed JSValue carries its tag in the high word (JS_VALUE_GET_TAG).
+func (v *Value) IsUndefined() bool { return v.raw>>32 == v.c.rt.undefined>>32 }
+func (v *Value) IsNull() bool      { return v.raw>>32 == v.c.rt.null>>32 }
 func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
 
 // ── bytes ─────────────────────────────────────────────────────────────────────

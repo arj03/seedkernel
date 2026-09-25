@@ -167,13 +167,6 @@ func (n *netHost) get(id int64) *sockChannel {
 	return n.chans[id]
 }
 
-func (n *netHost) alloc() int64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.nextID++
-	return n.nextID
-}
-
 // waitSpace is lazily built so a zero-value netHost still works; always called under mu.
 func (n *netHost) waitSpace() *sync.Cond {
 	if n.readSpace == nil {
@@ -214,7 +207,7 @@ func (n *netHost) releaseInboundRead(length int) {
 	n.mu.Unlock()
 }
 
-// allocInbound is alloc for a socket nobody asked for: it refuses once the host holds
+// allocInbound mints an id for a socket nobody asked for, refusing once the host holds
 // maxLiveChannels. The count is read under the same lock that hands out the id, so the
 // only slack is at most one connection per accept goroutine.
 func (n *netHost) allocInbound() (int64, bool) {
@@ -230,11 +223,11 @@ func (n *netHost) allocInbound() (int64, bool) {
 // dial opens an outbound byte duplex: it connects in the background and buffers
 // pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately.
 func (n *netHost) dial(addr string) int64 {
-	id := n.alloc()
-	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
 	n.mu.Lock()
-	n.chans[id] = ch
-	n.mu.Unlock()
+	defer n.mu.Unlock()
+	n.nextID++
+	id := n.nextID
+	n.chans[id] = newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return id
 }
 
@@ -272,7 +265,8 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				conn.Close()
 				continue
 			}
-			ch, start := n.wrapInbound(id, conn)
+			// Its writer starts now; its reader only once __netAccept has made the JS channel.
+			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 			// The transport's per-source half-open budget groups by IP, not ephemeral
 			// source port. This listener is TCP, so RemoteAddr is a *net.TCPAddr.
 			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
@@ -281,7 +275,7 @@ func (n *netHost) listen(host string, port int) (int, error) {
 			n.mu.Unlock()
 			n.el.post(func() {
 				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(id), n.qc.NewString(remoteAddr))
-				start() // safe now: the JS channel exists
+				go ch.readLoop() // safe now: the JS channel exists
 			})
 		}
 	}()
@@ -321,13 +315,6 @@ func (n *netHost) close() {
 	n.closed = true
 	n.waitSpace().Broadcast()
 	n.mu.Unlock()
-}
-
-// wrapInbound builds a channel for an accepted socket but defers its read goroutine
-// to the returned start(), so the loop registers the JS channel first.
-func (n *netHost) wrapInbound(id int64, conn net.Conn) (*sockChannel, func()) {
-	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
-	return c, func() { go c.readLoop() }
 }
 
 // onMsg/onClose run on a socket reader goroutine; they hand the work to the loop
