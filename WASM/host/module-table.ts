@@ -270,13 +270,17 @@ export class ModuleTable implements PureModuleLoader {
     await new Promise<void>((resolve, reject) => {
       let loading = true;
       let timer: ReturnType<typeof setTimeout> | null = null;
+      /** End the load in failure, once — and the worker with it. */
+      const fail = (err: Error): void => {
+        if (!loading) return;
+        loading = false;
+        if (timer !== null) clearTimeout(timer);
+        worker.kill();
+        reject(err);
+      };
       if (Number.isFinite(this.deadlineMs)) {
-        timer = setTimeout(() => {
-          if (!loading) return;
-          loading = false;
-          worker.kill();
-          reject(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`));
-        }, this.deadlineMs);
+        timer = setTimeout(() => fail(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`)),
+          this.deadlineMs);
       }
       // One handler for both phases: load and calls are strictly sequential per module (a
       // call reaches a worker only after `ready`, and a reload runs inside the queued call).
@@ -294,20 +298,10 @@ export class ModuleTable implements PureModuleLoader {
           ref.scratchSize = m.scratchSize;
           resolve();
         }
-        else if (m.type === "loadError") {
-          loading = false;
-          if (timer !== null) clearTimeout(timer);
-          worker.kill();
-          reject(new Error(`table: failed to instantiate wasm: ${m.message}`));
-        }
+        else if (m.type === "loadError") fail(new Error(`table: failed to instantiate wasm: ${m.message}`));
       });
-      worker.onError((err) => {
-        if (!loading) return;
-        loading = false;
-        if (timer !== null) clearTimeout(timer);
-        worker.kill();
-        reject(new Error(`table: module worker failed during load: ${(err as Error)?.message ?? String(err)}`));
-      });
+      worker.onError((err) =>
+        fail(new Error(`table: module worker failed during load: ${(err as Error)?.message ?? String(err)}`)));
       worker.post({ type: "load", wasm: ref.wasm });
     });
     // Loaded and idle: it holds nothing open until a call is posted. (Every rejection path

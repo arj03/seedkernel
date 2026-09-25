@@ -289,7 +289,8 @@ export function validateManifest(manifest: unknown): asserts manifest is BundleM
   const moduleNames = new Set(manifest.modules.map((m) => m.name));
   for (const r of manifest.guest.requires) {
     if (isService(r)) continue;
-    const head = r.slice(0, r.indexOf("/") < 0 ? r.length : r.indexOf("/"));
+    const slash = r.indexOf("/");
+    const head = slash < 0 ? r : r.slice(0, slash);
     if (isHostNamespace(head)) {
       const fix = isService(head) ? ` — declare the SERVICE "${head}" instead` : "";
       throw new Error(`bundle: "${r}" (manifest guest.requires) is a host method, not a service or a local service id${fix} (this host's services: ${Object.keys(HOST_SERVICES).join(", ")})`);

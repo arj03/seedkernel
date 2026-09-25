@@ -8,7 +8,7 @@ import { type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "../services/peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
-import { CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
+import { CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
 import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import {
@@ -359,17 +359,14 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // A synchronous throw is a refused NAME, which fails at the guest's call site
     // (guest-seam.ts); guest.go releases the call it had already admitted.
     const answer = hostCall(name, new Uint8Array(payload), budget);
-    // Expiry arrives as an ordinary rejection, so a late answer and a failed one settle
-    // by the same arm and neither can follow the other (realm-queue.ts).
-    const settle = (bytes: Uint8Array | null, error: string | null): void =>
+    // Expiry arrives as an ordinary failure, so a late answer and a failed one settle
+    // by the same path and neither can follow the other (realm-queue.ts).
+    settleByDeadline(deadlines.hostCall, budget.remainingMs, answer, HOST_CALL_LATE, (bytes, error) =>
       causalContext.run(causalClock, () => {
-        const elapsedNs = bridge.realmSettle(realm, callId, bytes, error, budget.detached ? 1 : 0);
+        const elapsedNs = bridge.realmSettle(realm, callId, bytes,
+          bytes === null ? errMessage(error) : null, budget.detached ? 1 : 0);
         causalClock?.charge(elapsedNs / 1_000_000);
-      });
-    void raceDeadline(deadlines.hostCall, budget.remainingMs, answer, HOST_CALL_LATE).then(
-      (bytes: Uint8Array) => settle(bytes, null),
-      (e: unknown) => settle(null, errMessage(e)),
-    );
+      }));
     return null;
   };
   try {

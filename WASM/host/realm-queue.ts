@@ -15,7 +15,7 @@ export const REALM_DISPOSED = "guest realm disposed";
 /** The two ways a host call ends on the clock rather than on an answer, said the same way
  *  by every realm factory: SPENT is a call the caller had no time left to make — thrown at
  *  the guest's call site, since the name was never issued — and LATE is one the handoff
- *  deadline overtook, which arrives as an ordinary rejection (`raceDeadline`). Constants
+ *  deadline overtook, which arrives as an ordinary failure (`settleByDeadline`). Constants
  *  for the reason REALM_DISPOSED is one: two targets, one contract, and a message that
  *  drifted would describe the same refusal two ways. */
 export const HOST_CALL_SPENT = "guest: handoff deadline exhausted before host.call";
@@ -113,7 +113,7 @@ export interface Deadline {
 /** One tier's queue: what a realm arms against, and what disposal ends. */
 export interface DeadlineQueue {
   add(deadline: Deadline): void;
-  drop(deadline: Deadline): void;
+  drop(deadline: Deadline): boolean;
   disarmAll(): void;
 }
 
@@ -167,12 +167,13 @@ export function createDeadlineQueue(): DeadlineQueue {
       else (timer as ReturnType<typeof setTimeout> & { ref?(): void }).ref?.();
     },
     drop(deadline) {
-      if (!pending.delete(deadline)) return;
+      if (!pending.delete(deadline)) return false;
       // Nothing is waiting on the retained wake now, so it must not hold a process up on
       // its own account; `add` refs it back. No-op off Node, whose loop is explicit.
       if (pending.size === 0) {
         (timer as (ReturnType<typeof setTimeout> & { unref?(): void }) | undefined)?.unref?.();
       }
+      return true;
     },
     /** Disposal ends the wake with the realm (§12.3): nothing is left to consume those
      *  answers, and a retained one would hold the host's loop for its whole remainder. */
@@ -198,21 +199,31 @@ export function createRealmDeadlines(): { hostCall: DeadlineQueue; entry: Deadli
   };
 }
 
-/** `answer`, or this deadline's REJECTION — whichever lands first. That shape is the whole
- *  "exactly one settlement" rule here: no owner needs a claim flag, and expiry arrives at
- *  every call site as ordinary failure rather than a second settlement path. */
-export function raceDeadline<T>(deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
-  remainingMs: number, answer: Promise<T>, message: string): Promise<T> {
+/** Settle a host call's `answer` through `settle` — its bytes, or its failure — unless this
+ *  deadline lands first, which settles it with `message` instead: exactly once either way,
+ *  and expiry reaches the caller as an ordinary failure rather than a second settlement path.
+ *  No claim flag: the deadline's place in its queue IS the claim, since expiry takes it out
+ *  before firing and an answer that finds it gone (`drop` answering false) lost the race.
+ *
+ *  A callback rather than a racing promise because this runs per host call, and on the
+ *  native loop every promise and closure is a measured cost; the one promise left is
+ *  `answer.then`'s own. Expiry still settles on a later microtask: `add` can expire a
+ *  deadline synchronously, inside the guest frame that issued the call, and a settlement
+ *  re-enters the realm. */
+export function settleByDeadline(deadlines: { add(d: Deadline): void; drop(d: Deadline): boolean },
+  remainingMs: number, answer: Promise<Uint8Array>, message: string,
+  settle: (bytes: Uint8Array | null, error: unknown) => void): void {
   const at = deadlineAt(remainingMs);
-  if (at === Infinity) return answer;
-  return new Promise<T>((resolve, reject) => {
-    const deadline: Deadline = { at, expire: () => reject(new Error(message)) };
-    deadlines.add(deadline);
-    answer.then(
-      (value) => { deadlines.drop(deadline); resolve(value); },
-      (err: unknown) => { deadlines.drop(deadline); reject(err); },
-    );
-  });
+  if (at === Infinity) {
+    void answer.then((bytes) => settle(bytes, null), (err: unknown) => settle(null, err));
+    return;
+  }
+  const deadline: Deadline = { at, expire: () => queueMicrotask(() => settle(null, new Error(message))) };
+  deadlines.add(deadline);
+  void answer.then(
+    (bytes) => { if (deadlines.drop(deadline)) settle(bytes, null); },
+    (err: unknown) => { if (deadlines.drop(deadline)) settle(null, err); },
+  );
 }
 
 /** Serialize realm entry under one deadline that starts at admission.

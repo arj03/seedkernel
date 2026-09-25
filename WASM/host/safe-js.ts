@@ -33,7 +33,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 // `__start` / `__host_call` contract this file implements.
 import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
-  CausalContext, createRealmDeadlines, monotonicMs, raceDeadline, serializeCalls,
+  CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline,
   HOST_CALL_LATE, REALM_DISPOSED,
   type CausalClock, type Invocation, type RealmFactory, type RealmOptions,
 } from "./realm-queue.js";
@@ -371,12 +371,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         activeHostCalls.release(callId);
       }
     };
-    // Expiry arrives as an ordinary rejection, so the deadline needs no settlement path of
-    // its own: the arms below are the only ones, for a backend answer and a late one alike.
-    void raceDeadline(deadlines.hostCall, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE).then(
-      (bytes: Uint8Array) => settle(bytes, null),
-      (err: unknown) => settle(null, err),
-    );
+    // Expiry arrives as an ordinary failure, so the deadline needs no settlement path of
+    // its own: `settle` is the only one, for a backend answer and a late one alike.
+    settleByDeadline(deadlines.hostCall, budget.remainingMs, Promise.resolve(answer), HOST_CALL_LATE, settle);
     return ctx.null;
   });
   ctx.setProp(ctx.global, "__host_call", hostCallFn);
