@@ -3,7 +3,7 @@
 // only way slots land (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { type Fs } from "../services/fs.js";
@@ -17,6 +17,8 @@ import type { Keypair } from "../services/subkeys.js";
 
 /** Neutral realm contracts exposed through the shell facade clients configure. */
 export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
+
+const EMPTY = new Uint8Array(0);
 
 /** Manifest verification plus the guest crypto ops; core libsodium satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
@@ -50,7 +52,7 @@ export interface Shell {
    *  nothing claims it. Resolves `services`, never `protocols`. How an embedder or the CLI
    *  asks the node's transport to wait for a cohort, list peers, or learn an address. */
   call(serviceId: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
-  /** Absent for a node with no disk; a bundle requiring `fs` then throws on its first call. */
+  /** Absent for a node with no disk, which refuses a bundle requiring `fs` at install. */
   fs?: Fs;
   sodium: ShellSodium;
   /** THE way a bundle enters this node: verify, admit, build modules, stand the guest,
@@ -171,19 +173,17 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const timers = createRealmTimers(
       // A host event under the host's caller id. No caller is left to reject, so a throw
       // is logged. The promise is returned: it gates the next wake (realm-timers.ts).
-      (body, causalClock) => callSlot(slot, body, undefined, causalClock).catch((err: unknown) => {
+      (input, causalClock) => slot.realm!.call(input, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
       deadlineMs,
     );
     const appScope = appScopeFor(sodium, loaded.manifest.app);
-    const scope = slotSignScope(opts, loaded.manifest.app, reachesLink(loaded.manifest));
     slot = {
       verifiedBundle: loaded,
       pureModules,
       fsScope: fs ? scopedFs(fs, appScope) : undefined,
       appScope,
-      signingScope: scope,
       realm: null,
       active: false,
       timers,
@@ -228,27 +228,55 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       ownTurns: reachesLink(slot.verifiedBundle.manifest),
     });
   };
-  /** Wire the `host.call` seam for one slot (guest-seam.ts). */
+  /** Enter a committed slot as `caller` with `body`. Host events the host frames itself
+   *  (a wake, a link event, a peer request) enter through `realm.call` directly. */
+  const enter = (slot: AppSlot, caller: Uint8Array, body: Uint8Array,
+    deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
+    slot.realm!.call(concatBytes([caller, body]), deadlineMs, causalClock);
+  /** A local service id's claimant, entered as `caller`, resolved at call time so a
+   *  service installed or replaced later is found. */
+  const callLocal = (caller: Uint8Array): LocalCall => (id, payload, deadlineMs, causalClock) => {
+    const slot = table.localClaimant(id);
+    return slot ? enter(slot, caller, payload, deadlineMs, causalClock) : null;
+  };
+  /** The `link` backend: the driver's raw links, plus peer-inbound delivery by one lookup
+   *  on the peer book, so a `services` claim is unreachable by a peer by construction
+   *  (§12.10). A refused claim and a failed handler both answer empty. */
+  const link: LinkBackend | undefined = netHost ? {
+    ...netHost.rawNet(),
+    deliver: (claim, framed, deadlineMs, causalClock) => {
+      const slot = table.peerClaimant(claim);
+      if (!slot) return Promise.resolve(EMPTY);
+      const answer = slot.realm!.call(framed, deadlineMs, causalClock);
+      const onInbound = slot.onInbound;
+      if (onInbound) {
+        const attribution = framed.subarray(0, HOST_CALLER_ID.length);
+        // Two-arg `.then`, so a refused frame leaves no unhandled rejection on this branch.
+        answer.then((bytes) => {
+          try { onInbound(claim, attribution, bytes); }
+          catch (err) { console.error(`[shell] the installer's onInbound threw: ${errMessage(err)}`); }
+        }, () => {});
+      }
+      return answer.catch(() => EMPTY);
+    },
+  } : undefined;
+  /** Wire the `host.call` seam for one slot (guest-seam.ts): only the services its bundle
+   *  declares. */
   const seamFor = (slot: AppSlot): HostCall => {
     const b = slot.verifiedBundle;
-    const links = reachesLink(b.manifest);
-    // The label, hashed: the same 32-byte shape as a peer's sender key. Zero is the host's.
-    const callerId = genesisHash(sodium, enc.encode(table.labelOf(slot)));
+    const app = table.labelOf(slot);
     const fullSeam = createGuestSeam({
-      platform: { sodium },
-      grants: {
-        // The signed list, unmodified: host services and local service ids.
-        names: new Set(b.manifest.guest.requires),
-        signScope: slot.signingScope,
-        // Wired whenever the node has an fs; `names` alone decides whether `fs/*` resolves.
+      sodium,
+      // The signed list, unmodified: host services and local service ids.
+      requires: b.manifest.guest.requires,
+      backends: {
+        node: slotSignScope(opts, app, reachesLink(b.manifest)),
         fs: slot.fsScope,
-        // Resolved at call time, so a service installed or replaced later is found.
-        calls: { call: (id, payload, deadlineMs, causalClock) =>
-          callClaimant(table.localClaimant(id), callerId, payload, deadlineMs, causalClock) },
-        // Never wired for a bundle that does not require `link` (§1).
-        rawNet: links ? netHost?.rawNet() : undefined,
-        timers: slot.timers,
+        timer: slot.timers,
+        link,
       },
+      // The label, hashed: the same 32-byte shape as a peer's sender key. Zero is the host's.
+      callLocal: callLocal(genesisHash(sodium, enc.encode(app))),
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
         call: slot.pureModules.call,
@@ -264,9 +292,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return fullSeam(name, payload, budget);
     };
   };
-  /** Enter a committed slot's guest with `[caller 32][body …]`. */
-  const callSlot = (slot: AppSlot, input: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) =>
-    slot.realm!.call(input, deadlineMs, causalClock);
   const doUninstall = (app: string) => {
     const slot = table.remove(app);
     if (!slot) return false;
@@ -275,38 +300,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     disposeSlot(slot);
     return true;
   };
-  /** Enter a slot with `[attribution ‖ payload]`. */
-  const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array,
-    deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
-    callSlot(slot, concatBytes([attribution, payload]), deadlineMs, causalClock);
-  /** An event the host writes into a slot. */
-  const hostCallSlot = (slot: AppSlot, body: Uint8Array, deadlineMs?: number): Promise<Uint8Array> =>
-    callFramed(slot, HOST_CALLER_ID, body, deadlineMs);
-  /** Hand a request to a claimant, or answer `null` when nothing claims it. */
-  const callClaimant = (slot: AppSlot | undefined, attribution: Uint8Array,
-    payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null =>
-    slot ? callFramed(slot, attribution, payload, deadlineMs, causalClock) : null;
-  /** Peer-inbound delivery (`link/deliver`): one lookup on the peer book, so a `services`
-   *  claim is unreachable by a peer by construction. `framed` is already the realm
-   *  argument. */
-  const deliverInbound = (claim: string, framed: Uint8Array,
-    deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null => {
-    const slot = table.peerClaimant(claim);
-    if (!slot) return null;
-    const answer = callSlot(slot, framed, deadlineMs, causalClock);
-    if (slot.onInbound) {
-      const onInbound = slot.onInbound;
-      const attribution = framed.subarray(0, HOST_CALLER_ID.length);
-      // Two-arg `.then`, so a refused frame leaves no unhandled rejection on this branch;
-      // the caller already holds `answer`.
-      answer.then((bytes) => {
-        try { onInbound(claim, attribution, bytes); }
-        catch (err) { console.error(`[shell] the installer's onInbound threw: ${errMessage(err)}`); }
-      }, () => {});
-    }
-    return answer;
-  };
-  netHost?.routeInbound(deliverInbound);
 
   // One transaction for every install: a free label, a named replacement, and the boot
   // transport differ only in their target.
@@ -362,7 +355,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // the incoming guest redials from its own config (§12.10).
     const linkHolder = table.occupant("link");
     if (linkHolder === slot) {
-      netHost?.activate((input) => callSlot(slot, input));
+      netHost?.activate((input) => slot.realm!.call(input));
     } else if (!linkHolder) {
       netHost?.release();
     }
@@ -373,7 +366,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       fs: slot.fsScope,
       appScope: slot.appScope,
       invoke: (payload, deadlineMs) => slot.active
-        ? hostCallSlot(slot, payload, deadlineMs)
+        ? enter(slot, HOST_CALLER_ID, payload, deadlineMs)
         : Promise.reject(new Error(`shell: app '${loaded.manifest.app}' slot is no longer loaded`)),
     };
     return handle;
@@ -385,8 +378,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return slot ? table.labelOf(slot) : null;
     },
     routes: table.routes,
-    call: (serviceId, payload, deadlineMs) =>
-      callClaimant(table.localClaimant(serviceId), HOST_CALLER_ID, payload, deadlineMs),
+    call: callLocal(HOST_CALLER_ID),
     fs,
     sodium,
     install: (blob, load) => installBundle(blob, load),

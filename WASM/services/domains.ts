@@ -54,10 +54,8 @@ export function isOccupiedService(name: string): boolean {
 }
 export const LINK_EVENTS = HOST_SERVICES.link.events;
 export type LinkEvent = (typeof LINK_EVENTS)[number];
-/** The full `service/call` vocabulary, typing the dispatch table (guest-seam.ts). */
-export type HostMethod = {
-  [S in ServiceName]: `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
-}[ServiceName];
+/** One service's `service/call` vocabulary, typing its handlers (guest-seam.ts). */
+export type ServiceMethod<S extends ServiceName> = `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
 /** Whether a name is a host service, by own-property check. */
 export function isService(name: string): name is ServiceName {
   return Object.prototype.hasOwnProperty.call(HOST_SERVICES, name);
@@ -66,13 +64,6 @@ export function isService(name: string): name is ServiceName {
  *  where a local service id may not live (bundle.ts `validateManifest`). */
 export function isHostNamespace(head: string): boolean {
   return head === "crypto" || isService(head);
-}
-/** The service a host method belongs to (text before the first `/`), or null. */
-export function serviceOf(name: string): ServiceName | null {
-  const i = name.indexOf("/");
-  if (i < 0) return null;
-  const svc = name.slice(0, i);
-  return isService(svc) ? (svc as ServiceName) : null;
 }
 // Manifest suite: first byte of the envelope, covered by the signature. Channel suite
 // lives in the transport bundle (ake.js), not here — §14.1.

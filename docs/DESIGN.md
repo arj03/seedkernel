@@ -28,9 +28,9 @@
 
 ## 12.2 The guest seam: the guest name ABI
 
-**A name means what the manifest declared.** Dispatch builds one map of declared names at load and falls through to the host table, so it never reads a name's spelling. A method named where a service belongs is refused at load rather than accepted as a no-op or read as a finer grant the seam cannot enforce, and an unknown service throws, so a typo fails loudly rather than granting nothing — or everything.
+**A name means what the manifest declared.** Dispatch builds one map at load of every name the realm can reach — the `crypto/*` transforms, the methods of each declared service, the declared local service ids and the bundle's own modules — so it never reads a name's spelling. A method named where a service belongs is refused at load rather than accepted as a no-op or read as a finer grant the seam cannot enforce, and an unknown service throws, so a typo fails loudly rather than granting nothing — or everything.
 
-**The gates are required arguments, enforced at runtime.** A seam is constructed with an allowed name set and a module map; omitting the set is a construction error, never an unrestricted seam. The check is a runtime one, not only a type, because the native target evaluates the compiled JS inside QuickJS where no TypeScript signature exists, and a gate that holds on one target of two is not a gate.
+**The gates are required arguments, enforced at runtime.** A seam is constructed from the declared `requires`, the node's service backends and a module map; omitting `requires` is a construction error, never an unrestricted seam. A declared service the node cannot back refuses the seam: a node's services are fixed for its life, so the install already knows what the first call would answer. The check is a runtime one, not only a type, because the native target evaluates the compiled JS inside QuickJS where no TypeScript signature exists, and a gate that holds on one target of two is not a gate.
 
 **One settlement algebra.** Because a produced value resolves and anything else rejects, nothing downstream re-derives failure from an answer's length, and "ran and returned nothing" stays distinct from "trapped".
 

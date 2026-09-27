@@ -283,14 +283,15 @@ export async function makeTransportHost(opts = {}) {
     guestDeadlineMs: opts.guestDeadlineMs,
     transport,
     // `onHostCall` sees every host call this node's realms make, and refuses one by
-    // throwing; `onHostAnswer` may stand in for its answer — a slow one, say.
+    // throwing; `onHostAnswer(name, answer, payload)` may stand in for its answer — a
+    // slow one, say.
     createRealm: async (o) => createSafeRealm(opts.onHostCall || opts.onHostAnswer
       ? {
         ...o,
         hostCall: (...args) => {
           opts.onHostCall?.(...args);
           const answer = o.hostCall(...args);
-          return opts.onHostAnswer ? opts.onHostAnswer(args[0], answer) : answer;
+          return opts.onHostAnswer ? opts.onHostAnswer(args[0], answer, args[1]) : answer;
         },
       }
       : o),

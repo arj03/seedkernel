@@ -16,7 +16,7 @@ import {
   toHex, concatBytes, verifyTestBundle,
   signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
   testAuthor, bootTestShell, imp, MemoryFs,
-  createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_TIMERS, TEST_CALLS,
+  createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_CALL_LOCAL, testBackends,
   createSafeRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
 } from "./fixtures.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -39,7 +39,7 @@ async function testGuestSeam() {
   // stub here so the seam is tested for what it does: gate the name, then hand the
   // payload to whatever claims the id. `_net` and `chat/v1` are claimed; `_nobody` is not.
   const claimed = new Set(["_net", "chat/v1"]);
-  const calls = { call: (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null) };
+  const callLocal = (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null);
   // THIS realm's declared requires (§12.10): every host service plus the local service ids
   // it calls — what tells those apart from a bare module name at the dispatch. `chat/v1` is
   // here because a local service id is an ordinary claim: it may carry a `/` exactly like a
@@ -56,8 +56,10 @@ async function testGuestSeam() {
   const signScope = appSignScope(id, "testapp");
   const scopeBytes = guestSignScope("testapp");
   const seam = withTestBudget(createGuestSeam({
-    platform: { sodium },
-    grants: { names, signScope, fs, calls, timers: TEST_TIMERS },
+    sodium,
+    requires: names,
+    backends: { ...testBackends(), node: signScope, fs },
+    callLocal,
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
@@ -638,10 +640,11 @@ async function testSeamGating() {
   console.log("Test: the guest seam enforces the manifest's declared requires + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (names) => withTestBudget(createGuestSeam({
-    platform: { sodium },
-    grants: { names, signScope: appSignScope(id, "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
+    sodium,
+    requires: names,
+    backends: { ...testBackends(), node: appSignScope(id, "probe") },
+    callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   }));
   const U = (...xs) => new Uint8Array(xs);
@@ -657,13 +660,10 @@ async function testSeamGating() {
   try { await timerOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
   // A bare name is the asking bundle's own module map — code it already holds, scoped by
-  // the app the seam was built for — so it passes the gate under an empty requires
-  // set. This seam declares no such module, so it is refused for NOT EXISTING rather than
-  // by the requires gate, and the message is the assertion.
-  let gateMsg = "";
-  try { await timerOnly("echo", U(1, 120)); } catch (e) { gateMsg = e.message; }
-  assert(gateMsg.includes("no such name") && !gateMsg.includes("guest.requires"),
-    `a bare name passes the gate ungated and fails only on existence (got: ${gateMsg})`);
+  // the app the seam was built for. This seam holds no such module, so it has no route.
+  threw = false;
+  try { await timerOnly("echo", U(1, 120)); } catch { threw = true; }
+  assert(threw, "a module name this seam was not built with reaches nothing");
 
   // Grants are gated by SERVICE, not by method: declaring `timer` resolves `timer/clear`,
   // and a different, undeclared service is still refused beside it.
@@ -688,21 +688,27 @@ async function testSeamGating() {
   try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
   assert(threw, "a different, undeclared service (fs) is still refused beside the declared one");
 
-  // Declaring the method's exact STRING is not declaring its service: the gate checks
-  // `serviceOf(name)` against the declared set, so a seam handed `node/sign` (rather than
-  // `node`) grants nothing at all — `requires` speaks in services, and install refuses
-  // the manifest besides.
+  // Declaring the method's exact STRING is not declaring its service: `node/sign` is not a
+  // service, so it is read as a local service id nothing claims, and no `node` handler is
+  // wired — `requires` speaks in services, and install refuses the manifest besides.
   const methodNameOnly = mk(["node/sign"]);
   threw = false;
   try { await methodNameOnly("node/sign", U(1, 2)); } catch { threw = true; }
   assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
   // Guest-controlled allocation caps. Tests that exercise the full catalog name every
-  // host service explicitly; omitting grants.names entirely still throws (§12.2).
+  // host service explicitly; omitting requires entirely still throws (§12.2).
   const open = mk(ALL_HOST_SERVICES);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
-  assert(omitted, "omitting grants.names throws rather than granting every name");
+  assert(omitted, "omitting requires throws rather than granting every name");
+  // A declared service this node cannot back refuses the seam, so the install fails.
+  let unbacked = "";
+  try {
+    createGuestSeam({ sodium, requires: ["fs"], backends: { ...testBackends(), fs: undefined },
+      callLocal: TEST_CALL_LOCAL, modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) } });
+  } catch (e) { unbacked = e.message; }
+  assert(unbacked.includes('requires "fs"'), `a declared fs on a diskless node is refused at construction (got: ${unbacked})`);
   // Entropy is an ungated transform: a seam declaring nothing still draws it.
   const none = mk([]);
   assertEqual((await none("crypto/random", U(0, 0, 4, 0))).length, 1024, "crypto/random under the cap works, with nothing declared");
@@ -866,8 +872,10 @@ async function testModuleCallChargedToGuestBudget() {
   const spinKey = "app";
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
-    platform: { sodium },
-    grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
+    sodium,
+    requires: ALL_HOST_SERVICES,
+    backends: testBackends(),
+    callLocal: TEST_CALL_LOCAL,
     modules: {
       names: new Set(["spin"]),
       call: (n, p, deadlineMs) => host.slots.get(spinKey)?.call(n, p, deadlineMs) ?? Promise.resolve({ bytes: null, ms: 0 }),
@@ -954,8 +962,10 @@ async function testPreviousAbiRefused() {
   const realm = await createSafeRealm({
     source,
     hostCall: createGuestSeam({
-      platform: { sodium },
-      grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
+      sodium,
+      requires: ALL_HOST_SERVICES,
+      backends: testBackends(),
+      callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     }),
   });
@@ -1147,8 +1157,10 @@ async function testNoiseVectors() {
   await import("./noise-vectors.js");
   const { vectors } = JSON.parse(readFileSync(join(root, "tests", "fixtures", "noise-xx-vectors.json"), "utf8"));
   const seam = withTestBudget(createGuestSeam({
-    platform: { sodium },
-    grants: { names: [], calls: TEST_CALLS, timers: TEST_TIMERS },
+    sodium,
+    requires: [],
+    backends: {},
+    callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   }));
   const { ran, failures } = await globalThis.runNoiseVectors((name, bytes) => seam(name, bytes), vectors);

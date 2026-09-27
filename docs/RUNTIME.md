@@ -76,8 +76,8 @@ The host provides four **host services** — `node`, `fs`, `timer`, `link` (`HOS
 | `crypto/*` | `blake2b`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries, each over its algorithm's whole standard interface (§12.2). `random` is host entropy. **Not a grant.** |
 | *bare names* | the bundle's own module names | The asking bundle's private WASM modules. **Not a grant.** |
 
-- **A grant is a service.** `guest.requires` (§12.4) lists everything a guest reaches: host services, and the local service ids it calls (§12.10). Which of the two a name is, is one closed-table lookup (`isService`), never a spelling convention. Host services are named by service, never by method; declaring `node` grants `node/sign` and `node/verify` together. Install refuses a method name (`fs/get`) with the service to declare instead, and refuses an unknown service. The seam refuses any host method whose service (`serviceOf`, the text before the first `/`) is not declared.
-- **An undeclared service is not wired.** An fs-less bundle gets no fs backend at all, not a backend behind a check.
+- **A grant is a service.** `guest.requires` (§12.4) lists everything a guest reaches: host services, and the local service ids it calls (§12.10). Which of the two a name is, is one closed-table lookup (`isService`), never a spelling convention. Host services are named by service, never by method; declaring `node` grants `node/sign` and `node/verify` together. Install refuses a method name (`fs/get`) with the service to declare instead, and refuses an unknown service. The seam holds handlers only for declared services, so an undeclared service's methods are unknown names.
+- **An undeclared service is not wired.** An fs-less bundle gets no fs backend at all, not a backend behind a check. A declared service the node cannot back (`fs` on a diskless node) refuses the install.
 - **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms. A name it does hold takes its algorithm's whole standard interface — BLAKE2b's output length and key, the AEAD's associated data — never the subset one bundle uses, so a standard protocol over these algorithms is a bundle, not a host release (`tests/noise-vectors.js` replays published Noise XX vectors through them on both targets).
 - **Time is not a service.** Every realm reads `Date.now()` and `performance.now()` as ordinary ECMAScript intrinsics.
 - **Anything with structure is a pure module**, never host code: WebSocket framing is `ws.wasm` in the transport bundle, erasure coding is an app's `codec.wasm`.
@@ -105,9 +105,9 @@ A guest reaches the world through one seam, `host.call(name, bytes)`, and is ent
 
 1. a local service id in **this realm's** `guest.requires` → the realm claiming it (§12.10);
 2. a name in this bundle's `modules` → that private module;
-3. anything else → the host table (host services and `crypto/*`).
+3. a method of a host service in `guest.requires`, or a `crypto/*` transform → the host (§12.1).
 
-Install keeps the three disjoint: every host name contains `/`, a module name matches `[A-Za-z0-9_-]` and begins alphanumeric, and a local service id may neither live in a host namespace (`fs/…`, `crypto/…`) nor spell one of the bundle's module names. Multi-byte integers are big-endian.
+Any other name is refused. Install keeps the three disjoint: every host name contains `/`, a module name matches `[A-Za-z0-9_-]` and begins alphanumeric, and a local service id may neither live in a host namespace (`fs/…`, `crypto/…`) nor spell one of the bundle's module names. Multi-byte integers are big-endian.
 
 | Name | Request | Response |
 | --- | --- | --- |
@@ -276,7 +276,7 @@ The host reads no WASM custom sections; conventions such as seedchat's `ui` and 
 4. Contests (label, claims, `link`) are checked against the slot table (§12.10).
 5. Read every module's declared memory and table limits before instantiating any; enforce per-module and aggregate bounds (§4.1).
 6. Build every module off to the side and validate its exports; on any failure release them all.
-7. Derive `fsScope` and `signingScope`, then stand the realm over a seam restricted to `guest.requires` and wired to those modules, with the preamble `HOST`, `APP`, `LOCAL`. A guest that does not compile rejects the candidate. The seam refuses every name until step 8 (§3.1).
+7. Derive `fsScope` and the signing scope, then stand the realm over a seam wired with exactly the services in `guest.requires` and those modules, with the preamble `HOST`, `APP`, `LOCAL`. A declared service the node cannot back, or a guest that does not compile, rejects the candidate. The seam refuses every name until step 8 (§3.1).
 8. Synchronously: re-check the gates and contests against current state, persist the freshness mark, put the slot in the installed set (in the place of the slot `replaces` named, or a free one) and reproject every claim to it. Only then dispose the predecessor. A candidate overtaken by a newer mark, revoked mid-load, or whose mark cannot be written is discarded, leaving the running version unchanged.
 
 The predicate is not re-asked at commit. Atomicity is specified in Atomic load and replacement (§3.1).
@@ -532,7 +532,7 @@ A frame names a **protocol id**, never an app, author or module. Each installed 
 - **Peer delivery.** The link occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in `peerClaims` alone and invokes the slot's `handle` with `attribution ‖ payload`. An unclaimed protocol, or a `services`-only name, is answered empty.
 - **Local calls.** `host.call(id, …)` on a local service id in the caller's own `guest.requires` resolves through `localClaims`; the host prepends the caller's 32-byte id and the answer is the callee's `handle` result on a later turn.
 - **Host doors.** `AppHandle.invoke(payload)` is slot-bound (a bundle claiming nothing has one) and prepends 32 zero bytes. `Shell.call(serviceId, payload)` resolves `localClaims` with the host's caller id and returns `null` when nothing claims the name.
-- **The binding.** The driver follows the book, and the host wires raw-link authority (`rawNet`) only into that slot.
+- **The binding.** The driver follows the book, and the host wires the `link` service — the driver's raw links plus its own `deliver` — only into that slot.
 - **`InstallOptions.onInbound(claim, sender, answer)`** fires once a peer-inbound request to this load's slot resolves. It is observation only: it cannot change the answer, never fires for `invoke` or local calls, and a throw from it is reported and swallowed.
 - **One slot per name.** There is no fan-out.
 - A claim grants no authority, but selects which admitted app receives decrypted input (§14).

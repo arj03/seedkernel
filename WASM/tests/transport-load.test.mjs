@@ -10,7 +10,7 @@
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
-  ready, linkedPeers, PROTO, TransportHost,
+  ready, linkedPeers, PROTO,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -318,25 +318,21 @@ await test("one peer's pipeline cannot spend the host calls every other link nee
   const fabric = new LoopbackChannels();
   const held = [];
   let answering = false;
-  const routeInbound = TransportHost.prototype.routeInbound;
-  // The route is handed the realm argument whole — `[attribution 32][payload …]`
-  // (transport-host.ts `TransportDeliver`) — so this stand-in claimant reads the sender and
-  // the request out of it the way a claimant's own realm would.
+  // `link/deliver` is `[claimLen u8][claim]` then the realm argument whole —
+  // `[attribution 32][payload …]` — so this stand-in claimant reads the sender and the
+  // request out of it the way a claimant's own realm would.
   const ATTR = 32;
-  TransportHost.prototype.routeInbound = function () {
-    return routeInbound.call(this, (_claim, framed) => (answering
+  const standIn = (name, answer, payload) => {
+    if (name !== "link/deliver") return answer;
+    const framed = payload.subarray(1 + payload[0]);
+    return answering
       ? Promise.resolve(framed.slice(ATTR))
       : new Promise((resolve) => {
         held.push({ from: Buffer.from(framed.subarray(0, ATTR)).toString("hex"), resolve });
-      })));
+      });
   };
   let closed = 0;
-  let s;
-  try {
-    s = keep(await server(fabric, undefined, { app: false, onLinkClosed: () => { closed++; } }));
-  } finally {
-    TransportHost.prototype.routeInbound = routeInbound;
-  }
+  const s = keep(await server(fabric, undefined, { app: false, onHostAnswer: standIn, onLinkClosed: () => { closed++; } }));
   const flooder = keep(await member(fabric, s, "10.20.0.1"));
   const other = keep(await member(fabric, s, "10.21.0.1"));
   await ready(flooder, 4000);

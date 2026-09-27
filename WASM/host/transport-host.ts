@@ -15,7 +15,7 @@ import {
 import { type LinkEvent } from "../services/domains.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../services/socket-seam.js";
 import { HOST_CALLER_ID, type RawNet } from "./guest-seam.js";
-import { REALM_DISPOSED, type CausalClock } from "./realm-queue.js";
+import { REALM_DISPOSED } from "./realm-queue.js";
 import { OpArgs } from "../services/op-frame.js";
 
 const EMPTY = new Uint8Array(0);
@@ -31,11 +31,6 @@ export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
 /** Active transport entrypoint, called with the whole realm argument `[caller 32][body …]`;
  *  `null` means the binding is vacant. */
 export type TransportCall = (input: Uint8Array) => Promise<Uint8Array> | null;
-
-/** The claim routing `link/deliver` is handed to (§12.10); `null` for a claim no peer may
- *  reach. `framed` is `[attribution 32][payload …]`, already the realm argument. */
-export type TransportDeliver = (claim: string, framed: Uint8Array,
-  deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
   /** Live raw links this driver holds at once (default `DEFAULT_MAX_RAW_LINKS`). Bounds the
@@ -147,7 +142,6 @@ export class TransportHost {
   private readonly idOf = new WeakMap<RawLink, number>();
   private nextLinkId = 1;
   private call: TransportCall | null = null;
-  private deliver: TransportDeliver | null = null;
   private closed = false;
   // One realm sits behind every link, so the inbound allowance is driver-wide: the read
   // dispatched per link plus anything held above unpausable adapters.
@@ -159,9 +153,6 @@ export class TransportHost {
   constructor(opts: TransportHostOptions) {
     this.opts = opts;
   }
-
-  /** Wire `link/deliver` to current peer claims (§12.10). */
-  routeInbound(deliver: TransportDeliver): void { this.deliver = deliver; }
 
   available(): boolean { return !this.closed && this.call !== null; }
 
@@ -266,7 +257,7 @@ export class TransportHost {
     if (r) void r.catch((err: unknown) => this.reportOpError(args.op, err));
   }
 
-  /** The raw `link` service the transport guest's seam is wired to. */
+  /** The raw links of the `link` service; the shell adds `deliver` (§12.10). */
   rawNet(): RawNet {
     const bound = () => this.call !== null;
     return {
@@ -298,13 +289,6 @@ export class TransportHost {
         // Backends disagree on whether a local close fires onClose (native cannot), so the
         // driver makes the event universal on a later turn; a racing callback is a no-op.
         queueMicrotask(() => this.channelClosed(linkId, link));
-      },
-      // (§12.10) A refused claim and a failed handler both answer empty.
-      deliver: (claim, framed, deadlineMs, causalClock) => {
-        if (!bound() || !this.deliver) return Promise.resolve(EMPTY);
-        const answer = this.deliver(claim, framed, deadlineMs, causalClock);
-        if (!answer) return Promise.resolve(EMPTY);
-        return answer.then((bytes) => bytes ?? EMPTY, () => EMPTY);
       },
     };
   }

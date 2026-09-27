@@ -25,10 +25,10 @@ The guest may call one of its own restartable modules by bare name on `host.call
 The host's lifecycle model is one direct projection:
 
 ```
-claim → { verifiedBundle, realm, pureModules, fsScope, signingScope }
+claim → { verifiedBundle, realm, pureModules, fsScope }
 ```
 
-The realm is the only inbound entry. `pureModules` is a private name-to-instance map captured by that realm's seam. `fsScope` is derived host-side from the verified manifest's `app` label, and `signingScope` from that label or — for the slot reaching `link` — the constant `DOMAIN_link_scope` domain. Neither is chosen by guest code. A slot can own several claims; each points to the same value.
+The realm is the only inbound entry. `pureModules` is a private name-to-instance map captured by that realm's seam. `fsScope` is derived host-side from the verified manifest's `app` label, and the seam's signing scope from that label or — for the slot reaching `link` — the constant `DOMAIN_link_scope` domain. Neither is chosen by guest code. A slot can own several claims; each points to the same value.
 
 The host also retains installed slots for administration and initiator-only bundles, but that collection is not a second routing model: dispatch is always one `claim → slot` lookup, and each claim has one active owner (§12.10).
 

@@ -320,23 +320,18 @@ func authorsPolicy(ids ...[]byte) string {
 // §12.10), which is why this lives in a _test file.
 const testGuestSeamJS = `
 "use strict";
-globalThis.__buildGuestSeam = function (names, calls, scope) {
+globalThis.__buildGuestSeam = function (names, callLocal, scope) {
   globalThis.__guestSeam = createGuestSeam({
-    // Per NODE.
-    platform: { sodium },
-    // Per REALM: the declared names straight through — a host call resolves iff the
-    // name's SERVICE is one of these (or crypto/*, or one of the bundle's own modules
-    // — never grants), and every other name here is a LOCAL service id (§12.10) — plus
-    // the backends behind them.
-    grants: {
-      names,
-      signScope: scope || undefined,
-      fs,
-      // The routing a local service id resolves through: the shell's, in production.
-      // Absent here means nothing claims any id, which the seam reports by name rather
-      // than leaving the caller pending.
-      calls: calls || { call: () => null },
-    },
+    sodium,
+    // The declared names straight through: a host service's methods are wired iff it is
+    // one of these, and every other name here is a LOCAL service id (§12.10).
+    requires: names,
+    // What this node can back; only the declared ones are wired.
+    backends: { node: scope || undefined, fs },
+    // The routing a local service id resolves through: the shell's, in production.
+    // Absent here means nothing claims any id, which the seam reports by name rather
+    // than leaving the caller pending.
+    callLocal: callLocal || (() => null),
     // Per APP: no app behind this harness, so a bare name reaches nothing. Nothing to
     // scope either — the seam is wired against ONE app's module map, so "a guest
     // reaches only its own modules" needs no argument here to stay true.
@@ -384,7 +379,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 		`(async () => {
 			globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
 				deadlineMs: __deadlineMs || undefined });
-			// The test driver's twin of the shell's callSlot: the host's 32 zero-byte
+			// The test driver's twin of the shell's enter: the host's 32 zero-byte
 			// caller id in front of the guest's own op framing (composed here, since the
 			// host writing it would learn the guest's vocabulary).
 			globalThis.__realmCall = (op, arg, causalClock) => {

@@ -35,11 +35,19 @@ export const withTestBudget = (seam) => (name, payload) =>
   seam(name, payload, new CallBudget(Infinity, undefined, undefined));
 export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
-export const TEST_CALLS = { call: () => null };
+/** Local service routing under which nothing claims any id. */
+export const TEST_CALL_LOCAL = () => null;
 export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
 /** Is this realm argument the host's wake event (§12.3)? */
 export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
+/** A stand-in behind every host service, so a test seam may declare any of them. */
+export const testBackends = () => ({
+  node: appSignScope(sodium.crypto_sign_keypair(), "test"),
+  fs: new MemoryFs(),
+  timer: TEST_TIMERS,
+  link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
+});
 export const enc = new TextEncoder();
 export const { NodeFs } = await imp("build/services/fs-node.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");

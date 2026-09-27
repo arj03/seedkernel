@@ -5,7 +5,6 @@ import { type LoadedBundle, type PureModules } from "./bundle.js";
 import { isOccupiedService } from "../services/domains.js";
 import { DEFAULT_MAX_APP_SLOTS } from "./wasm-limits.js";
 import type { Fs } from "../services/fs.js";
-import type { SignScope } from "./guest-seam.js";
 import type { Realm } from "./realm-queue.js";
 import type { RealmTimers } from "./realm-timers.js";
 
@@ -20,8 +19,6 @@ export interface AppSlot {
   fsScope?: Fs;
   /** The fs prefix this slot's view is scoped under (`appScopeFor`). */
   appScope: string;
-  /** The one scope `node/sign`/`node/verify` are wired to (`slotSignScope`). */
-  signingScope: SignScope;
   realm: Realm | null;
   /** Set once the freshness mark and claims have committed; until then the seam refuses
    *  every call (`seamFor`). */

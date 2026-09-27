@@ -17,7 +17,7 @@ import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { testkit } from "./testkit.mjs";
 import {
-  sodium, generateKeyPair, JsModuleLoader, bootShell, bootNodeShell, TransportHost,
+  sodium, generateKeyPair, JsModuleLoader, bootShell, bootNodeShell,
   toHex, fromHex, concatBytes, writeU32BE, hybridAuthorId, FreshnessMarks,
   verifyTestBundle, verifyBundle, loadBundleModules,
   signTestBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
@@ -196,28 +196,14 @@ async function testManifestClaimIsTheRouting() {
   }).blob;
   let realmBuilds = 0;
   const identity = generateKeyPair();
-  let routeDeliver;
-  const routeInbound = TransportHost.prototype.routeInbound;
-  TransportHost.prototype.routeInbound = function (deliver) {
-    routeDeliver = deliver;
-    return routeInbound.call(this, deliver);
-  };
-  let shell;
-  try {
-    shell = await bootTestShell({
-      identity,
-      transport: {},
-      createRealm: async () => {
-        realmBuilds++;
-        return { call: async () => new Uint8Array(), dispose() {} };
-      },
-      admit: admitAll,
-    });
-  } finally {
-    TransportHost.prototype.routeInbound = routeInbound;
-  }
-  shell.uninstall(shell.resolve("_net"));
-  realmBuilds = 0;
+  const shell = await bootTestShell({
+    identity,
+    createRealm: async () => {
+      realmBuilds++;
+      return { call: async () => new Uint8Array(), dispose() {} };
+    },
+    admit: admitAll,
+  });
   try {
     const key = "store";
     await shell.install(blob(author, "store", 1, ["seedstore/v1"]));
@@ -326,26 +312,36 @@ async function testManifestClaimIsTheRouting() {
       assert(threw, "a name claimed twice in the SAME list is still refused");
     }
     // The property that actually matters: a name in `services` is unreachable from a
-    // PEER while the SAME bundle's `protocols` name is — checked through the real
-    // delivery callback wired through `TransportHost.routeInbound`, rather than by
-    // inspecting the claim table or entering the shell through a second test-only method.
+    // PEER while the SAME bundle's `protocols` name is — checked through the transport's
+    // own `link/deliver`, rather than by inspecting the claim table. A node of its own,
+    // since this one's transport is gone; its realms echo the payload after the caller.
     {
       const pub = "reach/public", priv = "_reach-private";
-      const reachKey = "reach";
-      await shell.install(authorBundle(sodium, author, {
-        app: "reach", version: 1, protocols: [pub], services: [priv],
-        modules: [], guestSource: GUEST_TEXT, guestRequires: [],
-      }).blob);
-      // The route takes the realm argument whole: `[attribution 32][payload …]`, which is
-      // what the occupant's own `link/deliver` body already holds (transport-host.ts).
-      const framed = concatBytes([new Uint8Array(32).fill(0x11), new Uint8Array([1, 2, 3])]);
-      assert(typeof routeDeliver === "function", "the shell wires inbound delivery through the transport route");
-      const publicAnswer = routeDeliver(pub, framed);
-      assert(publicAnswer !== null, "a name in `protocols` is reachable by a peer");
-      await publicAnswer;
-      assert(routeDeliver(priv, framed) === null,
-        "the same bundle's `services` name is unreachable by a peer, however it is spelled");
-      shell.uninstall(reachKey);
+      const seams = [];
+      const node = await bootTestShell({
+        identity,
+        transport: {},
+        createRealm: async (o) => {
+          seams.push(o.hostCall);
+          return { call: async (input) => input.slice(32), dispose() {} };
+        },
+        admit: admitAll,
+      });
+      try {
+        await node.install(authorBundle(sodium, author, {
+          app: "reach", version: 1, protocols: [pub], services: [priv],
+          modules: [], guestSource: GUEST_TEXT, guestRequires: [],
+        }).blob);
+        // The boot transport stood first. Its `link/deliver` body is `[claimLen u8][claim]`
+        // then the realm argument whole: `[attribution 32][payload …]`.
+        const deliver = withTestBudget(seams[0]);
+        const framed = concatBytes([new Uint8Array(32).fill(0x11), new Uint8Array([1, 2, 3])]);
+        const to = (claim) => concatBytes([Uint8Array.of(claim.length), enc.encode(claim), framed]);
+        assertEqual([...await deliver("link/deliver", to(pub))], [1, 2, 3],
+          "a name in `protocols` is reachable by a peer");
+        assertEqual((await deliver("link/deliver", to(priv))).length, 0,
+          "the same bundle's `services` name is unreachable by a peer, however it is spelled");
+      } finally { node.close(); }
     }
   } finally { shell.close(); }
   console.log("  OK\n");

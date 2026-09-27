@@ -48,7 +48,8 @@ const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, CallBudget, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
-const TEST_CALLS = { call: () => null };
+const TEST_CALL_LOCAL = () => null;
+const TEST_LINK = { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) };
 const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
 const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/safe-js.js");
@@ -218,12 +219,16 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
 console.log("\n§12.2 — the service gates cannot be reached by omission");
 {
   const base = {
-    platform: { sodium },
-    grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
+    sodium,
+    backends: {
+      node: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: sodium.crypto_sign_keypair() },
+      fs: new MemoryFs(), timer: TEST_TIMERS, link: TEST_LINK,
+    },
+    callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   };
-  throws(() => createGuestSeam({ ...base }), "omitting grants.names throws at construction");
-  ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: ALL_HOST_SERVICES } }) === "function",
+  throws(() => createGuestSeam({ ...base }), "omitting requires throws at construction");
+  ok(typeof createGuestSeam({ ...base, requires: ALL_HOST_SERVICES }) === "function",
     "an explicit full service set is accepted");
 
   // A guest reaches its own app's modules with NO grant: a bare name is the asking
@@ -234,7 +239,7 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
   const otherModules = await chat.build([{ name: "evil", wasm: withMax }]);
   const scoped = createGuestSeam({
     ...base,
-    grants: { ...base.grants, names: [] },
+    requires: [],
     modules: { names: new Set(["codec"]), call: chatModules.call },
   });
   // The forwarder echoes its input, so a resolved module answers with the body.
@@ -718,11 +723,13 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     };
     const identity = sodium.crypto_sign_keypair();
     const seam = createGuestSeam({
-      platform: { sodium: burningSodium },
-      grants: {
-        names: ALL_HOST_SERVICES, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS,
-        signScope: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },
+      sodium: burningSodium,
+      requires: ALL_HOST_SERVICES,
+      backends: {
+        node: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },
+        fs: new MemoryFs(), timer: TEST_TIMERS, link: TEST_LINK,
       },
+      callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     });
     const meter = () => {

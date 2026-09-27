@@ -1,9 +1,7 @@
-// guest-seam — `host.call(name, bytes)` (§12.2). Ownership of the three deps:
-//   platform — per node (crypto)
-//   grants   — per realm (declared names, scopes, backends); unwired = unreachable
-//   modules  — per app (this bundle's WASM, by logical name)
+// guest-seam — `host.call(name, bytes)` (§12.2). One map per realm, built at construction
+// from what the bundle declares: an undeclared service has no handler at all (§12.1).
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../services/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, serviceOf, isService, type HostTransformName, type HostMethod } from "../services/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, isService, type HostTransformName, type ServiceMethod, type ServiceName } from "../services/domains.js";
 import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, monotonicMs, type CausalClock } from "./realm-queue.js";
@@ -31,12 +29,8 @@ export interface SeamCrypto {
   crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
 }
 
-/** Cross-realm call by a local service id. `null` when nothing claims it. */
-export interface SeamCalls {
-  call(id: string, payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> | null;
-}
-
-/** Raw-link service (§12.1): bytes over an opaque host-minted link id, plus `deliver`. */
+/** Raw links (§12.1): bytes over an opaque host-minted link id. The socket driver's half
+ *  of the `link` service. */
 export interface RawNet {
   /** Open an opaque destination; id 0 means no route (§12.1). */
   open(dest: string): { linkId: number; stream: boolean };
@@ -44,6 +38,10 @@ export interface RawNet {
   send(linkId: number, bytes: Uint8Array): void;
   /** Tear a link down; `graceful` flushes already-written bytes first. */
   close(linkId: number, graceful: boolean): void;
+}
+
+/** The `link` backend: the driver's raw links plus the shell's claim routing. */
+export interface LinkBackend extends RawNet {
   /** Route one request the occupant decoded off its links to the claim's realm, entered
    *  with `[attribution 32][payload …]` (§12.10). An unreachable claim and a failed handler
    *  both answer empty. It enters another realm, so the caller must fire it and return; the
@@ -58,28 +56,19 @@ export interface HostTimers {
   clear(): void;
 }
 
-/** Per-node facts every realm shares; nothing here is gated. */
-export interface SeamPlatform {
-  sodium: SeamCrypto;
+/** What stands behind each host service. */
+export interface SeamBackends {
+  /** This slot's signing scope (`slotSignScope`): signing is never raw. */
+  node: SignScope;
+  /** Already scoped to this app (`scopedFs`). */
+  fs: Fs;
+  timer: HostTimers;
+  link: LinkBackend;
 }
 
-/** Per-realm grants. Non-wiring is the load-bearing gate (§1): a realm handed no `rawNet`
- *  can never acquire one. `names` makes an undeclared name a refusal by name. */
-export interface SeamGrants {
-  /** Exactly the signed `guest.requires` (§12.2): host services and local service ids. A
-   *  host method resolves iff its service is listed; `crypto/*` and module names pass. */
-  names: Iterable<string>;
-  /** This slot's scope for `node/sign`/`node/verify` (`slotSignScope`). Without one, both
-   *  are unavailable: signing is never raw. */
-  signScope?: SignScope;
-  /** The fs backend, already scoped to this app (`scopedFs`). */
-  fs?: Fs;
-  /** Wired only for a bundle requiring `link` (§1). */
-  rawNet?: RawNet;
-  timers: HostTimers;
-  /** How a local service id in `names` is answered. */
-  calls: SeamCalls;
-}
+/** Cross-realm call by a local service id. `null` when nothing claims it. */
+export type LocalCall = (id: string, payload: Uint8Array, deadlineMs?: number,
+  causalClock?: CausalClock) => Promise<Uint8Array> | null;
 
 /** This bundle's own WASM modules, by manifest name. Not a grant: calling one reaches
  *  nothing the guest does not already hold. */
@@ -90,8 +79,14 @@ export interface SeamModules {
 }
 
 export interface GuestSeamDeps {
-  platform: SeamPlatform;
-  grants: SeamGrants;
+  sodium: SeamCrypto;
+  /** Exactly the signed `guest.requires` (§12.2): host services and local service ids. */
+  requires: Iterable<string>;
+  /** What this node can back. Only declared services are read; a declared one missing
+   *  here refuses the seam, so the bundle fails at install rather than on first use. */
+  backends: Partial<SeamBackends>;
+  /** How a declared local service id is answered, resolved at call time. */
+  callLocal: LocalCall;
   modules: SeamModules;
 }
 
@@ -144,12 +139,11 @@ export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
  *  cannot drift. */
 type CryptoName = `crypto/${HostTransformName}`;
 
-/** Every key the dispatch table must cover; a missing or extra handler is a compile error.
- *  Each contains a `/`, which module names cannot (§12.4). */
-type HandlerKey = HostMethod | CryptoName;
-
 /** Argument bytes in, response bytes out, inline or async. */
 type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
+
+/** A resolved name: every one answers a Promise. */
+type Route = (payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>;
 
 /** Residual host-transform table (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
@@ -355,35 +349,17 @@ function u64be(value: number): Uint8Array {
   return out;
 }
 
-/** The host names a guest may call (§12.2). `crypto/*` is ungated; the rest are
- *  authorities. */
-function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
-  const { sodium } = platform;
-  const fs = () => {
-    if (!grants.fs) throw new Error("guest-seam: fs.* used but no fs backend wired");
-    return grants.fs;
-  };
-  const rawNet = () => {
-    if (!grants.rawNet) throw new Error("guest-seam: link.* used but no raw net is wired");
-    return grants.rawNet;
-  };
-  const timers = grants.timers;
-  // Null-prototype, so `handlers["toString"]` is not an inherited function.
-  const handlers: Record<string, SeamHandler> = Object.assign(Object.create(null), {
-    ...hostTransforms(sodium),
-    // Signed under this slot's scope; the guest never picks a namespace.
-    "node/sign": (payload) => {
-      const s = grants.signScope;
-      if (!s) throw new Error("guest-seam: node/sign needs a slot-derived scope (signing is never raw)");
-      return sodium.crypto_sign_detached(scopedSigningInput(s, payload), s.key.privateKey);
-    },
-    // [pk 32][sig 64][msg …] → [ok u8], under this slot's scope. Too short to hold the
-    // prefix throws; an empty msg is legitimate.
+/** Each host service's handlers over its backend (§12.2). A missing or extra method is a
+ *  compile error; every name contains a `/`, which module names cannot (§12.4). */
+const SERVICES: {
+  [S in ServiceName]: (backend: SeamBackends[S], sodium: SeamCrypto) => Record<ServiceMethod<S>, SeamHandler>
+} = {
+  // Signed under this slot's scope; the guest never picks a namespace.
+  node: (s, sodium) => ({
+    "node/sign": (payload) => sodium.crypto_sign_detached(scopedSigningInput(s, payload), s.key.privateKey),
+    // [pk 32][sig 64][msg …] → [ok u8]. Too short to hold the prefix throws; an empty msg
+    // is legitimate.
     "node/verify": (payload) => {
-      const s = grants.signScope;
-      if (!s) {
-        throw new Error("guest-seam: node/verify needs a slot-derived scope (verification is never raw)");
-      }
       if (payload.length < 96) throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
       try {
         return sodium.crypto_sign_verify_detached(payload.subarray(32, 96), scopedSigningInput(s, payload.subarray(96)), payload.subarray(0, 32)) ? ONE : ZERO;
@@ -391,16 +367,18 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return ZERO;
       }
     },
-    "fs/get": (payload) => fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
+  }),
+  fs: (fs) => ({
+    "fs/get": (payload) => fs.get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
     // Views, not copies: the payload is already this call's own, and backends copy.
     "fs/put": (payload) => {
       const klen = readU32BE(payload, 0);
       const key = dec.decode(payload.subarray(4, 4 + klen));
-      return fs().put(key, payload.subarray(4 + klen)).then(() => NONE);
+      return fs.put(key, payload.subarray(4 + klen)).then(() => NONE);
     },
     "fs/list": (payload) => {
       const prefix = payload.length ? dec.decode(payload) : undefined;
-      return fs().list(prefix).then((keys) => {
+      return fs.list(prefix).then((keys) => {
         const head = new Uint8Array(4);
         writeU32BE(head, 0, keys.length);
         const parts = [head];
@@ -413,38 +391,15 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return concatBytes(parts);
       });
     },
-    "fs/delete": (payload) => fs().delete(dec.decode(payload)).then(() => NONE),
-    "fs/size": (payload) => fs().size(dec.decode(payload)).then((sz) => {
+    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => NONE),
+    "fs/size": (payload) => fs.size(dec.decode(payload)).then((sz) => {
       const out = new Uint8Array(4);
       writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
       return out;
     }),
-    "fs/stat": () => fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
-    // Raw bytes over an opaque link id (§12.1); inbound bytes arrive as `handle` events.
-    "link/open": (payload) => {
-      const link = rawNet().open(dec.decode(payload));
-      const out = new Uint8Array(5);
-      writeU32BE(out, 0, link.linkId);
-      out[4] = link.stream ? 1 : 0;
-      return out;
-    },
-    "link/send": (payload) => {
-      rawNet().send(readU32BE(payload, 0), payload.subarray(4));
-      return NONE;
-    },
-    "link/close": (payload) => {
-      rawNet().close(readU32BE(payload, 0), payload[4] === 1);
-      return NONE;
-    },
-    // [claimLen u8][claim][attribution 32][payload …] (§12.10). Detached: the reply is new
-    // work on a shared link, and must not inherit a read's spent budget — a record cut
-    // halfway is a hole in the stream (§12.3). Everything past the claim is already the
-    // realm argument, so it is passed on as a view.
-    "link/deliver": (payload, budget) => {
-      budget.detach();
-      const attrAt = 1 + payload[0];
-      return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
-    },
+    "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
+  }),
+  timer: (timers) => ({
     "timer/arm": (payload) => {
       if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
       timers.arm(readU32BE(payload, 0));
@@ -455,61 +410,43 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
       timers.clear();
       return NONE;
     },
-  } satisfies Record<HandlerKey, SeamHandler>);
-  return handlers;
-}
+  }),
+  // Raw bytes over an opaque link id (§12.1); inbound bytes arrive as `handle` events.
+  link: (net) => ({
+    "link/open": (payload) => {
+      const link = net.open(dec.decode(payload));
+      const out = new Uint8Array(5);
+      writeU32BE(out, 0, link.linkId);
+      out[4] = link.stream ? 1 : 0;
+      return out;
+    },
+    "link/send": (payload) => {
+      net.send(readU32BE(payload, 0), payload.subarray(4));
+      return NONE;
+    },
+    "link/close": (payload) => {
+      net.close(readU32BE(payload, 0), payload[4] === 1);
+      return NONE;
+    },
+    // [claimLen u8][claim][attribution 32][payload …] (§12.10). Detached: the reply is new
+    // work on a shared link, and must not inherit a read's spent budget — a record cut
+    // halfway is a hole in the stream (§12.3). Everything past the claim is already the
+    // realm argument, so it is passed on as a view.
+    "link/deliver": (payload, budget) => {
+      budget.detach();
+      const attrAt = 1 + payload[0];
+      return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
+    },
+  }),
+};
 
-/** The one `host.call` a realm runs against. A refusal (undeclared service, unknown name,
- *  missing module, spent budget) or an inline handler throw throws at the call site; a
- *  round trip that fails rejects. Serialization is the realm's. */
-export function createGuestSeam(deps: GuestSeamDeps): HostCall {
-  const { platform, grants, modules } = deps;
-  // Checked at runtime too: native runs the compiled JS, where types enforce nothing.
-  if (grants.names === undefined) {
-    throw new Error("guest-seam: grants.names is required — pass the manifest's declared guest.requires");
-  }
-  const allowed = new Set(grants.names);
-  const handlers = hostCatalog(platform, grants);
-  // Declared names resolved once. Install keeps modules, local ids and host names disjoint
-  // (bundle.ts), so lookup order decides nothing.
-  const declared = new Map<string, (payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>>();
-  // This slot's private modules, charged to the caller's segment (§4.3).
-  for (const name of modules.names) {
-    declared.set(name, (payload, budget) => modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
-      // The module's own processing time, not wall clock: queue wait behind one worker
-      // would otherwise be charged quadratically.
-      budget.charge(ms);
-      // Null is failure; empty is a module that said nothing (§12.2).
-      if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
-      return bytes;
-    }));
-  }
-  // Every declared name that is not a host service is another realm's service. One that
-  // nothing claims is refused rather than parked forever.
-  for (const id of allowed) {
-    if (isService(id)) continue;
-    declared.set(id, (payload, budget) => {
-      const answer = grants.calls.call(id, payload, budget.remainingMs, budget.causalClock);
-      if (!answer) throw new Error("guest-seam: no realm claims " + id);
-      return answer;
-    });
-  }
-  return (name, payload, budget) => {
-    const route = declared.get(name);
-    if (route) return route(payload, budget);
-    // Host names are gated by their SERVICE: declaring `node` grants `node/sign` and
-    // `node/verify` together.
-    const svc = serviceOf(name);
-    if (svc && !allowed.has(svc)) {
-      throw new Error("guest-seam: " + name + " not declared by the bundle manifest guest.requires");
-    }
-    const fn = handlers[name];
-    if (!fn) throw new Error("guest-seam: no such name " + name);
-    // The synchronous span is host CPU spent for the caller (libsodium runs to completion;
-    // I/O returns a promise at once), so billing it to a timer root's clock (§12.3) needs
-    // no list of which names compute. `finally`, because a rejected tag still did the work.
-    // Not `budget.charge`: this is the root's pacing, not the realm's segment (§4.3).
-    // Only timer roots carry a clock, so the frame path pays nothing.
+/** A host handler as a route. Its synchronous span is host CPU spent for the caller
+ *  (libsodium runs to completion; I/O returns a promise at once), so billing it to a timer
+ *  root's clock (§12.3) needs no list of which names compute. `finally`, because a rejected
+ *  tag still did the work. Not `budget.charge`: this is the root's pacing, not the realm's
+ *  segment (§4.3). Only timer roots carry a clock, so the frame path pays nothing. */
+function charged(fn: SeamHandler): Route {
+  return (payload, budget) => {
     const owner = budget.causalClock;
     if (owner === undefined) return Promise.resolve(fn(payload, budget));
     const at = monotonicMs();
@@ -518,5 +455,54 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     } finally {
       owner.charge(monotonicMs() - at);
     }
+  };
+}
+
+/** The one `host.call` a realm runs against. A refusal (unreachable name, spent budget) or
+ *  an inline handler throw throws at the call site; a round trip that fails rejects.
+ *  Serialization is the realm's. */
+export function createGuestSeam({ sodium, requires, backends, callLocal, modules }: GuestSeamDeps): HostCall {
+  // Checked at runtime too: native runs the compiled JS, where types enforce nothing.
+  if (requires === undefined) {
+    throw new Error("guest-seam: requires is required — pass the manifest's declared guest.requires");
+  }
+  // Every reachable name. Install keeps modules, local ids and host names disjoint
+  // (bundle.ts), so insertion order decides nothing.
+  const routes = new Map<string, Route>();
+  const addHost = (handlers: Record<string, SeamHandler>) => {
+    for (const [name, fn] of Object.entries(handlers)) routes.set(name, charged(fn));
+  };
+  addHost(hostTransforms(sodium));
+  for (const id of new Set(requires)) {
+    // A service is granted whole: declaring `node` wires `node/sign` and `node/verify`.
+    if (isService(id)) {
+      const backend = backends[id];
+      if (backend === undefined) throw new Error(`guest-seam: the bundle requires "${id}", which this node does not provide`);
+      addHost(SERVICES[id](backend as never, sodium));
+      continue;
+    }
+    // Any other declared name is another realm's service. One that nothing claims is
+    // refused rather than parked forever.
+    routes.set(id, (payload, budget) => {
+      const answer = callLocal(id, payload, budget.remainingMs, budget.causalClock);
+      if (!answer) throw new Error("guest-seam: no realm claims " + id);
+      return answer;
+    });
+  }
+  // This slot's private modules, charged to the caller's segment (§4.3).
+  for (const name of modules.names) {
+    routes.set(name, (payload, budget) => modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
+      // The module's own processing time, not wall clock: queue wait behind one worker
+      // would otherwise be charged quadratically.
+      budget.charge(ms);
+      // Null is failure; empty is a module that said nothing (§12.2).
+      if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
+      return bytes;
+    }));
+  }
+  return (name, payload, budget) => {
+    const route = routes.get(name);
+    if (!route) throw new Error("guest-seam: no such name " + name + " (not crypto, a module, or declared in guest.requires)");
+    return route(payload, budget);
   };
 }

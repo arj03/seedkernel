@@ -223,8 +223,10 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	if _, err := qc.Eval("module-budget-seam.js", `
 		globalThis.__seenModuleDeadline = -1;
 		globalThis.__guestSeam = createGuestSeam({
-		  platform: { sodium },
-		  grants: { names: [], calls: { call: () => null } },
+		  sodium,
+		  requires: [],
+		  backends: {},
+		  callLocal: () => null,
 		  modules: {
 		    names: new Set(["probe"]),
 		    call: (_name, _payload, deadlineMs) => {
@@ -559,7 +561,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", `
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
 		__buildGuestSeam(["_net"],
-			{ call: async () => new Uint8Array([9]) });
+			async () => new Uint8Array([9]));
 	`); err != nil {
 		t.Fatal("setup:", err)
 	}
@@ -769,7 +771,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", `
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
 		__buildGuestSeam(["_net"],
-			{ call: () => new Promise(() => {}) });
+			() => new Promise(() => {}));
 	`); err != nil {
 		t.Fatal("setup:", err)
 	}
