@@ -1,4 +1,4 @@
-# seedkernel: a sandboxed app runtime that grows from signed bundles
+# seedkernel: a sandboxed host that grows from apps
 
 Seedkernel runs signed apps in a sandbox (JavaScript or WebAssembly) across browsers, Node and a small native executable. It gives an app controlled access to storage and to authenticated, encrypted peer connections. Every app, the transport included, arrives as a signed bundle on top of a minimal host.
 
@@ -71,7 +71,7 @@ function handle(input) {
 }
 ```
 
-Every invocation receives `[caller 32][payload]` — the peer's key for a peer request, the calling app's id for a local call, zeros for the host — and answers with the bytes it returns. Everything else goes through `await host.call(name, bytes)`: a method of a host service the manifest declares (`fs/get` under `fs`), another app's service id it declares, one of the bundle's own modules by bare name, or a `crypto/*` transform. A build step signs the guest into a bundle, and a host installs and invokes it; [CLIENT §1](docs/CLIENT.md#1-build-and-run-a-bundle) is the whole runnable program.
+Every invocation receives `[caller 32][payload]` and answers with the bytes it returns. The caller is the peer's key for a peer request, the calling app's id for a local call, and zeros for the host. Everything else goes through `await host.call(name, bytes)`: a method of a host service the manifest declares (`fs/get` under `fs`), another app's service id it declares, one of the bundle's own modules by bare name, or a `crypto/*` transform. A build step signs the guest into a bundle, and a host installs and invokes it; [CLIENT §1](docs/CLIENT.md#1-build-and-run-a-bundle) is the whole runnable program.
 
 ## The shape of it
 
@@ -124,7 +124,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 - **Three targets, one implementation.** Seedkernel runs in the browser, on Node/Bun or as a single native binary, with the same admission and confinement on each. A large part of the implementation is shared between all platforms, including a transport bundle and crypto blobs. Nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
 - **The native node is one 7.5 MB file.** A cgo-free, cross-compiled Go binary with embedded QuickJS and a wasm engine. It is a tenth of what a Bun binary alone costs (~70 MB). The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
 - **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~25 µs; ~110 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
-- **The engine is fast enough for real storage.** Seedstore's write pipeline encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and decodes at ~2.6 GiB/s when every block is present — the same WASM, measured outside the guest. In its tested network configurations, transfer rate and latency dominated ([the overhead, measured](#the-overhead-measured)).
+- **The engine is fast enough for real storage.** Seedstore's write pipeline encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and decodes at ~2.6 GiB/s when every block is present, measured on the same WASM outside the guest. In its tested network configurations, transfer rate and latency dominated ([the overhead, measured](#the-overhead-measured)).
 - **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.3](docs/RUNTIME.md#123-zero-authority-js-realms)).
 - **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
 - **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
