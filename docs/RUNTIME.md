@@ -1,8 +1,8 @@
 # seedkernel: runtime
 
-*The runtime as an app host: performance, the chat demo, and the host's normative surface — host services, the guest-seam ABI, zero-authority JS realms, signed bundles, admission, the node↔node transport, the targets and routing.*
+*The runtime as an app host: performance, the chat demo, and the host's normative surface (host services, the guest-seam ABI, zero-authority JS realms, signed bundles, admission, the node↔node transport, the targets and routing).*
 
-> **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
+> **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set, so a `(§X.Y)` reference points to whichever file below holds that section:
 >
 > [README](../README.md) §1 · [PROTOCOL](PROTOCOL.md) §2–§5, §16 · **RUNTIME §10–§12** · [SECURITY](SECURITY.md) §13–§14
 >
@@ -16,7 +16,7 @@ The message path does **no asymmetric cryptography and no recursion**: routing a
 
 ### 10.1 Where the crypto is now
 
-- **Per connection:** the AKE handshake (§12.6) — one Ed25519 sign + verify, one ephemeral X25519 exchange, and one ML-KEM-768 encapsulation or decapsulation per endpoint.
+- **Per connection:** the AKE handshake (§12.6). Each endpoint makes one Ed25519 signature, one verification and one ephemeral X25519 exchange; the dialer also generates an ML-KEM-768 keypair and decapsulates, and the acceptor encapsulates.
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6).
 - **Per bundle load:** one BLAKE2b-256 hash of the body and verification of both Ed25519 and ML-DSA-65 signatures (§12.4).
 
@@ -28,17 +28,17 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page can reach — minified (`build-min`, excluding the embedded transport) | ~124 KB |
-| the embedded transport bundle (`host/transport-bundle.js` — the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~177 KB |
+| `services/*.js` + hand-written `host/*.js` a page can reach, minified (`build-min`, excluding the embedded transport) | ~114 KB |
+| the embedded transport bundle (`host/transport-bundle.js`: the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~155 KB |
 | libsodium.wasm (core build: the host trust root and current channel fast paths) | 217 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 135 KB |
 | mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
-| **Total browser deployment** | **~669 KB** |
+| **Total browser deployment** | **~637 KB** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, counted inside the transport bundle |
 | QuickJS realm engine (`quickjs/`, loaded only when a guest runs) | ~570 KB |
-| **Native binary**, stripped, per `GOOS`/`GOARCH` — mostly wazero's compiler backend (~4 MB) and the Go runtime (~2.4 MB) | ~7.5 MB |
+| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB) and the Go runtime (~2.4 MB) | ~7.5 MB |
 
-`npm run build` emits the readable `build/` (~482 KB of runtime code) and the comment-stripped `build-min/` (~301 KB) — a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach. It prints the current plain and gzipped totals on every run.
+`npm run build` emits the readable `build/` (~392 KB of JS) and the comment-stripped `build-min/` (~268 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach. It prints the gzipped size before and after minifying on every run.
 
 ---
 
@@ -46,9 +46,9 @@ This is the one place these figures live.
 
 Chat is the smallest complete app, and lives in [seedchat](https://github.com/arj03/seedchat), a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `net-ws`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
 
-- **The bundle** is a guest of a handful of lines whose `handle` forwards its input to one restartable module by name and returns the render bytes. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. Seedchat derives its consent key by hashing the verified WASM bytes it holds.
-- **The page** generates an Ed25519 channel identity, constructs a host (§3), installs a policy approving the authors the user trusts (§12.5), and starts with an empty table. `v1 — text only` and `v2 — text + image + nick` are two bundles under one `(author, app)`; v1→v2 is an install naming that slot, re-stating the `chat` protocol claim (§12.10).
-- **Peers** connect over a WebRTC mesh the transport bundle negotiates through a signaling relay (§12.7); chat rides the transport request plane as `[req][protocolId][type][chatType‖body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
+- **The bundle** is a guest of a couple of dozen lines. A peer's frame goes straight to its one restartable module, whose render bytes are the answer; the page's `send` op goes out through the transport's `_net` service. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. Seedchat derives its consent key by hashing the verified WASM bytes it holds.
+- **The page** generates an Ed25519 channel identity, boots a host (§12.8), installs a policy approving the authors the user trusts (§12.5), and starts with an empty table. `v1` (text only) and `v2` (text, image and nick) are two bundles under one `(author, app)`; v1→v2 is an install naming that slot, re-stating the `chat` protocol claim (§12.10).
+- **Peers** connect over a WebRTC mesh the transport bundle negotiates through a signaling relay (§12.7); chat rides the transport request plane as `[req][protocolId][chatType][body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
 - **Relayed bundles** travel in an `OFFER` frame; the recipient re-verifies both author signatures and applies its own policy (§12.4).
 - **Rendering** leaves the host: the guest returns render bytes to the page, which `postMessage`s them to an iframe sandboxed `allow-scripts allow-forms` with no same-origin access to the page's keys.
 - **The relay** partitions signaling into rooms by URL path (`ws://host:8080/<room>`, default `global`, `[A-Za-z0-9._-]`, ≤128 chars); the page joins one with the transport's `relay` op. A room is not authenticated: its members see its SDP metadata, but cannot impersonate a peer (§12.7).
@@ -65,7 +65,7 @@ The host knows nothing about chat or storage: it offers a fixed, generic surface
 
 ### 12.1 Host services: raw-byte backends
 
-The host provides four **host services** — `node`, `fs`, `timer`, `link` (`HOST_SERVICES`, `services/domains.ts`) — and two ungated name families. All of them move raw bytes; the host never interprets what an app means by them.
+The host provides four **host services**, `node`, `fs`, `timer` and `link` (`HOST_SERVICES`, `services/domains.ts`), and two ungated name families. All of them move raw bytes; the host never interprets what an app means by them.
 
 | Service | Methods | Backs |
 | --- | --- | --- |
@@ -78,24 +78,24 @@ The host provides four **host services** — `node`, `fs`, `timer`, `link` (`HOS
 
 - **A grant is a service.** `guest.requires` (§12.4) lists everything a guest reaches: host services, and the local service ids it calls (§12.10). Which of the two a name is, is one closed-table lookup (`isService`), never a spelling convention. Host services are named by service, never by method; declaring `node` grants `node/sign` and `node/verify` together. Install refuses a method name (`fs/get`) with the service to declare instead, and refuses an unknown service. The seam holds handlers only for declared services, so an undeclared service's methods are unknown names.
 - **An undeclared service is not wired.** An fs-less bundle gets no fs backend at all, not a backend behind a check. A declared service the node cannot back (`fs` on a diskless node) refuses the install.
-- **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms. A name it does hold takes its algorithm's whole standard interface — BLAKE2b's output length and key, the AEAD's associated data — never the subset one bundle uses, so a standard protocol over these algorithms is a bundle, not a host release (`tests/noise-vectors.js` replays published Noise XX vectors through them on both targets).
+- **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms. A name it does hold takes its algorithm's whole standard interface (BLAKE2b's output length and key, the AEAD's associated data), never the subset one bundle uses, so a standard protocol over these algorithms is a bundle, not a host release (`tests/noise-vectors.js` replays published Noise XX vectors through them on both targets).
 - **Time is not a service.** Every realm reads `Date.now()` and `performance.now()` as ordinary ECMAScript intrinsics.
 - **Anything with structure is a pure module**, never host code: WebSocket framing is `ws.wasm` in the transport bundle, erasure coding is an app's `codec.wasm`.
 
 #### fs
 
 - **Every method is asynchronous**, on every backend. `MemoryFs` and the native Go primitive answer in the call and are wrapped to resolve in a microtask.
-- **Keys** satisfy `isSafeFsKey` (`services/fs.ts`): `[A-Za-z0-9._-]+`, minus `.`, `..` and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` — on every OS, and regardless of extension (`NUL.txt` is `NUL`).
+- **Keys** satisfy `isSafeFsKey` (`services/fs.ts`): `[A-Za-z0-9._-]+`, minus `.`, `..` and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, on every OS and regardless of extension (`NUL.txt` is `NUL`).
 - **Scoped to the app label.** The backend a guest reaches prefixes every key with `appScopeFor(app)`, a lowercase-hex hash of the label. `fs/list` with an empty prefix enumerates only that app's keys, `fs/get`/`fs/delete` cannot name another app's, and keys come back stripped of the scope. The scope belongs to the label, not the author (§5).
 - **`fs/stat` is not scoped**: `used`/`available` describe the physical backend.
 - **Backends.** `MemoryFs` (`services/fs-memory.ts`) enforces `DEFAULT_MEMORY_FS_MAX_BYTES` and `DEFAULT_MEMORY_FS_MAX_ENTRIES`; the directory-backed `NodeFs` (`services/fs-node.ts`) takes the medium's own limit. OPFS/IndexedDB is the shape a browser backend fills in.
 
 #### Links
 
-- **A `RawLink`** reports `stream` (1: a byte duplex the caller frames itself; 0: the platform delivers whole messages), and `buffered()` — the bytes it still holds. It carries no codec and no authority. Every `RawLink` is ordered.
-- **An `Arrival`** accompanies a platform-opened link: the label of the listener that accepted it, or `via` — the link it arrived through, which is how a WebRTC data channel names the negotiation link the occupant opened for it (§12.7). Guest-opened links have no `Arrival`.
+- **A `RawLink`** reports `stream` (1: a byte duplex the caller frames itself; 0: the platform delivers whole messages), and `buffered()`, the bytes it still holds. It carries no codec and no authority. Every `RawLink` is ordered.
+- **An `Arrival`** accompanies a platform-opened link: the label of the listener that accepted it, or `via`, the link it arrived through, which is how a WebRTC data channel names the negotiation link the occupant opened for it (§12.7). Guest-opened links have no `Arrival`.
 - **Listeners are labelled.** A `ListenAddress` is `{ label, host, port }`; the label reaches the occupant with every link that listener accepts, and the host never reads it. The shipped transport reads `ws` as RFC 6455 and any other label as length framing.
-- **Socket seams**, each handing a `RawLink` to the driver (`host/transport-host.ts`) through the one `ChannelFactory` seam: `services/net-node.ts` (node:net — one TCP listener per address), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7), and `combineChannels` (`services/socket-seam.ts`) to put several behind one driver; on the native target `net.go`/`sock.go`. The flood bounds are `services/net-limits.ts` (§12.6).
+- **Socket seams**, each handing a `RawLink` to the driver (`host/transport-host.ts`) through the one `ChannelFactory` seam: `services/net-node.ts` (node:net, one TCP listener per address), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7), and `combineChannels` (`services/socket-seam.ts`) to put several behind one driver; on the native target `net.go`/`sock.go`. The flood bounds are `services/net-limits.ts` (§12.6).
 
 ### 12.2 The guest seam: the guest name ABI
 
@@ -125,7 +125,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 | `fs/stat` | (empty) | `[used u64][available u64]` |
 | `fs/size` | key (utf8) | `[size i32]`, −1 if absent |
 | *bare module name* | request bytes, unwrapped | the module's response. An unknown name is refused; a trap, an overrun length or a deadline kill rejects. |
-| `link/open` | `[dest utf8 ..]` — an opaque destination the host resolves against the sockets it can open. The shipped seams read `scheme://host:port[/path]`. | `[linkId u32][stream u8]`. Link 0 means no route, including an unparseable or unroutable destination. |
+| `link/open` | `[dest utf8 ..]`: an opaque destination the host resolves against the sockets it can open. The shipped seams read `scheme://host:port[/path]`. | `[linkId u32][stream u8]`. Link 0 means no route, including an unparseable or unroutable destination. |
 | `link/send` | `[linkId u32][bytes ..]` | (empty) |
 | `link/close` | `[linkId u32][graceful u8]` | (empty) |
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the peer claim map (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
@@ -146,10 +146,10 @@ Each slot has **one** signing scope, derived once at load from admitted facts (`
 
 | Slot | Domain ‖ scope |
 | --- | --- |
-| an ordinary app | `DOMAIN_guest ‖ app_len u8 ‖ app` (`appSignScope`) — the manifest's `app` label, never the author |
+| an ordinary app | `DOMAIN_guest ‖ app_len u8 ‖ app` (`appSignScope`), from the manifest's `app` label, never the author |
 | the slot holding `link` | `DOMAIN_link_scope`, no further scope bytes (`linkSignScope`) |
 
-`node/sign` signs `domain ‖ scope ‖ msg`; `node/verify` checks a caller-named key's signature under the same prefix. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. Raw verification stays host-internal (`SeamCrypto`). The domain family is disjoint (§16.1). Every node running an app under the same label derives the same scope, whoever authored it. The format inside a scope — including the transport's `DOMAIN_channel` tag — is bundle content.
+`node/sign` signs `domain ‖ scope ‖ msg`; `node/verify` checks a caller-named key's signature under the same prefix. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. Raw verification stays host-internal (`SeamCrypto`). The domain family is disjoint (§16.1). Every node running an app under the same label derives the same scope, whoever authored it. The format inside a scope, including the transport's `DOMAIN_channel` tag, is bundle content.
 
 #### Host events
 
@@ -179,7 +179,7 @@ The host enters a realm with its own events. A realm that armed a wake receives 
 | | `local` | our own deliberate shutdown |
 | | `truncated` | the stream just stopped |
 
-The driver prints a reason above severity 0 verbatim as `[transport] link N from <addr> down: <reason>` (`TransportHost.suppressLinkLog` silences it) and hands every reason to `TransportHostOptions.onLinkClosed`.
+The driver prints a reason above severity 0 verbatim as `[transport] link N from <addr> down: <reason>` (`TransportHostOptions.suppressLinkLog` silences it) and hands every reason to `TransportHostOptions.onLinkClosed`.
 
 ### 12.3 Zero-authority JS realms
 
@@ -196,31 +196,31 @@ Three constants reach the guest before its top level runs. All are objects and a
 
 | Constant | Contents | Source |
 | --- | --- | --- |
-| `HOST` | `identity` (the node's public key, 64 lowercase hex — the key `node/sign` signs with), `maxOutstandingHostCalls`, `maxOutstandingHostCallBytes` | the host; fixed for the realm's life. The budgets are advice for pacing; the ceilings still enforce. |
+| `HOST` | `identity` (the node's public key as 64 lowercase hex, the key `node/sign` signs with), `maxOutstandingHostCalls`, `maxOutstandingHostCallBytes` | the host; fixed for the realm's life. The budgets are advice for pacing; the ceilings still enforce. |
 | `APP` | exactly the manifest's signed `guest.config` | the author; the host never merges into it |
 | `LOCAL` | exactly the JSON object passed to this `install(blob, { localConfig })` | the installation; passed unchanged for every slot, not retained, invisible to other bundles |
 
-Runtime facts — the node key, budgets, the signing scope — come only from the host, never from `APP` or `LOCAL`. A guest validates and combines `APP` and `LOCAL` itself.
+Runtime facts (the node key, budgets, the signing scope) come only from the host, never from `APP` or `LOCAL`. A guest validates and combines `APP` and `LOCAL` itself.
 
 #### Resource bounds
 
 Boundedness follows three separate laws:
 
 1. **Retained space uses continuous custody.** Every host-side byte caused by untrusted input has a finite owner from creation to destruction; a handoff reserves in the receiver before releasing the sender.
-2. **Causal lifetime uses a monotone deadline.** One absolute deadline begins at an invocation root and only shrinks through queues and calls. No callee can renew it. The link occupant is the one exception (below).
+2. **Causal lifetime uses a monotone deadline.** One absolute deadline begins at an invocation root and only shrinks through queues and calls. No callee can renew it. The link occupant is the one exception (`ownTurns`).
 3. **Initiation rate uses explicit scheduling.** The realm wake paces the only fresh roots a guest can create for itself. Network-originated roots arrive only over authenticated links and are bounded per invocation; there is no node-wide CPU guarantee.
 
 No operation name relaxes custody; a name may tighten what an owner admits (`fs/put` meets a storage quota), and the owner of a resource enforces its bound, not the dispatcher. Every owner has a complete release path and a default, so a host that configures nothing still bounds its guests:
 
-- **Heap** — the realm's QuickJS runtime is capped: 64 MiB default, `realmMemoryBytes` / `--guest-memory`.
-- **Deadline** — per entrypoint invocation: 5 s default, `guestDeadlineMs` / `--guest-timeout`. Admission resolves one absolute deadline, the tighter of the initiator's live remainder and the callee realm's ceiling. It begins **before** the realm queue and runs through guest execution, host-call waits, socket backlog and a deferred answer. Every `host.call` and cross-realm delivery carries the remainder. A queued invocation keeps its deadline and is rejected rather than given a fresh segment. Installation-time evaluation runs under the configured ceiling. `Infinity` disables a realm's local ceiling but cannot widen a finite deadline handed to it. Every reading is monotonic (`performance.now`). Both targets enforce it with QuickJS's interrupt handler; an interrupted guest throws and the realm survives.
+- **Heap:** the realm's QuickJS runtime is capped at 64 MiB by default, `realmMemoryBytes` / `--guest-memory`.
+- **Deadline:** per entrypoint invocation, 5 s by default, `guestDeadlineMs` / `--guest-timeout`. Admission resolves one absolute deadline, the tighter of the initiator's live remainder and the callee realm's ceiling. It begins **before** the realm queue and runs through guest execution, host-call waits, socket backlog and a deferred answer. Every `host.call` and cross-realm delivery carries the remainder. A queued invocation keeps its deadline and is rejected rather than given a fresh segment. Installation-time evaluation runs under the configured ceiling. `Infinity` disables a realm's local ceiling but cannot widen a finite deadline handed to it. Every reading is monotonic (`performance.now`). Both targets enforce it with QuickJS's interrupt handler; an interrupted guest throws and the realm survives.
 - **The link occupant's turns are its own** (`ownTurns`). A caller's remainder bounds the caller's wait and the time its request queues, but the occupant runs each invocation on its own ceiling, and a `link/deliver` answer resumes it as a new turn.
 - **Module calls** run under the calling segment's remaining time and are killed at the engine when it runs out (§4.3).
 - **One wake per realm.** The host retains at most one armed wake and one notification in flight, each the fixed `wake` event. The guest reads its own clock to find what is due. A due successor waits for the previous wake invocation to settle. Replacement is transactional, clear cancels, disposal closes permanently; none retracts a notification already handed over. A wake handler must return before waiting for work that needs another wake.
 - **Clock share for self-initiated work.** Each timer fire receives a host-only causal clock, restored whenever that root's continuations run and carried through host calls, module calls, `link/deliver` and cross-realm calls, awaited or not. It debits **execution**: QuickJS segments, the measured CPU of module calls, and the synchronous span of host-service calls; time parked on I/O is free. A realm banks one invocation's budget and earns credit at `1 / SELF_INITIATED_CLOCK_DIVISOR` (twice `DEFAULT_MAX_APP_SLOTS`). A wake due with the share spent is **slipped**, never failed or dropped. Attribution is per turn: roots live in one realm share its account. A full node's summed self-initiated execution is at most half a CPU after the initial bank (`tests/verify-hardening.mjs`).
-- **Outstanding host calls** — at most 256 unresolved calls and 16 MiB of copied input per realm (`DEFAULT_MAX_OUTSTANDING_HOST_CALLS`, `DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES`), plus a response's bytes while it coexists with its request. The id, count slot and width are admitted together, before the copy leaves QuickJS. A response is charged when it is delivered. Release paths: settlement, the handoff deadline, disposal (which also clears their armed deadlines).
+- **Outstanding host calls:** at most 256 unresolved calls and 16 MiB of copied input per realm (`DEFAULT_MAX_OUTSTANDING_HOST_CALLS`, `DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES`), plus a response's bytes while it coexists with its request. The id, count slot and width are admitted together, before the copy leaves QuickJS. A response is charged when it is delivered. Release paths: settlement, the handoff deadline, disposal (which also clears their armed deadlines).
 - **The realm-entry queue** has no depth of its own: every entry borrows its bytes and population from a bounded upstream owner (the driver's inbound window, the calling realm's call registry, an explicit host owner) and keeps its admission deadline.
-- **Realms** — at most `DEFAULT_MAX_APP_SLOTS` slots, refused at `install`; a replacement retires one as it installs one.
+- **Realms:** at most `DEFAULT_MAX_APP_SLOTS` slots, refused at `install`; a replacement retires one as it installs one.
 
 **Operator knobs.** Heap and deadline cross every seam: CLI flag, `bootNodeShell()`, `bootShell`, `InstallOptions`, `RealmFactory`. `--guest-timeout 0` means no budget; a value that is not a whole number is refused. `bootShell` refuses a heap below 1 byte or from 2³², and a budget under 1 ms. Each `install` resolves its limits from its own option, then the `bootShell` default, then the shared default; a replacement resolves its own rather than inheriting. Execution time is the operator's number, never the manifest's.
 
@@ -237,7 +237,7 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 ```
 
 - Every length is an unsigned 32-bit big-endian byte count. There are no filenames. Missing fields or trailing bytes reject the bundle.
-- **Both signatures** — Ed25519 and ML-DSA-65 — are over `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ BLAKE2b-256(body)`; `DOMAIN_manifest` is prepended, not stored. **Both must verify.** The verifier authenticates the body before interpreting any of it.
+- **Both signatures**, Ed25519 and ML-DSA-65, are over `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ BLAKE2b-256(body)`; `DOMAIN_manifest` is prepended, not stored. **Both must verify.** The verifier authenticates the body before interpreting any of it.
 - **Suite.** Only `0x02` is supported. Another id is refused with its own error, distinct from a bad signature. Suite ids are never reused.
 - **Author id** = `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`, 32 bytes. Policy entries, revocations and freshness marks are written against it.
 - **Author keys from one seed.** `hybridAuthorKeysFromSeed` (offline-only `scripts/bundle-author.ts`) derives the Ed25519 half from a 32-byte seed and the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)`. The label is frozen. Pass the 32-byte seed, not libsodium's 64-byte secret key.
@@ -262,14 +262,14 @@ The host reads no WASM custom sections; conventions such as seedchat's `ui` and 
 
 `install(blob, options)` runs three phases. Failures throw to the operator.
 
-*Verify* — pure, nothing lands:
+*Verify* (pure, nothing lands):
 
 1. Read the fixed-width suite, keys and signatures; hash the body and verify both signatures. Invalid ⇒ reject.
 2. Parse and validate the manifest, then read the guest and modules in manifest order. Truncation or trailing bytes ⇒ reject.
 
-*Admit* — governance:
+*Admit* (governance):
 
-3. Ask the host's gates — author revoked? version below the `(author, app)` mark? — then, for an ordinary app, the admission predicate once (§12.5).
+3. Ask the host's gates (author revoked? version below the `(author, app)` mark?), then, for an ordinary app, the admission predicate once (§12.5).
 
 *Construct and commit*:
 
@@ -292,7 +292,7 @@ The predicate is not re-asked at commit. Atomicity is specified in Atomic load a
 
 - **Gates.** Every bundle clears revocation, then freshness, before any predicate and again at commit. The host composes them in front of whatever the operator configured; `admitAll` still has both.
 - **The predicate** is `admit(v: VerifiedBundle) → bool | Promise<bool>`: `true` admits, `false` rejects, a throw rejects with a reason. It is a pure function of the verified bundle. `authorAllowlist`, an interactive consent dialog and `admitAll` are constructors of it; further checks compose as ordinary functions. An absent predicate is `denyAll`.
-- **Link bundles** skip the predicate: `link` is authorized only by boot selection or by replacing its current owner (below).
+- **Link bundles** skip the predicate: `link` is authorized only by boot selection or by replacing its current owner.
 - **Contests are not gates.** Whether a label, claim or the `link` binding is free is answered by the slot table, before the candidate's code runs and again at commit (§12.10).
 
 #### Install and replacement
@@ -301,7 +301,7 @@ The predicate is not re-asked at commit. Atomicity is specified in Atomic load a
 - **`install(blob, { replaces: app })`** runs the same sequence and atomically takes over that slot, across authors and labels. An app candidate still needs the predicate. A candidate requiring `link` is authorized only if the named predecessor owns `link`.
 - A replacement may take the predecessor's label and claims, never unrelated claims nor a label a third slot holds. Claims the new manifest drops are released. The target is captured at call time and checked again at commit, so a concurrent update, uninstall or shutdown fails the stale replacement. Any failure leaves the current owner running. Replacement works at the slot ceiling.
 - Scopes follow the label and the freshness mark follows the author (§5). Old invocation handles become invalid.
-- **`reachesLink(manifest)`** — `guest.requires` contains `link` — is the one test the installer, the binding, the wiring and the signing scope use.
+- **`reachesLink(manifest)`** (`guest.requires` contains `link`) is the one test the installer, the binding, the wiring and the signing scope use.
 
 #### Boot transport
 
@@ -317,7 +317,7 @@ The predicate is not re-asked at commit. Atomicity is specified in Atomic load a
 
 `authors` is required; an empty array denies all apps. Malformed ids, unknown keys and malformed JSON fail boot. **Omitting `--policy` denies ordinary app installs**; it does not disable an enabled transport.
 
-Sensitive protocol and service names are pinned to approved owners (author and `app` label) inside the predicate — [CLIENT](CLIENT.md#the-assembly-is-an-export) has an example. A pin reserves ownership, not availability, and changing admission rules evicts no installed slot.
+Sensitive protocol and service names are pinned to approved owners (author and `app` label) inside the predicate; [CLIENT](CLIENT.md#the-assembly-is-an-export) has an example. A pin reserves ownership, not availability, and changing admission rules evicts no installed slot.
 
 #### Revocation
 
@@ -343,7 +343,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 
 #### Handshake
 
-Three messages, then records. A message is a bare body — no type byte.
+Three messages, then records. A message is a bare body with no type byte.
 
 ```
 msg1  i→r   [suite: 1][eph_i: 32][kem_pk_i: 1184]
@@ -369,17 +369,17 @@ sig_i   = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
 h3      = H(h2 ‖ msg3)
 k_i2r, k_r2i = KDF(ee ‖ pq ‖ contact, h3, "…i->r-v1\0" / "…r->i-v1\0")
 
-Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   — node/sign; the prefix is the host's
+Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   (node/sign; the prefix is the host's)
 ```
 
 - **Parsing is by state.** The initiator reads msg2, the responder msg1 then msg3, and everything after authentication is a record. Each handshake message is accepted only at its exact width.
 - **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret and network key are KDF inputs.
 - **Suite `0x03`** is the only suite: Ed25519 identity, ephemeral X25519 + ML-KEM-768, contact secret, ChaCha20-Poly1305 records. An unrecognised id draws silence. There is no list, fallback or negotiation. `suite` is folded into `h1`, so both signatures cover it.
-- **A dial pins its peer, and the receiver's key never travels.** `sig_r` is checked against the key the caller dialed; `id_r` is in the signed message but not on the wire. A signature under any other key — including the caller's own — closes the link before the caller names itself.
+- **A dial pins its peer, and the receiver's key never travels.** `sig_r` is checked against the key the caller dialed; `id_r` is in the signed message but not on the wire. A signature under any other key, including the caller's own, closes the link before the caller names itself.
 - **Ordering.** An accepting node sends nothing until a msg1 opens under its contact secret. The receiver proves itself at msg2; the caller names itself at msg3, only to a receiver it has verified.
 - **Signatures** cover `DOMAIN_channel ‖ root ‖ transcript ‖ own id` under the host's `DOMAIN_link_scope`; `sig_r`'s transcript chains the suite, both ephemerals, the KEM key and ciphertext, and `sig_i`'s all of msg2 besides. The initiator authenticates the responder at msg2 (1 RTT) and sends its first records behind msg3; the responder authenticates the initiator at msg3 (1.5 RTT).
-- **Refusals before msg3 are silent.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until the deadline. A caller the peer lint declines at msg3 is closed at once: it has verified the receiver, so silence would conceal nothing. An initiator's rejection at msg2 — a bad signature, its own key, the peer lint — closes.
-- **Pre-auth sends** are queued oldest-dropped under both `MAX_QUEUE_BYTES` and `maxPreAuthQueueSlices`. When the link goes before authenticating — a dial that dies, or the loser of the double-connect tie-break — the queue passes to another link to the same peer.
+- **Refusals before msg3 are silent.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until the deadline. A caller the peer lint declines at msg3 is closed at once: it has verified the receiver, so silence would conceal nothing. An initiator's rejection at msg2 (a bad signature, its own key, the peer lint) closes the link.
+- **Pre-auth sends** are queued oldest-dropped under both `MAX_QUEUE_BYTES` and `maxPreAuthQueueSlices`. When the link goes before authenticating (a dial that dies, or the loser of the double-connect tie-break), the queue passes to another link to the same peer.
 - **Double connect.** Two nodes dialing each other keep the link the smaller identity dialed. Only the loser's dialer closes it: a dialer sends behind msg3, before the far end has chosen, so the accepting end stops routing to the loser but reads it until the dialer's end-of-stream record. If the winner goes first, the loser routes again.
 
 #### 12.6.1 Records and link teardown
@@ -394,10 +394,10 @@ Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   — node/sign; the prefix is the ho
 
 - **No asymmetric cryptography before proof.** An accepting link generates its X25519 and ML-KEM keypairs only once a msg1 opens.
 - **Three budgets**: `MAX_HALF_OPEN_UNVERIFIED` (1024) until msg1 opens, `MAX_HALF_OPEN_VERIFIED` (256) until the identity is proved, `MAX_AUTHED_LINKS` (256) for the link's life.
-- **Every budget evicts; none refuses the newest.** The half-open tiers shed their oldest occupant; the authed tier sheds its quietest — a record crossing a link re-books it at the tail.
+- **Every budget evicts; none refuses the newest.** The half-open tiers shed their oldest occupant; the authed tier sheds its quietest, since a record crossing a link re-books it at the tail.
 - **A proved msg1 is spent.** The initiator's ephemeral key is remembered (4,096, drop-oldest) and a second sighting draws silence before promotion or asymmetric work. Only proved msg1s are remembered.
 - **`MAX_HALF_OPEN_PER_SOURCE` (8)** spans all three tiers and is not evictable: an address at its limit is refused rather than pushing another address out.
-- **Three deadlines**: `UNVERIFIED_TIMEOUT_MS` until msg1 opens, `HANDSHAKE_TIMEOUT_MS` for the rest, `LINK_IDLE_TIMEOUT_MS` after — an authenticated link carrying no traffic either way is retired with the authenticated goodbye, and the address book redials on the next send.
+- **Three deadlines**: `UNVERIFIED_TIMEOUT_MS` until msg1 opens, `HANDSHAKE_TIMEOUT_MS` for the rest, `LINK_IDLE_TIMEOUT_MS` after. An authenticated link carrying no traffic either way is retired with the authenticated goodbye, and the address book redials on the next send.
 
 Measured behaviour: `tests/transport-load.test.mjs`.
 
@@ -412,18 +412,18 @@ Measured behaviour: `tests/transport-load.test.mjs`.
 
 The host driver keeps its own coarse bounds beneath the transport's, on structures a socket costs the moment it is accepted:
 
-- **`MAX_LINK_READ_BYTES` (2 MiB)** caps one read handed to the occupant — a platform-framed message whole — and fails the link past it, before the copy into the realm. The occupant's frame cap must fit under it. The byte windows below are sized in it.
+- **`MAX_LINK_READ_BYTES` (2 MiB)** caps one read handed to the occupant (a platform-framed message whole) and fails the link past it, before the copy into the realm. The occupant's frame cap must fit under it. The byte windows below are sized in it.
 - **`DEFAULT_MAX_RAW_LINKS` (4096)** bounds the link table on the one path that mints a link id, and **refuses** rather than evicts (`TransportHostOptions.maxRawLinks`).
 - **`MAX_INBOUND_HOLD_BYTES` / `MAX_INBOUND_HOLD_SLICES`** are one driver-wide budget for reads admitted toward the transport realm, charged while held and while dispatched. The link whose next read crosses a ceiling is failed; reservations release when the dispatched call settles or held input is dropped. The native reader goroutine charges the same ceiling again on its staging copy and **waits** instead of failing, so native inbound memory is bounded at twice this figure.
 - **WebRTC negotiation** has no bound of its own: each peer connection is two entries under `DEFAULT_MAX_RAW_LINKS`, what the occupant writes to one is outbound custody, and what the platform emits is an ordinary read (§12.7).
-- **`MAX_OUTBOUND_QUEUE_BYTES` / `_SLICES`** per link and **`MAX_NODE_OUTBOUND_QUEUE_BYTES` / `_SLICES`** (4× each) node-wide bound authenticated writes waiting below the transport; the guest applies the same window to frames on its encryption chain. One custody period per link spans the adapter's pre-open buffer and the platform's send backlog: the charge is `RawLink.buffered()` (`writableLength` on Node, `bufferedAmount` in the browser, an exact queue on native), and the driver retires the drained prefix of the admitted sizes at each write. An adapter that cannot report fails its link. Crossing any ceiling — or the occupant's own `host.call` budget refusing a write — fails the whole link, never one record.
+- **`MAX_OUTBOUND_QUEUE_BYTES` / `_SLICES`** per link and **`MAX_NODE_OUTBOUND_QUEUE_BYTES` / `_SLICES`** (4× each) node-wide bound authenticated writes waiting below the transport; the guest applies the same window to frames on its encryption chain. One custody period per link spans the adapter's pre-open buffer and the platform's send backlog: the charge is `RawLink.buffered()` (`writableLength` on Node, `bufferedAmount` in the browser, an exact queue on native), and the driver retires the drained prefix of the admitted sizes at each write. An adapter that cannot report fails its link. Crossing any ceiling, or the occupant's own `host.call` budget refusing a write, fails the whole link, never one record.
 - **Teardown severs the wire first.** `close`/`abort` cut the wire synchronously, failing any parked write, then run the queued teardown; the link leaves routing at once.
 
 `buffered()` is host-only accounting; it is not exposed to guests.
 
 #### 12.6.2b One master seed, one identity
 
-A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity — the peer id, `senderPk`, and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2).
+A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity: the peer id, `senderPk` and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2).
 
 #### 12.6.3 The contact secret, the network key, and the peer list
 
@@ -431,7 +431,7 @@ A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` deriv
 | --- | --- | --- | --- |
 | **Contact secret** | per node | yes | A caller that cannot produce the receiver's secret draws no response. Distributed with the node's address. Absent (32 zero bytes), the node is open. Mixed at msg1 with the initiator's ephemeral and into every later key. |
 | **Network key** | per deployment | **no, public** | Seeds the transcript root, so every key and signature preimage differs between networks and a cross-network handshake fails at msg1. Isolation, not access control. |
-| **`admitPeers`** | per node | n/a | Optional peer list, applied as a lint to signature-verified identities only — at msg3 when accepting, closing the link, and at msg2 when dialing. It controls admission, not concealment: to stay invisible to scanners, set a contact secret. Empty by default in the signed `APP`; overridable in `LOCAL`. |
+| **`admitPeers`** | per node | n/a | Optional peer list, applied as a lint to signature-verified identities only: at msg3 when accepting, closing the link, and at msg2 when dialing. It controls admission, not concealment: to stay invisible to scanners, set a contact secret. Empty by default in the signed `APP`; overridable in `LOCAL`. |
 
 The transport enforces all three; a malicious transport can bypass the lint or fabricate attribution (§14). Revocation is key rotation: rotate a contact secret to drop a peer, a network key to split a network.
 
@@ -440,7 +440,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - The transport reads `networkKey` and `contactSecret` from `LOCAL` as 64 lowercase hex, rejects malformed values at load, and defaults each to 32 zero bytes (the public network, an open node).
 - Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ transport: { config } })` passes operator overrides as that load's `localConfig`.
 - Its identity comes from `HOST.identity`, never from config.
-- Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings — this transport's own grammar (`peerRef`, `core.js`), refused at load when malformed — and through `addr` calls.
+- Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls.
 - The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret from the address book; a WebRTC link presents this node's own, since the members of a room share one (§12.7).
 - The host-only `relay` op (one text: a `ws://`/`wss://` room URL, empty to leave) joins a WebRTC signaling room, and `relayState` answers `[u8]`: 0 none joined, 1 its link is up, 2 redialing. `iceServers` (`RTCConfiguration.iceServers` as JSON, `LOCAL ?? APP`, empty by default) is handed to every peer connection.
 
@@ -452,8 +452,8 @@ A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCP
 
 | Tag | Up (host → occupant) | Down (occupant → host) |
 | --- | --- | --- |
-| `o` | the local offer's SDP | a remote offer's SDP — answering side only |
-| `a` | the local answer's SDP | the remote answer's SDP — offering side only |
+| `o` | the local offer's SDP | a remote offer's SDP (answering side only) |
+| `a` | the local answer's SDP | the remote answer's SDP (offering side only) |
 | `c` | a local candidate | a remote candidate |
 | `s` | the connection state | — |
 | `r` | — | restart ICE (empty) |
@@ -461,11 +461,11 @@ A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCP
 - A candidate is its `candidate`, `sdpMid`, `sdpMLineIndex` and `usernameFragment`, NUL-separated, an absent one empty.
 - **Only the offering side offers.** Its `negotiationneeded` sets and sends a local offer; the answering side answers what it is given and never offers, so there is no glare. Down messages apply in order, a candidate never ahead of its description; up, a candidate gathered while a description is being set follows it. A malformed or out-of-role message fails the link.
 - **Bounds are the driver's.** Each link is an entry under `DEFAULT_MAX_RAW_LINKS`; down messages not yet applied are the negotiation link's `buffered()` backlog, so outbound custody bounds them (§12.6); up messages are ordinary reads.
-- **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. Seedstore's `scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
+- **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. Seedstore's `WASM/scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
 
 #### The shipped transport's signaling
 
-- **One room.** The `relay` op (§12.6) opens a `ws://`/`wss://` link to the room — through `WsNetwork` in a browser, or a raw socket and the bundle's own RFC 6455 framing elsewhere — and says hello; a relay that drops is redialed. The relay forwards every binary frame verbatim to the rest of the room.
+- **One room.** The `relay` op (§12.6) opens a `ws://`/`wss://` link to the room (through `WsNetwork` in a browser, or a raw socket and the bundle's own RFC 6455 framing elsewhere) and says hello; a relay that drops is redialed. The relay forwards every binary frame verbatim to the rest of the room.
 - **The relay wire**, UTF-8, NUL-separated: `h from to` (a hello; `to` empty broadcasts), `o`/`a from to sid sdp`, `i from to sid candidate sdpMid sdpMLineIndex usernameFragment`. A broadcast hello is answered once, directed. A frame over `MAX_SIGNAL_BYTES` closes the relay link; a sender outside `admitPeers` is ignored.
 - **Who offers.** The smaller key, as the smaller key's dial wins a TCP double connect. `sid` is the offering side's name for one negotiation, so a new negotiation is told apart from an ICE restart without reading the SDP. On `disconnected` the offering side restarts ICE.
 - **The data link.** The offering side's is the handshake's initiator, pinned to the key the relay named; the answering side's is an accept, under the half-open budgets. Both present this node's own contact secret, which the members of a room share.
@@ -486,7 +486,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
      [--guest-timeout <ms>] [--guest-memory <MiB>]
 ```
 
-- **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order — remedies, then the bundle, then the one-shots, then serve — and every printed line. A target supplies a `CliHost` of five members: files, one console line, raw stdout, entropy, and "stand a node up on this platform". Unknown flags are errors.
+- **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order (remedies, then the bundle, then the one-shots, then serve) and every printed line. A target supplies a `CliHost`: file reads and writes, argv and a banner, one console line, raw stdin and stdout, entropy, and `standUp` to stand a node up on that platform. Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
 - **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. The label reaches the transport with every link the listener accepts, unread (§12.1).
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one.
@@ -503,8 +503,8 @@ The Go/native target (`native/`) is the recommended non-browser deployment: one 
 
 - **Shared code, Go primitives.** `scripts/bundle-native-host.mjs` (`npm run build:native-host`) compiles the shared TypeScript into one `native/host-shell.gen.js`, which the binary `//go:embed`s and evaluates in QuickJS. `host/native-shim.ts` satisfies `PureModuleLoader`, `FreshnessStore`, the channel and realm interfaces by forwarding to Go's byte bridge, then calls the shared `bootShell`. Nothing under `native/` re-implements protocol, admission, routing or boot order; Go supplies only platform primitives.
 - **`bootShell` is the one assembly.** A target supplies `{ sodium, identity, modules, fs, freshnessStore, transport, createRealm }`; all but the first two have defaults.
-- **Embedded engines** over [wazero](https://wazero.io): the same core `libsodium.wasm` and `mldsa65.wasm` as the JS targets; a QuickJS built from the same quickjs-ng v0.16.2 pin as the JS platform (`native/qjs/build-qjs.sh`, `WASM/quickjs/build-quickjs-ng.sh`). Go owns the event loop — timers, the JS job queue, socket delivery. The guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`. Bundle modules, `ws.wasm` included, go through the ordinary private-module builder (§3.2).
-- **Primitives**: `os` for fs (synchronous; `native-shim.ts` wraps it async), `net` for one raw TCP socket kind (node↔node and browser↔node, the codec chosen per link above Go), `crypto/rand` for entropy. The CLI is the shared `runCli` over a Go `CliHost` of `argv`, `readFile`, `writeFile`, `log`, `stdout`, plus `__fs.open` for the data directory.
+- **Embedded engines** over [wazero](https://wazero.io): the same core `libsodium.wasm` and `mldsa65.wasm` as the JS targets; a QuickJS built from the same quickjs-ng v0.16.2 pin as the JS platform (`native/qjs/build-qjs.sh`, `WASM/quickjs/build-quickjs-ng.sh`). Go owns the event loop: timers, the JS job queue, socket delivery. The guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`. Bundle modules, `ws.wasm` included, go through the ordinary private-module builder (§3.2).
+- **Primitives**: `os` for fs (synchronous; `native-shim.ts` wraps it async), `net` for one raw TCP socket kind (node↔node and browser↔node, the codec chosen per link above Go), `crypto/rand` for entropy. The CLI is the shared `runCli` over a `CliHost` built from those primitives, plus `__fs.open` for the data directory.
 - **Native fast paths.** A target may substitute a native implementation of a primitive only if (1) it is standardized, (2) its output is byte-identical, pinned by a known-answer test against the shared blob, and (3) no protocol judgement lives inside it. BLAKE2b-256 and the ChaCha20-Poly1305 record layer are native Go; Ed25519 and ML-DSA-65 verification stay on the shared wasm.
 - **Interop.** A Go node and a Node/Bun node join one cohort against the same signed bundles (`WASM/scripts/native-interop.sh`).
 
@@ -528,13 +528,13 @@ A frame names a **protocol id**, never an app, author or module. Each installed 
 | the raw-link binding | `guest.requires` containing a service with `events` (only `link`) | the driver's raw-link events |
 
 - **One owner per name per book.** A candidate contesting an active claim, label or the binding is refused before commit. Only an install naming the holder in `replaces` takes it over; uninstall releases. A free `link` is taken only by boot selection.
-- **Claim charset**: alphanumeric or `_` first, then alphanumerics and `._/-`, at most 64 bytes. Uniqueness is per list; the same name in both lists is allowed. No spelling is reserved — `_net` is this repo's transport's convention.
+- **Claim charset**: alphanumeric or `_` first, then alphanumerics and `._/-`, at most 64 bytes. Uniqueness is per list; the same name in both lists is allowed. No spelling is reserved; `_net` is this repo's transport's convention.
 - **Peer delivery.** The link occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in `peerClaims` alone and invokes the slot's `handle` with `attribution ‖ payload`. An unclaimed protocol, or a `services`-only name, is answered empty.
 - **Local calls.** `host.call(id, …)` on a local service id in the caller's own `guest.requires` resolves through `localClaims`; the host prepends the caller's 32-byte id and the answer is the callee's `handle` result on a later turn.
 - **Host doors.** `AppHandle.invoke(payload)` is slot-bound (a bundle claiming nothing has one) and prepends 32 zero bytes. `Shell.call(serviceId, payload)` resolves `localClaims` with the host's caller id and returns `null` when nothing claims the name.
-- **The binding.** The driver follows the book, and the host wires the `link` service — the driver's raw links plus its own `deliver` — only into that slot.
+- **The binding.** The driver follows the book, and the host wires the `link` service (the driver's raw links plus its own `deliver`) only into that slot.
 - **`InstallOptions.onInbound(claim, sender, answer)`** fires once a peer-inbound request to this load's slot resolves. It is observation only: it cannot change the answer, never fires for `invoke` or local calls, and a throw from it is reported and swallowed.
 - **One slot per name.** There is no fan-out.
 - A claim grants no authority, but selects which admitted app receives decrypted input (§14).
 
-**Transport replacement** is ordinary slot replacement of the link owner. The candidate loads complete and offside; the host passes its own `LOCAL` unchanged, so the embedder re-supplies the network key (omission selects the public network) and peers — in the replacement's `transport.config.peers` (in that transport's own grammar) or afterwards by an `addr` call through `Shell.call`. At commit the host swaps the slot, its claims and the binding together. The driver keeps its listeners, so inbound links work at once; session keys and the address book are discarded, so peers reconnect.
+**Transport replacement** is ordinary slot replacement of the link owner. The candidate loads complete and offside; the host passes its own `LOCAL` unchanged, so the embedder re-supplies the network key (omission selects the public network) and peers, either in the replacement's `transport.config.peers` (in that transport's own grammar) or afterwards by an `addr` call through `Shell.call`. At commit the host swaps the slot, its claims and the binding together. The driver keeps its listeners, so inbound links work at once; session keys and the address book are discarded, so peers reconnect.

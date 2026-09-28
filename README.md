@@ -5,20 +5,20 @@ Seedkernel runs signed apps in a sandbox (JavaScript or WebAssembly) across brow
 That suits three kinds of work:
 
 - **Hosting third-party extensions.** The operator controls which authors can install code and what each extension can access. Extensions run in isolated slots without direct access to the host's file system, sockets or process.
-- **Distributing app updates as signed bundles.** A release is one blob — manifest, guest and modules under hybrid author signatures — verified at admission, checked against a version floor, and landed as one atomic slot commit. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
+- **Distributing app updates as signed bundles.** A release is one blob (manifest, guest and modules under hybrid author signatures), verified at admission, checked against a version floor, and landed as one atomic slot commit. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
 - **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
 
-**Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand — neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
+**Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand. Neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
 
 ## What it costs
 
 - **More machinery than you need** for an ordinary web app, a single-purpose server, or anything whose author and operator are the same party. A process boundary or a container is the cheaper answer there.
-- **A guest is not a Node or browser environment.** It has ECMAScript intrinsics, four injected globals and one `host.call` seam — no Node APIs, no DOM, no `fetch`, no runtime package imports. Dependencies have to be bundled into flat guest source and must not want any of those. Execution is serialized per realm and bounded in heap and time, so bursty or long work has to fit the deployment's budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
+- **A guest is not a Node or browser environment.** It has ECMAScript intrinsics, four injected globals and one `host.call` seam: no Node APIs, no DOM, no `fetch`, no runtime package imports. Dependencies have to be bundled into flat guest source and must not want any of those. Execution is serialized per realm and bounded in heap and time, so bursty or long work has to fit the deployment's budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
 - **You still write everything above the runtime.** Authorization rules, data model and persistence design, recovery after a realm is discarded, user key management, and the whole UI. What Seedkernel saves you is the runtime and transport plumbing.
 
 ## Status
 
-Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
+Beta: it works on all three targets, and everything measured below was measured on running code, but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
 
 There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Peer authentication and `node/sign` are Ed25519 alone: breaking Ed25519 later would not reveal earlier session keys, which rest on the hybrid X25519 + ML-KEM-768 exchange, but it would let an attacker forge live handshakes until the host's signing interface and the transport bundle are upgraded, and long-lived signed app records need separate consideration. Treat the security properties as design intent, not as verified.
 
@@ -44,7 +44,7 @@ The model has two parts, a host and the bundles it admits. The host runs each bu
 | Component | Role |
 | --- | --- |
 | **Host** | The runtime outside installed bundles: shared JS plus platform adapters, deployed as one artifact per target (§12.9). It verifies and admits bundles, builds their private slots, confines execution through its sandbox engines, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
-| ↳ **Host services** | What a confined app cannot obtain for itself: `node` (signing with the node's private key), `fs` (storage), `timer` (the realm's wake) and `link` (sockets) — the `HOST_SERVICES` set (§12.1). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
+| ↳ **Host services** | What a confined app cannot obtain for itself, the `HOST_SERVICES` set (§12.1): `node` (signing with the node's private key), `fs` (storage), `timer` (the realm's wake) and `link` (sockets). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
 | **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. |
 | ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
 | ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no host imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
@@ -53,9 +53,9 @@ The model has two parts, a host and the bundles it admits. The host runs each bu
 
 The operator chooses which authors may install code and which host services they may receive; the host enforces those grants at admission and at the guest seam. Application-level authorization and behaviour live in the bundles.
 
-There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and it is reached — by the host and by every app — through the local service id it claims (§12.10).
+There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and the host and every app reach it through the local service id it claims (§12.10).
 
-**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the table: `WASM/services/` holds the host services — the `HOST_SERVICES` table, their contracts and their platform backends — and `WASM/host/` holds admission, confinement, routing and the shell. `host/` imports `services/`, never the reverse.
+**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the table: `WASM/services/` holds the host services (the `HOST_SERVICES` table, their contracts and their platform backends), and `WASM/host/` holds admission, confinement, routing and the shell. `host/` imports `services/`, never the reverse.
 
 ## What a guest looks like
 
@@ -109,7 +109,7 @@ The fixed `crypto/*` transforms are a compatibility and performance exception. T
 
 ## The transport is a bundle
 
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)).
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record. The protocol is the same over TCP, WebSocket and WebRTC, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)).
 
 Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 framing in `ws.wasm` and ML-KEM-768 in `mlkem768.wasm`.
 
@@ -133,25 +133,25 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared — one implementation for all three targets (2,354 LOC)**
+**Shared: one implementation for all three targets (2,354 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 480 |
-| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 318 |
-| Guest seam — the guest ABI seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 654 |
-| Node assembly and claim routing (§12.8, §12.10) — the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 379 |
-| Node startup — the operator flow on Node and native: the flag set and its defaults, the order a node boots in, what it prints (§12.8) | `host/cli.ts` | 199 |
-| Host services — the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 324 |
+| Transport driver: channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 318 |
+| Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 654 |
+| Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 379 |
+| Node startup, the operator flow on Node and native (§12.8): the flag set and its defaults, the order a node boots in, what it prints | `host/cli.ts` | 199 |
+| Host services: the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 324 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
-**Per-target platform — the seam, written once per target**
+**Per-target platform: the seam, written once per target**
 
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,281 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs — plus `native-shim.ts` (290) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,214 Go + 357 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (290) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,214 Go + 357 TS |
 
 The transport bundle sits outside these host totals: 1,699 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455 and WebRTC signaling across the targets that support them.
 
@@ -161,7 +161,7 @@ All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, i
 
 The [seedstore](https://github.com/arj03/seedstore) measurements below describe specific workloads, not a general throughput guarantee. Confinement itself costs a per-call worker hop on the JS targets and inline deadline checks on native, measured in §14. The fixed hop can dominate small transforms; larger calls amortize it, and transfer rate and latency dominated the network configurations measured below:
 
-- **The compute-only write pipeline — encrypt, name every block, RS-encode — measured 177–189 MiB/s** in three runs on 2026-09-17 (100 MiB, RS(10,6), 64 KiB blocks, Node 20.11.1). ChaCha20-Poly1305 sealing measured 393–395 MiB/s, author-bound BLAKE2b block IDs 720–733 MiB/s, and SIMD RS encode 1,447–1,482 MiB/s. This benchmark calls host crypto and the codec directly; it does not measure guest scheduling, signing, storage, or transport overhead.
+- **The compute-only write pipeline (encrypt, name every block, RS-encode) measured 177–189 MiB/s** in three runs on 2026-09-17 (100 MiB, RS(10,6), 64 KiB blocks, Node 20.11.1). ChaCha20-Poly1305 sealing measured 393–395 MiB/s, author-bound BLAKE2b block IDs 720–733 MiB/s, and SIMD RS encode 1,447–1,482 MiB/s. This benchmark calls host crypto and the codec directly; it does not measure guest scheduling, signing, storage, or transport overhead.
 - **A read with every block present needs no GF(2⁸) work:** the compute benchmark's concatenation measured 2,339–2,926 MiB/s; reconstructing one missing block measured 1,465–1,682 MiB/s in those runs. These are component measurements, not complete GET rates.
 - **End-to-end throughput depends on framing and concurrency:** three fresh-process runs measured 7.6–8.2 MiB/s PUT and 15.7–16.9 MiB/s GET over a modelled 10 ms request/response RTT (4 MiB, RS(2,2), 32 KiB blocks, 256 KiB logical message cap split into 48 KiB physical chunks, fanoutWindow 32). These runs use the signed transport bundle over an in-process latency fabric, not a bandwidth-limited physical WebRTC link.
 - **Seedstore's codec, reputation module, and guest total ~14 KiB of WASM plus ~15 KiB of gzipped guest JS**, excluding the shared host and bundle metadata. They reuse the libsodium the runtime already loads rather than bundling a second copy of a crypto library. From seedstore's `WASM/` directory, `node tests/bench.mjs` measures compute and `node tests/bench-net.mjs 10 4 32 256 48 32` measures the framed PUT/GET configuration in a fresh process (omit the final `32` for a fanout sweep). Rates above use binary MiB even though the scripts label them MB. Rebuild with `npm run build` before comparing changed seedstore sources.
@@ -175,7 +175,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seedstore also points at. The transport bundle speaks its wire; the host holds only the peer connections (§12.7).
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps: `npm run relay` in seedchat, which seedstore also points at. The transport bundle speaks its wire; the host holds only the peer connections (§12.7).
 
 ## The rest of the spec
 
@@ -190,7 +190,7 @@ This file is §1; the rest of the spec lives in `docs/`, split by concern. READM
 | [CHANNEL](docs/CHANNEL.md) | — | The concealed-identity channel handshake: what the three messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
 | [CLIENT](docs/CLIENT.md) | — | How to write a bundle and the client that hosts it: a runnable first bundle, the manifest declarations an app adds as it grows, dependency setup, node boot, platform adapters, loading and invocation, browser integration traps, and the two existing clients as worked examples. Build guide, not protocol. |
 
-To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. DESIGN, CHANNEL and CLIENT sit outside that sequence — the first two are rationale, the last the guide to building on the runtime.
+To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. DESIGN, CHANNEL and CLIENT sit outside that sequence: the first two are rationale, the last the guide to building on the runtime.
 
 ## Background
 
