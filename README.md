@@ -18,59 +18,60 @@ That suits three kinds of work:
 
 ## Status
 
-Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles. There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Treat the security properties as design intent, not as verified.
+Beta: it works, on all three targets, and everything measured below was measured on running code — but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
 
-## What runs today
-
-- **Three targets, one implementation.** Seedkernel runs in the browser, on Node/Bun or as a single native binary. A large part of the implementation is shared between all platforms including a transport bundle and crypto blobs. Nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
-- **The native node is one 7.5 MB file.** A cgo-free, cross-compiled Go binary with embedded QuickJS and a wasm engine. It is a tenth of what a Bun binary alone costs (~70 MB). The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
-- **Bundles are sandboxed on every target.** Modules receive no I/O at all. A guest can access only the host services and local calls declared in its signed manifest, its private modules, and a fixed set of host transforms.
-- **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~25 µs; ~110 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
-- **The engine is fast enough for real storage.** Seedstore's write pipeline encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and decodes at ~2.6 GiB/s when every block is present — the same WASM, measured outside the guest. In its tested network configurations, transfer rate and latency dominated ([the overhead, measured](#the-overhead-measured)).
-- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.3](docs/RUNTIME.md#123-zero-authority-js-realms)).
-- **Code really does arrive only as a bundle.** Even the transport is one, so that it can be upgraded: it opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)). The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
-- **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
-- **Channels combine hybrid key establishment with Ed25519 authentication.** X25519 + ML-KEM-768 protects recorded traffic under the hybrid scheme's assumptions. Breaking Ed25519 later does not reveal earlier session keys, but peer authentication must be upgraded before attackers can forge live handshakes. That requires updating the host's signing interface and the transport bundle. The runtime's `node/sign` operation also remains Ed25519; long-lived signed app records need separate consideration ([security limits](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)).
+There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Peer authentication and `node/sign` are Ed25519 alone: breaking Ed25519 later would not reveal earlier session keys, which rest on the hybrid X25519 + ML-KEM-768 exchange, but it would let an attacker forge live handshakes until the host's signing interface and the transport bundle are upgraded, and long-lived signed app records need separate consideration. Treat the security properties as design intent, not as verified.
 
 ## 1. The model
 
-The model has two parts, a host and the bundles it admits:
+The model has two parts, a host and the bundles it admits. The host runs each bundle in its own slot and controls its access to the host's facilities:
+
+```
++-------------------------+  +-------------------------+
+| Application bundle      |  | Transport bundle        |
+| JS guest + optional     |  | JS guest + private      |
+| private WASM modules    |  | WASM modules            |
++-------------------------+  +-------------------------+
+             ↕                            ↕
++------------------------------------------------------+
+| Host                                                 |
+| Admission, confinement, guest calls and routing      |
+| Host services: raw I/O, storage, wakes and signing,  |
+| each within its resource limits                      |
++------------------------------------------------------+
+```
 
 | Component | Role |
 | --- | --- |
 | **Host** | The runtime outside installed bundles: shared JS plus platform adapters, deployed as one artifact per target (§12.9). It verifies and admits bundles, builds their private slots, confines execution through its sandbox engines, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
-| ↳ **Host services** | What a confined app cannot obtain for itself: `node` (signing with the node's private key), `fs` (storage), `timer` and `link` (sockets) — the `HOST_SERVICES` set (§12.1). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
-| **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. The transport uses this same format. |
+| ↳ **Host services** | What a confined app cannot obtain for itself: `node` (signing with the node's private key), `fs` (storage), `timer` (the realm's wake) and `link` (sockets) — the `HOST_SERVICES` set (§12.1). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
+| **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. |
 | ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
 | ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no host imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
+
+**Claims** decide which app receives what. A manifest claims the ids its app answers: `protocols` for requests from peers, `services` for calls from co-resident guests and the host. Each id has one owner, and routing is one lookup (§12.10). A guest calls another app's service id the way it calls a host service, by naming it in `guest.requires`. A claim grants no authority, but it selects which admitted app receives decrypted input (§14).
 
 The operator chooses which authors may install code and which host services they may receive; the host enforces those grants at admission and at the guest seam. Application-level authorization and behaviour live in the bundles.
 
 There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and it is reached — by the host and by every app — through the local service id it claims (§12.10).
 
-The transport authenticates and decodes incoming frames before handing them to host dispatch. Dispatch then resolves the protocol claim and invokes the app's guest (§12.10); it needs no separate wire parser or per-message signature scheme.
-
 **Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the table: `WASM/services/` holds the host services — the `HOST_SERVICES` table, their contracts and their platform backends — and `WASM/host/` holds admission, confinement, routing and the shell. `host/` imports `services/`, never the reverse.
 
-## What belongs in the host
+## What a guest looks like
 
-The host provides what a bundle cannot supply for itself; bundles implement everything else. The host writes bytes to a socket, and decides which installed guest may use that socket; the transport bundle decides how to authenticate a peer and encrypt a message. For storage, the host reads and writes bytes under opaque keys and gives each app a private namespace; the app defines its records, content hashes and encryption at rest.
+A guest is plain JavaScript that defines `handle`. This one counts its invocations:
 
-Host services leave application meaning to bundles. `link` uses opaque link ids, and `fs` uses flat storage keys. A signing request uses the node's private key, derived from a stored master seed; the host selects the signing domain and the caller's scope without interpreting the payload. This lets bundles change their wire and storage formats while the host continues to enforce the same boundaries. Functionality that can operate within those boundaries belongs in bundles, where it can change through a signed update.
+```js
+let count = 0;
+function handle(input) {
+  if (input.length !== 32) throw new Error("counter takes no payload");
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, count = (count + 1) >>> 0);
+  return out;
+}
+```
 
-The host is one deployed artifact: upgrading it means building and deploying a new host version. Bundles can be replaced within a running host; they cannot upgrade the host itself.
-
-The fixed `crypto/*` transforms are a compatibility and performance exception. They reuse primitives already shipped with the host, avoiding duplicate implementations and extra module calls on existing paths. New computation ships in the bundle that needs it.
-
-## The transport is a bundle
-
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. Its **guest** holds session state across calls and reaches sockets through the host. The node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 framing in `ws.wasm` and ML-KEM-768 in `mlkem768.wasm`.
-
-This makes the **protocol replaceable without a fork**: a deployment can change its handshake, framing or dial policy by selecting a new transport bundle. A running node can atomically replace its transport, even across authors. An upgrade is a **reconnect**: the old links, session state and address book are discarded, and the embedder supplies peers in the replacement's configuration. The node keeps its listeners active (§12.10).
-
-Choosing the transport grants it access to sockets, session keys and plaintext. The initial transport is selected at boot, and live changes must explicitly replace the current transport; ordinary app installation cannot acquire `link`. The transport must therefore be trusted with the traffic it handles ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
-
-**The first transport ships inside the host artifact**, because a node needs a transport before it can fetch anything. Later versions can arrive over the transport already running, like any other bundle.
+Every invocation receives `[caller 32][payload]` — the peer's key for a peer request, the calling app's id for a local call, zeros for the host — and answers with the bytes it returns. Everything else goes through `await host.call(name, bytes)`: a method of a host service the manifest declares (`fs/get` under `fs`), another app's service id it declares, one of the bundle's own modules by bare name, or a `crypto/*` transform. A build step signs the guest into a bundle, and a host installs and invokes it; [CLIENT §1](docs/CLIENT.md#1-build-and-run-a-bundle) is the whole runnable program.
 
 ## The shape of it
 
@@ -92,24 +93,41 @@ Response returns through the transport bundle
 for encryption, then through the host's socket
 ```
 
-The application and transport are both bundles. The host runs them in separate slots and controls their access to its facilities:
+Routing is one protocol-claim lookup (§12.10): the transport has already authenticated and decoded the frame, so the host needs no wire parser or per-message signature scheme of its own.
 
-```
-+-------------------------+  +-------------------------+
-| Application bundle      |  | Transport bundle        |
-| JS guest + optional     |  | JS guest + private      |
-| private WASM modules    |  | WASM modules            |
-+-------------------------+  +-------------------------+
-             ↕                            ↕
-+------------------------------------------------------+
-| Host                                                 |
-| Admission, confinement, guest calls and routing      |
-| Host services: raw I/O, storage, wakes and signing,  |
-| each within its resource limits                      |
-+------------------------------------------------------+
-```
+The host limits guest access, execution time and retained memory. These limits bound individual requests, but continuous peer traffic has no aggregate CPU guarantee. The transport authenticates the immediate peer; apps that relay messages must establish the original author's identity themselves. See [execution and resource limits](docs/RUNTIME.md#123-zero-authority-js-realms) and [trust boundaries](docs/SECURITY.md#14-security-considerations).
 
-The host limits guest access, execution time and retained memory. Buffered data remains accounted for as it passes between components. These limits bound individual requests, but continuous peer traffic has no aggregate CPU guarantee. The transport authenticates the immediate peer; apps that relay messages must establish the original author's identity themselves. See [execution and resource limits](docs/RUNTIME.md#123-zero-authority-js-realms) and [trust boundaries](docs/SECURITY.md#14-security-considerations).
+## What belongs in the host
+
+The host provides what a bundle cannot supply for itself; bundles implement everything else. The host writes bytes to a socket, and decides which installed guest may use that socket; the transport bundle decides how to authenticate a peer and encrypt a message. For storage, the host reads and writes bytes under opaque keys and gives each app a private namespace; the app defines its records, content hashes and encryption at rest.
+
+Host services leave application meaning to bundles. `link` uses opaque link ids, and `fs` uses flat storage keys. A signing request uses the node's private key, derived from a stored master seed; the host selects the signing domain and the caller's scope without interpreting the payload. This lets bundles change their wire and storage formats while the host continues to enforce the same boundaries. Functionality that can operate within those boundaries belongs in bundles, where it can change through a signed update.
+
+The host is one deployed artifact: upgrading it means building and deploying a new host version. Bundles can be replaced within a running host; they cannot upgrade the host itself.
+
+The fixed `crypto/*` transforms are a compatibility and performance exception. They reuse primitives already shipped with the host, avoiding duplicate implementations and extra module calls on existing paths. New computation ships in the bundle that needs it.
+
+## The transport is a bundle
+
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record — the same protocol over TCP, WebSocket and WebRTC. It does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)).
+
+Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 framing in `ws.wasm` and ML-KEM-768 in `mlkem768.wasm`.
+
+This makes the **protocol replaceable without a fork**: a deployment can change its handshake, framing or dial policy by selecting a new transport bundle. A running node can atomically replace its transport, even across authors. An upgrade is a **reconnect**: the old links, session state and address book are discarded, and the embedder supplies peers in the replacement's configuration. The node keeps its listeners active (§12.10).
+
+Choosing the transport grants it access to sockets, session keys and plaintext. The initial transport is selected at boot, and live changes must explicitly replace the current transport; ordinary app installation cannot acquire `link`. The transport must therefore be trusted with the traffic it handles ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
+
+**The first transport ships inside the host artifact**, because a node needs a transport before it can fetch anything. Later versions can arrive over the transport already running, like any other bundle.
+
+## What runs today
+
+- **Three targets, one implementation.** Seedkernel runs in the browser, on Node/Bun or as a single native binary, with the same admission and confinement on each. A large part of the implementation is shared between all platforms, including a transport bundle and crypto blobs. Nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
+- **The native node is one 7.5 MB file.** A cgo-free, cross-compiled Go binary with embedded QuickJS and a wasm engine. It is a tenth of what a Bun binary alone costs (~70 MB). The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
+- **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~25 µs; ~110 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
+- **The engine is fast enough for real storage.** Seedstore's write pipeline encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and decodes at ~2.6 GiB/s when every block is present — the same WASM, measured outside the guest. In its tested network configurations, transfer rate and latency dominated ([the overhead, measured](#the-overhead-measured)).
+- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.3](docs/RUNTIME.md#123-zero-authority-js-realms)).
+- **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
+- **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
 
 ## One implementation, three targets
 
