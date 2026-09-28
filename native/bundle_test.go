@@ -111,4 +111,4 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 // --contact-secret names a FILE (keeping the secret out of `ps` output) whose contents the
 // shared CLI passes to the transport unread; the transport refuses a malformed one at its
 // load — the only place an operator can be told, since a gated node refuses callers in
-// silence (§12.6.2). Covered in WASM/tests/cli.test.mjs and transport-bundle.test.mjs.
+// silence (§12.6.3). Covered in WASM/tests/cli.test.mjs and transport-bundle.test.mjs.

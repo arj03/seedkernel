@@ -40,7 +40,7 @@ const good = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 ok(toHex(parseHex32(good, "--key")) === good, "64 hex characters decode to the 32 bytes");
 ok(toHex(parseHex32(` ${good}\n`, "--key")) === good, "surrounding whitespace is tolerated");
 // fromHex maps a non-hex pair to 0, so a loose decode would boot the node under a
-// DIFFERENT identity, or gate it on a contact secret nobody can produce (§12.6.2 — a
+// DIFFERENT identity, or gate it on a contact secret nobody can produce (§12.6.3 — a
 // gated node refuses callers in silence, so this is the only place to be told).
 throws(() => parseHex32("zzzz" + "0".repeat(60), "--key"), "non-hex is refused rather than zero-filled");
 throws(() => parseHex32(good.slice(0, 62), "--key"), "31 bytes is refused");

@@ -1,4 +1,4 @@
-# seedkernel: the concealed-identity channel handshake (§12.6.2)
+# seedkernel: the concealed-identity channel handshake
 
 *What the handshake is, what each part is for, and where it sits in the literature.*
 

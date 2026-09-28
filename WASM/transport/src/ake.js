@@ -27,7 +27,7 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 // Why a link went down, returned from `linkClosed` and printed by the driver
 // (`logLinkDown`) when its severity is above 0. Only the end holding the session keys can
 // tell these apart. A local fact, never on the wire, so a refused peer still sees only
-// silence (§12.6.2).
+// silence (§12.6).
 const REASON_NONE = "", REASON_HANDSHAKE = "handshake", REASON_CLEAN = "clean",
   REASON_ABORTED = "aborted", REASON_LOCAL = "local", REASON_TRUNCATED = "truncated",
   REASON_REFUSED = "refused", REASON_TIMEOUT = "timeout", REASON_DROPPED = "dropped";
@@ -264,7 +264,7 @@ class Link {
     }
 
     // Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
-    // contact secret (§12.6.2). A failed boot aborts, and the chain recovers.
+    // contact secret (§12.6). A failed boot aborts, and the chain recovers.
     this.work = (async () => {
       this.root = await hash(DOMAIN_CHANNEL, networkKey);
       if (this.weDialed) {
@@ -509,7 +509,7 @@ class Link {
     else this.stall();
   }
 
-  /** Refuse without saying so: every refusal looks like silence (§12.6.2). Terminal. The
+  /** Refuse without saying so: every refusal looks like silence (§12.6). Terminal. The
    *  deadline and slot stay live, so silence still costs the sender a slot. */
   stall() {
     if (this.stalled) return;
@@ -533,7 +533,7 @@ class Link {
     for (const frame of this.takeQueued()) await this.wireRecord(frame);
   }
 
-  // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
+  // ── the concealed-identity handshake (suite 0x03, §12.6) ────────────────────
 
   /** Every handshake key comes through here, so every one mixes in the contact secret. */
   kdf(ikm, ctx, label) {
@@ -659,7 +659,7 @@ class Link {
     const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     // The lint, on a verified key. It closes rather than stalls: the dialer already
-    // verified us at msg2 (§12.6.2).
+    // verified us at msg2 (§12.6).
     if (!admits(idI)) { this.abort(true); return; }
     this.peerPubkey = idI; this.peerId = toHex(idI);
     this.th = await hash(this.th, w3);

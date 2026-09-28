@@ -120,7 +120,7 @@ Keep a private 32-byte author seed across releases and pass it to `hybridAuthorK
 
 Guests are plain scripts with ECMAScript intrinsics and four supplied globals: `host`, `HOST` (the host's own facts: `identity`, the node's public key in hex, and the host-call budget this load admits — `maxOutstandingHostCalls` and `maxOutstandingHostCallBytes`, advertised so a guest can window its own fan-out instead of being refused), `APP` (signed config), and `LOCAL` (installation config). They have no `fetch`, DOM, Node APIs, or runtime package imports. Bundle compatible dependencies into flat guest source; keep UI and platform code in the host client. For a multi-operation byte API, `guestOpFraming()` supplies the same `callerOf`/`readOp`/`writeOp` helpers used by host callers, so you need not write two codecs.
 
-Execution is serialized per realm and bounded. Long work must fit the deployment's budgets, and small WASM calls on JS targets pay a worker hop ([measured overhead](../README.md#the-overhead-measured)). Module memory can be discarded after a deadline failure; guest state is discarded on replacement. Persist data and design recovery around those lifetimes.
+Execution is serialized per realm and bounded. Long work must fit the deployment's budgets, and small WASM calls on JS targets pay a worker hop ([SECURITY §14](SECURITY.md#14-security-considerations)). Module memory can be discarded after a deadline failure; guest state is discarded on replacement. Persist data and design recovery around those lifetimes.
 
 ### Authoring API reference
 
