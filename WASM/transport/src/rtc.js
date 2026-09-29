@@ -1,55 +1,27 @@
-// WebRTC peers (§12.7): the signaling relay, who offers, and the negotiation links the
-// host's `rtc:` socket factory drives. The host holds only the RTCPeerConnection.
+// WebRTC upgrades (§12.7): once a peer is linked through a relay, the smaller key offers a
+// peer connection, signaled over that authenticated link, and the data channel becomes a
+// direct link. The host's `rtc:` socket factory holds only the RTCPeerConnection.
 
 // The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`): each message is
 // `[tag u8][UTF-8 text]`. Up: a local description, a local candidate, a connection state.
-// Down: a remote description, a remote candidate, an ICE restart.
+// Down: a remote description, a remote candidate, an ICE restart. Signaling reuses the
+// description and candidate tags, and adds a decline.
 const RTC_OFFER = 0x6f, RTC_ANSWER = 0x61, RTC_CANDIDATE = 0x63, RTC_STATE = 0x73, RTC_RESTART = 0x72;
-/** A relay frame past this is not signaling, and closes the relay link. */
-const MAX_SIGNAL_BYTES = 64 * 1024;
-/** How long a dropped or unreachable relay waits before it is dialed again. */
-const RELAY_RETRY_MS = 2000;
+/** Signaling only: the answering side has no WebRTC, so the offer is dropped. */
+const RTC_DECLINE = 0x78;
+/** A negotiation's id, chosen by the offering side, so a new negotiation is told apart
+ *  from an ICE restart without reading the SDP. */
+const SID_LEN = 8;
 
-// ── the relay wire ────────────────────────────────────────────────────────────
+// ── signaling ─────────────────────────────────────────────────────────────────
 //
-// A relay is a room that forwards every frame to every other member, unauthenticated, so
-// nothing here is trusted until the handshake proves it. A frame is UTF-8,
-// NUL-separated; each tag has a fixed field count:
+// A signal is a control frame on any link to the peer (router.js `KIND_CTL`):
 //
-//   h  from  to                      a hello; `to` empty is a broadcast
-//   o  from  to  sid  sdp            an offer, for negotiation `sid`
-//   a  from  to  sid  sdp            its answer
-//   i  from  to  sid  candidate  sdpMid  sdpMLineIndex  usernameFragment
+//   [KIND_CTL][tag u8][sid 8][UTF-8 text]
 //
-// `sid` names one negotiation, telling a new one from an ICE restart.
-
-/** A link to the relay: WebSocket frames over a raw stream, or whole platform messages. */
-class RelayLink {
-  constructor(linkId, stream, dest, onSignal) {
-    this.linkId = linkId;
-    this.framer = makeFramer(stream, linkId, dest, "");
-    if (this.framer) this.framer.cap = MAX_SIGNAL_BYTES;
-    this.onSignal = onSignal;
-    this.onGone = null;
-    this.closeReason = REASON_NONE; // a relay is not a peer: nothing to print
-  }
-  send(bytes) {
-    try {
-      const sent = this.framer ? this.framer.send(bytes) : netLinkSend(this.linkId, bytes);
-      void Promise.resolve(sent).catch(() => {});
-    } catch { /* budget: a lost signal, retried by the peer */ }
-  }
-  async onWire(bytes) {
-    if (!this.framer) {
-      if (bytes.length <= MAX_SIGNAL_BYTES) await this.onSignal(bytes);
-      return;
-    }
-    if ((await this.framer.push(bytes, (msg) => this.onSignal(msg))) === false) this.close();
-  }
-  close() { netLinkClose(this.linkId, false); }
-  onChannelClosed() { this.onGone?.(); }
-  onWake() { return Infinity; }
-}
+// with tag `o` (offer SDP), `a` (answer SDP), `c` (candidate: `candidate`, `sdpMid`,
+// `sdpMLineIndex` and `usernameFragment`, NUL-separated) or `x` (decline, empty). It
+// comes from the authenticated peer, so nothing in it needs checking beyond its shape.
 
 /** A negotiation link: the host's peer connection for one peer, and the deadline its data
  *  channel has to open by. */
@@ -71,8 +43,6 @@ class RtcCtlLink {
   }
 }
 
-// ── the peers ─────────────────────────────────────────────────────────────────
-
 class Rtc {
   constructor() {
     // ICE servers (STUN/TURN) as the platform takes them; empty offers host candidates only.
@@ -84,58 +54,15 @@ class Rtc {
     this.maxNegotiating = policy("maxRtcNegotiating");
     // How long a peer connection may take to open its data channel: ICE, DTLS and SCTP.
     this.connectTimeoutMs = policy("rtcConnectTimeoutMs");
-    this.url = "";           // the relay this node has joined, "" for none
-    this.relay = null;       // its live link
-    this.retryAt = Infinity; // when a dropped relay is dialed again
     this.byPeer = new Map(); // peer hex to negotiation
     this.byCtl = new Map();  // negotiation link id to negotiation
     // Data links announced before `open` has recorded their negotiation.
     this.early = new Map();  // negotiation link id to { linkId, stream }
-  }
-
-  /** 0 not joined, 1 relay link up, 2 joined and waiting to redial. */
-  state() { return this.url === "" ? 0 : this.relay ? 1 : 2; }
-
-  /** Join the relay at `url`, leaving any other; "" leaves. Links already up stay up. */
-  async join(url) {
-    if (url === this.url && this.relay) { this.signal("h", ""); return; }
-    this.url = url;
-    this.retryAt = Infinity;
-    const old = this.relay;
-    this.relay = null;
-    if (old) old.close();
-    if (url !== "") await this.dialRelay();
-  }
-
-  async dialRelay() {
-    const url = this.url;
-    const opened = await netLinkOpen(url);
-    if (url !== this.url || this.relay) {
-      if (opened.linkId !== 0) netLinkClose(opened.linkId, false);
-      return;
-    }
-    if (opened.linkId === 0) { this.retryAt = dueIn(RELAY_RETRY_MS); return; }
-    const r = new RelayLink(opened.linkId, opened.stream, url, (m) => this.onSignal(m));
-    r.onGone = () => {
-      if (this.relay !== r) return;
-      this.relay = null;
-      if (this.url !== "") this.retryAt = dueIn(RELAY_RETRY_MS);
-    };
-    linksById.set(opened.linkId, r);
-    this.relay = r;
-    this.signal("h", "");
-  }
-
-  onWake(t) {
-    if (t >= this.retryAt) {
-      this.retryAt = Infinity;
-      void this.dialRelay().catch(() => { if (this.url !== "" && !this.relay) this.retryAt = dueIn(RELAY_RETRY_MS); });
-    }
-    return this.retryAt;
-  }
-
-  signal(tag, to, ...fields) {
-    this.relay?.send(utf8Encode([tag, ownId, to, ...fields].join("\0")));
+    // Peers that declined an offer, not offered again while they stay linked.
+    this.declined = new Set();
+    // Signals are applied one at a time, in arrival order: records are not, and a
+    // candidate must never reach the peer connection ahead of its description.
+    this.signals = Promise.resolve();
   }
 
   /** Negotiations that have not produced an authenticated link; the cap counts these. */
@@ -145,59 +72,50 @@ class Rtc {
     return n;
   }
 
-  /** One relay frame. Decoded and checked before anything is allocated for it. */
-  async onSignal(bytes) {
-    if (bytes.length > MAX_SIGNAL_BYTES) return;
-    const f = utf8Decode(bytes).split("\0");
-    if (f.length < 3) return;
-    const [tag, from, to] = f;
-    if (!hex32(from) || from === ownId || (to !== "" && to !== ownId)) return;
-    if (admitPeers !== null && !admitPeers.has(from)) return;
-    if (tag === "h" && f.length === 3) return this.onHello(from, to === "");
-    if (to === "" || !/^[0-9a-f]{16}$/.test(f[3] ?? "")) return;
-    if ((tag === "o" || tag === "a") && f.length === 5) return this.onDescription(from, f[3], tag === "o", f[4]);
-    if (tag === "i" && f.length === 8) return this.onCandidate(from, f[3], f.slice(4).join("\0"));
-  }
-
-  /** The smaller key offers, just as the smaller key's dial wins a TCP double-connect. */
+  /** The smaller key offers, just as the smaller key's dial wins a double connect. */
   weOffer(peer) { return ownId < peer; }
 
-  async onHello(from, broadcast) {
-    // Answer a broadcast with a directed hello; never answer a directed one.
-    if (broadcast) this.signal("h", from);
-    const e = this.byPeer.get(from);
-    if (e) {
-      // A fresh broadcast from a peer whose negotiation never authenticated: it reloaded.
-      if (!broadcast || authedData(e)) return;
-      this.drop(e);
-    }
-    if (this.weOffer(from)) await this.open(from, true, toHex(await randomBytes(8)));
+  /** Offer a peer connection to a peer this node reaches only through a relay. */
+  async upgrade(peer) {
+    if (!this.weOffer(peer) || this.byPeer.has(peer) || this.declined.has(peer) || router.hasDirect(peer)) return;
+    await this.open(peer, true, toHex(await randomBytes(SID_LEN)));
   }
 
-  async onDescription(from, sid, isOffer, sdp) {
-    let e = this.byPeer.get(from);
-    if (isOffer) {
-      if (this.weOffer(from)) return;
-      if (e && e.sid !== sid) {
-        // An authenticated negotiation keeps its link against a fresh offer.
-        if (authedData(e)) return;
-        this.drop(e);
-        e = undefined;
-      }
-      if (!e) e = await this.open(from, false, sid);
-      if (!e) return;
-    } else if (!e || !e.offer || e.sid !== sid) {
+  /** The peer went down: it may offer or answer differently next time. */
+  forget(peer) { this.declined.delete(peer); }
+
+  signal(peer, tag, sid, text) {
+    const frame = concatBytes([Uint8Array.of(KIND_CTL, tag), fromHex(sid), utf8Encode(text)]);
+    return frame.length <= maxFrameBytes - TAG_LEN && router.send(peer, frame);
+  }
+
+  /** One signal from `peer` (router.js `KIND_CTL`), queued behind the ones before it. */
+  receive(peer, tag, body) {
+    this.signals = this.signals.then(() => this.onSignal(peer, tag, body)).catch(() => {});
+  }
+
+  async onSignal(peer, tag, body) {
+    if (body.length < SID_LEN) return;
+    const sid = toHex(body.subarray(0, SID_LEN));
+    const text = utf8Decode(body.subarray(SID_LEN));
+    let e = this.byPeer.get(peer);
+    if (tag === RTC_OFFER) {
+      if (this.weOffer(peer)) return;
+      // A new negotiation from the peer replaces ours: it restarted.
+      if (e && e.sid !== sid) { this.drop(e); e = undefined; }
+      if (!e) e = await this.open(peer, false, sid);
+      if (!e) { this.signal(peer, RTC_DECLINE, sid, ""); return; }
+      this.down(e, RTC_OFFER, text);
       return;
     }
-    this.down(e, isOffer ? RTC_OFFER : RTC_ANSWER, sdp);
+    if (!e || e.sid !== sid) return;
+    if (tag === RTC_ANSWER && e.offer) this.down(e, RTC_ANSWER, text);
+    else if (tag === RTC_CANDIDATE) this.down(e, RTC_CANDIDATE, text);
+    else if (tag === RTC_DECLINE && e.offer) { this.declined.add(peer); this.drop(e); }
   }
 
-  onCandidate(from, sid, candidate) {
-    const e = this.byPeer.get(from);
-    if (e && e.sid === sid) this.down(e, RTC_CANDIDATE, candidate);
-  }
-
-  /** Open a negotiation link for one peer. Null when the cap is reached or no route. */
+  /** Open a negotiation link for one peer. Null when the cap is reached or no route (a
+   *  host without WebRTC). */
   async open(peer, offer, sid) {
     if (this.pending() >= this.maxNegotiating) return null;
     const e = { peer, offer, sid, ctl: 0, data: null, gone: false, due: Infinity };
@@ -221,10 +139,8 @@ class Rtc {
 
   /** Something the peer connection produced: send it to the peer, or act on its state. */
   up(e, tag, text) {
-    if (tag === RTC_OFFER || tag === RTC_ANSWER) {
-      this.signal(tag === RTC_OFFER ? "o" : "a", e.peer, e.sid, text);
-    } else if (tag === RTC_CANDIDATE) {
-      this.signal("i", e.peer, e.sid, text);
+    if (tag === RTC_OFFER || tag === RTC_ANSWER || tag === RTC_CANDIDATE) {
+      if (!this.signal(e.peer, tag, e.sid, text)) this.drop(e);
     } else if (tag === RTC_STATE && text === "disconnected" && e.offer) {
       // A path went away (a network change, a NAT rebind): new candidates, same connection.
       this.down(e, RTC_RESTART, "");
@@ -241,13 +157,15 @@ class Rtc {
   }
 
   /** The data channel of negotiation `via` arrived as `linkId`: the offering side dials
-   *  the peer the relay named, and the answering side accepts whoever authenticates. */
+   *  the peer it signaled, under that peer's contact secret, and the answering side
+   *  accepts whoever authenticates. */
   bindData(via, linkId, stream) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
     if (!e || e.data) { netLinkClose(linkId, false); return; }
     e.data = core.openLink({
-      linkId, stream, dest: "", listener: "", linkSecret: null, source: undefined,
+      linkId, stream, dest: "", listener: "", source: undefined,
+      linkSecret: e.offer ? core.secretFor(e.peer) : null,
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,
@@ -260,17 +178,12 @@ class Rtc {
     if (e.ctl !== 0) netLinkClose(e.ctl, false);
   }
 
-  /** A negotiation link closed. If it carried an authenticated link, renegotiate: the
-   *  offering side offers again, the answering side says hello. */
+  /** A negotiation link closed, and its data link with it. The peer is still reachable
+   *  through its address, which is where the next upgrade starts. */
   gone(e) {
     this.byCtl.delete(e.ctl);
-    const lost = !e.gone && authedData(e);
     e.gone = true;
-    if (this.byPeer.get(e.peer) !== e) return;
-    this.byPeer.delete(e.peer);
-    if (!lost || !this.relay) return;
-    if (e.offer) void randomBytes(8).then((sid) => this.open(e.peer, true, toHex(sid))).catch(() => {});
-    else this.signal("h", e.peer);
+    if (this.byPeer.get(e.peer) === e) this.byPeer.delete(e.peer);
   }
 }
 

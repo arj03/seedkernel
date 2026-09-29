@@ -1,13 +1,15 @@
 // WebRTC (§12.7): the host's `rtc:` socket seam, which holds the RTCPeerConnection and
-// passes the W3C operations through as bytes, and the transport bundle's side: the relay,
-// who offers, the negotiation links and their bounds. The seam is tested with stub peer
-// connections (the platform global is referenced only inside `connect`, so it runs under
-// Node), the transport with an in-process relay room and a fake WebRTC world whose data
-// channels are loopback pairs. Run after `npm run build`.
+// passes the W3C operations through as bytes, and the transport bundle's side: the move
+// from a relayed link to WebRTC, signaled over that link, who offers, the negotiation
+// links and their bounds. The seam is tested with stub peer connections (the platform
+// global is referenced only inside `connect`, so it runs under Node), the transport with
+// the in-process relay (fake-relay.mjs) and a fake WebRTC world whose data channels are
+// loopback pairs. Run after `npm run build`.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { importBuilt, testkit } from "./testkit.mjs";
+import { FakeRelay } from "./fake-relay.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
 } from "./transport-harness.mjs";
@@ -226,42 +228,8 @@ await test("RtcChannel fails closed when a chunked write throws after a prefix",
   assert(writes === 2, "a failed channel must never append bytes after the truncated frame");
 });
 
-// ── the transport over a relay and a fake WebRTC world ───────────────────────
+// ── the transport: a relayed link moving to WebRTC ────────────────────────────
 
-/** A signaling room: every frame one member sends reaches every other member, verbatim. */
-class RelayRoom {
-  members = new Set();
-  frames = [];
-  link() {
-    const m = { msg: null, cls: null, dead: false };
-    const room = this;
-    const link = {
-      send(b) {
-        room.frames.push(dec.decode(b));
-        for (const o of room.members) if (o !== m) queueMicrotask(() => { if (!o.dead) o.msg?.(Uint8Array.from(b)); });
-      },
-      onData(cb) { m.msg = cb; },
-      onClose(cb) { m.cls = cb; },
-      close() { m.dead = true; room.members.delete(m); },
-      buffered: () => 0,
-    };
-    m.kill = () => { if (m.dead) return; m.dead = true; room.members.delete(m); m.cls?.(); };
-    this.members.add(m);
-    return link;
-  }
-  /** A frame from someone who is not a node: a spoofer, or a stranger. */
-  inject(text) { for (const o of this.members) queueMicrotask(() => o.msg?.(enc.encode(text))); }
-  factory() {
-    return {
-      connect: (dest) => (dest.startsWith("ws://relay/") ? this.link() : null),
-      listen: async (addrs) => addrs.map(() => 0),
-      close() {},
-    };
-  }
-}
-
-/** Peer connections that connect once both descriptions are set, their negotiated data
- *  channels becoming an in-process pair. A description's SDP names its connection. */
 class FakeWebRtc {
   pcs = new Map();
   made = [];
@@ -313,64 +281,75 @@ class FakeWebRtc {
   }
 }
 
+
 const relayState = async (node) => (await transportOp(node, new OpArgs("relayState")))[0];
 const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));
 
-/** A node whose sockets are the room and the fake world, and nothing else. */
-function rtcNode(room, world, opts = {}) {
-  const channels = combineChannels(room.factory(), new RtcNetwork({ peerConnectionFactory: world.factory }));
-  return makeTransportHost({ channels, ...opts });
+/** A node whose sockets are the relay and the fake world, and nothing else. `made` lists
+ *  the peer connections this node opened. */
+async function rtcNode(relay, world, opts = {}) {
+  const made = [];
+  const factory = () => { const pc = world.factory(); made.push(pc); return pc; };
+  const channels = combineChannels(relay.factory(), new RtcNetwork({ peerConnectionFactory: factory }));
+  const node = await makeTransportHost({ channels, ...opts });
+  node.made = made;
+  return node;
 }
 
-await test("two nodes in one room link over WebRTC and carry a request", async (keep) => {
-  const room = new RelayRoom(), world = new FakeWebRtc();
-  const A = keep(await rtcNode(room, world));
-  const B = keep(await rtcNode(room, world));
-  assert(await relayState(A) === 0, "no relay before one is joined");
+/** Nodes in key order, so a test knows which one offers (the smaller key). */
+function sortedIdentities(n) {
+  return Array.from({ length: n }, () => generateKeyPair())
+    .sort((a, b) => Buffer.compare(Buffer.from(a.publicKey), Buffer.from(b.publicKey)));
+}
+
+await test("two nodes in one room link through the relay, then move to WebRTC", async (keep) => {
+  const relay = new FakeRelay(), world = new FakeWebRtc();
+  const A = keep(await rtcNode(relay, world));
+  const B = keep(await rtcNode(relay, world));
   await joinRelay(A, "ws://relay/room");
   await joinRelay(B, "ws://relay/room");
-  assert(await relayState(A) === 1, "the relay link is up once joined");
+  await until(async () => (await relayState(A)) === 1, 2000, "A registered");
   await until(async () => (await linkedPeers(A)).includes(B.peerId) && (await linkedPeers(B)).includes(A.peerId),
-    4000, "the WebRTC link");
+    4000, "the link");
+  await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the splice to be retired");
+  assert(world.made.length === 2, `one peer connection per side, got ${world.made.length}`);
+  assert(world.made.every((pc) => pc.candidates.length >= 1), "candidates went over the relayed link and in");
+  const before = relay.spliceBytes;
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
   assert(resp.length === 3 && resp[2] === 9, "a request crosses the data channel");
-  assert(world.made.length === 2, `one peer connection per side, got ${world.made.length}`);
-  assert(world.made.every((pc) => pc.candidates.length >= 1), "candidates went through the relay and in");
-  assert(room.frames.every((f) => f.split("\0").length >= 3), "every relay frame is the NUL-separated wire");
+  assert(relay.spliceBytes === before, "and not the relay");
 });
 
-await test("a relay that drops is redialed, and a spoofed offer cannot take a live link down", async (keep) => {
-  const room = new RelayRoom(), world = new FakeWebRtc();
-  const A = keep(await rtcNode(room, world));
-  const B = keep(await rtcNode(room, world));
+await test("a peer without WebRTC declines, and the relayed link stays", async (keep) => {
+  const relay = new FakeRelay(), world = new FakeWebRtc();
+  const [small, large] = sortedIdentities(2);
+  const A = keep(await rtcNode(relay, world, { identity: small }));
+  // The larger key answers, and has no rtc: socket factory at all.
+  const B = keep(await makeTransportHost({ identity: large, channels: relay.factory() }));
   await joinRelay(A, "ws://relay/room");
   await joinRelay(B, "ws://relay/room");
-  await until(async () => (await linkedPeers(A)).includes(B.peerId), 4000, "the WebRTC link");
-  // Someone in the room claims to be whichever of the two answers, with a new negotiation.
-  const [small, large] = A.peerId < B.peerId ? [A, B] : [B, A];
-  room.inject(["o", small.peerId, large.peerId, "00".repeat(8), "fake:999"].join("\0"));
-  await settle(100);
-  assert((await linkedPeers(large)).includes(small.peerId), "a live link survives a fresh offer in its name");
-  assert(world.made.length === 2, "the spoofed offer allocated no peer connection");
-
-  for (const m of [...room.members]) m.kill();
-  await until(async () => (await relayState(A)) === 2, 2000, "the dropped relay to read as redialing");
-  await until(async () => (await relayState(A)) === 1, 4000, "the relay to be redialed");
+  await until(async () => (await linkedPeers(A)).includes(B.peerId), 4000, "the relayed link");
+  await until(() => A.made.length === 1 && A.made[0].closed, 2000, "the declined offer to be dropped");
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  assert(resp[0] === 1, "requests keep crossing the relay");
+  assert(relay.splices[0].every((e) => !e.dead), "the splice stays up");
 });
 
 await test("negotiations are capped, and one that never connects is dropped on its deadline", async (keep) => {
-  const room = new RelayRoom();
+  const relay = new FakeRelay();
   // A world where nothing ever connects: descriptions are set and never paired.
   const world = new FakeWebRtc();
   world.maybeConnect = () => {};
-  const A = keep(await rtcNode(room, world, { transportConfig: { maxRtcNegotiating: 2, rtcConnectTimeoutMs: 150 } }));
-  await joinRelay(A, "ws://relay/room");
-  // Strangers larger than A, so A is the side that offers to each.
-  for (let i = 0; i < 5; i++) room.inject(["h", "ff".repeat(31) + (16 + i).toString(16), ""].join("\0"));
-  await until(() => world.made.length === 2, 2000, "two negotiations");
+  const [small, ...rest] = sortedIdentities(3);
+  const A = keep(await rtcNode(relay, world, { identity: small, transportConfig: { maxRtcNegotiating: 1, rtcConnectTimeoutMs: 150 } }));
+  const others = [];
+  for (const identity of rest) others.push(keep(await rtcNode(relay, world, { identity })));
+  for (const n of [A, ...others]) await joinRelay(n, "ws://relay/room");
+  await until(async () => (await linkedPeers(A)).length === 2, 4000, "A's relayed links");
   await settle(50);
-  assert(world.made.length === 2, `the cap bounds the peer connections a room can make us open, got ${world.made.length}`);
-  await until(() => world.made.every((pc) => pc.closed), 2000, "the stalled negotiations to be dropped");
+  assert(A.made.length === 1, `the cap bounds the peer connections A opens, got ${A.made.length}`);
+  await until(() => A.made.every((pc) => pc.closed), 2000, "the stalled negotiation to be dropped");
+  assert((await linkedPeers(A)).length === 2, "the relayed links outlive it");
 });
 
 summary("WebRTC");

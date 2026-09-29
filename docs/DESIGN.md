@@ -127,7 +127,15 @@
 
 **A request inherits its caller's deadline, and neither clock is waited out needlessly.** Transport content cannot extend an owner's time because bytes happen to be moving; that is why `buffered()` is host-only and why `requestTimeoutMs` only retires the transport's own bookkeeping.
 
-## 12.7 Browser↔console WebRTC
+## 12.7 Relays and WebRTC
+
+**A relay joins two sockets and nothing more.** The channel handshake already proves who is at the other end, so a relay needs to know only which two sockets belong together, not to be trusted with the traffic. A splice is one socket per peer pair, so the relay's backpressure is TCP's and one slow peer cannot stall another's link, and the records are encrypted once, end to end. Multiplexing many peers over one relay socket would need a window per peer inside the transport, and a relay that could read or drop single records would break the record layer's strict nonce order.
+
+**Registration is signed.** Anyone could otherwise register a key and draw its calls. Such a caller would get only msg1, which names no one, and could not produce msg2's signature, so it would be denial of service, not impersonation. It still costs only one signature. The signed message names the relay's authority, so one relay cannot pass another's nonce through, and starts with a transport tag (`DOMAIN_relay`) beside `DOMAIN_channel` inside the host's link scope, so neither format's signature can stand for the other's.
+
+**The ticket goes to the callee only.** A room shows who is present, but a call is between two keys, so its ticket travels on the callee's control link and nowhere else, and the relay joins only tickets a registered key called. Nobody else in a room can take a splice, and two strangers cannot use the relay as a free pipe.
+
+**The end that accepted retires the splice.** Both ends must stop writing the relayed link before either closes it, or a record still crossing the relay is lost. The end that accepted the direct link authenticates it last, so by then the peer already routes over it; it keeps reading the relayed link, and the peer closes that link behind the last record it sent there, as a double connect's loser is closed by its dialer (§12.6).
 
 **The seam is the platform object and nothing else.** A browser's only peer-to-peer primitive is an object a confined guest cannot hold, so the host holds it, and only it. Which peers to connect, how to find them, who offers and how long to wait are a transport's decisions; a host that made them (a relay wire, a full-mesh policy, a key comparison) would need a release for a transport to change them. The negotiation link passes the W3C verbs through as bytes, so what the host carries changes only if WebRTC does.
 
@@ -139,9 +147,9 @@
 
 **No bounds of its own.** Every byte of negotiation crosses a link, so the driver's link table, outbound custody and read windows already own it. A second set of caps would bound the same bytes twice, in a place a transport cannot tune.
 
-**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A MITM relay can splice SDP and bring DTLS up to itself, but cannot produce the transcript signature without the peer's key, so the link never authenticates and never delivers a byte. That is also why signaling needs no signature and carries no credential: a room shares one contact secret, which never goes near the relay.
+**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A party that tampered with SDP could bring DTLS up to itself, but could not produce the transcript signature without the peer's key, so the link would never authenticate and never deliver a byte. Signaling travels over the already authenticated link, so no relay or room member sees SDP or candidates and none can offer in a peer's name.
 
-**A room member is not a peer.** The relay is unauthenticated, so anyone in a room can claim any key. That is why a fresh offer in the name of a peer with a live link is ignored rather than obeyed, and why a lost link is renegotiated rather than waited for: a reloaded peer gets back without a relay member being able to take a working link down.
+**A room member is a key, not a peer.** The relay vouches that a member registered its key, not that the key is anyone the node wants. A call to a member goes through the same handshake, contact secret and peer lint as any dial, so membership decides only whom to call.
 
 **Media is the app's own connection.** Audio and video need a peer connection an app can add tracks to. Lending the transport's would put a platform object back across the seam and its renegotiation back into the host, so an app that wants media opens its own and signals it over its own protocol, authenticated by the channel.
 

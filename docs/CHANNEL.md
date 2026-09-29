@@ -358,6 +358,11 @@ uses the same node address format and round-trip count described above.
 maps it once. Concealment defeats probing and flow attribution, not an observer who already
 knows where to look.
 
+**A relay sees who calls whom.** A node registers its key with a relay, and a call names the
+callee to the relay and to no one else (RUNTIME §12.7). The relay forwards only ciphertext
+and cannot pose as either end, but it learns which pairs talk, when and how much, until the
+pair moves to a direct link. A deployment that must hide that runs its own relay.
+
 **A recorded msg1 can be replayed once.** Anyone who captures a valid msg1 can replay it and
 draw a msg2. They cannot open it without the ephemeral private key, but the answer itself says
 the holder of that contact secret is at the address replayed to, so a recording tracks the

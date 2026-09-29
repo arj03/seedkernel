@@ -208,8 +208,15 @@ class Link {
     this.linkId = spec.linkId;
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
+    // A splice through a relay (relay.js), rather than a path of its own to the peer, and
+    // the ticket a dial called it with.
+    this.relayed = spec.relayed === true;
+    this.ticket = spec.ticket || "";
+    this.addrsSeen = false; // a relayed link carries one address message (core.js `onControl`)
     // The peer this dial is for (msg2 must verify under it); empty for an accept.
     this.dialedPeerId = spec.dialedPeerId || "";
+    // Resolves true once authenticated, false if the link ends first.
+    this.settled = new Promise((settle) => { this.settle = settle; });
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
@@ -398,6 +405,7 @@ class Link {
   end(farewell, defensive) {
     if (this.closed) return;
     this.closed = true;
+    this.settle(false);
     this.closedLocally = true;
     if (defensive) this.aborted = true;
     this.severWire();
@@ -532,6 +540,7 @@ class Link {
     this.onAuth(this.peerId, this);
     // The tie-break may have closed this link, handing its queue to the winner.
     if (this.closed) return;
+    this.settle(true);
     for (const frame of this.takeQueued()) await this.wireRecord(frame);
   }
 
@@ -735,13 +744,14 @@ class Link {
     if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
     // Not awaited, so the next record never waits on an answer. Both forms of the peer's
     // id travel: hex for routing, bytes for attribution.
-    this.onFrame(this.peerId, r.pt, this.peerPubkey);
+    this.onFrame(this.peerId, r.pt, this.peerPubkey, this);
   }
 
   /** The socket went away. */
   onChannelClosed() {
     if (this.closed) return;
     this.closed = true;
+    this.settle(false);
     this.teardown();
     this.onClose(this);
   }

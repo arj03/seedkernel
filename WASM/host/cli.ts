@@ -19,7 +19,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 /** Every flag the shell accepts. An allowlist, so a mistyped `--polcy` fails instead of
  *  silently booting a deny-all node. */
 const FLAGS = new Set([
-  "policy", "dir", "key", "listen", "peers", "contact-secret",
+  "policy", "dir", "key", "listen", "peers", "relay", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
@@ -193,10 +193,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     throw new Error("--local-config requires --bundle so the configuration has one app scope");
   }
   // Transport-only flags on a node with no network would otherwise be silently ignored.
-  const network = args.has("listen") || args.has("peers");
+  const relay = args.get("relay");
+  const network = args.has("listen") || args.has("peers") || relay !== undefined;
   for (const flag of ["transport", "contact-secret"]) {
     if (args.has(flag) && !network) {
-      throw new Error(`--${flag} requires --listen or --peers, which enable the network it configures`);
+      throw new Error(`--${flag} requires --listen, --peers or --relay, which enable the network it configures`);
     }
   }
   const listen = args.has("listen") ? parseListen(args.get("listen")!) : [];
@@ -229,6 +230,13 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });
+  // Register on the relay through the transport's service id, passing the URL unread, so
+  // a node nobody can dial is reachable there (§12.7).
+  if (relay !== undefined) {
+    const joined = shell.call(TRANSPORT_SERVICE, new OpArgs("relay").text(relay).build());
+    if (!joined) throw new Error("shell: --relay given, but there is nothing to join it with; enable transport first");
+    await joined;
+  }
   // Wait for the cohort through the transport's service id. Best effort: `ready` settles
   // at its deadline instead of rejecting, so a missing peer delays boot but never fails it.
   if (peers.length > 0) {
@@ -241,6 +249,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
+  // The URL's path is a room name, which is a credential, so only the relay is printed.
+  if (relay !== undefined) host.log(`  relay  ${/^[a-z]+:\/\/[^/?#]*/i.exec(relay)?.[0] ?? "(unparsed)"}`);
   for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
 
   // Operator remedies (§12.5) before the bundle, so a node never briefly installs what it
@@ -278,7 +288,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   const close = () => shell.close();
-  if (!net?.listening.some((l) => l.port > 0)) return { serving: false, close };
+  // A node on a relay serves through it, listening or not.
+  if (!net?.listening.some((l) => l.port > 0) && relay === undefined) return { serving: false, close };
   // Inbound requests already route to the loaded app by protocol id (§12.8, §12.10).
   if (bundlePath !== undefined) {
     host.log("  serving the app's request side from the confined guest");

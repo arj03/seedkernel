@@ -48,14 +48,14 @@ Chat is the smallest complete app, and lives in [seedchat](https://github.com/ar
 
 - **The bundle** is a guest of a couple of dozen lines. A peer's frame goes straight to its one restartable module, whose render bytes are the answer; the page's `send` op goes out through the transport's `_net` service. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. Seedchat derives its consent key by hashing the verified WASM bytes it holds.
 - **The page** generates an Ed25519 channel identity, boots a host (§12.8), installs a policy approving the authors the user trusts (§12.5), and starts with an empty table. `v1` (text only) and `v2` (text, image and nick) are two bundles under one `(author, app)`; v1→v2 is an install naming that slot, re-stating the `chat` protocol claim (§12.10).
-- **Peers** connect over a WebRTC mesh the transport bundle negotiates through a signaling relay (§12.7); chat rides the transport request plane as `[req][protocolId][chatType][body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
+- **Peers** meet in a relay room, link through the relay and move to WebRTC, all negotiated by the transport bundle (§12.7); chat rides the transport request plane as `[req][protocolId][chatType][body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
 - **Relayed bundles** travel in an `OFFER` frame; the recipient re-verifies both author signatures and applies its own policy (§12.4).
 - **Rendering** leaves the host: the guest returns render bytes to the page, which `postMessage`s them to an iframe sandboxed `allow-scripts allow-forms` with no same-origin access to the page's keys.
-- **The relay** partitions signaling into rooms by URL path (`ws://host:8080/<room>`, default `global`, `[A-Za-z0-9._-]`, ≤128 chars); the page joins one with the transport's `relay` op. A room is not authenticated: its members see its SDP metadata, but cannot impersonate a peer (§12.7).
+- **The relay** partitions its members into rooms by URL path (`ws://host:8080/<room>`, `[A-Za-z0-9._-]`, ≤128 chars); the page joins one with the transport's `relay` op. A room is not authenticated: its members see which keys are in it, but cannot impersonate a peer (§12.7).
 - **Calls** are chat's own: the page opens a separate `RTCPeerConnection` per peer for audio and video and signals it over the authenticated transport, under a protocol a small boot bundle claims.
 - **`ui` and `app_meta`** WASM custom sections are seedchat conventions; the host reads neither.
 
-To run it: `npm run build:browser` here, then follow seedchat's build steps (`npm run relay` runs the rendezvous).
+To run it: `npm run build:browser` here, then follow seedchat's build steps (`npm run relay` runs the relay).
 
 ---
 
@@ -331,9 +331,9 @@ Sensitive protocol and service names are pinned to approved owners (author and `
 
 Everything in this section is the **shipped transport bundle's guest program** (`transport/src/*.js`, with private modules `ws.wasm` and `mlkem768.wasm`), not host code. A replacement transport may differ; this is what ships. The first transport is embedded in the host artifact (`TRANSPORT_BUNDLE_B64`).
 
-- **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book and WebRTC signaling (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
+- **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book, relays and WebRTC signaling (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
-- **What a replacement changes without a host release.** Everything in this section and §12.7's signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's one call into a transport is `ready` on its service id, made when `--peers` is given (§12.8).
+- **What a replacement changes without a host release.** Everything in this section and §12.7's relays and signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers`, `--relay` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's calls into a transport are `relay` and `ready` on its service id, made when `--relay` and `--peers` are given (§12.8).
 
 #### Framing
 
@@ -440,13 +440,14 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - The transport reads `networkKey` and `contactSecret` from `LOCAL` as 64 lowercase hex, rejects malformed values at load, and defaults each to 32 zero bytes (the public network, an open node).
 - Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ transport: { config } })` passes operator overrides as that load's `localConfig`.
 - Its identity comes from `HOST.identity`, never from config.
-- Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls.
-- The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret from the address book; a WebRTC link presents this node's own, since the members of a room share one (§12.7).
-- The host-only `relay` op (one text: a `ws://`/`wss://` room URL, empty to leave) joins a WebRTC signaling room, and `relayState` answers `[u8]`: 0 none joined, 1 its link is up, 2 redialing. `iceServers` (`RTCConfiguration.iceServers` as JSON, `LOCAL ?? APP`, empty by default) is handed to every peer connection.
+- Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls. A `dest` of `relay+ws[s]://host:port` reaches the peer through that relay (§12.7).
+- `advertise` (`LOCAL ?? APP`, empty by default) lists the `scheme://host:port[/path]` destinations this node can be dialed at directly. Each peer linked through a relay is sent it with the node's contact secret, so it can move to a direct link (§12.7).
+- The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret: the one it last sent over a relayed link, else the one in the address book, else this node's own, since the members of a room share one (§12.7).
+- The host-only `relay` op (one text: a `ws://`/`wss://` URL, empty to leave) registers on that relay and joins the room its path names, none for a bare `/`, and `relayState` answers `[u8]`: 0 none joined, 1 registered, 2 redialing. `iceServers` (`RTCConfiguration.iceServers` as JSON, `LOCAL ?? APP`, empty by default) is handed to every peer connection.
 
-### 12.7 Browser↔console WebRTC
+### 12.7 Relays and WebRTC
 
-A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCPeerConnection`, and a confined guest cannot hold a platform object. `RtcNetwork` (`services/net-rtc.ts`) holds it and decides nothing: which peers to connect, the relay and its wire, who offers, when to restart ICE and how long connecting may take are the transport bundle's (`transport/src/rtc.js`).
+A node that cannot be dialed (a browser, or anything behind NAT) is reached through a relay, and moves to a direct link when one can be made. A browser has no UDP, so its only direct peer-to-peer primitive is the platform's `RTCPeerConnection`, and a confined guest cannot hold a platform object. `RtcNetwork` (`services/net-rtc.ts`) holds it and decides nothing: which peers to connect, the relay and its wire, who offers, when to restart ICE and how long connecting may take are the transport bundle's (`transport/src/relay.js`, `rtc.js`). The host only opens WebSockets and peer connections.
 
 - **Two links per peer connection.** `link/open("rtc:offer")` or `"rtc:answer"`, optionally followed by `?` and an `RTCConfiguration` as JSON, opens the *negotiation link*: message-framed, each message `[tag u8][UTF-8 text]`. The pre-agreed data channel (`negotiated`, id 0, on both sides) arrives once it opens as the *data link*, a byte stream announced with the negotiation link as its `via` (§12.2). Closing either closes both.
 
@@ -463,14 +464,21 @@ A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCP
 - **Bounds are the driver's.** Each link is an entry under `DEFAULT_MAX_RAW_LINKS`; down messages not yet applied are the negotiation link's `buffered()` backlog, so outbound custody bounds them (§12.6); up messages are ordinary reads.
 - **Console nodes** pass their own `peerConnectionFactory` implementing the W3C subset `RtcNetwork` uses; the runtime depends on no ICE/DTLS/SCTP library. Seedstore's `WASM/scripts/werift-pc.mjs` wraps werift. The native binary has no WebRTC.
 
-#### The shipped transport's signaling
+#### The shipped transport's relays
 
-- **One room.** The `relay` op (§12.6) opens a `ws://`/`wss://` link to the room (through `WsNetwork` in a browser, or a raw socket and the bundle's own RFC 6455 framing elsewhere) and says hello; a relay that drops is redialed. The relay forwards every binary frame verbatim to the rest of the room.
-- **The relay wire**, UTF-8, NUL-separated: `h from to` (a hello; `to` empty broadcasts), `o`/`a from to sid sdp`, `i from to sid candidate sdpMid sdpMLineIndex usernameFragment`. A broadcast hello is answered once, directed. A frame over `MAX_SIGNAL_BYTES` closes the relay link; a sender outside `admitPeers` is ignored.
-- **Who offers.** The smaller key, as the smaller key's dial wins a TCP double connect. `sid` is the offering side's name for one negotiation, so a new negotiation is told apart from an ICE restart without reading the SDP. On `disconnected` the offering side restarts ICE.
-- **The data link.** The offering side's is the handshake's initiator, pinned to the key the relay named; the answering side's is an accept, under the half-open budgets. Both present this node's own contact secret, which the members of a room share.
-- **Bounds.** `maxRtcNegotiating` caps negotiations without an authenticated link; `rtcConnectTimeoutMs` drops one whose data channel has not opened, and the handshake deadlines start when it does. A fresh offer in the name of a peer with a live link is ignored; a lost link is renegotiated.
-- **Signaling carries no credential.** Identity is proven in the channel (§12.6), and DTLS on the data channel is a second, redundant encryption layer.
+- **Registration.** The `relay` op (§12.6.3) opens a control link to the relay (through `WsNetwork` in a browser, or a raw socket and the bundle's own RFC 6455 framing elsewhere). The relay sends a 32-byte nonce, and the node answers with its key and `Sign(DOMAIN_relay ‖ authority ‖ nonce)` through `node/sign`, where `authority` is the relay's `host[:port]` as dialed, without a default port. A relay that drops is redialed. The relay routes calls for a key to the socket that registered it last.
+- **Rooms.** A control link's URL path names its room, none for `/`. The relay sends a newcomer the room's registered keys and tells the room when a key joins or leaves. Each member goes into the address book at `relay+<origin>`, under this node's own contact secret, which a room shares, and the smaller key calls.
+- **Splices.** A call names the callee's key and a fresh 16-byte ticket on the caller's control link. The relay passes the ticket to the callee's control link only, or answers "unreachable" at once, which fails the dial. Both ends open `<origin>/?splice=<ticket hex>`, and the relay joins the two sockets and forwards what one sends to the other. The caller's end dials as the handshake's initiator, pinned to the key it called; the callee's is an accept, under the half-open budgets. The handshake and records run end to end (§12.6): the relay forwards ciphertext and sees who calls whom, and the callee's contact secret gates the call as it gates any dial.
+- **The relay wire**, binary, `[type u8][body]`: from the relay `0x00` challenge `[nonce 32]`, `0x01` registered, `0x02` members `[pk 32]*`, `0x03` joined `[pk 32]`, `0x04` left `[pk 32]`, `0x05` incoming `[from 32][ticket 16]`, `0x06` unreachable `[to 32][ticket 16]`; from the node `0x01` register `[pk 32][sig 64]` and `0x05` call `[to 32][ticket 16]`. A frame over `MAX_SIGNAL_BYTES` closes the control link. The server is seedrelay.
+
+#### Moving to a direct link
+
+- **Addresses.** When a relayed link authenticates, each end sends a control frame (`KIND_CTL`) carrying its contact secret and its `advertise` list (§12.6.3). The peer dials those destinations in turn, in the background, until one authenticates.
+- **WebRTC.** The smaller key also offers a peer connection, signaled over the authenticated link as control frames `[KIND_CTL][tag u8][sid 8][UTF-8 text]` with the negotiation link's `o`, `a` and `c` tags, and `x` when the answering side has no WebRTC. `sid` is the offering side's name for one negotiation, so a new negotiation is told apart from an ICE restart without reading the SDP. On `disconnected` the offering side restarts ICE. The offering side's data link is the initiator, pinned to the peer and presenting its contact secret; the answering side's is an accept.
+- **Routing.** A peer's direct links carry its traffic whenever it has one; relayed links carry it otherwise. The double-connect tie-break (§12.6) compares a link only with links of its own kind.
+- **Retiring the splice.** The end that accepted the direct link authenticates it last, so the peer already routes over it. That end stops writing its relayed links, keeps reading them, and asks the peer (`CTL_RETIRE`) to close them, which the peer does behind the last record it sent on them.
+- **Bounds.** `maxRtcNegotiating` caps negotiations without an authenticated link; `rtcConnectTimeoutMs` drops one whose data channel has not opened, and the handshake deadlines start when it does. A declined or failed upgrade leaves the relayed link in place.
+- **Signaling carries no credential.** It travels inside the channel (§12.6), so no relay or room member sees SDP or candidates, and DTLS on the data channel is a second, redundant encryption layer.
 
 ### 12.8 The shell: node assembly and the CLI
 
@@ -480,6 +488,7 @@ A browser has no UDP, so its only peer-to-peer primitive is the platform's `RTCP
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
+     [--relay ws[s]://host:port/[room]] \
      [--contact-secret ./contact.hex] [--local-config ./app.json] \
      [--revoke <hex,…>] [--uninstall <app,…>] \
      [--op name  < argument > response] \
@@ -493,6 +502,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 - **`--contact-secret`** names a file, never the secret itself; its contents, less the line ending, become `transport.config.contactSecret` unread.
 - **`--local-config`** requires `--bundle` and is that load's `LOCAL`; it never reaches the transport.
 - **`--peers`** becomes `transport.config.peers` on the automatic transport load, as typed: the shell parses neither flag, so a replacement transport can spell addresses and secrets its own way, and the transport's load refuses a malformed one. Once up, the CLI waits for the cohort with the transport's `ready` op on its service id; `null` means no transport is installed.
+- **`--relay`** registers the node on that relay through the transport's `relay` op, passing the URL unread, so a node nobody can dial is reached there (§12.7). A node on a relay keeps serving without a listener, and the console shows the relay but not its path, since a room name is a credential.
 - **`--op name`** invokes the app `--bundle` just loaded, through that load's handle: stdin is the argument, stdout the response, framed as `[opLen u8][op][args]`. Logs go to stderr on both targets.
 
 **The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.

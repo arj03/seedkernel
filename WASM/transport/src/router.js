@@ -1,40 +1,67 @@
 // Link router + request/response layer (§12.6): correlation and protocol ids.
 
+/** A frame's first byte for the transport's own messages between two nodes, beside a
+ *  request (0x00, 0x80 without reply) and a response (0x01): `[KIND_CTL][tag u8][body]`. */
+const KIND_CTL = 0x02;
+/** Control tags: this node's contact secret and direct addresses, sent over a relayed
+ *  link (core.js `advertise`), and a request that the peer close the relayed link it
+ *  arrived on, since a direct one has replaced it. rtc.js's signals are the other tags. */
+const CTL_ADDRS = 0x64, CTL_RETIRE = 0x72;
+
 // ── the router ────────────────────────────────────────────────────────────────
 
 class Router {
   constructor(ownPubkey) {
     this.ownPubkey = ownPubkey;
-    // By peerId: { links: routable Link[], held: tie-break losers still being read, next:
-    // round-robin cursor }. A peer is here exactly while it has a routable link.
+    // By peerId: { links: routable Link[], direct: how many of them lead, held: links read
+    // but no longer written, next: round-robin cursor }. Direct links come before relayed
+    // ones, and a peer is here exactly while it has a routable link.
     this.pools = new Map();
   }
 
   linkCount(peerId) { const p = this.pools.get(peerId); return p ? p.links.length : 0; }
+  hasDirect(peerId) { const p = this.pools.get(peerId); return p !== undefined && p.direct > 0; }
+  /** Whether `link` is routed, rather than held or lost to a tie-break. */
+  routes(link) { const p = this.pools.get(link.peerId); return p !== undefined && p.links.includes(link); }
+
+  /** Round-robin over the direct links, or over the relayed ones when there is none. */
   send(to, frame) {
     const pool = this.pools.get(to);
     // Empty only inside `promote`, while a tie-break loser passes its queue on.
     if (!pool || pool.links.length === 0) return false;
-    const i = pool.next % pool.links.length;
+    const i = pool.next % (pool.direct || pool.links.length);
     pool.next = i + 1;
     pool.links[i].send(frame);
     return true;
   }
 
-  /** Add a newly authenticated link, after the double-connect tie-break. A peer's first
-   *  link marks it up. */
+  /** Add a newly authenticated link, after the double-connect tie-break, which compares
+   *  it only with links of its own kind: a relayed link and a direct one are two paths,
+   *  not a double connect. A peer's first link marks it up. */
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
-    const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed);
+    const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed && l.relayed === link.relayed);
     if (rival) {
       if (!this.canonicalKeep(link)) { this.retire(pool, link); return; }
-      pool.links.splice(pool.links.indexOf(rival), 1);
+      Router.unlist(pool, rival);
       this.retire(pool, rival);
     }
     const up = !pool;
-    if (up) { pool = { links: [], held: [], next: 0 }; this.pools.set(peerId, pool); }
-    pool.links.push(link);
+    if (up) { pool = { links: [], direct: 0, held: [], next: 0 }; this.pools.set(peerId, pool); }
+    Router.list(pool, link);
     if (up) core.checkReady();
+  }
+
+  static list(pool, link) {
+    if (link.relayed) { pool.links.push(link); return; }
+    pool.links.splice(pool.direct++, 0, link);
+  }
+  static unlist(pool, link) {
+    const i = pool.links.indexOf(link);
+    if (i < 0) return false;
+    pool.links.splice(i, 1);
+    if (!link.relayed) pool.direct--;
+    return true;
   }
 
   /** Only the end that dialed a losing link closes it. Records may already be in flight on
@@ -42,6 +69,20 @@ class Router {
   retire(pool, loser) {
     if (loser.weDialed) loser.close();
     else pool.held.push(loser);
+  }
+
+  /** A direct link to `peerId` has authenticated at this end, the second end to see it:
+   *  the peer already routes over it. Stop writing the relayed links, keep reading them
+   *  for what is still in flight, and ask the peer to close them, which it does behind
+   *  the last record it sent on them. */
+  retireRelayed(peerId) {
+    const pool = this.pools.get(peerId);
+    if (!pool || pool.direct === 0) return;
+    for (const link of pool.links.slice(pool.direct)) {
+      Router.unlist(pool, link);
+      pool.held.push(link);
+      link.send(Uint8Array.of(KIND_CTL, CTL_RETIRE));
+    }
   }
 
   /** Keep the link whose dialer is the lexicographically smaller identity. */
@@ -56,14 +97,16 @@ class Router {
     if (!pool) return;
     const h = pool.held.indexOf(link);
     if (h >= 0) { pool.held.splice(h, 1); return; }
-    const i = pool.links.indexOf(link);
-    if (i < 0) return;
-    pool.links.splice(i, 1);
+    if (!Router.unlist(pool, link)) return;
     if (pool.links.length > 0) return;
-    // The winner closed first: a held loser is now the only way to the peer, so route it.
-    if (pool.held.length > 0) { pool.links = pool.held; pool.held = []; return; }
+    // The winner closed first: a held link is now the only way to the peer, so route it.
+    if (pool.held.length > 0) {
+      for (const l of pool.held.splice(0)) Router.list(pool, l);
+      return;
+    }
     this.pools.delete(pid);
     reqres.peerDown(pid);
+    rtc.forget(pid);
   }
 }
 

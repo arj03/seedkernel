@@ -133,7 +133,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (2,354 LOC)**
+**Shared: one implementation for all three targets (2,361 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
@@ -141,7 +141,7 @@ All three targets share bundle admission, policy and routing, and run the same s
 | Transport driver: channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 318 |
 | Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 654 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 379 |
-| Node startup, the operator flow on Node and native (§12.8): the flag set and its defaults, the order a node boots in, what it prints | `host/cli.ts` | 199 |
+| Node startup, the operator flow on Node and native (§12.8): the flag set and its defaults, the order a node boots in, what it prints | `host/cli.ts` | 206 |
 | Host services: the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (8 shared files) | 324 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
@@ -153,7 +153,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,281 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (290) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,214 Go + 357 TS |
 
-The transport bundle sits outside these host totals: 1,699 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455 and WebRTC signaling across the targets that support them.
+The transport bundle sits outside these host totals: 1,916 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays and WebRTC signaling across the targets that support them.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 
@@ -175,7 +175,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps: `npm run relay` in seedchat, which seedstore also points at. The transport bundle speaks its wire; the host holds only the peer connections (§12.7).
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys, meet in rooms and reach each other before moving to a direct link, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), which seedchat's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
 
 ## The rest of the spec
 

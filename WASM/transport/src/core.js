@@ -42,8 +42,9 @@ const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
 /** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is that
- *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp). The
- *  host never reads it (§12.8). */
+ *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp), or
+ *  `relay+ws[s]://host:port` for a peer reached through that relay. The host never reads
+ *  it (§12.8). */
 function peerRef(spec) {
   const bad = (why) => new Error(`transport: config peers entry ${JSON.stringify(spec)}: ${why}`);
   if (typeof spec !== "string" || spec.indexOf("@") < 0) throw bad("want pk[.secret]@dest");
@@ -55,11 +56,24 @@ function peerRef(spec) {
   const dest = where.includes("://") ? where : "tcp://" + where;
   const m = /^[a-z][a-z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^\s:/[\]]+):(\d{1,5})(?:\/\S*)?$/i.exec(dest);
   if (!m || Number(m[1]) < 1 || Number(m[1]) > 65535) throw bad("the destination must be [scheme://]host:port[/path]");
+  if (dest.startsWith(RELAY_SCHEME) && !relayOrigin(dest.slice(RELAY_SCHEME.length))) {
+    throw bad("a relay must be relay+ws:// or relay+wss://");
+  }
   return { peer: fromHex(pk), secret: secret === undefined ? ZERO32 : fromHex(secret), dest };
 }
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const cohort = configuredPeers.map(peerRef);
+// Where this node can be dialed directly, as `scheme://host:port[/path]`: sent to each peer
+// linked through a relay, with the contact secret, so it can move to a direct link. Only
+// the operator knows the public address, so it is theirs to set in LOCAL.
+const DEST_SHAPE = /^[a-z]+:\/\/[^\s\0]+$/;
+const advertise = LOCAL.advertise ?? APP.advertise;
+if (!Array.isArray(advertise) || advertise.some((d) => typeof d !== "string" || !DEST_SHAPE.test(d))) {
+  throw new Error("transport: config advertise must be an array of scheme://host:port destinations");
+}
+/** At most this many learned direct addresses per peer, each at most MAX_DEST_LEN. */
+const MAX_LEARNED_DESTS = 8, MAX_DEST_LEN = 256;
 const maxFrameBytes = policy("maxFrameBytes");
 // Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
@@ -138,7 +152,7 @@ function onWake() {
     const t = now();
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
-    wakeBy(rtc.onWake(t));
+    wakeBy(relays.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
     walking = false;
@@ -237,9 +251,15 @@ function rememberProbe(ephI) {
 class Core {
   constructor() {
     this.connecting = new Map(); // peerId to Link[] (outbound, pre-auth)
-    this.addrs = new Map();      // peerId to { dest, secret }: the address book
+    // peerId to { dest, secret, room }: the address book. `room` is the relay origin the
+    // entry was learned from, for a peer met in a room rather than given.
+    this.addrs = new Map();
     this.readyWaiters = [];      // [{check, d, due}], one per in-flight ready()
     this.dialing = new Map();    // peerId to in-flight dial, so concurrent senders share one
+    // peerId to { secret, dests }: what a peer linked through a relay said about reaching
+    // it directly (`onAddrs`), and the peers a move to a direct link is under way for.
+    this.learned = new Map();
+    this.upgrading = new Set();
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
@@ -255,9 +275,29 @@ class Core {
   }
 
   /** Record one peer: where to reach it and its contact secret. An empty `dest` is a peer
-   *  this node cannot dial but `ready` still waits for (a WebRTC peer from the relay). */
+   *  this node cannot dial but `ready` still waits for. */
   addAddr(peerBytes, secret, dest) {
-    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
+    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null, room: "" });
+  }
+
+  /** A key joined or left a room this node is in on the relay at `origin`. A member is
+   *  reached through that relay unless the node was given another way, under this node's
+   *  own contact secret, which a room shares; the smaller key calls. */
+  onRoomMember(origin, peer, present) {
+    if (peer === ownId) return;
+    const a = this.addrs.get(peer);
+    if (!present) {
+      if (a && a.room === origin && !relays.isMember(peer)) this.addrs.delete(peer);
+      return;
+    }
+    if (!a || a.dest === "") this.addrs.set(peer, { dest: RELAY_SCHEME + origin, secret: null, room: origin });
+    if (ownId < peer && router.linkCount(peer) === 0) void this.dial(peer);
+  }
+
+  /** The contact secret a dial to `peer` presents: what it last said over a link, else
+   *  what its address gave, else this node's own (a room's shared one). */
+  secretFor(peer) {
+    return this.learned.get(peer)?.secret ?? this.addrs.get(peer)?.secret ?? null;
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -275,18 +315,29 @@ class Core {
     if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const opened = await netLinkOpen(addr.dest);
-      if (opened.linkId === 0) return; // no route
-      this.openLink({
-        linkId: opened.linkId,
-        stream: opened.stream,
-        dest: addr.dest,
-        weDialed: true,
-        linkSecret: addr.secret,
-        limiter: null,
-        dialedPeerId: peerId,
-      });
+      if (!(await this.dialDest(peerId, addr.dest, addr.secret))) return; // no route
     }
+  }
+
+  /** Open one outbound link to `peerId` at `dest`, through the relay a `relay+` one names.
+   *  The link, or null for no route. */
+  async dialDest(peerId, dest, secret) {
+    const relayed = dest.startsWith(RELAY_SCHEME);
+    const opened = relayed
+      ? await relays.call(peerId, relayOrigin(dest.slice(RELAY_SCHEME.length)))
+      : { ...(await netLinkOpen(dest)), dest };
+    if (opened.linkId === 0) return null;
+    return this.openLink({
+      linkId: opened.linkId,
+      stream: opened.stream,
+      dest: opened.dest,
+      weDialed: true,
+      linkSecret: secret,
+      limiter: null,
+      dialedPeerId: peerId,
+      relayed,
+      ticket: opened.ticket,
+    });
   }
 
   /** An accepted channel or a fresh dial; `spec` passes through to `Link` whole. */
@@ -294,7 +345,7 @@ class Core {
     const link = new Link({
       ...spec,
       onAuth: (pid, l) => this.onAuth(pid, l),
-      onFrame: (pid, frame, pk) => reqres.onFrame(pid, frame, pk),
+      onFrame: (pid, frame, pk, l) => (frame[0] === KIND_CTL ? this.onControl(pid, frame, l) : reqres.onFrame(pid, frame, pk)),
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);
@@ -303,15 +354,72 @@ class Core {
     return link;
   }
 
+  /** A link authenticated. A relayed one tells the peer how to reach this node directly
+   *  and starts the move to a direct link; a direct one this end accepted retires the
+   *  relayed links it replaces (router.js `retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.promote(peerId, link);
+    if (!router.routes(link)) return;
+    if (link.relayed) {
+      link.send(concatBytes([Uint8Array.of(KIND_CTL, CTL_ADDRS), contactSecret, utf8Encode(advertise.join("\0"))]));
+      void rtc.upgrade(peerId).catch(() => {});
+    } else if (!link.weDialed) {
+      router.retireRelayed(peerId);
+    }
+  }
+
+  /** The transport's own message from a peer (router.js `KIND_CTL`). A relayed link
+   *  carries one address message; a retire closes it once a direct link routes, and
+   *  otherwise leaves it to the idle clock. */
+  onControl(peerId, frame, link) {
+    const tag = frame[1];
+    const body = frame.subarray(2);
+    if (tag === CTL_ADDRS) {
+      if (!link.relayed || link.addrsSeen) return;
+      link.addrsSeen = true;
+      this.onAddrs(peerId, body);
+    } else if (tag === CTL_RETIRE) {
+      if (link.relayed && router.hasDirect(peerId)) link.close();
+    } else {
+      rtc.receive(peerId, tag, body);
+    }
+  }
+
+  /** A peer linked through a relay says how to reach it directly: `[secret 32][dests]`,
+   *  the destinations NUL-separated. Dial them in turn, in the background, until one
+   *  authenticates. */
+  onAddrs(peerId, body) {
+    if (body.length < PK_LEN) return;
+    const dests = utf8Decode(body.subarray(PK_LEN)).split("\0")
+      .filter((d) => d.length <= MAX_DEST_LEN && DEST_SHAPE.test(d) && !d.startsWith(RELAY_SCHEME))
+      .slice(0, MAX_LEARNED_DESTS);
+    this.learned.set(peerId, { secret: body.slice(0, PK_LEN), dests });
+    void this.upgrade(peerId);
+  }
+
+  async upgrade(peerId) {
+    if (this.upgrading.has(peerId)) return;
+    this.upgrading.add(peerId);
+    try {
+      const given = this.addrs.get(peerId)?.dest ?? "";
+      const dests = [...this.learned.get(peerId).dests];
+      if (given !== "" && !given.startsWith(RELAY_SCHEME) && !dests.includes(given)) dests.push(given);
+      for (const dest of dests) {
+        if (router.hasDirect(peerId) || router.linkCount(peerId) === 0) return;
+        const link = await this.dialDest(peerId, dest, this.secretFor(peerId));
+        if (link && (await link.settled)) return;
+      }
+    } finally {
+      this.upgrading.delete(peerId);
+    }
   }
 
   /** A link leaving routing, as soon as it closes, not once its teardown has run. */
   forget(link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
+    if (link.ticket) relays.tickets.delete(link.ticket);
     // Its queued frames move to another link to the peer. A dial that dies as the last way
     // to its peer fails what waits on it now, not at its timeout.
     const peerId = link.peerId || link.dialedPeerId;
@@ -368,6 +476,7 @@ const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
 const rtc = new Rtc();
+const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
@@ -477,15 +586,15 @@ entry("addr", (r) => {
   core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
 
-/** Join the WebRTC signaling relay at this `ws://`/`wss://` URL, leaving any other; empty
- *  leaves (rtc.js). */
+/** Register on the relay at this `ws://`/`wss://` URL and join the room its path names,
+ *  leaving any other; empty leaves (relay.js). */
 entry("relay", async (r) => {
-  await rtc.join(utf8Decode(r.blob()));
+  await relays.join(utf8Decode(r.blob()));
   return NOTHING;
 });
 
-/** `[state u8]`: 0 no relay joined, 1 its link is up, 2 joined and waiting to redial. */
-entry("relayState", () => Uint8Array.of(rtc.state()));
+/** `[state u8]`: 0 no relay joined, 1 registered on it, 2 joined and waiting to redial. */
+entry("relayState", () => Uint8Array.of(relays.state()));
 
 /** Rotate the inbound contact secret (§12.6.3). */
 entry("contact", (r) => {
