@@ -1,9 +1,9 @@
-// Two nodes over REAL node:net sockets — the path the loopback fabric cannot reach. A TCP
-// socket reaches the bundle as an UNframed RawLink (socket-seam.ts), where the loopback
-// fabric is a framed link (one send = one delivery), so the guest's length framer, its
-// two-stage pre-auth cap and the reassembly of a message split across segments are
-// exercised only here — as is the graceful close (the end-of-stream record must flush
-// before FIN, or a clean shutdown reads as the truncation that record exists to rule out).
+// Two nodes over real node:net sockets, which the loopback fabric cannot cover. A TCP
+// socket reaches the bundle as an unframed RawLink (socket-seam.ts), while the loopback
+// fabric is framed (one send, one delivery), so the guest's length framer, its two-stage
+// pre-auth cap and reassembly across segments are only exercised here, as is the graceful
+// close (the end-of-stream record must flush before FIN, or a clean shutdown looks like a
+// truncation).
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { testkit } from "./testkit.mjs";
@@ -58,9 +58,8 @@ async function makeNode(ws = false, extraConfig = {}) {
     admit: policy,
   });
   const app = await shell.install(harnessAppBlob(appAuthor));
-  // The node's own channel key, hex. Read off the identity this factory minted rather than
-  // asked of the driver: it is the same `toHex(identity.publicKey)` every caller already
-  // holds, and the driver has nothing to say about peers any more (services/socket-seam.ts).
+  // The node's own key, hex, from the identity this factory created. The driver knows
+  // nothing about peers (services/socket-seam.ts).
   return { shell, transport, app, peerId: Buffer.from(identity.publicKey).toString("hex") };
 }
 
@@ -76,13 +75,13 @@ const aNet = a.transport, bNet = b.transport;
 
 assert(aNet.portOf("tcp") > 0 && bNet.portOf("tcp") > 0, "both nodes bound real TCP listeners");
 
-// Both nodes run the echo app, which also answers a GENERATOR request with a payload
-// far larger than the pre-auth cap (8 KiB) — it can only cross once the guest has raised
-// its own cap on authentication, and it is certain to arrive as several TCP segments.
+// Both nodes run the echo app, which also answers a generator request with a payload far
+// larger than the pre-auth cap (8 KiB). It can only cross once the guest has raised its
+// cap on authentication, and it is certain to arrive as several TCP segments.
 const BIG = 512 * 1024;
 
-// The listener's port is only known now, so the peer is taught to the running occupant
-// rather than named in its load config — the same `addr` op either path ends in.
+// The listener's port is only known now, so the peer is added to the running transport
+// with `addr` instead of its install config.
 await addr(a, b.peerId, `tcp://${HOST}:${bNet.portOf("tcp")}`);
 await ready(a, 4000);
 assert((await linkedPeers(a)).includes(b.peerId), "the AKE completed over a real socket");
@@ -90,9 +89,9 @@ assert((await linkedPeers(a)).includes(b.peerId), "the AKE completed over a real
 const small = await appRequest(a.app, b.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(small.length === 4 && small[3] === 4, "a small request round-trips through the guest's framer");
 
-// The reassembly case: a response guaranteed to span many segments, checked byte for
-// byte. A framer that mishandled a partial length prefix or a split body would either
-// hang here or deliver a corrupted message rather than merely a short one.
+// The reassembly case: a response certain to span many segments, checked byte for byte.
+// A framer that mishandled a partial length prefix or a split body would hang here or
+// deliver a corrupted message.
 const big = await appRequest(a.app, b.peerId, generatorRequest(BIG, 1));
 assert(big.length === BIG, `a ${BIG}-byte response reassembled from many TCP segments`);
 let intact = true;
@@ -108,10 +107,10 @@ assert(true, "closing the dialing node did not wedge the listener");
 await bNet.close();
 
 // ── the same thing over RFC 6455 ──────────────────────────────────────────────
-// The browser edge, minus the browser: a node dialing another's `ws`-labelled listener runs
-// the guest's WsFramer at BOTH ends — client half masking its frames, server half computing
-// the accept value through the bundle's own ws.wasm and refusing unmasked client frames.
-// None of it is host code.
+// The browser path, without a browser: a node dialing another's `ws`-labelled listener
+// runs the guest's WsFramer at both ends, the client masking its frames and the server
+// computing the accept value through the bundle's ws.wasm and refusing unmasked client
+// frames. None of it is host code.
 console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle module)");
 
 const c = await makeNode(true);
@@ -119,9 +118,9 @@ const d = await makeNode(true);
 const cNet = c.transport, dNet = d.transport;
 assert(dNet.portOf("ws") > 0, "the WS listener bound");
 
-// The `ws://` scheme is the whole difference: the destination string sends the host's
-// factory at the same kind of TCP socket, which declares a different codec on it. The path
-// rides the client's request line, as a reverse proxy or a relay room would need it.
+// The `ws://` scheme is the only difference: the host's factory opens the same kind of
+// TCP socket, and the transport picks a different codec for it. The path goes in the
+// client's request line, as a reverse proxy or a relay room needs.
 await addr(c, d.peerId, `ws://${HOST}:${dNet.portOf("ws")}/cohort`);
 await ready(c, 4000);
 assert((await linkedPeers(c)).includes(d.peerId), "the AKE completed through the WS upgrade");
@@ -136,10 +135,10 @@ let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }
 assert(wsIntact, "every byte survived WS framing + reassembly");
 
-// Many requests in flight at once — the pipelining case, which puts several chunks on the
-// socket in one turn. Decoding a WS frame is a module call, so a push parks and the host
-// hands over the next chunk without waiting for it: what keeps the two parses from running
-// over one reassembly buffer is the framer's read chain (framing.js `push`).
+// Many requests in flight at once: the pipelining case, which puts several chunks on the
+// socket in one turn. Decoding a WS frame is a module call, so a push waits while the host
+// hands over the next chunk; the framer's read chain (framing.js `push`) keeps the two
+// parses from overlapping on one reassembly buffer.
 const burst = await Promise.all(
   Array.from({ length: 12 }, (_, i) => appRequest(c.app, d.peerId, generatorRequest(1024 + i, 11 + i))));
 let burstIntact = burst.length === 12;
@@ -153,11 +152,10 @@ await cNet.close();
 await dNet.close();
 
 // ── a WS upgrade that never lands must still meet its deadline ────────────────
-// The codec parks every write until the upgrade completes, and a teardown queued behind
-// that park would never run: no close, and the slot and raw link held until the socket
-// happened to die on its own. So the peer here does the one thing that defeats every
-// other clock — it accepts, says just enough to look alive (which clears the host's own
-// pre-speech read deadline), and then stops. Only the guest's handshake deadline is left.
+// The codec holds every write until the upgrade completes, and a teardown queued behind
+// it would never run: no close, and the slot and raw link held until the socket died on
+// its own. So the peer here accepts, sends just enough to look alive, and then stops.
+// Only the guest's handshake deadline can end it.
 console.log("\nTest: a WS peer that accepts, half-speaks and stalls still meets the deadline");
 
 const { createServer } = await import("node:net");

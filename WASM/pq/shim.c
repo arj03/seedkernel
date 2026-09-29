@@ -1,24 +1,20 @@
 /*
- * shim.c — the entire seedkernel-specific surface of mldsa65.wasm.
+ * The seedkernel-specific part of mldsa65.wasm.
  *
- * Three exports over mldsa-native's core API, in the shape the runtime's crypto
- * seam already speaks: raw byte pointers into linear memory, no key objects, no
- * formats, no allocation. Every buffer is caller-owned and its length is a format
- * constant (§12.4), so there is nothing here to get wrong at runtime.
+ * Three exports over mldsa-native's core API, matching the runtime's crypto seam:
+ * raw byte pointers into linear memory, no key objects, no formats, no allocation.
+ * Every buffer is caller-owned and its length is a format constant (§12.4).
  *
  * FIPS 204 pure mode prefixes the message with `0x00 ‖ ctxlen ‖ ctx`. The context
- * string is carried through the ABI even though the runtime always passes an empty
- * one — its domain separation is the DOMAIN_manifest prefix inside the signed
- * preimage (§16.1), which is the runtime's own property and must not be split
- * across two mechanisms. Keeping the parameter costs two arguments and buys the
- * ability to run the published ACVP vectors unmodified, most of which use a
- * context; a verifier that can only be tested on the subset of vectors that happen
- * to match your call site is a verifier you have barely tested.
+ * is passed through the ABI even though the runtime always passes an empty one: its
+ * domain separation is the DOMAIN_manifest prefix inside the signed preimage
+ * (§16.1), and it should not use two mechanisms. Keeping the parameter costs two
+ * arguments and lets the published ACVP vectors, most of which use a context, run
+ * unmodified.
  *
- * Randomness is an *argument*, never a syscall. That is what keeps the module
- * import-free: a wasm with no imports instantiates identically under Node, under a
- * browser, and under wazero in the Go host, with no per-target glue to disagree
- * about (§12.9).
+ * Randomness is an argument, never a syscall, so the module has no imports and
+ * instantiates identically under Node, a browser and wazero in the Go host, with no
+ * per-target glue (§12.9).
  */
 
 #include <stddef.h>
@@ -53,8 +49,8 @@ void *memset(void *s, int c, size_t n)
 }
 
 /* FIPS 204 pure-mode prefix: 0x00 ‖ ctxlen ‖ ctx, at most 2 + 255 bytes. Static
- * because wasm here is single-threaded and re-entrancy is impossible: the host
- * calls in, the module runs to completion, the host gets a number back. */
+ * because the module is single-threaded and cannot be re-entered: each call runs to
+ * completion. */
 static uint8_t mld_pre[257];
 
 static size_t mld_build_pre(const uint8_t *ctx, size_t ctxlen)
@@ -71,10 +67,9 @@ static size_t mld_build_pre(const uint8_t *ctx, size_t ctxlen)
 
 #define EXPORT __attribute__((visibility("default")))
 
-/* Verify. Returns 1 for a good signature, 0 for anything else — the runtime's
- * verifiers are booleans (`crypto_sign_verify_detached`), and collapsing here
- * rather than in JS means the two suites cannot report structurally different
- * failures through different paths. */
+/* Verify. Returns 1 for a good signature, 0 for anything else, since the runtime's
+ * verifiers are booleans (`crypto_sign_verify_detached`). Collapsing here instead of
+ * in JS keeps both halves of the suite failing the same way. */
 EXPORT int mldsa65_verify(const uint8_t *sig, const uint8_t *m, size_t mlen,
                           const uint8_t *ctx, size_t ctxlen, const uint8_t *pk)
 {
@@ -108,10 +103,9 @@ EXPORT int mldsa65_keypair(uint8_t *pk, uint8_t *sk, const uint8_t *seed)
   return mld65_keypair_internal(pk, sk, seed) == 0;
 }
 
-/* Field widths, exported so the JS and Go sides read them out of the artifact
- * instead of repeating them (they are already frozen by the envelope format, but
- * a build against the wrong parameter set should fail loudly at load, not
- * silently produce a verifier for a different algorithm). */
+/* Field widths, exported so the JS and Go sides can check them against the
+ * envelope format's constants at load: a build against the wrong parameter set
+ * fails there instead of verifying a different algorithm. */
 EXPORT int mldsa65_publickeybytes(void) { return MLDSA65_PUBLICKEYBYTES; }
 EXPORT int mldsa65_secretkeybytes(void) { return MLDSA65_SECRETKEYBYTES; }
 EXPORT int mldsa65_signaturebytes(void) { return MLDSA65_BYTES; }

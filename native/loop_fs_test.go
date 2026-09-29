@@ -5,17 +5,17 @@ import (
 	"time"
 )
 
-// A guest that chains fs ops must keep advancing with NOTHING else driving the loop —
-// the holder's shape, and the one case the pump ordering cannot carry on its own. A guest
-// continuation that issues `await host.call("fs/*")` parks, and its settlement is a
-// HOST-realm microtask queued after el.c was already drained this round, so without the
-// wake in __host_call the chain advances one fs call per externally-provoked round and
-// then stops dead.
+// A guest that chains fs ops must keep advancing with nothing else driving the loop, as a
+// storage holder does, the one case the pump ordering cannot handle alone. A guest
+// continuation that runs `await host.call("fs/*")` waits, and its settlement is a
+// host-realm microtask queued after el.c was already drained this round, so without the
+// wake in __host_call the chain advances one fs call per externally triggered round and
+// then stops.
 //
-// A holder serving from local disk generates no I/O of its own, which is why it strands:
-// while a peer keeps sending frames the loop is woken incidentally, so the stall only
-// shows once the inbound burst ends. This test removes that traffic entirely — no net, no
-// timers, just a chain of fs awaits.
+// A holder serving from local disk generates no I/O of its own, which is why it gets
+// stuck: while a peer keeps sending frames the loop is woken incidentally, so the stall
+// only shows once the inbound burst ends. This test removes that traffic entirely: no net,
+// no timers, just a chain of fs awaits.
 func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", `
@@ -24,7 +24,7 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 		t.Fatal("build seam:", err)
 	}
 
-	// Each iteration is PUT then GET then SIZE — three parked ops, so a 24-block run is
+	// Each iteration is PUT, then GET, then SIZE: three waiting ops, so a 24-block run is
 	// 72 chained host-realm settlements with no other source of loop activity.
 	newTestRealm(t, "{}", `
 		function keyBytes(i) {
@@ -62,8 +62,8 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 	if len(out) != 1 || out[0] != blocks {
 		t.Fatalf("chain read back %v blocks, want %d", out, blocks)
 	}
-	// The harness gives up at 30s. A stranded chain burns the whole budget; a driven one
-	// is milliseconds. Anything past a second means rounds are not being scheduled.
+	// The harness gives up at 30s. A stuck chain uses the whole budget; a working one takes
+	// milliseconds. Anything past a few seconds means rounds are not being scheduled.
 	if elapsed > 5*time.Second {
 		t.Fatalf("chained fs calls took %s — the loop is not scheduling a round per parked op", elapsed)
 	}

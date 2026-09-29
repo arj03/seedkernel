@@ -1,7 +1,6 @@
-// Builds browser/mlkem768.wasm — ML-KEM-768 (FIPS 203) as an import-free pure module
-// carried by the transport bundle — from the pinned mlkem-native submodule.
-// One artifact rides in the same signed bundle on every target, so a rejected encoding
-// cannot become a target-dependent handshake result.
+// Builds browser/mlkem768.wasm, ML-KEM-768 (FIPS 203) as an import-free pure module
+// shipped in the transport bundle, from the pinned mlkem-native submodule. The same
+// artifact runs on every target, so handshake results cannot depend on the target.
 import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({

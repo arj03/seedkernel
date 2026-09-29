@@ -1,15 +1,15 @@
-// testkit.mjs — the assertion/reporting/teardown skeleton the standalone test files share.
-// throw-based flavor: `test(name, fn)` + `assert(c, m)` — a failed assertion stops that
-// test, the wrapper reports it and moves on. report-based: `ok(c, m)` / `throws(fn, m)` —
-// a failed check is logged and counted, the file keeps going. `keep(o)` closes everything
-// kept so far after each test; `summary()` owns the exit code, so a test file never calls
+// The assertion, reporting and teardown helpers the standalone test files share.
+// Throw-based: `test(name, fn)` with `assert(c, m)`; a failed assertion stops that test,
+// which is reported, and the run moves on. Report-based: `ok(c, m)` / `throws(fn, m)`; a
+// failed check is logged and counted and the file keeps going. `keep(o)` closes everything
+// kept so far after each test; `summary()` sets the exit code, so a test file never calls
 // process.exit itself. `testkit({ verbose: false })` silences the per-check `ok:` lines.
 
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /** An `imp(path)` closure bound to `root`: resolves a `build/...`-relative path to a file
- *  URL and imports it. Every suite needs the same binding \u2014 this is the one definition. */
+ *  URL and imports it. */
 export function importBuilt(root) {
   return (p) => import(pathToFileURL(join(root, p)).href);
 }
@@ -23,8 +23,8 @@ export function testkit({ verbose = true } = {}) {
   const throws = (fn, m) => { try { fn(); ok(false, m); } catch { ok(true, m); } };
   const note = (s) => console.log(`       \u00b7 ${s}`);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  /** `ok`, normalizing both sides first \u2014 a mismatch reports readable expected/got text
-   *  rather than two objects `console.error` would print as `[object Object]`. */
+  /** `ok`, normalizing both sides first, so a mismatch reports readable expected/got text
+   *  instead of `[object Object]`. */
   const assertEqual = (actual, expected, m) => {
     const norm = (v) => {
       if (v === null || v === undefined) return String(v);
@@ -39,8 +39,7 @@ export function testkit({ verbose = true } = {}) {
   /** Close everything kept so far. */
   const cleanup = () => {
     for (const o of cleanups.splice(0)) {
-      // A test keeps either the state object itself (a `close()`) or a node whose
-      // cleanup hangs off `.shell` — close whichever shape it kept.
+      // A test keeps either an object with `close()` or a node whose `.shell` has one.
       const target = o?.shell ?? o;
       try { target.close?.(); } catch { /* already down */ }
     }
@@ -69,18 +68,17 @@ export function testkit({ verbose = true } = {}) {
   return { assert, ok, assertEqual, throws, note, sleep, keep, test, summary };
 }
 
-// The author helper below reaches the host's own derivations rather than restating them
-// — a test-side copy of an identity rule would agree with itself and nothing else.
-// Resolved from this file's location; every suite runs after `npm run build`.
+// The author helper below uses the host's own derivations instead of a test-side copy,
+// which would only agree with itself. Resolved from this file's location; every suite
+// runs after `npm run build`.
 const impBuilt = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
 const { hybridAuthorId } = await impBuilt("build/host/bundle.js");
 const { hybridAuthorKeysFromSeed } = await impBuilt("build/scripts/bundle-author.js");
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
- *  the two derive — built through the SHIPPED seed→key-set derivation, so a suite that
- *  signs a bundle exercises the rule real publishers use. Takes the caller's own
- *  `sodium` — it must be the SAME instance the test verifies with. Fresh keys per call:
- *  freshness is keyed by (author, app), so shared authors would inherit high-water marks. */
+ *  derived from both, built with the shipped seed-to-key-set derivation. Takes the
+ *  caller's `sodium`, which must be the same instance the test verifies with. Fresh keys
+ *  per call: freshness is keyed by (author, app), so shared authors would inherit marks. */
 export function makeAuthor(sodium) {
   const keys = hybridAuthorKeysFromSeed(sodium, sodium.randombytes_buf(32));
   return { ...keys, id: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey) };

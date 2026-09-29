@@ -1,10 +1,10 @@
 package main
 
-// A realm is zero-authority by construction: qjs.wasm links no quickjs-libc and sets no
+// A realm has no authority by construction: qjs.wasm links no quickjs-libc and sets no
 // module loader (native/qjs/csrc/shim.c), so no realm has std/os/bjson, their globals, or a
-// module name to import them by. Were they reachable, an admitted guest could `os.sleep()`
-// the single event-loop thread past every budget, `std.exit()` the process, or
-// `import("qjs:os")` to re-reach the modules.
+// module name to import them by. If they were reachable, an admitted guest could
+// `os.sleep()` the single event-loop thread past every budget, `std.exit()` the process,
+// or `import("qjs:os")` to reach the modules again.
 //
 // The engine's WASI imports refuse everything but the clock: see instantiateWASI
 // (native/qjs/qjs.go) and native/qjs/wasi_test.go.

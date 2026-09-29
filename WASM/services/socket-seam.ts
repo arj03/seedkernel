@@ -1,19 +1,19 @@
-// Raw socket ABI (§12.1). Framing, routing and every peer-shaped decision belong to the
+// Raw socket ABI (§12.1). Framing, routing and every peer-level decision belong to the
 // transport bundle.
 
 export interface RawLink {
   send(bytes: Uint8Array): void;
   /** One message, or an arbitrary slice when `stream` is true. */
   onData(cb: (bytes: Uint8Array) => void): void;
-  /** Stop/start inbound delivery around one serialized transport-realm turn. Optional;
-   * TransportHost gives adapters without platform backpressure one fallback message. */
+  /** Stop or start inbound delivery around one transport-realm turn. Optional;
+   *  TransportHost holds reads itself for adapters without platform backpressure. */
   setReadable?(enabled: boolean): void;
   onClose(cb: () => void): void;
   /** `graceful` permits flushing queued writes. */
   close(graceful?: boolean): void;
-  /** Bytes awaiting transmission, drained in send order: the only release signal
-   *  `LinkOutboundOwner` has. Omit only when nothing is retained past `send`. A throw
-   *  fails the link. */
+  /** Bytes awaiting transmission, drained in send order. This is how
+   *  `LinkOutboundOwner` learns what has drained; omit it only when nothing is retained
+   *  past `send`. A throw fails the link. */
   buffered?(): number;
   /** Unauthenticated key for per-source limits; never a peer identity. */
   readonly remoteAddr?: string;
@@ -23,14 +23,14 @@ export interface RawLink {
 
 /** Metadata for a platform-opened link. Guest-opened links have none. */
 export interface Arrival {
-  /** The label of the listener that accepted it, passed to the occupant unread. */
+  /** The label of the listener that accepted it, passed to the occupant as is. */
   readonly listener?: string;
   /** The link this one arrived through (a data channel's negotiation link). */
   readonly via?: RawLink;
 }
 
-/** Where a listener binds; port 0 asks the OS. The label reaches the occupant with every
- *  accepted link, so which codec a listener speaks is the transport's to decide. */
+/** Where a listener binds; port 0 lets the OS pick. The label reaches the occupant with
+ *  every accepted link, so the transport decides which codec a listener speaks. */
 export interface ListenAddress {
   label: string;
   host: string;
@@ -40,12 +40,12 @@ export interface ListenAddress {
 export interface ChannelFactory {
   connect?(dest: string): RawLink | null;
   /** Bind what this factory can and hand every platform-opened link to `onAccept`.
-   *  Answers each address's bound port in order, 0 for one it does not bind. */
+   *  Returns each address's bound port in order, 0 for one it does not bind. */
   listen(
     addrs: readonly ListenAddress[],
     onAccept: (channel: RawLink, arrival?: Arrival) => void,
   ): Promise<number[]>;
-  /** Stop the listeners. Open channels are closed by the core. */
+  /** Stop the listeners. TransportHost closes open channels. */
   close(): void;
 }
 

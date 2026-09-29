@@ -1,12 +1,12 @@
 package main
 
-// module_bound_test.go — the §4.3 lever, functionally: a module that never returns holds
-// the thread it runs on, and only the deadline ends it (SECURITY §14.1). These tests prove
-// the bound fires, that the closed module is evicted, and that a reinstall recovers the app.
+// The §4.3 bound in practice: a module that never returns holds the thread it runs on,
+// and only the deadline ends it (§14.1). These tests check the bound fires, that the
+// closed module is evicted, and that a reinstall recovers the app.
 //
-// Two wedges, because there are two places a module can refuse to return: its `handle`
-// (the call, below) and its START section, which instantiation runs — TestModuleBindBound
-// is what says the deadline covers that too.
+// Two wedges, because a module can fail to return in two places: its `handle` (the call,
+// below) and its start section, which instantiation runs; TestModuleBindBound checks the
+// deadline covers that too.
 //
 // The wedge is a minimal hand-assembled module whose handle is an infinite loop; it
 // declares the §4.1 exports like any installed module. WAT:
@@ -27,8 +27,8 @@ import (
 	"time"
 )
 
-// sec size-prefixes one wasm section. Sizes are computed rather than hand-counted so a
-// layout cannot drift from the WAT it is transcribed from.
+// sec size-prefixes one wasm section. Sizes are computed, not hand-counted, so the bytes
+// cannot drift from the WAT they are transcribed from.
 func sec(id byte, content ...byte) []byte {
 	out := []byte{id, byte(len(content))}
 	return append(out, content...)
@@ -53,7 +53,7 @@ func wedgeWasmBytes() []byte {
 		0x00,       // no locals
 		0x02, 0x40, // block (void)
 		0x03, 0x40, // loop (void)
-		0x0c, 0x00, // br 0 — back to the loop header, forever
+		0x0c, 0x00, // br 0: back to the loop header, forever
 		0x0b, 0x0b, // end loop, end block
 		0x41, 0x00, // i32.const 0
 		0x0b, // end func
@@ -70,8 +70,8 @@ func wedgeWasmBytes() []byte {
 	return out
 }
 
-// wedgeStartWasmBytes is the same module with the loop moved into a START section: its
-// `handle` returns immediately, and it is INSTANTIATION that never finishes. WAT:
+// wedgeStartWasmBytes is the same module with the loop moved into a start section: its
+// `handle` returns immediately, and instantiation never finishes. WAT:
 //
 //	(module
 //	  (memory (export "memory") 2)
@@ -81,13 +81,12 @@ func wedgeWasmBytes() []byte {
 //	  (func $init (loop (br 0)))   ;; never returns
 //	  (start $init))
 //
-// This is the one wedge a call-time deadline cannot reach — the module never becomes
-// callable — so it is what says the bound also covers the bind (main.go
-// instantiateWasm).
+// A call-time deadline cannot reach this wedge, since the module never becomes callable,
+// so it checks that the bound also covers instantiation (module.go instantiateWasm).
 func wedgeStartWasmBytes() []byte {
 	typ := sec(1, 2,
-		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   — handle
-		0x60, 0x00, 0x00) //             type 1: () -> ()       — the start function
+		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   (handle)
+		0x60, 0x00, 0x00) //             type 1: () -> ()       (the start function)
 	fn := sec(3, 2, 0x00, 0x01)                    // func 0: type 0, func 1: type 1
 	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
 	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
@@ -101,13 +100,13 @@ func wedgeStartWasmBytes() []byte {
 	start := sec(8, 0x01) // start = func 1
 	handleBody := []byte{
 		0x00,       // no locals
-		0x41, 0x00, // i32.const 0 — the callable half is trivial
+		0x41, 0x00, // i32.const 0: the callable half is trivial
 		0x0b, // end func
 	}
 	initBody := []byte{
 		0x00,       // no locals
 		0x03, 0x40, // loop (void)
-		0x0c, 0x00, // br 0 — forever, during instantiation
+		0x0c, 0x00, // br 0: forever, during instantiation
 		0x0b, // end loop
 		0x0b, // end func
 	}
@@ -165,9 +164,9 @@ func TestModuleCallBound(t *testing.T) {
 		t.Fatalf("wedge returned after %s, want ~50 ms: the bound did not fire", elapsed)
 	}
 
-	// The kill CLOSED the module, so it is evicted from the table — a closed instance
-	// left in place would fail every later call silently, which is the app answering
-	// empty on a protocol forever. The slot still holds the healthy module.
+	// The kill closed the module, so it is evicted from the table; a closed instance left
+	// in place would silently fail every later call, and the app would answer empty
+	// forever. The slot still holds the healthy module.
 	if moduleSlots[key]["wedge"] != nil {
 		t.Fatal("the wedged module must be evicted from the table, not left as a closed instance")
 	}
@@ -176,8 +175,8 @@ func TestModuleCallBound(t *testing.T) {
 	}
 	echo()
 
-	// A reinstall binds a fresh instance and the bound fires again on it — recovery
-	// is the ordinary reload path, not a restart of the host.
+	// A reinstall creates a fresh instance and the bound fires again on it: recovery is
+	// the ordinary reinstall path, not a host restart.
 	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
 		t.Fatalf("reinstall refused: %v", err)
 	}
@@ -191,9 +190,9 @@ func TestModuleCallBound(t *testing.T) {
 	}
 }
 
-// TestModuleRuntimeArmed proves the app-module runtime honors the per-call context handed
-// to it. The deadline value is no longer process configuration; every call supplies its
-// calling guest's remainder, while the runtime stays armed so that context has teeth.
+// TestModuleRuntimeArmed checks the app-module runtime honors the per-call context it is
+// given. Every call supplies its calling guest's remainder, and the runtime is armed so
+// that context is enforced.
 func TestModuleRuntimeArmed(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()
@@ -215,11 +214,11 @@ func TestModuleRuntimeArmed(t *testing.T) {
 	}
 }
 
-// TestModuleBindBound: the bind is bounded too. A module whose START section never
-// returns is wedged before it is ever callable, so the call-time deadline has nothing
-// to fire on — instantiation itself must run under the bound (main.go
-// instantiateWasm), or an install is the hole the whole lever was closing. The JS
-// table bounds its worker load for the same reason (module-table.ts).
+// TestModuleBindBound: instantiation is bounded too. A module whose start section never
+// returns is wedged before it is callable, so the call-time deadline has nothing to fire
+// on; instantiation itself must run under the bound (module.go instantiateWasm), or
+// install would bypass it. The JS table bounds its worker load for the same reason
+// (module-table.ts).
 func TestModuleBindBound(t *testing.T) {
 	bootRealm(t)
 	key := "startwedge"
@@ -230,8 +229,8 @@ func TestModuleBindBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("buildModuleSlot accepted a module whose start section never returns")
 	}
-	// It must be the DEADLINE that refused it, not validation: a compile-time refusal
-	// would pass this test while leaving the wedge wide open. The error comes from
+	// It must be the deadline that refused it, not validation: a compile-time refusal
+	// would pass this test while leaving the wedge open. The error comes from
 	// instantiation, and it took about as long as the bound.
 	if !strings.Contains(err.Error(), "instantiate") {
 		t.Fatalf("bind refused with %v, want an instantiate failure (the bound, not a validation error)", err)
@@ -244,7 +243,7 @@ func TestModuleBindBound(t *testing.T) {
 		t.Fatal("a refused bind left the app on the table")
 	}
 
-	// The host is unharmed — the runtime that killed the wedge still binds and runs an
+	// The host is unharmed: the runtime that killed the wedge still loads and runs an
 	// ordinary module.
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot refused a healthy module after the wedge: %v", err)

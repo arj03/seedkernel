@@ -1,12 +1,12 @@
-// Load behaviour of the half-open budgets (§12.6.2; CHANNEL §5, §11). The concealed handshake
-// refuses strangers by SILENCE (an immediate close is an oracle), so an unproven connection
-// occupies a socket for the whole deadline, and these budgets are what stand between a
-// stranger and the node. Three questions: what an unproven connection costs us, whether a
-// flood from outside the contact secret can stop members getting in, and whether the
-// budgets behave as the constants claim. Entirely over the in-process fabric, so the
-// numbers cover crypto/alloc cost per connection, not kernel socket limits. The limiter
-// lives inside the transport guest, so every assertion is on OBSERVABLE behaviour — is a
-// socket evicted or refused, does a member still complete its handshake — never a counter.
+// Load behaviour of the half-open budgets (§12.6.2; CHANNEL §5, §11). The concealed
+// handshake refuses strangers silently (an immediate close would be an oracle), so an
+// unproven connection holds a socket for the whole deadline, and these budgets protect the
+// node. Three questions: what an unproven connection costs, whether a flood from outside
+// the contact secret can keep members out, and whether the budgets behave as the constants
+// say. Entirely over the in-process fabric, so the numbers cover crypto and allocation cost
+// per connection, not kernel socket limits. The limiter lives inside the transport guest,
+// so every assertion is on observable behaviour (is a socket evicted or refused, does a
+// member still complete its handshake), never a counter.
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
@@ -16,10 +16,10 @@ import { testkit } from "./testkit.mjs";
 
 const CONTACT = new Uint8Array(32).fill(3);
 
-/** The node's sodium, wrapped to charge the asymmetric operations to a counter. The guest
- *  reaches ML-KEM through its private module and the remaining transforms through the host seam, so this is the real bill for a
- *  connection — including the ephemeral keypair, which is `RANDOM(32)` + an x25519/dh
- *  against the base point and so shows up as a scalarmult. */
+/** The node's sodium, wrapped to count the asymmetric operations. The guest reaches ML-KEM
+ *  through its private module and the other transforms through the host seam, so this is
+ *  the real cost of a connection, including the ephemeral keypair, which is
+ *  `crypto/random` plus an x25519/dh against the base point and so counts as a scalarmult. */
 function countingSodium(base) {
   const ops = { scalarmult: 0, sign: 0, verify: 0, aead: 0 };
   const charge = {
@@ -50,9 +50,8 @@ async function server(fabric, halfOpen, opts = {}) {
   return n;
 }
 
-/** A raw dial that opens a socket and then says nothing at all — the cheapest
- *  possible flood, and the one the deadline exists for. Resolves what the server did
- *  to it: `closed` flips when our socket is evicted or refused. */
+/** A raw dial that opens a socket and then sends nothing: the cheapest possible flood,
+ *  which the deadline exists for. `closed` flips when the server evicts or refuses it. */
 function silentDial(fabric, port, host) {
   const ch = fabric.connect(`tcp://${host}:${port}`);
   const st = { ch, closed: false };
@@ -64,9 +63,9 @@ function silentDial(fabric, port, host) {
 /** A real member node that dials the server and must complete its handshake. */
 async function member(fabric, serverNode, host) {
   const m = await makeTransportHost({ channels: fabric.view(), contactSecret: CONTACT });
-  // The server's port is only known once it is listening, so the peer is taught to the
-  // running occupant rather than named in its load config. `host` is what the fabric hands
-  // back as `remoteAddr`, which is what the per-source cap buckets on (§12.6.2).
+  // The server's port is only known once it is listening, so the peer is added to the
+  // running transport instead of its install config. `host` is what the fabric reports as
+  // `remoteAddr`, which the per-source cap counts by (§12.6.2).
   m.addr(serverNode.peerId, `tcp://${host}:${serverNode.driver.portOf("tcp")}`, CONTACT);
   return m;
 }
@@ -77,14 +76,14 @@ console.log("\nTransport load behaviour (§12.6.2; CHANNEL §5)\n");
 
 // ─────────────────────────────────────────────────────────────────────────────
 await test("a silent stranger costs NO asymmetric crypto", async () => {
-  // Key material is deferred until a msg1 opens (guest `ensureKeys`). Generating an X25519
-  // keypair when the socket lands would let every inbound TCP connection buy a keygen
-  // before the peer had proved anything — the cheapest flood there is.
+  // Key material waits until a msg1 opens (guest `ensureKeys`). Generating an X25519
+  // keypair on accept would give every inbound connection a keygen before the peer proved
+  // anything, the cheapest flood there is.
   const N = 200;
   const fabric = new LoopbackChannels();
   const c = countingSodium(realSodium);
   const s = keep(await server(fabric, { unverified: N + 1, perSource: N + 1, verified: N + 1 }, { sodium: c.sodium }));
-  c.reset(); // boot (manifest verify, hashing) is not what we are measuring
+  c.reset(); // boot (manifest verify, hashing) is not what this measures
   const t0 = process.hrtime.bigint();
   const dials = [];
   for (let i = 0; i < N; i++) dials.push(silentDial(fabric, s.driver.portOf("tcp"), `10.0.${(i >> 8) & 255}.${i & 255}`));
@@ -109,9 +108,9 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
   const dials = [];
   for (let i = 0; i < N; i++) {
     const d = silentDial(fabric, s.driver.portOf("tcp"), `10.1.${(i >> 8) & 255}.${i & 255}`);
-    // A well-formed-looking msg1 — right suite byte, right length, wrong everything
-    // else. The suite byte matters: get it wrong and the guest refuses on the byte
-    // alone, and this measures a cheaper path than a real attacker gets.
+    // A plausible msg1: right suite byte and length, wrong everything else. The suite
+    // byte matters: with a wrong one the guest refuses on the byte alone, a cheaper path
+    // than a real attacker gets.
     const junk = new Uint8Array(1233);
     junk[0] = 0x03; // SUITE_CHANNEL_CONCEALED
     for (let j = 1; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
@@ -128,11 +127,10 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
 });
 
 await test("an outside flood CANNOT keep members out", async () => {
-  // The property the whole budget design exists for. Separate tiers are not enough on
-  // their own: a saturating flood would refuse the member AT THE DOOR, before it could
-  // send the one message that promotes it. Eviction fixes the order — a new arrival
-  // displaces the stalest stranger, proves itself in one round trip, and leaves the
-  // contended budget.
+  // The property the budget design exists for. Separate tiers are not enough on their
+  // own: a saturating flood would refuse the member on accept, before it could send the
+  // message that promotes it. Eviction fixes that: a new arrival displaces the stalest
+  // stranger, proves itself in one round trip, and leaves the contended budget.
   const UNVER = 24;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: UNVER, perSource: UNVER, verified: 8 }));
@@ -175,19 +173,18 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
 });
 
 await test("a leaked contact secret cannot lock members out of the verified budget", async () => {
-  // The same failure one tier up: an attacker holding the leaked address can promote into
-  // the verified tier and stall, so a promote() that merely REFUSED when full would let a
-  // few hundred shut every real member out — the verified tier evicts too. The attacker is
-  // a real node holding the secret whose socket drops everything after msg1.
+  // The same failure one tier up: an attacker with the leaked address can promote into
+  // the verified tier and stall, so if promote() only refused when full, a few hundred
+  // could lock every real member out. The verified tier evicts too. The attacker is a real
+  // node holding the secret whose socket drops everything after msg1.
   const VER = 6;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: VER }));
   for (let i = 0; i < VER * 3; i++) {
     const d = silentDial(fabric, s.driver.portOf("tcp"), `10.6.6.${i}`);
     // A dialer that opens under the real secret and then stalls needs a real msg1, which
-    // only a real node can build — so borrow one and cut its socket after the first write.
-    // Its raw link is the one its own transport opens when it dials: an `InjectedChannels`
-    // factory answers that dial with the gated wrapper, exactly as a real factory would.
+    // only a real node can build, so use one and cut its socket after the first write. An
+    // `InjectedChannels` factory answers its dial with the gated wrapper.
     const factory = new InjectedChannels();
     const a = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT }));
     let wrote = 0;
@@ -215,10 +212,10 @@ await test("a leaked contact secret cannot lock members out of the verified budg
 });
 
 await test("the budget bounds links PAST the handshake, not just into it", async () => {
-  // The tiers above bound who is getting IN. Releasing the slot at authentication would
-  // let anyone who can complete a handshake hold links without limit, each with its own
-  // framer, session keys, timers and buffers. The slot is held for the link's life, in a
-  // third tier that evicts its stalest occupant like the other two.
+  // The tiers above bound who gets in. Releasing the slot at authentication would let
+  // anyone who can complete a handshake hold unlimited links, each with its own framer,
+  // session keys, timers and buffers. The slot is held for the link's life, in a third
+  // tier that evicts its stalest member like the other two.
   const AUTHED = 3;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
@@ -237,9 +234,9 @@ await test("the budget bounds links PAST the handshake, not just into it", async
 
 await test("a full authed budget sheds the QUIETEST link, not the oldest", async () => {
   // Everyone in the authed tier has proved the same thing, so admission order says nothing
-  // about which link is worth keeping. Evicting by it hands anyone who can complete a
-  // handshake a way to walk established peers off the node one fresh connection at a time —
-  // and the peer doing real work is the oldest one precisely because it is working.
+  // about which link to keep. Evicting by it would let anyone who can complete a handshake
+  // push established peers off one fresh connection at a time, and the busiest peer is
+  // often the oldest.
   const AUTHED = 2;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
@@ -247,8 +244,7 @@ await test("a full authed budget sheds the QUIETEST link, not the oldest", async
   await ready(busy, 4000);
   const quiet = keep(await member(fabric, s, "10.13.2.1"));
   await ready(quiet, 4000);
-  // The busy link is also the OLDEST, which is what makes this a test of the policy rather
-  // than of the order two members happened to arrive in.
+  // The busy link is also the oldest, so this tests the policy, not arrival order.
   await busy.request(s.peerId, PROTO, Uint8Array.from([1]), 4000);
 
   const late = keep(await member(fabric, s, "10.13.3.1"));
@@ -264,8 +260,8 @@ await test("a full authed budget sheds the QUIETEST link, not the oldest", async
 });
 
 await test("the per-source cap still bites under flood", async () => {
-  // Per-source is deliberately NOT evictable: one address at its own limit must be
-  // refused outright, never allowed to push a different address out.
+  // Per-source is not evictable: one address at its limit is refused outright, never
+  // allowed to push a different address out.
   const PER = 8;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: PER, verified: 256 }));
@@ -280,12 +276,11 @@ await test("the per-source cap still bites under flood", async () => {
 });
 
 await test("the HOST's own link table is bounded, under every tier the guest enforces", async () => {
-  // The tiers above are content policy living in the transport guest, because only it can
-  // see "half-open" and "authenticated". But a socket costs the HOST a descriptor and a
-  // table entry the moment it is accepted — before the guest forms an opinion — so a
-  // wedged or hostile occupant that never refuses would spend host memory the tiers cannot
-  // reach. `maxRawLinks` is the ceiling underneath them, set here far BELOW the budgets so
-  // what bites is unambiguously the driver's ceiling and not a tier.
+  // The tiers above are policy in the transport guest, since only it can see "half-open"
+  // and "authenticated". But a socket costs the host a descriptor and a table entry as soon
+  // as it is accepted, before the guest sees it, so a wedged or hostile occupant that never
+  // refuses would spend host memory the tiers cannot bound. `maxRawLinks` is the ceiling
+  // under them, set here far below the budgets so the driver's ceiling is what applies.
   const RAW = 6;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256 }, { maxRawLinks: RAW }));
@@ -294,15 +289,15 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
   await sleep(300);
   const held = dials.filter((d) => !d.closed).length;
   note(`${RAW * 3} connections against a ${RAW}-link driver ceiling; ${held} held`);
-  // The driver REFUSES rather than evicts: eviction is a policy about which link is worth
-  // keeping, and picking one is exactly the judgement this layer does not have. A budget
-  // this far above the guest's own tiers is never the thing rationing a healthy node.
+  // The driver refuses instead of evicting: eviction is a policy about which link to keep,
+  // which this layer cannot judge. Set this far above the guest's tiers, it never limits a
+  // healthy node.
   assert(held <= RAW, `the driver held ${held} raw links against a ceiling of ${RAW}`);
   assert(dials.slice(0, RAW).every((d) => !d.closed), "the links inside the ceiling must be kept");
   assert(dials.slice(RAW).every((d) => d.closed), "a connection past the ceiling must be closed, not stranded open");
 
-  // …and the ceiling is not a one-way door: a link going away frees its entry, or the
-  // first burst would blackhole the node permanently.
+  // A closing link frees its entry, or the first burst would lock the node out
+  // permanently.
   for (const d of dials.slice(0, RAW)) d.ch.close(false);
   await sleep(200);
   const after = silentDial(fabric, s.driver.portOf("tcp"), "10.12.0.1");
@@ -311,16 +306,16 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
 });
 
 await test("one peer's pipeline cannot spend the host calls every other link needs", async () => {
-  // A request handed to `link/deliver` holds one of the transport's host calls until its
-  // claimant answers, and the next record on ANY link needs one too. The worst claimant never
-  // answers, so this one holds everything it is handed: a peer flooding it must be refused
-  // past its share — answered empty at once — while another peer's request still arrives.
+  // A request passed to `link/deliver` holds one of the transport's host calls until its
+  // claimant answers, and the next record on any link needs one too. The worst claimant
+  // never answers, so this one holds everything it gets: a peer flooding it must be refused
+  // past its share (answered empty at once) while another peer's request still gets through.
   const fabric = new LoopbackChannels();
   const held = [];
   let answering = false;
-  // `link/deliver` is `[claimLen u8][claim]` then the realm argument whole —
-  // `[attribution 32][payload …]` — so this stand-in claimant reads the sender and the
-  // request out of it the way a claimant's own realm would.
+  // `link/deliver` is `[claimLen u8][claim]` followed by the whole realm argument,
+  // `[attribution 32][payload ...]`, so this stand-in claimant reads the sender and the
+  // request from it as a claimant's realm would.
   const ATTR = 32;
   const standIn = (name, answer, payload) => {
     if (name !== "link/deliver") return answer;
@@ -358,9 +353,8 @@ await test("one peer's pipeline cannot spend the host calls every other link nee
 });
 
 await test("an unverified connection is dropped on the SHORT deadline", async () => {
-  // A stranger holds a slot for the unverified deadline, not the full handshake one —
-  // measured rather than restated, since the constants live in the transport bundle and a
-  // number copied out of it here would be drift waiting to happen.
+  // A stranger holds a slot for the unverified deadline, not the full handshake one.
+  // Measured, not copied, since the constants live in the transport bundle.
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 8, perSource: 8, verified: 8 }));
   const d = silentDial(fabric, s.driver.portOf("tcp"), "10.4.4.4");
@@ -374,9 +368,8 @@ await test("an unverified connection is dropped on the SHORT deadline", async ()
 });
 
 await test("sustained-rate headroom", async () => {
-  // What the constants actually buy, stated as a rate rather than a count: a flood must
-  // exceed this to keep the unverified budget saturated, and even then eviction (above)
-  // says members are unaffected.
+  // What the constants allow, as a rate: a flood must exceed this to keep the unverified
+  // budget saturated, and even then eviction (above) keeps members unaffected.
   const defaults = verifyBundle(realSodium, transportBlob).manifest.guest.config;
   const deadlineMs = globalThis.__unverifiedMs ?? 2000;
   const rate = defaults.maxHalfOpenUnverified / (deadlineMs / 1000);

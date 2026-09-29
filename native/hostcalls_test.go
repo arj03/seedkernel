@@ -2,11 +2,11 @@ package main
 
 import "testing"
 
-// The ledger is what stands between a guest and unbounded host-side allocation (§12.3):
-// every parked host.call costs the host a copy of the input it was handed, and only these
-// two ceilings bound that. The equivalent registry on the JS target is covered by
-// WASM/tests/verify-hardening.mjs; these are the native one's, and they run without a
-// QuickJS runtime because the ledger deliberately owns nothing but the accounting.
+// The ledger is what keeps a guest from causing unbounded host-side allocation (§12.3):
+// every pending host.call costs the host a copy of its input, and only these two ceilings
+// bound that. The JS target's equivalent is covered by WASM/tests/verify-hardening.mjs;
+// these test the native one, without a QuickJS runtime, since the ledger only does
+// accounting.
 
 // sumCharged is the invariant every case below re-checks: the aggregate is exactly what
 // the live calls hold, so no refusal path can leak a charge or credit one twice.
@@ -40,7 +40,7 @@ func TestHostCallLedgerCallCap(t *testing.T) {
 	}
 	sumCharged(t, &l)
 
-	// Releasing one makes room again — the cap is on what is outstanding, not on how many
+	// Releasing one makes room again: the cap is on what is outstanding, not on how many
 	// calls a realm may make over its life.
 	l.release(1)
 	if err := l.admit(99, 8, nil); err != nil {
@@ -75,8 +75,8 @@ func TestHostCallLedgerDuplicateID(t *testing.T) {
 	if err := l.admit(7, 10, nil); err != nil {
 		t.Fatal("first admit:", err)
 	}
-	// A guest re-using a live id must not be able to re-charge it or displace the entry —
-	// its release would then credit the realm for bytes it still holds.
+	// A guest reusing a live id must not be able to re-charge it or replace the entry, or
+	// its release would credit the realm for bytes it still holds.
 	if err := l.admit(7, 10, nil); err == nil {
 		t.Fatal("admitted a duplicate live call id")
 	}
@@ -92,8 +92,8 @@ func TestHostCallLedgerReserveRefusalKeepsTheCall(t *testing.T) {
 		t.Fatal("admit:", err)
 	}
 	// A response too big for the remaining allowance is refused, but the call stays live
-	// and keeps its original charge — the caller settles it with the error, and THAT
-	// release is what returns the bytes. Dropping it here would strand the guest.
+	// and keeps its original charge: the caller settles it with the error, and that release
+	// returns the bytes. Dropping it here would leave the guest waiting forever.
 	if err := l.reserve(1, 41); err == nil {
 		t.Fatal("reserved 41 bytes with 40 left")
 	}
@@ -108,13 +108,13 @@ func TestHostCallLedgerReserveRefusalKeepsTheCall(t *testing.T) {
 	}
 	sumCharged(t, &l)
 
-	// Release returns the request AND everything reserved against it.
+	// Release returns the request and everything reserved against it.
 	l.release(1)
 	if l.bytes != 0 || len(l.live) != 0 {
 		t.Fatalf("release left %d calls and %d bytes", len(l.live), l.bytes)
 	}
 
-	// Reserving against an id that is not live is refused rather than creating one.
+	// Reserving against an id that is not live is refused instead of creating one.
 	if err := l.reserve(1, 1); err == nil {
 		t.Fatal("reserved against a released call")
 	}
@@ -128,7 +128,7 @@ func TestHostCallLedgerStrayReleaseIsANoOp(t *testing.T) {
 	if err := l.admit(1, 25, nil); err != nil {
 		t.Fatal("admit:", err)
 	}
-	// A settlement for an id that was never parked, and a second settlement for one
+	// A settlement for an id that was never pending, and a second settlement for one
 	// already released, must not credit the realm for bytes it never charged.
 	l.release(404)
 	l.release(1)
@@ -159,8 +159,8 @@ func TestHostCallLedgerReleaseAll(t *testing.T) {
 	if len(l.live) != 0 || l.bytes != 0 {
 		t.Fatalf("releaseAll left %d calls and %d bytes", len(l.live), l.bytes)
 	}
-	// The ledger stays usable afterwards — close() is the only caller today, but a zeroed
-	// map that could not be admitted into would be a trap for the next one.
+	// The ledger stays usable afterwards: close() is the only caller, but a cleared map
+	// that refused new entries would be a trap for the next one.
 	if err := l.admit(1, 100, nil); err != nil {
 		t.Fatal("admit after releaseAll:", err)
 	}

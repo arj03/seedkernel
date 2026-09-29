@@ -13,8 +13,8 @@ mkdirSync(dst, { recursive: true });
 
 const copies = [
   ["browser/libsodium.wasm", "libsodium.wasm"],
-  // ML-DSA-65 for manifest suite 0x02 (§12.4): the native binary instantiates the very
-  // artifact the browser fetches, so there is one accept/reject boundary.
+  // ML-DSA-65 for the hybrid manifest suite (§12.4): the native binary runs the same
+  // artifact the browser fetches, so they agree on which bundles verify.
   ["browser/mldsa65.wasm", "mldsa65.wasm"],
 ];
 

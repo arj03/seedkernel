@@ -1,6 +1,6 @@
-// Platform-neutral shell (§12.9). `bootShell` is THE assembly path: defaults, the slot
-// table and load order. Targets displace platform members only; signed bundles are the
-// only way slots land (§12.4).
+// Platform-neutral shell (§12.8). `bootShell` is the one assembly path: defaults, the slot
+// table and load order. Targets only swap platform members; signed bundles are the only
+// way to fill a slot (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall } from "./guest-seam.js";
@@ -23,23 +23,25 @@ const EMPTY = new Uint8Array(0);
 /** Manifest verification plus the guest crypto ops; core libsodium satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
 
-/** This installation's settings for one install — the operator's, never the author's.
+/** This installation's settings for one install: the operator's, never the author's.
  *  The guest reads `localConfig` as `LOCAL`. */
 export interface InstallOptions {
-  /** The slot this install retires, by its `app` label. Absent, the candidate must land on
-   *  a free label. Present, it must name a live slot, which the candidate takes over
-   *  atomically, across authors and labels — the only way to take `link`. */
+  /** The slot this install replaces, by its `app` label. If absent, the candidate needs a
+   *  free label. If present, it must name an installed slot, which the candidate takes
+   *  over atomically, across authors and labels. After boot, this is the only way to take
+   *  `link`. */
   replaces?: string;
   localConfig?: JsonObject;
-  /** QuickJS heap limit for this load's realm. Omitted ⇒ the shell's `realmMemoryBytes`,
-   *  then `DEFAULT_REALM_MEMORY_BYTES`; a replacement never inherits the outgoing value. */
+  /** QuickJS heap limit for this install's realm. Falls back to the shell's
+   *  `realmMemoryBytes`, then `DEFAULT_REALM_MEMORY_BYTES`; a replacement never inherits
+   *  the old value. */
   realmMemoryBytes?: number;
-  /** Guest execution budget per invocation for this load, in ms. Omitted ⇒ the shell's
-   *  `guestDeadlineMs`, then `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
+  /** Guest execution budget per invocation for this install, in ms. Falls back to the
+   *  shell's `guestDeadlineMs`, then `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
   guestDeadlineMs?: number;
-  /** Observe this slot's own answer to a peer-inbound frame, so an embedder can paint what
-   *  its app answered. Observation only: never consulted for a loopback `invoke` or a
-   *  cross-realm call, and a throw from it is swallowed. */
+  /** Observe this slot's answer to a peer-inbound frame, so an embedder can show what its
+   *  app answered. Observation only: not called for a loopback `invoke` or a cross-realm
+   *  call, and anything it throws is logged and ignored. */
   onInbound?: InboundObserver;
 }
 
@@ -49,16 +51,16 @@ export interface Shell {
   /** Every claim this node serves, as `[claim, owner]`, peer-reachable first. A snapshot. */
   routes(): [string, string][];
   /** Call the realm claiming this local service id with the host's caller id; `null` when
-   *  nothing claims it. Resolves `services`, never `protocols`. How an embedder or the CLI
-   *  asks the node's transport to wait for a cohort, list peers, or learn an address. */
+   *  nothing claims it. Resolves `services`, never `protocols`. This is how an embedder or
+   *  the CLI asks the transport to wait for a cohort, list peers, or add an address. */
   call(serviceId: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
   /** Absent for a node with no disk, which refuses a bundle requiring `fs` at install. */
   fs?: Fs;
   sodium: ShellSodium;
-  /** THE way a bundle enters this node: verify, admit, build modules, stand the guest,
-   *  commit the slot. An install leaves a running app or nothing — a failed candidate
-   *  leaves the slot it named exactly as it was. fs and signing namespaces follow the
-   *  label, not the author. */
+  /** The only way a bundle enters this node: verify, admit, build modules, start the
+   *  guest, commit the slot. An install leaves a running app or nothing; a failed
+   *  candidate leaves the slot it named exactly as it was. fs and signing namespaces follow
+   *  the label, not the author. */
   install(blob: Uint8Array, opts?: InstallOptions): Promise<AppHandle>;
   /** Drop the slot's claims and dispose its realm, modules and timers. Its fs keys stay. */
   uninstall(app: string): boolean;
@@ -73,9 +75,9 @@ export interface AppHandle extends LoadedBundle {
   /** This app's fs view, already scoped. Absent on a shell with no fs. */
   fs?: Fs;
   /** The fs prefix this app's view is scoped under (`appScopeFor`), for reading the raw
-   *  backend cold with `scopedFs(raw, appScope)`. */
+   *  backend directly with `scopedFs(raw, appScope)`. */
   appScope: string;
-  /** Loopback invoke into the slot this install stood. Rejects once that slot is
+  /** Loopback invoke into the slot this install created. Rejects once that slot is
    *  disposed, including by a replacement, which returns its own handle. */
   invoke(payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
 }
@@ -88,23 +90,23 @@ export { scopedFs } from "./fs-view.js";
 /** This node's network (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
   /** The signed transport to install at boot; selecting it authorizes `link`. Defaults to
-   *  the artifact-shipped bundle. */
+   *  the bundle shipped with the package. */
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
 }
 
-/** JS-target assembly options (§12.9). Everything but `sodium` and `identity` defaults. */
+/** Assembly options (§12.8). Everything except `sodium` and `identity` has a default. */
 export interface BootShellOptions {
   /** Core libsodium with the ML-DSA-65 verifier mixed in. */
   sodium: ShellSodium;
   /** The node's keypair: its public half is the peer id every realm reads as
    *  `HOST.identity`; the handshake and `node/sign` both sign with it. */
   identity: Keypair;
-  /** Admission for ordinary apps. Absent ⇒ deny-all. `link` is authorized only by boot
-   *  selection or replacement of its holder; host gates apply to every bundle. */
+  /** Admission for ordinary apps; deny-all when absent. `link` is authorized only by boot
+   *  selection or by replacing its holder. Host gates apply to every bundle. */
   admit?: Admit;
-  /** Default `MemoryFs`. `false` is a node with no disk: no backend at all. */
+  /** Defaults to `MemoryFs`. `false` means a node with no fs backend at all. */
   fs?: Fs | false;
   /** Persisted bundle-freshness store (§12.4). Default: in-memory `FreshnessMarks`. */
   freshnessStore?: FreshnessStore;
@@ -118,24 +120,24 @@ export interface BootShellOptions {
   /** Default QuickJS heap limit per realm (`DEFAULT_REALM_MEMORY_BYTES`); an install
    *  overrides it with `InstallOptions.realmMemoryBytes`. */
   realmMemoryBytes?: number;
-  /** The sockets and signed transport (§12.6). Omitted or `false`: no network. The object
-   *  is retained, so live accessors keep working. */
+  /** The sockets and signed transport (§12.6). Omitted or `false` means no network. The
+   *  object is kept, so live accessors keep working. */
   transport?: TransportOptions | false;
 }
 
 export interface BootResult {
   shell: Shell;
-  /** The channel adapter the platform still drives (listeners, ports); the same object the
-   *  shell holds. Null only on a node with no network. */
+  /** The channel adapter the platform drives (listeners, ports); the same object the shell
+   *  holds. Null only on a node with no network. */
   transport: TransportHost | null;
 }
 
-/** Stand a node up and install the selected signed transport through the shared installer. */
+/** Boot a node and install the selected signed transport through the shared installer. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
-  /** One load's realm bounds: this load's, else the node's, else the shared default.
+  /** One install's realm bounds: its own, else the node's, else the shared default.
    *  Checked here because the engines disagree on out-of-range values: a heap limit that
-   *  truncates to 0 is unlimited on JS and refused natively, 2^32 wraps, and a budget under
-   *  1 ms is none natively and refused on JS. */
+   *  truncates to 0 is unlimited on JS and refused on native, 2^32 wraps, and a budget
+   *  under 1 ms is no budget on native and refused on JS. */
   const boundsFor = (load: InstallOptions): { deadlineMs: number; memoryBytes: number } => {
     const deadlineMs = load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
     const memoryBytes = load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES;
@@ -147,7 +149,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     }
     return { deadlineMs, memoryBytes };
   };
-  // A bad node-wide default fails the boot rather than every install after it.
+  // A bad node-wide default fails the boot instead of every later install.
   boundsFor({});
   const sodium = opts.sodium;
   // JS-target defaults are imported lazily so the native binary never loads them.
@@ -165,14 +167,15 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   let closed = false;
 
   const table = createSlotTable();
-  /** An empty slot for `loaded`. The wake reads `slot` at fire time, so it re-enters
-   *  whichever realm is standing then. */
+  /** A slot for `loaded`, without its realm yet. The wake reads `slot.realm` when it
+   *  fires, so it enters whichever realm is there then. */
   const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions,
     deadlineMs: number): AppSlot => {
     let slot: AppSlot;
     const timers = createRealmTimers(
-      // A host event under the host's caller id. No caller is left to reject, so a throw
-      // is logged. The promise is returned: it gates the next wake (realm-timers.ts).
+      // A host event under the host's caller id. There is no caller to reject to, so an
+      // error is logged. The promise is returned because it gates the next wake
+      // (realm-timers.ts).
       (input, causalClock) => slot.realm!.call(input, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
@@ -191,7 +194,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     };
     return slot;
   };
-  /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
+  /** Cancel the wake, then dispose the realm and modules. Every teardown path uses this. */
   const disposeSlot = (slot: AppSlot | undefined) => {
     if (!slot) return;
     slot.active = false;
@@ -199,20 +202,20 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     slot.realm?.dispose();
     slot.pureModules.dispose();
   };
-  /** A preamble constant via JSON.parse rather than an object literal, so a `__proto__`
-   *  key stays data. */
+  /** A preamble constant built with JSON.parse instead of an object literal, so a
+   *  `__proto__` key stays data. */
   const jsonPreamble = (name: string, value: JsonObject): string => {
     const json = JSON.stringify(value);
     return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
   };
-  /** Stand one candidate realm. It stays out of the table until this and the freshness
+  /** Create one candidate realm. It stays out of the table until this and the freshness
    *  write both succeed. */
   const standRealm = async (slot: AppSlot, localConfig: JsonObject,
     bounds: { deadlineMs: number; memoryBytes: number }): Promise<void> => {
     const b = slot.verifiedBundle;
     const appConfig = b.manifest.guest.config ?? {};
-    // The host's own facts (§12.5): the key `node/sign` signs with, and the budgets the
-    // realm will be held to, so a guest can window its fan-out. Change them together.
+    // The host's facts (§12.3): the key `node/sign` signs with, and the budgets the realm
+    // is held to, so a guest can pace its fan-out.
     const hostFacts: JsonObject = {
       identity: toHex(opts.identity.publicKey),
       maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
@@ -239,9 +242,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const slot = table.localClaimant(id);
     return slot ? enter(slot, caller, payload, deadlineMs, causalClock) : null;
   };
-  /** The `link` backend: the driver's raw links, plus peer-inbound delivery by one lookup
-   *  on the peer book, so a `services` claim is unreachable by a peer by construction
-   *  (§12.10). A refused claim and a failed handler both answer empty. */
+  /** The `link` backend: the driver's raw links, plus peer-inbound delivery looked up in
+   *  the peer book only, so a peer can never reach a `services` claim (§12.10). A refused
+   *  claim and a failed handler both answer empty. */
   const link: LinkBackend | undefined = netHost ? {
     ...netHost.rawNet(),
     deliver: (claim, framed, deadlineMs, causalClock) => {
@@ -275,7 +278,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         timer: slot.timers,
         link,
       },
-      // The label, hashed: the same 32-byte shape as a peer's sender key. Zero is the host's.
+      // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
+      // zeros is the host.
       callLocal: callLocal(genesisHash(sodium, enc.encode(app))),
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
@@ -283,8 +287,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       },
     });
     // A candidate's top level runs before commit, so every seam call is refused until the
-    // slot is active: disposing a failed candidate then has nothing to undo. Top level still
-    // initializes from `HOST`, `APP` and `LOCAL`.
+    // slot is active, and disposing a failed candidate has nothing to undo. Top level can
+    // still initialize from `HOST`, `APP` and `LOCAL`.
     return (name, payload, budget) => {
       if (!slot.active) {
         throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
@@ -301,23 +305,23 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     return true;
   };
 
-  // One transaction for every install: a free label, a named replacement, and the boot
+  // One code path for every install: a free label, a named replacement and the boot
   // transport differ only in their target.
   const installBundle = async (blob: Uint8Array, load: InstallOptions = {},
     bootTransport = false): Promise<AppHandle> => {
     const localConfig = load.localConfig ?? {};
     if (!isJsonObject(localConfig)) throw new Error("shell: localConfig must be a JSON object");
     const bounds = boundsFor(load);
-    // Resolved to the exact live slot now; commit refuses if a different slot holds the
-    // label by then.
+    // Resolved to the exact slot now; commit refuses if a different slot holds the label
+    // by then.
     const replacement = load.replaces === undefined ? undefined : table.get(load.replaces);
     if (load.replaces !== undefined && replacement === undefined) {
       throw new Error(`shell: '${load.replaces}' is not installed, so there is nothing for this bundle to replace`);
     }
     const v = verifyBundle(sodium, blob);
     checkHostGates(v, freshnessStore);
-    // Taking `link` is the slot table's rule (boot selection or holder replacement), never
-    // the admission predicate's.
+    // Who may take `link` is decided by the slot table (boot selection or holder
+    // replacement), never by the admission predicate.
     const links = reachesLink(v.manifest);
     if (bootTransport && !links) throw new Error('shell: the boot transport must require "link"');
     if (!links && !(await appAdmit(v))) throw new Error("bundle: rejected by admission predicate");
@@ -329,20 +333,20 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       if (closed) throw new Error("shell: node is closed");
       table.refuseConflicts(loaded, replacement, bootTransport);
     };
-    // Refuse a known loser before its code runs; asked again at commit, since another
-    // load may take a free claim meanwhile.
+    // Refuse a conflict before the candidate's code runs; checked again at commit, since
+    // another install may take a free claim in the meantime.
     checkInstallation();
     const pureModules = await loadBundleModules(moduleLoader, v);
     const slot = newSlot(loaded, pureModules, load, bounds.deadlineMs);
     // A guest that cannot compile fails the install, not the first frame.
     try {
       await standRealm(slot, localConfig, bounds);
-      // Synchronous from here to the end: gates, contest, mark and claim hand-over cannot
-      // interleave with another load or an uninstall. The gates are asked again because a
-      // newer version or a `revoke` may have landed meanwhile; admission consent is not.
+      // Synchronous from here to the end, so gates, conflict check, mark and claim handover
+      // cannot interleave with another install or an uninstall. The gates are checked again
+      // because a newer version or a `revoke` may have arrived; admission is not re-asked.
       checkHostGates(v, freshnessStore);
       checkInstallation();
-      // A mark that cannot persist throws after rolling itself back; the running slot is
+      // A mark that cannot be persisted throws after rolling back; the running slot is
       // untouched.
       freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
     } catch (err) {
@@ -351,8 +355,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     }
     table.commit(slot, replacement);
     // The driver follows the `link` claim. Links are session state of the outgoing realm,
-    // so they are torn down, after the hand-over so no `linkClosed` reaches the new realm;
-    // the incoming guest redials from its own config (§12.10).
+    // so they are closed, after the handover so no `linkClosed` reaches the new realm; the
+    // incoming guest redials from its own config (§12.10).
     const linkHolder = table.occupant("link");
     if (linkHolder === slot) {
       netHost?.activate((input) => slot.realm!.call(input));
@@ -388,7 +392,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       if (!isHex64(hex)) {
         throw new Error(`shell: revoke expects a 64-character hex author key, got ${JSON.stringify(authorHex)}`);
       }
-      // Persist first: the other order leaves a window where nothing refuses the key.
+      // Persist first; the other order leaves a window where the key is not refused.
       freshnessStore.revoke(fromHex(hex));
       const gone = table.all()
         .filter((slot) => toHex(slot.verifiedBundle.author) === hex)
@@ -396,7 +400,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       for (const app of gone) doUninstall(app);
       return gone;
     },
-    // A disposed realm fails whatever is parked in it (§12.3).
+    // A disposed realm fails whatever is pending in it (§12.3).
     close() {
       closed = true;
       netHost?.close();
@@ -404,7 +408,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     },
   };
 
-  // A failed boot returns no handle, so it tears down what it stood up.
+  // A failed boot returns no handle, so it tears down what it started.
   try {
     if (netHost && transportBlob) {
       await installBundle(transportBlob,

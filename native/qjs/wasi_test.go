@@ -5,12 +5,11 @@ import (
 	"testing"
 )
 
-// TestWASIStubsAreUnreachable pins a runtime's WASI surface: every import but the clock is
-// a refusing stub (instantiateWASI), and nothing in a bare quickjs-ng context reaches one —
-// but for wasi-libc's allocator setup, which asks for entropy once at construction and
-// settles for a fixed value when refused. The clock is the positive control: it is the one
-// import a realm keeps, so a probe that records it proves the witness is wired; anything
-// else recorded fails the test.
+// TestWASIStubsAreUnreachable checks a runtime's WASI imports: every import but the clock
+// is a refusing stub (instantiateWASI), and nothing in a bare quickjs-ng context reaches
+// one, except wasi-libc's allocator setup, which asks for entropy once at construction and
+// uses a fixed value when refused. The clock is the positive control: it is the one import
+// a realm uses, so recording it shows the probe works; anything else recorded fails.
 func TestWASIStubsAreUnreachable(t *testing.T) {
 	var reached []string
 	probe := func(name string) { reached = append(reached, name) }
@@ -40,7 +39,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 	// wasi-libc's _initialize asks for entropy.
 	only("construction", "clock_time_get", "random_get")
 
-	// Prove a JS call reaches the witness before trusting a quiet one.
+	// Check a JS call reaches the probe before trusting a quiet one.
 	if _, err := c.Eval("clock.js", "Date.now()"); err != nil {
 		t.Fatal("Date.now:", err)
 	}
@@ -79,10 +78,10 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 	only("JS", "clock_time_get")
 }
 
-// Deep recursion — in JS, or in the engine's own recursive native code such as JSON.parse —
+// Deep recursion, in JS or in the engine's own recursive native code such as JSON.parse,
 // ends in a catchable RangeError and leaves the runtime usable. quickjs-ng switches its
 // stack limit off for WASI (csrc/0001-wasi-stack-limit.patch turns it back on), and without
-// the limit the recursion runs off the shadow stack into a trap that breaks every later call.
+// it the recursion runs off the shadow stack into a trap that breaks every later call.
 func TestStackOverflowThrows(t *testing.T) {
 	for _, tc := range []struct{ name, src string }{
 		{"recursion", `(function f(n) { return f(n + 1) + 1; })(0)`},

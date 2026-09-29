@@ -14,13 +14,10 @@ const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
-/** A byte-to-digit-pair table, four bytes per append: this formats every peer id, block
- *  id and key the runtime prints, and the native shell runs it in QuickJS, where the
- *  per-append cost dominates (the same table one byte at a time is the slowest of the
- *  three shapes there). It replaced formatting a 32-bit word with toString(16) and
- *  padStart, which the table beats on both engines. The tail covers the 1-3 bytes of a
- *  length that is not a multiple of four (never taken by the 32-byte ids on the hot
- *  path, but toHex is not restricted to them). */
+/** A byte-to-digit-pair table, appended four bytes at a time. This formats every peer id,
+ *  block id and key the runtime prints, and on native it runs in QuickJS, where the cost
+ *  per append dominates; this shape measured fastest on both engines. The tail loop
+ *  handles lengths that are not a multiple of four. */
 export function toHex(b: Uint8Array): string {
   let out = "", i = 0;
   for (; i + 4 <= b.length; i += 4)
@@ -29,10 +26,10 @@ export function toHex(b: Uint8Array): string {
   return out;
 }
 
-/** Nibble value PLUS ONE per ASCII code, so both 0 and the `undefined` an out-of-range
- *  character reads back as mean "not a hex digit". A table rather than `parseInt` over a
- *  two-character slice: this decodes every peer id, key and secret the runtime handles,
- *  and the slice shape allocated a string per byte to do it. */
+/** Nibble value plus one per ASCII code, so both 0 and the `undefined` an out-of-range
+ *  character reads as mean "not a hex digit". A table instead of `parseInt` over a
+ *  two-character slice, which allocates a string per byte; this decodes every peer id,
+ *  key and secret the runtime handles. */
 const NIBBLE = (() => {
   const t = new Uint8Array(128);
   for (let i = 0; i < 16; i++) {
@@ -44,8 +41,8 @@ const NIBBLE = (() => {
 
 export function fromHex(hex: string): Uint8Array {
   const n = hex.length >> 1, out = new Uint8Array(n);
-  // Carry a cursor rather than multiplying the index by two per byte: the native shell
-  // runs this in QuickJS, which charges enough per arithmetic op for that to be worth ~15%.
+  // A second cursor instead of multiplying the index by two: in QuickJS on native, that
+  // saves ~15%.
   for (let i = 0, j = 0; i < n; i++, j += 2) {
     const hi = NIBBLE[hex.charCodeAt(j)], lo = NIBBLE[hex.charCodeAt(j + 1)];
     out[i] = hi && lo ? ((hi - 1) << 4) | (lo - 1) : 0;
@@ -53,10 +50,9 @@ export function fromHex(hex: string): Uint8Array {
   return out;
 }
 
-/** 32 bytes as hex, in either case — the shape of every key, author id and secret an
- *  operator types, and the one check for it; a caller that keeps the string lowercases it.
- *  `fromHex` maps a non-hex pair to 0, so an unvalidated decode turns a typo into a
- *  different-but-plausible 32 bytes. */
+/** 32 bytes as hex, in either case: the format of every key, author id and secret an
+ *  operator types. A caller that keeps the string lowercases it. Validate before
+ *  `fromHex`, which maps a non-hex pair to 0 and so turns a typo into plausible bytes. */
 const HEX64 = /^[0-9a-fA-F]{64}$/;
 export function isHex64(s: string): boolean {
   return HEX64.test(s);
@@ -83,7 +79,7 @@ export function readU32BE(buf: Uint8Array, offset: number): number {
           (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
 }
 
-/** Base64 → bytes via the platform's `atob` (a browser global; also in Node ≥16 and in
+/** Base64 to bytes via the platform's `atob` (a browser global, also in Node 16+ and in
  *  the native shell's QuickJS). */
 export function fromBase64(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -97,18 +93,17 @@ export function errMessage(e: unknown): string {
   return m == null ? String(e) : String(m);
 }
 
-/** A queue whose pop is O(1): a head index into a plain array, with the consumed prefix
- *  dropped once it outnumbers what is still live.
+/** A queue with O(1) pop: a head index into a plain array, with the consumed prefix
+ *  dropped once it outnumbers the live entries.
  *
  *  `Array.prototype.shift` moves every remaining element, so draining a full queue costs
- *  O(n²) — and every queue here is BOUNDED, which means the quadratic term is paid exactly
- *  when the bound is doing its job and the queue is full. The same shape as the framer's
- *  `ByteParts`, which is where the amortization constants come from. */
+ *  O(n²), and the queues here are bounded, so that cost lands exactly when they are full.
+ *  Same design and constants as the framer's `ByteParts`. */
 export class Fifo<T> {
   private items: T[] = [];
   private head = 0;
 
-  /** Live entries — never `items.length`, which counts the consumed prefix too. */
+  /** Live entries; `items.length` also counts the consumed prefix. */
   get size(): number { return this.items.length - this.head; }
 
   push(v: T): void { this.items.push(v); }
@@ -116,8 +111,8 @@ export class Fifo<T> {
   /** The front, still queued. Undefined only when empty. */
   peek(): T | undefined { return this.head < this.items.length ? this.items[this.head] : undefined; }
 
-  /** The i-th live entry, oldest first. Callers bound `i` by `size`; past it reads
-   *  undefined, which is a bug rather than a case. */
+  /** The i-th live entry, oldest first. Callers keep `i` below `size`; past it reads
+   *  undefined. */
   at(i: number): T { return this.items[this.head + i]; }
 
   shift(): T | undefined {
@@ -127,9 +122,8 @@ export class Fifo<T> {
     return v;
   }
 
-  /** Discard the oldest `n`, for the caller that scanned a prefix before deciding. The
-   *  slots are cleared as they go: a consumed entry the array still points at would stay
-   *  reachable until the next compaction. */
+  /** Discard the oldest `n`, for a caller that scanned a prefix first. Slots are cleared
+   *  so consumed entries are not kept alive until the next compaction. */
   drop(n: number): void {
     const end = Math.min(this.head + n, this.items.length);
     while (this.head < end) this.items[this.head++] = undefined as unknown as T;

@@ -1,16 +1,14 @@
-// ws-framing.test.mjs — unit tests for the RFC 6455 STATE MACHINE in transport/src/framing.js
-// (`WsFramer`): fragment reassembly, control-frame interleaving, the pre-auth frame cap,
-// and the read/write serialization `push`/`enqueue` provide over an async, per-frame module
-// call. transport.test.mjs covers ws.wasm's stateless per-frame codec (one call in, one
-// call out); nothing there exercises state carried ACROSS calls, which is everything this
-// file is about.
+// Unit tests for the RFC 6455 state machine in transport/src/framing.js (`WsFramer`):
+// fragment reassembly, control-frame interleaving, the pre-auth frame cap, and the
+// read/write serialization `push`/`enqueue` provide over an async per-frame module call.
+// transport.test.mjs covers ws.wasm's stateless per-frame codec; this file covers state
+// carried across calls.
 //
-// `WsFramer` is guest code with no module boundary of its own — it shares a scope with
-// util.js (transport/src/util.js) and reads `host`, `N_WS`, `maxFrameBytes`, `randomBytes`
-// as free variables normally supplied by ake.js and the realm. Rather than reimplement
-// those, this loads the REAL util.js + framing.js source into a vm context and supplies
-// just those four names, with `host.call` bridged to the real ws.wasm the transport bundle
-// ships — so a change to either file's contract shows up here without being restated.
+// `WsFramer` is guest code without a module boundary: it shares a scope with util.js
+// (transport/src/util.js) and reads `host`, `N_WS`, `maxFrameBytes` and `randomBytes` as
+// free variables normally supplied by ake.js and the realm. This loads the real util.js
+// and framing.js source into a vm context and supplies just those four names, with
+// `host.call` bridged to the real ws.wasm, so a change to either file shows up here.
 import vm from "node:vm";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -22,8 +20,8 @@ const { ok, assertEqual, note, summary } = testkit({ verbose: false });
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// ── the real ws.wasm, called exactly as framing.js's `wsCall` calls it: raw request in,
-// UNPARSED response out (status byte included) — framing.js reads that status itself. ────
+// ── the real ws.wasm, called as framing.js's `wsCall` does: raw request in, unparsed
+// response out (status byte included), since framing.js reads the status itself. ────
 const wasmBytes = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
 const wsInst = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {
   env: { abort: () => { throw new Error("ws.wasm abort"); }, seed: () => Date.now(), trace: () => {} },
@@ -36,8 +34,8 @@ function wsRawCall(req) {
   return new Uint8Array(wsInst.exports.memory.buffer, wsScratch, len).slice();
 }
 
-/** Decode one whole frame with the same module, independent of any `WsFramer` under test —
- *  the oracle for what landed in a captured `put` sink. */
+/** Decode one whole frame with the same module, independent of any `WsFramer` under test:
+ *  the oracle for what a captured `put` sink received. */
 function decodeFrame(frame, expectMasked) {
   const req = new Uint8Array(2 + frame.length);
   req[0] = 2; req[1] = expectMasked ? 1 : 0; // WS_OP_DECODE_ONE
@@ -48,7 +46,7 @@ function decodeFrame(frame, expectMasked) {
   return { fin: (r[1] & 0x80) !== 0, opcode: r[1] & 0x0f, payload: r.slice(10, 10 + payloadLen) };
 }
 
-// ── stand up the real WsFramer, in the same lexical scope util.js gives it in production ──
+// ── the real WsFramer, in the same lexical scope util.js gives it in production ──
 const TEST_MAX_FRAME_BYTES = 1 << 20; // the post-`raiseCap` ceiling; distinct from the 8 KiB pre-auth one
 
 const guestSrc =
@@ -85,15 +83,14 @@ function makeFramer(client, authority = "") {
   return { framer, outbox };
 }
 
-/** Mint one raw, correctly masked client frame — a byte-factory only; this instance's own
- *  handshake machinery (`prepared`) runs and writes into a throwaway sink, which `.frame()`
- *  does not depend on. */
+/** Make raw, correctly masked client frames. Only a frame source: this instance's own
+ *  handshake (`prepared`) writes into a throwaway sink, which `.frame()` does not use. */
 function frameFactory() {
   return makeFramer(true).framer;
 }
 
-/** Force a fragment START (`opEncode` always sets FIN=1); flipping the bit post-encode is
- *  safe because masking only XORs the payload. */
+/** Force a fragment start (`opEncode` always sets FIN=1); flipping the bit after encoding
+ *  is safe because masking only XORs the payload. */
 function withFin(frame, fin) {
   const b = frame.slice();
   b[0] = (b[0] & 0x7f) | (fin ? 0x80 : 0);
@@ -108,7 +105,7 @@ function concat(parts) {
   return out;
 }
 
-/** A fresh, already-upgraded SERVER framer — the role that reads a stranger's masked
+/** A fresh, already-upgraded server framer: the role that reads a stranger's masked
  *  frames over a live connection. */
 async function serverAfterUpgrade() {
   const { framer, outbox } = makeFramer(false);
@@ -199,8 +196,8 @@ async function run() {
   }
 
   {
-    // A second data frame preempting an open fragment, both as another fragment START
-    // (fin=false) and as a whole message (fin=true) — RFC 6455 §5.4 forbids either.
+    // A second data frame preempting an open fragment, both as another fragment start
+    // (fin=false) and as a whole message (fin=true); RFC 6455 §5.4 forbids either.
     for (const secondFin of [false, true]) {
       const { framer, delivered } = await serverAfterUpgrade();
       const part1 = withFin(await client.frame(WS.WS_OP_BINARY, payload(10)), false);
@@ -213,8 +210,8 @@ async function run() {
   }
 
   {
-    // Individually small, but their sum crosses the (pre-`raiseCap`) 8 KiB cap once
-    // reassembled — the cumulative `fragBytes` check, not the per-frame one.
+    // Individually small, but their sum crosses the pre-`raiseCap` 8 KiB cap once
+    // reassembled: the cumulative `fragBytes` check, not the per-frame one.
     const { framer, delivered } = await serverAfterUpgrade();
     const half = WS.MAX_HANDSHAKE_FRAME_BYTES / 2 + 100;
     const part1 = withFin(await client.frame(WS.WS_OP_BINARY, payload(half, 1)), false);
@@ -240,10 +237,10 @@ async function run() {
     ok(r2 === true && delivered.length === 1 && delivered[0].length === n, `${n}-byte payload round-trips whole, split across the length-field boundary`);
   }
 
-  // The cap is on the PAYLOAD, as every codec's is on its message: the header and mask are
-  // this codec's own bytes, and a record the sender may send at the cap must cross. Exactly
-  // at the cap passes and one byte over closes the link — before authentication, and once
-  // raised, where a max-size record's masked frame runs 14 bytes past the cap on the wire.
+  // The cap is on the payload, as every codec's is on its message: the header and mask
+  // are this codec's own bytes, and a record exactly at the cap must get through. At the
+  // cap passes and one byte over closes the link, both before authentication and after
+  // the cap is raised, where a max-size record's masked frame is 14 bytes over on the wire.
   for (const raised of [false, true]) {
     const cap = raised ? TEST_MAX_FRAME_BYTES : WS.MAX_HANDSHAKE_FRAME_BYTES;
     for (const [len, accepted] of [[cap, true], [cap + 1, false]]) {
@@ -259,10 +256,10 @@ async function run() {
   }
 
   {
-    // The cap rises when the step a delivery starts has RUN (ake.js `becomeAuthed`), not when
-    // the message is handed over — so a full-size record riding the same read as msg3 must be
-    // measured once that step has settled, against the raised cap. The step here is a later
-    // turn, as the real one's host calls are.
+    // The cap rises when the handling of a delivery has finished (ake.js `becomeAuthed`),
+    // not when the message is handed over, so a full-size record in the same read as msg3
+    // must be measured after that, against the raised cap. The step here finishes on a
+    // later turn, as the real one's host calls do.
     const raisingStep = (framer, delivered) => (p) => {
       delivered.push(p);
       if (delivered.length === 1) return new Promise((r) => setTimeout(r, 5)).then(() => framer.raiseCap());
@@ -292,9 +289,8 @@ async function run() {
   // ── the handshake head's own rolling scan (`WsFramer.scanHead`) ──────────────────────
 
   {
-    // The terminator dribbled one byte per push exercises the exact property a resumable
-    // scan exists for: each push only extends the rolling window, it never rescans bytes
-    // an earlier push already saw.
+    // The terminator arriving one byte per push exercises the resumable scan: each push
+    // only extends the rolling window and never rescans bytes an earlier push saw.
     const { framer, outbox } = makeFramer(false);
     const enc = new TextEncoder();
     const head = enc.encode("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -309,9 +305,9 @@ async function run() {
   }
 
   {
-    // The cap is exact: a head totaling MAX_WS_HANDSHAKE bytes (terminator included) is
-    // accepted, one byte more is refused. Padded with a harmless header so the upgrade can
-    // actually succeed at the boundary, not just fail to be refused for the wrong reason.
+    // The cap is exact: a head of MAX_WS_HANDSHAKE bytes (terminator included) is
+    // accepted, one byte more is refused. Padded with a harmless header so the upgrade
+    // really succeeds at the boundary.
     const enc = new TextEncoder();
     const headerBlock = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
@@ -331,9 +327,8 @@ async function run() {
   }
 
   {
-    // A single oversized chunk with no terminator anywhere in it must be refused without
-    // buffering all of it first — the exact gap the review called out in the old
-    // "scan fully, then check length" shape.
+    // A single oversized chunk with no terminator must be refused without buffering all
+    // of it first.
     const { framer } = makeFramer(false);
     const oversized = new Uint8Array(WS.MAX_WS_HANDSHAKE + 4096).fill(0x41); // no CRLFCRLF at all
     const r = await framer.push(oversized, () => {});
@@ -356,9 +351,8 @@ async function run() {
     const concDelivered = [];
     {
       const { framer } = await serverAfterUpgrade();
-      // Fire every push before awaiting ANY of them — the case the docstring on
-      // `WsFramer.push` claims is safe because of the `this.reads` chain, and the one a
-      // probe that always awaits before its next push can never exercise.
+      // Start every push before awaiting any: the case `WsFramer.push`'s `this.reads`
+      // chain makes safe, which a test that awaits each push never exercises.
       const pending = frames.map((f) => framer.push(f, (p) => concDelivered.push(p)));
       const results = await Promise.all(pending);
       ok(results.every((r) => r === true), "every queued push still resolved true");
@@ -371,10 +365,9 @@ async function run() {
   }
 
   {
-    // Same property, but each frame arrives as several small, unawaited chunks — stresses
-    // `ByteParts` reassembly and the read chain at once, which a whole-frame-per-push test
-    // cannot: a chunk boundary can now land mid-header or mid-payload of ANY frame, for
-    // frames whose parse is still in flight from an earlier, un-awaited push.
+    // Same property, but each frame arrives as several small unawaited chunks, testing
+    // `ByteParts` reassembly and the read chain together: a chunk boundary can land
+    // mid-header or mid-payload of any frame while an earlier push is still parsing.
     const N = 6;
     const CHUNK = 7;
     const frames = [];

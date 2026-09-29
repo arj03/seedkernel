@@ -60,8 +60,8 @@ func TestTransportNetworkOptional(t *testing.T) {
 	}
 }
 
-// parsePolicy fails loudly on malformed config rather than silently widening trust: a
-// node handed one does not stand up at all.
+// parsePolicy fails loudly on malformed config instead of silently widening trust: a node
+// given one does not start at all.
 func TestPolicyMalformed(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	for _, bad := range []string{`{}`, `[]`, `not json`, `{"authors":[123]}`, `{"authors":"x"}`, `{"authors":["zz"]}`, `{"authors":[],"grants":{"link":[]}}`} {
@@ -71,9 +71,8 @@ func TestPolicyMalformed(t *testing.T) {
 	}
 }
 
-// The whole point of the omitted-policy default: a node that was never given a policy
-// refuses every ordinary app install (README §14). The JS
-// shell has always done this (main.ts) — the native binary used to do the opposite.
+// The omitted-policy default: a node that was never given a policy refuses every ordinary
+// app install (§14), on every target.
 func TestNoPolicyDeniesInstalls(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)
@@ -86,24 +85,24 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// One slot per app label on a node, whoever authored it (§5): the label names the
-// slot's fs and signing namespaces, so a second author's bundle under a label already
-// standing is refused by name, even one claiming nothing the first serves. Taking a label
-// over means naming the slot being replaced, which this operator flow never does.
+// One slot per app label on a node, whoever authored it (§5): the label names the slot's
+// fs and signing namespaces, so a second author's bundle under an installed label is
+// refused by name, even one claiming nothing the first serves. Taking a label over means
+// naming the slot being replaced, which this operator flow never does.
 //
-// The label and the wire claim are separate facts, and both have ONE owner: B under a
-// label of its own still cannot contest the id A serves (§12.10).
+// The label and the wire claim are separate, and each has one owner: B under a label of
+// its own still cannot contest the id A serves (§12.10).
 func TestOneSlotPerLabel(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	authorA := testAuthor(t)
 	authorB := testAuthor(t)
-	// Both authors are allowed to install: this test is about the namespace, not the
-	// closed author set. A permissive policy is exactly the interesting case — even with
-	// nothing refusing anyone, neither author can take the other's label or claim.
+	// Both authors may install: this test is about the namespace, not the author set.
+	// Even with a policy that refuses nobody, neither author can take the other's label
+	// or claim.
 	startShell(t, authorsPolicy(authorA.id(), authorB.id()), nil)
-	// A installs and claims the id its manifest declares. Asserted on the whole operator
-	// line rather than on a substring: every rejection below also names the app, so a
-	// `Contains` would read a refused load as a successful one.
+	// A installs and claims the id its manifest declares. Checked on the whole operator
+	// line, not a substring: every rejection below also names the app, so `Contains` would
+	// read a refused install as a successful one.
 	bundleA, keyA := writeTestBundle(t, authorA, "ownedapp", 1)
 	if status := loadBundle(bundleA); status != loadedLine("ownedapp", 1, authorA.id(), "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
@@ -123,7 +122,7 @@ func TestOneSlotPerLabel(t *testing.T) {
 	if status := loadBundle(contested); !strings.Contains(status, "is already held by '"+keyA+"'") {
 		t.Fatalf("a second app contesting an active claim must be refused by name: %s", status)
 	}
-	// The decisive assertion: A's slot, and the id it serves, are untouched by both.
+	// The key assertion: A's slot, and the id it serves, are untouched by both.
 	if out, err := invokeBundle(keyA, []byte("A2")); err != nil || string(out) != "A2" {
 		t.Fatalf("author B's installs displaced author A's slot `%s`: %q, %v", keyA, out, err)
 	}

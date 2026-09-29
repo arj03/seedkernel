@@ -1,37 +1,33 @@
 #!/usr/bin/env bash
-# Rebuilds dist/emscripten-module.{wasm,mjs} — the emscripten quickjs-ng 0.16.2
-# engine the JS targets run their confined realms on (safe-js.ts).
+# Rebuilds dist/emscripten-module.{wasm,mjs}: the emscripten build of quickjs-ng 0.16.2
+# that the JS targets run their confined realms on (safe-js.ts).
 #
-# ONE glue for both targets (`ENVIRONMENT=web,node`): the browser apps vendor
-# this same dist/ and load it from a static server, so a node-only glue —
-# which reads the .wasm through `require("node:fs")` at module scope — would
-# make safe-js.js unimportable in a browser. Emscripten guards each
-# environment's loader behind a runtime `ENVIRONMENT_IS_*` test, so the browser
-# never evaluates the `node:` imports and fetches the .wasm beside this module
-# instead. A separate .browser.mjs (what the @jitl packages ship) would be a
-# second glue over the same engine, i.e. a second thing to keep in sync.
+# One glue for both targets (`ENVIRONMENT=web,node`): the browser apps vendor this
+# same dist/ and load it from a static server, and a node-only glue (which reads the
+# .wasm through `require("node:fs")` at module scope) would make safe-js.js
+# unimportable in a browser. Emscripten guards each environment's loader behind a
+# runtime `ENVIRONMENT_IS_*` test, so the browser never evaluates the `node:` imports
+# and fetches the .wasm beside this module instead. A separate .browser.mjs (what the
+# @jitl packages ship) would be a second glue to keep in sync.
 #
-# The blob is ours: csrc/ carries the QTS_* shim (forked from
-# quickjs-emscripten v0.32.0's c/interface.c — the same ABI the npm @jitl
-# variants use, so the JS API layer is the unchanged quickjs-emscripten-core
-# package), and this script is that binary's source's other half.
+# csrc/ holds the QTS_* shim, forked from quickjs-emscripten v0.32.0's c/interface.c
+# (the same ABI the npm @jitl variants use, so the JS API layer is the unchanged
+# quickjs-emscripten-core package).
 #
-# What it builds, and from where:
-#   csrc/interface.c            — the QTS_* ABI shim (see README.md).
-#   csrc/0001-*.patch           — the bellard-style module detection helper
-#                                 (QTS_DetectModule) applied to the amalgam.
-#   quickjs-ng                  — the engine, fetched at the pin below as the
-#                                 release amalgam (quickjs-amalgam.zip).
+# Inputs:
+#   csrc/interface.c            the QTS_* ABI shim (see README.md).
+#   csrc/0001-*.patch           the bellard-style module detection helper
+#                               (QTS_DetectModule) applied to the amalgam.
+#   quickjs-ng                  the engine, fetched at the pin below as the
+#                               release amalgam (quickjs-amalgam.zip).
 #   templates/ + exportedRuntimeMethods.json
-#                               — emscripten glue templates, from
-#                                 quickjs-emscripten v0.32.0 (their Makefile's
-#                                 inputs, vendored verbatim).
+#                               emscripten glue templates from quickjs-emscripten
+#                               v0.32.0 (their Makefile's inputs, vendored verbatim).
 #
 # Requires emsdk (5.0.1) with emcc on PATH, curl, unzip, patch, node (any).
 #   ./build-quickjs-ng.sh       # build into .build/ and install over dist/
 #
-# After a build, re-run the WASM suite: cd WASM && npm test, plus the
-# seedstore mount repro (node repro-mount.mjs small-big).
+# After a build, re-run the WASM suite (cd WASM && npm test).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -39,9 +35,9 @@ work="$here/.build"
 dist="$here/dist"
 version="v0.16.2"
 
-# quickjs-ng v0.16.2 — the SAME pin the native binary builds
-# (native/qjs/build-qjs.sh). Moving this is a deliberate engine upgrade:
-# re-run the WASM and native suites, which drive every export the shim uses.
+# quickjs-ng v0.16.2, the same pin the native binary builds (native/qjs/build-qjs.sh).
+# Changing it is an engine upgrade: re-run the WASM and native suites, which exercise
+# every export the shim uses.
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 
 command -v emcc >/dev/null || { echo "no emcc on PATH (source emsdk_env.sh)" >&2; exit 1; }
@@ -78,9 +74,9 @@ patch -d "$work" -p1 -s -N < "$here/csrc/0001-bellard-module-detection.patch" 2>
 grep -q QTS_DetectModule "$work/quickjs-amalgam.c" \
   || { echo "module-detection patch did not apply" >&2; exit 1; }
 
-# The exported-function list: what dist/ffi.mjs binds (the vendored ffi IS the
-# ABI contract — it is generated from csrc/interface.c). _malloc/_free are the
-# emscripten runtime methods the glue uses.
+# The exported-function list: what dist/ffi.mjs binds (ffi.mjs is generated from
+# csrc/interface.c and defines the ABI). _malloc/_free are the emscripten runtime
+# methods the glue uses.
 grep -oE 'cwrap\("QTS_[A-Za-z0-9_]+' "$dist/ffi.mjs" \
   | sed 's/cwrap("//' | sort -u \
   | awk 'BEGIN { printf "[\"_malloc\",\"_free\"" } { printf ",\"_%s\"", $0 } END { print "]" }' \
@@ -108,4 +104,4 @@ emcc \
   "$here/csrc/interface.c" "$work/quickjs-amalgam.c"
 
 echo "wrote $(stat -c%s "$dist/emscripten-module.wasm") bytes -> $dist/emscripten-module.wasm"
-echo "now run: cd .. && npm run build:host && npm test (and the seedstore mount repro)"
+echo "now run: cd .. && npm run build:host && npm test"

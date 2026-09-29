@@ -1,9 +1,9 @@
-// net-rtc.test.mjs — WebRTC (§12.7): the host's `rtc:` socket seam, which holds the
-// RTCPeerConnection and passes the W3C verbs through as bytes, and the transport bundle's
-// side of it — the relay, who offers, the negotiation links and their bounds. The seam is
-// pinned with stub peer connections (the platform global is referenced only inside
-// `connect`, so it runs under Node); the transport with an in-process relay room and a fake
-// WebRTC world whose data channels are loopback pairs. Run after `npm run build`.
+// WebRTC (§12.7): the host's `rtc:` socket seam, which holds the RTCPeerConnection and
+// passes the W3C operations through as bytes, and the transport bundle's side: the relay,
+// who offers, the negotiation links and their bounds. The seam is tested with stub peer
+// connections (the platform global is referenced only inside `connect`, so it runs under
+// Node), the transport with an in-process relay room and a fake WebRTC world whose data
+// channels are loopback pairs. Run after `npm run build`.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

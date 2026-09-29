@@ -1,15 +1,14 @@
-// Named-op envelope for the kernel's raw-link event ABI and optional application framing.
-// Event names live in services/domains.ts; their byte layouts are documented in RUNTIME §12.2.
-// The three functions below are serialized by bundle-author.ts's `guestOpFraming` for
-// import-free guests, and the transport assembler injects that source before signing — so
-// they must reference nothing outside themselves, not even this file's imports. The type
-// system does not say so: `testGeneratedOpFrame` (tests/bundle-install.test.mjs) EXECUTES
-// the emitted source, and that is what catches a free variable — a new code path here needs
-// a case there.
+// Named-op envelope for the host's raw-link event ABI, and optional application framing.
+// Event names live in services/domains.ts; their byte layouts are in §12.2.
+// bundle-author.ts's `guestOpFraming` serializes the three functions below into
+// import-free guests, and the transport build injects that source before signing, so they
+// must reference nothing outside themselves, not even this file's imports. The type system
+// cannot check that; `testGeneratedOpFrame` (tests/bundle-install.test.mjs) runs the
+// emitted source to catch a free variable, so a new code path here needs a case there.
 import { writeU32BE, enc } from "./util.js";
 
-/** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched
- *  over the whole 32 bytes — a caller id is grindable, so a prefix test is unsafe. */
+/** Split a `handle` argument: `[caller 32][body ...]`. The host id is all zeros, checked
+ *  over all 32 bytes, since a caller id can be ground to match any short prefix. */
 export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Array; body: Uint8Array } {
   const caller = arg.subarray(0, 32);
   let fromHost = true;
@@ -19,7 +18,7 @@ export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Arr
   return { fromHost, caller, body: arg.subarray(32) };
 }
 
-/** Read `[opLen u8][op ascii][args …]`: required for link events, optional for apps. */
+/** Read `[opLen u8][op ascii][args ...]`: required for link events, optional for apps. */
 export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   const n = body.length > 0 ? body[0] : -1;
   if (n < 0 || body.length < 1 + n) throw new Error("op-frame: malformed op envelope");
@@ -28,7 +27,7 @@ export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   return { op, args: body.subarray(1 + n) };
 }
 
-/** Write `[opLen u8][op ascii][args …]`: required for link events, optional for apps. */
+/** Write `[opLen u8][op ascii][args ...]`: required for link events, optional for apps. */
 export function writeOp(op: string, args: Uint8Array): Uint8Array {
   if (op.length < 1 || op.length > 255)
     throw new Error(`op-frame: op name ${JSON.stringify(op)} must be 1..255 bytes`);
@@ -45,13 +44,13 @@ export function writeOp(op: string, args: Uint8Array): Uint8Array {
 
 // ── op arguments ──────────────────────────────────────────────────────────────
 //
-// The op's fields after the envelope above, in the order the op declares. Reader twin is
-// `Reader` (transport/src/util.js); a field written here and not read there desyncs the
-// payload rather than degrading quietly. Shared by the socket driver and by anyone
-// composing an op for `Shell.call`, so the two ends cannot drift.
+// The op's fields after the envelope, in the order the op defines. The reading side is
+// `Reader` (transport/src/util.js); a field written here and not read there misaligns
+// everything after it. Used by the socket driver and by anyone building an op for
+// `Shell.call`, so both use one encoder.
 
-/** Memoized `[opLen u8][op]`: rebuilt once per socket read otherwise. Sharing is safe —
- *  nothing mutates a header. */
+/** Cached `[opLen u8][op]`, which would otherwise be rebuilt per socket read. Sharing is
+ *  safe since nothing mutates a header. */
 const OP_HEADERS = new Map<string, Uint8Array>();
 function opHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
@@ -62,9 +61,9 @@ function opHeader(op: string): Uint8Array {
   return h;
 }
 
-/** One op's payload. The op is named in the constructor so `build()` emits the whole
- *  envelope in one pass, rather than copying every payload again behind its header. The
- *  attribution prefix is part of that one pass too (see `build`). */
+/** One op's payload. The op is named in the constructor so `build()` writes the whole
+ *  envelope, attribution prefix included, in one pass instead of copying the payload
+ *  again behind a header. */
 export class OpArgs {
   readonly op: string;
   private readonly parts: Uint8Array[] = [];
@@ -92,9 +91,9 @@ export class OpArgs {
   /** A UTF-8 string as a blob. */
   text(s: string): this { return this.blob(enc.encode(s)); }
   private raw(b: Uint8Array): this { this.parts.push(b); this.len += b.length; return this; }
-  /** The whole thing as one buffer. `prefix` — the kernel's 32-byte caller id — is written
-   *  in FRONT of the envelope, so a socket read is gathered once here instead of again
-   *  behind a prefix added downstream. */
+  /** The whole thing as one buffer. `prefix` (the host's 32-byte caller id) is written in
+   *  front of the envelope, so a socket read is copied once here instead of again when a
+   *  prefix is added later. */
   build(prefix?: Uint8Array): Uint8Array {
     const head = prefix ? prefix.length : 0;
     const out = new Uint8Array(head + this.len);

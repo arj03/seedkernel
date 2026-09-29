@@ -25,8 +25,8 @@ type guestRealm struct {
 	qc     *qjs.Context
 	loop   *eventLoop
 
-	hostCall *qjs.Value // retained host-realm seam — this app's whole authority
-	start    *qjs.Value // guest-realm __start — the one way in
+	hostCall *qjs.Value // retained host-realm seam: this app's whole authority
+	start    *qjs.Value // guest-realm __start: the one way in
 
 	resolveHostCall *qjs.Value // guest-realm __resolveHostCall (a host call fulfilled)
 	rejectHostCall  *qjs.Value // guest-realm __rejectHostCall (a host call failed)

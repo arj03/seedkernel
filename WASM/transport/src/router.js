@@ -5,15 +5,15 @@
 class Router {
   constructor(ownPubkey) {
     this.ownPubkey = ownPubkey;
-    // peerId → { links: routable Link[], held: tie-break losers still being read, next:
-    // round-robin cursor }. A peer is here exactly while it holds a routable link.
+    // By peerId: { links: routable Link[], held: tie-break losers still being read, next:
+    // round-robin cursor }. A peer is here exactly while it has a routable link.
     this.pools = new Map();
   }
 
   linkCount(peerId) { const p = this.pools.get(peerId); return p ? p.links.length : 0; }
   send(to, frame) {
     const pool = this.pools.get(to);
-    // Empty only inside `promote`, while a tie-break loser hands its queue on.
+    // Empty only inside `promote`, while a tie-break loser passes its queue on.
     if (!pool || pool.links.length === 0) return false;
     const i = pool.next % pool.links.length;
     pool.next = i + 1;
@@ -21,8 +21,8 @@ class Router {
     return true;
   }
 
-  /** Install a freshly authenticated link, after the double-connect tie-break. A peer's
-   *  first link is its up edge. */
+  /** Add a newly authenticated link, after the double-connect tie-break. A peer's first
+   *  link marks it up. */
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
     const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed);
@@ -37,8 +37,8 @@ class Router {
     if (up) core.checkReady();
   }
 
-  /** Only the end that dialed a losing link closes it: records may already be in flight on
-   *  it, so the accepting end holds it out of routing and reads until the goodbye. */
+  /** Only the end that dialed a losing link closes it. Records may already be in flight on
+   *  it, so the accepting end keeps it out of routing and reads until the goodbye. */
   retire(pool, loser) {
     if (loser.weDialed) loser.close();
     else pool.held.push(loser);
@@ -49,7 +49,7 @@ class Router {
     return link.weDialed === (bytesCompare(this.ownPubkey, link.peerPubkey) < 0);
   }
 
-  /** Take a link out of its peer's pool; the last one out is the peer's down edge. */
+  /** Take a link out of its peer's pool; removing the last one marks the peer down. */
   remove(link) {
     const pid = link.peerId;
     const pool = this.pools.get(pid);
@@ -60,7 +60,7 @@ class Router {
     if (i < 0) return;
     pool.links.splice(i, 1);
     if (pool.links.length > 0) return;
-    // The winner went first: a held loser is now the only way to the peer, so it routes.
+    // The winner closed first: a held loser is now the only way to the peer, so route it.
     if (pool.held.length > 0) { pool.links = pool.held; pool.held = []; return; }
     this.pools.delete(pid);
     reqres.peerDown(pid);
@@ -76,10 +76,10 @@ const RES_HEAD_LEN = 1 + 4;
 
 class ReqRes {
   constructor() {
-    // corr → {to, d, due}: the deferred answering the app, and when it is retired
+    // By corr: {to, d, due}, the deferred that answers the app and when it times out.
     this.pending = new Map();
     this.nextCorr = 1;
-    // peerId → the weight of its requests waiting on `link/deliver`, and the sum
+    // By peerId: the weight of its requests waiting on `link/deliver`; plus the total.
     this.delivering = new Map();
     this.deliveringWeight = 0;
   }
@@ -93,9 +93,9 @@ class ReqRes {
     p.d.settle(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
   }
 
-  /** Whether `from` may put one more request, `weight` wide, on `link/deliver` (core.js
-   *  `deliveryWindow`). A peer already waiting leaves one max-size request's room for the
-   *  others and stops at an equal share, so no peer can starve another. */
+  /** Whether `from` may put one more request of `weight` on `link/deliver` (core.js
+   *  `deliveryWindow`). A peer already waiting must leave room for one max-size request
+   *  from others and stops at an equal share, so no peer can starve another. */
   admits(from, weight) {
     const mine = this.delivering.get(from) || 0;
     if (mine === 0) return this.deliveringWeight + weight <= deliveryWindow;
@@ -110,10 +110,10 @@ class ReqRes {
     this.deliveringWeight += weight;
   }
 
-  /** One request out for an app. `d` is its deferred (null for noReply, corr 0). `proto`
+  /** Send one request for an app. `d` is its deferred (null for noReply, corr 0). `proto`
    *  and `payload` are borrowed views, so `buildReq` runs before any await.
    *  `requestTimeoutMs` bounds the correlation, not the caller (§16.1); a frame no link
-   *  took fails at once. */
+   *  accepted fails at once. */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;
     // corr is a u32 on the wire; 0 is noReply's.
@@ -154,9 +154,9 @@ class ReqRes {
     if (frame.length < 6 + idLen) return;
     const proto = frame.subarray(6, 6 + idLen);
     const payload = frame.subarray(6 + idLen);
-    // Deliver to the host's claim routing, attributed to the authenticated sender. Fired,
-    // not awaited: the answer is another turn. The closure holds corr and sender, so no
-    // bookkeeping is needed. Past the window, answer empty as for an unclaimed request.
+    // Deliver to the host's claim routing, attributed to the authenticated sender. Not
+    // awaited: the answer comes in another turn, and the closure keeps corr and sender.
+    // Past the window, answer empty as for an unclaimed request.
     const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
     if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
     const answer = netLinkDeliver(proto, fromPubkey, payload);
@@ -167,7 +167,7 @@ class ReqRes {
   }
 
   /** Answer a delivered request to `from`, unless noReply. An answer too big for one
-   *  record goes back empty rather than leave the caller waiting. */
+   *  record is sent back empty instead of leaving the caller waiting. */
   respond(corr, noReply, from, payload) {
     if (noReply) return;
     const fits = payload && RES_HEAD_LEN + payload.length <= maxFrameBytes - TAG_LEN;
@@ -185,8 +185,8 @@ class ReqRes {
     }
   }
 
-  /** One wake (core.js `onWake`): retire timed-out correlations. `pending` is in due
-   *  order, so the walk stops at the first still waiting. */
+  /** One wake (core.js `onWake`): fail timed-out requests. `pending` is in due order, so
+   *  the walk stops at the first one still waiting. */
   onWake(t) {
     if (requestTimeoutMs <= 0) return Infinity;
     for (const [corr, p] of this.pending) {

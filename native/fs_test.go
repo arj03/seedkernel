@@ -49,8 +49,8 @@ func TestNodeFsRoundTrip(t *testing.T) {
 }
 
 // Containment: a key that could name something other than a plain file inside the data
-// directory is rejected on write and never resolves on read/delete. WHICH keys are legal
-// is `isSafeFsKey` (WASM/services/fs.ts), one rule for every target, tested there.
+// directory is rejected on write and never resolves on read or delete. Which keys are
+// valid is `isSafeFsKey` (WASM/services/fs.ts), one rule for every target, tested there.
 //
 // "" is in the list for a reason of this layer's own: filepath.Join(dir, "") is the data
 // directory itself, so an unchecked empty key makes delete("") remove the store.
@@ -87,13 +87,13 @@ func TestNodeFsNoEscape(t *testing.T) {
 	}
 }
 
-// The `fs` seam the shared code consumes (services/fs.ts) presents its shape — Uint8Array on
-// a hit, null on a miss — end to end over Go's synchronous primitive.
+// The `fs` seam the shared code uses (services/fs.ts) returns Uint8Array on a hit and null
+// on a miss, end to end over Go's synchronous primitive.
 //
-// Every call awaits, because the seam is async on every target: a synchronous `get` is a
-// shape no browser backend can implement, so the native target may not offer one either.
-// Go still answers from disk within the call; the wrap making that a promise is
-// host/native-shim.ts, which this drives rather than a copy of.
+// Every call is awaited, because the seam is async on every target: no browser backend
+// could implement a synchronous `get`, so the native target does not offer one either. Go
+// still answers from disk within the call; host/native-shim.ts wraps it in a promise, and
+// this test uses that real code.
 func TestFsExposedToRealm(t *testing.T) {
 	bootRealm(t) // opens a store on a fresh temp dir, the way --dir does
 	if _, err := qc.Eval("fs-realm-test.js", `
@@ -119,21 +119,20 @@ func TestFsExposedToRealm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
-	// Existence is size ≥ 0 now (no `has`): present blk1 = 11, absent = -1.
+	// Existence is size >= 0 (there is no `has`): present blk1 = 11, absent = -1.
 	const want = "payload-one|null|11|-1|blk1,blk2|0|true|-1|11"
 	if string(got) != want {
 		t.Fatalf("fs realm round trip:\n got %q\nwant %q", string(got), want)
 	}
 }
 
-// A realm whose store has not been opened is CLOSED — not pointed at the process's
-// working directory. `standUp` opens it on its way to standing a node up, which leaves a
-// window where `__fs` exists with no directory, and the honest answer there is an empty
-// store that refuses writes. The failure this pins is the quiet one: a nil backend
-// joining a key to no directory yields the key itself, scattering blocks into whatever
-// directory the binary started from.
+// A realm whose store has not been opened is closed, not pointed at the process's working
+// directory. `standUp` opens it while booting a node, which leaves a window where `__fs`
+// exists with no directory, and there it must act as an empty store that refuses writes.
+// The failure this guards against is silent: a nil backend joining a key to no directory
+// yields the key itself, scattering blocks into whatever directory the binary started from.
 func TestFsClosedUntilOpened(t *testing.T) {
-	if err := boot(); err != nil { // deliberately no store opened
+	if err := boot(); err != nil { // no store opened
 		t.Fatal("boot:", err)
 	}
 	if _, err := qc.Eval("fs-closed-test.js", `

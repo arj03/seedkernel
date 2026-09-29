@@ -12,24 +12,23 @@ import (
 )
 
 // Routing and transport run as the transport bundle's guest program inside QuickJS, over
-// the Go socket primitive. Two independent nodes complete the PeerLink handshake, route,
-// and exchange a typed request/response over a real loopback socket — the
-// dial/accept/promote/deliver path and the correlation/timeout layer, none of it Go logic.
+// the Go socket primitive. Two independent nodes complete the handshake, route, and
+// exchange a request and response over a real loopback socket: the
+// dial/accept/promote/deliver path and the correlation/timeout layer, none of it Go code.
 //
-// Only the WebSocket transport is exercised here, which drives the full WS path: the raw
-// Go byte stream (sock.go), the shared net-frame MessageChannel and the RFC 6455 codec. The TCP
-// twin is asyncnet_test, and scripts/native-interop.sh covers both against real node/bun
-// nodes.
+// Only WebSocket framing is exercised here, which covers the full WS path: the raw Go byte
+// stream (sock.go), the guest's WsFramer and the RFC 6455 codec in ws.wasm. The TCP
+// counterpart is asyncnet_test, and scripts/native-interop.sh covers both against real
+// node/bun nodes.
 //
-// The realm is the production one — boot() installs the primitives and evaluates the
-// shared bundle — so `standUp` is the function the binary boots through, not a harness
-// assembling the stack a second way.
+// The realm is the production one (boot() installs the primitives and evaluates the shared
+// bundle), so `standUp` is the function the binary boots through, not a separate harness.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", `portOf("ws")`, `listen: [{ label: "ws", host: "127.0.0.1", port: 0 }],`)
 }
 
-// TestNativeAcceptedLinksShareRemoteSourceBudget proves the native accept bridge carries
+// TestNativeAcceptedLinksShareRemoteSourceBudget checks the native accept bridge carries
 // the peer IP all the way into RawLink.remoteAddr. Eight silent loopback connections fill
 // the transport's per-source budget; the ninth must be closed while the first eight stay
 // open. If the Go callback or native-shim drops the address, all nine remain admitted.
@@ -102,9 +101,8 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	bootRealm(t)
 
-	// A listens; B dials A and asks; A's probe app echoes the payload back. Both ends load
-	// the same app, because a request is an app calling the id the transport claims — there is
-	// no host-side request facade to stand in for one.
+	// A listens; B dials A and asks; A's probe app echoes the payload back. Both ends
+	// install the same app, because a request is an app calling the id the transport claims.
 	sender := testAuthor(t)
 	senderHex := hex.EncodeToString(sender.id())
 	probeBlob, err := os.ReadFile(writeProbeBundle(t, sender, "probe"))
@@ -112,9 +110,9 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		t.Fatal(err)
 	}
 	harness := fmt.Sprintf(`
-		// A node's network IS the transport bundle, so both ends are stood up by standUp —
-		// the function the operator flow boots through — which boots the artifact's own
-		// transport. The policy names only the probe app's author.
+		// A node's network is the transport bundle, so both ends boot through standUp (the
+		// function the operator flow uses), which installs the default transport. The
+		// policy names only the probe app's author.
 		globalThis.__policy = JSON.stringify({ authors: [%q] });
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
@@ -129,9 +127,9 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const bApp = await b.shell.install(__probe);
 		  teachAddr(b.shell, aId, "%s://127.0.0.1:" + a.transport.%s);
 		  // The send op's own argument order (transport/src/core.js):
-		  // [noReply u8][to blob][proto blob][payload blob]. The op NAME that
-		  // leads it is the APP's framing, composed here (the shell passes bytes unread;
-		  // the caller id is the shell's).
+		  // [noReply u8][to blob][proto blob][payload blob]. The op name in front is the
+		  // app's framing, built here (the shell passes bytes unread and adds the caller
+		  // id).
 		  const proto = new TextEncoder().encode("probe");
 		  const payload = new Uint8Array([10, 20, 30]);
 		  const args = new Uint8Array(1 + 4 + 32 + 4 + proto.length + 4 + payload.length);

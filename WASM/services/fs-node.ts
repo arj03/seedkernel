@@ -1,12 +1,11 @@
 // Node backend for the `fs` service (exported as `seedkernel-wasm/fs-node`): one flat
-// file per key under a directory, no nested paths. Content-addressing and quota are the
-// app's, layered on top.
+// file per key under a directory, no nested paths. Content addressing and quotas are up
+// to the app.
 
 import { mkdirSync } from "node:fs";
-// The seam is async (services/fs.ts), so this backend is genuinely async rather than sync
-// calls in an async wrapper: a node serving requests should not block its only thread on
-// a disk read. `mkdirSync` is the exception and stays sync — it runs once, in the
-// constructor, where there is no promise to return.
+// Truly async, not sync calls in an async wrapper, so a node serving requests does not
+// block its only thread on disk. `mkdirSync` is the exception: it runs once, in the
+// constructor, which cannot return a promise.
 import {
   readdir, readFile, writeFile, unlink, stat, statfs,
 } from "node:fs/promises";
@@ -22,9 +21,9 @@ export class NodeFs implements Fs {
 
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }
 
-  /** One scan before the first mutation or statistics query. This instance owns writes
-   *  to its directory; reopen it to account for out-of-band changes, as on native.
-   *  Limit the scan's concurrent stats so opening a large store cannot flood the I/O pool. */
+  /** One scan before the first mutation or `stat`. This instance assumes it is the only
+   *  writer to its directory; reopen it to pick up outside changes, as on native. The scan
+   *  limits concurrent stats so opening a large store does not flood the I/O pool. */
   private initialize(): Promise<void> {
     if (this.initialized) return this.initialized;
     const scan = (async () => {
@@ -41,9 +40,10 @@ export class NodeFs implements Fs {
     return scan;
   }
 
-  /** Order writes to the same file around its size delta; unrelated files stay parallel.
-   *  Conservatively group case/trailing-dot aliases even on case-sensitive filesystems.
-   *  Only the queue key is normalized, never the actual filename. */
+  /** Serialize writes to the same file so its size delta is accounted correctly;
+   *  unrelated files stay parallel. Names that may alias (case, trailing dots) share a
+   *  queue even on case-sensitive filesystems. Only the queue key is normalized, never the
+   *  filename. */
   private mutate<T>(key: string, action: () => Promise<T>): Promise<T> {
     const queueKey = key.toLowerCase().replace(/[. ]+$/, "");
     const previous = this.mutations.get(queueKey);
@@ -60,10 +60,9 @@ export class NodeFs implements Fs {
     return result;
   }
 
-  /** Which keys are representable is `isSafeFsKey` (services/fs.ts), applied over every backend
-   *  by `validatedFs` — not restated here, because a backend's copy of that rule is how key
-   *  spaces start differing between targets. What this adds is containment: a key that got
-   *  this far while still holding a separator would escape `dir`. */
+  /** Which keys are valid is `isSafeFsKey` (services/fs.ts), applied over every backend by
+   *  `validatedFs`, and deliberately not duplicated here so targets cannot drift. This only
+   *  adds containment: a key with a separator would escape `dir`. */
   private path(key: string): string {
     if (key.includes("/") || key.includes("\\") || key === "." || key === "..") {
       throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
@@ -74,7 +73,8 @@ export class NodeFs implements Fs {
   async get(key: string): Promise<Uint8Array | null> {
     try {
       const b = await readFile(this.path(key));
-      // A plain view keeps Uint8Array.slice's copying semantics without copying the read.
+      // A plain Uint8Array view, so slice() copies (unlike Buffer's) without copying the
+      // read here.
       return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
     } catch { return null; }
   }

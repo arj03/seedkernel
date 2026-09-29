@@ -20,8 +20,8 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   // app to have time to try another holder (§16.1).
   requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),
-  // Peers to dial, as `pk[.secret]@dest` (core.js `peerRef`). A deployment's fact, so set
-  // in LOCAL (§12.10).
+  // Peers to dial, as `pk[.secret]@dest` (core.js `peerRef`). Deployment-specific, so set
+  // in LOCAL (§12.6.3).
   peers: Object.freeze([]),
   // The dialing side's whole handshake deadline.
   handshakeTimeoutMs: 10_000,

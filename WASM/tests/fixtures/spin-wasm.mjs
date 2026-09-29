@@ -1,7 +1,6 @@
-// The §4.3 compute residual, made physical: a minimal hand-assembled WASM module (no
-// build step — this is the one module that must not link the AssemblyScript runtime at
-// all) whose `handle` never returns: 3 pages of memory (room for the 128 KiB scratch,
-// §4.1), the scratch global at 8, and an infinite br 0 loop.
+// The §4.3 compute case: a minimal hand-assembled WASM module (no build step, and no
+// AssemblyScript runtime) whose `handle` never returns: 3 pages of memory (room for the
+// 128 KiB scratch, §4.1), the scratch global at 8, and an infinite br 0 loop.
 export const SPIN_WASM = new Uint8Array([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
   0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f, // type: (i32) -> (i32)
@@ -17,7 +16,7 @@ export const SPIN_WASM = new Uint8Array([
 ]);
 
 // The same module, except `handle` spins only when the payload's first byte is nonzero and
-// otherwise echoes the payload — so one instance can be killed and then prove, on its next
+// otherwise echoes the payload, so one instance can be killed and then show, on its next
 // call, that a fresh worker answers.
 export const SPIN_OR_ECHO_WASM = new Uint8Array([
   ...SPIN_WASM.slice(0, -12),                     // everything before the code section

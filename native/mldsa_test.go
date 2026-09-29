@@ -1,10 +1,10 @@
 package main
 
 // The native half of "one implementation, three targets" (§12.9, §14.1). The JS suite
-// checks mldsa65.wasm from Node; these check that THIS target's embedded copy, under
-// wazero, reaches the same verdicts — on NIST's vectors and on a whole hybrid-signed
-// bundle through the production install path. Otherwise the target that embeds its own copy of
-// the artifact would be the one nobody checked, and a verifier's boundary is consensus.
+// checks mldsa65.wasm from Node; these check that this target's embedded copy, under
+// wazero, reaches the same verdicts, on NIST's vectors and on a whole hybrid-signed bundle
+// through the production install path. A verifier's accept/reject boundary is consensus,
+// so the embedded copy needs its own check.
 
 import (
 	"crypto/ed25519"
@@ -20,10 +20,10 @@ import (
 
 // ─── a test-only signer ──────────────────────────────────────────────────────────
 //
-// The shipped native binary binds mldsa65_verify and nothing else, which is what keeps it from
-// being turned into a signing oracle (§12.4). A test still has to produce a hybrid bundle
-// for it to admit, so it instantiates its OWN copy of the same artifact and binds the
-// signing exports there — keeping the signing half to _test files.
+// The shipped native binary binds mldsa65_verify and nothing else, so it cannot be used as
+// a signing oracle (§12.4). A test still has to produce a hybrid bundle for it to accept,
+// so it instantiates its own copy of the same artifact and binds the signing exports
+// there, keeping signing in _test files.
 
 type mldsaSigner struct {
 	mldsa
@@ -32,8 +32,8 @@ type mldsaSigner struct {
 	keys api.Function
 }
 
-// ML-DSA-65 secret key width (FIPS 204). Only the signing side needs it, so it lives
-// here rather than beside the envelope's format constants in mldsa.go.
+// ML-DSA-65 secret key width (FIPS 204). Only signing needs it, so it is here, not with
+// the envelope's format constants in mldsa.go.
 const mldsaSkBytes = 4032
 
 func newMlDsaSigner(t testing.TB) *mldsaSigner {
@@ -75,19 +75,17 @@ func (s *mldsaSigner) keypair(t testing.TB, seed []byte) (pk, sk []byte) {
 	return s.read(t, pkP, mldsaPkBytes), s.read(t, skP, mldsaSkBytes)
 }
 
-// signDetached signs with an empty FIPS 204 context — the runtime's only mode, since its
+// signDetached signs with an empty FIPS 204 context, the runtime's only mode, since its
 // domain separation is the DOMAIN_manifest prefix inside the preimage (§16.1).
 func (s *mldsaSigner) signDetached(t testing.TB, msg, sk []byte) []byte {
 	t.Helper()
-	// Hedging randomness: a fixed value is acceptable here and nowhere else — these
-	// signatures never leave the test binary, and a deterministic one makes a failure
-	// reproducible.
+	// Hedging randomness: a fixed value is acceptable only here, since these signatures
+	// never leave the test binary, and a deterministic one makes a failure reproducible.
 	return s.signCtx(t, msg, nil, make([]byte, 32), sk)
 }
 
 // signCtx is the full FIPS 204 external interface, context and hedging randomness
-// included. The ACVP vectors carry both, and a wrapper that can only be tested on the
-// subset matching one call site is a wrapper that has barely been tested.
+// included, since the ACVP vectors use both.
 func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	t.Helper()
 	s.mu.Lock()
@@ -103,9 +101,8 @@ func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	return s.read(t, sigP, mldsaSigBytes)
 }
 
-// verifyCtx is the same for the verify side. The production wrapper fixes the context to
-// empty, so the vectors that carry one are driven at the export directly — the same
-// instance of the same module, exercised through a wider door.
+// verifyCtx is the same for verification. The production wrapper fixes the context to
+// empty, so vectors with a context call the export directly, on the same module.
 func (s *mldsaSigner) verifyCtx(t testing.TB, sig, msg, sctx, pk []byte) bool {
 	t.Helper()
 	s.mu.Lock()
@@ -146,10 +143,9 @@ type acvpCase struct {
 	Sig    string `json:"sig"`
 }
 
-// TestMlDsaAcvpVectors runs NIST's published ACVP vectors against the wasm THIS binary
-// embeds. It reads the fixture the JS suite reads rather than keeping a second copy: the
-// whole value of the test is that both targets are judged by the same vectors, so a
-// local copy could quietly drift into agreeing only with itself.
+// TestMlDsaAcvpVectors runs NIST's published ACVP vectors against the wasm this binary
+// embeds. It reads the same fixture as the JS suite, so both targets are checked against
+// the same vectors.
 func TestMlDsaAcvpVectors(t *testing.T) {
 	bootRealm(t)
 	raw, err := os.ReadFile("../WASM/tests/fixtures/mldsa65-acvp.json")
@@ -178,8 +174,8 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 			t.Fatalf("ACVP sigVer tc%d (%s): got %v, want %v", v.TcID, v.Reason, got, v.Pass)
 		}
 	}
-	// sigGen must match byte for byte, which is what catches a build against the wrong
-	// parameter set or a toolchain that reordered something inside.
+	// sigGen must match byte for byte, which catches a build against the wrong parameter
+	// set or a toolchain that changed something inside.
 	for _, v := range kat.SigGen {
 		out := s.signCtx(t, unhex(v.Msg), unhex(v.Ctx), unhex(v.Rnd), unhex(v.Sk))
 		if hex.EncodeToString(out) != v.Sig {
@@ -187,10 +183,9 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 		}
 	}
 
-	// And the production wrapper's own path (mldsa.go): it agrees with the artifact, and
-	// a wrong-width input is `false` rather than an error — the verdict
-	// crypto_sign_verify_detached gives for the same input, so one suite cannot report a
-	// structural failure through a different channel than the other.
+	// The production wrapper's path (mldsa.go): it agrees with the artifact, and a
+	// wrong-width input is `false`, not an error, as crypto_sign_verify_detached gives, so
+	// both halves of the suite fail the same way.
 	pk, sk := s.keypair(t, make([]byte, 32))
 	msg := []byte("native adapter path")
 	sig := s.signDetached(t, msg, sk)
@@ -211,19 +206,19 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 // ─── a hybrid bundle, end to end, through the production install path ──────────────────
 
 // Suite 0x02 envelope offsets:
-// [suite 1][ed_pk 32][ml_dsa_pk 1952][ed_sig 64][ml_dsa_sig 3309][json].
+// [suite 1][ed_pk 32][ml_dsa_pk 1952][ed_sig 64][ml_dsa_sig 3309][body].
 const (
 	offHybridMlPk  = 1 + ed25519.PublicKeySize
 	offHybridEdSig = offHybridMlPk + mldsaPkBytes
 	offHybridMlSig = offHybridEdSig + ed25519.SignatureSize
 )
 
-// The author identity, the envelope writer and the bundle fixtures are the shared
-// harness's (bundle_helper_test.go): one manifest suite, so every bundle any test writes
-// is hybrid-signed. What is left here is specific to the PQ half.
+// The author identity, the envelope writer and the bundle fixtures come from the shared
+// harness (bundle_helper_test.go): there is one manifest suite, so every bundle any test
+// writes is hybrid-signed. What is here is specific to the PQ half.
 
-// The whole point of the suite on this target: a hybrid-signed bundle loads, and its
-// module binds under the DERIVED author id — the key-set hash, never either key alone.
+// The suite on this target: a hybrid-signed bundle installs, and its module is bound under
+// the derived author id (the key-set hash), never either key alone.
 func TestHybridManifestBundleLoads(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
@@ -237,17 +232,17 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	if out, err := invokeBundle(key, []byte("hybrid")); err != nil || string(out) != "hybrid" {
 		t.Fatalf("hybrid bundle's private module did not run through `%s`: %q, %v", key, out, err)
 	}
-	// The id is the key-set hash, not the Ed25519 key — the property hybrid signing
-	// actually rests on (§12.4), since otherwise an attacker who breaks Ed25519 brings
-	// an ML-DSA key of their own and lands on the author's names under an unchanged id.
+	// The id is the key-set hash, not the Ed25519 key. Hybrid signing depends on this
+	// (§12.4): otherwise an attacker who breaks Ed25519 could bring their own ML-DSA key
+	// and install under the author's unchanged id.
 	if hex.EncodeToString(a.id()) == hex.EncodeToString(a.edPub) {
 		t.Fatal("the hybrid author id must not be the Ed25519 public key")
 	}
 }
 
-// Both halves are load-bearing on this target too. "Either verifies" would be exactly as
-// strong as the weaker algorithm; a break in one half must reject valid bundles (an
-// operator's problem, recoverable) rather than admit forged ones.
+// Both halves matter on this target too. "Either verifies" would only be as strong as the
+// weaker algorithm; a break in one half must reject valid bundles (a recoverable
+// operator problem) instead of admitting forged ones.
 func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
@@ -260,9 +255,9 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	}{
 		{"the Ed25519 signature", offHybridEdSig},
 		{"the ML-DSA signature", offHybridMlSig},
-		// Not a signature, but the splice the format has to survive: both preimages
-		// commit to both keys, so touching one key invalidates BOTH signatures rather
-		// than only the one made under it.
+		// Not a signature, but the splice the format must resist: both preimages cover both
+		// keys, so changing one key invalidates both signatures, not just the one made
+		// with it.
 		{"the ML-DSA public key", offHybridMlPk},
 	} {
 		menv := bundleEnvelope(t, a, mjson, stubGuestSrc, forwarderWasm)
@@ -274,17 +269,16 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	}
 }
 
-// The retired genesis suite, refused on this target too (§14.1). `0x01` bundles were
-// Ed25519-only; a host that still admitted one would be a downgrade an attacker can ask
-// for by writing a byte, so the host answers "a suite I do not implement" — a
-// legibility failure, not a signature verdict.
+// The Ed25519-only suite `0x01` is refused on this target too (§14.1). A host that accepted
+// it would allow a downgrade by changing one byte, so the host reports "a suite I do not
+// implement", not a signature verdict.
 func TestGenesisManifestSuiteRefused(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	a := testAuthor(t)
 	startShell(t, authorsPolicy(a.id(), a.edPub), nil)
 
-	// A well-formed genesis envelope: [0x01][ed_pk 32][ed_sig 64][json], signed over
-	// DOMAIN_manifest ‖ 0x01 ‖ json exactly as the retired suite specified.
+	// A well-formed 0x01 envelope: [0x01][ed_pk 32][ed_sig 64][json], signed over
+	// DOMAIN_manifest ‖ 0x01 ‖ json as that suite specified.
 	mjson := manifestJSON(t, "genesis", 1, stubGuestSrc, nil)
 	pre := append(append(domainManifest(), 0x01), mjson...)
 	menv := append(append(append([]byte{0x01}, a.edPub...), ed25519.Sign(a.edPriv, pre)...), mjson...)

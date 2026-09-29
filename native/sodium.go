@@ -1,6 +1,7 @@
 // The crypto primitive: the shared browser/libsodium.wasm driven over wazero, exposed with
 // libsodium-wrappers method names. BLAKE2b and ChaCha20-Poly1305-IETF run on native Go
-// (§12.9); Ed25519 stays on the shared wasm, since its accept/reject boundary is consensus.
+// (§12.9); Ed25519 and X25519 stay on the shared wasm, since Ed25519's accept/reject
+// boundary is consensus.
 package main
 
 import (
@@ -73,11 +74,11 @@ const (
 // sodium_init.
 func bootSodium(rt wazero.Runtime) *libsodium {
 	a := rt.NewHostModuleBuilder("a")
-	// a.a — __assert_fail(cond,file,line,func): only reached on a libsodium bug.
+	// a.a: __assert_fail(cond,file,line,func), only reached on a libsodium bug.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) {
 		panic("libsodium: assertion failed")
 	}).Export("a")
-	// a.b — _emscripten_asm_const_int: only the two entropy snippets.
+	// a.b: _emscripten_asm_const_int, only the two entropy snippets.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, code, _, _ uint32) uint32 {
 		switch code {
 		case sodiumRandU32:
@@ -90,11 +91,11 @@ func bootSodium(rt wazero.Runtime) *libsodium {
 			panic(fmt.Sprintf("libsodium: unexpected asm-const code %d", code))
 		}
 	}).Export("b")
-	// a.c — abort().
+	// a.c: abort().
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module) {
 		panic("libsodium: abort")
 	}).Export("c")
-	// a.d — emscripten_resize_heap(requestedBytes): grow linear memory to fit.
+	// a.d: emscripten_resize_heap(requestedBytes), grow linear memory to fit.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, requested uint32) uint32 {
 		mem := m.Memory()
 		if cur := mem.Size(); requested > cur {

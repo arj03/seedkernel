@@ -1,7 +1,7 @@
-// The transport bundle's guest program: transport/src/*.js concatenated in a FIXED order
-// (util → ake → framing → router → rtc → core). Order is load-bearing (parts share one scope,
-// "use strict" leads), and the parts live ONLY here. The canonical op-frame fragment
-// replaces the marker util.js carries. Dependency-free so loc.mjs can use its path list.
+// The transport bundle's guest program: transport/src/*.js concatenated in a fixed order
+// (util, ake, framing, router, rtc, core). The order matters (the parts share one scope,
+// and "use strict" must come first), and this is the only list of parts. The op-frame
+// source replaces the marker in util.js. No dependencies, so loc.mjs can use the path list.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -17,15 +17,14 @@ export function guestSourcePaths() {
   return GUEST_PARTS.map((f) => join(wasmDir, "transport", "src", f));
 }
 
-/** The assembled guest program as text — the shape the manifest hashes; verification
- *  decodes the packed guest back to text, so text is the only shape that round-trips.
- *  `opFrameSource` comes from bundle-author.ts's `guestOpFraming`, which serializes the
- *  canonical services/op-frame.ts functions.
+/** The assembled guest program as text, which is what the manifest signs; verification
+ *  decodes the packed guest back to text. `opFrameSource` comes from bundle-author.ts's
+ *  `guestOpFraming`, which serializes the services/op-frame.ts functions.
  *
- *  The result is normalized to LF because this text is SIGNED: `.gitattributes` checks the
- *  parts out LF, but the build reads the working tree, where an editor can still save CRLF,
- *  and the same commit must sign the same bytes on every machine. Only comments hold a raw
- *  newline here — a template literal's would be normalized by the JS parser anyway — so it
+ *  The result is normalized to LF because this text is signed: `.gitattributes` checks
+ *  the parts out LF, but an editor can still save CRLF in the working tree, and the same
+ *  commit must sign the same bytes on every machine. Raw newlines here only appear in
+ *  comments and whitespace (the JS parser normalizes template literals anyway), so this
  *  cannot change what the program does. */
 export function readGuestSource(opFrameSource) {
   if (typeof opFrameSource !== "string" || opFrameSource.trim().length === 0) {

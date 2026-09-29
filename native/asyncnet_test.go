@@ -11,11 +11,11 @@ import (
 	"seedkernel/qjs"
 )
 
-// asyncnet: a confined guest *initiates* a real network round-trip, which proves the
+// asyncnet: a confined guest starts a real network round trip, which tests the
 // cross-realm async seam end to end. The guest's await suspends (the engine has no
-// Asyncify, so the call returns a callId-backed Promise rather than blocking), the host
+// Asyncify, so the call returns a callId-backed Promise instead of blocking), the host
 // realm's transport dials a responder over a loopback socket, and when its promise settles
-// the shared loop resolves the guest's and resumes the entrypoint — one loop, both realms.
+// the shared loop resolves the guest's and resumes the entrypoint: one loop, both realms.
 //
 // Topology: one host realm, two networks. A (responder) listens and echoes
 // [type, ...payload]; B holds the guest seam over its transport, and its guest asks A.
@@ -23,9 +23,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 	guestSeamRealm(t)
 
 	// A (responder, listens) and B (the guest's node). The guest's seam is built over B's
-	// identity, granting only the transport's reserved id and resolving it through B's own
-	// routing — the same shell method an app's seam gets in production. A runs the probe
-	// app, which echoes, so the round-trip result is checkable.
+	// identity, declaring only the transport's service id and resolving it through B's own
+	// routing, like an app's seam in production. A runs the probe app, which echoes, so the
+	// round-trip result can be checked.
 	sender := testAuthor(t)
 	probeBlob, err := os.ReadFile(writeProbeBundle(t, sender, "probe"))
 	if err != nil {
@@ -50,13 +50,12 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.__nodeA = a;
 		  globalThis.__nodeB = b;
 		  // The seam a confined guest on B runs against: _net resolves through B's own
-		  // routing, which is what an app's seam is wired with (shell-core crossRealmCall).
-		  // Driven through B's retained app handle rather than dispatch, because _net is a LOCAL service
-		  // name: a co-resident realm reaches it and a peer does not (§12.10), and
-		  // dispatch is the peer's door. This seam is hand-built rather than a loaded
-		  // slot, so the host loopback stands in for the cross-realm call — the same
-		  // slot, the same entrypoint, the app's own op framing recomposed here (the
-		  // shell passes bytes and never reads them).
+		  // routing, as an app's seam does (shell-core.ts callLocal). Reached through B's
+		  // app handle, because _net is a local service name: a co-resident realm reaches it
+		  // and a peer does not (§12.10). This seam is hand-built, not an installed slot, so
+		  // the host loopback stands in for the cross-realm call: the same slot and
+		  // entrypoint, with the app's own op framing rebuilt here (the shell passes bytes
+		  // and never reads them).
 		  __buildGuestSeam(["_net"], (id, payload) => {
 		    const n = payload[0];
 		    let op = "";
@@ -82,8 +81,8 @@ func TestAsyncNetInitiator(t *testing.T) {
 	awaitOK(t, "addr", `teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"))`, 5*time.Second)
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and
-	// await the response. The await is the whole point — it suspends until the host
-	// realm's socket round-trip settles and the loop resolves the guest's promise.
+	// await the response, which suspends until the host realm's socket round trip settles
+	// and the loop resolves the guest's promise.
 	const askGuestSource = `
 		function fromHex(h) {
 		  const out = new Uint8Array(h.length / 2);
@@ -91,9 +90,8 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  return out;
 		}
 		// handle reads [caller 32][this app's op framing]: the local "ask" op (the mock
-		// realm composes it around the test payload) builds the transport's send op and
-		// awaits the response. The await is the whole point — it suspends until the host
-		// realm's socket round-trip settles and the loop resolves the guest's promise.
+		// realm builds it around the test payload) builds the transport's send op and
+		// awaits the response.
 		function handle(arg) {
 		  const n = arg[32];
 		  const msg = arg.subarray(33 + n);

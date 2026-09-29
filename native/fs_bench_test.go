@@ -1,17 +1,17 @@
 package main
 
-// fs.* perf for the native binary — the storage hot path, where a holder turns every FETCH
-// into fs.get → os.ReadFile and every STORE into fs.put → os.WriteFile, one ~64 KB block
-// at a time (§27). Timed at two levels:
+// fs.* performance on the native binary: the storage hot path, where a seedstore holder
+// turns every FETCH into fs.get (os.ReadFile) and every STORE into fs.put (os.WriteFile),
+// one ~64 KB block at a time. Timed at two levels:
 //
-//   - BenchmarkNodeFs{Get,Put}64K — the bare Go nodeFs. MB/s, so it lines up next to the
-//     BLAKE2b/XChaCha20 rates: that comparison says whether GET is disk- or crypto-bound.
-//   - BenchmarkFs{Get,Put}JS64K — the same op through the QuickJS shim, so the delta is
-//     the per-block ArrayBuffer copy the storage guest pays on the JS↔Go boundary.
+//   - BenchmarkNodeFs{Get,Put}64K: the bare Go nodeFs, in MB/s to compare with the
+//     BLAKE2b/XChaCha20 rates, which shows whether GET is disk- or crypto-bound.
+//   - BenchmarkFs{Get,Put}JS64K: the same op through the QuickJS shim, so the difference
+//     is the per-block ArrayBuffer copy the storage guest pays across JS and Go.
 //
-// Plus BenchmarkNodeFsOpenScan: FsBlobStore rebuilds its index at open by listing the fs
-// and stat-ing every block (store-fs.ts), so that O(N) scan is a node-startup cost, not a
-// per-request one. The sweep over directory size shows its scaling.
+// Plus BenchmarkNodeFsOpenScan: seedstore's FsBlobStore rebuilds its index at open by
+// listing the fs and stat-ing every block (store-fs.ts), so that O(N) scan is a startup
+// cost, not a per-request one. The sweep over directory size shows its scaling.
 //
 // Native-internal numbers: node uses node:fs, so there is no byte-identical twin to
 // compare against.
@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// blockBytes is the §27 block size every fs bench moves per op.
+// blockBytes is the block size every fs bench moves per op (seedstore's block size).
 const blockBytes = 64 * 1024
 
 func benchBlock() []byte { return bytes.Repeat([]byte{0x5a}, blockBytes) }
@@ -68,9 +68,9 @@ func BenchmarkNodeFsGet64K(b *testing.B) {
 // ── through the QuickJS shim (the storage guest's actual fs surface) ─────────
 //
 // The `fs` the guest reaches is the async `Fs` seam (native-shim.ts over fs.go's
-// synchronous primitive), so a put/get settles through the event loop like every
-// other promised op — batching b.N ops in one JS await loop keeps the el.await
-// boundary out of the per-op number, exactly as the net benches do.
+// synchronous primitive), so a put/get settles through the event loop like every other
+// async op; running b.N ops in one JS await loop keeps the el.await cost out of the per-op
+// number, as the net benches do.
 
 func BenchmarkFsPutJS64K(b *testing.B) {
 	setupFsJS(b)
@@ -88,9 +88,9 @@ func BenchmarkFsGetJS64K(b *testing.B) {
 	b.StopTimer()
 }
 
-// setupFsJS boots the shared shell, uses the process-wide benchmark data dir and seeds one
-// block, leaving __benchPut/__benchGet ready to run on the shared loop. The seed put is
-// itself an awaited async call — `fs.put` returning a Promise is the whole point of the seam.
+// setupFsJS boots the shared shell, uses the process-wide benchmark data dir and writes one
+// block, leaving __benchPut/__benchGet ready to run on the shared loop. The first put is
+// itself an awaited async call, since `fs.put` returns a Promise.
 func setupFsJS(b *testing.B) {
 	ensureBooted(b)
 	// Do not re-point the process-wide realm at b.TempDir(): Go removes that directory
@@ -134,10 +134,10 @@ func BenchmarkNodeFsOpenScan(b *testing.B) {
 	}
 }
 
-// BenchmarkNodeFsStat times the used-bytes admission query the storage guest runs per
-// block.offer. The cached counter (maintained by put/delete) makes it O(1) regardless of
-// directory size — the sweep should stay flat, in contrast to BenchmarkNodeFsOpenScan's
-// one-time O(N) open walk that seeds the counter.
+// BenchmarkNodeFsStat times the used-bytes query the storage guest runs per block.offer.
+// The cached counter (maintained by put/delete) makes it O(1) regardless of directory
+// size, so the sweep should stay flat, unlike BenchmarkNodeFsOpenScan's one-time O(N)
+// walk that initializes the counter.
 func BenchmarkNodeFsStat(b *testing.B) {
 	for _, n := range []int{1_000, 10_000} {
 		b.Run(fmt.Sprintf("files=%d", n), func(b *testing.B) {

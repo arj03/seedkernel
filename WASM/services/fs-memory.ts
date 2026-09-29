@@ -1,21 +1,18 @@
-// The in-RAM `Fs` backend — the portable one, for tests and ephemeral nodes, and the shape
-// a browser backend (OPFS/IndexedDB) will mirror. It sits with the other backends
-// (`fs-node.ts`, Go's `native/fs.go`) and the seam it satisfies (`fs.ts`). The per-app key
-// rule is applied in host/fs-view.ts — that decides what an app can reach. Which medium the
-// bytes land in decides nothing.
+// The in-memory `Fs` backend: portable, for tests and ephemeral nodes. The other backends
+// are `fs-node.ts` and Go's `native/fs.go`; the seam is `fs.ts`. The per-app key rule is
+// applied in host/fs-view.ts, so what an app can reach does not depend on the backend.
 
 import { type Fs, type FsStat } from "./fs.js";
 
-/** The default in-memory backend's whole quota, so a successful put cannot turn bounded
- *  in-flight calls into unbounded permanent process RAM. */
+/** The in-memory backend's total quota, so puts cannot grow process memory without
+ *  bound. */
 export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 
-/** In-RAM Fs. Stores copies so callers can reuse their buffers.
+/** In-memory Fs. Stores copies so callers can reuse their buffers.
  *
- *  Every method is `async` even though the map behind them is not: the seam is what is
- *  asynchronous, and a backend that resolved even sometimes-immediately would let a caller
- *  work by accident on this one and fail on the backend it ships against. */
+ *  Every method is `async` even though the map is not, so code that accidentally relies
+ *  on synchronous results fails here too and not only on a real backend. */
 export class MemoryFs implements Fs {
   private readonly map = new Map<string, Uint8Array>();
   private used = 0;
@@ -43,9 +40,9 @@ export class MemoryFs implements Fs {
     if (nextUsed > this.maxBytes) {
       throw new Error(`memory-fs: byte quota exceeded (cap ${this.maxBytes})`);
     }
-    // Checked before the copy, committed after it: a failed allocation leaves the old
-    // value and the accounting intact.
-    // Buffer is a Uint8Array too, but its slice() aliases the caller's storage.
+    // Checked before the copy, committed after it, so a failed allocation leaves the old
+    // value and the accounting intact. `new Uint8Array` because a Node Buffer's slice()
+    // aliases the caller's storage.
     const stored = new Uint8Array(bytes);
     this.map.set(key, stored);
     this.used = nextUsed;

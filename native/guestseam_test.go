@@ -12,13 +12,12 @@ import (
 	"seedkernel/qjs"
 )
 
-// The shared guest-seam.ts runs in the host realm over the Go
-// primitives (sodium + fs), reused verbatim. Each name is exercised through the
-// single `__guestSeam(name, bytes)` seam and checked against the underlying
-// primitive, plus the name gate (an undeclared authority is refused).
+// The shared guest-seam.ts runs in the host realm over the Go primitives (sodium and fs),
+// unchanged. Each name is called through the single `__guestSeam(name, bytes)` seam and
+// checked against the underlying primitive, plus the name gate (an undeclared service is
+// refused).
 
-// The names of guest-seam.ts's catalog, written here so a rename shows up as
-// one edit rather than as bare strings scattered through the assertions.
+// The guest-seam.ts names used below, defined once so a rename is one edit.
 const (
 	nameSign     = "node/sign"
 	nameVerify   = "node/verify"
@@ -31,24 +30,23 @@ const (
 func TestGuestSeamOps(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Grant node/sign, node/verify, fs/put and fs/get (not link),
-	// plus an identity from sodium. The signing scope binds node/sign and
-	// node/verify to a bundle namespace (README §12.2) — a real node derives it from the
-	// manifest's (author, app); here it is a throwaway pair.
+	// Declare `node` and `fs` (not link), plus an identity from sodium. The signing scope
+	// ties node/sign and node/verify to an app namespace (§12.2); a real node derives it
+	// from the manifest's `app` label, here it is a throwaway one.
 	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__other = sodium.crypto_sign_keypair();
-		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
-		// the key that signs, all three.
+		// node/sign signs under a slot-derived scope: domain, scope bytes and the signing
+		// key.
 		globalThis.__scope = appSignScope(__id, "testapp");
 		__buildGuestSeam(["node", "fs"], null, __scope);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
 
-	// Every seam name — crypto included — answers a Promise now, so every probe goes
-	// through callRealm, which pumps the loop until it settles. A gate refusal is a
-	// rejected promise here and surfaces as callRealm's error.
+	// Every seam name, crypto included, answers a Promise, so every probe goes through
+	// callRealm, which pumps the loop until it settles. A gate refusal surfaces as
+	// callRealm's error.
 	callBytes := func(name string, payload []byte) []byte {
 		t.Helper()
 		b, err := callRealm("__callSeam", 5*time.Second,
@@ -69,10 +67,9 @@ func TestGuestSeamOps(t *testing.T) {
 	// for the seam's own use, so it can be read directly.
 	pk := jsBytes(t, qc, `__id.publicKey`)
 
-	// A primitive is reached BY NAME through the `crypto/` prefix, so there is no op
-	// number per algorithm and no ABI rev to add one.
+	// A primitive is reached by name under `crypto/`; there is no op number per algorithm.
 
-	// crypto/blake2b — [outLen][keyLen][key][msg] — over RFC 7693's whole interface: the
+	// crypto/blake2b, [outLen][keyLen][key][msg], over RFC 7693's whole interface: the
 	// system hash's 32 bytes, and the published 64-byte unkeyed and keyed answers.
 	h := callBytes("crypto/blake2b", append([]byte{32, 0}, "hello seedkernel"...))
 	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"), null)`)
@@ -101,29 +98,29 @@ func TestGuestSeamOps(t *testing.T) {
 		}
 	}
 
-	// node/sign and node/verify are scoped (README §12.2): the host applies
-	// DOMAIN_guest ‖ scope to the message on BOTH sides, so the guest checks a
-	// signature by naming the key, never by reconstructing host-owned prefix bytes.
+	// node/sign and node/verify are scoped (§12.2): the host applies DOMAIN_guest ‖ scope
+	// to the message on both sides, so the guest checks a signature by naming the key,
+	// never by rebuilding the host's prefix bytes.
 	msg := []byte("a message to sign")
 	sig := callBytes(nameSign, msg)
 	if len(sig) != 64 {
 		t.Fatalf("node/sign len = %d, want 64", len(sig))
 	}
-	// node/verify — [pk 32][sig 64][msg] — the scope rides on the host side of the seam.
+	// node/verify, [pk 32][sig 64][msg]; the host adds the scope.
 	verifyScoped := append(append(append([]byte{}, pk...), sig...), msg...)
 	if v := callBytes(nameVerify, verifyScoped); len(v) != 1 || v[0] != 1 {
 		t.Fatalf("node/verify(scoped msg) = %v, want [1]", v)
 	}
-	// The same signature must NOT verify under a different key: the key is caller-named,
-	// the scope is not — this is a check of this bundle's namespace, not of "some key".
+	// The same signature must not verify under a different key: the caller names the key,
+	// not the scope, so this checks this app's namespace, not just any key.
 	otherPk := jsBytes(t, qc, `__other.publicKey`)
 	verifyOther := append(append(append([]byte{}, otherPk...), sig...), msg...)
 	if v := callBytes(nameVerify, verifyOther); len(v) != 1 || v[0] != 0 {
 		t.Fatalf("node/verify(another key) = %v, want [0]", v)
 	}
-	// A mis-framed call is not a failed verification: a payload too short to hold
-	// [pk 32][sig 64] errors, where [0] would have been a verdict about bytes nothing
-	// checked. The bound is exactly that prefix, so an empty message still answers.
+	// A mis-framed call is not a failed verification: a payload too short for
+	// [pk 32][sig 64] errors, since [0] would be a verdict on bytes nothing checked. The
+	// bound is exactly that prefix, so an empty message still gets an answer.
 	if err := refused(nameVerify, verifyScoped[:95]); err == nil {
 		t.Fatal("node/verify(short payload) returned a verdict, want an error (mis-framed is not invalid)")
 	}
@@ -138,9 +135,9 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatal("crypto/ed25519/verify was exposed, want unknown host transform")
 	}
 
-	// fs/put then fs/get: content-addressed round trip. Both AWAIT — fs round-trips at
-	// the seam, because a synchronous `get` is a shape no browser backend can implement
-	// and the seam is one shape on every target (services/fs.ts).
+	// fs/put then fs/get round trip. Both are awaited: fs is async at the seam, since no
+	// browser backend could implement a synchronous `get` and the seam is the same on
+	// every target (services/fs.ts).
 	awaitBytes := func(name string, payload []byte) []byte {
 		t.Helper()
 		b, err := callRealm("__callSeamAwait", 5*time.Second,
@@ -162,20 +159,19 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatalf("fs/get = %v, want [1] ++ %q", got, value)
 	}
 
-	// Entropy is an ungated host transform: random bytes reach nothing.
+	// Entropy needs no declaration: random bytes reach nothing.
 	if r := callBytes(nameRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
 		t.Fatalf("crypto/random = %d bytes, want 4", len(r))
 	}
-	// And raw net is not merely undeclared here — it is wired only for the link occupant, so no app
-	// seam is ever wired one.
+	// Raw links are not declared here, and `link` is only ever wired for the link
+	// occupant.
 	if err := refused(nameLinkSend, make([]byte, 8)); err == nil {
 		t.Fatal("a link/* name resolved on an app seam")
 	}
 
-	// THE gate, on a service this harness wires a real backend for, so nothing but the
-	// gate can be what refuses it: the same seam narrowed to `node` alone answers no
-	// fs name. A refusal at the GATE — an undeclared service, still a throw at the call
-	// site (guest-seam.ts) — reaches the test as callRealm's error.
+	// The gate itself, on a service this harness has a real backend for, so only the gate
+	// can refuse it: the same seam narrowed to `node` answers no fs name. The refusal (a
+	// throw at the call site, guest-seam.ts) reaches the test as callRealm's error.
 	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["node"], null, __scope);`); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
@@ -205,9 +201,9 @@ func jsBytes(t *testing.T, qc *qjs.Context, expr string) []byte {
 }
 
 // TestGuestSeamNoiseVectors replays the published Noise XX vectors through the Go
-// primitives by way of the shared seam — the same script tests/realm-guest.test.mjs runs
-// on the JS target. The crypto/ names must carry their algorithms' whole interface, or a
-// replacement transport stops being a bundle update (services/domains.ts).
+// primitives via the shared seam, the same script tests/realm-guest.test.mjs runs on the
+// JS target. The crypto/ names must expose their algorithms' whole interface, or a
+// replacement transport could not ship as a bundle (services/domains.ts).
 func TestGuestSeamNoiseVectors(t *testing.T) {
 	guestSeamRealm(t)
 	script, err := os.ReadFile("../WASM/tests/noise-vectors.js")
@@ -221,7 +217,7 @@ func TestGuestSeamNoiseVectors(t *testing.T) {
 	if _, err := qc.Eval("noise-vectors.js", string(script)); err != nil {
 		t.Fatal("noise-vectors.js:", err)
 	}
-	// A seam granting nothing: every name the handshake needs is an ungated transform.
+	// A seam declaring nothing: every name the handshake needs is a crypto transform.
 	if _, err := qc.Eval("build.js", `__buildGuestSeam([], null);`); err != nil {
 		t.Fatal("build seam:", err)
 	}

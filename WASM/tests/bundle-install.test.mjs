@@ -1,16 +1,13 @@
-// bundle-install.test.mjs — bundle/manifest verify → admit → install (§12.4, §12.5,
-// §12.10): routing claims, fs, freshness, revocation, and in-place upgrade. Split out of
-// the former single-file run.mjs so this topic reads on its own; realm-guest.test.mjs
-// covers the guest seam, bundle-replacement.test.mjs explicit slot replacement, and
-// crypto.test.mjs the manifest-suite and ACVP vector suites.
+// Bundle verify, admit and install (§12.4, §12.5, §12.10): routing claims, fs, freshness,
+// revocation, and in-place upgrade. realm-guest.test.mjs covers the guest seam,
+// bundle-replacement.test.mjs explicit slot replacement, and crypto.test.mjs the manifest
+// suite and ACVP vectors.
 //
-// Positive-path bundle fixtures go through `authorBundle` (scripts/bundle-author.ts), which
-// assembles, validates and signs in one call — the same path a real publisher
-// uses. A handful of tests build a manifest or envelope by hand instead, because what they
-// assert on is deliberately malformed or corrupted: duplicate module names,
-// a corrupted body, a tampered envelope byte. `authorBundle` calls `validateManifest`
-// internally and cannot produce any of those on purpose, so those cases keep
-// `signTestBundle` directly.
+// Valid bundle fixtures go through `authorBundle` (scripts/bundle-author.ts), which
+// assembles, validates and signs in one call, as a real publisher does. A few tests build
+// a manifest or envelope by hand because they need it malformed or corrupted (duplicate
+// module names, a corrupted body, a tampered envelope byte), which `authorBundle` cannot
+// produce since it calls `validateManifest`; those use `signTestBundle`.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -43,9 +40,9 @@ async function testFullLifecycle() {
   await installMod(host, chatKey, "chat", forwarderBytes);
   assert(host.isBound(chatKey, "chat"), "chat module installed");
 
-  // Reach it by name: the host stages input at the module's scratch, calls handle, and
-  // reads the response back (§4). A guest reaches the same module through its seam by
-  // the bare name (§12.2); here the host calls it directly.
+  // Reach it by name: the host writes input at the module's scratch, calls handle, and
+  // reads the response back (§4). A guest reaches the same module through its seam by the
+  // bare name (§12.2); here the host calls it directly.
   const text = new TextEncoder().encode("hello from author");
   const resp = await host.callModule(chatKey, "chat", text);
   assert(resp !== null && bytesEqual(resp, text), "module echoed its input");
@@ -61,14 +58,14 @@ async function testInstallRejectsUntrustedAuthor() {
   const author = testAuthor();
   const { host } = await makeHost();
 
-  // A valid manifest signed by an untrusted author — the author is not in the policy.
+  // A valid manifest signed by an author who is not in the policy.
   const { blob } = authorBundle(sodium, author, {
     app: "demo", version: 1,
     modules: [{ name: "fwd", wasm: forwarderBytes }],
     guestSource: GUEST_TEXT, guestRequires: [],
   });
 
-  // The predicate only trusts a DIFFERENT key.
+  // The predicate only trusts a different key.
   const stranger = testAuthor();
   const admit = authorAllowlist([toHex(stranger.id)]);
   let threw = false;
@@ -126,8 +123,8 @@ async function testWholeBundleIsSigned() {
 async function testDenyAllPolicyRejects() {
   console.log("Test: an omitted policy is deny-all, not 'no policy' (§12.5, §14)");
 
-  // `policyFromJson(null)` is the boot default every target shares: a predicate
-  // that returns false for every bundle. The absence of a decision is never permission.
+  // `policyFromJson(null)` is the boot default on every target: a predicate that returns
+  // false for every bundle. No policy never means permission.
   const admit = policyFromJson(null);
   assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
     "deny-all predicate returns false for any VerifiedBundle");
@@ -155,9 +152,9 @@ async function testBundleRefusesNonModule() {
   const author = testAuthor();
   const { host } = await makeHost();
 
-  // Two modules the author genuinely signed: the real forwarder, and arbitrary bytes that
-  // are signed but will not instantiate. With a two-phase install, a
-  // module failing phase 1 must fail the whole load — nothing lands.
+  // Two modules the author really signed: the forwarder, and arbitrary bytes that are
+  // signed but will not instantiate. A module failing to build must fail the whole
+  // install, leaving nothing installed.
   const notAModule = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
   const { blob } = authorBundle(sodium, author, {
     app: "demo", version: 1,
@@ -169,7 +166,7 @@ async function testBundleRefusesNonModule() {
   let threw = false;
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
-  // Neither module is bound — the install was atomic.
+  // Neither module is bound: the install was atomic.
   assert(!host.isBound("demo", "fwd"), "the valid module is NOT bound (the load failed atomically)");
   assert(!host.isBound("demo", "broken"), "the non-module is not bound");
 
@@ -177,18 +174,17 @@ async function testBundleRefusesNonModule() {
 }
 
 
-// ─── Test: the manifest's claim IS the routing (§12.10) ──────────────────────
-// The bundle declares the protocol ids it serves and the load claims them: one act, no
-// operator step in between. Claims have one active owner: an update replaces its own
-// claims atomically, and a different bundle cannot silently displace it.
+// ─── Test: the manifest's claims are the routing (§12.10) ──────────────────────
+// The bundle declares the protocol ids it serves and the install claims them, with no
+// operator step in between. Each claim has one owner: an update replaces its own claims
+// atomically, and a different bundle cannot silently displace it.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
   const other = testAuthor();
-  // One bundle shape, parameterised by who signs it, what it is called, which version it
-  // is, and what it claims — every case below is a different point in that space.
+  // One bundle shape, parameterized by signer, label, version and claims.
   const blob = (signer, app, version, protocols) => authorBundle(sodium, signer, {
     app, version, protocols,
     modules: [{ name: "fwd", wasm: forwarderBytes }],
@@ -212,14 +208,14 @@ async function testManifestClaimIsTheRouting() {
     assert(shell.resolve("store") === null,
       "…and exactly the id it declared, never a default to the app's own name");
 
-    // An app that claims nothing serves nothing: the initiator-only shape (§12.8), and
-    // the reason the field is optional rather than a required empty list.
+    // An app that claims nothing serves nothing: the initiator-only shape (§12.8), which
+    // is why the field is optional.
     const quiet = "quiet";
     await shell.install(blob(author, "quiet", 1, undefined));
     assertEqual(shell.routes().length, 1, "a bundle claiming nothing adds no route");
 
-    // An install that names no predecessor takes a FREE label: this one is taken, and
-    // taking it over means saying so.
+    // An install without `replaces` needs a free label: this one is taken, and taking it
+    // over has to be explicit.
     let taken = "";
     try { await shell.install(blob(author, "store", 2, ["seedstore/v2"])); }
     catch (e) { taken = String(e); }
@@ -227,15 +223,14 @@ async function testManifestClaimIsTheRouting() {
       `an install onto a running label is refused by name, got: ${taken || "no error"}`);
     assertEqual(shell.resolve("seedstore/v1"), key, "…leaving the running version's claim untouched");
 
-    // An update re-projects from the NEW manifest, so a claim that was dropped stops
-    // being served — the table cannot outlive the manifest that put it there.
+    // An update takes its claims from the new manifest, so a dropped claim stops being
+    // served.
     await shell.install(blob(author, "store", 2, ["seedstore/v2"]), { replaces: key });
     assertEqual(shell.resolve("seedstore/v2"), key, "an update claims what the new manifest declares");
     assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
-    // A second app cannot shadow an active claim. Rejection leaves both the existing
-    // route and the candidate's install state untouched — including never evaluating its
-    // guest, whose top level could already exercise its granted services.
+    // A second app cannot shadow an active claim. Rejection leaves the existing route
+    // untouched and never evaluates the candidate's guest.
     const rival = "rival-store";
     const buildsBeforeConflict = realmBuilds;
     let conflict = "";
@@ -249,16 +244,15 @@ async function testManifestClaimIsTheRouting() {
     assertEqual(realmBuilds, buildsBeforeConflict,
       "a known claim conflict is refused before the candidate guest executes");
 
-    // Uninstall drops what the app claimed: a route never outlives its app.
+    // Uninstall drops what the app claimed.
     shell.uninstall(key);
     shell.uninstall(quiet);
     assert(shell.resolve("seedstore/v2") === null, "uninstall drops the app's claims");
     assertEqual(shell.routes().length, 0, "…leaving no route behind");
 
-    // Realms are the multiplicand every per-realm ceiling is multiplied by (§12.3), so the
-    // install list is counted: without this bound each of those ceilings is a floor. A
-    // REPLACEMENT is never refused — it takes the slot its own label already holds — and an
-    // uninstall gives one back.
+    // Every per-realm ceiling is multiplied by the number of realms (§12.3), so the number
+    // of installs is capped. A replacement is never refused (it takes the slot its label
+    // already holds), and an uninstall frees one.
     const { DEFAULT_MAX_APP_SLOTS } = await imp("build/host/wasm-limits.js");
     for (let i = 0; i < DEFAULT_MAX_APP_SLOTS; i++) {
       await shell.install(blob(author, `filler${i}`, 1, [`filler/${i}`]));
@@ -279,8 +273,8 @@ async function testManifestClaimIsTheRouting() {
     for (let i = 1; i < DEFAULT_MAX_APP_SLOTS; i++) shell.uninstall(`filler${i}`);
     assertEqual(shell.routes().length, 0, "the node is empty again");
 
-    // The format's half of the rule: an id that is not routable is a manifest its author
-    // got wrong, refused whole at verify rather than dropped quietly.
+    // The format's half of the rule: an id that is not routable is refused at verify, not
+    // dropped quietly.
     for (const bad of [["bad id"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
       let threw = false;
       try {
@@ -289,17 +283,16 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
     }
-    // No spelling is reserved to the host: a `_`-led name is legal in either claim
-    // list, and it is the LIST — never the spelling — that decides who may reach it.
+    // No spelling is reserved to the host: a name starting with `_` is valid in either
+    // claim list, and the list, not the spelling, decides who may reach it.
     for (const claim of ["_offer", "_host", "_net", "plain"]) {
       verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "reserved", version: 1, protocols: [claim], modules: [], guest: GUEST() }));
       verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "reserved", version: 1, services: [claim], modules: [], guest: GUEST() }));
     }
-    // Two maps, so uniqueness is PER LIST. A name in both is not ambiguous — it says
-    // "reachable by a peer AND by a co-resident guest", which is a thing a bundle may mean
-    // and the two maps express without a rule. A duplicate WITHIN one list still is.
+    // Two maps, so uniqueness is per list. A name in both is not ambiguous: it is reachable
+    // by a peer and by a co-resident guest. A duplicate within one list is refused.
     {
       assert(verifyTestBundle(sodium, signTestBundle(sodium, author,
         { app: "dual", version: 1, protocols: ["both"], services: ["both"], modules: [], guest: GUEST() })) !== null,
@@ -311,10 +304,10 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, "a name claimed twice in the SAME list is still refused");
     }
-    // The property that actually matters: a name in `services` is unreachable from a
-    // PEER while the SAME bundle's `protocols` name is — checked through the transport's
-    // own `link/deliver`, rather than by inspecting the claim table. A node of its own,
-    // since this one's transport is gone; its realms echo the payload after the caller.
+    // The property that matters: a peer cannot reach a name in `services` but can reach
+    // the same bundle's `protocols` name, checked through `link/deliver` instead of by
+    // inspecting the claim table. A separate node, since this one's transport is gone; its
+    // realms echo the payload after the caller.
     {
       const pub = "reach/public", priv = "_reach-private";
       const seams = [];
@@ -332,8 +325,9 @@ async function testManifestClaimIsTheRouting() {
           app: "reach", version: 1, protocols: [pub], services: [priv],
           modules: [], guestSource: GUEST_TEXT, guestRequires: [],
         }).blob);
-        // The boot transport stood first. Its `link/deliver` body is `[claimLen u8][claim]`
-        // then the realm argument whole: `[attribution 32][payload …]`.
+        // The boot transport was created first. Its `link/deliver` body is
+        // `[claimLen u8][claim]` followed by the realm argument
+        // `[attribution 32][payload ...]`.
         const deliver = withTestBudget(seams[0]);
         const framed = concatBytes([new Uint8Array(32).fill(0x11), new Uint8Array([1, 2, 3])]);
         const to = (claim) => concatBytes([Uint8Array.of(claim.length), enc.encode(claim), framed]);
@@ -363,8 +357,7 @@ async function testInstallerRemove() {
   assert(host.isBound(chat, "text") && host.isBound(chat, "media"), "the app's two modules installed");
   assert(host.isBound(notes, "text"), "the other app installed");
 
-  // The unbind is per APP, and the app is the key: one delete takes every module the app
-  // landed and nothing else.
+  // Removal is per app: one call removes every module the app installed and nothing else.
   assertEqual(host.removeApp(chat), 2, "both modules of the app went in one call");
   assert(!host.isBound(chat, "text") && !host.isBound(chat, "media"), "the app is gone");
   assert(host.isBound(notes, "text"), "the other app is untouched");
@@ -377,7 +370,7 @@ async function testInstallerRemove() {
   console.log("  OK\n");
 }
 
-// ─── Test: fs service (opaque key → bytes) ─────────────────────────
+// ─── Test: fs service (opaque key to bytes) ─────────────────────────
 
 async function testFs() {
   console.log("Test: fs service — opaque key → bytes (NodeFs + MemoryFs)");
@@ -401,8 +394,8 @@ async function testFs() {
   for (const { name, make } of backends) {
     const { fs, cleanup } = make();
     try {
-      // The seam is async on every backend (services/fs.ts), which is what lets a browser
-      // backend satisfy this shape at all.
+      // The seam is async on every backend (services/fs.ts), so a browser backend can
+      // implement it.
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
       assert(await fs.size("a.blk") < 0, `${name}: absent before put`);
       assertEqual(await fs.size("a.blk"), -1, `${name}: size -1 when absent`);
@@ -438,8 +431,8 @@ async function testFs() {
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-"));
   try {
     const fs = new NodeFs(dir);
-    // The key check throws inside an async method, so it surfaces as a rejection —
-    // still a refusal the caller cannot miss, and still before any syscall.
+    // The key check throws inside an async method, so it surfaces as a rejection, still
+    // before any syscall.
     let threw = false;
     try { await fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects a path-traversal key on put");
@@ -511,10 +504,10 @@ async function testFs() {
   console.log("  OK\n");
 }
 
-// ─── Test: the fs key space is ONE rule, shared by every target ──────────
-// Which keys a node admits decides which blocks it stores and advertises, so it is a
-// consensus predicate: a Go node and a Bun node that disagree about it disagree about
-// their contents. The rule lives in shared JS (services/fs.ts `isSafeFsKey`), applied over
+// ─── Test: the fs key space is one rule, shared by every target ──────────
+// Which keys a node accepts decides which blocks it stores and advertises, so it is
+// consensus: a Go node and a Bun node that disagree about it disagree about their
+// contents. The rule lives in shared code (services/fs.ts `isSafeFsKey`), applied over
 // whatever backend a target supplies (`validatedFs`, host/fs-view.ts).
 
 async function testFsKeyRule() {
@@ -534,8 +527,8 @@ async function testFsKeyRule() {
   ];                                     // case- and extension-insensitively
   for (const k of illegal) assert(!isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should not hold`);
 
-  // validatedFs applies it to every op that NAMES a key, as a rejection rather than a
-  // silent miss: an unrepresentable key is a caller bug on read exactly as on write.
+  // validatedFs applies it to every op that names a key, as a rejection, not a silent
+  // miss: an invalid key is a caller bug on read as much as on write.
   const fs = validatedFs(new MemoryFs());
   await fs.put("ok.blk", new Uint8Array([1]));
   for (const [what, call] of [
@@ -549,15 +542,15 @@ async function testFsKeyRule() {
     assert(rejected, `validatedFs rejects an unsafe key on ${what}`);
   }
 
-  // …and to none that does not. `list()` takes a PREFIX, and the empty prefix — "every
-  // key I can see" — is exactly the call a key rule applied here would wrongly refuse.
+  // It does not apply to ops that take no key. `list()` takes a prefix, and the empty
+  // prefix (every key) is exactly what a key rule here would wrongly refuse.
   assertEqual((await fs.list()).join(","), "ok.blk", "validatedFs leaves list(undefined) alone");
   assertEqual((await fs.list("ok")).join(","), "ok.blk", "validatedFs leaves a list prefix alone");
   assert((await fs.stat()).used === 1, "validatedFs leaves stat alone");
 
-  // The shell wraps the backend UNDER scopedFs, so what the rule sees is the composite
-  // key the medium sees — a guest key that would escape its scope is refused even though
-  // the scope prefix is itself legal.
+  // The shell puts validatedFs under scopedFs, so the rule sees the full key the backend
+  // sees: a guest key that would escape its scope is refused even though the scope prefix
+  // is itself valid.
   const scoped = scopedFs(fs, "abcd1234");
   await scoped.put("mine.blk", new Uint8Array([2]));
   assert((await fs.get("abcd1234mine.blk")) !== null, "scoped put lands under the scope");
@@ -568,7 +561,7 @@ async function testFsKeyRule() {
   console.log("  OK\n");
 }
 
-// ─── Test: the transport's freshness (§12.4) ───────────────────
+// ─── Test: freshness is per (author, app), transport included (§12.4) ──────────
 
 async function testSlotFreshness() {
   console.log("Test: the transport carries the ordinary (author, app) freshness mark");
@@ -583,11 +576,10 @@ async function testSlotFreshness() {
     modules: [{ name: "fwd", wasm: forwarderBytes }],
     guestSource: GUEST_TEXT, guestRequires: [],
   }).blob;
-  // The load path as the shell composes it: the host's gates read the store and answer
-  // once, installBundle lands the modules, and the mark is advanced last — after the guest
-  // stands, which is the shell's job and why the mark is written here rather than inside
-  // installBundle. The predicate never touches the store, so "who refuses a downgrade" is
-  // one place.
+  // The install path as the shell runs it: the host's gates read the store, the modules
+  // are loaded, and the mark is advanced last, after the guest starts. That is the shell's
+  // job, so the mark is written here. The predicate never touches the store, so only one
+  // place refuses a downgrade.
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
     checkHostGates(v, freshness);
@@ -595,9 +587,8 @@ async function testSlotFreshness() {
     freshness.set(v.author, v.manifest.app, v.manifest.version);
   };
 
-  // Versions are an author's own lineage, transport or not: a floor keyed to the
-  // transport would put two independent authors on one shared version line with no owner,
-  // and would only pay where an attacker chooses which signed bundle arrives (§12.4).
+  // Versions are per author, transport or not: a floor keyed to the transport would put
+  // two independent authors on one shared version line (§12.4).
   {
     const freshness = new FreshnessMarks();
     const host = testHost(new ModuleTable());
@@ -617,9 +608,8 @@ async function testSlotFreshness() {
     assert(refused, "an author's own stale transport is still refused as a downgrade");
   }
 
-  // The store holds marks and revocations only. A file carrying an unrecognized key —
-  // one a newer version added, say — still loads (it is ignored, not refused) and is
-  // rewritten without it.
+  // The store holds marks and revocations only. A file with an unrecognized key (one a
+  // newer version added, say) still loads; the key is ignored and dropped on rewrite.
   {
     const markKey = "aa".repeat(32) + ":app";
     const legacy = new FreshnessMarks(JSON.stringify({ marks: { [markKey]: 2 }, futureKey: { anything: 1 }, revoked: [] }));
@@ -645,10 +635,9 @@ async function testShellBoot() {
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir,
-      identity, // dial-only: no listen/wsListen, so start() binds nothing
+      identity, // no transport, so no network
     });
-    // Admitting an allowed author's code is the bundle path, covered end-to-end by
-    // testBundle (§12.4).
+    // Installing an allowed author's bundle is covered end to end by testBundle (§12.4).
     assert((await shell.fs.list()).length === 0, "fs.* backend is wired over the data dir");
   } finally {
     if (shell) shell.close();
@@ -657,7 +646,7 @@ async function testShellBoot() {
   console.log("  OK\n");
 }
 
-// ─── Test: app bundle — signed manifest + governed load (step 6) ────────
+// ─── Test: app bundle, signed manifest and policy-gated install ────────
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
@@ -672,16 +661,15 @@ async function testBundle() {
   let shell, shell2;
   try {
     // A minimal one-module bundle (forwarder.wasm) plus a guest stub. Modules install
-    // straight from the manifest (§12.4) under the signed `app` label, each at its own
-    // logical name — so the manifest declares no bind name or filename: module bytes
-    // follow the guest in manifest order.
+    // from the manifest (§12.4) under the signed `app` label, each by its own name; the
+    // manifest has no filenames, and module bytes follow the guest in manifest order.
     const { host: h } = await makeHost();
     const testKey = "test";
     const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
       modules: [{ name: "codec" }],
-      // requires + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
+      // requires and config live inside `guest` (§12.4): only the guest has authority.
       guest: {
         requires: [],
       },
@@ -695,9 +683,8 @@ async function testBundle() {
     const tampered = env.slice(); tampered[tampered.length - 1] ^= 1;
     assert(verifyTestBundle(sodium, tampered) === null, "a tampered manifest fails verification");
 
-    // A manifest whose module names collide is ambiguous (the name keys the
-    // guest's module map), so it is refused even though it is
-    // validly signed (§12.4).
+    // A manifest whose module names collide is ambiguous (the name is the guest's key for
+    // the module), so it is refused even though it is validly signed (§12.4).
     const dupEnv = signTestBundle(sodium, author, {
       ...manifest,
       modules: [manifest.modules[0], { ...manifest.modules[0] }],
@@ -706,7 +693,7 @@ async function testBundle() {
     try { verifyTestBundle(sodium, dupEnv); } catch { dupRefused = true; }
     assert(dupRefused, "a manifest with duplicate module names is refused as malformed");
 
-    // booted shell, policy allows the author → bundle loads + module installs
+    // A shell whose policy allows the author installs the bundle and its module.
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
@@ -714,9 +701,9 @@ async function testBundle() {
     const loaded = await shell.installFile(bundlePath);
     assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
 
-    // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
-    // set to 1 by the load above. Re-running this label against the mark is an explicit
-    // replacement of the slot already standing, since a load only ever takes a free one.
+    // Freshness (§12.4): the version is a monotonic high-water mark per (author, app), set
+    // to 1 by the install above. Installing this label again needs `replaces`, since an
+    // install without it only takes a free label.
     const remanifest = (version) => writeBundle({ ...manifest, version });
     const reload = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: loaded.manifest.app });
     remanifest(1); await reload();                // equal version reinstalls (an ordinary reboot)
@@ -728,7 +715,7 @@ async function testBundle() {
     remanifest(2); await reload();                // the mark held at 2, so v2 still loads
     remanifest(1);                                // restore the original for the shell2 check below
 
-    // a shell whose policy does NOT allow the author refuses the bundle
+    // A shell whose policy does not allow the author refuses the bundle.
     shell2 = await boot({
       policyJson: JSON.stringify({ authors: [toHex(generateKeyPair().publicKey)] }),
       dir: pjoin(dir, "_data2"), identity,
@@ -744,12 +731,12 @@ async function testBundle() {
   console.log("  OK\n");
 }
 
-// ─── Test: every app is a guest (§12.4) + the verify/install split ────
+// ─── Test: every app is a guest (§12.4), and the verify/install split ────
 // A chat-style app is a guest plus its module; since requires live inside `guest`, an
-// empty list IS declaring zero authority. Covers the one app shape (guestSource
-// round-trips), a bundle blob round-tripping as one value, and `verifyBundle`
-// authenticating + integrity-checking WITHOUT a host or policy — the seam the browser
-// shell peeks a received Offer through before asking for consent.
+// empty list declares no authority. Covers the one app shape (guestSource round-trips),
+// a bundle blob round-tripping as one value, and `verifyBundle` authenticating and
+// checking integrity without a host or policy, which is how a browser shell inspects a
+// received Offer before asking for consent.
 async function testGuestBundle() {
   console.log("Test: every app is a guest — bundle blob + verify/install split");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -764,7 +751,7 @@ async function testGuestBundle() {
   try {
     const { host: h } = await makeHost();
     const demoKey = "demo";
-    // A manifest with NO `guest` field is refused: every app is a guest (§12.4).
+    // A manifest with no `guest` field is refused: every app is a guest (§12.4).
     let noGuest = "";
     try {
       verifyTestBundle(sodium, signTestBundle(sodium, author,
@@ -780,8 +767,8 @@ async function testGuestBundle() {
     const packed = signTestBundle(sodium, author, manifest, GUEST_BYTES, [forwarderBytes]);
     assert(bytesEqual(verifyBundle(sodium, packed).modules[0].wasm, forwarderBytes), "module bytes round-trip");
 
-    // The verify half on its own: no host, no policy, no freshness — the browser
-    // shell's peek path. It authenticates and yields every verified byte.
+    // Verification on its own, with no host, policy or freshness (a browser shell's
+    // inspection path). It authenticates and returns every verified byte.
     const v = verifyBundle(sodium, packed);
     assert(bytesEqual(v.author, author.id), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
@@ -803,10 +790,10 @@ async function testGuestBundle() {
 
 // ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
 //
-// The freshness high-water mark must record only versions that fully loaded. A newer
-// bundle whose manifest is intact and signed but whose module bytes are corrupt (a
-// half-landed upgrade) must fail the content check WITHOUT raising the mark, or reloading
-// the known-good older bundle is refused as a downgrade and rollback is bricked (§12.4).
+// The freshness mark must only record versions that fully installed. A newer bundle whose
+// manifest is intact and signed but whose module bytes are corrupt (a half-written
+// upgrade) must fail without raising the mark, or reinstalling the known-good older bundle
+// is refused as a downgrade and rollback is impossible (§12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
   const { mkdtempSync, rmSync, writeFileSync: wf, readFileSync: rf } = await import("node:fs");
@@ -839,21 +826,21 @@ async function testBundleCorruptNewerRollback() {
       dir: pjoin(dir, "_data"), identity,
     });
 
-    // 1. Good v4 loads and sets the mark to 4. Every step after it is an upgrade of THIS
-    //    slot, which is the shape a half-landed upgrade actually has.
+    // 1. Good v4 installs and sets the mark to 4. Every step after it is an upgrade of
+    //    this slot, as a real half-written upgrade would be.
     writeBundle(4);
     const v4 = await shell.installFile(bundlePath);
     const upgrade = () => shell.install(new Uint8Array(rf(bundlePath)), { replaces: v4.manifest.app });
 
-    // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
-    //    match the signed body. The load must throw on signature verification.
+    // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer match
+    //    the signed body. The install must fail signature verification.
     writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
     try { await upgrade(); } catch { v5Failed = true; }
     assert(v5Failed, "a corrupt v5 bundle fails to load");
 
-    // 3. Restore the good v4 bundle and reload. If the failed v5 load had advanced the
-    //    mark to 5, this would now be refused as a downgrade. It must still load.
+    // 3. Restore the good v4 bundle and reinstall. If the failed v5 install had advanced
+    //    the mark to 5, this would be refused as a downgrade. It must still install.
     writeBundle(4);
     let v4Reloaded = true;
     try { await upgrade(); } catch { v4Reloaded = false; }
@@ -865,13 +852,13 @@ async function testBundleCorruptNewerRollback() {
   console.log("  OK\n");
 }
 
-// ─── Test: writing off a compromised author key (§12.5) ─────────────────────────
+// ─── Test: revoking a compromised author key (§12.5) ─────────────────────────
 //
-// Freshness cannot answer "is this key still the author's?": a stolen key signs
-// `version + 1`, clears the high-water mark, and lands again whenever it likes.
-// `shell.revoke` is the remedy, and what is tested is that both of its halves
-// happen and that the refusal survives a reboot — an operator doing this by hand can
-// uninstall without closing the door, or close it with the code still running.
+// Freshness cannot tell whether a key still belongs to its author: a stolen key signs
+// `version + 1`, passes the high-water mark, and installs again whenever it likes.
+// `shell.revoke` is the remedy; this tests that it both uninstalls and refuses, and that
+// the refusal survives a reboot. An operator doing it by hand could uninstall without
+// blocking the key, or block it with the code still running.
 async function testAuthorRevocation() {
   console.log("Test: revoking an author key refuses its bundles and tears down what it landed");
   const { mkdtempSync, rmSync, writeFileSync: wf, readFileSync: rf } = await import("node:fs");
@@ -896,32 +883,31 @@ async function testAuthorRevocation() {
     shell = await boot({ policyJson, dir: dataDir, identity });
     const victimKey = "victim";
 
-    // 1. The author is trusted: v1 loads and binds.
+    // 1. The author is trusted: v1 installs.
     writeBundle(1);
     await shell.installFile(bundlePath);
 
-    // 2. The key is stolen. Freshness does NOT stop it — v2 is strictly newer, so it
-    //    upgrades the same name with nothing to say the hand on the key changed. This is
-    //    the gap, asserted rather than assumed.
+    // 2. The key is stolen. Freshness does not stop it: v2 is strictly newer, so it
+    //    upgrades the same label with nothing to show the key changed hands.
     writeBundle(2);
     await shell.install(new Uint8Array(rf(bundlePath)), { replaces: victimKey });
 
-    // 3. Write the key off. Both halves must happen in the one call.
+    // 3. Revoke the key. Both halves must happen in the one call.
     const gone = shell.revoke(authorHex);
     assert(gone.includes(victimKey), "revoke reports the app it tore down");
     assert(shell.uninstall(victimKey) === false, "revoke uninstalls the running slot");
 
-    // 4. The thief's next bundle is refused even though the version keeps climbing
-    //    and the author is still in the policy allowlist.
+    // 4. The thief's next bundle is refused even though the version keeps increasing and
+    //    the author is still in the policy allowlist.
     writeBundle(3);
     let refused = false;
     try { await shell.installFile(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a revoked key is refused despite a higher version");
     assert(shell.uninstall(victimKey) === false, "nothing landed on the refused load");
 
-    // 4b. The refusal must come BEFORE the admission predicate: an interactive shell puts
-    //     its consent dialog there (§12.4), and prompting a user to approve a bundle this
-    //     host has already decided to refuse is the wrong order to ask in.
+    // 4b. The refusal must come before the admission predicate: an interactive shell puts
+    //     its consent dialog there (§12.4), and a user should not be asked to approve a
+    //     bundle this host will refuse anyway.
     {
       const store = new FreshnessMarks();
       let admitCalls = 0;
@@ -936,17 +922,17 @@ async function testAuthorRevocation() {
       probe.close();
     }
 
-    // 5. The refusal is persisted, not process-local: a fresh boot over the same data
-    //    directory — same unedited policy file — still refuses. This is the half an
-    //    operator calling uninstall by hand does not get.
+    // 5. The refusal is persisted, not per process: a fresh boot over the same data
+    //    directory, with the same policy file, still refuses. A manual uninstall would not
+    //    give this.
     shell.close();
     shell = await boot({ policyJson, dir: dataDir, identity });
     let refusedAfterReboot = false;
     try { await shell.installFile(bundlePath); } catch { refusedAfterReboot = true; }
     assert(refusedAfterReboot, "the revocation survives a reboot with the policy untouched");
 
-    // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5) and
-    //    its own mark, so it is unaffected by the dead key's state.
+    // 6. Recovery is a new key, not an un-revoke: it has its own id (§5) and its own
+    //    marks, so it is unaffected by the revoked key's state.
     const heir = testAuthor();
     writeBundle(1, heir);
     shell.close();
@@ -962,12 +948,12 @@ async function testAuthorRevocation() {
   console.log("  OK\n");
 }
 
-// ─── Test: a pre-revocation store file is refused, not silently emptied ─────────
+// ─── Test: a store file without revocations is refused, not silently emptied ─────
 //
-// The store's shape is `{ marks, revoked }`, not the bare `{ "authorHex:app": version }`
-// map it once was. An old file parsed leniently would read as NO marks — every downgrade
-// guard silently dropped on the first boot after a host upgrade, with the next stale
-// bundle accepted and nothing saying why. It must fail loudly instead (§12.4).
+// The store's shape is `{ marks, revoked }`. A bare `{ "authorHex:app": version }` map
+// parsed leniently would read as no marks, silently dropping every downgrade guard and
+// accepting the next stale bundle with no explanation. It must fail loudly instead
+// (§12.4).
 async function testPreRevocationStoreIsRefused() {
   console.log("Test: a store file predating revocation is refused rather than read as empty");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
@@ -983,8 +969,8 @@ async function testPreRevocationStoreIsRefused() {
   assert(cur.get(new Uint8Array(32).fill(0xaa), "app") === 7, "the current format reads marks back");
   assert(cur.isRevoked(new Uint8Array(32).fill(0xbb)), "the current format reads revocations back");
 
-  // Only actual absence is first boot. Bytes that exist but cannot reconstruct both
-  // guard-bearing fields must fail closed.
+  // Only a missing file means first boot. A file that exists but lacks either field must
+  // fail closed.
   let absentThrew = false;
   try { new FreshnessMarks(null); } catch { absentThrew = true; }
   assert(!absentThrew, "an absent store starts empty on first boot");
@@ -1000,12 +986,12 @@ async function testPreRevocationStoreIsRefused() {
   console.log("  OK\n");
 }
 
-// ─── Test: a WRONG-TYPED store is refused, not silently emptied ──────────────
+// ─── Test: a wrong-typed store is refused, not silently emptied ──────────────
 //
-// The guard above catches only the old bare-map shape. The same silent discard — every
-// downgrade guard AND every revocation gone for one boot — is reachable through a
-// NEW-shaped file with wrong-typed fields (`{"marks":"garbage"}`) reading as "no marks,
-// nothing revoked". Guard data that exists but cannot be read is a corrupt store (§12.5).
+// The test above only catches the bare-map shape. The same silent loss (every downgrade
+// guard and every revocation gone for one boot) could come from a correctly shaped file
+// with wrong-typed fields (`{"marks":"garbage"}`) read as "no marks, nothing revoked".
+// Data that exists but cannot be read is a corrupt store (§12.5).
 async function testWrongTypedStoreIsRefused() {
   console.log("Test: a wrong-typed freshness store fails the boot loudly, never silently empty");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
@@ -1028,8 +1014,8 @@ async function testWrongTypedStoreIsRefused() {
     assert(threw, `${what} must throw as a corrupt store`);
   }
 
-  // The well-formed shapes still load — including a file carrying an unrecognized
-  // key (one a newer version added), which is ignored rather than refused.
+  // Well-formed files still load, including one with an unrecognized key (one a newer
+  // version added), which is ignored.
   const good = new FreshnessMarks(JSON.stringify({
     marks: { ["aa".repeat(32) + ":app"]: 2 }, revoked: ["bb".repeat(32)], futureKey: { anything: 1 },
   }));
@@ -1041,8 +1027,8 @@ async function testWrongTypedStoreIsRefused() {
   }));
   assert(odd.get(new Uint8Array(32).fill(0xcc), oddApp) === 3,
     "freshness accepts every app spelling the manifest accepts");
-  // A hand-edited file may spell an author in capitals. Accepted, so it must also guard:
-  // marks are looked up by lowercase hex, exactly as revocations are.
+  // A hand-edited file may write an author in capitals. It is accepted, so it must also
+  // protect: marks are looked up by lowercase hex, like revocations.
   const shouted = new FreshnessMarks(JSON.stringify({
     marks: { ["DD".repeat(32) + ":app"]: 4 }, revoked: ["EE".repeat(32)],
   }));
@@ -1085,22 +1071,22 @@ async function testWrongTypedStoreIsRefused() {
 
 // ─── Test: an app the runtime cannot serve is refused at load ────────────────
 //
-// `app` is the guest's signing scope, which caps at 255 UTF-8 bytes (guestSignScope's
-// one-byte length). Refused at load, or a longer name verifies, installs, and then fails
-// at first use — a bundle the host can admit but can never serve (§12.2, §12.4).
+// `app` is the guest's signing scope, limited to 255 UTF-8 bytes (guestSignScope's
+// one-byte length). Refused at install, or a longer name would verify and install, then
+// fail at first use (§12.2, §12.4).
 async function testAppNameLengthRefused() {
   console.log("Test: an over-long app name is refused at load, not at first use");
   const author = testAuthor();
   const mk = (app, extra = {}) => signTestBundle(sodium, author,
     { app, version: 1, modules: [], guest: GUEST(), ...extra });
 
-  // At the limit, everything works — 255 bytes is exactly what the scope can carry.
+  // At the limit everything works: 255 bytes is exactly what the scope can hold.
   assert(verifyTestBundle(sodium, mk("a".repeat(255))) !== null,
     "a 255-byte app name verifies");
 
   for (const [what, env] of [
     ["a 256-byte app name", mk("a".repeat(256))],
-    // The limit counts UTF-8 BYTES, the unit the scope uses.
+    // The limit counts UTF-8 bytes, the unit the scope uses.
     ["a 200-char (600-byte) UTF-8 app name", mk("\u{1f600}".repeat(200))],
   ]) {
     let threw = false;
@@ -1112,10 +1098,10 @@ async function testAppNameLengthRefused() {
 
 // ─── Test: a freshness persist failure fails the load and keeps nothing ──────
 //
-// A failed persist must be a failed load with nothing kept, and the mark rolled back so a
-// retry persists a fresh advance (§12.4). Otherwise a durable write that failed leaves the
-// modules on the table while the load reports failure, and the stale in-memory mark makes
-// the retry a no-op against a store that still lacks it.
+// A failed persist must be a failed install with nothing kept, and the mark rolled back
+// so a retry persists it again (§12.4). Otherwise the modules would stay installed while
+// the install reports failure, and the stale in-memory mark would make the retry a no-op
+// against a store that still lacks it.
 async function testPersistFailureRollsBack() {
   console.log("Test: a failed freshness persist fails the load — nothing is kept, the mark is rolled back");
   const { ModuleTable } = await imp("build/host/module-table.js");
@@ -1129,9 +1115,8 @@ async function testPersistFailureRollsBack() {
   });
   const key = "persist";
 
-  // Driven through the shell, since the shell is what advances the mark — last, after the
-  // guest stands, so the write it rolls back is one that was about to record a version
-  // that really ran.
+  // Tested through the shell, since the shell advances the mark, last, after the guest
+  // starts, so the write it rolls back would have recorded a version that really ran.
   const host = testHost(new ModuleTable());
   const shellOver = (freshnessStore) => bootTestShell({
     modules: host, freshnessStore,
@@ -1149,8 +1134,8 @@ async function testPersistFailureRollsBack() {
   assert(brokenShell.uninstall(key) === false, "nothing was kept — no slot was committed");
   assertEqual(broken.get(author.id, "persist"), -Infinity, "the in-memory mark was rolled back");
 
-  // A retry against a healthy store completes cleanly: the rollback is what makes
-  // it persist a FRESH advance rather than no-op'ing against the stale mark.
+  // A retry against a healthy store succeeds: the rollback makes it persist the advance
+  // again instead of doing nothing against the stale mark.
   const healthy = new FreshnessMarks();
   const healthyShell = await shellOver(healthy);
   await healthyShell.install(blob);
@@ -1161,13 +1146,13 @@ async function testPersistFailureRollsBack() {
 
 // ─── Test: a candidate realm cannot act before its installation commits ─────
 //
-// Guest source is evaluated before the freshness mark and claim table land so it can
-// register its entrypoints, and the realm factory runs it SYNCHRONOUSLY inside the seam —
-// so anything it reaches for has already landed by the time the commit window decides. The
-// seam therefore refuses the WHOLE vocabulary in that window, reads and the bundle's own
-// modules included: a rejected upgrade must leave the installed version's keyspace, its
-// neighbours, and the links of whatever it was replacing untouched. A guest initializes
-// from its preamble, which is why the candidate's `LOCAL` is still asserted complete here.
+// Guest source is evaluated before the freshness mark and claims are committed, so it can
+// define its entrypoint, and the realm factory runs it synchronously inside the seam, so
+// anything it did would already have happened by the time the commit is decided. The seam
+// therefore refuses every name in that window, reads and the bundle's own modules
+// included: a rejected upgrade must leave the installed version's keyspace, its neighbours
+// and the links of whatever it was replacing untouched. A guest initializes from its
+// preamble, which is why the candidate's `LOCAL` is still checked complete here.
 async function testCandidateRealmCannotActBeforeCommit() {
   console.log("Test: a candidate realm cannot act before its installation commits");
   const { admitAll } = await imp("build/host/policy.js");
@@ -1180,11 +1165,10 @@ async function testCandidateRealmCannotActBeforeCommit() {
     modules: [{ name: "fwd", wasm: forwarderBytes }],
     guestSource: GUEST_TEXT, guestRequires: ["fs", "link", "_svc"],
   });
-  // The neighbour a candidate must not reach: a REAL second bundle declaring `_svc`
-  // under `services` (a co-resident guest's to reach, never a peer's), installed under
-  // its own slot rather than stood in for by a host closure — dispatch has only ever had
-  // one owner kind. Its own realm is a plain counting stub; what is under test is
-  // whether the OFFSIDE candidate can reach it, not what it does once reached.
+  // The neighbour a candidate must not reach: a real second bundle claiming `_svc` under
+  // `services` (reachable by a co-resident guest, never a peer), installed in its own
+  // slot. Its realm is a counting stub, since this tests whether the uncommitted candidate
+  // can reach it, not what it does.
   const { blob: neighborBlob } = authorBundle(sodium, author, {
     app: "svc-neighbor", version: 1, services: ["_svc"],
     modules: [], guestSource: GUEST_TEXT, guestRequires: [],
@@ -1192,23 +1176,22 @@ async function testCandidateRealmCannotActBeforeCommit() {
   const flaky = { fail: false };
   const store = new FreshnessMarks(null, () => { if (flaky.fail) throw new Error("disk full"); });
   const candidates = [];
-  // Set only while `neighborBlob` is the one loading, so the ONE factory both bundles
-  // share can tell which realm it is being asked to stand: the neighbour gets a stub that
-  // only counts entries, and everything else — including every offside attempt — gets the
-  // offside probing below, pushed into `candidates` in load order.
+  // Set only while `neighborBlob` is installing, so the factory both bundles share can
+  // tell which realm it is creating: the neighbour gets a stub that counts entries, and
+  // everything else, including every candidate, gets the probing below, pushed into
+  // `candidates` in install order.
   let loadingNeighbor = false;
-  // A REAL socket-less driver (the browser-edge shape) running a fixture transport: a
-  // `link` candidate is authorized only as the replacement of the current link owner, so
-  // without one this candidate never reaches the seam under test.
+  // A real socket-less driver (as in a browser) running a fixture transport: a `link`
+  // candidate is only allowed as the replacement of the current link owner, so without
+  // one this candidate would never reach the seam under test.
   const shell = await bootTestShell({
     fs, freshnessStore: store, transportAuthor: author,
     createRealm: async ({ hostCall, source }) => {
       if (loadingNeighbor) {
         return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
       }
-      // One per kind the old irreversibility list sorted into open and closed: a durable
-      // write, a cross-realm call, a link op, a pure read, a crypto transform, and this
-      // bundle's own module. All six are one kind now.
+      // One of each kind of name: a durable write, a cross-realm call, a link op, a pure
+      // read, a crypto transform, and this bundle's own module. All six are refused.
       const refused = [];
       for (const [name, payload] of [
         ["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)],
@@ -1231,10 +1214,10 @@ async function testCandidateRealmCannotActBeforeCommit() {
   });
   const key = "offside";
   try {
-    // The neighbour goes in FIRST, so `_svc` is a claim held by a standing realm before the
-    // candidate ever reaches for it: the refusal below is then the offside gate's, and not
-    // the absence of a claimant. The store starts healthy, because the boot transport's
-    // mark and the neighbour's own have to persist, and fails from here on.
+    // The neighbour installs first, so `_svc` is claimed by a running realm before the
+    // candidate tries it, and the refusal below comes from the commit gate, not from a
+    // missing claimant. The store starts healthy, because the boot transport's mark and the
+    // neighbour's have to persist, and fails from here on.
     loadingNeighbor = true;
     await shell.install(neighborBlob);
     loadingNeighbor = false;
@@ -1278,9 +1261,9 @@ async function testCandidateRealmCannotActBeforeCommit() {
 
 // ─── Test: a failed revocation persist is a failed revocation ───────────────
 //
-// The same rule as the mark, one method over. A write that throws must not leave the key
-// revoked only in memory: that reads as safe for the rest of this boot while making the
-// retry a silent no-op, and the next boot admits the author regardless (§12.5).
+// The same rule as for the mark. A write that throws must not leave the key revoked only
+// in memory: that looks safe for the rest of this boot while making the retry a silent
+// no-op, and the next boot accepts the author anyway (§12.5).
 async function testFailedRevokePersistRollsBack() {
   console.log("Test: a revocation that cannot be persisted is refused, not held in memory");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
@@ -1298,8 +1281,8 @@ async function testFailedRevokePersistRollsBack() {
   assert(msg.includes("disk full"), "the original persist error survives the wrap");
   assert(!store.isRevoked(author), "the key is not left revoked in memory only");
 
-  // The retry is the point of the rollback: without it the early return would see
-  // the key already revoked and never write.
+  // The retry is why the rollback matters: without it the early return would see the key
+  // already revoked and never write.
   broken = false;
   store.revoke(author);
   assert(store.isRevoked(author), "the retry revokes");
@@ -1310,10 +1293,9 @@ async function testFailedRevokePersistRollsBack() {
 
 // ─── Test: an in-place upgrade releases the version it replaces ──────────────
 //
-// An upgrade is a teardown of what it displaces, by the same rule as uninstall (§12.4).
-// Leaving the outgoing slot whole would keep its realm undisposed and its deadlines armed,
-// and since a timer's callback reads the slot's realm, the superseded guest would go on
-// running `timer` turns — re-arming more, and holding ~1.2 MB of engine per upgrade.
+// An upgrade tears down what it replaces, like uninstall (§12.4). Leaving the old slot in
+// place would keep its realm alive and its wakes armed, so the replaced guest would keep
+// running wake turns, re-arming more and holding ~1.2 MB of engine per upgrade.
 async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("Test: an in-place upgrade disposes the realm and deadlines it replaces");
   const { admitAll } = await imp("build/host/policy.js");
@@ -1328,10 +1310,9 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   }).blob;
 
   // Each realm records what it was asked to run and whether it was released, and arms a
-  // 200 ms deadline on construction — the guest's half, since a deadline exists only
-  // because a guest asked for one and re-enters THAT guest's realm. 200 rather than 5
-  // because the upgrade loads the replacing bundle's modules in workers, and a deadline
-  // firing inside that window is a legitimate turn of the guest that armed it.
+  // 200 ms wake on its first entry, as a guest would, since a wake re-enters the guest that
+  // armed it. 200 instead of 5 because the upgrade loads the new bundle's modules in
+  // workers, and a wake firing during that is a valid turn of the guest that armed it.
   const realms = [];
   let failNextRealm = false;
   const arm = (ms) => {
@@ -1342,9 +1323,9 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-      // Armed on this realm's FIRST entry, not from `createRealm`: a candidate's seam
-      // refuses everything until its installation commits (§3.1), which is the same
-      // reason a real guest defers its setup to its first invocation.
+      // Armed on this realm's first entry, not in `createRealm`: a candidate's seam
+      // refuses everything until its install commits (§3.1), which is also why a real
+      // guest defers its setup to its first invocation.
       const r = { calls: [], disposed: false, call: async (p) => {
         r.calls.push(isWake(p) ? "timer" : "invoke");
         if (!r.armed) { r.armed = true; await withTestBudget(o.hostCall)("timer/arm", arm(200)); }
@@ -1376,8 +1357,8 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
     assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
     assert(!realms[1].disposed, "…which is the one left standing");
 
-    // Past the 200ms deadline both realms armed. Only the standing one may hear it: a
-    // `timer` turn in realms[0] is the superseded guest still executing.
+    // Past the 200ms wake both realms armed. Only the current one may receive it: a wake
+    // in realms[0] would mean the replaced guest is still running.
     await new Promise((r) => setTimeout(r, 350));
     assert(!realms[0].calls.includes("timer"),
       `the replaced guest ran no timer turn after the upgrade (ran: ${realms[0].calls.join(",")})`);
@@ -1390,13 +1371,13 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
 // ─── Test: generated guest op-frame source is the canonical implementation ─────
 //
-// services/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
-// functions for import-free guests; the transport assembler injects the same fragment.
-// Exercise the emitted program at every boundary so serialization cannot change behavior.
+// services/op-frame.ts defines the functions. `guestOpFraming` serializes the compiled
+// functions for import-free guests, and the transport build injects the same fragment.
+// Run the emitted program at every boundary so serialization cannot change behavior.
 function testGeneratedOpFrame() {
   console.log("Test: generated guest op-frame source preserves the canonical implementation");
-  // Every caller inlines this fragment into a guest it then SIGNS, so the bytes must not
-  // depend on the machine that compiled op-frame.ts. Line endings are the part that does.
+  // Every caller inlines this fragment into a guest it then signs, so the bytes must not
+  // depend on the machine that compiled op-frame.ts, which line endings otherwise would.
   assert(!guestOpFraming().includes("\r"), "the emitted op-frame source is LF-only, so a signed guest is the same bytes anywhere");
   const host = { callerOf, readOp, writeOp };
   const guest = new Function(`"use strict";${guestOpFraming()}
@@ -1407,13 +1388,13 @@ function testGeneratedOpFrame() {
   const agree = (label, fn, ...args) =>
     assert(out(guest, fn, args) === out(host, fn, args), `${label}: generated source and host disagree`);
 
-  // A caller id differing from the host's all-zero one in its LAST byte: a prefix test
-  // would call this the host.
+  // A caller id differing from the host's all-zero one only in its last byte: a prefix
+  // test would call this the host.
   const peer = new Uint8Array(32); peer[31] = 1;
   agree("a host loopback", "callerOf", concatBytes([new Uint8Array(32), enc.encode("hi")]));
   agree("a caller differing only in its last byte", "callerOf", concatBytes([peer, new Uint8Array(0)]));
   agree("a well-formed op", "readOp", Uint8Array.from([2, 0x68, 0x69, 9]));
-  // Declared length equal to the bytes left after it — what separates `len < 1 + n`
+  // Declared length one past the bytes that follow it, which separates `len < 1 + n`
   // from `len < n`.
   agree("a length one byte past the end", "readOp", Uint8Array.from([2, 0x61]));
   agree("an ordinary op", "writeOp", "put", Uint8Array.from([1, 2, 3]));
@@ -1427,9 +1408,9 @@ function testGeneratedOpFrame() {
 
 // ─── Test: the commit window re-asks the host's gates (§12.4, §12.5) ────────────
 //
-// Module construction, the guest's top level and a consent dialog all run between admission
-// and the commit, and the mark, the revocation set and the installed identities all move in
-// that window.
+// Module construction, the guest's top level and a consent dialog all run between
+// admission and commit, and the mark, the revocation set and the installed slots can all
+// change in that time.
 async function testCommitRevalidatesHostGates() {
   console.log("Test: a candidate is re-checked against freshness and revocation at commit");
 
@@ -1439,17 +1420,16 @@ async function testCommitRevalidatesHostGates() {
     app: "racer", version, modules: [],
     guestSource: `${GUEST_TEXT}//v${version}`, guestRequires: [],
   }).blob;
-  // Which version is standing, read off the guest source — the only thing that tells the two
-  // candidates apart from inside the shell.
+  // Which version is installed, read from the guest source, the only thing that tells the
+  // two candidates apart from inside the shell.
   const createRealm = async ({ source }) => ({
     call: async () => Uint8Array.of(Number(/\/\/v(\d+)$/.exec(source)[1])),
     dispose() { },
   });
 
-  // Two loads of one identity, overlapping. Installing is not replacing, so the one that
-  // arrives second is refused by name rather than quietly taking the slot the first is
-  // already running in — the case freshness cannot catch, since it refuses only a LOWER
-  // version and these are the same one.
+  // Two overlapping installs of the same label. Installing is not replacing, so the second
+  // is refused instead of quietly taking the slot the first is already running in.
+  // Freshness cannot catch this, since it only refuses a lower version and these are equal.
   {
     let release, held = null;
     const shell = await bootTestShell({
@@ -1471,10 +1451,10 @@ async function testCommitRevalidatesHostGates() {
     } finally { shell.close(); }
   }
 
-  // A v1 held in admission while v2 lands and is then uninstalled: fresh when admitted, a
-  // downgrade by commit. The uninstall is what lets v1 reach its own commit window at all,
-  // since a load never takes an identity another slot still holds — and it is the shape
-  // the case really has, an operator clearing an app out while a consent dialog is open.
+  // A v1 held in admission while v2 installs and is then uninstalled: fresh when admitted,
+  // a downgrade by commit. The uninstall lets v1 reach its commit at all, since an install
+  // never takes a label another slot holds; in practice, an operator removing an app while
+  // a consent dialog is open.
   {
     const store = new FreshnessMarks();
     let release;
@@ -1497,8 +1477,8 @@ async function testCommitRevalidatesHostGates() {
     } finally { shell.close(); }
   }
 
-  // An author written off while its own load waits on the predicate. `revoke` tears down what
-  // is installed, and a candidate is not — so the load has to refuse itself.
+  // An author revoked while its own install waits on the predicate. `revoke` tears down
+  // what is installed, and a candidate is not, so the install has to refuse itself.
   {
     let release;
     const held = new Promise((r) => { release = r; });

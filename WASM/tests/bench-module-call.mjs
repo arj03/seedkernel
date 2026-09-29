@@ -1,8 +1,8 @@
-// bench-module-call.mjs — the §4.3 module-call path, measured the way the native target's
-// bound is: same workload, with and without the interrupt mechanism, as a ratio. Native
-// cost (SECURITY §14.1) is MULTIPLICATIVE (a termination check per loop: 2.8x RS encode,
-// 4.8x decode, 2.6x XChaCha20, 1.65x Ed25519); the JS worker model is ADDITIVE — one
-// fixed isolate round-trip per call, quantified here on ws.wasm. Run after `npm run build`.
+// The §4.3 module-call path, measured like the native target's bound: the same workload
+// with and without the interrupt mechanism, as a ratio. The native cost (§14.1) is
+// multiplicative (a termination check per loop: 2.8x RS encode, 4.8x decode, 2.6x
+// XChaCha20, 1.65x Ed25519); the JS worker model's is additive, one fixed isolate round
+// trip per call, measured here on ws.wasm. Run after `npm run build`.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -70,8 +70,8 @@ for (const [name, payloadLen, iters] of [
   console.log(`${name.padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
 }
 
-// Decode-one of a ~64 KiB frame — the inbound record path. A real masked frame, built
-// by hand: [FIN|opcode 0x82][mask|len7 0xfe][u16 BE length][mask 4][payload …].
+// Decode-one of a ~64 KiB frame, the inbound record path. A real masked frame, built by
+// hand: [FIN|opcode 0x82][mask|len7 0xfe][u16 BE length][mask 4][payload ...].
 {
   const payloadLen = 65535;
   const frame = new Uint8Array(8 + payloadLen);
@@ -86,8 +86,8 @@ for (const [name, payloadLen, iters] of [
   console.log(`${"decode 64 KiB frame".padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
 }
 
-// The one-time cost: stand a worker up (spawn + compile + instantiate), paid at bind
-// and once more per kill-and-respawn (§4.3).
+// The one-time cost of starting a worker (spawn, compile, instantiate), paid at install
+// and again per kill and respawn (§4.3).
 {
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < 10; i++) {

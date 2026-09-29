@@ -29,8 +29,8 @@ writeFileSync(resolve(outDir, "libsodium.wasm"), wasm);
 const patchedCore = core.slice(0, b64Start) + '""' + core.slice(b64End + 1);
 writeFileSync(resolve(outDir, "libsodium-core.mjs"), patchedCore);
 
-// Patch the wrapper: import our stripped core, and inject an instantiateWasm that fetches
-// the .wasm — the wrappers invoke the core as `a({getRandomValue:function(){…}})`.
+// Patch the wrapper: import the stripped core, and inject an instantiateWasm that fetches
+// the .wasm (the wrappers call the core as `a({getRandomValue:function(){...}})`).
 const wrap = readFileSync(wrapSrc, "utf8");
 const wrapPatched = wrap
   .replace('import e from"libsodium"', 'import e from"./libsodium-core.mjs"')

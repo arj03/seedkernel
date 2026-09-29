@@ -1,8 +1,8 @@
-// The ws.wasm module's RFC 6455 conformance, plus destination parsing. The framing STATE
-// MACHINE (residual buffer, two-stage cap, fragment reassembly) is the transport guest's
-// (transport/src/framing.js `WsFramer`), covered end to end by transport-tcp.test.mjs; what
-// is tested here is the module those framers call — one frame in, one decoded frame out,
-// and the refusals it owes its callers.
+// The ws.wasm module's RFC 6455 conformance, plus destination parsing. The framing state
+// machine (leftover buffer, two-stage cap, fragment reassembly) lives in the transport
+// guest (transport/src/framing.js `WsFramer`) and is covered by transport-tcp.test.mjs and
+// ws-framing.test.mjs; this tests the module those framers call: one frame in, one decoded
+// frame out, and the refusals it must make.
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
 import { MAX_LINK_READ_BYTES } from "../build/services/net-limits.js";
@@ -65,8 +65,8 @@ test("each length encoding decodes to the length it declares", () => {
 });
 
 test("the mask direction is enforced in BOTH directions", () => {
-  // The RFC is not asymmetric by accident: an unmasked client frame is the one an
-  // off-path attacker can smuggle through a cache, which is what masking exists to stop.
+  // The asymmetry is deliberate in the RFC: masking client frames stops an off-path
+  // attacker from smuggling content through a cache.
   assert(decodeOne(encodeFrame(WS_OP.BINARY, body(8), null), true) === null,
     "a server must refuse an UNmasked client frame");
   assert(decodeOne(encodeFrame(WS_OP.BINARY, body(8), MASK), false) === null,
@@ -75,7 +75,7 @@ test("the mask direction is enforced in BOTH directions", () => {
 
 test("a fragmented control frame is refused (RFC 6455 §5.5)", () => {
   const f = encodeFrame(WS_OP.PING, body(4), null);
-  f[0] &= 0x7f; // clear FIN — a control frame may never be fragmented
+  f[0] &= 0x7f; // clear FIN; a control frame may never be fragmented
   assert(decodeOne(f, false) === null, "a FIN-less control frame must be a protocol error");
 });
 
@@ -84,14 +84,14 @@ test("a truncated frame decodes to nothing rather than reading past its end", ()
   assert(decodeOne(f.subarray(0, f.length - 10), false) === null, "short frame");
 });
 
-// The cross-artifact couplings in the frame path, checked rather than documented. The
-// transport's `MAX_FRAME_BYTES` (scripts/transport-config.mjs) is a floor under the module's
-// compiled scratch, and raising the cap past it fails nothing at build time — TCP keeps
-// carrying the frame while WS tears the link down on the first big one. Red here, naming
-// the rebuild. It must also fit the host's read cap, or a platform-framed link (a browser
-// WebSocket, a data channel) is failed by the driver on its first full-size frame.
+// The cross-artifact limits in the frame path, checked here. The transport's
+// `MAX_FRAME_BYTES` (scripts/transport-config.mjs) must fit the module's compiled scratch,
+// and raising it past that fails nothing at build time: TCP keeps carrying the frame
+// while WS tears the link down on the first big one. It must also fit the host's read
+// cap, or the driver fails a platform-framed link (a browser WebSocket, a data channel) on
+// its first full-size frame.
 test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () => {
-  // The encoder's own ceiling: header (10) + mask (4) ≤ the 16 bytes abi.ts holds back.
+  // The encoder's own ceiling: header (10) + mask (4) <= the 16 bytes abi.ts reserves.
   assert(MAX_FRAME_BYTES + 16 <= SCRATCH_SIZE,
     `MAX_FRAME_BYTES ${MAX_FRAME_BYTES} needs ${MAX_FRAME_BYTES + 16} B of scratch, `
     + `ws.wasm allocates ${SCRATCH_SIZE} — raise SCRATCH_SIZE in assembly/ws/abi.ts and `
@@ -104,14 +104,14 @@ test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () =
 });
 
 // ── destinations ─────────────────────────────────────────────────────────────
-// The string `link/open` carries is the only thing a socket factory reads, so a scheme and
-// a path have to survive the one parser the socket edges share (services/peer-addr.ts).
-// How a PEER is spelled is the transport's grammar, tested with its config (transport-link).
+// The string `link/open` carries is all a socket factory reads, so a scheme and a path
+// have to survive the shared parser (services/peer-addr.ts). How a peer address is
+// written is the transport's grammar, tested with its config (transport-link).
 
 test("destinations: a scheme and a path survive whole, and neither disturbs the port", () => {
-  // `wss://` is how a deployment asks for TLS, and a path is how it is reached behind a
-  // reverse proxy. The port still parses out of the middle of both — a naive last-colon
-  // split would read `8080/chat` as the port.
+  // `wss://` asks for TLS, and a path reaches a node behind a reverse proxy. The port
+  // still parses out of the middle of both; a naive last-colon split would read
+  // `8080/chat` as the port.
   const bare = parseDest("ws://example.com:8080");
   assert(bare.scheme === "ws" && bare.host === "example.com" && bare.port === 8080 && bare.path === undefined,
     `a bare host:port must carry no path, got ${JSON.stringify(bare)}`);

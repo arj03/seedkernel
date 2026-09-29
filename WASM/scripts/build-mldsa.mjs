@@ -1,7 +1,7 @@
-// Builds browser/mldsa65.wasm — the ML-DSA-65 verifier for manifest suite 0x02
-// (§12.4, §14.1) — from the pinned mldsa-native submodule; see build-pq-wasm.mjs for the
-// shared flag set. ONE artifact for all three targets, so the accept/reject boundary
-// cannot drift between a node that admits a bundle and one that refuses it.
+// Builds browser/mldsa65.wasm, the ML-DSA-65 verifier for the hybrid manifest suite
+// (§12.4, §14.1), from the pinned mldsa-native submodule; see build-pq-wasm.mjs for the
+// shared flags. One artifact for all three targets, so nodes cannot disagree on which
+// bundles verify.
 import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({

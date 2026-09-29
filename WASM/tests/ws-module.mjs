@@ -1,9 +1,8 @@
-// Test-only driver for ws.wasm's 4-op ABI (assembly/ws/index.ts). RFC 6455 framing is
-// content, so the codec runs in the transport bundle's guest over this module, reached by
-// its bare name; its conformance is worth testing directly — a bad mask direction or a
-// fragmented control frame is far easier to provoke here than over a socket. This is the
-// whole driver, and it is the §4 module ABI the host drives identically in production:
-// stage a request at `scratch`, call handle(len), read the response back.
+// Test-only driver for ws.wasm's 4-op ABI (assembly/ws/index.ts). RFC 6455 framing ships
+// in the transport bundle, whose guest calls this module by name; testing it directly
+// makes a bad mask direction or a fragmented control frame far easier to provoke than
+// over a socket. It uses the same §4 module ABI the host does: write a request at
+// `scratch`, call handle(len), read the response back.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -20,8 +19,7 @@ const inst = new WebAssembly.Instance(new WebAssembly.Module(wasm), {
 const exp = inst.exports;
 const scratch = exp.scratch.value;
 
-/** The module's declared scratch — read from the export rather than restated, since
- *  that export is exactly what tells the host how much it may stage. */
+/** The module's declared scratch size, read from the same export the host reads. */
 export const SCRATCH_SIZE = exp.scratchSize.value;
 
 function call(req) {
@@ -32,7 +30,7 @@ function call(req) {
   return new Uint8Array(exp.memory.buffer, scratch, len).slice();
 }
 
-/** base64(sha1(key ‖ GUID)) — the server's answer to Sec-WebSocket-Key. */
+/** base64(sha1(key ‖ GUID)): the server's answer to Sec-WebSocket-Key. */
 export function wsAcceptKey(key) {
   const k = new TextEncoder().encode(key);
   const req = new Uint8Array(1 + k.length);

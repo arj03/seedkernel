@@ -1,13 +1,11 @@
-// Node CLI entry for the seedkernel-shell: the shared operator flow (`cli.ts`) bound to
-// the Node platform. Kept separate from shell-node.ts so that stays a pure library module with
-// no argv-sniffing auto-run guard.
+// Node CLI entry: the shared operator flow (`cli.ts`) bound to the Node platform. Kept
+// apart from shell-node.ts so that one stays a library module with no auto-run guard.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64]
 //
-// Everything below is platform: files, stdout, entropy, and "stand a node up on Node".
-// Which flags exist and what the node does with them is `cli.ts`, the same module the
-// native binary runs inside QuickJS.
+// This file supplies only the platform: files, stdio, crypto, and booting a node on
+// Node. Flags and what they do live in `cli.ts`, which the native binary also runs.
 import { readFileSync } from "node:fs";
 import { runCli, type CliHost } from "./cli.js";
 import { bootNodeShell, nodeFiles } from "./shell-node.js";
@@ -20,19 +18,18 @@ async function nodeHost(): Promise<CliHost> {
     ...nodeFiles,
     banner: "seedkernel-shell",
     argv: process.argv.slice(2),
-    // STDERR, not stdout: stdout carries an app's raw `--op` response bytes, which an
-    // operator line landing in it would corrupt.
+    // stderr, because stdout carries an app's raw `--op` response bytes.
     log(line) { console.error(line); },
     stdout(bytes) { process.stdout.write(bytes); },
-    // Whatever was piped in, or empty. Reading fd 0 throws rather than blocking when stdin
-    // is a terminal nobody redirected, which is the same answer: no argument.
+    // Whatever was piped in, or empty. Reading fd 0 throws instead of blocking when stdin
+    // is an unredirected terminal, which also means no argument.
     stdin() {
       try { return new Uint8Array(readFileSync(0)); }
       catch { return new Uint8Array(0); }
     },
     sodium,
-    // bootNodeShell takes the operator flow's NodeSetup itself, so the config crosses
-    // unchanged — a new field reaches this platform by existing, not by being remembered.
+    // bootNodeShell takes NodeSetup directly, so new config fields pass through
+    // without changes here.
     standUp: bootNodeShell,
   };
 }

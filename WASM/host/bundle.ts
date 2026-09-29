@@ -13,8 +13,8 @@ export interface BundleModule {
  *  modules carry no authority and read no config. */
 export interface BundleGuest {
   /** Everything this guest reaches outside itself: host services and local service ids of
-   *  co-resident guests (§12.10). The unit declared is the service, never a method
-   *  (`fs/get`); this list is the whole reach an operator reads. */
+   *  co-resident guests (§12.10). Declares services, never methods (`fs/get`); this list
+   *  is the guest's whole reach as an operator sees it. */
   requires: string[];
   /** The app's signed configuration, injected as `const APP`. Must be an object, so a
    *  mistake fails the load rather than leaving every `APP.x` undefined (§12.4). */
@@ -32,21 +32,21 @@ export interface BundleManifest {
    *  (§12.10). May overlap `protocols`: a name in both is reachable by both audiences. */
   services?: string[];
   modules: BundleModule[];
-  /** The guest program — required. Modules are the pure transforms it drives. */
+  /** The guest program (required). Modules are the pure transforms it drives. */
   guest: BundleGuest;
 }
 
 /** The libsodium subset verifying a manifest needs; install is handed no way to sign. */
 export interface ManifestVerifier {
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
-  /** The genesis hash — content integrity, and the author id (`hybridAuthorId`). */
+  /** The genesis hash: content integrity, and the author id (`hybridAuthorId`). */
   crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
   /** ML-DSA-65 verify (FIPS 204), the PQ half of the hybrid suite (§14.1). Required:
    *  there is no Ed25519-only fallback. */
   ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
 }
 
-/** The public half of the key set that signed a manifest — both keys, always. */
+/** The public keys that signed a manifest; always both. */
 export interface ManifestAuthorKeys {
   ed: Uint8Array;
   mlDsa: Uint8Array;
@@ -60,14 +60,14 @@ export interface FreshnessStore {
   /** Advance the mark (never rewinds). Throws, leaving the mark unchanged, if the write
    *  does not land. */
   set(author: Uint8Array, app: string, version: number): void;
-  /** Has this author key been written off (§12.5)? Checked on every load. */
+  /** Has this author key been revoked (§12.5)? Checked on every load. */
   isRevoked(author: Uint8Array): boolean;
-  /** Write off an author key permanently, even if it reappears in the allowlist. */
+  /** Revoke an author key permanently, even if it is still in the allowlist. */
   revoke(author: Uint8Array): void;
 }
 
 /** One module invocation's answer: its bytes (null on failure) and `ms`, the module's own
- *  processing time, which is what the caller is billed (§12.3). */
+ *  processing time, which the caller is billed (§12.3). */
 export interface ModuleResult {
   bytes: Uint8Array | null;
   ms: number;
@@ -79,8 +79,8 @@ export interface PureModules {
   dispose(): void;
 }
 
-/** Build all of a bundle's pure modules or none — worker-backed on JS, a Go-owned slot
- *  natively. */
+/** Build all of a bundle's pure modules or none: worker-backed on JS, a Go-owned slot on
+ *  the native target. */
 export interface PureModuleLoader {
   build(mods: { name: string; wasm: Uint8Array }[]): PureModules | Promise<PureModules>;
 }
@@ -123,20 +123,19 @@ export function appScopeFor(crypto: ManifestVerifier, app: string): string {
 const SUITE_LEN = 1;
 const PK_LEN = 32;
 const SIG_LEN = 64;
-// ML-DSA-65 widths, duplicated from pq.ts on purpose: these are the envelope's frozen field
-// widths, parseable by a host with no PQ implementation.
+// ML-DSA-65 widths, duplicated from pq.ts so a host with no PQ implementation can still
+// parse the envelope.
 const ML_DSA_PK_LEN = 1952;
 const ML_DSA_SIG_LEN = 3309;
-// Keys, then signatures, each one contiguous run, so a later suite extends rather than
-// interleaves.
+// All keys, then all signatures, so a later suite can extend each run.
 const OFF_ED_PK = SUITE_LEN;
 const OFF_ML_PK = OFF_ED_PK + PK_LEN;
 const OFF_ED_SIG = OFF_ML_PK + ML_DSA_PK_LEN;
 const OFF_ML_SIG = OFF_ED_SIG + SIG_LEN;
 const OFF_BODY = OFF_ML_SIG + ML_DSA_SIG_LEN;
 
-/** Module names: no `/`, which every host name carries, so none collides with a host
- *  method. Collisions with local service ids are `validateManifest`'s. */
+/** Module names: no `/`, so none collides with a host method. `validateManifest` checks
+ *  collisions with local service ids. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /** The claim charset (§12.10) for `protocols`, `services` and local ids in
@@ -186,8 +185,8 @@ export function isJsonObject(value: unknown): value is JsonObject {
   return isJsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Shape check on a verified manifest: turns an author's mistake into a loud rejection
- *  rather than a TypeError deep in install. Not a security boundary. */
+/** Shape check on a verified manifest, so an author's mistake is rejected up front
+ *  instead of surfacing as a TypeError deep in install. Not a security boundary. */
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
   const o = m as Record<string, unknown>;
@@ -223,12 +222,12 @@ function isValidManifest(m: unknown): m is BundleManifest {
 }
 
 /** Shape and vocabulary checks shared by `verifyBundle` and `authorBundle`, so an author
- *  refuses to sign exactly what a verifier refuses. Grants are policy (§12.5). */
+ *  refuses to sign exactly what a verifier refuses. */
 export function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
   if (!isValidManifest(manifest)) throw new Error("bundle: malformed manifest");
-  // A local id may not live in a host namespace or spell one of this bundle's modules, so
-  // one `host.call` name means one thing. Whether anything claims it is answered at the
-  // call, since the service may be installed later.
+  // A local id may not sit in a host namespace or match one of this bundle's modules, so
+  // each `host.call` name means one thing. Whether anything claims it is checked at call
+  // time, since the service may be installed later.
   const moduleNames = new Set(manifest.modules.map((m) => m.name));
   for (const r of manifest.guest.requires) {
     if (isService(r)) continue;
@@ -251,8 +250,8 @@ export function validateManifest(manifest: unknown): asserts manifest is BundleM
  *  JSON, guest UTF-8, then one WASM per manifest module. Returned bytes own their storage. */
 export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): VerifiedBundle {
   if (env.length < SUITE_LEN) throw new Error("bundle: signature invalid");
-  // Suite first: other suites have other widths. An unknown suite says so rather than
-  // reporting a bad signature; the byte is public (§14.1).
+  // Suite first, since other suites have other widths. An unknown suite is reported as
+  // such, not as a bad signature; the byte is public (§14.1).
   const suite = env[0];
   if (suite !== SUITE_MANIFEST_HYBRID_PQ) {
     throw new Error(`bundle: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
@@ -262,14 +261,15 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
     throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
   }
   if (env.length < OFF_BODY) throw new Error("bundle: signature invalid");
-  // Only the keys outlive this call (`authorKeys`), so only they own their bytes — a Node Buffer's slice() aliases.
+  // Only the keys outlive this call (`authorKeys`), so only they are copied. A Node
+  // Buffer's slice() aliases.
   const edPk = new Uint8Array(env.subarray(OFF_ED_PK, OFF_ML_PK));
   const mlPk = new Uint8Array(env.subarray(OFF_ML_PK, OFF_ED_SIG));
   const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
   const mlSig = env.slice(OFF_ML_SIG, OFF_BODY);
   const body = env.subarray(OFF_BODY);
   const pre = bundleSigningInput(sodium, edPk, mlPk, body);
-  // Both, always: a broken half then rejects valid bundles instead of admitting forged ones.
+  // Always check both, so a broken half rejects valid bundles instead of admitting forged ones.
   if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk)) throw new Error("bundle: signature invalid");
   if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk)) throw new Error("bundle: signature invalid");
   const author = hybridAuthorId(sodium, edPk, mlPk);
@@ -293,7 +293,7 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
   } catch {
     throw new Error("bundle: malformed manifest (not JSON)");
   }
-  // Refused by name: this is what the old module-only format produces.
+  // A manifest with no guest gets its own error.
   if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
     && (parsed as Record<string, unknown>).guest === undefined) {
     throw new Error("bundle: this manifest declares no guest, and every app is a guest (§12.4) — the modules are the library it drives, so ship the guest that drives them");
@@ -305,8 +305,8 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
   return { author, authorKeys, manifest: parsed, guestSource, modules };
 }
 
-/** Where a data directory's freshness marks live: a sibling, never inside it, where an
- *  `fs`-capable guest could edit its own downgrade guard. */
+/** Where a data directory's freshness marks live: beside it, never inside it, where a
+ *  guest with `fs` could edit its own downgrade guard. */
 export function freshnessPathFor(dir: string): string {
   return dir.replace(/[/\\]+$/, "") + ".freshness.json";
 }
@@ -315,11 +315,10 @@ export function freshnessPathFor(dir: string): string {
  *  supplies `persist`; without one it is in-memory. */
 export class FreshnessMarks {
   private readonly marks = new Map<string, number>();
-  /** Author keys written off (§12.5), as lowercase hex. */
+  /** Revoked author keys (§12.5), as lowercase hex. */
   private readonly revoked = new Set<string>();
-  /** Seed from `{ marks, revoked }`; absent input is a first boot. `persist` must be
-   *  atomic and must throw if the write did not land, since an empty store is
-   *  "unrevoked". */
+  /** Seed from `{ marks, revoked }`; absent input means first boot. `persist` must be
+   *  atomic and throw if the write failed, since a lost store silently un-revokes. */
   constructor(json?: string | null, private readonly persist: (json: string) => void = () => {}) {
     if (json !== undefined && json !== null) {
       let parsed: unknown;
@@ -364,13 +363,13 @@ export class FreshnessMarks {
       }
     }
   }
-  /** Serialize the marks and the dead-key set for `persist`. */
+  /** Serialize the marks and revoked keys for `persist`. */
   serialize(): string {
     const marks: Record<string, number> = {};
     for (const [k, v] of this.marks) marks[k] = v;
     return JSON.stringify({ marks, revoked: [...this.revoked] });
   }
-  /** `"<author hex>:<app>"`: another author on the same label has its own count. */
+  /** `"<author hex>:<app>"`: each author has its own mark per label. */
   private key(author: Uint8Array, app: string): string { return toHex(author) + ":" + app; }
   get(author: Uint8Array, app: string): number {
     const v = this.marks.get(this.key(author, app));
@@ -414,8 +413,8 @@ export class FreshnessMarks {
 
 /** Build a verified bundle's private modules, all or none (§3.1). Admission already ran. */
 export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundle): Promise<PureModules> {
-  // The §4.3 bound, per module and aggregate, read off the bytes before any instantiation
-  // allocates them. One number for every target, applied only here.
+  // The §4.3 bound, per module and in total, read from the bytes before anything is
+  // instantiated. The same on every target, and applied only here.
   const maxBytes = DEFAULT_MAX_MODULE_MEMORY_BYTES;
   let bundleBytes = 0;
   for (const { wasm } of v.modules) {
@@ -424,7 +423,7 @@ export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundl
       throw new Error(`bundle: modules declare ${bundleBytes} aggregate bytes of memory and tables, above the host budget of ${maxBytes}`);
     }
   }
-  // All or none; the target owns that because it holds the half-built instances.
+  // The target enforces all-or-none, since it holds the half-built instances.
   try {
     return await host.build(v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
   } catch (e) {

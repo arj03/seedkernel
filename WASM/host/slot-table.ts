@@ -1,6 +1,6 @@
-// What this node holds (§12.10): the installed slots and the three claim books that route
-// into them. The books are projections of the installed manifests, and every rule about
-// what may be installed beside what lives here.
+// The installed slots and the three claim books that route to them (§12.10). The books
+// are derived from the installed manifests. Every rule about what may be installed next
+// to what lives here.
 import { type LoadedBundle, type PureModules } from "./bundle.js";
 import { isOccupiedService } from "../services/domains.js";
 import { DEFAULT_MAX_APP_SLOTS } from "./wasm-limits.js";
@@ -11,8 +11,8 @@ import type { RealmTimers } from "./realm-timers.js";
 /** Observe a slot's own answer to a peer-inbound frame, after it resolves. */
 export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array) => void;
 
-/** One installed app. `realm` is null only while its install is standing it; a slot
- *  enters the table with its realm standing. */
+/** One installed app. `realm` is null only while the install is still building it; a
+ *  slot enters the table with its realm in place. */
 export interface AppSlot {
   verifiedBundle: LoadedBundle;
   pureModules: PureModules;
@@ -23,8 +23,7 @@ export interface AppSlot {
   /** Set once the freshness mark and claims have committed; until then the seam refuses
    *  every call (`seamFor`). */
   active: boolean;
-  /** Per slot: a timer is a pending re-entry into this realm, so disposal cancels exactly
-   *  its own. */
+  /** Per slot, so disposing a slot cancels only its own pending wake. */
   timers: RealmTimers;
   /** This install's answer observer; a replacement carries its own or none. */
   onInbound?: InboundObserver;
@@ -38,12 +37,12 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
    *  `services`. Uniqueness is per book; a name in both is reachable either way. */
   const peer = new Map<string, AppSlot>();
   const local = new Map<string, AppSlot>();
-  /** Occupied host services a manifest requires (today `link`): their events have one
-   *  sink, so one holder per name. */
+  /** Occupied host services a manifest requires (currently `link`). Their events go to
+   *  one place, so each has one holder. */
   const occupied = new Map<string, AppSlot>();
   const labelOf = (slot: AppSlot): string => slot.verifiedBundle.manifest.app;
-  /** Each signed list paired with its book. Occupied services first, so a would-be
-   *  transport is told the rule it broke. */
+  /** Each signed list paired with its book. Occupied services first, so a candidate
+   *  transport is told which rule it broke. */
   const booksOf = (manifest: LoadedBundle["manifest"]): readonly (readonly [Map<string, AppSlot>, readonly string[], string])[] => [
     [occupied, manifest.guest.requires.filter(isOccupiedService), "requires"],
     [peer, manifest.protocols ?? [], "protocols"],

@@ -1,8 +1,8 @@
 package main
 
-// Value.Bytes is the JS→Go byte seam every subsystem crosses (fs.put, __net.send,
-// sodium args, guest-seam payloads). The view path must copy exactly the view's window —
-// O(view), not O(backing buffer) — and leave the source intact for re-reads.
+// Value.Bytes is the JS-to-Go byte path every subsystem uses (fs.put, __net.send, sodium
+// args, guest-seam payloads). For a view it must copy exactly the view's window (O(view),
+// not O(backing buffer)) and leave the source intact for re-reads.
 
 import (
 	"bytes"
@@ -23,7 +23,7 @@ func TestValueBytesViews(t *testing.T) {
 				empty: full.subarray(5, 5),
 				words: new Uint16Array(buf, 16, 2),
 				dv: new DataView(buf, 60, 4),
-				// Shaped like a view, with an honest window: still not one.
+				// Shaped like a view, with a valid window, but still not one.
 				fake: { buffer: buf, byteOffset: 0, byteLength: 4 },
 			};
 		})();
@@ -97,8 +97,8 @@ func TestValueBytesIgnoresAccessors(t *testing.T) {
 	}
 }
 
-// The bytes arrive from untrusted code on the guest seam, and an object that merely carries
-// view-shaped properties — odd values, throwing getters — is refused without leaving the
+// The bytes come from untrusted code on the guest seam, and an object that only has
+// view-shaped properties (odd values, throwing getters) is refused without leaving the
 // engine's error for the next call to inherit.
 func TestValueBytesHostileProperties(t *testing.T) {
 	bootRealm(t)
@@ -132,10 +132,10 @@ func TestValueBytesHostileProperties(t *testing.T) {
 	}
 }
 
-// A conversion that cannot succeed must take its own exception. Every entry point on a
-// context assumes a clean one, and all three conversions are reached with arguments a
-// guest chose (guest.go's __host_call), so one left pending fails the NEXT call there —
-// rejecting an invocation that had already produced its answer.
+// A conversion that cannot succeed must clear its own exception. Every entry point on a
+// context assumes a clean one, and all three conversions get arguments a guest chose
+// (guest.go's __host_call), so one left pending would fail the next call there, rejecting
+// an invocation that had already produced its answer.
 func TestFailedConversionsTakeTheirException(t *testing.T) {
 	bootRealm(t)
 	for _, tc := range []struct {

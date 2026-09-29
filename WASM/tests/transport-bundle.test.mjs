@@ -1,15 +1,13 @@
-// Smoke test: the transport bundle stands up as a shell's network over the in-process
-// loopback fabric; two nodes complete the AKE and exchange a typed request/response
-// through it. The second half is the claim the whole arrangement rests on: a node replaces
-// its `_net` claimant while running, with the concrete channel adapter on the same port —
-// "the protocol is replaceable without a fork", in practice.
+// Smoke test: the transport bundle runs as a shell's network over the in-process loopback
+// fabric; two nodes complete the AKE and exchange a request and response through it. The
+// second half tests the central claim: a node replaces its `_net` claimant while running,
+// keeping its channel adapter on the same port, so the protocol can change without a fork.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { testkit, makeAuthor } from "./testkit.mjs";
-// The same assembler the build signs through, imported rather than mirrored: these
-// bundles must be signed over the byte-for-byte guest production signs, and a second copy
-// of the part order here would quietly sign a different program (scripts/guest-source.mjs).
+// The same assembler the build signs through (scripts/guest-source.mjs), imported instead
+// of copied, so these bundles sign exactly the guest production signs.
 import { readGuestSource } from "../scripts/guest-source.mjs";
 import { TRANSPORT_APP_CONFIG } from "../scripts/transport-config.mjs";
 
@@ -29,13 +27,12 @@ const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
 const { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const TRANSPORT_SERVICE = "_net";
-// Every transport change below is one install naming the slot standing (§12.5) — the
-// node's current link owner, read off the claim rather than remembered, because a
-// successful change moves it.
+// Every transport change below is one install naming the installed slot (§12.5): the
+// node's current link owner, looked up each time because a successful change moves it.
 const reinstallTransport = (node, blob, opts) =>
   node.shell.install(blob, { replaces: node.shell.resolve(TRANSPORT_SERVICE), ...opts });
-// The app that drives the transport: there is no host-side request facade left, so a
-// request is an app calling the id the transport claims (tests/transport-harness.mjs).
+// The app that drives the transport: a request is an app calling the id the transport
+// claims (tests/transport-harness.mjs).
 const { harnessAppBlob, appRequest, addr, ready, linkedPeers } = await imp("tests/transport-harness.mjs");
 const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
@@ -46,27 +43,26 @@ const { ok, summary } = testkit();
 const assert = ok;
 assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signBundle", "encodeBundleBody", "authorBundle"]
   .every((name) => !(name in bundleApi)), "the runtime bundle entry point has no authoring surface");
-// Read out of the artifact rather than restated: a hard-coded author is drift waiting
-// to happen, and rebuilding the bundle with a different key is a supported thing to do.
+// Read from the artifact, since the bundle can be rebuilt with a different key.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
 assert(transportVerified.guestSource === currentTransportGuest,
   "the shipped transport contains the canonical generated op-frame source");
-// The guest text is part of the signed body, and the parts are checked out CRLF on
-// Windows and LF elsewhere — so the assembler normalizes, or the same commit signs
-// different bytes depending on who built it.
+// The guest text is part of the signed body, and an editor can save a part with CRLF even
+// though the repo checks out LF, so the assembler normalizes; otherwise the same commit
+// could sign different bytes depending on who built it.
 assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its signed bytes are the same on every platform");
 assert(JSON.stringify(transportVerified.manifest.guest.config) === JSON.stringify(TRANSPORT_APP_CONFIG),
   "the shipped transport manifest signs the guest's complete default configuration");
-// The artifact is PQ-signed (§14.1): one hybrid suite, and the id policy pins is a key-set
-// hash, so both keys are on the verified result.
+// The artifact is PQ-signed (§14.1): one hybrid suite, and the author id in a policy is a
+// hash of the key set, so both keys are on the verified result.
 assert(transportVerified.authorKeys.mlDsa !== undefined,
   "the shipped transport bundle carries the ML-DSA-65 public key of its signing key set");
 
-// The build script derives the author's key set with its OWN copy of that derivation, so
-// this pins it against `hybridAuthorKeysFromSeed` — the one every other publisher calls. A
-// drift fails no build but silently re-identifies this artifact's author, invalidating
-// every operator's pinned id. The seed is per-clone, gitignored, written by the build.
+// Checks the build script's author against `hybridAuthorKeysFromSeed`, the derivation
+// every publisher uses. A mismatch would fail no build but silently change this
+// artifact's author, invalidating every operator's policy. The seed is per clone,
+// gitignored, and written by the build.
 const transportSeed = Uint8Array.from(Buffer.from(
   readFileSync(join(root, "transport", "author.key"), "utf8").trim(), "hex"));
 const transportKeys = hybridAuthorKeysFromSeed(sodium, transportSeed);
@@ -75,25 +71,25 @@ const derivedTransportAuthor = Buffer.from(
 assert(derivedTransportAuthor === transportAuthor,
   "the shared seed→key-set derivation reproduces the shipped bundle's author id");
 
-// `guestSource` overrides the artifact's guest — the only caller that passes one hands in
-// a program that cannot compile, to fail the load at the point where the DRIVER stands
-// rather than at verify. `guestConfig` is `null` for the one caller signing a transport
-// with no config at all, which is refused at the same point and for the same reason.
+// `guestSource` overrides the artifact's guest; the only caller that passes one gives a
+// program that cannot compile, so the install fails when the realm starts instead of at
+// verify. `guestConfig` is `null` for the one caller signing a transport with no config,
+// which fails at the same point.
 function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_APP_CONFIG) {
   const guest = guestSource ?? currentTransportGuest;
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const mlkemWasm = new Uint8Array(readFileSync(join(root, "browser/mlkem768.wasm")));
   const { blob } = authorBundle(sodium, keys, {
     app: "transport", version,
-    // The local service id the transport claims (§12.10) — mirror of the artifact
-    // manifest. A `services` claim, reachable by a co-resident guest and by no peer.
+    // The local service id the transport claims (§12.10), as in the artifact manifest. A
+    // `services` claim, reachable by a co-resident guest and by no peer.
     services: [TRANSPORT_SERVICE],
     modules: [{ name: "ws", wasm: wsWasm }, { name: "mlkem", wasm: mlkemWasm }],
     guestSource: guest,
-    // Exactly the services the transport guest holds — a mirror of the artifact manifest
-    // (scripts/build-transport-bundle.mjs). `link` is what the installer authorizes only
-    // by boot selection or owner replacement (§12.5), inbound delivery (`link/deliver`)
-    // among its names: the unit declared here is the service, never the method.
+    // The services the transport guest requires, as in the artifact manifest
+    // (scripts/build-transport-bundle.mjs). The installer grants `link` only by boot
+    // selection or owner replacement (§12.5); it includes inbound delivery (`link/deliver`),
+    // since services are declared whole, never by method.
     guestRequires: ["node", "link", "timer"],
     guestConfig: guestConfig ?? undefined,
   });
@@ -105,7 +101,7 @@ function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_A
 const appAuthor = makeAuthor(sodium);
 const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
 
-// `transport.config` becomes `LOCAL` (§12.10).
+// `transport.config` becomes `LOCAL` (§12.6.3).
 {
   let source = "";
   const { shell } = await bootShell({
@@ -135,7 +131,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     "bootShell transport.config reaches LOCAL unchanged, including the network key");
   shell.close();
 }
-/** One request through a node's app handle to `to` — the path a deployment uses. */
+/** One request through a node's app handle to `to`, the path a deployment uses. */
 async function request(app, to, payload) {
   return appRequest(app, to, payload);
 }
@@ -147,13 +143,13 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   }));
   const transportOptions = { channels, listen, bundle: transportBlob };
   const transportConfig = {};
-  // A test may pause a candidate right after its realm stands, before the shell publishes
-  // it: its LOCAL facts are installed, but the incumbent still owns `_net`, which exposes
-  // address-book updates in the replacement window deterministically.
+  // A test may pause a candidate right after its realm starts, before the shell commits
+  // it: its LOCAL config is in place, but the incumbent still owns `_net`, which makes
+  // address-book updates during replacement deterministic to test.
   const realmControl = { pauseNext: null };
   // bootShell installs the selected transport at boot; every candidate below replaces
-  // its current owner explicitly (§12.5), so each load exercises replacement and the
-  // freshness rule rather than app admission.
+  // its current owner explicitly (§12.5), so each install exercises replacement and the
+  // freshness rule, not app admission.
   const { shell, transport } = await bootShell({
     sodium, identity,
     modules: new ModuleTable(),
@@ -169,8 +165,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     admit: policy,
   });
   const app = await shell.install(harnessAppBlob(appAuthor));
-  // This node's channel key, hex. Off the identity minted here, not asked of the driver:
-  // it is `toHex(identity.publicKey)`, which every caller already holds.
+  // This node's key, hex, from the identity created here.
   const peerId = Buffer.from(identity.publicKey).toString("hex");
   return { shell, transport, realmControl, app, peerId };
 }
@@ -179,7 +174,7 @@ console.log("Test: transport bundle drives two nodes over loopback");
 
 const fabric = new LoopbackChannels();
 const listen = [{ label: "tcp", host: "loopback", port: 0 }];
-// A per-node VIEW of the shared fabric, not the fabric itself: an upgrade closes the
+// A per-node view of the shared fabric, not the fabric itself: an upgrade closes the
 // outgoing driver, and a whole-fabric close would unbind the other node's listener too.
 const a = await makeNode(fabric.view(), listen);
 const b = await makeNode(fabric.view(), listen);
@@ -193,8 +188,8 @@ const cId = c.peerId;
 console.log("  starting listeners…");
 assert(aNet.portOf("tcp") > 0 && bNet.portOf("tcp") > 0 && cNet.portOf("tcp") > 0, "all nodes bound loopback listeners");
 
-// Each node runs the echo app, so both directions work — the upgrade below has to be
-// checked both ways: A dialing out through the new transport, and B reaching A.
+// Each node runs the echo app, so the upgrade below can be checked both ways: A dialing
+// out through the new transport, and B reaching A.
 const bDest = `tcp://loopback:${bNet.portOf("tcp")}`;
 await addr(a, bId, bDest);
 await ready(a, 2000);
@@ -216,10 +211,9 @@ a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; }
 const replacementKeys = makeAuthor(sodium);
 const upgrading = reinstallTransport(a, transportBundleAt(2, replacementKeys));
 await configured;
-// An address taught in the replacement window lands on whoever owns `_net` right NOW —
-// still the incumbent, since the candidate's realm stands but is unpublished. Nothing
-// host-side holds it, so the entry dies with that realm; the assertion below is that it is
-// GONE rather than replayed.
+// An address added during replacement goes to whoever owns `_net` right now: still the
+// incumbent, since the candidate is not yet committed. The host keeps nothing, so the
+// entry dies with that realm; the assertion below checks it is gone, not replayed.
 await addr(a, cId, `tcp://loopback:${cNet.portOf("tcp")}`);
 publishCandidate();
 const upgraded = await upgrading;
@@ -230,30 +224,28 @@ assert(Buffer.from(upgraded.author).toString("hex") === Buffer.from(replacementK
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.portOf("tcp") === oldPort, "the node stayed on the SAME port its peers hold");
 
-// The COST of the address book living in the guest, stated as a test rather than left
-// implicit: neither the peer A was linked to nor the one taught mid-window survives the
-// swap, because both were entries in a realm that is gone. A request to either has nowhere
-// to go and fails on its deadline, exactly as a peer with no address always has.
+// The cost of the address book living in the guest: neither the peer A was linked to nor
+// the one added mid-replacement survives the swap, because both were entries in a realm
+// that is gone. A request to either fails on its deadline, like any peer with no address.
 let strandedB = true, strandedC = true;
 try { await request(a.app, bId, new Uint8Array([9, 9])); strandedB = false; } catch { /* expected */ }
 try { await request(a.app, cId, new Uint8Array([7, 8, 9])); strandedC = false; } catch { /* expected */ }
 assert(strandedB && strandedC, "the replacement starts with an EMPTY address book — nothing is replayed to it");
 
-// The embedder's part of the bargain: re-supply the address and the new guest dials it
-// itself. Live links never survived either — the session keys were private to the outgoing
-// realm — so this one request is a reconnect in both halves, over the same listener on the
-// same port B has always known.
+// The embedder re-supplies the address and the new guest dials it itself. Live links do
+// not survive either (the session keys were private to the outgoing realm), so this
+// request reconnects, over the same listener on the same port B already knew.
 await addr(a, bId, bDest);
 const resp2 = await request(a.app, bId, new Uint8Array([9, 9]));
 assert(resp2.length === 2 && resp2[0] === 9, "A reconnects once the embedder re-supplies the address, through the NEW transport");
 
-// And the reverse direction over that fresh link: B answers back into A's app through the
-// incoming guest, so the replacement carries inbound frames as well as the ones it dialed.
+// The reverse direction over that new link: B reaches A's app through the incoming
+// guest, so the replacement handles inbound frames as well as the ones it dialed.
 const resp3 = await request(b.app, a.peerId, new Uint8Array([5, 6, 7]));
 assert(resp3.length === 3 && resp3[2] === 7, "B reaches A through the new guest, on the unchanged port");
 
-// A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
-// and the transport answers to that mark like any other bundle (§12.4).
+// A downgrade is still refused: installing v2 advanced this (author, app) mark, and the
+// transport is checked against it like any other bundle (§12.4).
 let refused = false;
 try { await reinstallTransport(a, transportBundleAt(1, replacementKeys)); }
 catch { refused = true; }
@@ -262,9 +254,9 @@ assert((await request(a.app, bId, new Uint8Array([4]))).length === 1,
   "…and the refused load left the standing transport serving");
 
 // ── A version that never ran must not consume the claim ──────────────────────────
-// Every app's guest is STOOD at load (shell-core.ts), so a v3 that cannot compile dies
-// there. If the mark advanced on the way in, the node could not reinstall the transport
-// it had — rollback bricked by a failed upgrade. So the mark is the last step of the load.
+// Every app's guest starts at install (shell-core.ts), so a v3 that cannot compile fails
+// there. If the mark advanced before that, the node could not reinstall the transport it
+// had, so the mark is the last step of the install.
 const brokenGuest = "const nope = ( ;";
 let v3Failed = false;
 try { await reinstallTransport(a, transportBundleAt(3, replacementKeys, brokenGuest)); }
@@ -276,18 +268,18 @@ try { await reinstallTransport(a, transportBundleAt(2, replacementKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
 assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
-// A successful reinstall is a slot replacement like any other, so this realm's address book
-// is empty too and the embedder supplies it again. The refused loads above needed no such
-// line: nothing was replaced, so the standing occupant kept the book it already had.
+// A successful reinstall is a slot replacement like any other, so this realm's address
+// book is empty too and the embedder supplies it again. The refused installs above needed
+// no such line: nothing was replaced, so the occupant kept its address book.
 await addr(a, bId, bDest);
 assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
 
 // ── A transport that signs no bounds is refused, not run unbounded ───────────────
 // Every policy value the guest reads bounds a resource, and an absent one does not fail
-// the comparison that applies it — it makes that comparison always false, so a frame cap
-// read as `undefined` is a cap silently gone rather than a cap set wrong. The guest
-// therefore validates its own config at realm evaluation, which is a failed load.
+// the comparison that applies it; it makes it always false, so a frame cap read as
+// `undefined` silently disappears. The guest therefore validates its config when the realm
+// evaluates, which fails the install.
 let noConfigFailed = false;
 let noConfigMsg = "";
 try { await reinstallTransport(a, transportBundleAt(3, replacementKeys, undefined, null)); }
@@ -309,12 +301,12 @@ assert((await request(a.app, bId, new Uint8Array([7]))).length === 1,
   "invalid network config leaves the standing transport serving");
 
 // ── A cohort named wrong is a failed load, not a peer that looks down ────────────
-// The same rule one field over: a half-length peer key would key the guest's address book
-// under an id no handshake can ever match, and the only symptom would be a peer that never
-// links — indistinguishable from one that is switched off. So the guest checks the shape
-// of `LOCAL.peers` where it reads it, and a load naming a cohort wrong fails outright. The
-// references are the transport's own grammar — the CLI passes `--peers` through unread —
-// and so is the contact secret's encoding.
+// The same rule for another field: a half-length peer key would put an id in the address
+// book that no handshake can match, and the only symptom would be a peer that never links,
+// indistinguishable from one that is switched off. So the guest checks the shape of
+// `LOCAL.peers` when it reads it, and a malformed cohort fails the install. The peer
+// grammar and the contact secret's encoding belong to the transport; the CLI passes
+// `--peers` through unread.
 const PK = "ab".repeat(32);
 for (const [what, localConfig] of [
   ["a short peer key", { peers: ["ab".repeat(20) + "@tcp://loopback:1"] }],
@@ -350,8 +342,8 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
     "nothing of the failed load was kept — the claim stayed with the transport that was standing, " +
     "and its mark did not advance");
 
-  // The mark was rolled back, so the retry is a fresh advance and not a no-op against a
-  // store that never got the first one.
+  // The mark was rolled back, so the retry is a real advance, not a no-op against a store
+  // that never got the first one.
   broken = false;
   let reloaded = true;
   try { await reinstallTransport(c, transportBundleAt(2, transportKeys)); } catch { reloaded = false; }

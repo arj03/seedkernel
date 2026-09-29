@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// abortingWasm is a minimal §4-shaped module whose `handle` calls `env.abort` and would
-// then return 0. Hand-assembled rather than built from AssemblyScript because the point is
-// one import and one call: a toolchain fixture would bury that under a runtime, and the
-// build step would have to exist on every machine that runs the suite.
+// abortingWasm is a minimal §4 module whose `handle` calls `env.abort` and would then
+// return 0. Hand-assembled instead of built with AssemblyScript because only one import and
+// one call matter, and a toolchain build would need to exist on every machine that runs
+// the suite.
 //
 //	(module
 //	  (import "env" "abort" (func $abort (param i32 i32 i32 i32)))
@@ -34,11 +34,11 @@ var abortingWasm = []byte{
 	0x41, 0x00, 0x0b,
 }
 
-// AssemblyScript calls `env.abort` at the point a module has declared itself broken — a
-// failed assertion, an out-of-bounds access. The shim must TRAP rather than return: a
-// returning abort lets the module run on past that point, and would make one module fail
-// its call on the JS targets while silently continuing here (PROTOCOL §4.2). callModule
-// reads the resulting call error as a failure, which the guest seam rejects (§12.2).
+// AssemblyScript calls `env.abort` where a module has detected it is broken (a failed
+// assertion, an out-of-bounds access). The shim must trap, not return: a returning abort
+// would let the module run past that point, failing on the JS targets while silently
+// continuing here (§4.2). callModule reads the resulting call error as a failure, which
+// the guest seam rejects (§12.2).
 func TestAbortShimTraps(t *testing.T) {
 	ensureBooted(t)
 	m, err := rt.Instantiate(ctx, abortingWasm)
@@ -51,8 +51,8 @@ func TestAbortShimTraps(t *testing.T) {
 	if err == nil {
 		t.Fatal("a module calling env.abort returned instead of trapping")
 	}
-	// The site is the only thing that makes an abort diagnosable — the instance is spent
-	// by the time anyone reads the error.
+	// The location is the only thing that makes an abort diagnosable, since the instance
+	// is gone by the time anyone reads the error.
 	if !strings.Contains(err.Error(), "12:34") {
 		t.Fatalf("abort trap lost its line:column: %v", err)
 	}

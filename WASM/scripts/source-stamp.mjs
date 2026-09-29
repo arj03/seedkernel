@@ -1,22 +1,20 @@
-// What the generated native host bundle was made FROM: the in-repo sources behind it, and what
-// each hashed to when it was written. bundle-native-host.mjs stamps the answer into
-// native/host-shell.gen.js; the Go side re-hashes the same files and refuses an artifact
-// whose sources have moved on (native/shell_stamp_test.go).
+// What the generated native host bundle was built from: the in-repo sources behind it and
+// their hashes at build time. bundle-native-host.mjs writes this stamp into
+// native/host-shell.gen.js; the Go tests re-hash the same files and refuse an artifact
+// whose sources have changed (native/shell_stamp_test.go).
 //
-// The artifact is generated, gitignored and never pruned, so nothing about a checkout says
-// whether it matches the tree beside it — and everything the native target runs goes
-// through it, including, inside the signed transport blob it embeds, the transport guest
-// and ws.wasm. A stale one is a whole suite quietly asserting about a program that is no
-// longer in the repository.
+// The artifact is generated, gitignored and never pruned, so nothing else says whether it
+// matches the checkout, and everything the native target runs goes through it, including
+// the transport guest and ws.wasm inside the embedded transport bundle. A stale one means
+// the native suite tests code that is no longer in the repository.
 //
-// SOURCES, NOT TOOLS: the .ts each bundled module was compiled from, the transport guest's
-// own parts, the ws module's AssemblyScript, and the signed app config that ships with the
-// bundle. The generators are deliberately absent — editing one is an edit whose whole point
-// was to run it.
+// Sources only: the .ts each bundled module was compiled from, the transport guest's
+// parts, the ws module's AssemblyScript, and the signed transport config. The generator
+// scripts are left out, since editing one means running it anyway.
 //
-// The stamp is a statement about `npm run build:native`, which rebuilds the chain in
-// order (ws.wasm → transport bundle → tsc → this). Running one sub-step of that by hand can
-// stamp a source the artifact did not really pick up; the answer is to run the whole thing.
+// The stamp assumes `npm run build:native`, which rebuilds the chain in order (ws.wasm,
+// transport bundle, tsc, this). Running one step by hand can stamp a source the artifact
+// did not pick up, so run the whole thing.
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -40,16 +38,16 @@ export function stampedSources(buildFiles) {
   const ws = readdirSync(join(wasmDir, "assembly", "ws"))
     .filter((f) => f.endsWith(".ts"))
     .map((f) => "assembly/ws/" + f);
-  // The guest config the bundle is SIGNED over: content of the artifact, not a build knob.
+  // The guest config the bundle is signed over: part of the artifact's content.
   return [...new Set([...ts, ...guest, ...ws, "scripts/transport-config.mjs"])].sort();
 }
 
-/** `{ "services/util.ts": "<sha256 hex>", ... }` — the stamp itself. */
+/** The stamp: `{ "services/util.ts": "<sha256 hex>", ... }`. */
 export function sourceStamp(buildFiles) {
   const out = {};
   for (const p of stampedSources(buildFiles)) {
-    // A source the mapping names but the tree does not have is a mapping that has drifted,
-    // not a file to skip: skipping it would stamp a bundle as covering less than it does.
+    // A listed source missing from the tree means the mapping is wrong; fail instead of
+    // skipping it, which would stamp the bundle as covering less than it does.
     out[p] = createHash("sha256").update(readFileSync(join(wasmDir, p))).digest("hex");
   }
   return out;

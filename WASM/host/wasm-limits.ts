@@ -10,19 +10,17 @@ export const WASM_PAGE_BYTES = 65536;
  *  every target. */
 export const WASM_TABLE_ELEMENT_BYTES = 32;
 
-/** The `scratch` I/O region when a module declares no `scratchSize` (§4.1). One number on
- *  every target, or a module would load on one node and not another; Go receives it from
+/** The `scratch` I/O region when a module declares no `scratchSize` (§4.1). The same on
+ *  every target, or a module could load on one node and not another; Go receives it from
  *  the shim. */
 export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
-/** Default heap cap for a guest realm (§12.3); equal to `DEFAULT_MAX_MODULE_MEMORY_BYTES`
- *  on purpose. */
+/** Default heap cap for a guest realm (§12.3), equal to `DEFAULT_MAX_MODULE_MEMORY_BYTES`. */
 export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
 
 /** Default budget per entrypoint invocation (§12.3): guest execution and the wall clock of
  *  every handoff it makes (queue wait, parked host calls, a deferred answer). */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
-
 
 /** Unresolved `host.call`s one realm may hold. Each retains host-side state outside the
  *  guest heap, so fire-and-forget calls need a count bound as well as the byte bound below. */
@@ -32,17 +30,17 @@ export const DEFAULT_MAX_OUTSTANDING_HOST_CALLS = 1 << 8;
  *  destination cannot turn a confined heap into unbounded host memory. */
 export const DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES = 16 * 1024 * 1024;
 
-/** Realms one node may hold. Every per-realm ceiling is multiplied by it, which makes the
- *  node total a ceiling (measured in tests/verify-hardening.mjs, §12.3). Per-realm quotas
- *  rather than a shared pool, so no app can refuse another's calls by being busy. */
+/** Realms one node may hold. Every per-realm ceiling times this is the node-wide ceiling
+ *  (measured in tests/verify-hardening.mjs, §12.3). Quotas are per realm instead of one
+ *  shared pool, so a busy app cannot starve another. */
 export const DEFAULT_MAX_APP_SLOTS = 8;
 
-/** One realm's clock share for work it starts itself (timer roots, §12.3), which could
- *  otherwise re-arm forever. Twice the slot count holds all such roots to half a CPU in
- *  steady state. Peer- and host-started work is not paced by it. */
+/** One realm's clock share for work it starts itself (wakes, §12.3), which could
+ *  otherwise re-arm forever. Twice the slot count holds all of it to half a CPU in steady
+ *  state. Work started by peers or the host is not paced. */
 export const SELF_INITIATED_CLOCK_DIVISOR = 2 * DEFAULT_MAX_APP_SLOTS;
 
-/** Ceiling on a module's declared memory plus tables, applied at shared admission (§3). */
+/** Ceiling on a module's declared memory plus tables, checked at admission (§4.3). */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 /** Modules per bundle, so zero-memory modules cannot make admission an unbounded walk. */
@@ -55,8 +53,8 @@ export interface MemoryLimits {
   maxPages: number | null;
 }
 
-/** Everything a module makes the host allocate by declaring it — linear memory and table
- *  elements — charged to one budget (§4.3). */
+/** What a module makes the host allocate by declaring it (linear memory and table
+ *  elements), charged to one budget (§4.3). */
 export interface ModuleLimits {
   /** The module's own linear memory, or null (then refused by module-table's `memory`
    *  export check). */
@@ -69,8 +67,8 @@ export interface ModuleLimits {
 
 interface Cursor { readonly b: Uint8Array; i: number; }
 
-/** LEB128 u32. Accumulated by multiplication rather than `<<`, which is 32-bit *signed*
- *  in JS and would turn a legitimate 5-byte length into a negative number. */
+/** LEB128 u32. Accumulated by multiplication because `<<` is 32-bit signed in JS and
+ *  would turn a valid 5-byte length negative. */
 function readVarU32(c: Cursor): number {
   let result = 0;
   let shift = 0;
@@ -102,8 +100,8 @@ function readLimits(c: Cursor, what: "memory" | "table"): { initial: number; max
   return { initial, max };
 }
 
-/** A table type: reftype, then `limits`. Only funcref/externref are read; anything else
- *  would be guessed at, and a misread table is an uncharged one. */
+/** A table type: reftype, then `limits`. Only funcref and externref are accepted, since
+ *  a misread table would go uncharged. */
 function readTableType(c: Cursor): { initial: number; max: number | null } {
   if (c.i >= c.b.length) throw new Error("wasm: truncated table type");
   const reftype = c.b[c.i++];

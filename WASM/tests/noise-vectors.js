@@ -1,15 +1,15 @@
-// noise-vectors.js — just enough of the Noise Protocol Framework (rev 34) to replay the
-// published Noise_XX / Noise_XXpsk3 _25519_ChaChaPoly_BLAKE2b vectors
-// (tests/fixtures/noise-xx-vectors.json), written against nothing but the guest-visible
-// `crypto/` names. It is a test of those names, not a Noise library: a replacement transport
-// is a bundle only while a standard handshake can be built on them (services/domains.ts,
-// HOST_TRANSFORM_NAMES). BLAKE2b-512 carries the hash and HMAC, the handshake hash rides the
-// AEAD's associated data, and the transport messages use it empty — all three through the
-// host. A plain script, so the JS suite (tests/realm-guest.test.mjs) and the native one
-// (native/guestseam_test.go) run these same bytes against their own seam.
+// Just enough of the Noise Protocol Framework (rev 34) to replay the published Noise_XX /
+// Noise_XXpsk3 _25519_ChaChaPoly_BLAKE2b vectors (tests/fixtures/noise-xx-vectors.json),
+// using only the guest-visible `crypto/` names. It tests those names, not a Noise library:
+// a replacement transport can only ship as a bundle if a standard handshake can be built
+// on them (services/domains.ts, HOST_TRANSFORM_NAMES). BLAKE2b-512 provides the hash and
+// HMAC, the handshake hash goes in the AEAD's associated data, and the transport messages
+// leave it empty, all through the host. A plain script, so the JS suite
+// (tests/realm-guest.test.mjs) and the native one (native/guestseam_test.go) run the same
+// bytes against their own seam.
 "use strict";
 
-/** `call(name, bytes)` → Promise<Uint8Array>, the seam. Answers `{ ran, failures }`. */
+/** `call(name, bytes)` returns Promise<Uint8Array> (the seam). Returns `{ ran, failures }`. */
 globalThis.runNoiseVectors = async function (call, vectors) {
   const XX = [["e"], ["e", "ee", "s", "es"], ["s", "se"]];
   const EMPTY = new Uint8Array(0);
@@ -23,7 +23,7 @@ globalThis.runNoiseVectors = async function (call, vectors) {
   };
   const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n); return b; };
 
-  // The three host names, in the argument framing RUNTIME §12.2 gives them.
+  // The three host names, in their argument framing (§12.2).
   const hash = (data) => call("crypto/blake2b", cat(Uint8Array.of(64, 0), data));
   async function dh(sk, pk) {
     const r = await call("crypto/x25519/dh", cat(sk, pk));
@@ -52,7 +52,7 @@ globalThis.runNoiseVectors = async function (call, vectors) {
     return out;
   }
 
-  /** One side's HandshakeState, its SymmetricState inline — XX's tokens and `psk`, no more. */
+  /** One side's HandshakeState, its SymmetricState inline; only XX's tokens and `psk`. */
   async function party(v, initiator, name, pskMode) {
     const side = initiator ? "init" : "resp";
     const base = new Uint8Array(32); base[0] = 9;
@@ -121,7 +121,7 @@ globalThis.runNoiseVectors = async function (call, vectors) {
       const pskMode = m[1] !== undefined;
       const init = await party(v, true, name, pskMode);
       const resp = await party(v, false, name, pskMode);
-      // After the handshake, [initiator→responder, responder→initiator] with their nonces.
+      // After the handshake: [initiator-to-responder, responder-to-initiator] with nonces.
       let keys = null;
       const counters = [0, 0];
       for (let i = 0; i < v.messages.length; i++) {

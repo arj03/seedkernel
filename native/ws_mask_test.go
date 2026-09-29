@@ -1,12 +1,11 @@
 package main
 
-// ws_mask_test.go — the RFC 6455 masking transform, at every length that lands differently
-// in ws.wasm's vectorized loop (assembly/ws/index.ts `maskRun`).
+// The RFC 6455 masking transform, at every length that takes a different path through
+// ws.wasm's vectorized loop (assembly/ws/index.ts `maskRun`).
 //
 // The loop masks eight bytes at a time, then four, then the last 0..3 one at a time, so a
-// payload's length mod 8 chooses which of the three paths runs and how they hand over. So
-// the lengths below are walked exhaustively across the boundaries, in both directions,
-// against a frame masked one byte at a time by hand.
+// payload's length mod 8 decides which paths run and where they meet. The lengths below
+// cover every boundary, in both directions, against a frame masked byte by byte by hand.
 
 import (
 	"bytes"
@@ -28,9 +27,9 @@ const wsModuleJS = `
 globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).modules.find(({ mod }) => mod.name === "ws").wasm;
 `
 
-// wsModule stands the codec up on the module table's runtime. The scratch floor mirrors
+// wsModule loads the codec on the module table's runtime. The scratch floor matches
 // host/wasm-limits.ts DEFAULT_SCRATCH_SIZE; ws.wasm exports its own larger `scratchSize`,
-// so this only has to be a floor it clears.
+// so this only needs to be a floor it exceeds.
 func wsModule(t *testing.T) *boundModule {
 	t.Helper()
 	bootRealm(t)
@@ -49,8 +48,8 @@ func wsModule(t *testing.T) *boundModule {
 	return w
 }
 
-// wsCall stages one request and returns handle()'s answer, unclamped: a length past the
-// scratch is a finding here, not something to trim the way the host's callModule does.
+// wsCall writes one request and returns handle()'s answer, unclamped: a length past the
+// scratch is a bug to find here, not something to trim as the host's callModule does.
 func wsCall(t *testing.T, w *boundModule, req []byte) []byte {
 	t.Helper()
 	mem := w.mod.Memory()
@@ -74,14 +73,14 @@ func wsCall(t *testing.T, w *boundModule, req []byte) []byte {
 	return bytes.Clone(out)
 }
 
-// wsMaskKey is deliberately four DIFFERENT non-zero octets: a key with a repeat, or a zero
-// byte, would let a loop that mixes up its lane order still pass.
+// wsMaskKey is four different non-zero octets: a key with a repeat, or a zero byte, would
+// let a loop that mixes up its lane order still pass.
 var wsMaskKey = [4]byte{0x37, 0xfa, 0x21, 0x3d}
 
-// wsMaskLengths are the payload widths worth walking: every residue class of the eight- and
-// four-byte steps (0..40 covers each of them several times), the 7-bit/16-bit/64-bit length
-// form boundaries, and two megabyte-scale payloads — one a multiple of 8 and one not, so the
-// bulk path is exercised with and without a tail.
+// wsMaskLengths are the payload widths to test: every residue of the eight- and four-byte
+// steps (0..40 covers each several times), the 7-bit/16-bit/64-bit length form
+// boundaries, and two megabyte-scale payloads, one a multiple of 8 and one not, so the
+// bulk path runs with and without a tail.
 func wsMaskLengths() []int {
 	lens := make([]int, 0, 64)
 	for n := 0; n <= 40; n++ {
@@ -90,8 +89,8 @@ func wsMaskLengths() []int {
 	return append(lens, 125, 126, 127, 128, 65535, 65536, 65537, 1<<20, 1<<20+5)
 }
 
-// wsMaskPayload is position-dependent, so a mask applied at the wrong offset — or a lane
-// swapped inside the word — changes the bytes rather than cancelling out.
+// wsMaskPayload is position-dependent, so a mask applied at the wrong offset, or a lane
+// swapped inside the word, changes the bytes instead of cancelling out.
 func wsMaskPayload(n int) []byte {
 	p := make([]byte, n)
 	for i := range p {
@@ -101,7 +100,7 @@ func wsMaskPayload(n int) []byte {
 }
 
 // wsMaskedFrame builds one masked binary frame by hand, one byte at a time, in the minimal
-// length encoding RFC 6455 §5.2 requires — so neither test checks the module against itself.
+// length encoding RFC 6455 §5.2 requires, so neither test checks the module against itself.
 func wsMaskedFrame(payload []byte) []byte {
 	var f []byte
 	n := len(payload)
@@ -121,8 +120,8 @@ func wsMaskedFrame(payload []byte) []byte {
 	return f
 }
 
-// TestWsMaskDecodeEveryTail decodes a masked frame at each length. This is the SERVER side:
-// every frame a browser edge sends is masked, so it is the whole inbound data path.
+// TestWsMaskDecodeEveryTail decodes a masked frame at each length. This is the server side:
+// every frame a browser sends is masked, so it is the whole inbound data path.
 func TestWsMaskDecodeEveryTail(t *testing.T) {
 	w := wsModule(t)
 	for _, n := range wsMaskLengths() {
@@ -145,9 +144,9 @@ func TestWsMaskDecodeEveryTail(t *testing.T) {
 	}
 }
 
-// TestWsMaskEncodeEveryTail masks on the way OUT — the client side — and checks the frame
+// TestWsMaskEncodeEveryTail masks on the way out (the client side) and checks the frame
 // byte for byte against the hand-masked one. Same lengths, so both directions cross the
-// same loop seams.
+// same loop boundaries.
 func TestWsMaskEncodeEveryTail(t *testing.T) {
 	w := wsModule(t)
 	for _, n := range wsMaskLengths() {

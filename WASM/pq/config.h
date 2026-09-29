@@ -1,29 +1,28 @@
 /*
  * mldsa-native configuration for seedkernel's freestanding wasm32 build.
  *
- * Three choices, each of which removes something from the artifact rather than
- * adding to it:
+ * Four choices, each of which removes something from the artifact:
  *
  *  - PARAMETER_SET 65   the only set the manifest suite uses (§12.4)
  *  - CORE_API_ONLY      leaves only keypair_internal / signature_internal /
- *                       verify_internal — the variants that take their randomness
- *                       as an argument. The randomized wrappers are what would pull
- *                       randombytes() in, and an import the host must satisfy is an
- *                       import the Go host must satisfy identically. The module has
- *                       none: no imports at all, only exports.
- *  - CUSTOM_MEMCPY/SET  mldsa-native's whole libc dependency is memcpy and memset
+ *                       verify_internal, the variants that take their randomness
+ *                       as an argument. The randomized wrappers would pull in
+ *                       randombytes(), an import every host (Go included) would
+ *                       have to provide identically. The module has no imports,
+ *                       only exports.
+ *  - CUSTOM_MEMCPY/SET  mldsa-native's only libc dependency is memcpy and memset
  *                       (STDLIB.md). Supplying both here means the build needs no
- *                       sysroot, no wasi-libc, no emscripten — just clang's own
+ *                       sysroot, wasi-libc or emscripten, only clang's own
  *                       freestanding headers.
- *  - CUSTOM_ZEROIZE     the default zeroize reaches for <string.h> too. The
- *                       replacement writes through a volatile pointer, which is the
- *                       portable way to keep the compiler from eliding a wipe of
- *                       memory that is never read again.
+ *  - CUSTOM_ZEROIZE     the default zeroize needs <string.h> too. The replacement
+ *                       writes through a volatile pointer, the portable way to keep
+ *                       the compiler from eliding a wipe of memory that is never
+ *                       read again.
  */
 
 #define MLD_CONFIG_PARAMETER_SET 65
 
-/* Symbol prefix. Set explicitly because this file REPLACES mldsa_native_config.h
+/* Symbol prefix. Set explicitly because this file replaces mldsa_native_config.h
  * (that is what MLD_CONFIG_FILE means), and the upstream default is defined at the
  * bottom of the file being replaced. */
 #define MLD_CONFIG_NAMESPACE_PREFIX mld65

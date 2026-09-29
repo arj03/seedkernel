@@ -9,16 +9,15 @@ import (
 // ── what a stranger's upgrade head costs this realm ──────────────────────────
 //
 // An accepting WebSocket link buffers bytes until it sees `\r\n\r\n`, and
-// `WsFramer.scanHead` is what looks for it as each slice arrives. The sender picks the
-// slice size, so the same 16 KiB of head is one scan or sixteen thousand of them — and the
-// difference is work this node does for a peer it has not authenticated, on the one realm
-// every other link shares.
+// `WsFramer.scanHead` looks for it as each slice arrives. The sender picks the slice size,
+// so the same 16 KiB of head is one scan or sixteen thousand, and the difference is work
+// this node does for an unauthenticated peer, on the realm every other link shares.
 
-// wsHeadJS evaluates the signed transport bundle's own guest program in a function scope,
-// under the config it ships with, and feeds one accepting WsFramer a head one byte under
-// the ceiling with no terminator in it — the most it will hold for a peer that has not said
-// who it is — in slices of `chunk` bytes. A head that never completes never reaches
-// ws.wasm, so the framer's host has nothing to answer.
+// wsHeadJS evaluates the signed transport bundle's guest program in a function scope, with
+// the config it ships with, and feeds one accepting WsFramer a head one byte under the
+// ceiling with no terminator (the most it will hold for an unauthenticated peer) in slices
+// of `chunk` bytes. A head that never completes never reaches ws.wasm, so the stub host
+// never has to answer.
 const wsHeadJS = `
 "use strict";
 {
@@ -68,22 +67,20 @@ func wsHead(tb testing.TB, chunk int) {
 // wsHeadWhole is the head's ceiling (MAX_WS_HANDSHAKE), so one push carries all of it.
 const wsHeadWhole = 16 * 1024
 
-// wsHeadAmplificationBound is how much more a 16 KiB head may cost dribbled one byte at a
-// time than delivered whole. A scan that restarts at the front costs n²/2 byte steps and
-// measured ~6800× (25 s against 3.7 ms); a scan that resumes leaves only per-push overhead,
-// which is linear in the number of pushes and measures ~40× for 16384 of them against one.
-// The bound sits an order of magnitude above what a resumed scan costs and more than an
-// order below what a restarted one does.
+// wsHeadAmplificationBound is how much more a 16 KiB head may cost sent one byte at a time
+// than sent whole. A scan that restarts from the front costs n²/2 byte steps and measured
+// ~6800x (25 s against 3.7 ms); a scan that resumes leaves only per-push overhead, linear
+// in the number of pushes, ~40x for 16384 of them against one. The bound is an order of
+// magnitude above the resumed cost and more than an order below the restarted one.
 const wsHeadAmplificationBound = 500
 
-// TestWsHandshakeHeadScansOnce asserts a RATIO — the same head, both ways, in the same
-// realm on the same machine — so machine speed cancels out of both sides and what is left
-// is the shape of the scan: the head is scanned once, however it arrives.
+// TestWsHandshakeHeadScansOnce checks a ratio (the same head both ways, in the same realm
+// on the same machine), so machine speed cancels out and what is left is the shape of the
+// scan: the head is scanned once, however it arrives.
 func TestWsHandshakeHeadScansOnce(t *testing.T) {
 	wsHeadRealm(t)
-	// Best of three. The realm is shared and this machine moves work between cores, so the
-	// fastest run is the one least contaminated by that — and a floor is the right summary
-	// when the assertion is an upper bound.
+	// Best of three. The realm is shared and the machine moves work between cores, so the
+	// fastest run is the least disturbed, and a minimum suits an upper-bound assertion.
 	feed := func(chunk int) time.Duration {
 		best := time.Duration(0)
 		for i := 0; i < 3; i++ {
@@ -103,7 +100,7 @@ func TestWsHandshakeHeadScansOnce(t *testing.T) {
 }
 
 // BenchmarkWsHandshakeHead holds the head fixed and varies only the chunking, so the
-// number it prints IS the amplification.
+// number it prints is the amplification.
 func BenchmarkWsHandshakeHead(b *testing.B) {
 	wsHeadRealm(b)
 	for _, chunk := range []int{wsHeadWhole, 1024, 64, 8, 1} {

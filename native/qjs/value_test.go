@@ -2,9 +2,9 @@ package qjs
 
 import "testing"
 
-// TestImmediatesMatchEngine pins the Go-side IsUndefined/IsNull, which compare tags
-// against the engine's own JS_UNDEFINED and JS_NULL, to the engine's predicates over a
-// value of every kind — doubles included, since a NaN-boxed double spreads over the high
+// TestImmediatesMatchEngine checks the Go-side IsUndefined/IsNull, which compare tags
+// against the engine's own JS_UNDEFINED and JS_NULL, against the engine's predicates for a
+// value of every kind, doubles included, since a NaN-boxed double spreads over the high
 // word a tag occupies.
 func TestImmediatesMatchEngine(t *testing.T) {
 	rt, err := New()

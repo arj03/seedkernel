@@ -1,39 +1,39 @@
 // The WebRTC socket seam (§12.7): a `ChannelFactory` for `rtc:` destinations. A browser has
 // no UDP, so its only peer-to-peer primitive is the platform's RTCPeerConnection, and a
-// confined guest cannot hold a platform object. This file holds it and nothing else: every
-// decision — which peers to connect, the signaling relay and its wire, who offers, when to
-// restart ICE, how long a negotiation may take — is the transport bundle's.
+// confined guest cannot hold a platform object. This file holds that object and nothing
+// else. Every decision (which peers to connect, the signaling relay and its wire format,
+// who offers, when to restart ICE, how long negotiation may take) belongs to the transport
+// bundle.
 //
 // A peer connection is two links. `link/open("rtc:offer")` or `"rtc:answer"` opens the
-// NEGOTIATION link: its messages are the local descriptions, candidates and connection states
-// going up, and the remote descriptions, candidates and ICE restarts coming down, each
-// `[tag u8][UTF-8 text]` (below) — the W3C verbs, passed through without a reading of their
-// contents. The pre-agreed data channel (`negotiated`, id 0, on both sides) arrives as the
-// DATA link, announced with the negotiation link as its `via`, so neither side is "the dialer"
-// as far as the host can tell. Closing either link closes both.
+// negotiation link. Up from the host come local descriptions, candidates and connection
+// states; down from the guest come remote descriptions, candidates and ICE restarts. Each
+// message is `[tag u8][UTF-8 text]` (below), the W3C operations passed through without
+// interpreting their contents. The pre-agreed data channel (`negotiated`, id 0, on both
+// sides) arrives as the data link, announced with the negotiation link as its `via`, so to
+// the host neither side is the dialer. Closing either link closes both.
 //
-// Only the offering side ever offers — its `negotiationneeded` sets a local description, the
-// answering side's is ignored — so there is no glare to resolve here. Bounds are the driver's:
-// each link is an entry under `maxRawLinks`, what the guest writes is outbound custody
+// Only the offering side offers (its `negotiationneeded` sets a local description; the
+// answering side's is ignored), so there is no glare to resolve. The driver's bounds
+// apply: each link counts against `maxRawLinks`, what the guest writes counts as outbound
 // (`buffered`), and what the platform emits reaches the guest as an ordinary read.
 //
-// Browser-native, but the platform global is referenced only inside `connect`, so importing
-// this under Node is safe — a console peer passes its own `peerConnectionFactory`.
+// The platform global is referenced only inside `connect`, so importing this under Node is
+// safe; a console peer passes its own `peerConnectionFactory`.
 import { MessageChannel } from "./net-channel.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
 import { enc, dec } from "./util.js";
 
 export interface RtcNetworkOptions {
   /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
-   *  Node/Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
-   *  W3C surface used here) so this exact seam runs off-browser. */
+   *  Node or Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
+   *  W3C interface used here) so this seam runs outside the browser. */
   peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
 }
 
-// Keep physical data-channel messages below the conservative cross-browser ceiling while
-// exposing an ordered byte stream to the transport. Its existing bounded length framer
-// restores record boundaries, so storage can coalesce several blocks per encrypted record
-// without asking WebRTC to carry that record as one message.
+// Keep data-channel messages under the conservative cross-browser size limit while
+// exposing an ordered byte stream to the transport. The transport's length framer restores
+// record boundaries, so a record can be larger than one WebRTC message.
 export const RTC_CHUNK_BYTES = 48 * 1024;
 
 export class RtcChannel extends MessageChannel {
@@ -49,10 +49,10 @@ export class RtcChannel extends MessageChannel {
   end(): void { this.fail(); }
 }
 
-/** The negotiation link's message tags. Up (host → guest): a local description, a local
- *  candidate, a connection state. Down (guest → host): a remote description, a remote
- *  candidate, an ICE restart. A candidate is its four W3C fields NUL-separated — NUL is
- *  outside SDP's and ICE's grammar — an absent one empty. */
+/** The negotiation link's message tags. Up (host to guest): a local description, a local
+ *  candidate, a connection state. Down (guest to host): a remote description, a remote
+ *  candidate, an ICE restart. A candidate is its four W3C fields separated by NUL (which
+ *  SDP and ICE never contain), with an absent field left empty. */
 export const RTC_TAG = { OFFER: 0x6f, ANSWER: 0x61, CANDIDATE: 0x63, STATE: 0x73, RESTART: 0x72 } as const;
 
 /** One message on the negotiation link. */
@@ -105,9 +105,9 @@ class RtcNegotiation implements RawLink {
   private work: Promise<void> = Promise.resolve();
   private pendingBytes = 0;
   /** Local candidates gathered while a local description is being set, held until it has
-   *  gone up: a platform may gather before `setLocalDescription` resolves, and a candidate
-   *  that reaches the peer ahead of its description is one the peer drops. Null passes them
-   *  straight through. */
+   *  been sent: a platform may gather before `setLocalDescription` resolves, and the peer
+   *  drops a candidate that arrives before its description. Null passes them straight
+   *  through. */
   private held: string[] | null = [];
   private dead = false;
   readonly data: RtcChannel;
@@ -118,8 +118,9 @@ class RtcNegotiation implements RawLink {
     this.data = new RtcChannel(dc);
     // After RtcChannel's own listener, so the channel has flushed and is writable.
     dc.addEventListener("open", () => { if (!this.dead) onOpen(); });
-    // The data channel going is the connection going: one peer, one channel, never re-bound.
-    // On the platform object, because the driver owns the data link's own `onClose`.
+    // Losing the data channel means losing the connection: one peer, one channel, never
+    // re-bound. Listened on the platform object because the driver owns the data link's
+    // `onClose`.
     dc.addEventListener("close", () => this.fail());
     dc.addEventListener("error", () => this.fail());
     pc.addEventListener("icecandidate", (ev) => {
@@ -138,7 +139,7 @@ class RtcNegotiation implements RawLink {
     });
   }
 
-  /** Set the implicit local description and hand it to the occupant. */
+  /** Set the implicit local description and send it to the occupant. */
   private async describe(): Promise<void> {
     this.held ??= [];
     await this.pc.setLocalDescription();
@@ -153,9 +154,9 @@ class RtcNegotiation implements RawLink {
     if (!this.dead) this.onMsg?.(message(tag, text));
   }
 
-  /** Run one platform operation after every earlier one. A rejection is the platform
-   *  refusing this peer's input — stale after an ICE restart, or malformed — and is dropped:
-   *  a negotiation that cannot complete is ended by its occupant's own deadline. */
+  /** Run one platform operation after every earlier one. A rejection means the platform
+   *  refused this peer's input (stale after an ICE restart, or malformed) and is ignored;
+   *  a negotiation that cannot complete is ended by the occupant's own deadline. */
   private chain(op: () => Promise<void>, bytes = 0): void {
     this.pendingBytes += bytes;
     this.work = this.work.then(() => (this.dead ? undefined : op())).catch(() => {})
@@ -215,10 +216,10 @@ export class RtcNetwork implements ChannelFactory {
     this.makePc = opts.peerConnectionFactory ?? ((cfg) => new RTCPeerConnection(cfg));
   }
 
-  /** A negotiation link for `rtc:offer` / `rtc:answer`; every other destination is not
-   *  this factory's. Its data link is announced once the channel opens — so the occupant's
-   *  handshake clock starts when there is a channel to speak on, and how long connecting may
-   *  take is the occupant's own deadline on the negotiation link. */
+  /** A negotiation link for `rtc:offer` or `rtc:answer`; other destinations are not this
+   *  factory's. Its data link is announced once the channel opens, so the occupant's
+   *  handshake clock starts when there is a channel to use, and how long connecting may
+   *  take is up to the occupant's deadline on the negotiation link. */
   connect(dest: string): RawLink | null {
     const d = parseRtcDest(dest);
     const accept = this.onAccept;
@@ -229,7 +230,7 @@ export class RtcNetwork implements ChannelFactory {
     return n;
   }
 
-  /** Binds nothing: the sink is what data links are announced through. */
+  /** Binds nothing; only keeps the sink data links are announced through. */
   async listen(
     addrs: readonly ListenAddress[],
     onAccept: (channel: RawLink, arrival?: Arrival) => void,

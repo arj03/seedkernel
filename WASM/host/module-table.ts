@@ -1,6 +1,5 @@
-// JS target's private pure-module builder (§3, §4). Call is bounded by worker kill;
-// native target returns the same interface over a wazero handle.
-
+// The JS target's private pure-module builder (§3, §4). Calls are bounded by killing the
+// worker. The native target returns the same interface over a wazero handle.
 
 import {
   DEFAULT_GUEST_DEADLINE_MS,
@@ -11,30 +10,30 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 // ─── module routing ─────────────────────────────────────────────────────
 
 export interface ModuleTableOptions {
-  /** Bound on one module invocation — one call, and one worker load at install — in ms,
-   *  for a call that carries no deadline of its own; a call from a GUEST carries that
-   *  guest's remaining execution segment instead (§4.3). Defaults to the shared guest
-   *  budget, one number for untrusted code wherever it runs. On expiry the worker is
-   *  killed and respawned and the call answers empty. `Infinity` disables it. */
+  /** Bound in ms on one module call, or one worker load at install, when the call carries
+   *  no deadline of its own. A call from a guest carries that guest's remaining execution
+   *  segment instead (§4.3). Defaults to the guest budget. On expiry the worker is killed
+   *  and respawned and the call answers empty. `Infinity` disables it. */
   deadlineMs?: number;
 }
 
-/** What the table holds at one name. The instance lives in the worker; the host holds the
- *  verified bytes (for the respawn after a kill), the live worker, and the bookkeeping that
- *  makes one call at a time answer within one deadline. */
+/** What the table holds per module name. The instance lives in the worker; the host holds
+ *  the verified bytes (to respawn after a kill), the live worker, and the state that runs
+ *  one call at a time under a deadline. */
 interface WasmModuleRef {
   /** The verified bytes, retained for the respawn after a kill (§4.3). */
   wasm: Uint8Array;
-  /** The live worker, or null after a kill or crash — the next call loads a fresh one. */
+  /** The live worker, or null after a kill or crash, in which case the next call loads a
+   *  fresh one. */
   worker: ModuleWorker | null;
-  /** Set once the ref leaves the table (`teardown`). A load in flight then must kill what
-   *  it spawned rather than adopt it onto a ref nothing holds. */
+  /** Set once the ref leaves the table (`teardown`). A load still in flight must then kill
+   *  what it spawned instead of attaching it. */
   dead: boolean;
-  /** One in-flight call per module (§3's "one transform at a time"): calls chain on this,
-   *  so a spinning module burns at most one core for at most one bound. */
+  /** One in-flight call per module (§4.3): calls chain on this, so a spinning module burns
+   *  at most one core for at most one bound. */
   tail: Promise<unknown>;
-  /** The module's scratch region, read off the worker's instance at load, so an oversized
-   *  payload is refused without a worker round-trip. */
+  /** The module's scratch size, reported by the worker at load, so an oversized payload
+   *  is refused without a round trip. */
   scratchSize: number;
   /** The call awaiting its worker's answer. Calls chain on `tail`, so there is at most one. */
   pending: ((r: ModuleResult) => void) | null;
@@ -47,35 +46,33 @@ function answer(ref: WasmModuleRef, r: ModuleResult): void {
   settle?.(r);
 }
 
-/** One worker message, the whole protocol between the table and a module worker. */
+/** The messages a module worker sends back to the table. */
 type WorkerMsg =
   | { type: "ready"; scratchSize: number }
   | { type: "loadError"; message: string }
   | { type: "result"; bytes: ArrayBuffer | null; ms: number };
 
-/** A worker port as the table uses it — the subset the two platforms' workers share
- *  (Node `worker_threads` and the browser's dedicated `Worker`). */
+/** A worker as the table uses it: the part Node `worker_threads` and the browser's
+ *  dedicated `Worker` have in common. */
 interface ModuleWorker {
   onMessage(cb: (msg: WorkerMsg) => void): void;
   onError(cb: (err: unknown) => void): void;
   post(msg: object, transfer?: ArrayBuffer[]): void;
-  /** Hold the host's event loop open, or stop holding it. An idle worker must never keep a
-   *  process alive, but one with a call in flight must: an unbounded call arms no timer,
-   *  so the process would exit mid-transform with its caller's promise unsettled. */
+  /** Hold the host's event loop open, or stop. An idle worker must not keep a process
+   *  alive, but one with a call in flight must, since an unbounded call arms no timer and
+   *  the process would otherwise exit with the caller's promise unsettled. */
   keepAlive(on: boolean): void;
   kill(): void;
 }
 
-/** The worker script, one copy per module. It is the module's whole world: instantiate on
- *  `load`, run `handle` on `call`, post the response back. The §4 ABI validation runs HERE,
- *  in the isolate that holds the instance — a module that fails it reports `loadError` and
- *  the bind refuses the whole app (§3.1). */
+/** The worker script, one per module: instantiate on `load`, run `handle` on `call`, post
+ *  the response back. The §4 ABI checks run here, in the isolate that holds the instance;
+ *  a module that fails them reports `loadError` and the whole app is refused (§3.1). */
 const moduleWorkerSrc = (): string => `"use strict";
-// The §4 ABI instance, one per worker: where the module's statics live, which is what a
-// kill-and-respawn resets (§4.3).
+// The module instance's state, one per worker. A kill and respawn resets it (§4.3).
 let memory = null, scratch = 0, scratchSize = ${DEFAULT_SCRATCH_SIZE}, handle = null;
-// Node's eval:true workers expose no Web globals — the port is parentPort, reached through
-// require. A browser worker is a normal dedicated worker, where self is the port.
+// Node's eval:true workers have no Web globals, so the port is parentPort via require. In
+// a browser dedicated worker, self is the port.
 const port = (typeof require === "function" ? require("node:worker_threads").parentPort : null) ?? self;
 const fail = (message) => port.postMessage({ type: "loadError", message: String(message) });
 port.onmessage = (e) => {
@@ -84,9 +81,9 @@ port.onmessage = (e) => {
     let instance;
     try {
       const mod = new WebAssembly.Module(m.wasm);
-      // The three AssemblyScript runtime shims and nothing else — the same set every other
-      // target resolves, so "does this module load" never depends on which target it landed
-      // on. \`seed\` is a constant (a pure transform reaches no clock, §4.2), \`trace\` drops.
+      // The three AssemblyScript runtime shims and nothing else, the same set every target
+      // provides, so whether a module loads never depends on the target. \`seed\` is a
+      // constant (a pure transform reads no clock, §4.2) and \`trace\` is a no-op.
       instance = new WebAssembly.Instance(mod, {
         env: {
           abort: (_m, _f, l, c) => { throw new Error("dynamic module abort at " + l + ":" + c); },
@@ -116,10 +113,9 @@ port.onmessage = (e) => {
     return;
   }
   if (m.type === "call") {
-    // A trap, an oversized result, a negative length — all null, which the seam rejects
-    // (§12.2); a 0-length answer stays a value. ms is this worker's own time inside
-    // handle — the module's actual compute, excluding queue wait — which is what the
-    // caller's execution budget is billed (§12.3).
+    // A trap, an oversized result or a negative length all give null, which the seam
+    // rejects (§12.2); a zero-length answer is still a value. ms is the time spent inside
+    // handle, excluding queue wait, and is what the caller's budget is billed (§12.3).
     let bytes = null, wipeLen = m.payload.byteLength;
     const t0 = performance.now();
     try {
@@ -131,8 +127,8 @@ port.onmessage = (e) => {
       }
     } catch { bytes = null; }
     finally {
-      // The response has been copied out. Neither request bytes nor a secret-bearing
-      // response may survive in a long-lived module instance's shared scratch window.
+      // The response has been copied out. Wipe the scratch window so neither the request
+      // nor a secret-bearing response lingers in a long-lived instance.
       try { new Uint8Array(memory.buffer, scratch, wipeLen).fill(0); } catch { /* trapped/grown memory */ }
     }
     const ms = performance.now() - t0;
@@ -143,8 +139,7 @@ port.onmessage = (e) => {
 
 let nodeWorkerCtor: Promise<{ new (code: string, opts: { eval: boolean }): ModuleWorkerPort }> | null = null;
 
-/** The Node side of a worker, structurally — @types/node's `Worker` minus what this
- *  file never uses, so the table reads one shape regardless of platform. */
+/** The part of Node's `Worker` this file uses, typed structurally. */
 interface ModuleWorkerPort {
   on(event: "message", cb: (msg: unknown) => void): unknown;
   on(event: "error", cb: (err: unknown) => void): unknown;
@@ -154,8 +149,8 @@ interface ModuleWorkerPort {
   unref?(): void;
 }
 
-/** The browser side of a worker — the DOM's `Worker`, structurally, since this
- *  tsconfig carries no DOM lib and the global is checked at runtime. */
+/** The part of the DOM's `Worker` this file uses, typed structurally since this tsconfig
+ *  has no DOM lib and the global is checked at runtime. */
 interface BrowserWorkerLike {
   onmessage?: ((e: { data: unknown }) => void) | null;
   onerror?: ((e: { message?: string }) => void) | null;
@@ -163,16 +158,15 @@ interface BrowserWorkerLike {
   terminate?(): void;
 }
 
-/** Stand up one module worker. Browser first — the global `Worker` is the detection —
- *  Node `worker_threads` second, loaded lazily so the browser build never resolves the
- *  `node:` import. */
+/** Start one module worker. Uses the browser `Worker` global when there is one, else Node
+ *  `worker_threads`, imported lazily so the browser build never resolves `node:`. */
 async function spawnWorker(src: string): Promise<ModuleWorker> {
   const browserCtor = (globalThis as { Worker?: { new (url: string): BrowserWorkerLike } }).Worker;
   if (typeof browserCtor === "function") {
     const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
     const w = new browserCtor(url);
-    // The URL is a document-lifetime blob-registry entry nothing else revokes — a leak that
-    // would grow one entry per deadline kill.
+    // Nothing else revokes the blob URL, so without this it would leak one entry per
+    // deadline kill for the life of the document.
     URL.revokeObjectURL(url);
     return {
       onMessage: (cb) => { w.onmessage = (e) => cb(e.data as WorkerMsg); },
@@ -187,8 +181,8 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
   }
   const WorkerCtor = await nodeWorkerCtor;
   const w = new WorkerCtor(src, { eval: true });
-  // An IDLE worker is never a reason for the process to stay up; one with work in flight
-  // is, and `keepAlive` re-refs it for exactly that window.
+  // An idle worker should not keep the process up; `keepAlive` re-refs it while a call is
+  // in flight.
   w.unref?.();
   return {
     onMessage: (cb) => { w.on("message", (m) => cb(m as WorkerMsg)); },
@@ -210,8 +204,7 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── installing WASM modules ─────────────────────────────────────────
 
-  /** Build one slot's modules, all or none (§3.1). Commit is one assignment;
-   *  a re-install replaces the map rather than merging. */
+  /** Build one slot's modules, all or none (§3.1). A re-install replaces the whole map. */
   async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
     const built = new Map<string, WasmModuleRef>();
     try {
@@ -222,8 +215,7 @@ export class ModuleTable implements PureModuleLoader {
       }
     }
     catch (e) {
-      // Nothing above touched the table; release what the attempt stood up, so a refused
-      // bundle leaves no orphaned isolates behind.
+      // Release what this attempt started, so a refused bundle leaves no orphaned workers.
       for (const ref of built.values()) this.teardown(ref);
       throw e;
     }
@@ -236,11 +228,9 @@ export class ModuleTable implements PureModuleLoader {
     };
   }
 
-  /** Stand up a module's worker. The §4.3 memory ceiling was applied before this by the
-   *  load path, off the bytes and before any worker exists (instantiation allocates the
-   *  declared initial memory and reserves the declared tables); the §4 export checks run in
-   *  the worker on the same load and
-   *  report `loadError`. */
+  /** Start a module's worker. The load path has already applied the §4.3 memory ceiling
+   *  to the bytes, before instantiation allocates anything. The §4 export checks run in
+   *  the worker and report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
     if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
     const ref: WasmModuleRef = {
@@ -255,22 +245,21 @@ export class ModuleTable implements PureModuleLoader {
     return ref;
   }
 
-  /** Bring `ref`'s worker up: spawn, load, wait for `ready` — or fail. Bounded like a call,
-   *  because instantiation RUNS the start section, so an unbounded load is a wedged node at
-   *  install. */
+  /** Bring `ref`'s worker up: spawn, load, wait for `ready`, or fail. Bounded like a call,
+   *  because instantiation runs the start section and could otherwise hang install. */
   private async load(ref: WasmModuleRef): Promise<ModuleWorker> {
     const worker = await spawnWorker(moduleWorkerSrc());
-    // The ref may have left its set while this was spawning. Adopting the worker now would
-    // leave it unreachable, unkillable, and still running whatever it was given.
+    // The ref may have been released while this was spawning; attaching the worker now
+    // would leave it running with nothing able to kill it.
     if (ref.dead) { worker.kill(); throw new Error("table: module was released while it loaded"); }
     ref.worker = worker;
-    // A load holds the loop open for the same reason a call does: an unbounded table arms
-    // no load timer, and a bind is something its caller is waiting on.
+    // Keep the loop open during the load, as during a call: an unbounded table arms no
+    // load timer, and the caller is waiting on it.
     worker.keepAlive(true);
     await new Promise<void>((resolve, reject) => {
       let loading = true;
       let timer: ReturnType<typeof setTimeout> | null = null;
-      /** End the load in failure, once — and the worker with it. */
+      /** Fail the load once, killing the worker. */
       const fail = (err: Error): void => {
         if (!loading) return;
         loading = false;
@@ -282,12 +271,12 @@ export class ModuleTable implements PureModuleLoader {
         timer = setTimeout(() => fail(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`)),
           this.deadlineMs);
       }
-      // One handler for both phases: load and calls are strictly sequential per module (a
+      // One handler for both phases, since load and calls are sequential per module (a
       // call reaches a worker only after `ready`, and a reload runs inside the queued call).
       worker.onMessage((m) => {
         if (m.type === "result") {
-          // Only the current worker answers the call in flight: a killed or crashed worker
-          // can still deliver a late reply, which must not settle the call that followed.
+          // Only the current worker may answer: a killed or crashed worker can still deliver
+          // a late reply, which must not settle the next call.
           if (ref.worker === worker) answer(ref, { bytes: m.bytes === null ? null : new Uint8Array(m.bytes), ms: m.ms });
           return;
         }
@@ -304,15 +293,15 @@ export class ModuleTable implements PureModuleLoader {
         fail(new Error(`table: module worker failed during load: ${(err as Error)?.message ?? String(err)}`)));
       worker.post({ type: "load", wasm: ref.wasm });
     });
-    // Loaded and idle: it holds nothing open until a call is posted. (Every rejection path
-    // above killed the worker.)
+    // Loaded and idle, so stop holding the loop open. (Every failure path above killed the
+    // worker.)
     worker.keepAlive(false);
-    // A release that landed while the load was in flight: `teardown` had no worker to kill,
-    // so this one must not be left standing.
+    // Released while the load was in flight: `teardown` had no worker to kill, so kill it
+    // here.
     if (ref.dead) { ref.worker = null; worker.kill(); throw new Error("table: module was released while it loaded"); }
-    // After the load settles, an engine crash — not a wasm trap, which the worker catches
-    // and reports as a null result — fails the in-flight call with the same empty answer
-    // and leaves the next call to load a fresh worker.
+    // After the load, an engine crash (not a wasm trap, which the worker reports as a null
+    // result) fails the in-flight call with an empty answer, and the next call loads a
+    // fresh worker.
     worker.onError(() => {
       if (ref.worker !== worker) return;
       ref.worker = null;
@@ -323,38 +312,35 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── public API ──────────────────────────────────────────────────────
 
-  /** Invoke one module in this private set, returning its response bytes or null. The
-   *  scratch-region contract (§4) writes input at scratch, calls handle, and reads the
-   *  response back. The set itself is the scope, so no app label participates in lookup.
-   *  BOUNDED: `deadlineMs` is the call's whole budget, and exceeding it answers empty with
-   *  the worker killed and respawned — a module that never returns fails like a trap instead
-   *  of holding the node's thread. A guest's call carries its own remaining segment (§4.3). */
+  /** Invoke one module in this private set, returning its response bytes or null (§4).
+   *  The set is already per slot, so lookup is by module name alone. `deadlineMs` is the
+   *  call's whole budget; past it the call answers empty and the worker is killed and
+   *  respawned, so a module that never returns fails like a trap. A guest's call carries
+   *  its own remaining segment (§4.3). */
   private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult> {
     const w = modules.get(module);
     if (!w) return { bytes: null, ms: 0 };
     if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
     const bound = deadlineMs ?? this.deadlineMs;
-    // Bytes are not this table's to account for: the realm's `ActiveHostCalls` ledger holds
-    // `payload` under the enclosing `host.call` until the module settles (§12.3). Execution
-    // IS — one in-flight call per module, so a spinner burns one core for one bound.
+    // Payload bytes are accounted by the realm's `ActiveHostCalls` ledger under the
+    // enclosing `host.call` (§12.3). Execution is accounted here: one in-flight call per
+    // module, so a spinning module burns one core for one bound.
     const started = w.tail.then(() => this.call(w, payload, bound));
     w.tail = started.catch(() => {});
     return started;
   }
 
-  /** Run one call on a module's worker, under `bound`. Never rejects: every failure — a
-   *  dead worker, a reload that could not stand up, a worker killed at the deadline — is
-   *  the same empty answer a trap produces, so nothing downstream changes. */
+  /** Run one call on a module's worker, under `bound`. Never rejects: a dead worker, a
+   *  failed reload and a deadline kill all give the same empty answer a trap does. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
-    // A kill or crash left no worker: load a fresh instance, whose statics are gone — which
-    // is the point. Calls chain on `tail`, so this is the module's only load in flight. A
-    // failed load killed what it spawned; the module answers empty and the next call retries.
+    // After a kill or crash there is no worker, so load a fresh instance with clean state.
+    // Calls chain on `tail`, so this is the only load in flight. A failed load has killed
+    // what it spawned; this call answers empty and the next one retries.
     const worker = w.worker ?? await this.load(w).catch(() => null);
     if (worker === null) { w.worker = null; return { bytes: null, ms: 0 }; }
     // Own an exact-sized, transferable buffer even when the caller passed a Node Buffer.
     const input = new Uint8Array(payload);
-    // Held open for the duration of the call: an unbounded call arms no timer, and the
-    // caller is awaiting an answer only this worker can give.
+    // Hold the loop open for the call, since an unbounded call arms no timer.
     worker.keepAlive(true);
     return new Promise<ModuleResult>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -365,12 +351,11 @@ export class ModuleTable implements PureModuleLoader {
       };
       if (Number.isFinite(bound)) {
         timer = setTimeout(() => {
-          // The module did not return within its bound. Kill the isolate — the engine's one
-          // interrupt, which works even mid-loop — answer empty, and leave the next call to
-          // load a fresh one. It burned the full bound, so THAT is what the caller's segment
-          // is billed: a guest looping on a wedged module must exhaust its budget rather than
-          // spin forever free. Every other path that retires this worker settles the call
-          // first, which clears this timer, so the worker is still the module's own.
+          // The module overran its bound. Kill the worker (the only interrupt that works
+          // mid-loop), answer empty, and let the next call load a fresh one. The caller is
+          // billed the full bound, so a guest looping on a wedged module exhausts its budget.
+          // Every other path that retires this worker settles the call first and clears
+          // this timer, so the worker here is still the current one.
           answer(w, { bytes: null, ms: bound });
           w.worker = null;
           worker.kill();
@@ -380,11 +365,10 @@ export class ModuleTable implements PureModuleLoader {
     });
   }
 
-  /** Kill a module's worker and settle the call waiting on it as empty — the module is
-   *  gone, and no caller may hang on a promise nothing can settle. */
+  /** Kill a module's worker and settle any waiting call as empty, so no caller hangs. */
   private teardown(ref: WasmModuleRef): void {
-    // Marked first: a load may be mid-flight, and when it finishes after this returns it
-    // has to kill what it spawned rather than adopt it onto a departed ref.
+    // Mark first: a load may be in flight, and when it finishes it must kill what it
+    // spawned instead of attaching it.
     ref.dead = true;
     answer(ref, { bytes: null, ms: 0 });
     ref.worker?.kill();

@@ -9,15 +9,14 @@ export interface RealmTimers extends HostTimers {
   clearAll(): void;
 }
 
-/** Every wake arrives as the host's caller id and the `wake` event, no args. Built per fire:
- *  the realm owns what it is handed. */
+/** Every wake is the `wake` event from the host's caller id, with no args. Built fresh
+ *  per fire, since the realm owns what it is handed. */
 const wakeBody = (): Uint8Array => new OpArgs("wake").build(HOST_CALLER_ID);
 
-/** At most one armed notification and one in flight, each the fixed wake event. A due
- *  successor waits for the previous invocation to settle. This bounds host retention even
- *  when the guest defers its answer and repeatedly arms another wake. Clear/replacement
- *  cannot retract a notification already handed to the realm; the guest reads its own
- *  clock to find a wake with nothing due. */
+/** At most one armed wake and one in flight. A due wake waits for the previous
+ *  invocation to settle, which bounds what the host holds even when the guest defers its
+ *  answer and keeps re-arming. Clearing or re-arming cannot retract a wake already handed
+ *  to the realm, so the guest checks its own clock for a wake with nothing due. */
 export function createRealmTimers(
   fire: (payload: Uint8Array, causalClock: CausalClock) => Promise<unknown> | void,
   budgetMs = DEFAULT_GUEST_DEADLINE_MS,

@@ -1,8 +1,8 @@
-// Computes the README's LOC figures ("one implementation, three targets") rather than
-// remembering them: `npm run loc` drifts → exit 1, `--write` rewrites the README.
-// Counted per the README's own rule (non-test sources, no blanks/comments), and the
-// shared set is DERIVED from build:native-host and reconciled against the rows, so a
-// shared file appearing in no row fails too.
+// Computes the README's LOC figures ("one implementation, three targets"): `npm run loc`
+// exits 1 on drift, and `--write` updates the README. Counted by the README's own rule
+// (non-test sources, no blank or comment lines). The shared set is derived from
+// build:native-host and checked against the rows, so a shared file missing from every row
+// also fails.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -13,11 +13,10 @@ const wasmDir = resolve(here, "..");
 const repoDir = resolve(wasmDir, "..");
 const readmePath = resolve(repoDir, "README.md");
 
-/** Code lines: blank lines, `//` lines and block comments excluded. Deliberately
- *  crude — it is counting the same way a reader eyeballing the file would, and a
- *  parser here would be a second language implementation to keep correct. A block
- *  comment is one that OPENS a line: a `/*` anywhere else is a `crypto/*` in prose or a
- *  regex, and treating it as a comment silently drops the code up to the next close. */
+/** Code lines, excluding blank lines, `//` lines and block comments. Intentionally
+ *  simple; a real parser would be another language implementation to maintain. A block
+ *  comment must start the line: a `/*` elsewhere is a `crypto/*` in prose or a regex, and
+ *  treating it as a comment would drop code up to the next close. */
 function loc(path) {
   const text = readFileSync(resolve(repoDir, path), "utf8");
   let inBlock = false;
@@ -45,8 +44,8 @@ const sharedSet = new Set(
     .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
 // ── the rows, exactly as the README groups them ──────────────────────────────
-// `find` matches the row's file cell rather than its prose (re-wording can't orphan a
-// count); `--write` puts `render(n)` back into the row's last cell.
+// `find` matches the row's file cell, not its prose, so rewording cannot break a count;
+// `--write` puts `render(n)` into the row's last cell.
 const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
@@ -65,14 +64,14 @@ const sharedRows = [
     files: [...sharedSet].filter((f) => f.startsWith("WASM/services/")) },
 ];
 
-// Ride in the shared bundle but counted elsewhere on purpose (the Go target's own;
-// transport-bundle.ts is one line of signed blob base64, content not host code) — named
-// so reconciliation can tell them from "counted nowhere".
+// In the shared bundle but counted elsewhere: the native target's own files, and
+// transport-bundle.ts, which is one line of signed bundle base64, not host code. Listed
+// so reconciliation can tell them from files counted nowhere.
 const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
 const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
 
 /** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
- *  not compile in. Derived rather than listed, so a new backend counts itself. */
+ *  not include. Derived, so a new backend is counted automatically. */
 const jsFiles = ["services", "host"].flatMap((d) =>
   readdirSync(resolve(wasmDir, d))
     .filter((f) => f.endsWith(".ts"))
@@ -83,8 +82,8 @@ const goFiles = readdirSync(resolve(repoDir, "native"))
   .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
   .map((f) => `native/${f}`);
 
-// The Native row's TS side follows from `nativeTs` above, so a third such file extends
-// that list and the row's numbers follow — one list, not a list plus a row.
+// The Native row's TS count comes from `nativeTs` above, so adding a file there updates
+// the row.
 const rows = [
   ...sharedRows.map((r) => ({ ...r, n: sum(r.files), render: cell })),
   { find: /\*\*JS\*\* \(browser \+ Node\)/, n: sum(jsFiles),
@@ -126,8 +125,7 @@ for (const row of rows) {
 readme = lines.join("\n");
 
 // The Native row's prose gives each of its TS files its own figure (`native-shim.ts`
-// (N)). Checked like the cells above: an inline figure drifts just as easily as a cell,
-// and nothing else would notice.
+// (N)), checked like the cells above.
 const inlineChecks = [
   { file: "WASM/host/native-shim.ts", re: /native-shim\.ts` \((\d+)\)/ },
   { file: "WASM/host/native-polyfills.ts", re: /native-polyfills\.ts` \((\d+)\)/ },
@@ -180,7 +178,7 @@ if (write && (drift > 0)) {
   writeFileSync(readmePath, readme);
   console.log(`\nloc: README updated (${drift} figure${drift === 1 ? "" : "s"}).`);
 } else if (drift > 0 || orphans.length || phantoms.length) {
-  console.error("\nloc: README is out of date — run `npm run loc -- --write`.");
+  console.error("\nloc: README is out of date; run `npm run loc -- --write`.");
   process.exit(1);
 } else {
   console.log("\nloc: README matches.");

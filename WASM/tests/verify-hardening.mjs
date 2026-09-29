@@ -1,8 +1,8 @@
 import { signTestBundle, verifyTestBundle } from "./bundle-fixtures.mjs";
-// Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and seam
-// gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each block is a
-// tight loop over one seam; the *.test.mjs suites cover the same ground end-to-end. Run
-// after `npm run build`.
+// Focused checks of the resource bounds (§4.3 memory bounds, §12.2 scoping and seam gates,
+// §12.3 realm budgets, §12.4 guest-only apps). Standalone because each block is a tight
+// loop over one seam; the *.test.mjs suites cover the same ground end to end. Run after
+// `npm run build`.
 
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -33,13 +33,13 @@ const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
-// ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
-// is signed and verified with both halves of the author's key set (§12.4), so a bare
+// Add ML-DSA-65 to this instance, as a target does at its crypto seam: a manifest is
+// signed and verified with both halves of the author's key set (§12.4), so plain
 // libsodium cannot sign one.
 const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
-/** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
- *  identity policy pins and freshness marks name. `ed` doubles as a node identity. */
+/** A manifest author: both halves of the key set, plus the 32-byte id derived from them,
+ *  which policies and freshness marks use. `ed` also serves as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { createRealmTimers } = await imp("build/host/realm-timers.js");
@@ -56,23 +56,23 @@ const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
 const { ok, throws, summary, sleep } = testkit();
-/** Await a promise and assert it rejects — the async form of `throws`, which is what a
- *  build that stands up workers now needs (`PureModuleLoader.build` is async). */
+/** Await a promise and assert it rejects: the async form of `throws`, needed because
+ *  `PureModuleLoader.build` is async. */
 const rejects = async (p, msg) => { let threw = false; try { await p; } catch { threw = true; } ok(threw, msg); };
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
 const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; };
 const section = (id, body) => [id, ...leb(body.length), ...body];
-/** A module header plus whichever sections the bounds read looks at, and nothing else.
- *  Enough for that read, which walks section headers and deliberately does not validate
- *  (host/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
+/** A module header plus only the sections the bounds check reads. That check walks
+ *  section headers without validating the rest (host/wasm-limits.ts), so an oversized
+ *  declaration is cheap to build here. */
 const rawModule = (...sections) => new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sections.flat()]);
 const memSection = (initialPages, maxPages) => section(5, [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]); // one memory, flags=1 (a maximum is declared)
 /** One funcref table of `initial` elements; `max` null declares no maximum. */
 const tableSection = (initial, max) => section(4, [0x01, 0x70,
   ...(max === null ? [0x00, ...leb(initial)] : [0x01, ...leb(initial), ...leb(max)])]);
-/** A module importing a table (`e.t`) rather than declaring one. */
+/** A module importing a table (`e.t`) instead of declaring one. */
 const importedTableModule = () => rawModule(section(2, [0x01, 0x01, 0x65, 0x01, 0x74, 0x01, 0x70, 0x00, ...leb(1)]));
 const memModule = (initialPages, maxPages) => rawModule(memSection(initialPages, maxPages));
 
@@ -87,8 +87,8 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   throws(() => checkModuleLimits(withMax, 1024 * 1024), "a module above the host budget is refused");
   throws(() => checkModuleLimits(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
-  // A table is the other allocation a declaration alone buys: the engine reserves every
-  // element at instantiation (~28 bytes each on V8), so it meets the same budget as pages.
+  // A table is the other allocation a declaration alone causes: the engine reserves every
+  // element at instantiation (~28 bytes each on V8), so it counts against the same budget.
   ok(a.maxTableElements === 0, "the built module declares no table");
   ok(checkModuleLimits(rawModule(memSection(1, 1), tableSection(16, 16)), 64 * 1024 * 1024).maxTableElements === 16,
     "a module with a small bounded table passes the budget");
@@ -101,9 +101,8 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   throws(() => checkModuleLimits(importedTableModule(), 64 * 1024 * 1024),
     "an imported table is refused like an imported memory (§4.2)");
 
-  // The ceiling is applied ONCE, by the shared load path (bundle.ts `loadBundleModules`),
-  // to every target alike. A stub loader is the whole fixture: under test is that path, not
-  // an isolate.
+  // The ceiling is applied once, on the shared load path (bundle.ts `loadBundleModules`),
+  // for every target. A stub loader is enough, since this tests that path, not an isolate.
   const stub = () => ({
     build: async () => ({ call: async () => ({ bytes: null, ms: 0 }), dispose() { } }),
   });
@@ -121,8 +120,8 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
       { mod: { name: "b" }, wasm: memModule(1, 600) },
     ],
   }), "module maxima are bounded in aggregate across one bundle");
-  // Table elements join that aggregate at their own charge: 1.5M elements is 48 MiB, so one
-  // such module lands and two do not.
+  // Table elements count toward the same total: 1.5M elements is 48 MiB, so one such
+  // module fits and two do not.
   const tabled = rawModule(memSection(1, 1), tableSection(1, 1_500_000));
   ok(await loadBundleModules(stub(), bundleOf(tabled)) !== null,
     "a module whose table fits the budget loads");
@@ -136,8 +135,8 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
   ok(echoed instanceof Object && echoed.bytes instanceof Uint8Array && typeof echoed.ms === "number",
     "ModuleTable builds a bounded module set (call resolves { bytes, ms })");
 
-  // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
-  // table exactly as it was. The host's guarantee, so a caller does nothing to earn it.
+  // Module loading is all or none (§3.1): a bundle whose second module is malformed
+  // leaves the table as it was, without the caller doing anything.
   const atomic = new ModuleTable();
   await rejects(atomic.build([
     { name: "first", wasm: withMax },
@@ -151,7 +150,7 @@ console.log("\n§12.2 — fs is scoped per app label");
   const disk = new MemoryFs();
   const chat = scopedFs(disk, appScopeFor(sodium, "chat"));
   const notes = scopedFs(disk, appScopeFor(sodium, "notes"));
-  // Every method awaits: the seam is async so a browser backend can implement it
+  // Every method is awaited: the seam is async so a browser backend can implement it
   // (services/fs.ts), and MemoryFs answers in a microtask like any other.
   await chat.put("secret", new Uint8Array([1, 2, 3]));
   await notes.put("secret", new Uint8Array([9]));
@@ -173,8 +172,8 @@ console.log("\n§12.2 — fs is scoped per app label");
   const upper = appScopeFor(sodium, "Chat");
   ok(upper !== appScopeFor(sodium, "chat") && upper === upper.toLowerCase(),
     "labels differing only in case get distinct lowercase prefixes");
-  // The real backends reject anything outside that charset, so an unsafe scope must
-  // fail at construction rather than on the first write.
+  // The real backends reject anything outside that charset, so an unsafe scope must fail
+  // at construction, not on the first write.
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
 
   const bounded = new MemoryFs(4, 2);
@@ -197,9 +196,8 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
 {
   const kp = testAuthor();
   const verify = (m) => verifyTestBundle(sodium, signTestBundle(sodium, kp, m));
-  // Refused BY NAME, like an unimplemented ABI: this is what a bundle written against the
-  // retired module-only format produces, so its author has to learn the rule rather than
-  // read "malformed manifest".
+  // A missing guest gets its own error instead of "malformed manifest", so the author
+  // learns the rule.
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
@@ -231,9 +229,9 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
   ok(typeof createGuestSeam({ ...base, requires: ALL_HOST_SERVICES }) === "function",
     "an explicit full service set is accepted");
 
-  // A guest reaches its own app's modules with NO grant: a bare name is the asking
-  // bundle's own code, scoped by the app the seam was wired for, so it resolves under
-  // an empty requires set exactly like `crypto`.
+  // A guest reaches its own app's modules without declaring them: a bare name is the
+  // calling bundle's own code, scoped to the app the seam was built for, so it resolves
+  // with an empty requires list, like `crypto`.
   const chat = new ModuleTable();
   const chatModules = await chat.build([{ name: "codec", wasm: withMax }]);
   const otherModules = await chat.build([{ name: "evil", wasm: withMax }]);
@@ -256,16 +254,15 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const enc = new TextEncoder();
   const noop = () => new Uint8Array();
 
-  // Construction has to be isolated from this runner: the regression shape blocks the
-  // thread forever when its guard is missing, so the parent kills a broken child instead
-  // of hanging the entire suite.
+  // Construction runs in a child process: without its guard the regression blocks the
+  // thread forever, so the parent kills a broken child instead of hanging the suite.
   const initProbe = spawnSync(process.execPath, [join(root, "tests/fixtures/guest-init-deadline.mjs")], {
     timeout: 3000, encoding: "utf8",
   });
   ok(initProbe.status === 0 && !initProbe.error,
     `top-level guest code is interrupted during realm construction (${initProbe.error?.message ?? initProbe.stderr.trim()})`);
 
-  // A holder that loops forever is interrupted rather than wedging the host thread.
+  // A guest that loops forever is interrupted instead of wedging the host thread.
   const spinner = await createSafeRealm({
     source: 'function handle() { for(;;){} }',
     hostCall: noop, deadlineMs: 300,
@@ -291,9 +288,9 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "an initiator parked past its handoff deadline is released");
   waiter.dispose();
 
-  // Invocations are serialized per realm: a holder invoked while an initiator is parked
-  // waits for it rather than interleaving, and then runs on a budget of its own rather
-  // than on what the initiator left (§12.3).
+  // Invocations are serialized per realm: a second invocation arriving while the first is
+  // waiting waits for it instead of interleaving, and then runs on its own budget, not on
+  // what the first left (§12.3).
   const order = [];
   const both = await createSafeRealm({
     source: 'async function handle(a) { if (a[0] === 1) { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); } return new Uint8Array([2]); }',
@@ -307,8 +304,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     `the queue runs them in acceptance order, never interleaved (got ${order.join(",")})`);
   both.dispose();
 
-  // The queue does not strand callers on dispose: one still in it fails rather than
-  // entering a torn-down realm, which is what aborts the whole wasm module.
+  // The queue does not strand callers on dispose: one still queued fails instead of
+  // entering a torn-down realm, which would abort the whole wasm module.
   const closing = await createSafeRealm({
     source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); }',
     hostCall: slowSeam, deadlineMs: 5000,
@@ -319,8 +316,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(await first === "failed", "a parked call is failed by dispose rather than left pending");
   ok(await queued === "failed", "and so is one still waiting in the queue");
 
-  // The default is a real number, so forgetting the field bounds the guest rather than
-  // unbounding it — the same posture as the seam gates above.
+  // The default is a real number, so omitting the field bounds the guest instead of
+  // leaving it unbounded, like the seam gates above.
   const defaulted = await createSafeRealm({ source: 'function handle() { for(;;){} }', hostCall: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
@@ -376,7 +373,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok((await reused).length === 0, "a settled id can be admitted again");
   duplicateIds.dispose();
 
-  // Reach the byte boundary with only eight calls, then prove the ninth is rejected before
+  // Reach the byte limit with only eight calls, then check the ninth is rejected before
   // the host seam receives another copied payload.
   const hostCallChunk = 2 * 1024 * 1024;
   const callsAtByteCap = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES / hostCallChunk;
@@ -405,7 +402,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "settled host calls release their per-realm byte accounting");
   byteBoundedCalls.dispose();
 
-  // Changing only the operation name cannot buy an accounting exemption.
+  // Changing only the operation name does not escape the accounting.
   const ordinaryHeld = [];
   const ordinaryCalls = await createSafeRealm({
     source: `function handle() {
@@ -426,35 +423,33 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
 console.log("\n§12.3 — a bounded realm count is what makes the node total a ceiling");
 {
-  // Every owner is per realm and none is pooled between realms: a shared allowance is a
-  // standing way for a busy app to refuse a quiet sibling's calls, and one realm's ceiling
-  // times a bound on realms reaches the same total without one. So the multiplication has
-  // to appear in the sum — otherwise each per-realm number is a floor that an install list
-  // nobody counts multiplies at will. This sum is where the node total lives: adding a
-  // node-scoped owner of admitted host memory means adding its term HERE, not just
-  // declaring its own constant.
-  const perRealm = DEFAULT_REALM_MEMORY_BYTES  // §12.3 — one confined guest heap
+  // Every allowance is per realm and none is shared between realms: a shared one would let
+  // a busy app starve a quiet one, and one realm's ceiling times the realm cap gives the
+  // same total without that. So the multiplication must appear in the sum, or the total
+  // would grow with every install. This sum is the node total: a new node-wide owner of
+  // host memory must add its term here, not just declare its own constant.
+  const perRealm = DEFAULT_REALM_MEMORY_BYTES  // §12.3: one confined guest heap
     + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES  // copied host-call inputs and their answers
     + 2 * (HOST_CALLER_ID.length + 4)           // one armed and one in-flight wake
-    + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3 — one bundle's aggregate module memory
+    + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3: one bundle's total module memory
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
-    + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6 — outbound socket queues, over every link
-    + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6 — native staging and the driver window hold the
-  // same read at once, by design (native/sock.go). WebRTC negotiation rides these same
-  // link windows (§12.7): it has no owner of its own to add.
+    + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6: outbound socket queues, over every link
+    + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6: native staging and the driver window can hold
+  // the same read at once (native/sock.go). WebRTC negotiation uses the same link windows
+  // (§12.7), so it adds nothing of its own.
     + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
-  // Not circular: the sum is measured against a real machine, so growing any owner has to
-  // be a deliberate choice rather than a number nobody added up.
+  // Measured against a real machine's memory, so growing any term has to be a deliberate
+  // choice.
   ok(nodeMemoryCeiling <= 2 * 1024 * 1024 * 1024,
     "the summed worst case of every node-scoped owner still fits a modest machine");
 }
 
 console.log("\n§12.3 — guest-created invocation roots have a bounded clock share");
 {
-  // Memory's total above is a standing quantity and really is a total. Time's is not: a
-  // peer or host can replace settled work immediately. A timer is different because it is
-  // the one fresh invocation root a guest creates ITSELF; calls descended from an existing
-  // root inherit its deadline. A second self-created root mechanism belongs in this sum.
+  // The memory total above is a real total. Time is not: a peer or the host can replace
+  // settled work immediately. A wake is different because it is the only new invocation a
+  // guest creates itself; calls descended from an existing invocation inherit its
+  // deadline. Any second way for a guest to create invocations belongs in this sum.
   ok(DEFAULT_MAX_APP_SLOTS * DEFAULT_GUEST_DEADLINE_MS <= 60_000,
     "every slot spending its banked invocation at once is a stall someone added up");
   ok(DEFAULT_MAX_APP_SLOTS / SELF_INITIATED_CLOCK_DIVISOR <= 1 / 2,
@@ -474,11 +469,11 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   active.release(2);
   ok(true, "terminal settlement releases request, response, id, and count together");
 
-  // A realm that dies with calls still parked releases them: nothing is left to consume
-  // those answers, and no handle survives that could release them later — so holding the
-  // charge would pin the realm's allowance on a backend that never answers. The two ways a
-  // realm can die (construction failure, dispose) are both checked, and a backend that
-  // settles afterwards must be a no-op, never a second release.
+  // A realm that dies with calls still pending releases them: nothing is left to consume
+  // those answers or release them later, so keeping the charge would pin the allowance on
+  // a backend that never answers. Both ways a realm can die (construction failure,
+  // dispose) are checked, and a backend that settles afterwards must be a no-op, never a
+  // second release.
   const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const timersBeforeFailedConstruction = liveTimers();
   let settleOrphan;
@@ -507,8 +502,8 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   // dispose() rejects this invocation; the caller holds the error, so consume it here.
   disposedWithParked.call(new Uint8Array()).catch(() => {});
   await sleep(20);
-  // The parked call's handoff deadline is host-side state exactly like its byte charge and
-  // dispose() must end both (§12.3), so the timer count is read either side of dispose.
+  // The pending call's handoff deadline is host-side state like its byte charge, and
+  // dispose() must end both (§12.3), so the timer count is read before and after dispose.
   const armedAtDispose = liveTimers();
   disposedWithParked.dispose();
   ok(armedAtDispose > 0 && liveTimers() < armedAtDispose,
@@ -518,8 +513,8 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   settleAtDispose(new Uint8Array());
   afterFailure.dispose();
 
-  // Fast serialized calls share one retained wake rather than crossing the host timer seam
-  // per invocation, and disposal still clears it at once (realm-queue.ts).
+  // Fast serialized calls share one retained timer instead of crossing the host timer
+  // seam per invocation, and disposal still clears it at once (realm-queue.ts).
   const nativeSetTimeout = globalThis.setTimeout;
   const nativeClearTimeout = globalThis.clearTimeout;
   let deadlineArms = 0, deadlineClears = 0;
@@ -571,16 +566,16 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
     "an expired queue entry never draws a fresh realm segment");
   gates.shift()();
   await thirdInvocation;
-  // Queue depth is derived from bounded upstream owners, while payload bytes remain
-  // charged to those owners rather than counted or copied again here.
+  // Queue depth is bounded by the upstream owners, and payload bytes stay charged to
+  // those owners instead of being counted or copied again here.
   const large = queued(new Uint8Array(32 * 1024 * 1024));
   await sleep(0);
   gates.shift()();
   ok((await large).length === 32 * 1024 * 1024,
     "the entry queue borrows bytes already charged to the initiating owner");
-  // The RUNNING entry's deadline frees the realm, not just its caller: `cancel` rejects the
-  // invocation, which is what the queue waits on, so a wedged answer cannot hold the realm
-  // past the budget it was admitted under and the entry behind it still runs.
+  // The running entry's deadline frees the realm, not just its caller: `cancel` rejects
+  // the invocation the queue waits on, so a wedged answer cannot hold the realm past its
+  // budget, and the entry behind it still runs.
   const wedged = queued(Uint8Array.of(9), 25);
   await sleep(0);
   const behind = queued(Uint8Array.of(10), 500);
@@ -650,10 +645,10 @@ console.log("\nOne replaceable wake and one in-flight notification per realm");
 
 console.log("\n§12.3 — a realm's self-initiated work is paced by its share of the node's clock");
 {
-  // Re-arming at ms=0 from inside the timer entrypoint: the one fresh invocation root a guest
-  // creates itself, each fire taking a fresh full budget (§12.3). Scaled down so the RATIO is
-  // under test, and run at a divisor of 1 as its own control — there a busy table earns back
-  // exactly what it spends, which is the unpaced behaviour this replaced.
+  // Re-arming at ms=0 from inside the wake: the only new invocation a guest creates itself,
+  // each with a full budget (§12.3). Scaled down so the ratio is what is tested, with a
+  // divisor of 1 as the control, where a busy realm earns back exactly what it spends
+  // (unpaced).
   const budgetMs = 40, occupyMs = 20, spinForMs = 400;
   const spin = async (clockDivisor) => {
     let fires = 0;
@@ -661,8 +656,8 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     table = createRealmTimers((_body, causalClock) => {
       fires += 1;
       table.arm(0);
-      // Stand in for the realm's execution report. Burn real time too, so divisor 1 is
-      // the control where execution spend and concurrent credit accrual cancel exactly.
+      // Stand in for the realm's execution report. Burn real time too, so at divisor 1
+      // execution spend and concurrent credit cancel exactly.
       const started = performance.now();
       while (performance.now() - started < occupyMs) { /* guest is computing */ }
       causalClock.charge(performance.now() - started);
@@ -707,12 +702,12 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   ok(waitingFires === 2, "clock credit earned during I/O admits the successor promptly after settlement");
   waiting.clearAll();
 
-  // Host compute is execution too, and it is the half no guest segment is open to see: a
-  // body that only calls host services parks between every one of them. The seam times the
-  // SYNCHRONOUS span of each handler, so libsodium's work lands on the root while an I/O
-  // name — whose promise is already back — bills nothing, and there is no list of which
-  // names are which. A verify that FAILS still did the work, hence the measurement is in
-  // `finally`: otherwise a re-arm loop of deliberately bad signatures would be free.
+  // Host compute counts as execution too, and no guest segment sees it: a body that only
+  // calls host services waits between each call. The seam times the synchronous part of
+  // each handler, so libsodium's work is billed while an I/O name (whose promise returns at
+  // once) bills nothing, with no list of which names are which. A failed verify still did
+  // the work, so the measurement is in `finally`; otherwise a re-arm loop of bad
+  // signatures would be free.
   {
     const burnMs = 15;
     const burningSodium = Object.create(sodium);
@@ -750,10 +745,10 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       `a host name that round-trips bills only its dispatch (${io.spent().toFixed(1)}ms)`);
   }
 
-  // The inverse escape is returning before descendant work: await once (so lineage must
-  // survive settlement), call a second realm without awaiting it, and let that callee
-  // launch module-like work without awaiting that either. The late charge must still land
-  // on the timer root after both entrypoints have already answered.
+  // The opposite escape is returning before descendant work finishes: await once (so the
+  // clock must survive settlement), call a second realm without awaiting it, and let that
+  // callee start module-like work without awaiting that either. The late charge must still
+  // reach the wake's clock after both entrypoints have answered.
   let moduleCharged;
   const callee = await createSafeRealm({
     source: 'function handle() { void host.call("work", new Uint8Array()); return new Uint8Array(); }',
@@ -796,9 +791,9 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 {
-  // A bound can be declared on every interface between the operator and the realm and be
-  // passed by none of them, so this boots a node onto a stub realm factory and asserts the
-  // numbers arrive. No transport, so nothing here may reach `link`.
+  // A bound can be declared on every interface between the operator and the realm and
+  // still not be passed through, so this boots a node on a stub realm factory and checks
+  // the numbers arrive. No transport, so nothing here may require `link`.
   const kp = testAuthor();
   const guestSrc = 'function handle() { return new Uint8Array([1]); }';
   const guestBytes = new TextEncoder().encode(guestSrc);
@@ -827,9 +822,9 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const probe = await shell.install(blob, {
     localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
   });
-  // Every load after this one is an upgrade of this same slot — a load only ever takes a
-  // FREE label — and a replacement carries per-load config and bounds exactly as a
-  // first install does, which is the whole subject below.
+  // Every install after this one replaces this same slot (an install without `replaces`
+  // only takes a free label), and a replacement takes per-install config and bounds just
+  // like a first install, which is what is tested below.
   const reload = (loadOpts) => shell.install(blob, { ...loadOpts, replaces: probe.manifest.app });
   await probe.invoke(new Uint8Array());
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
@@ -837,8 +832,8 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
   ok(!seen[0]?.ownTurns, "an app's turns stay on its callers' clocks; only the link occupant's are its own");
 
-  // HOST, APP and LOCAL are three provenance-preserving values, not one host-side merge:
-  // what the runtime admits, what the author signed, what the operator set for this load.
+  // HOST, APP and LOCAL are three separate values, not one merge: what the runtime
+  // provides, what the author signed, and what the operator set for this install.
   // Evaluate only the three generated preamble lines (the guest body is self-contained).
   const valuesFrom = (source) => Function(
     source.split("\n").slice(0, 3).join("\n") + "\nreturn [APP, LOCAL, HOST];",
@@ -850,7 +845,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(Object.hasOwn(app, "__proto__") && app.__proto__.kept === "data" && Object.getPrototypeOf(app) === Object.prototype,
     "JSON config preserves an own __proto__ key as data");
 
-  // A second load receives no residue from the first load's LOCAL value.
+  // A second install gets nothing from the first install's LOCAL value.
   await reload();
   const [appAgain, localAgain] = valuesFrom(seen[1].source);
   ok(appAgain.mode === "signed" && Object.keys(localAgain).length === 0,
@@ -858,16 +853,16 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen[1]?.memoryLimitBytes === 7 * 1024 * 1024 && seen[1]?.deadlineMs === 1234,
     "a load naming no bounds of its own falls back to the shell's");
 
-  // …and a load that names them OVERRIDES the shell's, which is the point of their being
-  // per load: one shell hosts unrelated apps, and the heap a storage guest needs is not the
-  // heap the transport bundle beside it should be handed.
+  // An install that sets them overrides the shell's, which is why they are per install:
+  // one shell hosts unrelated apps, and a storage guest needs a different heap from the
+  // transport bundle beside it.
   await reload({ realmMemoryBytes: 9 * 1024 * 1024, guestDeadlineMs: 77 });
   ok(seen.at(-1)?.memoryLimitBytes === 9 * 1024 * 1024, "a load's own realmMemoryBytes overrides the shell's");
   ok(seen.at(-1)?.deadlineMs === 77, "a load's own guestDeadlineMs overrides the shell's");
   // A bound the two engines would read differently is refused where it is resolved, for
-  // one load and the node's defaults alike: a heap limit that truncates to 0 (or is NaN)
-  // is no limit to the JS engine and a refused realm natively, 2^32 and up wraps on JS, and
-  // a budget under 1 ms is none natively and a refused realm on JS.
+  // one install and the node's defaults alike: a heap limit that truncates to 0 (or is NaN)
+  // is no limit on JS and a refused realm on native, 2^32 and up wraps on JS, and a budget
+  // under 1 ms is no budget on native and a refused realm on JS.
   const realmsBefore = seen.length;
   for (const bad of [0, 0.5, NaN, -1, 2 ** 32]) {
     await rejects(reload({ realmMemoryBytes: bad }), `a load's realmMemoryBytes of ${bad} is refused`);
@@ -885,8 +880,8 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const cyclic = {}; cyclic.self = cyclic;
   await rejects(reload({ localConfig: cyclic }),
     "a non-JSON local value is refused instead of being silently changed during injection");
-  // Both channels are OBJECTS. A guest reads config by name, so a scalar or array would
-  // make every `LOCAL.x` read `undefined` at run time rather than fail at the load.
+  // Both config values are objects. A guest reads config by name, so a scalar or array
+  // would make every `LOCAL.x` read `undefined` at run time instead of failing the install.
   await rejects(reload({ localConfig: [1, 2] }),
     "a JSON array is refused as local config — a guest reads config by name");
   await rejects(reload({ localConfig: 7 }),
@@ -903,17 +898,17 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
       "a signed guest.config that is not a JSON object is a refused manifest");
   }
 
-  // §12.5 — uninstalling a GUEST-ONLY app reports success. An app is its modules and
-  // its realm, and this bundle legitimately declares no modules at all, so a count of
-  // dropped modules is the wrong answer to "was there anything here".
+  // §12.5: uninstalling a guest-only app reports success. An app is its modules and its
+  // realm, and this bundle declares no modules at all, so a count of dropped modules would
+  // wrongly say nothing was there.
   ok(shell.uninstall("probe") === true,
     "uninstalling a guest-only app reports success, not 'nothing there'");
   ok(shell.uninstall("probe") === false,
     "uninstalling it twice reports nothing the second time");
   shell.close();
 
-  // Omitted ⇒ the SHARED defaults arrive at the seam (host/wasm-limits.ts), not undefined
-  // and not "unbounded". The shell resolves them so no factory owns the numbers.
+  // When omitted, the shared defaults arrive at the seam (host/wasm-limits.ts), not
+  // undefined and not unbounded. The shell resolves them so no factory owns the numbers.
   let seen2 = null;
   const { shell: bare } = await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
@@ -928,16 +923,16 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   await bareProbe.invoke(new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
-  // The budgets a guest is measured against are TOLD to it (the `HOST` preamble), so an app
-  // can window its own fan-out to them instead of discovering them by being refused.
+  // The budgets a guest is measured against are passed to it (the `HOST` preamble), so an
+  // app can pace its own fan-out instead of discovering them by being refused.
   const advertised = Function(
     seen2.source.split("\n").slice(0, 3).join("\n") + "\nreturn HOST;",
   )();
   ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   "the realm's host-call budget is advertised to the guest, not only enforced against it");
-  // …and so is the node's public key: the keypair `node/sign` signs with, as hex, so what a
-  // guest publishes as its node and what its signatures verify under cannot disagree.
+  // So is the node's public key, as hex: the key `node/sign` signs with, so what a guest
+  // publishes as its node and what its signatures verify under cannot disagree.
   ok(advertised.identity === toHex(kp.ed.publicKey),
     "HOST.identity is the node's public key, the one node/sign signs with");
   bare.close();
@@ -963,9 +958,8 @@ console.log("\n§12.6 — host socket send queues are bounded");
     const { linkId } = raw.open("test");
     return {
       send: (bytes) => raw.send(linkId, bytes),
-      // Observe the adapter directly. Its backlog is no longer guest-visible: the host
-      // owner still uses it for custody reconciliation, but transport content has no
-      // `link/stat` clock to rebuild deadlines from.
+      // Observe the adapter directly. Its backlog is not visible to the guest; only the
+      // host uses it for outbound accounting.
       buffered: () => {
         try { return channel.buffered?.() ?? 0; } catch { return 0; }
       },
@@ -973,10 +967,9 @@ console.log("\n§12.6 — host socket send queues are bounded");
       close: () => driver.close(),
     };
   };
-  // A transport that never becomes writable — the state an unfinished connect leaves a
-  // channel in. Until `open` fires, everything written is HOST memory spent by a peer that
-  // has proved nothing, so the queue a handshake frame or two needs must not be a place an
-  // occupant can put a megabyte per stalled socket.
+  // A transport that never becomes writable, as with an unfinished connect. Until `open`
+  // fires, everything written is host memory spent on a peer that has proved nothing, so
+  // the queue a handshake frame or two needs must not hold a megabyte per stalled socket.
   const sent = [];
   let closed = false;
   const stuck = {
@@ -995,8 +988,8 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(owned.buffered() === MAX_OUTBOUND_QUEUE_BYTES,
     `the link owner reports pre-open bytes (got ${owned.buffered()})`);
   owned.send(frame);
-  // Failed, not silently trimmed: dropping a frame off an ordered stream leaves the far end
-  // waiting on a gap forever, where a dead channel is one the occupant is told about.
+  // Failed, not silently trimmed: dropping a frame from an ordered stream leaves the far
+  // end waiting on a gap forever, while a dead channel is reported to the occupant.
   ok(!died && closed, "crossing the ceiling closes the adapter instead of growing the queue");
   ok(owned.buffered() === 0, "a failed link releases its queue rather than holding it to be collected");
 
@@ -1016,7 +1009,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
   };
 
   // Once open, the platform's own queue is host memory too. Exactly the byte window is
-  // accepted; the next whole ordered message fails the link rather than being dropped.
+  // accepted; the next message fails the link instead of being dropped.
   const byBytes = openedChannel();
   const block = new Uint8Array(1 << 20);
   for (let n = block.length; n <= MAX_OUTBOUND_QUEUE_BYTES; n += block.length) {
@@ -1028,8 +1021,8 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(byBytes.channel.closed() && byBytes.transport.closed,
     "crossing the outbound byte ceiling closes and releases the link");
 
-  // A byte cap alone admits millions of one-byte message objects. The independent count
-  // ceiling bites while the byte total is still tiny.
+  // A byte cap alone allows millions of one-byte message objects. The separate count
+  // ceiling applies while the byte total is still tiny.
   const byCount = openedChannel();
   for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) byCount.channel.send(Uint8Array.of(i));
   ok(!byCount.failed() && byCount.channel.buffered() < MAX_OUTBOUND_QUEUE_BYTES,
@@ -1038,9 +1031,9 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(byCount.channel.closed() && byCount.transport.closed,
     "crossing the outbound slice ceiling closes and releases the link");
 
-  // Slices retire as the drained PREFIX, not all at once at an empty queue. The count is
-  // shared node-wide, so a link that stays busy and never reaches an idle instant would
-  // otherwise hold it at its high-water mark until the socket closed.
+  // Writes are released as a drained prefix, not all at once when the queue empties. The
+  // count is shared node-wide, so a busy link that never goes idle would otherwise hold it
+  // at its high-water mark until the socket closed.
   const half = MAX_OUTBOUND_QUEUE_SLICES / 2;
   const drain = openedChannel();
   for (let i = 0; i < MAX_OUTBOUND_QUEUE_SLICES; i++) drain.channel.send(Uint8Array.of(1));
@@ -1082,8 +1075,8 @@ console.log("\n§12.6 — host socket send queues are bounded");
     "the node allowance prevents individually legal links multiplying retained bytes");
   parentDriver.close();
 
-  // Node reports its platform backlog to the same link owner. A connect cannot progress while
-  // this synchronous loop runs, which makes both exact boundaries deterministic without
+  // Node reports its platform backlog to the same link owner. A connect cannot progress
+  // while this synchronous loop runs, so both exact boundaries are deterministic without
   // depending on a peer or on kernel socket-buffer sizes.
   const nodeLink = () => {
     const link = new NodeChannelFactory().connect("tcp://127.0.0.1:1");
@@ -1108,14 +1101,12 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(nodeCount.closed(),
     "the link owner destroys Node's socket before accepting a write past the count ceiling");
 
-  // `RawLink.buffered` is a required member of the contract (socket-seam.ts). An adapter
-  // reporting 0 ASSERTS it retains nothing; one whose call throws — or, since a JS double
-  // is not type-checked, is missing entirely — asserts nothing at all, and the two must not
-  // read alike. Reading "cannot say" as 0 would release this link's charge and the node's
-  // while the platform still holds the bytes, which is the uncharged interval this owner
-  // exists to rule out; freezing the accounting instead would strangle a healthy link at
-  // its cumulative ceiling. The link fails on the write instead, and only that teardown
-  // releases — a destroyed socket really has dropped what it held.
+  // An adapter whose `RawLink.buffered` returns 0, or that has none (socket-seam.ts),
+  // states it retains nothing; one whose call throws says nothing at all, and the two must
+  // not be treated alike. Reading "cannot say" as 0 would release this link's charge and
+  // the node's while the platform still holds the bytes; freezing the accounting instead
+  // would choke a healthy link at its cumulative ceiling. The link fails on the write, and
+  // only that teardown releases, since a destroyed socket has dropped what it held.
   let silentClosed = false, silentWrote = 0;
   const silent = ownedChannel({
     stream: true, send: () => { silentWrote++; }, onData: () => {}, onClose: () => {},
@@ -1140,11 +1131,10 @@ console.log("\n§12.6 — host socket send queues are bounded");
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
-  // The catalog calls `timer` an app service (services/domains.ts), so what is under test is
-  // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring it
-  // off the transport driver would admit such an app and then fail it at its first
-  // `host.call` — a manifest install accepted naming a backend nothing wired. Which
-  // deadline is due is the guest's own state, never a host-side id.
+  // `timer` is an ordinary host service (services/domains.ts), so this tests that an
+  // ordinary app gets it: no transport bundle is installed below. If it were wired off the
+  // transport driver, such an app would install and then fail at its first `host.call`.
+  // Which deadline is due is the guest's own state, never a host-side id.
   const kp = testAuthor();
   const guestSrc = `
     let fired = [], armedId = null;
@@ -1177,8 +1167,8 @@ ${guestOpFraming()}
     };
     return signTestBundle(sodium, kp, manifest, guestBytes);
   };
-  // `fs: false` said rather than omitted: these bundles declare no `fs` cap, and the
-  // in-memory default would hand this node a backend it is not meant to have.
+  // `fs: false` explicitly: these bundles do not require `fs`, and the in-memory default
+  // would give this node a backend it does not need.
   const newShell = async () => (await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
@@ -1188,9 +1178,8 @@ ${guestOpFraming()}
 
   const shell = await newShell();
   const ticker = await shell.install(mkBlob(["timer"]));
-  // The op frame is this app's own format (its `handle` reads it); the invoke below
-  // passes bytes the shell never interprets. Same `writeOp` the guest's inlined block
-  // reads back, from the one definition of it.
+  // The op frame is this app's own format (its `handle` reads it); the shell never
+  // interprets the bytes. The same `writeOp` whose reader the guest inlines.
   const opInput = (op, p = new Uint8Array(0)) => writeOp(op, p);
   await ticker.invoke(opInput("arm", new Uint8Array([7, 5])));    // arm: id 7, in 5ms
   await sleep(80);
@@ -1198,7 +1187,7 @@ ${guestOpFraming()}
   ok(fired.length === 1 && fired[0] === 7,
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
-  // Re-arming replaces the deadline rather than adding one, and `clear` takes it back.
+  // Re-arming replaces the deadline instead of adding one, and `clear` cancels it.
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
   await ticker.invoke(opInput("clear", new Uint8Array([9])));
@@ -1207,8 +1196,8 @@ ${guestOpFraming()}
   ok(after.length === 1, `a cleared wake does not fire, and repeated arms replace it (got [${[...after]}])`);
   shell.close();
 
-  // The gate is still the manifest: a bundle that did not declare `timer` is refused by
-  // NAME at the seam, not handed a table because the shell has one to give.
+  // The manifest still decides: a bundle that did not declare `timer` is refused by name
+  // at the seam, even though the shell has timers.
   const ungated = await newShell();
   const ungatedApp = await ungated.install(mkBlob([]));
   let refused = false;
@@ -1216,10 +1205,10 @@ ${guestOpFraming()}
   ok(refused, "an undeclared timer service is refused at the seam, wired backend or not");
   ungated.close();
 
-  // Uninstall CANCELS: a pending setTimeout holds a callback that re-enters the realm, so
-  // one outliving its realm is a call into a freed QuickJS context (§12.3) rather than an
-  // error. Through a stub realm, since what must be observed is the entrypoint NOT being
-  // invoked — which a real realm would report only by crashing, or not at all.
+  // Uninstall cancels: a pending setTimeout holds a callback that re-enters the realm, so
+  // one outliving its realm would call into a freed QuickJS context (§12.3). Uses a stub
+  // realm, since what must be observed is the entrypoint not being invoked, which a real
+  // realm would show only by crashing, or not at all.
   let armed = null;
   const entries = [];
   const { shell: stub } = await bootShell({
@@ -1240,7 +1229,7 @@ ${guestOpFraming()}
   });
   const stubApp = await stub.install(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
-  // Arm through the very seam the realm was handed, then drop the app underneath it.
+  // Arm through the seam the realm was given, then uninstall the app.
   const pending = new Uint8Array([0, 0, 0, 5]);
   await armed("timer/arm", pending, new CallBudget(Infinity, undefined, undefined));
   ok(stub.uninstall("ticker") === true, "the app uninstalls with a deadline still pending");
@@ -1249,12 +1238,11 @@ ${guestOpFraming()}
   stub.close();
 }
 
-// ── §12.2 — the host's one caller id is matched whole, never by prefix ──────────
-// There is exactly ONE host caller id — 32 zero bytes — matched over the WHOLE 32 bytes.
-// Every other caller id is a hashed app label or a peer key: facts their authors pick, so
-// ANY byte of it is grindable (~256 tries per byte). A reader stopping at the first zero
-// byte would hand the "host proper" verdict to whoever wants it, so the match runs the
-// whole prefix rather than a shortcut over its lead byte.
+// ── §12.2: the host's caller id is matched whole, never by prefix ──────────
+// There is one host caller id, 32 zero bytes, matched over all 32 bytes. Every other
+// caller id is a hashed app label or a peer key, which their owners choose, so any byte
+// can be ground (~256 tries per byte). A reader checking only a prefix would let anyone
+// pass as the host, so the match covers all 32 bytes.
 console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not by its prefix");
 {
   const body = new Uint8Array([9, 9, 9, 9]);
@@ -1262,15 +1250,15 @@ console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not b
 
   // This test app's reader; the host contributes only the 32-byte attribution prefix.
   ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
-  // A near-miss on the host id is not the host: one late bit is all it takes.
+  // A near-miss on the host id is not the host: one bit in the last byte is enough.
   const nearHost = new Uint8Array(32); nearHost[31] = 1;
   ok(!callerOf(withCaller(nearHost)).fromHost, "a caller id that is zero but for its last byte is not the host");
   const leadingZero = new Uint8Array(32); leadingZero[31] = 0xff; // zero everywhere but the LAST byte
   ok(!callerOf(withCaller(leadingZero)).fromHost,
     "a caller id that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
 
-  // The transport assembler injects the canonical generated reader into its signed source.
-  // Evaluate that assembled source rather than restating the reader in this test.
+  // The transport build injects the generated reader into its signed source. Evaluate that
+  // assembled source instead of copying the reader into this test.
   const transportSrc = readGuestSource(guestOpFraming());
   const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(transportSrc);
   ok(m !== null, "the transport assembler injected the canonical callerOf");

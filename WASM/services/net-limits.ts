@@ -1,12 +1,12 @@
 // Driver bounds (§12.6). Host-owned: the socket side of a link, never its framing.
-/** Hard cap on one read handed to the link occupant, refused before it is copied into a
- *  realm. A platform-framed transport's frame cap must fit under it. The unit the windows
- *  below are sized in. */
+/** Hard cap on one read handed to the link occupant, checked before it is copied into a
+ *  realm. A platform-framed transport's frame cap must fit under it. The windows below
+ *  are sized in multiples of it. */
 export const MAX_LINK_READ_BYTES = 2 * 1024 * 1024; // 2 MiB
 
-/** Inbound bytes one driver admits across dispatched and held reads, driver-wide rather
- *  than per link. Native applies it again to reads staged toward QuickJS, so its bound is
- *  2× (§12.6); there a full window stalls the reader, here it fails the arriving link.
+/** Inbound bytes one driver admits across dispatched and held reads, for the whole driver,
+ *  not per link. Native applies it again to reads staged toward QuickJS, so its bound is
+ *  2x (§12.6); there a full window stalls the reader, here it fails the arriving link.
  *  Seedstore's holder ingest bench, the worst case, peaks at ~6 MiB. */
 export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_LINK_READ_BYTES;
 

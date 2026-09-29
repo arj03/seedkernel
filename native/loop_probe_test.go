@@ -9,13 +9,12 @@ import (
 	"seedkernel/qjs"
 )
 
-// TestQjsPumpModel is the gate for the whole Go-owned async design. It verifies the two
-// facts the event loop relies on:
+// TestQjsPumpModel checks the two facts the Go-owned event loop relies on:
 //
-//  1. Invoke (QJS_Call) does NOT run the job queue — a microtask queued during an
-//     invoked JS callback stays pending afterwards.
-//  2. Pump DOES run it, draining that pending microtask, and returns promptly: the
-//     engine has no timers or I/O of its own, so the drain has nothing to wait on.
+//  1. Invoke (QJS_Call) does not run the job queue: a microtask queued during an invoked
+//     JS callback stays pending afterwards.
+//  2. Pump does run it, draining that pending microtask, and returns promptly: the engine
+//     has no timers or I/O of its own, so the drain has nothing to wait on.
 func TestQjsPumpModel(t *testing.T) {
 	rt, err := qjs.New()
 	if err != nil {
@@ -31,7 +30,7 @@ func TestQjsPumpModel(t *testing.T) {
 		t.Fatal("setup:", err)
 	}
 
-	// Call kick() via Invoke — this queues a microtask but must NOT run it.
+	// Call kick() via Invoke: this queues a microtask but must not run it.
 	kick := c.Global().GetPropertyStr("kick")
 	if _, err := c.Invoke(kick, c.Global()); err != nil {
 		t.Fatal("invoke kick:", err)
@@ -51,10 +50,10 @@ func TestQjsPumpModel(t *testing.T) {
 	}
 }
 
-// Node ends the process on a rejection nothing handles, and the shell is the same TS on
-// both targets, so the native loop fails the same way: the await driving it returns the
-// rejection, and main exits with it. A rejection handled before the queue drains is not
-// one, and the failure is reported once rather than inherited by the next await.
+// Node ends the process on an unhandled rejection, and the shell is the same TS on both
+// targets, so the native loop fails the same way: the await driving it returns the
+// rejection, and main exits with it. A rejection handled before the queue drains does not
+// count, and the failure is reported once, not inherited by the next await.
 func TestUnhandledRejectionFailsTheAwait(t *testing.T) {
 	bootRealm(t)
 	if _, err := callRealm(`(async () => {
@@ -80,17 +79,16 @@ func TestUnhandledRejectionFailsTheAwait(t *testing.T) {
 	}
 }
 
-// The host realm's monotonic clock must answer FRACTIONAL milliseconds, as Node and the
-// browsers do. The guest seam meters host compute by the distance across one synchronous
-// handler (host/guest-seam.ts), and an ed25519 verify does not last a whole millisecond:
-// a truncating clock would read every one of them as free, and with it a timer re-arm
-// loop built out of them (§12.3). Nothing else fails if this regresses, so it is asserted
-// here rather than left to a pacing test that would still pass at zero.
+// The host realm's monotonic clock must return fractional milliseconds, as Node and the
+// browsers do. The guest seam measures host compute across one synchronous handler
+// (host/guest-seam.ts), and an ed25519 verify takes less than a millisecond: a truncating
+// clock would count every one as free, and with it a wake re-arm loop built from them
+// (§12.3). Nothing else fails if this regresses, so it is checked here.
 func TestHostClockIsSubMillisecond(t *testing.T) {
 	bootRealm(t)
 	// Two readings around a busy wait far shorter than a millisecond. Whole-ms truncation
-	// answers "0" for the difference on all but the unlucky reading that straddles a tick,
-	// so the loop retries: one fractional reading is proof, many zeroes are not.
+	// gives "0" for the difference except when a reading straddles a tick, so the loop
+	// retries: one fractional reading is enough, many zeroes are not.
 	got := evalString(t, `(() => {
 	  for (let attempt = 0; attempt < 100; attempt++) {
 	    const started = performance.now();
@@ -105,12 +103,12 @@ func TestHostClockIsSubMillisecond(t *testing.T) {
 	}
 }
 
-// TestAwaitIgnoresStaleSettle covers the one way a finished await can still reach into the
-// next one. __settle is installed once and outlives the await that wrote it, and the
-// loop's timer heap is shared across awaits — so the promise of a timed-out call can resolve
-// during a *later* await and, before awaitGen tokens, would settle that await with the
-// previous call's result. The first await here abandons a 300ms promise after 60ms; the
-// second runs long enough (500ms) for that promise to land inside it.
+// TestAwaitIgnoresStaleSettle covers the one way a finished await can affect the next one.
+// __settle is installed once and outlives the await that wrote it, and the loop's timer
+// heap is shared across awaits, so the promise of a timed-out call can resolve during a
+// later await; without awaitGen it would settle that await with the previous call's
+// result. The first await here abandons a 300ms promise after 60ms; the second runs long
+// enough (500ms) for that promise to resolve inside it.
 func TestAwaitIgnoresStaleSettle(t *testing.T) {
 	ensureBooted(t)
 
@@ -131,9 +129,10 @@ func TestAwaitIgnoresStaleSettle(t *testing.T) {
 	}
 }
 
-// TestLoopTimerRunsDuringTaskBacklog pins timer fairness against a queue that never empties:
-// a streaming peer re-posts each delivery as the loop drains the last, so step() must take
-// only the tasks queued when its drain began, or the timers wait until the producers pause.
+// TestLoopTimerRunsDuringTaskBacklog checks timer fairness against a queue that never
+// empties: a streaming peer posts each delivery as the loop drains the last, so step() must
+// take only the tasks queued when its drain began, or the timers wait until the producers
+// pause.
 func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
 	rt, err := qjs.New()
 	if err != nil {
@@ -168,9 +167,9 @@ func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
 	}
 }
 
-// TestLoopTaskRunsDuringZeroDelayTimers is the mirror image: a callback that re-arms itself
-// at zero delay — as a guest can re-arm a 0 ms wake from inside its own fire — must not keep
-// the timer phase running, just as Node's never runs a timer armed during it.
+// TestLoopTaskRunsDuringZeroDelayTimers is the reverse: a callback that re-arms itself at
+// zero delay (as a guest can re-arm a 0 ms wake from inside its own wake) must not keep the
+// timer phase running, just as Node never runs a timer armed during that phase.
 func TestLoopTaskRunsDuringZeroDelayTimers(t *testing.T) {
 	rt, err := qjs.New()
 	if err != nil {

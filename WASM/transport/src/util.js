@@ -1,5 +1,5 @@
-// Byte, hex and UTF-8 helpers and the seam's argument codec; pure transforms. First in
-// the concatenation, so its "use strict" leads the signed program.
+// Byte, hex and UTF-8 helpers and the seam's argument codec. First in the concatenation,
+// so its "use strict" starts the signed program.
 
 "use strict";
 
@@ -47,7 +47,7 @@ function fromHex(s) {
   return out;
 }
 
-/** Lexicographic byte-array compare (−1 / 0 / 1). */
+/** Lexicographic byte-array compare (-1 / 0 / 1). */
 function bytesCompare(a, b) {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) { if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; }
@@ -96,7 +96,7 @@ function argU32(v) {
   writeU32BE(b, 0, v);
   return b;
 }
-/** `[u32 fields][u8 fields][raw tail]` — each op's own fixed order. */
+/** `[u32 fields][u8 fields][raw tail]`, in each op's fixed order. */
 function args(u32s, u8s, tail) {
   const parts = [];
   for (const v of u32s) parts.push(argU32(v));
@@ -108,7 +108,7 @@ function args(u32s, u8s, tail) {
 // ── inbound argument decoding ─────────────────────────────────────────────────
 
 // Each op reads its own fixed field order: u32 BE, u8, and blobs as `[len u32 BE][bytes]`.
-// The host's twin is transport-host.ts `Args`.
+// The host's writer is `OpArgs` (services/op-frame.ts).
 function Reader(b) {
   this.b = b;
   this.off = 0;

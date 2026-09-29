@@ -7,14 +7,13 @@ import (
 	"testing"
 )
 
-// TestHostConsoleReachesStderr covers a platform facility the engine lacks: quickjs-ng
-// defines no `console`, while shared host code logs through one — not least from the
-// `.catch` handler that reports a wedged transport. host/native-polyfills.ts supplies
-// console over `bridge.log`.
+// TestHostConsoleReachesStderr covers something the engine lacks: quickjs-ng defines no
+// `console`, while shared host code logs through one (for example the `.catch` handler
+// that reports a wedged transport). host/native-polyfills.ts supplies console over
+// `bridge.log`.
 //
-// Asserted on stderr rather than on the bridge function, because *which* stream it lands
-// on is the property: stdout carries `--op`'s raw response bytes, which a diagnostic
-// mixed in would corrupt.
+// Checked on stderr, not on the bridge function, because the stream is what matters:
+// stdout carries `--op`'s raw response bytes, which a diagnostic would corrupt.
 func TestHostConsoleReachesStderr(t *testing.T) {
 	bootRealm(t)
 	for _, method := range []string{"log", "error", "warn", "info", "debug"} {

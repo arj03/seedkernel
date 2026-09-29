@@ -1,8 +1,8 @@
-// The few Web globals the shared host code assumes and quickjs-ng does not provide — the
-// native HOST realm's, and only its: browser and Node have all of them, and a confined guest
-// realm holds ECMAScript intrinsics on every target, these not among them (§12.3).
+// The Web globals the shared host code uses that quickjs-ng lacks, for the native host
+// realm only. Browser and Node have them all, and guest realms get only ECMAScript
+// intrinsics on every target (§12.3).
 //
-// FIRST in the native host bundle, so the globals exist before any module reaches for one at load
+// First in the native host bundle, so the globals exist before any module uses one at load
 // time (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
 
 /** The one `bridge` member this file uses (native-shim.ts declares the whole of it). */
@@ -12,11 +12,10 @@ const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; consol
 
 if (web.TextEncoder === undefined) {
   web.TextEncoder = class TextEncoder {
-    // Written straight into a typed array rather than pushed byte-by-byte into a plain one
-    // and converted at the end. Three bytes per UTF-16 code unit is the ceiling — a
-    // surrogate pair is two units and four bytes — plus one for the single case that beats
-    // it: a lone high surrogate in the final position consumes one unit and still writes
-    // four. That can happen once, because it ends the loop.
+    // Writes straight into a typed array sized for the worst case: three bytes per UTF-16
+    // code unit (a surrogate pair is two units, four bytes), plus one because a lone high
+    // surrogate in the last position takes one unit and writes four. That can only happen
+    // once, since it ends the loop.
     encode(input: string): Uint8Array {
       const s = String(input);
       const out = new Uint8Array(s.length * 3 + 1);
@@ -42,10 +41,9 @@ if (web.TextEncoder === undefined) {
 }
 
 if (web.TextDecoder === undefined) {
-  // Code units per String.fromCharCode call. This is the ONLY decoder the native target
-  // has — it reads every manifest, every guest source and every fs listing — so the batch
-  // is what keeps it from building those strings one concatenation per character. Well
-  // under any engine argument limit, since a batch is spread as arguments.
+  // Code units per String.fromCharCode call. This is the native target's only decoder
+  // (every manifest, guest source and fs listing goes through it), and batching avoids
+  // one string concatenation per character. Well under any engine's argument limit.
   const CHUNK = 4096;
   web.TextDecoder = class TextDecoder {
     decode(buf?: ArrayBuffer | ArrayLike<number>): string {
@@ -72,19 +70,18 @@ if (web.TextDecoder === undefined) {
   };
 }
 
-// console — quickjs-ng defines none, and shared host code logs through one, not least from
-// the handler that reports a wedged transport guest. Everything goes to STDERR through
+// console: quickjs-ng defines none, and shared host code logs through it (for example
+// when reporting a wedged transport guest). Everything goes to stderr through
 // `bridge.log`, because stdout carries the app's raw response bytes for --op.
 {
   const show = (a: unknown): string => {
     if (typeof a === "string") return a;
-    // Message first: quickjs's `stack` is the frames ALONE, so printing it by itself drops
-    // the part that says what went wrong.
+    // Message first: quickjs's `stack` holds only the frames, not the message.
     if (a instanceof Error) return a.stack ? String(a) + "\n" + a.stack : String(a);
     try {
       const j = JSON.stringify(a);
       if (j !== undefined) return j;
-    } catch { /* cyclic, or a toJSON that throws — fall through to String */ }
+    } catch { /* cyclic, or a throwing toJSON: fall through to String */ }
     return String(a);
   };
   const sink = (...args: unknown[]): void => { bridge.log(args.map(show).join(" ")); };

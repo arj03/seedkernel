@@ -1,8 +1,7 @@
-// transport-harness.mjs — shared plumbing for the transport-bundle tests. The transport
-// is a signed bundle whose guest holds the AKE, record layer, routing and request/response
-// layer; these tests drive it through the real host stack — shell → driver (TransportHost)
-// → guest realm — with in-process channel pairs for sockets, so the properties pinned
-// here are the shipped bundle's, not a parallel reimplementation's.
+// Shared plumbing for the transport-bundle tests. The transport is a signed bundle whose
+// guest holds the AKE, record layer, routing and request/response layer; these tests drive
+// it through the real host stack (shell, driver (TransportHost), guest realm) with
+// in-process channel pairs for sockets, so what they check is the shipped bundle.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -21,10 +20,10 @@ export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { OpArgs } = await imp("build/services/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
-/** A `ChannelFactory` that hands the driver channels the TEST built, so a test keeps the
- *  instrumented object it is asserting on (`wirePair`'s recorder, tamperer and backlog).
- *  Not a fabric: a test holds both ends of a pair, hands one end in as an accept (`give`)
- *  and the other as the socket a node's transport opens when it dials (`dial`). */
+/** A `ChannelFactory` that hands the driver channels the test built, so the test keeps the
+ *  instrumented object it asserts on (`wirePair`'s recorder, tamperer and backlog). Not a
+ *  fabric: a test holds both ends of a pair, passes one in as an accept (`give`) and the
+ *  other as the socket a node's transport opens when it dials (`dial`). */
 export class InjectedChannels {
   #accept = null;
   /** Channels queued per destination, handed out one per `connect`. */
@@ -47,9 +46,9 @@ export class InjectedChannels {
     this.#accept(channel, arrival);
     return channel;
   }
-  /** A link `node`'s transport DIALS to `peerHex` — through its own address book, as every
-   *  dial is: the peer is taught at a destination this factory answers with `channel`, under
-   *  the contact secret the dial presents, and `ready` sets the dial off. The node needs a
+  /** A link `node`'s transport dials to `peerHex` through its own address book, like every
+   *  dial: the peer is added at a destination this factory answers with `channel`, under the
+   *  contact secret the dial presents, and `ready` starts the dial. The node needs a
    *  `connsPerPeer` above its live links to that peer for a second dial to open. */
   async dial(node, peerHex, channel, secret) {
     const dest = `inject://${peerHex}`;
@@ -72,18 +71,18 @@ export const transportBlob = transportBundleBytes();
 /** The protocol id the harness app claims. */
 export const PROTO = "harness/v1";
 
-/** The harness APP — a real signed bundle, since an app reaches the network by calling the
- *  id the transport claims (`_net`) and is reached by the id it claims itself. ONE
- *  entrypoint, with the mode chosen at load through the manifest's `config`:
- *    send — one request out; answers `[ok u8][response]` straight through from `_net`.
- *    op   — an already-framed `[opLen u8][op][args]` handed to `_net` verbatim, for the
- *           tests whose subject is WHICH ops an app may name (no name of its own).
- *    seen/from — everything `handle` was handed INBOUND, and who it was attributed to. */
+/** The harness app: a real signed bundle, since an app reaches the network by calling the
+ *  id the transport claims (`_net`) and is reached by the id it claims itself. Its local
+ *  ops:
+ *    send: one request out; returns `[ok u8][response]` straight from `_net`.
+ *    op:   an already-framed `[opLen u8][op][args]` passed to `_net` verbatim, for the
+ *          tests about which ops an app may name.
+ *    seen/from: everything `handle` received inbound, and who it was attributed to.
+ *  The echo/hang mode is chosen at install through the manifest's `config`. */
 const HARNESS_GUEST = `
-// This app's own copies of the shape it shares with whatever it calls (its own format
-// after the host's 32-byte caller prefix): a local op is [opLen u8][op][args], and
-// the transport's app contract (the id this app calls) is spelled the same way. The
-// host never reads any of it.
+// This app's own copy of the op format it shares with what it calls (after the host's
+// 32-byte caller prefix): a local op is [opLen u8][op][args], and the transport's app
+// interface uses the same format. The host never reads any of it.
 function readOp(b) {
   const n = b.length > 0 ? b[0] : -1;
   if (n < 0 || b.length < 1 + n) throw new Error("harness: malformed op");
@@ -99,18 +98,17 @@ function writeOp(op, args) {
   return out;
 }
 const seen = [];
-// Who each inbound frame was ATTRIBUTED to, in step with \`seen\`: the shell puts the
-// authenticated sender in front of the payload, so this is what a delivery claims about
-// its own origin. Recorded separately because a test about attribution must be able to
-// read it back without the payload tests changing shape.
+// Who each inbound frame was attributed to, in step with \`seen\`: the shell puts the
+// authenticated sender in front of the payload. Recorded separately so attribution tests
+// can read it without changing the payload tests.
 const from = [];
 function handle(arg) {
   const c = arg.subarray(0, 32);
   let fromHost = true;
   for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
   const p = arg.subarray(32);
-  // A LOCAL call from the host (caller = 32 zero bytes): the op NAME picks the local op,
-  // the one-vocabulary shape the transport's own handle reads.
+  // A local call from the host (caller = 32 zero bytes): the op name picks the local op,
+  // as in the transport's own handle.
   if (fromHost) {
     const { op, args } = readOp(p);
     if (op === "send") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, writeOp("send", args));
@@ -139,9 +137,9 @@ function handle(arg) {
   seen.push(p);
   from.push(c.slice());
   if (APP.mode === "hang") return new Promise(() => {});
-  // A GENERATOR request, for the reassembly tests: [0xff][len u32][mul u8] asks for
-  // len bytes where out[i] = (i * mul) & 255 — a response far larger than anything
-  // that fits in one segment, and checkable byte for byte.
+  // A generator request, for the reassembly tests: [0xff][len u32][mul u8] asks for len
+  // bytes where out[i] = (i * mul) & 255, a response far larger than one segment and
+  // checkable byte for byte.
   if (p.length === 6 && p[0] === 255) {
     const n = ((p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4]) >>> 0;
     const out = new Uint8Array(n);
@@ -152,12 +150,11 @@ function handle(arg) {
 }
 `;
 
-/** The harness app's local op names — the one op vocabulary its `handle` reads. */
+/** The harness app's local op names. */
 const OP = { SEND: "send", RAW: "op", SEEN: "seen", FROM: "from" };
 
 /** One local op through the harness app's slot-bound handle, with the host's caller id in
- *  front of THIS app's own op framing — the name is the app's vocabulary and the shell
- *  never reads it. */
+ *  front of this app's own op framing; the shell never reads the name. */
 function invoke(app, op, args = new Uint8Array(0), deadlineMs) {
   const b = new Uint8Array(1 + op.length + args.length);
   b[0] = op.length;
@@ -174,8 +171,8 @@ export function harnessAppBlob(author, mode = "echo") {
     protocols: [PROTO],
     modules: [],
     guestSource: HARNESS_GUEST,
-    // The whole of what an app needs to talk to the network: the id the transport claims.
-    // A local service id; this app holds no host service at all.
+    // All an app needs to use the network: the id the transport claims. A local service
+    // id; this app requires no host service at all.
     guestRequires: [TRANSPORT_SERVICE],
     guestConfig: { mode },
   });
@@ -201,22 +198,20 @@ export function sendArgs(to, payload, { proto = PROTO, noReply = false } = {}) {
   return out;
 }
 
-/** One request out of `shell`, through the harness app it loaded — the path a real
- *  deployment uses. */
+/** One request through the harness app, the path a real deployment uses. */
 export async function appRequest(app, to, payload, opts) {
   const r = await invoke(app, OP.SEND, sendArgs(to, payload, opts), opts?.deadlineMs);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 }
 
-/** Ask a node's app for `len` generated bytes — the reassembly probe. */
+/** Ask a node's app for `len` generated bytes (the reassembly probe). */
 export function generatorRequest(len, mul) {
   return Uint8Array.from([255, (len >>> 24) & 255, (len >>> 16) & 255, (len >>> 8) & 255, len & 255, mul]);
 }
 
-/** The author of the artifact-shipped transport bundle, read OUT of the artifact. A fresh
- *  clone mints its own, so a fixed id — or one scraped from the generated header — is
- *  drift waiting to happen. */
+/** The author of the default transport bundle, read from the artifact. Each clone
+ *  generates its own author, so a fixed id would go stale. */
 export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
@@ -228,12 +223,11 @@ export function transportPolicy(appAuthors) {
   }));
 }
 
-/** One transport host: a shell over a fresh identity + the transport bundle, and — unless
- *  `app: false` — the harness app that drives it. Socket options pass to the driver;
- *  guest-owned policy passes as the transport bundle's one-load LOCAL config.
- *  `request`/`sendNoReply`/`peers`/`seen`/`from`/`op` are
- *  each a single `invoke` into the harness app, so the bytes cross exactly the seam a real
- *  app's would. */
+/** One transport host: a shell over a fresh identity and the transport bundle, plus
+ *  (unless `app: false`) the harness app that drives it. Socket options go to the driver;
+ *  guest policy goes into the transport bundle's LOCAL config.
+ *  `request`/`sendNoReply`/`peers`/`seen`/`from`/`op` are each a single `invoke` into the
+ *  harness app, so the bytes cross the same seam a real app's would. */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
@@ -242,14 +236,14 @@ export async function makeTransportHost(opts = {}) {
   const transport = {
     channels: opts.channels,
     listen: opts.listen,
-    // The DRIVER's own ceiling, not one of the guest's link-state tiers.
+    // The driver's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
-    // The occupant's reason per link teardown (transport/src/ake.js `REASON_*`) — the node's
-    // own observation seam, and the only place a test can read WHY a link went down.
+    // The occupant's reason per link teardown (transport/src/ake.js `REASON_*`), the only
+    // place a test can read why a link went down.
     onLinkClosed: opts.onLinkClosed,
     // Most of this suite tears links down on purpose, so the driver's diagnostic would bury
-    // the actual output. Off by default HERE only; the line itself is pinned by its own
-    // test, which opts back in.
+    // the real output. Off by default here only; the line itself has its own test, which
+    // turns it back on.
     suppressLinkLog: opts.suppressLinkLog ?? true,
     bundle: opts.transportBlob ?? transportBlob,
   };
@@ -277,14 +271,13 @@ export async function makeTransportHost(opts = {}) {
     identity,
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
-    // No disk: nothing here declares `fs`, and the in-memory default would be a backend
-    // these tests never meant to hand out.
+    // No fs: nothing here requires it.
     fs: false,
     guestDeadlineMs: opts.guestDeadlineMs,
     transport,
-    // `onHostCall` sees every host call this node's realms make, and refuses one by
-    // throwing; `onHostAnswer(name, answer, payload)` may stand in for its answer — a
-    // slow one, say.
+    // `onHostCall` sees every host call this node's realms make and refuses one by
+    // throwing; `onHostAnswer(name, answer, payload)` can replace its answer (with a slow
+    // one, say).
     createRealm: async (o) => createSafeRealm(opts.onHostCall || opts.onHostAnswer
       ? {
         ...o,
@@ -297,9 +290,8 @@ export async function makeTransportHost(opts = {}) {
       : o),
     admit: policy,
   });
-  // The node's own channel key, hex — off the identity this harness minted, not asked of
-  // the driver: it is `toHex(identity.publicKey)`, which every caller of this factory
-  // already holds, and the driver says nothing about peers any more (services/socket-seam.ts).
+  // The node's own key, hex, from the identity this harness created. The driver knows
+  // nothing about peers (services/socket-seam.ts).
   const peerId = Buffer.from(identity.publicKey).toString("hex");
   const node = { shell, driver, identity, appAuthor, peerId };
   if (opts.app === false) return node;
@@ -323,8 +315,8 @@ export async function makeTransportHost(opts = {}) {
     out.set(payload, off);
     return invoke(app, OP.SEND, out, deadlineMs);
   };
-  /** One request out, resolving with the response bytes — or rejecting, which is what
-   *  the `[0]` failure byte means (an unreachable peer, a deadline, a refusal). */
+  /** One request out, resolving with the response bytes, or rejecting on the `[0]`
+   *  failure byte (an unreachable peer, a deadline, a refusal). */
   node.request = async (to, proto, payload, deadlineMs) => {
     const r = await call(to, proto, payload, deadlineMs, false);
     if (r[0] !== 1) throw new Error("net: request failed");
@@ -332,9 +324,8 @@ export async function makeTransportHost(opts = {}) {
   };
   node.sendNoReply = (to, proto, payload) => call(to, proto, payload, undefined, true);
   node.app = app;
-  /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller
-   *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the
-   *  name, which is what those tests pin. */
+  /** Name an arbitrary transport op from the app, for the tests about the caller boundary
+   *  (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the name. */
   node.op = (name, args = new Uint8Array(0)) => {
     const n = enc.encode(name);
     const out = new Uint8Array(1 + n.length + args.length);
@@ -354,8 +345,8 @@ export async function makeTransportHost(opts = {}) {
     }
     return out;
   };
-  /** Who this node's app was told each inbound frame came from, in step with `seen` —
-   *  the attribution the shell put in front of the payload, as hex. */
+  /** Who this node's app was told each inbound frame came from, in step with `seen`: the
+   *  attribution the shell put in front of the payload, as hex. */
   node.from = async () => {
     const b = await invoke(app, OP.FROM);
     const out = [];
@@ -367,8 +358,8 @@ export async function makeTransportHost(opts = {}) {
   return node;
 }
 
-/** The host's own door into the transport — exactly what the CLI composes, so a test drives
- *  the real path. Throws when nothing claims the id: a node with no transport bundle. */
+/** The host's own call into the transport, as the CLI makes it, so a test uses the real
+ *  path. Throws when nothing claims the id (a node with no transport bundle). */
 export function transportOp(node, args) {
   const answer = node.shell.call(TRANSPORT_SERVICE, args.build());
   if (!answer) throw new Error("transport: no bundle claims " + TRANSPORT_SERVICE);
@@ -390,9 +381,9 @@ export async function linkedPeers(node) {
   return out;
 }
 
-/** Teach this node one peer: where to reach it, and the secret THAT peer's door gates on.
- *  Straight into the occupant's book — the host retains nothing — so a test that replaces
- *  the transport must say it again (§12.10). */
+/** Add one peer to this node: where to reach it, and that peer's contact secret. It goes
+ *  straight into the occupant's address book (the host keeps nothing), so a test that
+ *  replaces the transport must add it again (§12.10). */
 export function addr(node, peerHex, dest, contactSecret) {
   const ZERO32 = new Uint8Array(32);
   return transportOp(node, new OpArgs("addr")
@@ -406,17 +397,15 @@ export function contact(node, secret) {
   return transportOp(node, new OpArgs("contact").blob(secret ?? new Uint8Array(0)));
 }
 
-/** Whether `node` holds an authenticated link to `peerHex` right now. The set lives in the
- *  transport guest — a fact about links, and links are the guest's — so this is a question
- *  rather than a field, and it is what a test reads instead of the per-link callbacks the
- *  driver used to fire. */
+/** Whether `node` has an authenticated link to `peerHex` right now. Links are state in the
+ *  transport guest, so this asks the guest. */
 export async function linkedTo(node, peerHex) {
   return (await linkedPeers(node)).includes(peerHex);
 }
 
-/** Await a condition with a deadline — the tests' tick, bounded. The predicate is
- *  AWAITED: an async one is polled on its resolved value, where a bare promise object
- *  would be truthy on the first tick and make the wait a silent no-op. */
+/** Wait for a condition, with a deadline. The predicate is awaited, so an async one is
+ *  polled on its resolved value; a bare promise would be truthy at once and make the wait
+ *  a no-op. */
 export async function until(fn, ms = 3000, what = "condition") {
   const start = Date.now();
   for (;;) {

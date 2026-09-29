@@ -1,6 +1,6 @@
-// Offline app-bundle authoring (§12.4). A running host imports only bundle.ts, which has no
-// signing or packing surface; this module depends on the verifier's manifest validation so
-// an author's accepted vocabulary cannot drift behind what install will accept.
+// Offline app-bundle authoring (§12.4). A running host imports only bundle.ts, which cannot
+// sign or pack; this module reuses the verifier's manifest validation so an author cannot
+// sign what install would refuse.
 import { concatBytes, enc } from "../services/util.js";
 import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
 import { callerOf, readOp, writeOp } from "../services/op-frame.js";
@@ -15,16 +15,15 @@ import {
   type ManifestVerifier,
 } from "../host/bundle.js";
 
-/** The surface *signing* a manifest needs — the build-side of the format. */
+/** What signing a manifest needs. */
 export interface ManifestCrypto extends ManifestVerifier {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
   /** The PQ half of the signature; `signBundle` throws without it. */
   ml_dsa65_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
 }
 
-/** An author's key set (§12.4). Both keys together are the identity — see `hybridAuthorId`
- *  for why neither alone is. "hybrid" names the *construction*, so only the things whose
- *  shape would differ under another suite keep the qualifier. */
+/** An author's key set (§12.4). Both keys together are the identity (`hybridAuthorId`).
+ *  Only names whose shape depends on the suite carry "hybrid". */
 export interface HybridAuthorKeys {
   ed: {
     publicKey: Uint8Array;
@@ -43,9 +42,8 @@ export interface AuthorSeedCrypto {
   ml_dsa65_keypair_from_seed(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
 
-/** Canonical manifest bytes. The signed envelope carries these verbatim and the verifier
- *  parses the exact bytes it checked, so there is no separate canonicalisation step — the
- *  bytes *are* the manifest. */
+/** Manifest bytes. The signed envelope carries these verbatim and the verifier parses the
+ *  exact bytes it checked, so no separate canonicalization is needed. */
 export function encodeManifest(m: BundleManifest): Uint8Array {
   return enc.encode(JSON.stringify(m));
 }
@@ -76,8 +74,8 @@ export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: 
   return concatBytes(parts);
 }
 
-/** Sign the whole bundle. Low-level writer for tests as well as authorBundle; validation
- *  belongs to authorBundle so tests can sign malformed manifests and body layouts. */
+/** Sign the whole bundle. A low-level writer used by authorBundle and by tests; it does
+ *  not validate, so tests can sign malformed manifests and body layouts. */
 export function signBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest,
   guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
   if (!sodium.ml_dsa65_sign_detached) {
@@ -96,15 +94,15 @@ export function signBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: Bu
 /** The raw materials for a new signed bundle. */
 export interface UnsignedBundle {
   app: string;
-  /** Monotonic per-(author, app) freshness mark (§12.4) — the caller's to bump. */
+  /** Monotonic per-(author, app) version (§12.4); the caller increments it. */
   version: number;
   protocols?: string[];
   services?: string[];
   modules: { name: string; wasm: Uint8Array }[];
   /** Source text; the manifest commits to its UTF-8 encoding. */
   guestSource: string;
-  /** Everything this guest reaches — host services and local service ids,
-   *  `manifest.guest.requires`. */
+  /** Everything this guest reaches: host services and local service ids
+   *  (`manifest.guest.requires`). */
   guestRequires: string[];
   guestConfig?: JsonObject;
 }
@@ -140,13 +138,12 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
   };
 }
 
-/** The canonical op-frame functions as flat guest source for a build tool to inline before
- *  signing. Their implementations live only in op-frame.ts; serializing the compiled,
- *  self-contained functions gives an import-free guest the exact code host callers run.
+/** The op-frame functions as flat guest source, for a build tool to inline before signing.
+ *  They are implemented only in op-frame.ts; serializing the compiled functions gives an
+ *  import-free guest the same code the host runs.
  *
- *  Newlines are forced to LF: every caller inlines this into a guest it then SIGNS, and the
- *  compiler's line endings are a property of the machine that built this file, not of the
- *  program. */
+ *  Newlines are forced to LF because callers sign the result, and the compiled line
+ *  endings depend on the machine that built this file. */
 export function guestOpFraming(): string {
   const src = [callerOf, readOp, writeOp].map((fn) => fn.toString()).join("\n");
   return `

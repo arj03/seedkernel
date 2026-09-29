@@ -86,8 +86,8 @@ func bootModuleTable() error {
 	// WithCloseOnContextDone compiles in the check that enforces the §4.3 bound.
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
 		WithCloseOnContextDone(true))
-	// AssemblyScript's three imports, as the JS host resolves them. `seed` is a constant
-	// (§4.2), `trace` drops its args (§4.3), and `abort` traps.
+	// AssemblyScript's three imports, as the JS host resolves them. `seed` is a constant,
+	// `trace` drops its args, and `abort` traps (§4.2).
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, line, col uint32) {
 		panic(fmt.Sprintf("module abort at %d:%d", line, col))

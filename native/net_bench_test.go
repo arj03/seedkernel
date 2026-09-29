@@ -1,20 +1,20 @@
 package main
 
-// Networking round-trip perf for the native binary: the transport bundle's request/response
-// over a real loopback socket — dial/accept, the AKE + record layer (amortized: the warmup
-// request establishes the link), routing, the TCP framing (net.go), the Go↔JS
-// frame-delivery boundary (sock.go), and the correlation/timeout layer. This is the
-// wall-clock wrapping the crypto/RS arithmetic the other benches cover.
+// Network round-trip performance on the native binary: the transport bundle's
+// request/response over a real loopback socket, covering dial/accept, the AKE and record
+// layer (amortized: the warmup request establishes the link), routing, the TCP stream
+// (net.go), the Go-to-JS delivery boundary (sock.go), and the correlation/timeout layer.
+// This is the wall-clock time around the crypto and RS work the other benches cover.
 //
-//   - BenchmarkNetRoundTrip — a tiny control-plane request (HAVE/OFFER-shaped); ns/op is
-//     the per-request latency, 1e9/ns ≈ serial req/s.
-//   - BenchmarkNetFetch64K — a FETCH-shaped op: small request, ~64 KB response (§27, the
-//     GET bulk read), so bytes/op surfaces the framing + boundary-copy cost on a real
-//     block rather than just the round-trip floor.
+//   - BenchmarkNetRoundTrip: a tiny control-plane request (like seedstore's HAVE/OFFER);
+//     ns/op is the per-request latency, 1e9/ns is about serial req/s.
+//   - BenchmarkNetFetch64K: a FETCH-like op, small request and ~64 KB response (seedstore's
+//     GET bulk read), so bytes/op shows the framing and copy cost on a real block, not
+//     just the round-trip floor.
 //
 // b.N requests run as one JS-side await loop (benchPingN/benchFetchN) so the per-op
-// el.await harness cost isn't folded into every iteration — only the socket round-trips
-// are timed. Built on the shared benchmark realm (bench_test.go).
+// el.await cost is not in every iteration; only the socket round trips are timed. Built on
+// the shared benchmark realm (bench_test.go).
 //
 //	go test -run x -bench BenchmarkNet -benchmem ./...
 
@@ -25,23 +25,19 @@ import (
 	"time"
 )
 
-// benchProto is the protocol id the bench app claims, and the id B addresses A by. An
-// ordinary id, deliberately: `_`-led ids are the runtime's reservation and no ordinary
-// bundle may spell one (§12.10).
+// benchProto is the protocol id the bench app claims, and the id B addresses A by.
 const benchProto = "netbench"
 
-// netBenchGuestSource is the bench APP — both ends of it. There is no host-side request
-// facade, so the thing being benchmarked has to be an app, which is the point: this is the
-// path a deployment uses.
+// netBenchGuestSource is the bench app, for both ends. A request is an app calling the
+// transport, so the benchmark uses the path a deployment uses.
 //
-//	handle — one entrypoint, both ends. A remote peer's frame is keyed on the first
-//	         payload byte: type 7 is FETCH-shaped (a fixed 64 KB block), type 9 is
-//	         UPLOAD-shaped (a 1-byte ack folding in the length and last byte, so the
-//	         bench can prove the payload arrived whole), and anything else echoes — the
-//	         control-plane round trip. A local loopback (the host's zero caller id) carries
-//	         this app's own op framing: `send` is the transport's send op behind the name
-//	         this side writes, `echo` is the bare realm hop. The framing is content — the
-//	         host never reads it.
+//	handle: one entrypoint, both ends. A remote peer's frame is keyed on the first
+//	        payload byte: type 7 is FETCH-like (a fixed 64 KB block), type 9 is
+//	        UPLOAD-like (a 1-byte ack combining the length and last byte, so the bench can
+//	        check the payload arrived whole), and anything else echoes (the control-plane
+//	        round trip). A local call (the host's zero caller id) uses this app's own op
+//	        framing: `send` wraps the transport's send op, `echo` is the bare realm hop.
+//	        The host never reads the framing.
 const netBenchGuestSource = `
   function readOp(b) {
     const n = b.length > 0 ? b[0] : -1;
@@ -73,14 +69,13 @@ const netBenchGuestSource = `
   }
 `
 
-// netBenchHarness wires two nodes in one realm: A listens and answers, B requests. Both
-// load the SAME signed app — one guest serves both ends — so the bundle is built once,
-// in Go, and handed in as hex. benchPingN/benchFetchN/benchUploadN issue n sequential
+// netBenchHarness sets up two nodes in one realm: A listens and answers, B requests. Both
+// install the same signed app (one guest serves both ends), so the bundle is built once,
+// in Go, and passed in as hex. benchPingN/benchFetchN/benchUploadN send n sequential
 // requests over the one link, each as an `invoke` of the `send` op into B's app.
 //
-// The nodes are stood up by standUp — the function the operator flow boots through —
-// which boots the artifact's own transport. Each node's policy admits the bench app's
-// author.
+// The nodes boot through standUp (the function the operator flow uses), which installs the
+// default transport. Each node's policy admits the bench app's author.
 //
 // The three %q holes, in order: the app bundle hex, the app author's hex id, and the
 // protocol id B sends under.
@@ -97,8 +92,8 @@ const netBenchHarness = `
 	  const b = await standUp({ dir: __dir, policyJson: __benchPolicy, identity: idB, transport: {} });
 	  globalThis.netA = a.transport;
 	  globalThis.netB = b.transport;
-	  // A claims the protocol so inbound frames route to its guest; B holds the same app
-	  // because the request goes out THROUGH it.
+	  // A claims the protocol so inbound frames route to its guest; B has the same app
+	  // because the request goes out through it.
 	  await a.shell.install(__appBlob);
 	  const bApp = await b.shell.install(__appBlob);
 
@@ -141,35 +136,35 @@ const netBenchHarness = `
 	  globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await req(ping); return new Uint8Array(0); };
 	  globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await req(fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
 	  globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await req(upload); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
-	  // The realm hop ALONE: one invocation of the app's guest, no socket in the path.
-	  // Two of these sit inside every round trip above (the sender's app and the
-	  // receiver's), so it is what says whether a round-trip number is the wire or the
-	  // guest boundary.
+	  // The realm hop alone: one invocation of the app's guest, no socket in the path.
+	  // Every round trip above includes two of these (the sender's app and the
+	  // receiver's), so this shows whether a round-trip number is the wire or the guest
+	  // boundary.
 	  const localArg = new Uint8Array(34);
 	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await bApp.invoke(opFrame("echo", localArg)); return new Uint8Array(0); };
 	  teachAddr(b.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"));
 	})();
 `
 
-// setupNetBench stands up the harness in the shared benchmark realm: A's listeners are
-// bound inside __netSetup (standUp awaits start()), both nodes load the bench
-// app, and B is pointed at A's bound port, leaving benchPingN/benchFetchN/benchUploadN
-// ready to run on the shared loop.
+// setupNetBench sets up the harness in the shared benchmark realm: A's listeners are bound
+// inside __netSetup (standUp awaits start()), both nodes install the bench app, and B is
+// pointed at A's port, leaving benchPingN/benchFetchN/benchUploadN ready to run on the
+// shared loop.
 func setupNetBench(b *testing.B) {
 	ensureBooted(b)
-	// Once per REALM, not once per call. The realm is shared across benchmarks
-	// (ensureBooted) and the framework re-enters each benchmark to grow b.N, so a second
-	// eval of the harness would redeclare its top-level consts and fail as a SyntaxError.
-	// Asking the realm what it already holds keeps this correct however the benchmarks are
-	// ordered or filtered — a Go-side "did I do this" flag would drift from the realm.
+	// Once per realm, not once per call. The realm is shared across benchmarks
+	// (ensureBooted) and the framework re-runs each benchmark to grow b.N, so a second eval
+	// of the harness would redeclare its top-level consts and fail with a SyntaxError.
+	// Asking the realm keeps this correct however the benchmarks are ordered or filtered,
+	// where a Go-side flag could get out of step.
 	v, err := qc.Eval("net-bench-installed.js", `typeof benchPingN`)
 	if err != nil {
 		b.Fatal("harness probe:", err)
 	}
 	if v.String() != "function" {
-		// The app is signed HERE, by the Go-side writer, for the same reason the tests'
-		// probe app is: the realm holds no signing key and the native binary deliberately cannot
-		// sign (mldsa.go binds verify only, §12.4).
+		// The app is signed here, by the Go-side writer, like the tests' probe app: the
+		// realm holds no signing key and the native binary cannot sign (mldsa.go binds
+		// verify only, §12.4).
 		author := testAuthor(b)
 		blob := signedBundleBytes(b, author, benchProto, 1, netBenchGuestSource, []string{"_net"})
 		src := fmt.Sprintf(netBenchHarness,
@@ -183,20 +178,20 @@ func setupNetBench(b *testing.B) {
 	}
 }
 
-// benchAwait drives one JS request loop to completion and fails the bench unless it
-// resolves (so a number is only ever reported for round-trips that actually succeeded).
-// The timeout scales with b.N as a safety net — it bounds a hang, not the real run.
+// benchAwait runs one JS request loop to completion and fails the bench unless it resolves
+// (so a number is only reported for round trips that succeeded). The timeout scales with
+// b.N as a safety net; it bounds a hang, not the real run.
 func benchAwait(b *testing.B, expr string) {
 	b.Helper()
 	awaitOK(b, expr, expr, time.Duration(b.N)*5*time.Millisecond+10*time.Second)
 }
 
-// BenchmarkGuestDispatch times ONE guest entrypoint invocation with no socket in the
-// path — the Go↔QuickJS boundary, the per-realm FIFO queue (§12.3) and the guest's own
-// `handle`, and nothing else. Every network round trip above crosses two of these (the
+// BenchmarkGuestDispatch times one guest entrypoint invocation with no socket in the path:
+// the Go-to-QuickJS boundary, the per-realm FIFO queue (§12.3) and the guest's own
+// `handle`, nothing else. Every network round trip above includes two of these (the
 // sending app's realm on the way out, the receiving app's on the way in), so this is the
-// floor a round-trip number is measured against: it says whether a regression is the
-// wire, the record layer, or the guest boundary.
+// floor for a round-trip number and shows whether a regression is in the wire, the record
+// layer, or the guest boundary.
 func BenchmarkGuestDispatch(b *testing.B) {
 	setupNetBench(b)
 	benchAwait(b, "benchLocalN(1)") // warmup: the realm is built lazily
@@ -207,7 +202,7 @@ func BenchmarkGuestDispatch(b *testing.B) {
 
 func BenchmarkNetRoundTrip(b *testing.B) {
 	setupNetBench(b)
-	benchAwait(b, "benchPingN(1)") // warmup: dial + PeerLink handshake (amortized out)
+	benchAwait(b, "benchPingN(1)") // warmup: dial and handshake (amortized out)
 	b.ResetTimer()
 	benchAwait(b, fmt.Sprintf("benchPingN(%d)", b.N))
 	b.StopTimer()
@@ -222,11 +217,11 @@ func BenchmarkNetFetch64K(b *testing.B) {
 	b.StopTimer()
 }
 
-// BenchmarkNetUpload1M is the twin of BenchmarkNetFetch64K for the OPPOSITE direction:
-// B sends a 1 MiB payload to A and A returns a 1-byte ack, so bytes/op surfaces the
-// cost of A's RECEIVE path (socket read → frame reassembly → Go↔JS boundary → request
-// dispatch) — the path a PUT hits at the holder, which no other bench exercises (Fetch
-// has A *send* the bulk and *receive* a tiny request).
+// BenchmarkNetUpload1M is BenchmarkNetFetch64K in the opposite direction: B sends a 1 MiB
+// payload to A and A returns a 1-byte ack, so bytes/op shows the cost of A's receive path
+// (socket read, frame reassembly, Go-to-JS boundary, request dispatch), the path a PUT
+// takes at the holder, which no other bench covers (in Fetch, A sends the bulk and
+// receives a tiny request).
 func BenchmarkNetUpload1M(b *testing.B) {
 	setupNetBench(b)
 	b.SetBytes(1 << 20)

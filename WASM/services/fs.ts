@@ -1,5 +1,5 @@
-// `fs` (§12.1): raw bytes under an opaque flat key. Content-addressing and quota are
-// app policy. Keys are filenames on both backends — charset in §16.1.
+// `fs` (§12.1): raw bytes under an opaque flat key. Content addressing and quotas are
+// app policy. Keys are filenames on both backends; the charset is in §16.1.
 
 export interface FsStat {
   /** Total bytes stored across all keys (best-effort). */
@@ -11,12 +11,12 @@ export interface FsStat {
 /** Sentinel when the backend cannot ask the OS for free space. */
 export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
 
-/** Storage seam. Every method is async: IndexedDB/OPFS cannot be sync, so a sync shape
- *  would drop the browser. */
+/** Storage seam. Every method is async because browser storage (IndexedDB, OPFS) cannot
+ *  be synchronous. */
 export interface Fs {
   get(key: string): Promise<Uint8Array | null>;
   put(key: string, bytes: Uint8Array): Promise<void>;
-  /** Byte length, or -1 if absent — existence is `size ≥ 0`; there is no `has`. */
+  /** Byte length, or -1 if absent. Use `size >= 0` to test existence. */
   size(key: string): Promise<number>;
   list(prefix?: string): Promise<string[]>;
   /** true if a value was removed, false if the key was already absent. */
@@ -24,7 +24,7 @@ export interface Fs {
   stat(): Promise<FsStat>;
 }
 
-// Key charset is a consensus predicate (§16.1), applied once in shared JS.
+// The key charset is consensus (§16.1), applied once in shared code.
 
 /** The key charset. Also the scope charset. */
 const SAFE_CHARS = /^[A-Za-z0-9._-]+$/;
@@ -49,10 +49,9 @@ export function isSafeFsKey(key: string): boolean {
   return key !== "." && key !== ".." && SAFE_CHARS.test(key) && !isReservedDeviceName(key);
 }
 
-/** Whether `scope` — the host-derived prefix an app's keys live under (`scopedFs`,
- *  host/fs-view.ts) — is representable as the head of every key it will ever reach. The
- *  charset only: a scope is not a whole key, so the bare-dot and device-name cases
- *  (which are about a complete name) do not apply to it. */
+/** Whether `scope`, the host-derived prefix of an app's keys (`scopedFs`,
+ *  host/fs-view.ts), is valid as the start of every key. Charset only: the bare-dot and
+ *  device-name rules apply to whole names, not prefixes. */
 export function isSafeFsScope(scope: string): boolean {
   return SAFE_CHARS.test(scope);
 }

@@ -1,9 +1,9 @@
 package main
 
-// Perf benchmarks for the native binary's crypto primitives, to compare runtime-to-runtime
-// against node. Ed25519 verify runs on native/wasm/libsodium.wasm under wazero — the same
-// wasm node runs under V8; BLAKE2b is native Go (see sodium.go). The node counterpart for
-// BLAKE2b is the block-ids line of seedstore's WASM/tests/bench.mjs.
+// Benchmarks for the native binary's crypto primitives, to compare against Node. Ed25519
+// verify runs on native/wasm/libsodium.wasm under wazero, the same wasm Node runs under V8;
+// BLAKE2b is native Go (see sodium.go). The Node counterpart for BLAKE2b is the block-ids
+// line of seedstore's WASM/tests/bench.mjs.
 //
 //	go test -run x -bench BenchmarkSodium -benchmem ./...
 
@@ -14,10 +14,10 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
-// benchSodium stands up an isolated libsodium for a benchmark (newSodium's twin in
-// sodium_test.go). The runtime mirrors boot()'s rtCore: deliberately UNARMED, since
-// libsodium is the TCB's own trusted code and the checks are not free
-// (module_bound_bench_test.go prices them).
+// benchSodium creates an isolated libsodium for a benchmark (like newSodium in
+// sodium_test.go). The runtime matches boot()'s rtCore: without deadline checks, since
+// libsodium is trusted code and the checks are not free (module_bound_bench_test.go
+// measures them).
 func benchSodium(b *testing.B) *libsodium {
 	b.Helper()
 	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())

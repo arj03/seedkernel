@@ -870,7 +870,7 @@ JSValue qts_resolve_func_data(
 }
 
 // QTS_DetectModule - bellard/quickjs style module detection heuristic.
-// For quickjs-ng, this is patched into the amalgam (see vendor/quickjs-ng-patches/).
+// For quickjs-ng, this is patched into the amalgam (csrc/0001-bellard-module-detection.patch).
 // It uses bellard's approach: skip whitespace/comments, check for 'import' or 'export'.
 #ifdef QTS_USE_QUICKJS_NG
 extern bool QTS_DetectModule(const char *input, size_t input_len);

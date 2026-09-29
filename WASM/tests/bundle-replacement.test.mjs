@@ -71,7 +71,7 @@ await test("another author keeping the label takes its data and signing scope, b
     await old.fs.put("history", Uint8Array.of(42));
     const msg = Uint8Array.of(7, 7);
     const sig = await n.records[0].seam("node/sign", msg);
-    // One slot per label: a second author's `chat` lands only by naming the one standing.
+    // One slot per label: a second author's `chat` installs only by replacing the current one.
     await assert.rejects(n.shell.install(bundle(bob, "chat", 1, reach)), /'chat' is already installed/);
     const next = await n.shell.install(bundle(bob, "chat", 1, reach), { replaces: "chat" });
     assert.equal(next.appScope, old.appScope);
@@ -177,9 +177,9 @@ await test("transport author can change only through replacement of its current 
   const bobLink = (version = 1) => linkBundle(bob, version, { app: "bob-transport" });
   try {
     const standing = n.shell.resolve("_net");
-    // The standing transport's own label is taken like any other, so its next version
-    // arrives by replacement; a DIFFERENT label reaching `link` is refused by the
-    // binding rule instead, before it can contest the holder's service id.
+    // The installed transport's label is taken like any other, so its next version
+    // arrives by replacement; a different label requiring `link` is refused by the
+    // binding rule, before it can contest the holder's service id.
     await assert.rejects(n.shell.install(linkBundle(alice, 2)), /is already installed/);
     await assert.rejects(n.shell.install(bobLink()), /claim 'link' is already held by 'transport'/);
     await n.shell.install(bundle(carol, "chat"));
@@ -194,8 +194,8 @@ await test("transport author can change only through replacement of its current 
     n.store.revoke(alice.id);
     await assert.rejects(n.shell.install(linkBundle(alice, 11), { replaces: "bob-transport" }), /revoked/);
     assert.equal(n.shell.resolve("_net"), "bob-transport");
-    // A version that DROPS `link` is no back door either: the label is taken, so taking
-    // it over is the same explicit replacement as for any other app.
+    // A version that drops `link` is no back door either: the label is taken, so taking
+    // it over needs the same explicit replacement as any other app.
     await assert.rejects(n.shell.install(bundle(bob, "bob-transport", 2)), /is already installed/);
     await n.shell.install(bundle(carol, "offline", 1, { services: ["offline"] }), { replaces: "bob-transport" });
     assert.equal(n.transport.available(), false, "dropping link releases the driver");

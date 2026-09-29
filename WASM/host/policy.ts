@@ -1,29 +1,25 @@
-// Admission predicate (§12.5): one pure function of the verified bundle, asked once for an
-// ordinary app between verifyBundle and slot construction. The host's gates (revocation,
-// freshness) run before it for every bundle, transport included, so no posture can lose
-// them, and are asked again at commit, where the facts they read may have moved. Deny-all
-// is the default for ordinary apps.
-
+// Admission predicate (§12.5): a pure function of the verified bundle, asked once for an
+// ordinary app between verifyBundle and slot construction. The host gates (revocation,
+// freshness) run before it for every bundle, transport included, and again at commit,
+// since what they read may have changed by then. Ordinary apps default to deny-all.
 
 import { isHex64, toHex } from "../services/util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
-/** The ONE admission seam. `(v) → bool | Promise<bool>`.
- *  Return `true` to admit, `false` to reject silently, or throw to reject with a
- *  reason — which is how a rejection stays distinguishable without a result type. */
+/** The admission seam. Return `true` to admit, `false` to reject silently, or throw to
+ *  reject with a reason. */
 export type Admit = (v: VerifiedBundle) => boolean | Promise<boolean>;
 
-/** The default: nothing is admitted.
- *  A node with no configured predicate refuses every ordinary app install. */
+/** The default: a node with no configured predicate refuses every ordinary app install. */
 export const denyAll: Admit = () => false;
 
 /** Any verified bundle is admitted. The shell still applies its own gates first. */
 export const admitAll: Admit = () => true;
 
-/** Revocation (§12.5) before the downgrade guard (§12.4), so a written-off key never reaches
- *  an interactive consent dialog. Equal versions reload, transport included. Sync and
- *  throwing, and read off the store at the call: install asks it again in the commit
- *  window, which cannot await, and a `revoke` or another load may have moved both facts. */
+/** Revocation (§12.5), then the downgrade guard (§12.4), so a revoked key never reaches an
+ *  interactive consent dialog. Equal versions reload, transport included. Synchronous and
+ *  read from the store on each call, because install asks again in the commit window,
+ *  which cannot await, and a `revoke` or another load may have changed either fact. */
 export function checkHostGates(v: VerifiedBundle, store: FreshnessStore): void {
   if (store.isRevoked(v.author)) {
     throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
@@ -59,7 +55,7 @@ export function parsePolicy(json: string): Admit {
   return authorAllowlist(o.authors);
 }
 
-/** An absent policy admits no apps. Transport selection is a separate explicit decision. */
+/** An absent policy admits no apps. Transport selection is a separate decision. */
 export function policyFromJson(json: string | null | undefined): Admit {
   return json ? parsePolicy(json) : denyAll;
 }

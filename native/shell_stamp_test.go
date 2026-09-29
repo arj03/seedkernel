@@ -17,14 +17,14 @@ import (
 // ── is the artifact under test the tree beside it? ───────────────────────────
 //
 // host-shell.gen.js is generated, gitignored and never pruned, and everything this target
-// runs goes through it: the shared host TS, and — inside the signed transport blob it
-// embeds — the transport guest and ws.wasm. So a checkout whose npm build has not been
+// runs goes through it: the shared host TS, and, inside the signed transport bundle it
+// embeds, the transport guest and ws.wasm. So a checkout whose npm build has not been
 // re-run tests a program that is no longer in the repository, with every suite green.
 //
-// bundle-native-host.mjs stamps the sources it generated from into the artifact
-// (scripts/source-stamp.mjs); this re-hashes them. The file list comes OUT of the artifact,
-// so nothing here restates the build's own set — a source added to the bundle is described
-// by the next artifact generated, and every source already in one is checked byte for byte.
+// bundle-native-host.mjs stamps the sources it was generated from into the artifact
+// (scripts/source-stamp.mjs); this re-hashes them. The file list comes from the artifact,
+// so it never goes out of step with the build, and every listed source is checked byte for
+// byte.
 
 // shellSourceMarker introduces the stamp line bundle-native-host.mjs writes.
 const shellSourceMarker = "//@sources "
@@ -90,5 +90,5 @@ func shellSourceDrift() error {
 }
 
 // TestGeneratedShellIsFresh gives the check a failure of its own, so `go test ./...` names
-// the problem once rather than reporting it as every other test's boot failing.
+// the problem once instead of as every other test's boot failing.
 func TestGeneratedShellIsFresh(t *testing.T) { requireFreshShell(t) }

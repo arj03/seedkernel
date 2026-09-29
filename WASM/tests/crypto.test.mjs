@@ -1,11 +1,11 @@
-// crypto.test.mjs — the manifest-suite envelope and the ACVP known-answer vector suites
-// (§12.4, §14.1): the signed suite byte, ML-DSA-65 and ML-KEM-768 against NIST's published
-// vectors, and the hybrid (Ed25519 + ML-DSA-65) manifest suite. Split out of the former
-// single-file run.mjs; bundle-install.test.mjs and realm-guest.test.mjs cover the rest.
+// The manifest-suite envelope and the ACVP known-answer vectors (§12.4, §14.1): the signed
+// suite byte, ML-DSA-65 and ML-KEM-768 against NIST's published vectors, and the hybrid
+// (Ed25519 + ML-DSA-65) manifest suite. bundle-install.test.mjs and realm-guest.test.mjs
+// cover the rest.
 //
-// Every test here is either pure envelope/vector arithmetic or deliberately probes a
-// tampered/unsupported envelope byte — there is no valid-path bundle fixture to convert to
-// `authorBundle`, except the hybrid suite's §6 end-to-end case (see below).
+// Every test here is either envelope and vector arithmetic or a probe of a tampered or
+// unsupported envelope byte, so none uses `authorBundle` except the hybrid suite's
+// end-to-end case (case 6 below).
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -20,17 +20,16 @@ import {
 const { ok, assertEqual, summary } = testkit({ verbose: false });
 const assert = ok;
 
-// ─── Test: manifest suite byte — signed, so it cannot be edited in flight ────────
+// ─── Test: manifest suite byte, signed so it cannot be edited in flight ────────
 //
-// The suite byte leads the §12.4 envelope and is part of the signed preimage
-// `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. That is what makes it safe to read
-// the byte *before* verifying: a verifier needs it to know the field widths, and the
-// signature it then checks commits to the same byte, so rewriting it only breaks the
-// manifest. Algorithm confusion with a later suite is unrepresentable (§14.1).
+// The suite byte starts the §12.4 envelope and is part of the signed preimage
+// `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ BLAKE2b-256(body)`. That makes it safe to
+// read the byte before verifying: a verifier needs it to know the field widths, and the
+// signature it then checks covers the same byte, so rewriting it only breaks the
+// manifest. Algorithm confusion with a later suite is impossible (§14.1).
 //
-// There is ONE live suite (§12.4), `0x02`. The retired Ed25519-only `0x01` is refused as
-// a suite this host does not implement, which is what keeps the retirement from being a
-// downgrade path an attacker can ask for.
+// There is one suite (§12.4), `0x02`. The Ed25519-only `0x01` is refused like any suite
+// this host does not implement, so it cannot be used as a downgrade path.
 async function testManifestSuiteByte() {
   console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
   const author = testAuthor();
@@ -38,8 +37,8 @@ async function testManifestSuiteByte() {
   const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } };
   const env = signTestBundle(sodium, author, manifest);
 
-  // Layout: the suite byte leads, and the author's Ed25519 key follows it (not at
-  // offset 0). The rest of the envelope is testHybridManifestSuite's subject.
+  // Layout: the suite byte comes first, then the author's Ed25519 key (not at offset 0).
+  // testHybridManifestSuite covers the rest of the envelope.
   assertEqual(env[0], 0x02, "the envelope opens with the one manifest suite id");
   assertEqual(toHex(env.slice(1, 33)), toHex(author.ed.publicKey), "the Ed25519 key follows the suite byte");
 
@@ -52,9 +51,9 @@ async function testManifestSuiteByte() {
   }
 
   // 2. A suite this host does not implement is refused with its own message, not as a bad
-  //    signature — which would misdirect an operator whose real problem is a bundle built
-  //    for a host they are not running. `0x01` goes by the same rule as `0x7f`; there is
-  //    no retired-suite special case.
+  //    signature, which would mislead an operator whose real problem is a bundle built
+  //    for a different host. `0x01` follows the same rule as `0x7f`; there is no special
+  //    case for it.
   for (const suite of [0x01, 0x7f]) {
     const bad = env.slice(); bad[0] = suite;
     let msg = "";
@@ -64,9 +63,8 @@ async function testManifestSuiteByte() {
     assert(!msg.includes("signature"), "an unimplemented suite is not reported as a signature failure");
   }
 
-  // 3. A whole, validly-signed 0x01 envelope — the shape a bundle built against the
-  //    retired suite actually has — is refused the same way. The retirement is a property
-  //    of the verifier, not of the fact that nobody happens to hold such a bundle.
+  // 3. A complete, validly signed 0x01 envelope (what a bundle built for the Ed25519-only
+  //    suite would look like) is refused the same way.
   {
     const json = new TextEncoder().encode(JSON.stringify(manifest));
     const pre = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x01), json]);
@@ -78,11 +76,11 @@ async function testManifestSuiteByte() {
       `a well-formed genesis-suite envelope is refused by suite (got: ${msg || "no throw"})`);
   }
 
-  // 4. The load-bearing property: the suite byte is inside the signed preimage, so
-  //    tampering anywhere in the envelope breaks the signature rather than the parse.
+  // 4. The key property: the suite byte is inside the signed preimage, so tampering
+  //    anywhere in the envelope breaks the signature, not the parse.
   {
     const forged = env.slice();
-    forged[33] ^= 0x01; // flip a byte of the ML-DSA public key → must not verify
+    forged[33] ^= 0x01; // flip a byte of the ML-DSA public key; must not verify
     assert(verifyTestBundle(sodium, forged) === null, "a tampered envelope does not verify");
   }
 
@@ -91,25 +89,23 @@ async function testManifestSuiteByte() {
 
 // ─── Test: ML-DSA-65 against NIST's own vectors (ACVP known-answer test) ─────────
 //
-// A round trip — sign, verify, flip a bit, verify again — is satisfied by an
-// implementation that is wrong but self-consistent, and says nothing about whether two
-// targets will agree. These are NIST's published ACVP vectors for ML-DSA-65 (external
-// interface, pure, FIPS 204): fixed keys, messages and signatures with a verdict
-// attached, plus sigGen cases where the signature must match byte for byte.
+// A round trip (sign, verify, flip a bit, verify again) passes for an implementation that
+// is wrong but self-consistent, and says nothing about whether two targets agree. These
+// are NIST's published ACVP vectors for ML-DSA-65 (external interface, pure, FIPS 204):
+// fixed keys, messages and signatures with a verdict, plus sigGen cases where the
+// signature must match byte for byte.
 //
-// That makes "one implementation across three targets" checkable rather than asserted:
-// the same bytes the browser fetches, Node reads and the native binary embeds, so a drifting
-// build fails here instead of splitting the network into nodes that admit a bundle and
-// nodes that refuse it.
+// These run against the same bytes the browser fetches, Node reads and the native binary
+// embeds, so a bad build fails here instead of splitting the network into nodes that
+// accept a bundle and nodes that refuse it.
 async function testMlDsaAcvpVectors() {
   console.log("Test: ML-DSA-65 ACVP known-answer vectors (FIPS 204, external/pure)");
   const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mldsa65-acvp.json"), "utf8"));
   const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
   const mldsa = await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm")));
 
-  // The vectors carry FIPS 204 context strings; the runtime always signs with an
-  // empty one (§12.4), so the raw module is exercised through the same low-level
-  // entry the adapter wraps.
+  // The vectors use FIPS 204 context strings; the runtime always signs with an empty one
+  // (§12.4), so the raw module is called through the low-level entry the adapter wraps.
   const inst = (await WebAssembly.instantiate(readFileSync(join(root, "browser/mldsa65.wasm")), {})).instance;
   const e = inst.exports;
   const base = e.__heap_base.value;
@@ -142,9 +138,8 @@ async function testMlDsaAcvpVectors() {
     checked++;
   }
 
-  // The adapter's own path (empty context, the runtime's only mode) must agree with the
-  // raw module: a wrapper passing a stray context byte would still pass every vector
-  // above.
+  // The adapter's path (empty context, the runtime's only mode) must agree with the raw
+  // module: a wrapper passing a stray context byte would still pass every vector above.
   {
     const seed = new Uint8Array(32).fill(9);
     const kp = mldsa.ml_dsa65_keypair_from_seed(seed);
@@ -165,22 +160,16 @@ async function testMlDsaAcvpVectors() {
   console.log(`  OK (${checked} NIST vectors)\n`);
 }
 
-// ─── Test: hybrid manifest suite 0x02 — Ed25519 + ML-DSA-65, both required ───────
-//
-// The §14.1 migration that cannot be delivered through its own mechanism: a PQ verifier
-// shipped as a bundle would be admitted by the classical verifier, so the suite goes into
-// the artifact ahead of need. What is pinned below is the *shape* — both signatures
-// required, the author id bound to both keys, and a host without the PQ half refusing
-// rather than falling back.
 // ─── Test: ML-KEM-768 against NIST's own vectors (ACVP known-answer test) ────────
 //
-// testMlDsaAcvpVectors' argument, applied to the transport's own module: NIST's published ACVP
-// vectors for ML-KEM-768 (FIPS 203): fixed coins with the key, ciphertext and shared
-// secret that must come out of them byte for byte.
+// The same reasoning as testMlDsaAcvpVectors, for the transport's own module: NIST's
+// published ACVP vectors for ML-KEM-768 (FIPS 203), fixed coins with the key, ciphertext
+// and shared secret that must come out of them byte for byte.
 //
-// Three of the five groups pin behaviour a round trip cannot reach at all: `decaps` over
-// MODIFIED ciphertexts, where implicit rejection must produce NIST's specific unrelated
-// secret rather than an error, and the two key checks (§7.2's modulus, §7.3's hash).
+// Three of the five groups test behaviour a round trip cannot reach: `decaps` over
+// modified ciphertexts, where implicit rejection must produce NIST's specific unrelated
+// secret instead of an error, and the two key checks (FIPS 203 §7.2's modulus, §7.3's
+// hash).
 async function testMlKemAcvpVectors() {
   console.log("Test: ML-KEM-768 ACVP known-answer vectors (FIPS 203)");
   const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mlkem768-acvp.json"), "utf8"));
@@ -237,6 +226,12 @@ async function testMlKemAcvpVectors() {
   console.log(`  OK (${checked} NIST vectors)\n`);
 }
 
+// ─── Test: hybrid manifest suite 0x02, Ed25519 + ML-DSA-65, both required ───────
+//
+// This §14.1 migration cannot be delivered through its own mechanism: a PQ verifier
+// shipped as a bundle would be admitted by the classical verifier, so the suite ships in
+// the artifact ahead of need. Tested below: both signatures required, the author id bound
+// to both keys, and a host without the PQ half refusing instead of falling back.
 async function testHybridManifestSuite() {
   console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
 
@@ -247,7 +242,7 @@ async function testHybridManifestSuite() {
   const env = signTestBundle(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][body]`. Both keys
-  //    lead, so a verifier reads the whole key set before either signature.
+  //    come first, so a verifier reads the whole key set before either signature.
   const OFF_ML_PK = 33, OFF_ED_SIG = OFF_ML_PK + ML_DSA65_PK_LEN;
   const OFF_ML_SIG = OFF_ED_SIG + 64, OFF_BODY = OFF_ML_SIG + ML_DSA65_SIG_LEN;
   assertEqual(env[0], 0x02, "the envelope opens with the hybrid manifest suite id");
@@ -264,9 +259,9 @@ async function testHybridManifestSuite() {
   assert(sodium.ml_dsa65_verify_detached(env.subarray(OFF_ML_SIG, OFF_BODY), signedInput, pq.publicKey),
     "ML-DSA signs the same body-hash preimage");
 
-  // 2. Untouched, it verifies — and the author id is the hash over BOTH keys, never
-  //    either one (§12.4). That is what hybrid signing rests on: an attacker who breaks
-  //    one algorithm cannot reach this identity while choosing the other half's key.
+  // 2. Untouched, it verifies, and the author id is the hash over both keys, never either
+  //    one (§12.4). Hybrid signing depends on this: an attacker who breaks one algorithm
+  //    cannot reach this identity by choosing the other half's key.
   {
     const v = verifyTestBundle(sodium, env);
     assert(v !== null, "an untouched hybrid manifest verifies");
@@ -278,8 +273,8 @@ async function testHybridManifestSuite() {
     assertEqual(v.manifest.app, "pq-probe", "the manifest round-trips");
   }
 
-  // 3. Both halves are load-bearing: tampering with either signature fails the whole
-  //    manifest. "Either verifies" would be exactly as strong as the weaker algorithm.
+  // 3. Both halves matter: tampering with either signature fails the whole manifest.
+  //    "Either verifies" would only be as strong as the weaker algorithm.
   {
     const badEd = env.slice(); badEd[OFF_ED_SIG] ^= 0x01;
     assert(verifyTestBundle(sodium, badEd) === null, "a broken Ed25519 half fails the manifest");
@@ -287,10 +282,10 @@ async function testHybridManifestSuite() {
     assert(verifyTestBundle(sodium, badMl) === null, "a broken ML-DSA half fails the manifest");
   }
 
-  // 4. The splice a hybrid format has to survive: swap in a different Ed25519 key with a
-  //    validly-made signature of its own, keeping the original PQ key and signature.
-  //    Both preimages commit to BOTH keys, so the surviving half no longer verifies —
-  //    the pair cannot be taken apart and half-replaced.
+  // 4. The splice a hybrid format must resist: swap in a different Ed25519 key with its
+  //    own valid signature, keeping the original PQ key and signature. Both preimages
+  //    cover both keys, so the remaining half no longer verifies; the pair cannot be
+  //    half-replaced.
   {
     const { generateKeyPair } = await import("./fixtures.mjs");
     const attacker = generateKeyPair();
@@ -308,9 +303,9 @@ async function testHybridManifestSuite() {
       "an Ed25519 key swap invalidates the untouched ML-DSA half");
   }
 
-  // 5. A host with no ML-DSA verifier REFUSES rather than falling back to the Ed25519
-  //    signature alone — the downgrade the suite exists to prevent. Its own message, like
-  //    an unknown suite's: a legibility failure, not a verdict on the bundle.
+  // 5. A host with no ML-DSA verifier refuses instead of falling back to the Ed25519
+  //    signature alone, the downgrade the suite exists to prevent. It gets its own message,
+  //    like an unknown suite: the host cannot check it, which says nothing about the bundle.
   {
     const classicalOnly = {
       crypto_sign_verify_detached: (...a) => sodium.crypto_sign_verify_detached(...a),
@@ -323,9 +318,8 @@ async function testHybridManifestSuite() {
     assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");
   }
 
-  // 6. End to end: a signed bundle loads, and the author it carries on to policy and
-  //    freshness is the DERIVED id — the key-set hash, never either key — the one identity
-  //    the format produces.
+  // 6. End to end: a signed bundle installs, and the author passed on to policy and
+  //    freshness is the derived id (the key-set hash), never either key.
   {
     const { blob } = authorBundle(sodium, keys, {
       app: "pq-app", version: 1,

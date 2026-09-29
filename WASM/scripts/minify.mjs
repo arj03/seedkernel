@@ -1,9 +1,8 @@
 // The shipped host tree (§10.2). `build/` keeps its doc comments for debugging;
 // `build-min/` is what a browser vendors: a second `tsc` pass over only what the browser
-// entry points reach (tsconfig.min.json), with `removeComments`, since over half the
-// gzipped bytes would be those comments. Letting the compiler strip them is what keeps a
-// hand-written lexer, which cannot tell a regex literal from a division, out of the build.
-// One `npm run build` produces both trees.
+// entry points reach (tsconfig.min.json), with `removeComments`, since comments would be
+// over half the gzipped bytes. The compiler strips them, so no hand-written lexer is
+// needed. One `npm run build` produces both trees.
 
 import { readFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { gzipSync } from "node:zlib";

@@ -1,14 +1,14 @@
 /* The flat ABI the Go bridge (../qjs.go, ../value.go) drives quickjs-ng through.
 
-   Every JSValue crosses as one i64 — this build is NaN-boxed — and every pointer as an i32,
+   Every JSValue crosses as one i64 (this build is NaN-boxed) and every pointer as an i32,
    so each export is a plain wasm function Go calls without marshaling. A result that is an
    address and a length packs both into one i64, (addr << 32) | len, so reading one costs a
    single call and no allocation.
 
    Nothing else is linked in: no quickjs-libc, no module loader, no filesystem. A runtime is
-   the engine's ECMAScript intrinsics plus whatever Go installs on it, which is what keeps a
-   guest realm zero-authority — there is no host object for it to reach, and no module name
-   that resolves. The engine's WASI imports are Go's to answer (qjs.go instantiateWASI). */
+   the engine's ECMAScript intrinsics plus whatever Go installs on it, which keeps a guest
+   realm without authority: there is no host object for it to reach, and no module name
+   that resolves. Go answers the engine's WASI imports (qjs.go instantiateWASI). */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -77,7 +77,7 @@ int QJS_TakeInterrupted(void)
 /* ── unhandled rejections ────────────────────────────────────────────────────
    For a runtime that asks (QJS_New's track_rejections): a promise rejected with no handler
    joins the list and leaves it if a handler arrives later, and QJS_RunJobs reports what is
-   still listed once the queue is empty — Node's rule for an unhandled rejection. */
+   still listed once the queue is empty, Node's rule for an unhandled rejection. */
 typedef struct {
     JSValue promise;
     JSValue reason;
@@ -196,10 +196,10 @@ bool QJS_IsUndefined(JSValue v) { return JS_IsUndefined(v); }
 bool QJS_IsNull(JSValue v) { return JS_IsNull(v); }
 bool QJS_IsObject(JSValue v) { return JS_IsObject(v); }
 
-/* A conversion that throws answers the zero value and TAKES its own exception. Every entry
-   point on a context assumes it is handed a clean one, so an exception left pending here
-   would surface as the failure of the next, unrelated call — for a guest realm, of an
-   invocation that had already produced its answer (../value.go: String, Int32, Int64). */
+/* A conversion that throws returns the zero value and clears its own exception. Every entry
+   point on a context assumes a clean one, so an exception left pending here would surface
+   as the failure of the next, unrelated call; in a guest realm, of an invocation that had
+   already produced its answer (../value.go: String, Int32, Int64). */
 static void take_exception(JSContext *ctx)
 {
     JS_FreeValue(ctx, JS_GetException(ctx));
@@ -255,8 +255,8 @@ JSValue QJS_NewArrayBuffer(JSContext *ctx, size_t len)
 }
 
 /* The bytes an ArrayBuffer or a TypedArray covers, packed; all ones with the exception
-   pending. Read from the engine's own slots — no property lookup, so no JS runs, and
-   nothing the caller wrote on the object is believed. The address is live storage, valid
+   pending. Read from the engine's own slots, with no property lookup, so no JS runs and
+   nothing the caller set on the object is trusted. The address is live storage, valid
    until JS next runs. */
 uint64_t QJS_GetBytes(JSContext *ctx, JSValue v)
 {
@@ -299,8 +299,8 @@ JSValue QJS_Call(JSContext *ctx, JSValue fn, JSValue this_val, int argc, JSValue
     return JS_Call(ctx, fn, this_val, argc, argv);
 }
 
-/* Evaluates strict global code and answers its completion value as it stands — a promise
-   stays a promise. code[len] must be NUL, as JS_Eval requires. */
+/* Evaluates strict global code and returns its completion value as is: a promise stays a
+   promise. code[len] must be NUL, as JS_Eval requires. */
 JSValue QJS_Eval(JSContext *ctx, const char *code, size_t len, const char *filename)
 {
     return JS_Eval(ctx, code, len, filename, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);

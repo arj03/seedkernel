@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Rebuilds qjs.wasm — the engine every realm runs on (main.go, guest.go).
+# Rebuilds qjs.wasm, the engine every realm runs on (main.go, guest.go).
 #
-# What it builds, and from where:
-#   csrc/shim.c      — the flat QJS_* ABI the Go bridge drives (qjs.go, value.go).
-#   csrc/*.patch     — applied to the engine before the build (see each patch's hunks).
-#   quickjs-ng       — the engine, fetched at the pin below. Not vendored: it is ~2 MB of
-#                      C, and a pinned SHA plus the patches say exactly as much as a copy.
+# Inputs:
+#   csrc/shim.c      the flat QJS_* ABI the Go bridge drives (qjs.go, value.go).
+#   csrc/*.patch     applied to the engine before the build (see each patch's hunks).
+#   quickjs-ng       the engine, fetched at the pin below. Not vendored: it is ~2 MB of C,
+#                    and a pinned SHA plus the patches identify it exactly.
 #
 # The build links the engine and wasi-libc, and nothing of quickjs-libc.
 #
-# Requires wasi-sdk (the sysroot clang needs for a WASI target — the PQ builds are
+# Requires wasi-sdk (the sysroot clang needs for a WASI target; the PQ builds are
 # freestanding and need none, this one links libc), binaryen for wasm-opt, cmake, git.
 #   Arch:   pacman -S binaryen cmake git   +   wasi-sdk in /opt
 #   Debian: apt install binaryen cmake git +   wasi-sdk in /opt
@@ -23,10 +23,10 @@ here="$(cd "$(dirname "$0")" && pwd)"
 work="$here/.build"
 wasi_sdk="${WASI_SDK:-/opt/wasi-sdk}"
 
-# quickjs-ng v0.16.2. Moving this is a deliberate engine upgrade: re-run the Go suite,
-# which drives every export the bridge uses, and check the patches still apply. The
-# JS targets' emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the SAME
-# commit, so both engines stay one version.
+# quickjs-ng v0.16.2. Changing it is an engine upgrade: re-run the Go suite, which uses
+# every export the bridge needs, and check the patches still apply. The JS targets'
+# emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the same commit, so both
+# engines stay on one version.
 quickjs_repo="https://github.com/quickjs-ng/quickjs"
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 

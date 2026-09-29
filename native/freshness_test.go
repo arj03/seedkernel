@@ -8,42 +8,42 @@ import (
 	"testing"
 )
 
-// The bundle-freshness high-water mark must survive a reboot: the marks live in the JS
-// realm (bundle.ts FreshnessMarks) and are persisted through Go's atomic-write seam, so
-// a fresh realm must re-read them from the file (README §12.4). This drives the real
-// load path — boot, load, "reboot", load again — so a regression that dropped the write
-// (or left it non-atomic and unreadable) shows up as a downgrade that is wrongly allowed.
+// The bundle freshness mark must survive a reboot: the marks live in the JS realm
+// (bundle.ts FreshnessMarks) and are persisted through Go's atomic write, so a fresh realm
+// must re-read them from the file (§12.4). This uses the real install path (boot,
+// install, reboot, install again), so a regression that dropped the write (or left it
+// non-atomic and unreadable) shows up as a downgrade that is wrongly allowed.
 func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
-	// The mark is a SIBLING of the data dir (a fs-capable guest writes files inside the
-	// dir and must not be able to reach its own mark), so give the dir a parent we can
-	// list: one data directory plus exactly one mark file, and no stray temp.
+	// The mark file sits beside the data dir (a guest with fs writes files inside the dir
+	// and must not be able to reach its own mark), so give the dir a parent to list: one
+	// data directory plus exactly one mark file, and no stray temp.
 	parent := t.TempDir()
 	dataDir := filepath.Join(parent, "data")
 
-	// One author across every "boot": the mark is keyed by (author, app). The author is
-	// minted against the first realm's sodium, so boot once before writing bundles.
+	// One author across every boot: the mark is keyed by (author, app). The author is
+	// created with the first realm's sodium, so boot once before writing bundles.
 	bootRealmIn(t, dataDir)
 	author := testAuthor(t)
 	policyJSON := `{"authors":["` + hex.EncodeToString(author.id()) + `"]}`
 
-	// reboot stands up a fresh realm and node on the same data dir — the marks are
-	// in-realm state, so this is what forces the next load to re-read them from the file.
+	// reboot starts a fresh realm and node on the same data dir; the marks are in-realm
+	// state, so this forces the next install to re-read them from the file.
 	reboot := func() { bootShell(t, dataDir, policyJSON, nil) }
 	load := func(version int) string {
 		bundlePath, _ := writeTestBundle(t, author, "testapp", version)
 		return loadBundle(bundlePath)
 	}
 
-	// First boot: v3 clears the (empty) mark and, once loaded, advances + persists it.
+	// First boot: v3 passes the (empty) mark and, once installed, advances and persists it.
 	reboot()
 	if status := load(3); !strings.HasPrefix(status, "testapp v3") {
 		t.Fatalf("v3 on a fresh store: %s", status)
 	}
 
-	// The advance must have written the mark to disk (atomically — no temp left behind).
-	// Where that file is is the shared rule's (`freshnessPathFor`, bundle.ts), asked of
-	// the realm rather than recomputed here: a test that spelled the sibling-file
-	// convention itself could pass while the two targets wrote to different places.
+	// The advance must have written the mark to disk (atomically, no temp left behind).
+	// The file's location comes from the shared rule (`freshnessPathFor`, bundle.ts), asked
+	// of the realm instead of recomputed here, so the test cannot pass while the two
+	// targets write to different places.
 	markPath := evalString(t, "freshnessPathFor("+jsonString(dataDir)+")")
 	if _, err := os.Stat(markPath); err != nil {
 		t.Fatalf("freshness mark was not persisted: %v", err)
@@ -64,9 +64,9 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	if status := load(2); !strings.Contains(status, "downgrade refused") {
 		t.Fatalf("v2 after reboot: expected a downgrade refusal, got: %s (mark did not survive the reboot)", status)
 	}
-	// An equal-version reload (v3) and a newer version (v4) both pass; v4 advances the mark.
-	// Each gets its own boot: a load only ever takes a FREE slot, and this is the reboot
-	// path — an in-place upgrade is the explicit replacement of the slot standing.
+	// An equal-version reinstall (v3) and a newer version (v4) both pass; v4 advances the
+	// mark. Each gets its own boot: an install without `replaces` needs a free slot, and
+	// this tests the reboot path, not in-place replacement.
 	if status := load(3); !strings.HasPrefix(status, "testapp v3") {
 		t.Fatalf("v3 after reboot: %s", status)
 	}
@@ -82,11 +82,10 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	}
 }
 
-// A mark the disk refuses is a FAILED load on this target too. The native store once
-// caught its write error and only logged it, which turned the shared rollback (bundle.ts
-// installBundle) off for the whole binary: the load reported success while the mark it
-// depends on was never written, re-opening the downgrade gate at the next boot with
-// nothing saying why. The write seam is Go's, so this is the only place to check it.
+// A mark the disk refuses fails the install on this target too. If the native write
+// swallowed its error, the shared rollback would never run: the install would report
+// success while the mark was never written, reopening the downgrade path at the next boot
+// with no explanation. The write is Go's, so this is the only place to check it.
 func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
 	parent := t.TempDir()
 	dataDir := filepath.Join(parent, "data")
@@ -95,9 +94,9 @@ func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
 	policyJSON := `{"authors":["` + hex.EncodeToString(author.id()) + `"]}`
 	bootShell(t, dataDir, policyJSON, nil)
 
-	// A directory standing where the mark file goes. Every write ends in a rename onto
-	// that path, which the kernel refuses whatever the process's privileges — a full or
-	// read-only disk without needing either.
+	// A directory where the mark file goes. Every write ends in a rename onto that path,
+	// which the OS refuses whatever the process's privileges, standing in for a full or
+	// read-only disk.
 	markPath := evalString(t, "freshnessPathFor("+jsonString(dataDir)+")")
 	os.Remove(markPath) // the boot may already have written one
 	if err := os.MkdirAll(markPath, 0o755); err != nil {
@@ -110,9 +109,9 @@ func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
 		t.Fatalf("a load whose mark cannot be written must fail loudly, got: %s", status)
 	}
 
-	// And it kept nothing: the in-memory mark was rolled back, so the store never
-	// silently ran ahead of the disk. A LOWER version landing now is the proof — after a
-	// swallowed error the mark would sit at 4 and refuse this as a downgrade.
+	// And it kept nothing: the in-memory mark was rolled back, so the store never got
+	// ahead of the disk. A lower version installing now shows it; after a swallowed error
+	// the mark would be at 4 and refuse this as a downgrade.
 	if err := os.Remove(markPath); err != nil {
 		t.Fatal(err)
 	}

@@ -1,30 +1,28 @@
-/** Platform adapter with a natural pre-open buffer. Admission belongs to the enclosing
- * link owner (`TransportHost`); this class retains accepted bytes and reports them. */
+/** Platform adapter with a pre-open buffer. Admission is the link owner's job
+ * (`TransportHost`); this class holds accepted bytes and reports them. */
 
-/** The minimal view of a message-oriented transport that MessageChannel wraps: a
- *  browser WebSocket and an RTCDataChannel both deliver whole ordered binary
- *  messages and expose binaryType/bufferedAmount. It is the whole contract a
- *  console peer's own peer-connection implementation has to satisfy. */
+/** The part of a message-oriented transport that MessageChannel uses. A browser
+ *  WebSocket and an RTCDataChannel both deliver whole ordered binary messages and expose
+ *  binaryType and bufferedAmount. This is all a console peer's own peer-connection
+ *  implementation has to provide. */
 export interface MessageTransport {
   binaryType: string;
-  /** Bytes queued but not yet on the wire — the host owner's custody signal
-   *  (socket-seam.ts `RawLink.buffered`). Optional: not every transport-shaped
-   *  object in a test double reports it. */
+  /** Bytes queued but not yet on the wire, which the host uses for outbound accounting
+   *  (socket-seam.ts `RawLink.buffered`). Optional, since some test doubles omit it. */
   bufferedAmount?: number;
-  /** This class only ever sends bytes, so that is the whole requirement: a DOM
-   *  WebSocket or RTCDataChannel accepts more, an off-browser data channel may not.
-   *  A view rather than `Uint8Array`, because the DOM lib types RTCDataChannel's as
-   *  `ArrayBufferView<ArrayBuffer>`, which a `Uint8Array<ArrayBufferLike>` misses. */
+  /** This class only sends bytes, so that is all it requires; a DOM WebSocket or
+   *  RTCDataChannel accepts more, an off-browser data channel may not. A view instead of
+   *  `Uint8Array`, because the DOM lib types RTCDataChannel's as
+   *  `ArrayBufferView<ArrayBuffer>`, which a `Uint8Array<ArrayBufferLike>` does not match. */
   send(data: ArrayBufferView): void;
   close(): void;
   addEventListener(type: "open" | "close" | "error", cb: () => void): void;
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
 }
 
-/** RawLink over any whole-message binary transport: a WebSocket (net-ws) and RtcChannel
- *  (net-rtc) are both this class — the transport's own event wiring is identical, so it is
- *  written once here. The seam carries bytes, so only binary frames are delivered; a
- *  string frame is dropped rather than re-encoded. */
+/** RawLink over any whole-message binary transport. WebSocket (net-ws) and RtcChannel
+ *  (net-rtc) both use it, since their event wiring is identical. The seam carries bytes,
+ *  so only binary frames are delivered; a string frame is dropped. */
 export class MessageChannel {
   private onMsg: ((bytes: Uint8Array) => void) | null = null;
   private onCls: (() => void) | null = null;
@@ -42,9 +40,8 @@ export class MessageChannel {
     t.addEventListener("close", () => this.fail());
     t.addEventListener("error", () => this.fail());
   }
-  /** Written-but-not-yet-on-the-wire bytes: the pre-open queue plus the platform
-   *  transport's own send backlog. Feeds the host's outbound custody owner
-   *  (socket-seam.ts). */
+  /** Bytes written but not yet on the wire: the pre-open queue plus the transport's own
+   *  send backlog. Used for the host's outbound accounting (socket-seam.ts). */
   buffered(): number { return this.pendingBytes + (this.t.bufferedAmount ?? 0); }
   send(bytes: Uint8Array): void {
     if (this.dead) throw new Error("socket: link is closed");
@@ -52,8 +49,8 @@ export class MessageChannel {
       try {
         this.write(bytes);
       } catch {
-        // A message may have been split into several physical writes. Once any
-        // write fails, the byte stream cannot safely continue after that prefix.
+        // A message may have been split into several physical writes. Once one fails,
+        // the stream cannot safely continue after the part already written.
         this.fail();
       }
     } else {
@@ -64,9 +61,8 @@ export class MessageChannel {
   /** One physical write. Overridable so a transport with a message-size ceiling
    *  (RtcChannel) can split it while everything above still sees whole writes. */
   protected write(bytes: Uint8Array): void { this.t.send(bytes); }
-  /** Release the pre-open queue. Every path out of the buffering state ends here or in
-   *  `open()`, so a channel that dies before it opened does not hold its backlog until
-   *  the object itself is dropped. */
+  /** Release the pre-open queue, so a channel that dies before opening does not hold its
+   *  backlog until the object is collected. */
   private dropPending(): void {
     this.pending.length = 0;
     this.pendingBytes = 0;
@@ -83,9 +79,9 @@ export class MessageChannel {
       this.t.close();
     } catch { /* already gone */ }
   }
-  /** The transport became writable — drain the pre-open buffer. Idempotent, so a
-   *  transport writable from birth (a socket that buffers its own writes) calls it
-   *  straight from its ctor. */
+  /** The transport became writable: flush the pre-open buffer. Idempotent, so a transport
+   *  that is writable immediately (a socket that buffers its own writes) can call it from
+   *  its constructor. */
   protected open(): void {
     if (this.opened) return;
     this.opened = true;
@@ -97,9 +93,9 @@ export class MessageChannel {
     }
     this.dropPending();
   }
-  /** The transport failed/closed: mark dead and notify onClose once. `close()` sets `dead`
-   *  first, so a deliberate close never re-enters here — but a failure on a live channel
-   *  must reach onClose, or the link is never forgotten and the peer is blackholed. */
+  /** The transport failed or closed: mark it dead and notify onClose once. `close()` sets
+   *  `dead` first, so a local close does not come through here, but a failure on a live
+   *  channel must reach onClose or the link is never removed. */
   protected fail(): void {
     if (this.dead) return;
     this.close();

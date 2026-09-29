@@ -1,10 +1,8 @@
 package main
 
-// The one way a test stands the native host up. Production has a single assembly path — boot()
-// installs the platform primitives and evaluates the shared bundle, standUp() builds the
-// node and shell inside it — so the tests drive that path. A harness that assembled the
-// realm differently would be the second implementation this target exists not to have
-// (README §12.9).
+// How tests boot the native host. Production has a single assembly path (boot() installs
+// the platform primitives and evaluates the shared bundle, standUp() builds the node and
+// shell inside it), and the tests use that path instead of a second assembly (§12.9).
 
 import (
 	"crypto/rand"
@@ -15,16 +13,16 @@ import (
 	"time"
 )
 
-// The old Shell.invoke-by-key shape survives only as a TEST adapter for Go assertions
-// that select among several bundles. Production returns AppHandles and retains none.
+// A test-only adapter that invokes installed bundles by label, for Go assertions that pick
+// among several bundles. Production returns AppHandles and keeps none.
 const nativeHandleHarness = `
 (() => {
   const apps = new Map();
-  // The node startNode stood: the one a test's bundles load into and its invocations reach.
+  // The node startNode booted: the one a test's bundles install into and its invocations reach.
   let node = null;
-  // The operator's choices as one JSON object, stood up through the same standUp the
-  // shared CLI's flow reaches, on this realm's data directory. The key is derived HERE,
-  // by the shared subkey code the CLI runs, so the peer id is the one --key would give.
+  // The operator's choices as one JSON object, booted through the same standUp the shared
+  // CLI uses, on this realm's data directory. The key is derived here by the shared subkey
+  // code the CLI runs, so the peer id is the one --key would give.
   globalThis.startNode = async (json) => {
     const cfg = JSON.parse(json);
     const identity = deriveNodeKey(sodium, fromHex(cfg.keyHex));
@@ -58,18 +56,18 @@ const nativeHandleHarness = `
   globalThis.invokeApp = (key, payload) => {
     const app = apps.get(key);
     if (!app) throw new Error("native test: no loaded handle for '" + key + "'");
-    // This adapter only ever invokes the test fixture's literal "test" operation. Keep
-    // that fixture frame here rather than widening the production QuickJS globals with
-    // the optional client codec solely for Go assertions.
+    // This adapter only invokes the test fixture's literal "test" op. The frame is built
+    // here instead of exposing the client codec as a production QuickJS global just for
+    // Go assertions.
     const args = new Uint8Array(payload);
     const body = new Uint8Array(5 + args.length);
     body.set([4, 0x74, 0x65, 0x73, 0x74]);
     body.set(args, 5);
     return app.invoke(body);
   };
-  // Teaching a peer is a claim call on the id the transport bundle claims — the host's own
-  // door into the network. The op frame is written out here rather than by widening the
-  // production QuickJS globals with the client codec, as invokeApp does for its own frame.
+  // Adding a peer is a call to the id the transport bundle claims, the host's own way into
+  // the network. The op frame is written out here, as invokeApp does for its own frame,
+  // instead of exposing the client codec as a production QuickJS global.
   const opFrame = (op, args) => {
     const out = new Uint8Array(1 + op.length + args.length);
     out[0] = op.length;
@@ -102,22 +100,20 @@ const nativeHandleHarness = `
 })();
 `
 
-// The data directory the standing realm is rooted in, while the harness owns it.
+// The data directory of the current realm, while the harness owns it.
 //
-// A realm OUTLIVES the caller that stood it up: boot() keeps it until the next boot, so a
-// data directory removed when that test ends leaves whatever runs next writing into a path
-// that is gone — and `tb.TempDir()` has exactly that lifetime. Benchmarks are where the
-// mismatch bites, since Go runs them after the tests in one process: a bench that reboots
-// the realm handed every later one a directory testing had already deleted, which surfaced
-// as a freshness-store write failure nowhere near the boot that caused it. So the realm
-// gets a directory of the harness's own, dropped when the realm it rooted is torn down —
-// hand over hand, so a run leaves a stale directory or two behind rather than one per
-// boot.
+// A realm outlives the caller that booted it: boot() keeps it until the next boot, so a
+// data directory removed when that test ends would leave whatever runs next writing into
+// a deleted path, and `tb.TempDir()` has exactly that lifetime. Benchmarks run after the
+// tests in the same process, so a reused realm would hand them a deleted directory, which
+// shows up as a freshness-store write failure far from its cause. So the realm gets a
+// directory owned by the harness, removed when that realm is torn down, which leaves at
+// most a stale directory or two per run instead of one per boot.
 var ownedRealmDir string
 
-// bootRealm stands up a fresh realm on a temp data dir: the engines, the platform
-// primitives, and the one shared bundle — but no node. For tests that exercise a
-// primitive (fs, the byte seam) or the shared JS directly.
+// bootRealm starts a fresh realm on a temp data dir: the engines, the platform
+// primitives, and the shared bundle, but no node. For tests of a primitive (fs, the byte
+// seam) or the shared JS directly.
 func bootRealm(tb testing.TB) {
 	tb.Helper()
 	dir, err := os.MkdirTemp("", "seedkernel-realm-")
@@ -125,25 +121,24 @@ func bootRealm(tb testing.TB) {
 		tb.Fatal("realm data dir:", err)
 	}
 	bootRealmIn(tb, dir)
-	// Claimed only once the boot succeeded — bootRealmIn has just released the previous
-	// claim, and this is the directory the realm now standing reads and writes.
+	// Recorded only once the boot succeeded: bootRealmIn has just released the previous
+	// one, and this is the directory the new realm reads and writes.
 	ownedRealmDir = dir
 }
 
 func bootRealmIn(tb testing.TB, dir string) {
 	tb.Helper()
-	// Nothing below is worth running against an artifact the sources have moved past
-	// (shell_stamp_test.go). Checked here rather than per suite because every one of them
-	// evaluates that artifact and none of them can tell.
+	// Nothing below is worth running against an artifact older than its sources
+	// (shell_stamp_test.go). Checked here, not per suite, because every suite evaluates
+	// that artifact and none can tell.
 	requireFreshShell(tb)
 	if err := boot(); err != nil {
 		tb.Fatal("boot:", err)
 	}
-	// boot() tore the previous realm down, so nothing reads the directory it was rooted
-	// in any more. A caller-supplied `dir` is the caller's to keep. The freshness marks
-	// are a SIBLING of the data directory rather than a file inside it (bundle.ts
-	// `freshnessPathFor`, which owns the name), so dropping a realm's directory means
-	// dropping both.
+	// boot() tore the previous realm down, so nothing reads its directory now. A
+	// caller-supplied `dir` is the caller's to keep. The freshness marks sit beside the
+	// data directory, not inside it (bundle.ts `freshnessPathFor`), so removing a realm's
+	// directory means removing both.
 	if ownedRealmDir != "" {
 		_ = os.RemoveAll(ownedRealmDir)
 		_ = os.Remove(ownedRealmDir + ".freshness.json")
@@ -153,9 +148,9 @@ func bootRealmIn(tb testing.TB, dir string) {
 		tb.Fatal("native handle harness:", err)
 	}
 	// This realm's data directory, which Go's boot knows nothing about. Opened through the
-	// platform's own `fs.open` for the tests that reach `fs` with no node standing, and
-	// kept as `__dir` for every `standUp` a test calls: the Go primitive serves one
-	// directory, so the nodes a realm stands share it (host/native-shim.ts).
+	// platform's own `fs.open` for tests that use `fs` with no node running, and kept as
+	// `__dir` for every `standUp` a test calls: the Go primitive serves one directory, so
+	// all nodes in a realm share it (host/native-shim.ts).
 	evalString(tb, "__fs.open("+jsonString(dir)+"), globalThis.__dir = "+jsonString(dir))
 }
 
@@ -171,13 +166,13 @@ func jsonString(s string) string {
 
 // ── the realm entry points a test drives ─────────────────────────────────────
 //
-// TEST drivers, not production code: the binary reaches the realm once, at `runMain`, and
-// everything below that is the shared CLI's. A test needs finer joints than one call, so
-// it uses the same realm exports `runCli` does — never a second assembly of its own.
+// Test drivers, not production code: the binary calls into the realm once, at `runMain`,
+// and everything below that is the shared CLI. A test needs finer control than one call,
+// so it uses the same realm exports `runCli` does, never a separate assembly.
 
 // nodeConfig is what the harness's `startNode` takes: the operator's choices as one JSON
 // object. In production the shared CLI builds a node's setup from the flags; here a test
-// builds it directly to stand a node up without a command line.
+// builds it directly to boot a node without a command line.
 type nodeConfig struct {
 	PolicyJSON       *string   `json:"policyJson"`
 	KeyHex           string    `json:"keyHex"`
@@ -191,7 +186,7 @@ type hostPort struct {
 	Port int    `json:"port"`
 }
 
-// nodeStatus is what the realm reports once the node is up: who we are, and the ports
+// nodeStatus is what the realm reports once the node is up: its peer id, and the ports
 // actually bound (0 where not listening).
 type nodeStatus struct {
 	PeerID string `json:"peerId"`
@@ -199,8 +194,8 @@ type nodeStatus struct {
 	WsPort int    `json:"wsPort"`
 }
 
-// startNode builds the node inside the realm and waits for its listeners to bind — the
-// same `standUp` the shared CLI's flow reaches, minus the command line.
+// startNode builds the node inside the realm and waits for its listeners to bind, using
+// the same `standUp` as the shared CLI, without the command line.
 func startNode(cfg nodeConfig) (nodeStatus, error) {
 	var st nodeStatus
 	j, err := json.Marshal(cfg)
@@ -214,10 +209,9 @@ func startNode(cfg nodeConfig) (nodeStatus, error) {
 	return st, json.Unmarshal(out, &st)
 }
 
-// loadBundle loads a signed bundle file and returns the operator's console line for it,
-// or an `ERROR: …` string. The line is produced by `loadedLine` in the shared CLI — the
-// very line the binary prints — so a test asserting on it is asserting on what an
-// operator sees, and there is no second formatting here to drift from it.
+// loadBundle installs a signed bundle file and returns the operator's console line for it,
+// or an `ERROR: ...` string. The line comes from `loadedLine` in the shared CLI, the same
+// line the binary prints, so a test checks exactly what an operator sees.
 func loadBundle(path string) string {
 	out, err := callRealm("cliLoadBundle", 30*time.Second, qc.NewString(path))
 	if err != nil {
@@ -226,8 +220,8 @@ func loadBundle(path string) string {
 	return string(out)
 }
 
-// invokeBundle drives a loaded slot through its guest; pure modules are intentionally
-// unreachable from the host test seam except through this path.
+// invokeBundle calls an installed slot through its guest; pure modules are only reachable
+// from tests this way.
 func invokeBundle(app string, payload []byte) ([]byte, error) {
 	return callRealm("invokeApp", 30*time.Second, qc.NewString(app), qc.NewArrayBuffer(payload))
 }
@@ -242,10 +236,10 @@ func evalString(tb testing.TB, expr string) string {
 	return v.String()
 }
 
-// awaitOK drives the loop until expr settles and fails the test unless it FULFILLED. Prefer
-// it to el.await, which reports a rejection as kind 1 with a NIL error — so an `err != nil`
-// check reads like one and silently passes on the failure it was written to catch. A test
-// whose subject IS the rejection or timeout reads the kind instead (loop_probe_test.go).
+// awaitOK drives the loop until expr settles and fails the test unless it fulfilled. Prefer
+// it to el.await, which reports a rejection as kind 1 with a nil error, so an `err != nil`
+// check silently passes on the failure it was meant to catch. A test about a rejection or
+// timeout reads the kind instead (loop_probe_test.go).
 func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	tb.Helper()
 	kind, value, msg, err := el.await(expr, timeout)
@@ -258,19 +252,18 @@ func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	return value
 }
 
-// bootShell stands a whole node up exactly as the binary does — a fresh realm on `dir`,
-// then startShell. Returns what the realm reported: the peer id and the ports actually
-// bound.
+// bootShell boots a whole node as the binary does: a fresh realm on `dir`, then
+// startShell. Returns what the realm reported: the peer id and the ports actually bound.
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
 	return startShell(tb, policyJSON, listen)
 }
 
-// startShell stands a node up in the realm already booted — standUp inside it (identity,
-// network, bootShell over this platform) — for a test whose policy names an author it
-// has to mint against that realm first. `listen` is nil for a node that only initiates;
-// policyJSON "" is the deny-all default (README §14).
+// startShell boots a node in the already booted realm (standUp inside it: identity,
+// network, bootShell over this platform), for a test whose policy names an author it has
+// to create in that realm first. `listen` is nil for a node that only initiates;
+// policyJSON "" is the deny-all default (§14).
 func startShell(tb testing.TB, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen}
@@ -284,14 +277,14 @@ func startShell(tb testing.TB, policyJSON string, listen *hostPort) nodeStatus {
 	return st
 }
 
-// testContactSecretHex is the deployment secret every test node shares: it gates who may
-// draw any response at all from a node, so two nodes on different values are mutually
-// invisible. One value here means one deployment.
+// testContactSecretHex is the contact secret every test node uses. A node answers only
+// callers presenting its secret, so one shared value lets every test node reach every
+// other.
 const testContactSecretHex = "0303030303030303030303030303030303030303030303030303030303030303"
 
-// testKeyHex mints a node identity master seed: 32 bytes of entropy, hex — the same
-// 64 hex chars --key holds. startNode derives the node's keypair from it inside the
-// shared realm (deriveNodeKey, services/subkeys.ts).
+// testKeyHex creates a node master seed: 32 bytes of entropy as hex, the same 64 hex chars
+// --key holds. startNode derives the node's keypair from it inside the shared realm
+// (deriveNodeKey, services/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
 	seed := make([]byte, 32)
@@ -314,27 +307,25 @@ func authorsPolicy(ids ...[]byte) string {
 	return string(j)
 }
 
-// testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience over the
-// shared createGuestSeam, so a test can hand a realm a seam with no signed bundle behind
+// testGuestSeamJS installs __buildGuestSeam / __callSeam: a test-only helper over the
+// shared createGuestSeam, so a test can give a realm a seam with no signed bundle behind
 // it. Production wires the seam from the admitted manifest's guest.requires (§12.2,
-// §12.10), which is why this lives in a _test file.
+// §12.10).
 const testGuestSeamJS = `
 "use strict";
 globalThis.__buildGuestSeam = function (names, callLocal, scope) {
   globalThis.__guestSeam = createGuestSeam({
     sodium,
-    // The declared names straight through: a host service's methods are wired iff it is
-    // one of these, and every other name here is a LOCAL service id (§12.10).
+    // The declared names as given: a host service's methods are wired only if it is one
+    // of these, and every other name here is a local service id (§12.10).
     requires: names,
-    // What this node can back; only the declared ones are wired.
+    // What this node provides; only the declared ones are wired.
     backends: { node: scope || undefined, fs },
-    // The routing a local service id resolves through: the shell's, in production.
-    // Absent here means nothing claims any id, which the seam reports by name rather
-    // than leaving the caller pending.
+    // Local service id routing, done by the shell in production. Absent here means
+    // nothing claims any id, which the seam reports by name instead of leaving the caller
+    // waiting.
     callLocal: callLocal || (() => null),
-    // Per APP: no app behind this harness, so a bare name reaches nothing. Nothing to
-    // scope either — the seam is wired against ONE app's module map, so "a guest
-    // reaches only its own modules" needs no argument here to stay true.
+    // Per app: there is no app behind this harness, so a bare name reaches nothing.
     modules: { names: new Set(), call: () => null },
   });
   return __guestSeam;
@@ -342,9 +333,8 @@ globalThis.__buildGuestSeam = function (names, callLocal, scope) {
 // With the budget a realm would pass: an unbounded segment, no causal root, no spend.
 const __testBudget = { remainingMs: Infinity, causalClock: undefined, charge() {}, detach() {} };
 globalThis.__callSeam = async (name, ab) => __guestSeam(name, new Uint8Array(ab), __testBudget);
-// EVERY name answers a Promise now — crypto included — so this is the one calling
-// convention. Driven through callRealm, which already knows how to pump the loop
-// until a realm promise settles.
+// Every name, crypto included, answers a Promise, so this is the only calling convention.
+// Used through callRealm, which pumps the loop until a realm promise settles.
 globalThis.__callSeamAwait = __callSeam;
 `
 
@@ -357,11 +347,10 @@ func guestSeamRealm(tb testing.TB) {
 	}
 }
 
-// newTestRealm creates a confined realm through the SAME factory production uses
+// newTestRealm creates a confined realm through the same factory production uses
 // (createRealm, host/native-shim.ts) over a seam the caller has already installed at
-// `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared guest
-// preamble, the given signed APP fixture and an empty LOCAL value, mirroring what
-// the shell composes for a real bundle's guest.
+// `__guestSeam`, and stores it at `__realm`. `source` is prefixed with the given APP
+// fixture and an empty LOCAL value, as the shell does for a real bundle's guest (no HOST).
 func newTestRealm(tb testing.TB, appJSON, source string) {
 	tb.Helper()
 	newTestRealmBudget(tb, appJSON, source, 0)
@@ -379,9 +368,9 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 		`(async () => {
 			globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
 				deadlineMs: __deadlineMs || undefined });
-			// The test driver's twin of the shell's enter: the host's 32 zero-byte
-			// caller id in front of the guest's own op framing (composed here, since the
-			// host writing it would learn the guest's vocabulary).
+			// The test driver's version of the shell's enter: the host's 32 zero-byte
+			// caller id in front of the guest's own op framing (built here, since the host
+			// never knows a guest's op names).
 			globalThis.__realmCall = (op, arg, causalClock) => {
 			  const body = new Uint8Array(arg);
 			  const framed = new Uint8Array(1 + op.length + body.length);
@@ -400,19 +389,19 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	}
 }
 
-// realmCall invokes the realm newTestRealm parked, as the initiator — the same shape
-// the shell uses, with the 32 zero-byte caller id + the guest's own op framing composed
-// by __realmCall — driving the loop until it settles; the guest may await net on the way.
-// Go stages the payload as an ArrayBuffer, so the view SafeRealm.call is declared to
-// take is made in the expression rather than by widening the shared signature.
+// realmCall invokes the realm newTestRealm stored, as the initiator, the same way the
+// shell does (the 32 zero-byte caller id plus the guest's own op framing, built by
+// __realmCall), driving the loop until it settles; the guest may await the network on the
+// way. Go passes the payload as an ArrayBuffer, so the Uint8Array Realm.call takes is
+// made in the expression instead of loosening the shared signature.
 func realmCall(entry string, payload []byte) ([]byte, error) {
 	return callRealm("__realmCall", 30*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
 }
 
-// TestCallRealmReleasesStagedArgs covers the argument staging: callRealm lands each
-// argument on a __aN global and must release it when the call returns — otherwise a
-// one-shot op (an --op put of a large file) leaves its payload rooted on the global object
-// for the process's life.
+// TestCallRealmReleasesStagedArgs covers argument staging: callRealm puts each argument on
+// an __aN global and must release it when the call returns, or a one-shot op (an --op put
+// of a large file) would keep its payload alive on the global object for the life of the
+// process.
 func TestCallRealmReleasesStagedArgs(t *testing.T) {
 	bootRealm(t)
 	if _, err := qc.Eval("probe.js", `

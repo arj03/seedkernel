@@ -1,8 +1,5 @@
-// fixtures.mjs — the bundle/shell/host scaffolding every seedkernel test suite needs.
-// Each suite in tests/*.test.mjs imports what it needs from here instead of restating
-// sodium init, the author/guest fixtures, or the test-only ModuleTable host. Extracted
-// from the single-file run.mjs so a suite file reads as its own topic, not a topic plus a
-// copy of everyone else's setup.
+// The bundle, shell and host scaffolding the test suites share: sodium init, the author
+// and guest fixtures, and the test-only module host.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -18,10 +15,9 @@ export const { bootShell } = await imp("build/host/shell-core.js");
 export const { bootNodeShell } = await imp("build/host/shell-node.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 
-// The host's already-readied instance rather than our own copy:
-// libsodium-wrappers declares separate "import" and "require" conditions pointing at
-// different builds, so a require() here returns a SECOND instance with its own wasm heap
-// that nothing awaits .ready on. One shared instance is the rule (§12.1).
+// The host's already-readied instance, not a separate copy: libsodium-wrappers has
+// separate "import" and "require" builds, so a require() here would return a second
+// instance with its own wasm heap that nothing awaits .ready on.
 export const sodium = await loadCrypto();
 
 // One contact secret for the whole harness. In production each node has its own and
@@ -54,36 +50,33 @@ export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
 export { bytesEqual } from "./bytes.mjs";
 
-// Install's admission step (§12.4) — tests drive the SAME code path a bundle load does
-// rather than a parallel copy of it.
+// Install's admission step (§12.4): tests use the same code path an install does.
 export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
 export const { guestOpFraming, authorBundle } = await imp("build/scripts/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
 export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 
-// Every app is a guest (§12.4), so every bundle a test builds declares one. The stub
-// used by tests that do not exercise the guest is the same minimal program throughout.
+// Every app is a guest (§12.4), so every test bundle declares one. Tests that do not
+// exercise the guest use this minimal program.
 export const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 export const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 export const GUEST = (extra = {}) => ({ requires: [], ...extra });
 
-/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
- *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins,
- *  freshness marks, revocation) and hand the whole object to `signTestBundle`, so none can
- *  pin half an identity. */
+/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
+ *  derived from both. Tests use `a.id` wherever the runtime names an author (policy,
+ *  freshness marks, revocation) and pass the whole object to `signTestBundle`, so none
+ *  can use half an identity. */
 export const testAuthor = () => makeAuthor(sodium);
 
-/** A NODE-platform node for one test: `bootNodeShell` (shell-node.ts) with no network,
- *  which these tests do not drive. The disk-backed platform — NodeFs on a data
- *  directory, a file-backed freshness store — is the point of reaching for it over
- *  {@link bootTestShell}, which stands a node with no disk. */
+/** A Node-platform node for one test: `bootNodeShell` (shell-node.ts) with no network.
+ *  Use it instead of {@link bootTestShell} for the disk-backed parts: NodeFs on a data
+ *  directory and a file-backed freshness store. */
 export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
 
-/** A node for ONE test, through the one assembly (`bootShell`, §12.9). The platform
- *  members are stated flat, as the assembly takes them; `fs` defaults to `false` — most
- *  bundles here declare no `fs` cap, and handing them the in-memory backend would be a
- *  seam open the test never asked for.
+/** A node for one test, through the shared assembly (`bootShell`, §12.8). The platform
+ *  members are passed flat, as the assembly takes them; `fs` defaults to `false`, since
+ *  most bundles here do not require `fs`.
  *
  *  `transportAuthor` boots a small signed link occupant for explicit replacement tests. */
 export async function bootTestShell({ transportAuthor, ...opts } = {}) {
@@ -111,20 +104,19 @@ export async function bootTestShell({ transportAuthor, ...opts } = {}) {
   return shell;
 }
 
-/** `verifyBundle` → `admit` → `installBundle` (§12.4), for the policy + integrity tests
- *  that own their own ModuleTable without a shell. `admit` is AWAITED — a predicate may
- *  answer with a Promise, and reading one as a verdict is fail-open. */
+/** `verifyBundle`, then `admit`, then module loading (§12.4), for the policy and
+ *  integrity tests that use their own module host without a shell. `admit` is awaited:
+ *  a predicate may return a Promise, and treating one as a verdict would fail open. */
 export async function loadBundle(host, blob, admit) {
   const v = verifyBundle(sodium, blob);
   if (!(await admit(v))) throw new Error("admit rejected");
   return installBundle(host, v);
 }
 
-// The empty payload — a module whose `handle` takes no meaningful input.
+// The empty payload, for a module whose `handle` takes no meaningful input.
 export const EMPTY = new Uint8Array(0);
 
-// Standard bootstrap (§3): a fresh module table. The host holds no policy — it is the
-// map and nothing else.
+// A fresh module table (§3). It holds no policy, only the map.
 export class TestModuleHost {
   constructor(loader) { this.loader = loader; this.slots = new Map(); this.names = new Map(); }
   build(mods) { return this.loader.build(mods); }
@@ -159,12 +151,12 @@ export async function makeHost() {
 
 export const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
-// ML-DSA-65 onto the test instance exactly as a target does at its crypto seam — the
-// hybrid manifest suite is "a sodium that knows this method" (§12.4).
+// Add ML-DSA-65 to the test instance as a target does at its crypto seam; the hybrid
+// manifest suite needs a sodium with this method (§12.4).
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 
-// Install one verified module as the whole of `app`'s module set. Async: a bind stands
-// each module up in its own worker and returns when it has loaded.
+// Install one verified module as `app`'s whole module set. Async, since each module
+// starts in its own worker and this returns once it has loaded.
 export async function installMod(host, app, module, wasm) {
   await host.bindAll(app, [{ name: module, wasm }]);
 }

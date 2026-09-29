@@ -1,45 +1,43 @@
-// ws — RFC 6455 framing + opening-handshake bytes as a pure module.
+// RFC 6455 framing and opening-handshake bytes as a pure module.
 //
-// A wire codec is pure byte transformation — exactly the shape of a no-cap WASM module.
-// It imports nothing but the AS runtime, and ships as a module of the transport bundle,
-// whose guest holds the socket, the RNG and the residual receive buffer. This module only
-// frames, deframes and computes the handshake accept, holding no per-connection state.
+// A wire codec is pure byte transformation, which suits a WASM module with no host
+// imports. It imports nothing but the AS runtime and ships as a module of the transport
+// bundle, whose guest holds the socket, the RNG and the leftover receive buffer. This
+// module only frames, deframes and computes the handshake accept, with no per-connection
+// state.
 //
-// ABI (same as codec): the host stages a request at the exported `scratch`
-// offset, calls handle(input_len), and reads the response from `scratch`.
+// ABI (§4): the host writes a request at the exported `scratch` offset, calls
+// handle(input_len), and reads the response from `scratch`.
 //   request  = [op u8] [args ...]
 //   response = [bytes ...]   (length is handle()'s return value; 0 = error)
 //
 // Ops:
-//   OP_ENCODE     (1) args [opcode u8][maskFlag u8][mask 4?][payload]  → frame
+//   OP_ENCODE     (1) args [opcode u8][maskFlag u8][mask 4?][payload]  -> frame
 //   OP_DECODE_ONE (2) args [expectMasked u8][buf ...]
-//        → [status u8] then, if status==1:
+//        -> [status u8] then, if status==1:
 //          [fin<<7 | opcode u8][consumed u32 BE][payloadLen u32 BE][payload ...]
 //          status 0 = need more bytes; status 2 = protocol error
 //        Fragmented data frames (FIN=0, opcode 0/1/2) are reported with the fin
 //        bit clear; the host reassembles the message. A fragmented *control*
 //        frame is a protocol error (RFC 6455 §5.4/§5.5).
-//   OP_ACCEPT     (3) args [key bytes]   → base64(sha1(key ‖ GUID)) bytes (28)
-//   OP_BASE64     (4) args [bytes]       → base64(bytes)
+//   OP_ACCEPT     (3) args [key bytes]   -> base64(sha1(key ‖ GUID)) bytes (28)
+//   OP_BASE64     (4) args [bytes]       -> base64(bytes)
 
-// The ABI ops, handshake GUID and scratch caps live beside this module in
-// assembly/ws/abi.ts (sized to MAX_FRAME_BYTES from scripts/transport-config.mjs plus header/mask
-// overhead — the two codecs must cap identically).
+// The ABI ops, handshake GUID and scratch sizes are in assembly/ws/abi.ts.
 import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "./abi";
 
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
 
 const B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// priv layout (handshake only — small inputs)
+// priv layout (handshake only, small inputs)
 const PRIV_MSG_OFF: i32 = 0;        // key ‖ GUID
 const PRIV_DIGEST_OFF: i32 = 4096;  // 20-byte sha1
 const PRIV_WORK_OFF: i32 = 8192;    // sha1 padded message + W[80]
 
 export let scratch: i32 = 0;
-/** How much I/O space the host may stage at `scratch` (§4.1). One WS frame here may be
- *  a whole MAX_FRAME_BYTES message, which the host's 128 KB default would refuse to
- *  stage — as the transport's first bulk response would discover. */
+/** How much I/O space the host may use at `scratch` (§4.1). One WS frame may be a whole
+ *  MAX_FRAME_BYTES message, which the host's 128 KB default would refuse. */
 export const scratchSize: i32 = SCRATCH_SIZE;
 let priv: i32 = 0;
 scratch = heap.alloc(SCRATCH_SIZE) as i32;
@@ -60,15 +58,15 @@ function b64char(idx: i32): u8 {
 
 /** XOR `len` bytes at `ptr` with the RFC 6455 masking key m0..m3, eight bytes at a time.
  *
- *  The key repeats every four octets counted from the PAYLOAD's own start (§5.3), and both
- *  callers mask a run that begins there, so one little-endian word covers every group and
- *  the doubled word covers two. A byte-at-a-time loop with a four-way select per byte was
- *  the whole client→server data path — every frame a browser edge sends is masked.
+ *  The key repeats every four octets counted from the payload's start (RFC 6455 §5.3),
+ *  and both callers mask a run that starts there, so one little-endian word covers every
+ *  group and the doubled word covers two. Every frame a browser sends is masked, so this
+ *  is on the whole client-to-server data path.
  *
- *  Alignment is declared as 1 because it genuinely is: a decoded payload lands at
+ *  Alignment is declared as 1 because the data is unaligned: a decoded payload lands at
  *  `scratch + 10` and an encoded one after a 2/4/10-byte header plus the key. Wasm allows
- *  unaligned access regardless — the immediate is a hint, not a constraint — so the honest
- *  hint costs nothing and cannot mislead an engine that acts on it. */
+ *  unaligned access anyway (the immediate is only a hint), so the accurate hint costs
+ *  nothing. */
 function maskRun(ptr: i32, len: i32, m0: i32, m1: i32, m2: i32, m3: i32): void {
   // Little-endian, so byte i of the word is the key octet for payload offset i.
   const word: u32 = (m0 as u32) | ((m1 as u32) << 8) | ((m2 as u32) << 16) | ((m3 as u32) << 24);
@@ -106,7 +104,7 @@ function base64(inPtr: i32, inLen: i32, outPtr: i32): i32 {
   return o;
 }
 
-/** SHA-1 of [msgPtr, msgPtr+msgLen) → 20 bytes at outPtr. workPtr needs
+/** SHA-1 of [msgPtr, msgPtr+msgLen) to 20 bytes at outPtr. workPtr needs
  *  pad(msgLen) + 320 bytes of scratch. */
 function sha1(msgPtr: i32, msgLen: i32, outPtr: i32, workPtr: i32): void {
   const total = ((msgLen + 1 + 8 + 63) >> 6) << 6;
@@ -228,7 +226,7 @@ function opDecodeOne(input_len: i32): i32 {
   let payloadLen = b1 & 0x7f;
   if (opcode >= 8) {
     if (!fin || payloadLen > 125) { store<u8>(scratch, 2); return 1; } // control frames: FIN=1, payload <= 125
-    if (opcode == 8 && payloadLen == 1) { store<u8>(scratch, 2); return 1; } // close frame payload length != 1
+    if (opcode == 8 && payloadLen == 1) { store<u8>(scratch, 2); return 1; } // a 1-byte close payload is invalid
   }
   let headerLen = 2;
   if (payloadLen == 126) {
@@ -271,7 +269,7 @@ function opDecodeOne(input_len: i32): i32 {
   return 10 + payloadLen;
 }
 
-/** base64(sha1(key ‖ GUID)) — the RFC 6455 server accept value. */
+/** base64(sha1(key ‖ GUID)), the RFC 6455 server accept value. */
 function opAccept(input_len: i32): i32 {
   const keyLen = input_len - 1;
   if (keyLen < 0 || keyLen + WS_GUID.length > 4096) return 0;

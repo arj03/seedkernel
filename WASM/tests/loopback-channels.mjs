@@ -1,12 +1,12 @@
-// loopback-channels.mjs — the in-process socket fabric the transport tests run over.
-// Test infrastructure, so it stays out of the shared bundle every target ships: tests
-// drive the transport through this ChannelFactory the way a node drives real sockets.
+// The in-process socket fabric the transport tests run over. Test infrastructure, so it
+// stays out of the shipped bundle; tests drive the transport through this ChannelFactory
+// the way a node uses real sockets.
 
 import { parseDest } from "../build/services/peer-addr.js";
 
-/** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
- *  mirroring a real socket; closing one end fires the other's onClose — the close
- *  semantics of MessageChannel's fail() path on a real channel. */
+/** One end of an in-process socket pair. Delivery is asynchronous (a microtask), like a
+ *  real socket; closing one end fires the other's onClose, like MessageChannel's fail()
+ *  path on a real channel. */
 class LoopbackChannel {
   // `send` preserves message boundaries, so `stream` stays absent.
   peer = null;
@@ -32,7 +32,7 @@ class LoopbackChannel {
     const p = this.peer;
     queueMicrotask(() => { if (p && !p.dead) p.msg?.(bytes); });
   }
-  // Honest: delivery is a microtask handoff, so nothing is retained past send().
+  // Delivery is a microtask handoff, so nothing is retained past send().
   buffered() { return 0; }
   onData(cb) { this.msg = cb; }
   onClose(cb) { this.cls = cb; }
@@ -42,8 +42,8 @@ class LoopbackChannel {
     const p = this.peer;
     queueMicrotask(() => { if (p && !p.dead) p.cls?.(); });
   }
-  /** The far end went away / this end failed: notify our own onClose (the
-   *  MessageChannel.fail() path — how a socket reports being cut). */
+  /** The far end went away or this end failed: notify this end's onClose (as
+   *  MessageChannel.fail() does when a socket is cut). */
   kill() {
     if (this.dead) return;
     this.dead = true;
@@ -51,9 +51,9 @@ class LoopbackChannel {
   }
 }
 
-/** In-process socket fabric for the transport driver. The fabric is SHARED by every
- *  driver in a process (like a real network), so closing one driver only clears its
- *  own listeners — a per-node `view()` handles that. */
+/** In-process socket fabric for the transport driver. The fabric is shared by every
+ *  driver in a process (like a real network), so closing one driver must only clear its
+ *  own listeners, which a per-node `view()` handles. */
 export class LoopbackChannels {
   listeners = new Map();
   nextPort = 10000;
@@ -77,15 +77,15 @@ export class LoopbackChannels {
     if (!d || d.scheme !== "tcp") return null;
     const onAccept = this.listeners.get(d.port);
     if (!onAccept) {
-      // A dial to a dead port: the channel fails immediately on the DIAL side
-      // (mirroring ECONNREFUSED → the socket's error/close events), so the
-      // transport forgets the link instead of holding it until the deadline.
+      // A dial to a dead port: the channel fails immediately on the dial side (like
+      // ECONNREFUSED firing the socket's error and close events), so the transport drops
+      // the link instead of holding it until the deadline.
       const [dial] = LoopbackChannel.pair(d.host);
       queueMicrotask(() => dial.kill());
       return dial;
     }
-    // The destination's host is the "far end" both sides see — it is what the
-    // half-open limiter buckets accepts by (the per-source cap; §12.6.2).
+    // The destination's host is the far end both sides see, which the half-open limiter
+    // counts accepts by (the per-source cap, §12.6.2).
     const [dial, accepted] = LoopbackChannel.pair(d.host);
     queueMicrotask(() => onAccept(accepted));
     return dial;
@@ -96,9 +96,9 @@ export class LoopbackChannels {
   }
 
   /** A per-node view of this fabric: it dials and listens through the same registry, but
-   *  its `close` unbinds only the ports *it* bound — the whole-fabric `close` above is
-   *  right only for teardown. (An in-place transport upgrade re-binds the driver's port,
-   *  which on the shared object would unbind every other node.) */
+   *  its `close` unbinds only the ports it bound; the whole-fabric `close` above is only
+   *  for teardown. (An in-place transport upgrade re-binds the driver's port, which on the
+   *  shared object would unbind every other node.) */
   view() {
     const fabric = this;
     const mine = [];
@@ -115,8 +115,8 @@ export class LoopbackChannels {
     };
   }
 
-  /** Release one bound port. The per-node `view()` is the only caller — the fabric's
-   *  own `close` drops everything. */
+  /** Release one bound port. Only the per-node `view()` calls this; the fabric's own
+   *  `close` drops everything. */
   unbind(port) {
     this.listeners.delete(port);
   }

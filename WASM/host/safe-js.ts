@@ -1,7 +1,7 @@
 // Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus the shared preamble's
 // three host functions. The preamble's `__start` reports each invocation's answer through
-// `__callDone`/`__callFail`, and every `__host_call` parks and settles via
-// `__resolveHostCall`/`__rejectHostCall` — the contract the native binary implements too.
+// `__callDone`/`__callFail`, and every `__host_call` waits and settles through
+// `__resolveHostCall`/`__rejectHostCall`, the same contract the native binary implements.
 // Invocations are serialized (realm-queue.ts).
 
 import {
@@ -19,8 +19,8 @@ import {
   DEFAULT_REALM_MEMORY_BYTES,
 } from "./wasm-limits.js";
 import { errMessage } from "../services/util.js";
-// The in-repo quickjs-ng build (quickjs/build-quickjs-ng.sh), the engine the native binary
-// compiles, serving node and the browser. Sync flavour only: host calls are real Promises.
+// The in-repo quickjs-ng build (quickjs/build-quickjs-ng.sh), the same engine the native
+// binary uses, for Node and the browser. Sync variant only: host calls are real Promises.
 import ngVariantMod from "seedkernel-wasm/quickjs";
 const ngVariant = ngVariantMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModuleFromVariant>[0]
@@ -45,9 +45,9 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : new Uint8Array(u8).buffer;
 }
 
-/** Custody of every guest-to-host copy, by guest-minted call id: the ledger native keeps in
- *  native/hostcalls.go, whose rules apply. This target admits after the copy out of the
- *  guest heap (`admitPayload`), native before it. */
+/** Accounting for every guest-to-host copy, by guest-assigned call id. The same ledger
+ *  native keeps in native/hostcalls.go, with the same rules. This target admits after the
+ *  copy out of the guest heap (`admitPayload`), native before it. */
 export interface ActiveHostCalls {
   admit(callId: number, payloadBytes: number): void;
   reserve(callId: number, additionalBytes: number): void;
@@ -59,7 +59,7 @@ export function createActiveHostCallRegistry(
   maxCalls = DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   maxBytes = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
 ): ActiveHostCalls {
-  /** call id → bytes charged to it; `bytes` is the sum. */
+  /** call id to bytes charged to it; `bytes` is the sum. */
   const live = new Map<number, number>();
   let bytes = 0;
   const charge = (additionalBytes: number): void => {
@@ -129,7 +129,7 @@ function configureRealm(ctx: QuickJSContext, opts: RealmOptions): ExecClock {
   let segmentStart = 0;
   let segmentClock: CausalClock | undefined;
   let running = false;
-  // Installed even for an unbounded realm: a caller can still hand it a finite deadline.
+  // Installed even for an unbounded realm, since a caller can still pass a finite deadline.
   ctx.runtime.setInterruptHandler(() => {
     if (!running) return false;
     const now = monotonicMs();
@@ -173,8 +173,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   const runtime: QuickJSRuntime = mod.newRuntime();
   const ctx: QuickJSContext = runtime.newContext();
   // Phantom contexts (see `pumpJobs`): options present with `contextPointer` undefined.
-  // Not `options?.` — no options at all is `getSystemContext()`, cached on the runtime, and
-  // disposing it would be a use-after-free.
+  // Not `options?.`: no options at all means `getSystemContext()`, which is cached on the
+  // runtime, and disposing it would be a use-after-free.
   const phantoms = new Set<QuickJSContext>();
   {
     const newContext = runtime.newContext.bind(runtime);
@@ -184,8 +184,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       return c;
     };
   }
-  /** Release every phantom context discovered since the previous drain. Best-effort: a
-   *  context may already have been disposed while unwinding another engine operation. */
+  /** Release every phantom context found since the last drain. Best effort: a context may
+   *  already have been disposed while unwinding another engine operation. */
   const disposePhantoms = (): void => {
     for (const phantom of phantoms) {
       if (phantom.alive) {
@@ -197,12 +197,12 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   const clock = configureRealm(ctx, opts);
   const causalContext = new CausalContext();
   const activeHostCalls = createActiveHostCallRegistry();
-  // The wall-clock half of the same custody (§12.3), one queue per tier.
+  // The wall-clock deadlines (§12.3), one queue per tier.
   const deadlines = createRealmDeadlines();
 
   // Drain the job queue, throwing on failure. `executePendingJobs` returns its error as a
-  // live handle instead of throwing: ignored, an interrupt is swallowed, and undisposed, it
-  // aborts the wasm module at dispose().
+  // live handle instead of throwing: if ignored, an interrupt is lost, and if not disposed,
+  // it aborts the wasm module at dispose().
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
     try {
@@ -220,17 +220,17 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       }
       throw new Error(msg);
     } finally {
-      // executePendingJobs can mint a context nothing disposes: heap growth detaches its
-      // ctxPtrOut view and the `?? newContext(...)` fallback fires, and that context aborts
-      // the module at runtime free. After the error handle, which that context may own.
+      // executePendingJobs can create a context nothing disposes: heap growth detaches its
+      // ctxPtrOut view, the `?? newContext(...)` fallback fires, and that context aborts the
+      // module when the runtime is freed. Runs after the error handle, which it may own.
       disposePhantoms();
     }
   };
 
   // Callers awaiting an invocation's answer (§12.3), by invocation id. Answers are reported
-  // from inside the realm, so an interrupt or dispose() mid-flight would strand them: the
-  // host fails them explicitly — dispose() all, an interrupted continuation its own.
-  // Taken on settlement, so a late report finds nothing.
+  // from inside the realm, so an interrupt or dispose() would strand them; the host fails
+  // them explicitly (dispose() all of them, an interrupted continuation its own). Removed
+  // on settlement, so a late report finds nothing.
   const invocations = new Map<number, { resolve(bytes: Uint8Array): void; reject(err: Error): void }>();
   let invocationSeq = 0;
   const takeInvocation = (id: number) => {
@@ -243,7 +243,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     invocations.clear();
   };
 
-  // Settle a parked host.call through the preamble's __resolveHostCall/__rejectHostCall,
+  // Settle a pending host.call through the preamble's __resolveHostCall/__rejectHostCall,
   // then pump. `made` is the invocation the call was made under.
   const settleHostCall = (fn: "__resolveHostCall" | "__rejectHostCall", callId: number,
     arg: QuickJSHandle, budget: CallBudget, made: InvocationBudget): void => {
@@ -274,11 +274,12 @@ export const createSafeRealm: RealmFactory = async (opts) => {
 
   /** Copy one call's payload out of the guest heap and admit it. `getArrayBuffer` already
    *  mallocs a copy outside setMemoryLimit, and `.slice()` must copy again since the view
-   *  dies with its lifetime — so admission can only refuse after the first copy. */
+   *  dies with its handle, so admission can only refuse after the first copy. */
   const admitPayload = (callId: number, handle: QuickJSHandle): Uint8Array => {
     const heapCopy = ctx.getArrayBuffer(handle);
     try {
-      // A refused admission must not release: on a duplicate id that ends another's custody.
+      // A refused admission must not release: on a duplicate id that would release the
+      // other call's charge.
       activeHostCalls.admit(callId, heapCopy.value.byteLength);
       try { return heapCopy.value.slice(); }
       catch (err) { activeHostCalls.release(callId); throw err; }
@@ -287,14 +288,15 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     }
   };
 
-  // The single seam. It always returns null; the answer settles the promise the preamble
-  // parked under callId, never inside the frame that issued the call.
+  // The single seam. It always returns null; the answer later settles the promise the
+  // preamble holds under callId, never inside the frame that issued the call.
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
     // The shared record, not a snapshot: concurrent calls charge the same spend.
     const made = clock.current;
-    // Read while the segment is live (§4.3); none left throws at the guest's call site.
+    // Read while the segment is running (§4.3); with no time left it throws at the guest's
+    // call site.
     const budget = new CallBudget(clock.remaining(), causalContext.current, made);
     const payload = admitPayload(callId, payloadHandle);
     let answer: Promise<Uint8Array> | Uint8Array;
@@ -304,8 +306,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       activeHostCalls.release(callId);
       throw err;
     }
-    // One settlement either way, so a refused copy reads as a failure and custody ends
-    // once (the same shape as native-shim.ts).
+    // One settlement either way, so a refused copy becomes a failure and the charge is
+    // released once (as in native-shim.ts).
     const settle = (bytes: Uint8Array | null, error: unknown): void => {
       try {
         let failure = error;
@@ -333,7 +335,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   ctx.setProp(ctx.global, "__host_call", hostCallFn);
   hostCallFn.dispose();
 
-  // The preamble's two reports. The answer crosses as bytes; no guest handle outlives them.
+  // The preamble's two reports. The answer is copied out as bytes, so no guest handle
+  // outlives them.
   const callDoneFn = ctx.newFunction("__callDone", (idHandle, bytesHandle) => {
     const answer = ctx.getArrayBuffer(bytesHandle);
     let bytes: Uint8Array;
@@ -355,8 +358,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   try {
     ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
   } catch (err) {
-    // No dispose seam is returned for a guest that failed to initialize, so free it here,
-    // custody of any calls it parked included, or rejected installs leak.
+    // A guest that failed to initialize gets no dispose, so free it here, including any
+    // calls it left pending, or rejected installs leak.
     activeHostCalls.releaseAll();
     deadlines.disarmAll();
     disposePhantoms();
@@ -373,8 +376,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   /** The preamble's entrypoint, retained once for every dispatch. */
   const start = ctx.getProp(ctx.global, "__start");
 
-  /** One invocation, once the queue has given it the realm. Not `async`: the queue needs
-   *  the `Invocation` when the synchronous segment ends, before the answer exists. */
+  /** One invocation, once the queue has given it the realm. Not `async`, because the
+   *  queue needs the `Invocation` when the synchronous part ends, before the answer exists. */
   const invoke = (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock): Invocation => {
     // Kept through every host-call settlement; a later entry gets its own.
     const invocationBudget = clock.create(deadlineMs);
@@ -396,10 +399,11 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         flag.dispose();
         pumpJobs();
       } catch (err) {
-        // Interrupt or engine fault: nothing inside will report. A reported answer stands.
+        // Interrupt or engine fault: nothing inside will report. An answer already
+        // reported stands.
         fail(err instanceof Error ? err : new Error(String(err)));
       } finally {
-        // Past this point the host waits on the seam, which is not the guest's time.
+        // From here the host waits on the seam, which is not billed to the guest.
         clock.end();
         idHandle?.dispose();
         argument?.dispose();
@@ -415,7 +419,7 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     dispose(): void {
       // Fail every waiting caller first: answers only come from inside the realm.
       failInvocations(new Error(REALM_DISPOSED));
-      // Nothing will consume unanswered calls now, so end their custody and deadlines.
+      // Nothing will consume unanswered calls now, so release their charges and deadlines.
       activeHostCalls.releaseAll();
       deadlines.disarmAll();
       // Context before runtime; `start` is the only handle held between calls, and one live

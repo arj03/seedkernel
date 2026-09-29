@@ -1,12 +1,10 @@
-// realm-guest.test.mjs — the guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy
-// parsing, node/sign scoping, safe-js confinement, realm serialization, seam gating, and
-// module-call budgeting. Split
-// out of the former single-file run.mjs; bundle-install.test.mjs covers the bundle/manifest
-// verify → admit → install lifecycle, crypto.test.mjs the manifest-suite and ACVP suites.
+// The guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy parsing, node/sign
+// scoping, safe-js confinement, realm serialization, seam gating, and module-call
+// budgeting. bundle-install.test.mjs covers the verify, admit and install lifecycle;
+// crypto.test.mjs the manifest suite and ACVP vectors.
 //
-// Positive-path bundle fixtures go through `authorBundle` (scripts/bundle-author.ts) rather
-// than hand-rolled `signTestBundle` — see bundle-install.test.mjs's header for
-// why a handful of cases keep the manual form instead.
+// Valid bundle fixtures go through `authorBundle` (scripts/bundle-author.ts), not
+// `signTestBundle`; bundle-install.test.mjs's header explains the exceptions.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -25,9 +23,9 @@ const { ok, assertEqual, summary, sleep } = testkit({ verbose: false });
 const assert = ok;
 
 // ─── Test: guest-side fan-out over the cross-realm call (Promise.all) ────────────
-// Fan-out is not a host op: with real promises at the seam, a confined guest scatters a
-// distinct request per peer itself with Promise.all over `_net`. Driven here through the
-// seam's single-peer cross-realm call, concurrently, so the round trips overlap in one realm.
+// Fan-out is not a host op: with real promises at the seam, a confined guest sends one
+// request per peer itself with Promise.all over `_net`. Tested here through the seam's
+// single-peer cross-realm call, concurrently, so the round trips overlap in one realm.
 
 async function testGuestSeam() {
   console.log("Test: guest seam — host transforms, authorities and private modules (step 7)");
@@ -35,18 +33,18 @@ async function testGuestSeam() {
   const id = generateKeyPair();
   const otherKey = generateKeyPair();
   const fs = new MemoryFs();
-  // The routing a local service id resolves through — the shell's job in production, a
-  // stub here so the seam is tested for what it does: gate the name, then hand the
-  // payload to whatever claims the id. `_net` and `chat/v1` are claimed; `_nobody` is not.
+  // Local service id routing: the shell's job in production, a stub here, so the seam is
+  // tested for what it does: check the name, then pass the payload to whatever claims the
+  // id. `_net` and `chat/v1` are claimed; `_nobody` is not.
   const claimed = new Set(["_net", "chat/v1"]);
   const callLocal = (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null);
-  // THIS realm's declared requires (§12.10): every host service plus the local service ids
-  // it calls — what tells those apart from a bare module name at the dispatch. `chat/v1` is
-  // here because a local service id is an ordinary claim: it may carry a `/` exactly like a
-  // wire protocol id.
+  // This realm's declared requires (§12.10): every host service plus the local service ids
+  // it calls, which is what tells them apart from a bare module name at dispatch.
+  // `chat/v1` is here because a local service id is an ordinary claim and may contain a
+  // `/` like a wire protocol id.
   const names = [...ALL_HOST_SERVICES, "_net", "_nobody", "chat/v1"];
 
-  // A module reachable by name, for the catalog's app-module half.
+  // A module reachable by name.
   const { host } = await makeHost();
   const testKey = "testapp";
   await installMod(host, testKey, "echo", forwarderBytes);
@@ -60,8 +58,8 @@ async function testGuestSeam() {
     requires: names,
     backends: { ...testBackends(), node: signScope, fs },
     callLocal,
-    // Scoped to one app, exactly as the shell scopes it: a bare name is a module
-    // inside this app's map and cannot reach out of it.
+    // Scoped to one app, as the shell does: a bare name is a module in this app's map
+    // and cannot reach outside it.
     modules: {
       names: new Set(["echo"]),
       call: (name, p) => host.slots.get(testKey)?.call(name, p) ?? Promise.resolve({ bytes: null, ms: 0 }),
@@ -70,14 +68,13 @@ async function testGuestSeam() {
   const U = (...xs) => new Uint8Array(xs);
 
   try {
-    // Primitives are reached BY NAME through the `crypto/` prefix: there is no op
-    // number per algorithm, so adding one is a catalog entry and the seam never learns
-    // what a cipher suite is.
+    // Primitives are reached by name under `crypto/`: there is no op number per
+    // algorithm, and the seam knows nothing about cipher suites.
     const prim = (name, argBytes) => seam(`crypto/${name}`, argBytes);
     const msg = U(1, 2, 3, 4, 5);
-    // crypto/blake2b takes RFC 7693's whole interface — [outLen][keyLen][key][msg] — and
-    // the AEAD names take associated data (RFC 8439): a standard protocol must be buildable
-    // on them without a host release (tests/noise-vectors.js runs one).
+    // crypto/blake2b takes RFC 7693's whole interface ([outLen][keyLen][key][msg]) and the
+    // AEAD names take associated data (RFC 8439), so a standard protocol can be built on
+    // them without a host release (tests/noise-vectors.js runs one).
     assert(bytesEqual(await prim("blake2b", concatBytes([U(32, 0), msg])), sodium.crypto_generichash(32, msg, null)), "crypto/blake2b, by name");
     const hex = (b) => Buffer.from(b).toString("hex");
     assertEqual(hex(await prim("blake2b", concatBytes([U(64, 0), new TextEncoder().encode("abc")]))),
@@ -106,8 +103,8 @@ async function testGuestSeam() {
     try { await prim("chacha20poly1305-ietf/open", concatBytes([npub, aeadKey, U(0, 0, 0, 9), msg])); } catch { shortAead = true; }
     assert(shortAead, "associated data longer than the call is mis-framed, not a failed open");
     // node/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
-    // node/verify applies the SAME scope host-side, so a guest checks a signature by
-    // naming the key, never by reconstructing the prefix the host owns.
+    // node/verify applies the same scope on the host, so a guest checks a signature by
+    // naming the key, never by rebuilding the host's prefix.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
     const sig = await seam("node/sign", msg);
     const preimage = concatBytes([DOMAIN_GUEST, scopeBytes, msg]);
@@ -116,9 +113,9 @@ async function testGuestSeam() {
     assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "node/verify accepts what node/sign signed — the same scope, host-applied");
     assertEqual((await seam("node/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "node/verify rejects the signature under a different key");
     assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "node/verify rejects a forged message");
-    // A mis-framed call is not a failed verification: too few bytes to hold [pk][sig]
-    // throws, where 0 would have been a verdict about bytes nothing checked. The bound
-    // is exactly the fixed prefix — an empty message is a legitimate question.
+    // A mis-framed call is not a failed verification: too few bytes for [pk][sig] throws,
+    // since 0 would be a verdict on bytes nothing checked. The bound is exactly the fixed
+    // prefix; an empty message is valid.
     const emptySig = await seam("node/sign", new Uint8Array(0));
     assertEqual((await seam("node/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "node/verify takes an empty message — 96 bytes is a whole call");
     let verifyThrew = false;
@@ -150,32 +147,30 @@ async function testGuestSeam() {
     const szAbsent = await seam("fs/size", new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "fs/size of an absent key → -1 (0xFFFFFFFF)");
 
-    // There is no sync/async line and nothing to version: every name — a catalog
-    // primitive included — answers a Promise the guest awaits. A forgotten `await`
-    // reads a Promise where bytes were expected for ALL names alike, which is why no
-    // manifest field is needed to catch it any more.
+    // Every name, crypto included, answers a Promise the guest awaits, so a forgotten
+    // `await` reads a Promise instead of bytes for every name alike.
     assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Promise, "a catalog primitive answers a Promise like every name");
     assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise");
     assert(prim("random", U(0, 0, 0, 1)) instanceof Promise, "crypto/random returns a Promise");
 
-    // The CROSS-REALM call: a name in THIS realm's declared local services is another
-    // realm, reached on a later turn, so it is a Promise like fs. There is no `net`
-    // domain — the network is a bundle that declares the service `_net`, and this seam's
-    // routing answers it (§12.10).
+    // The cross-realm call: a declared local service is another realm, reached on a later
+    // turn, so it is a Promise like fs. There is no `net` host service; the network is a
+    // bundle that claims the service `_net`, and this seam's routing reaches it (§12.10).
     const crossed = seam("_net", U(1, 2, 3));
     assert(crossed instanceof Promise, "a local service id returns a Promise (the callee runs on a later turn)");
     assertEqual([...await crossed], [9, 9], "…and resolves with what the callee's handle returned");
     let unclaimed = false;
     try { await seam("_nobody", U()); } catch { unclaimed = true; }
     assert(unclaimed, "a local service id no realm claims is refused by name, not left pending");
-    // A name is what the manifest declared it as, never what its spelling suggests: an
-    // id with a `/` — legal for any claim (§12.10) — routes to its claimant rather than
-    // the host table, where it would have died as an unknown host name.
+    // A name is what the manifest declared, not what its spelling suggests: an id with a
+    // `/` (valid for any claim, §12.10) routes to its claimant, not to the host table
+    // where it would fail as an unknown host name.
     assertEqual([...await seam("chat/v1", U(1))], [9, 9],
       "a declared local service id carrying a `/` still routes to the claiming realm");
 
-    // A bare name reaches this app's module by its LOGICAL name, in the same `host.call`
-    // shape as every other name (§12.2). Whose modules is the seam's, never the caller's.
+    // A bare name reaches this app's module by its manifest name, through the same
+    // `host.call` as every other name (§12.2). The seam decides whose modules, never the
+    // caller.
     assertEqual([...await seam("echo", U(8, 9))], [8, 9], "a bare name invokes this app's module");
     let noSuch = false;
     try { await seam("nosuchmodule", U(1)); } catch { noSuch = true; }
@@ -185,7 +180,7 @@ async function testGuestSeam() {
   console.log("  OK\n");
 }
 
-// ──── Test: channel identity pinning (transport §12.6) ────
+// ──── Test: the author allowlist policy (§12.5) ────
 
 async function testPolicy() {
   console.log("Test: shell install policy — closed author sets gate bundle loads");
@@ -233,14 +228,14 @@ async function testPolicy() {
   console.log("  OK\n");
 }
 
-// ─── Test: node/sign is the one sign name; its scope is the slot's — the app scope for ──
-// ─── an app slot, the link scope for the link slot, on EVERY load path ──────────────
-// `slotSignScope` is a function of admitted facts — the node's identity, the manifest and
-// whether it requires link — which is the whole reason it cannot drift. Driven through a
-// real shell because the property is about the point where a signed manifest becomes a
-// realm, and because the path that could silently lose it is the in-place UPDATE: a
-// transport that re-scoped itself on upgrade would keep serving while every handshake
-// with an un-upgraded peer failed as an authentication error naming nothing.
+// ─── Test: node/sign's scope is the slot's: the app scope for an app slot, the ──────
+// ─── link scope for the link slot, on every install path ─────────────────────────────
+// `slotSignScope` depends only on admitted facts (the node's identity, the manifest, and
+// whether it requires link), so it cannot drift. Tested through a real shell because the
+// property is about where a signed manifest becomes a realm, and because in-place update
+// is the path that could lose it: a transport that changed scope on upgrade would keep
+// running while every handshake with a non-upgraded peer failed as an unexplained
+// authentication error.
 async function testSigningScopeFollowsSlot() {
   console.log("Test: node/sign is the slot's scope — app scope for an app, link scope for the link slot, on every load path");
   const { admitAll } = await imp("build/host/policy.js");
@@ -250,8 +245,8 @@ async function testSigningScopeFollowsSlot() {
   const identity = generateKeyPair();
   const linkScope = new Uint8Array(0);
   let seam;
-  // `linkAuthor` signs the boot transport, so the link probe below lands by replacing it;
-  // the app author's bundle never reaches `link`.
+  // `linkAuthor` signs the boot transport, so the link probe below installs by replacing
+  // it; the app author's bundle never requires `link`.
   const shell = await bootTestShell({
     identity,
     createRealm: async ({ hostCall }) => {
@@ -272,8 +267,8 @@ async function testSigningScopeFollowsSlot() {
   const msg = new Uint8Array([5, 4, 3]);
   const linkApp = guestSignScope("linkprobe");
   try {
-    // The link slot's one scope is the LINK scope: the channel AUTH is a fact of the
-    // slot, not a second name.
+    // The link slot's scope is the link scope: channel authentication comes from the slot,
+    // not from a second sign name.
     await shell.install(blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
       replaces: shell.resolve("_fixture-transport"),
       localConfig: { networkKey: "7a".repeat(32) },
@@ -286,7 +281,7 @@ async function testSigningScopeFollowsSlot() {
     assertEqual((await seam("node/verify", concatBytes([identity.publicKey, v1, msg])))[0], 1,
       "node/verify on the link slot checks under the same link scope");
 
-    // The path a lease would be dropped on: the standing slot is replaced in place.
+    // In-place update: the installed slot is replaced.
     await shell.install(blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
       replaces: "linkprobe",
       localConfig: { networkKey: "7b".repeat(32) },
@@ -296,9 +291,8 @@ async function testSigningScopeFollowsSlot() {
       "an in-place update of the link slot keeps the SAME link scope — an upgrade cannot re-scope a node");
     assert(bytesEqual(v1, v2), "changing transport config does not change the host's signing scope");
 
-    // And the other arm, on a shell that already has a link occupant: an ordinary app
-    // signs under its own scope, and there is only one pair of sign names — nothing under
-    // a second name to reach.
+    // The other case, on a shell that already has a link occupant: an ordinary app signs
+    // under its own scope, with the same sign names.
     await shell.install(blob(appAuthor, "plainapp", 1, ["node"]));
     const app = await seam("node/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope("plainapp"), msg),
@@ -309,8 +303,8 @@ async function testSigningScopeFollowsSlot() {
     try { await seam("link/sign", msg); } catch { refused = true; }
     assert(refused, "there is no link/sign name — the sign pair is one names pair per slot");
 
-    // The two arms are the one exported constructor, so a caller building a scope by hand
-    // agrees with what the slot got.
+    // Both cases come from the one exported constructor, so a caller building a scope by
+    // hand gets what the slot got.
     assert(bytesEqual(slotSignScope({ identity }, "linkprobe", true).scope, linkScope),
       "slotSignScope gives the link slot the link scope");
     assert(bytesEqual(slotSignScope({ identity }, "plainapp", false).scope,
@@ -328,25 +322,21 @@ async function testGuestAbi() {
   const mk = (guest) => signTestBundle(sodium, author,
     { app: "abi", version: 1, modules: [], guest });
 
-  // A guest declares its required services. There is no `abi` field left to
-  // get wrong or forget — the one failure the version existed to refuse (a name read
-  // on the wrong side of a sync/async line) is structurally impossible when every
-  // name answers a Promise.
+  // A guest declares its required services and nothing else: with every name answering a
+  // Promise, there is no calling convention to version.
   const verified = verifyTestBundle(sodium, mk({ requires: [] }));
   assert(verified !== null, "a manifest with no seam version verifies");
   assert(!("abi" in verified.manifest.guest), "the verified manifest carries no abi field");
 
-  // Every bundle declares a guest (§12.4), and a manifest without one is refused BY NAME:
-  // it is what a bundle written against the retired module-only format produces.
+  // Every bundle declares a guest (§12.4), and a manifest without one gets its own error.
   let noGuest = "";
   try { verifyTestBundle(sodium, signTestBundle(sodium, author,
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
-  // `requires` names host SERVICES (§12.2) and local service ids. A finer method name asks
-  // for a grant finer than the seam can enforce — the seam gates a `host.call` by the
-  // method's SERVICE — so it is refused, naming the fix; a local id is the other half of
-  // the same list.
+  // `requires` names host services (§12.2) and local service ids. A method name asks for
+  // finer access than the seam enforces (it checks a `host.call` by the method's service),
+  // so it is refused with the fix in the message.
   {
     let refused = "";
     try { verifyTestBundle(sodium, mk({ requires: ["fs/get"] })); }
@@ -362,15 +352,14 @@ async function testGuestAbi() {
     assert(crypto.includes("host method"),
       `a local id in the ungated crypto/ namespace is refused, so it cannot shadow a host transform (got: ${crypto})`);
   }
-  // …and the SERVICE, by exact name, is what a manifest may require — the guest still
-  // calls the finer-grained method; being undeclarable at that granularity is not being
-  // unavailable.
+  // The service, by exact name, is what a manifest requires; the guest still calls its
+  // methods.
   assert(verifyTestBundle(sodium, mk({ requires: ["fs"] })) !== null,
     "a service, by exact name, is what a manifest may require");
 
-  // A local id colliding with this bundle's OWN module name is refused: one `host.call`
-  // name means one declared thing (guest-seam.ts). A local id spelled like a host method is
-  // refused for the mirror reason.
+  // A local id matching this bundle's own module name is refused: each `host.call` name
+  // means one thing (guest-seam.ts). A local id spelled like a host method is refused for
+  // the same reason.
   {
     const withModule = (requires) => signTestBundle(sodium, author, {
       app: "abi", version: 1,
@@ -389,9 +378,8 @@ async function testGuestAbi() {
       `a local id spelled like a host method is refused (got: ${shadow})`);
   }
 
-  // Any OTHER bare or slashed name is a legitimate LOCAL service id (§12.10): the
-  // vocabulary is open on that half, since whether anything actually claims it is answered
-  // at the call, never at the manifest.
+  // Any other bare or slashed name is a valid local service id (§12.10): whether anything
+  // claims it is checked at call time, never at the manifest.
   assert(verifyTestBundle(sodium, mk({ requires: ["_backup", "reporting/v2"] })) !== null,
     "an arbitrary local service id verifies; nothing claiming it yet is not a manifest error");
 
@@ -399,14 +387,14 @@ async function testGuestAbi() {
 }
 
 // ─── Test: safe-js zero-authority JS confinement (§12.3) ─────────────────
-// Run zero-authority guest JS over a single host-call seam. Three load-bearing properties,
-// over stand-in seams: airtight by construction, the async seam + byte boundary, and realm
+// Zero-authority guest JS over a single host-call seam, with stand-in seams: nothing
+// reachable by construction, the async seam and byte boundary, control flow, and realm
 // isolation.
 
 async function testSafeJs() {
   console.log("Test: safe-js — zero-authority JS confinement (§12.3)");
 
-  // 1. Airtight: the guest cannot name fs/net/Bun/process/fetch/require, and
+  // 1. Nothing reachable: the guest cannot name fs/net/Bun/process/fetch/require, and
   //    dynamic import() is unavailable (no module loader).
   {
     const DANGER = ["Bun", "process", "require", "fetch", "Buffer", "WebAssembly", "globalThis"];
@@ -442,21 +430,21 @@ async function testSafeJs() {
     realm.dispose();
   }
 
-  // 2. The seam: a sync name returns bytes directly (no yield); a net-like name returns a
-  //    real Promise the guest awaits. Bytes round-trip across the copy boundary both ways.
+  // 2. The seam: a host handler may answer synchronously or with a Promise; the guest
+  //    awaits either. Bytes round-trip across the copy boundary both ways.
   {
     let hostCalls = 0;
     const hostCall = (name, payload) => {
       hostCalls++;
-      if (name === "inc") return payload.map((b) => (b + 1) & 0xff);                          // sync name — bytes directly
-      if (name === "slow") return sleep(3).then(() => payload.map((b) => (b + 1) & 0xff));     // net-like name — a Promise
+      if (name === "inc") return payload.map((b) => (b + 1) & 0xff);                          // answers synchronously
+      if (name === "slow") return sleep(3).then(() => payload.map((b) => (b + 1) & 0xff));     // answers later
       return new Uint8Array();
     };
     const src = `
       function handle(a) {
         const sel = a[0], arg = a.subarray(1);
-        if (sel === 1) return host.call("inc", arg);                  // sync name: host.call returns bytes, no await
-        if (sel === 2) return (async () => await host.call("slow", arg))();  // net-like name: a genuinely awaited Promise
+        if (sel === 1) return host.call("inc", arg);                  // returned Promise, awaited by the preamble
+        if (sel === 2) return (async () => await host.call("slow", arg))();  // awaited in the guest
         throw new Error("no such sel " + sel);
       }
     `;
@@ -473,9 +461,8 @@ async function testSafeJs() {
     realm.dispose();
   }
 
-  // 3. Orchestration control-flow shapes run as ordinary async guest JS, including a
-  //    concurrent fan-out with the guest's own Promise.all over a net-like name — the
-  //    real-promise seam is what makes this possible in one realm.
+  // 3. Control flow runs as ordinary async guest JS, including a concurrent fan-out with
+  //    the guest's own Promise.all, which real promises at the seam make possible.
   {
     const hostCall = (name, payload) => {
       const peer = payload[0];
@@ -486,7 +473,7 @@ async function testSafeJs() {
     const src = `
       async function handle(arg) {
         const count = arg[0], peerCount = arg[1];
-        // Fan out OFFERs concurrently — the guest's own Promise.all, no host sendMany.
+        // Fan out OFFERs concurrently with the guest's own Promise.all.
         const offers = await Promise.all(
           Array.from({ length: peerCount }, (_, p) => host.call("offer", new Uint8Array([p]))),
         );
@@ -531,15 +518,14 @@ async function testSafeJs() {
 }
 
 // ─── Test: one entry seam, serialized per realm (§12.3) ─────────────────
-// One way in, `call`, which may yield. That one invocation runs to completion before the
-// next begins is the realm's own FIFO queue (host/realm-queue.ts) rather than a property
-// of the host's call stack — which is what a synchronous entry used to give for free.
+// One way in, `call`, which may yield. Each invocation runs to completion before the next
+// begins because of the realm's FIFO queue (host/realm-queue.ts).
 
 async function testRealmSerialization() {
   console.log("Test: one entry seam, serialized per realm (§12.3)");
 
-  // 1. A synchronous entrypoint over a synchronous seam still round-trips, and the
-  //    realm is reusable — it just resolves through a promise like everything else.
+  // 1. A synchronous entrypoint over a synchronous seam round-trips, and the realm is
+  //    reusable; the result still resolves through a promise.
   {
     let calls = 0;
     const hostCall = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
@@ -554,21 +540,21 @@ async function testRealmSerialization() {
     realm.dispose();
   }
 
-  // 2. An invocation accepted while another is parked mid-await waits for the queue
-  //    rather than interleaving. Worth its head-of-line cost: two frames resuming into
-  //    each other at every await is state no guest author can reason about.
+  // 2. An invocation that arrives while another is waiting mid-await waits in the queue
+  //    instead of interleaving. Worth the head-of-line cost: two invocations interleaving
+  //    at every await would be impossible for a guest author to reason about.
   {
     let release;
     const gate = new Promise((r) => { release = r; });
     const hostCall = (name, payload) => {
-      if (name === "park") return gate.then(() => new Uint8Array([42]));   // parks until released
-      if (name === "inc") return payload.map((b) => (b + 1) & 0xff);       // sync — holder path
+      if (name === "park") return gate.then(() => new Uint8Array([42]));   // waits until released
+      if (name === "inc") return payload.map((b) => (b + 1) & 0xff);       // answers at once (holder path)
       return new Uint8Array();
     };
     const realm = await createSafeRealm({
       source: `function handle(a) {
                  if (a[0] === 1) return (async () => await host.call("park", new Uint8Array()))();
-                 if (a[0] === 2) return host.call("inc", a.subarray(1)); // sync — holder path
+                 if (a[0] === 2) return host.call("inc", a.subarray(1)); // holder path
                  throw new Error("no such sel " + a[0]);
                }`,
       hostCall,
@@ -588,7 +574,7 @@ async function testRealmSerialization() {
     realm.dispose();
   }
 
-  // 3. Still airtight — the one seam is the same zero-authority sandbox.
+  // 3. Still nothing reachable: the one seam is the same zero-authority sandbox.
   {
     const realm = await createSafeRealm({
       source: `function handle() { return new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]); }`,
@@ -599,11 +585,10 @@ async function testRealmSerialization() {
     realm.dispose();
   }
 
-  // 4. Disposing a realm while an invocation is parked mid-await — the ordinary state of
-  //    a node whose initiator waits on the network — fails the parked caller and frees
-  //    the context WITHOUT taking the wasm module with it: the engine asserts an empty gc
-  //    object list when a runtime is freed, so a handle the parked call still held would
-  //    abort the whole module.
+  // 4. Disposing a realm while an invocation waits mid-await (the normal state of a node
+  //    waiting on the network) fails the waiting caller and frees the context without
+  //    taking the wasm module with it: the engine asserts an empty gc object list when a
+  //    runtime is freed, so a handle the waiting call still held would abort the module.
   {
     const realm = await createSafeRealm({
       source: `async function handle() { await host.call("park", new Uint8Array()); }`,
@@ -620,7 +605,7 @@ async function testRealmSerialization() {
     try { await realm.call(new Uint8Array()); } catch (e) { after = e.message; }
     assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
 
-    // A realm built after the teardown proves the module survived it.
+    // A realm built after the teardown shows the module survived it.
     const next = await createSafeRealm({
       source: `function handle(arg) { return arg; }`,
       hostCall: async () => new Uint8Array(),
@@ -633,8 +618,7 @@ async function testRealmSerialization() {
   console.log("  OK\n");
 }
 
-// ─── Test: PR-review hardening — seam gating, guarded callModule, ───────
-// ─── sender-bound responses, WS fragmentation, redial after failure ──────
+// ─── Test: seam gating ───────────────────────────────────────────────────
 
 async function testSeamGating() {
   console.log("Test: the guest seam enforces the manifest's declared requires + allocation caps");
@@ -650,23 +634,22 @@ async function testSeamGating() {
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
 
-  // A residual HOST TRANSFORM is exempt from the gate by rule: `crypto/` reaches
-  // nothing, so there is nothing to grant. A seam built for a bundle declaring NO
-  // names still hashes.
+  // Host crypto transforms need no declaration: `crypto/` reaches nothing, so there is
+  // nothing to gate. A seam for a bundle declaring no names still hashes.
   const timerOnly = mk(["timer"]);
   assertEqual((await timerOnly("crypto/blake2b", U(32, 0, 1, 2))).length, 32,
     "crypto/blake2b resolves for a bundle declaring no crypto name — a pure transform is not a grant");
   threw = false;
   try { await timerOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
-  // A bare name is the asking bundle's own module map — code it already holds, scoped by
-  // the app the seam was built for. This seam holds no such module, so it has no route.
+  // A bare name looks up the calling bundle's own modules, scoped to the app the seam was
+  // built for. This seam has no such module, so it has no route.
   threw = false;
   try { await timerOnly("echo", U(1, 120)); } catch { threw = true; }
   assert(threw, "a module name this seam was not built with reaches nothing");
 
-  // Grants are gated by SERVICE, not by method: declaring `timer` resolves `timer/clear`,
-  // and a different, undeclared service is still refused beside it.
+  // Access is by service, not method: declaring `timer` resolves `timer/clear`, and an
+  // undeclared service is still refused beside it.
   threw = false;
   try { await timerOnly("node/sign", U(1)); } catch { threw = true; }
   assert(threw, "an undeclared service (node) is refused by the seam");
@@ -677,9 +660,8 @@ async function testSeamGating() {
   try { await timerOnly("timer/clear", U()); } catch { threw = true; }
   assert(!threw, "timer/clear resolves under the declared service");
 
-  // The unit a manifest grants is the WHOLE service: declaring `node` grants every
-  // `node/*` method — `node/verify` beside `node/sign` — because there was never a finer
-  // boundary anyone held (§12.2).
+  // A manifest declares whole services: declaring `node` wires every `node/*` method,
+  // `node/verify` as well as `node/sign` (§12.2).
   const nodeOnly = mk(["node"]);
   assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign resolves under the declared service");
   const nodeSig = await nodeOnly("node/sign", U(3));
@@ -688,36 +670,36 @@ async function testSeamGating() {
   try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
   assert(threw, "a different, undeclared service (fs) is still refused beside the declared one");
 
-  // Declaring the method's exact STRING is not declaring its service: `node/sign` is not a
-  // service, so it is read as a local service id nothing claims, and no `node` handler is
-  // wired — `requires` speaks in services, and install refuses the manifest besides.
+  // Declaring a method's name is not declaring its service: `node/sign` is not a service,
+  // so it is read as a local service id nothing claims and no `node` handler is wired
+  // (install would also refuse the manifest).
   const methodNameOnly = mk(["node/sign"]);
   threw = false;
   try { await methodNameOnly("node/sign", U(1, 2)); } catch { threw = true; }
   assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
-  // Guest-controlled allocation caps. Tests that exercise the full catalog name every
-  // host service explicitly; omitting requires entirely still throws (§12.2).
+  // Guest-controlled allocation caps. Tests that use every host service declare them all
+  // explicitly; omitting requires entirely throws (§12.2).
   const open = mk(ALL_HOST_SERVICES);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
   assert(omitted, "omitting requires throws rather than granting every name");
-  // A declared service this node cannot back refuses the seam, so the install fails.
+  // A declared service this node cannot provide fails the seam, so the install fails.
   let unbacked = "";
   try {
     createGuestSeam({ sodium, requires: ["fs"], backends: { ...testBackends(), fs: undefined },
       callLocal: TEST_CALL_LOCAL, modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) } });
   } catch (e) { unbacked = e.message; }
   assert(unbacked.includes('requires "fs"'), `a declared fs on a diskless node is refused at construction (got: ${unbacked})`);
-  // Entropy is an ungated transform: a seam declaring nothing still draws it.
+  // Entropy needs no declaration: a seam declaring nothing can still get it.
   const none = mk([]);
   assertEqual((await none("crypto/random", U(0, 0, 4, 0))).length, 1024, "crypto/random under the cap works, with nothing declared");
   threw = false;
   try { await none("crypto/random", U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "crypto/random over the cap is refused");
 
-  // The vocabulary is closed at LOAD, not at first use: an unknown name in a manifest is
-  // a refused bundle (verifyTestBundle), and the seam answers "no such name" besides.
+  // Names are checked at install, not at first use: an unknown name in a manifest refuses
+  // the bundle (verifyTestBundle), and the seam also answers "no such name".
   threw = false;
   try { await open("transform/do", U()); } catch { threw = true; }
   assert(threw, "`transform` is gone from the vocabulary — a manifest naming it is refused");
@@ -732,8 +714,8 @@ async function testCallModuleGuards() {
   const { host } = await makeHost();
   const guards = "guards";
 
-  // An unbound module resolves to null, distinct from an empty response — and so does a
-  // module under an app that was never installed: neither is a thing that exists.
+  // An unbound module resolves to null, distinct from an empty response, and so does a
+  // module under an app that was never installed.
   assert(await host.callModule(guards, "missing", new Uint8Array([1])) === null,
     "callModule returns null for an unbound module");
   assert(await host.callModule("nope", "echo", new Uint8Array([1])) === null,
@@ -745,15 +727,15 @@ async function testCallModuleGuards() {
   const r = await host.callModule(guards, "echo", new Uint8Array([5]));
   assertEqual([...r], [5], "callModule reaches an installed module");
 
-  // A 0-length response is a valid EMPTY answer, not the null of an unbound name, so a
-  // caller can tell "module ran, said nothing" from "nothing there".
+  // A 0-length response is a valid empty answer, not the null of an unbound name, so a
+  // caller can tell "module ran and returned nothing" from "no such module".
   const empty = await host.callModule(guards, "echo", EMPTY);
   assert(empty !== null && empty.length === 0,
     "an empty response is an empty array, distinct from null");
 
-  // The worker copies a result out before erasing scratch. This probe's second call
-  // returns the first call's old span without rewriting it, so any staged secret left in
-  // the long-lived instance would come straight back here.
+  // The worker copies a result out before wiping scratch. This probe's second call
+  // returns the first call's old span without rewriting it, so anything left behind in
+  // the long-lived instance would come back here.
   const scrubber = await new JsModuleLoader().build([{
     name: "probe", wasm: readFileSync(join(root, "build/scratch-probe.wasm")),
   }]);
@@ -773,12 +755,12 @@ async function testCallModuleGuards() {
   console.log("  OK\n");
 }
 
-// ─── Test: a module call is bounded — the §4.3 compute residual, closed ──────────
-// The JS platform's WebAssembly exposes no fuel or timeout, so a module call in the host
-// thread that never returned would wedge the node irrecoverably — a restart would
-// re-trigger it from the same inbound frame. The worker-per-module table closes that: a
-// spinning module answers EMPTY at its deadline, the host thread stays alive, and a fresh
-// instance serves the next call.
+// ─── Test: a module call is bounded (§4.3) ────────────────────────────────────────
+// The JS platform's WebAssembly has no fuel or timeout, so a module call in the host
+// thread that never returned would wedge the node for good (a restart would hit it again
+// from the same inbound frame). The worker-per-module table prevents that: a spinning
+// module answers empty at its deadline, the host thread stays alive, and a fresh instance
+// serves the next call.
 async function testModuleCallBound() {
   console.log("Test: a spinning module is killed at its deadline and respawned (§4.3)");
 
@@ -787,21 +769,21 @@ async function testModuleCallBound() {
   const { testHost } = await import("./fixtures.mjs");
   const spinKey = "spin";
 
-  // The default table bound is generous; a bounded host is the deployment's number. The
-  // call's OWN deadline is what a guest's call carries — the guest's remaining segment.
+  // The default table bound is generous and set by the deployment. A guest's call carries
+  // its own deadline: the guest's remaining segment.
   const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_OR_ECHO_WASM }]);
   assert(host.isBound(spinKey, "spin"), "the spinning module binds (its memory is bounded at admission)");
 
   // The host thread is never blocked: timers keep firing while the module spins in its
   // worker. Running the call in this thread would let a spinner wedge everything,
-  // transport included.
+  // including the transport.
   let heartbeats = 0;
   const beats = setInterval(() => heartbeats++, 25);
 
   const t0 = Date.now();
-  // A 120 ms bound. Null at the table — exactly what a trap produces, and what the guest
-  // seam rejects on (§12.2).
+  // A 120 ms bound. Null at the table, as for a trap, which the guest seam turns into a
+  // rejection (§12.2).
   const r = await host.callModule(spinKey, "spin", new Uint8Array([1]), 120);
   const spent = Date.now() - t0;
   clearInterval(beats);
@@ -810,14 +792,13 @@ async function testModuleCallBound() {
   assert(spent >= 100 && spent < 3000, `it is killed near its bound, not eventually (${spent}ms)`);
   assert(heartbeats > 0, "the host thread was alive the whole time the module spun");
 
-  // A fresh instance serves the next call to the SAME module: the kill terminated the old
-  // worker, and that call loads a new one, statics gone. No rebind — a rebind builds a new
-  // set and would never touch the killed module.
+  // A fresh instance serves the next call to the same module: the kill ended the old
+  // worker, and that call loads a new one with clean state, without reinstalling.
   const echo = await host.callModule(spinKey, "spin", new Uint8Array([0, 9]), 1000);
   assertEqual([...echo], [0, 9], "the killed module answers on a fresh worker");
 
-  // Two calls to the SAME module cannot run at once: the table keeps one in flight per
-  // module (§3, "one transform at a time"), so a spinner burns one core for one bound.
+  // Two calls to the same module cannot run at once: the table keeps one in flight per
+  // module (§4.3), so a spinner burns one core for one bound.
   const host2 = testHost(new ModuleTable());
   await host2.bindAll(spinKey, [{ name: "spin", wasm: SPIN_OR_ECHO_WASM }]);
   const t1 = Date.now();
@@ -829,15 +810,15 @@ async function testModuleCallBound() {
   assert(a === null && b === null,
     "both spins answered like traps, at their own deadlines");
   assert(serial >= 140 && serial < 5000, `the two calls ran one after the other (${serial}ms)`);
-  // …and the same module still answers after two kills in a row: the queued call loaded
-  // the worker the second spin ran on, and the next call loads another.
+  // The same module still answers after two kills in a row: the queued call loaded the
+  // worker the second spin ran on, and the next call loads another.
   const after = await host2.callModule(spinKey, "spin", new Uint8Array([0, 3]), 1000);
   assertEqual([...after], [0, 3], "the module answers on a fresh worker after two kills");
   host2.removeApp(spinKey);
 
-  // An unbounded call is an operator's explicit opt-out: Infinity disables the bound,
-  // and the worker then spins until the app is dropped — the host stays responsive, and
-  // dropping the app settles the in-flight call as empty rather than stranding it.
+  // An unbounded call is an explicit operator opt-out: Infinity disables the bound, and
+  // the worker spins until the app is dropped. The host stays responsive, and dropping
+  // the app settles the in-flight call as empty instead of leaving it hanging.
   const host3 = testHost(new ModuleTable({ deadlineMs: Infinity }));
   await host3.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   let beats3 = 0;
@@ -855,10 +836,10 @@ async function testModuleCallBound() {
 
 // ─── Test: the guest's module call runs under the guest's own budget ─────────────
 //
-// "Charged to the calling guest's budget" (§4.3) made literal: the realm computes the
-// caller's remaining execution segment at the moment of the call and hands it to the
-// module as the call's deadline. A guest that has already spent most of its budget gets
-// a module call killed far sooner than the deployment's default bound.
+// "Charged to the calling guest's budget" (§4.3): the realm computes the caller's
+// remaining execution segment at the moment of the call and gives it to the module as the
+// call's deadline. A guest that has spent most of its budget gets a module call killed
+// far sooner than the deployment's default bound.
 async function testModuleCallChargedToGuestBudget() {
   console.log("Test: a module call is charged to the calling guest's remaining segment (§4.3)");
 
@@ -900,17 +881,17 @@ async function testModuleCallChargedToGuestBudget() {
   realm.dispose();
   assert(firstFailure.includes("deadline"),
     "the module's bounded empty answer cannot arrive after the enclosing handoff expired");
-  // The burn is ~4.9s, so the whole call is ~5s; the module itself died at the ~100ms
-  // that remained, NOT at the table's 60s default — a broken deadline flow would hang
-  // this call for a minute instead.
+  // The burn is ~4.9s, so the whole call is ~5s; the module died at the ~100ms that
+  // remained, not at the table's 60s default. A broken deadline flow would hang this
+  // call for a minute.
   assert(spent >= 4800 && spent < 8000,
     `the call died with the guest's remaining budget, not the table's (${spent}ms)`);
 
-  // The other half of "charged": what a module BURNS is billed back to the segment that
+  // The other half of "charged": the module's CPU time is billed to the segment that
   // called it, and a segment with nothing left refuses the next call. Both halves are
-  // needed — the guest is parked while the module runs, so its own spend advances by
-  // microseconds per turn, and QuickJS's interrupt is consulted per bytecode, of which
-  // this guest executes almost none between parks.
+  // needed: the guest waits while the module runs, so its own spend advances by
+  // microseconds per turn, and QuickJS's interrupt is checked per bytecode, of which this
+  // guest runs almost none between calls.
   const looper = await createSafeRealm({
     source: `async function handle() {
       for (;;) await host.call("spin", new Uint8Array());
@@ -936,12 +917,9 @@ async function testModuleCallChargedToGuestBudget() {
 
 // ─── Test: the seam is always async, and a forgotten await cannot read bytes ─────
 //
-// There is no seam version to refuse a guest written against the old calling convention,
-// because there is no old convention left to be written against: every name — crypto
-// included — answers a Promise. The invariant worth pinning is the one the version used
-// to buy: `host.call` NEVER resolves to bytes in the calling turn. A guest that forgets
-// the await reads a Promise where bytes were expected, and this test makes that shape
-// loud instead of silent.
+// Every name, crypto included, answers a Promise, so `host.call` never returns bytes in
+// the calling turn. A guest that forgets the await reads a Promise instead of bytes; this
+// test checks that for each name.
 async function testPreviousAbiRefused() {
   console.log("Test: every host.call answers a Promise — no name sits on a sync line");
 
@@ -1005,12 +983,12 @@ async function testSafeRealmConcurrency() {
 // ─── Test: a deferred invocation keeps its own deadline ─────────────────────────────
 //
 // `__deferred` hands the realm to the next entry and nothing else: it "transfers queue
-// occupancy, never time custody" (§12.3). A host call that settles after another invocation
-// has entered therefore resumes under — and can only fail — the invocation that made it. A
-// realm keeping one clock for whoever entered last lends a parked invocation that entry's
-// remainder, fails every parked caller when one overruns, and bills a module's burn to the
-// wrong one. native/guest_test.go holds the native realm to case 1; case 2 is JS-only, since
-// a native module runs inside the segment that called it.
+// occupancy and never time custody" (§12.2). A host call that settles after
+// another invocation has entered therefore resumes under, and can only fail, the
+// invocation that made it. A realm with one clock for whoever entered last would lend a
+// waiting invocation that entry's remainder, fail every waiting caller when one overruns,
+// and bill a module's CPU time to the wrong one. native/guest_test.go checks case 1 on the
+// native realm; case 2 is JS-only, since a native module runs inside the calling segment.
 async function testDeferredKeepsItsDeadline() {
   console.log("Test: a deferred invocation resumes under its own deadline, not a later entry's (§12.3)");
 
@@ -1031,7 +1009,7 @@ async function testDeferredKeepsItsDeadline() {
   };
   const outcome = (call) => call.then(() => "answered", (err) => err.message);
 
-  // 1. Invocation 1 (1 s) parks, then 2 (the realm's 5 s) enters and parks behind it. 1 is
+  // 1. Invocation 1 (1 s) waits, then 2 (the realm's 5 s) enters and waits behind it. 1 is
   //    resumed by a rejection and 2 by an answer, so both settlement paths are covered.
   {
     const { realm, parked, remaining, bothParked } = await parkingRealm(`async function handle(tag) {
@@ -1057,8 +1035,8 @@ async function testDeferredKeepsItsDeadline() {
     }
   }
 
-  // 2. A module's burn is billed to the invocation whose call it was (§4.3), even when the
-  //    bill lands while another holds the realm: a whole allowance exhausts 1, never 2.
+  // 2. A module's CPU time is billed to the invocation that called it (§4.3), even when
+  //    it is billed while another holds the realm: a full allowance exhausts 1, never 2.
   {
     const { realm, parked, bothParked } = await parkingRealm(`async function handle(tag) {
       globalThis.__deferred = true;
@@ -1085,8 +1063,8 @@ async function testDeferredKeepsItsDeadline() {
 async function testDetachedAnswerIsANewTurn() {
   console.log("Test: a detached call's answer resumes as a new turn, not under a spent invocation (§12.3)");
 
-  // `deliver` detaches and never answers, so its own handoff deadline — the invocation's
-  // 100 ms — settles it; `remaining` records the remainder its continuation was handed.
+  // `deliver` detaches and never answers, so its own handoff deadline (the invocation's
+  // 100 ms) settles it; `remaining` records the remainder its continuation was given.
   const remaining = [];
   const realm = await createSafeRealm({
     source: `function handle(tag) {
@@ -1148,10 +1126,10 @@ async function testOwnTurns() {
 }
 
 // ─── Test: a standard handshake is buildable on the host names (Noise XX vectors) ───
-// The host's crypto/ names must carry their algorithms' whole standard interface, or a
-// replacement transport stops being a bundle update (services/domains.ts). Published
-// Noise_XX vectors, replayed byte for byte through a seam that grants nothing — the same
-// script native/guestseam_test.go runs against the Go primitives.
+// The host's crypto/ names must expose their algorithms' whole standard interface, or a
+// replacement transport could not ship as a bundle (services/domains.ts). Published
+// Noise_XX vectors, replayed byte for byte through a seam with no services declared: the
+// same script native/guestseam_test.go runs against the Go primitives.
 async function testNoiseVectors() {
   console.log("Test: the published Noise XX vectors replay through the crypto/ names alone");
   await import("./noise-vectors.js");

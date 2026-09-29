@@ -23,10 +23,10 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 		`); err != nil {
 			t.Fatal("build seam:", err)
 		}
-		// callRealm appends its own call parens, so the expression must be a function: an
-		// IIFE that awaits the realm. Passing createRealm({...}) directly would evaluate
-		// createRealm({...})() — a TypeError that made this test pass without ever running
-		// the source.
+		// callRealm appends its own call parens, so the expression must be a function that
+		// awaits the realm. Passing createRealm({...}) directly would evaluate
+		// createRealm({...})(), a TypeError that would pass this test without running the
+		// source.
 		if _, err := callRealm(`(async () => { await createRealm({ source: __src, hostCall: __guestSeam, deadlineMs: 100 }); })`, 3*time.Second); err == nil {
 			t.Fatal("top-level guest loop unexpectedly completed")
 		}
@@ -47,10 +47,10 @@ func TestGuestRealmInitializationBudget(t *testing.T) {
 }
 
 // Guest source whose completion value is a never-settling promise must not wedge its host
-// either. Eval hands the completion value back as it stands; an eval that waited on it
-// would spin inside C, where the Budget interrupt never runs, because only the interpreter
-// consults it. Runs in a child for the same reason as the budget probe above: a regression
-// cannot be timed out from inside the wedged process.
+// either. Eval returns the completion value as it is; an eval that waited on it would spin
+// inside C, where the Budget interrupt never runs, since only the interpreter checks it.
+// Runs in a child for the same reason as the test above: a regression cannot be timed out
+// from inside the wedged process.
 func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 	const marker = "SEEDKERNEL_TEST_GUEST_PENDING_PROMISE"
 	if os.Getenv(marker) == "1" {
@@ -201,9 +201,9 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 	}
 }
 
-// TestGuestRealmIDsAreMintedByTheirOwner pins the bridge's handle contract at the Go side:
-// the map that owns realms also mints their opaque ids, so callers have no id to reuse or
-// forge and successive realms can never quietly displace one another.
+// TestGuestRealmIDsAreMintedByTheirOwner checks the bridge's handle contract on the Go
+// side: the map that owns realms also assigns their opaque ids, so callers cannot reuse or
+// forge an id and one realm can never silently replace another.
 func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
 	bootRealm(t)
 	const mk = `bridge.createRealm("function handle(){ return new Uint8Array(); }", () => {}, 67108864, 1000, 10, 1048576)`
@@ -215,9 +215,9 @@ func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
 	}
 }
 
-// TestGuestRealmCarriesModuleDeadline pins the native-only half of CallBudget: guest.go
-// owns the live execution segment, so it must carry that remainder into the shared seam.
-// The seam then hands exactly that value to this slot's private module call.
+// TestGuestRealmCarriesModuleDeadline checks the native-only half of CallBudget: guest.go
+// owns the running execution segment, so it must pass that remainder into the shared
+// seam, which passes exactly that value to this slot's private module call.
 func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("module-budget-seam.js", `
@@ -252,9 +252,9 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	}
 }
 
-// A timer root pays for native guest execution on both sides of an await, but not for the
-// wait itself. This pins the Go-to-TypeScript execution report as well as restoration of
-// the causal clock while the settled host call's continuation is drained.
+// A wake's clock pays for native guest execution on both sides of an await, but not for
+// the wait itself. This checks the Go-to-TypeScript execution report and that the causal
+// clock is restored while the settled host call's continuation runs.
 func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("causal-clock-seam.js", `
@@ -312,9 +312,9 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	`)
 	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 
-	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which stands the host realm up
-	// fresh (host-shell.gen.js re-evaluates, resetting native-shim.ts's own realm-id
-	// counter), and newTestRealm above is the first createRealm this test makes.
+	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which starts a fresh host realm
+	// (host-shell.gen.js re-evaluates, resetting the realm id counter), and newTestRealm
+	// above is the first createRealm this test makes.
 	g := realms[1]
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
@@ -337,10 +337,10 @@ func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	}
 }
 
-// TestGuestRealmCloseReleasesParkedCalls: closing a realm ends the custody of whatever it
-// still had parked. The guest that would have consumed those answers is gone, so what a
-// pending backend holds is the host's own memory — keeping the charge would pin the
-// process-wide pool on any backend that never answers, with nothing left to release it.
+// TestGuestRealmCloseReleasesParkedCalls: closing a realm releases the charges of calls it
+// still had pending. The guest that would have consumed those answers is gone, so keeping
+// the charge would pin the realm's allowance on any backend that never answers, with
+// nothing left to release it.
 func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("park-close-seam.js", `
@@ -369,10 +369,9 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	}
 }
 
-// A confined guest realm runs an app's entrypoints over the single
-// host.call seam, reaching only its declared requires. This exercises a
-// content-addressed put/get guest (local, synchronous ops) end-to-end, and asserts
-// the realm is zero-authority — the host services are not reachable by name.
+// A confined guest realm runs an app's entrypoint over the single host.call seam, reaching
+// only its declared requires. This runs a content-addressed put/get guest end to end, and
+// checks the realm has no authority: the host services are not reachable as globals.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
 // put hashes the data (crypto/blake2b, by name) and stores it under that id
@@ -395,8 +394,8 @@ function handle(arg) {
   for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
   const data = arg.subarray(33 + n);
   if (op === "put") {
-    // A primitive is reached BY NAME through the crypto/ prefix — the name is the
-    // seam, not an op number — and it answers a Promise like every name now.
+    // A primitive is reached by name under crypto/, not by op number, and answers a
+    // Promise like every name.
     const hashArg = new Uint8Array(2 + data.length); hashArg[0] = 32; hashArg.set(data, 2);
     return host.call("crypto/blake2b", hashArg).then((id) =>
       host.call("fs/put", fsPutArg(hex(id), data)).then(() => id));
@@ -419,7 +418,7 @@ function handle(arg) {
 func TestGuestPutGetAndConfinement(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Host realm: build the guest seam granting fs/put + fs/get (no net).
+	// Host realm: build the guest seam with `fs` declared (no link).
 	if _, err := qc.Eval("build.js", `
 		__buildGuestSeam(["fs"], null);
 	`); err != nil {
@@ -427,7 +426,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 	newTestRealm(t, "{}", storeGuestSource)
 
-	// put → returns the content id (32-byte hash).
+	// put returns the content id (32-byte hash).
 	data := []byte("hello, confined world — stored by content id")
 	id, err := realmCall("put", data)
 	if err != nil {
@@ -437,7 +436,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 		t.Fatalf("put returned id of %d bytes, want a 32-byte hash", len(id))
 	}
 
-	// get(id) → the original bytes (proves it stored under the content id).
+	// get(id) returns the original bytes (showing it stored under the content id).
 	got, err := realmCall("get", id)
 	if err != nil {
 		t.Fatal("get:", err)
@@ -462,10 +461,9 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 }
 
 // The realm's heap cap is a confinement property, not a tuning knob: an admitted guest
-// that runs away must exhaust its own realm rather than the host, including on the request
-// path a remote peer drives. Asserted on the real createRealm path, since the cap can only
-// be set at runtime creation and is easy to drop there silently. The modest allocation is
-// the control.
+// that runs away must exhaust its own realm, not the host, including on the request path a
+// remote peer drives. Checked on the real createRealm path, since the cap can only be set
+// at runtime creation and is easy to lose there. The small allocation is the control.
 func TestGuestRealmHeapCapped(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -475,7 +473,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	// Twice the shared 64 MiB default (host/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
-	// resolved by the shim) — mirrored here because the runtime no longer owns a copy.
+	// passed by the shim); Go has no constant of its own.
 	src := fmt.Sprintf(`
 		function handle(arg) {
 		  const n = arg[32];
@@ -500,14 +498,14 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	}
 }
 
-// A guest that never yields is stopped by its execution budget (README §12.3, §16.1).
+// A guest that never yields is stopped by its execution budget (§12.3, §16.1).
 //
-// The native half of safe-js.ts's interrupt handler, and the SAME lever: QuickJS's own,
-// armed through qjs.Runtime.Budget. So the consequence asserted below is safe-js's — the
-// overrun is a throw, the caller gets an error, and the realm is still usable. A guest
-// that spends its allowance has failed one invocation, not destroyed the app.
+// The native counterpart of safe-js.ts's interrupt handler, using the same mechanism:
+// QuickJS's own, armed through qjs.Runtime.Budget. So the result checked below matches
+// safe-js: the overrun is a throw, the caller gets an error, and the realm is still usable.
+// A guest that spends its allowance fails one invocation, not the whole app.
 //
-// The trivial call first is the control; the trivial call AFTER is the point.
+// The trivial call before is the control; the trivial call after is what is tested.
 func TestGuestRealmExecutionBudget(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -545,19 +543,20 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 	}
 }
 
-// A realm killed mid-flight must SETTLE the calls it still owes, not strand them.
+// A realm interrupted mid-flight must settle the calls it still owes, not leave them
+// hanging.
 //
-// The dangerous shape is an entrypoint that parks on a host call and then burns its budget
-// in the continuation: the kill lands inside settleHostCall, after the initiator's promise
-// reached the shell but before anything settled it. safe-js has no equivalent problem (its interrupt
-// throws and the guest's promise rejects), so a native realm that merely stopped answering
-// would hang the node rather than fail it — strictly worse, since the caller cannot retry,
-// time out, or tell anything went wrong.
+// The dangerous case is an entrypoint that waits on a host call and then burns its budget
+// in the continuation: the interrupt lands inside settleHostCall, after the initiator's
+// promise reached the shell but before anything settled it. safe-js has no such problem
+// (its interrupt throws and the guest's promise rejects), so a native realm that just
+// stopped answering would hang the node instead of failing, which is worse, since the
+// caller cannot retry, time out, or tell anything went wrong.
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 
 	// A stub claimant is enough: a cross-realm call only needs a promise that settles on
-	// the loop, and using one keeps the kill (not a socket) as the only variable.
+	// the loop, and it keeps the interrupt (not a socket) as the only variable.
 	if _, err := qc.Eval("setup.js", `
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
 		__buildGuestSeam(["_net"],
@@ -568,9 +567,9 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 
 	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
 		async function handle() {
-		  // the mock composes this guest's op framing; the local op is "park"
+		  // the mock builds this guest's op framing; the local op is "park"
 		  await host.call("_net", new Uint8Array(0));
-		  for (;;) {}                 // burn the budget in the CONTINUATION
+		  for (;;) {}                 // burn the budget in the continuation
 		}
 	`, 300)
 
@@ -578,17 +577,17 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	if _, err := realmCall("park", nil); err == nil {
 		t.Fatal("a guest that spun in its continuation was not stopped")
 	}
-	// The harness gives up at 30s. Anything near that means the call was stranded
-	// rather than settled — the bug this test exists for.
+	// The harness gives up at 30s. Anything near that means the call was left hanging
+	// instead of settled.
 	if d := time.Since(start); d > 20*time.Second {
 		t.Fatalf("in-flight call was stranded for %s, not settled with an error", d)
 	}
 }
 
-// The budget also covers continuations the realm pump drains directly. A plain `await`
-// (no host.call) resumes through that pump rather than settleHostCall, which was once
-// outside every guard the realm had: one `await Promise.resolve()` bought an unbounded
-// loop, since only the segment before the await was budgeted.
+// The budget also covers continuations the realm pump runs directly. A plain `await` (no
+// host.call) resumes through that pump, not settleHostCall; if the pump were unbudgeted,
+// one `await Promise.resolve()` would allow an unbounded loop, since only the segment
+// before the await would be budgeted.
 //
 // Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
 // the loop must be driven by whoever is waiting on it.
@@ -616,11 +615,11 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 }
 
 // A deferred invocation hands the realm to the next entry and nothing else: `__deferred`
-// "transfers queue occupancy, never time custody" (README §12.3). A host call that settles
-// after another invocation has entered must resume under — and can only fail — the
+// "transfers queue occupancy and never time custody" (§12.2). A host call that settles
+// after another invocation has entered must resume under, and can only fail, the
 // invocation that made it; otherwise it borrows the later entry's remainder, and one
-// overrun fails every parked caller. realm-guest.test.mjs (testDeferredKeepsItsDeadline)
-// holds safe-js.ts to the same scenario.
+// overrun fails every waiting caller. realm-guest.test.mjs (testDeferredKeepsItsDeadline)
+// tests safe-js.ts with the same scenario.
 func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	// `park` waits until the harness settles it by tag; `remaining` records the remainder
@@ -649,7 +648,7 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 	`, 5000)
 	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 
-	// Invocation 1 (1 s) parks, then 2 (the realm's 5 s) enters and parks behind it. 1 is
+	// Invocation 1 (1 s) waits, then 2 (the realm's 5 s) enters and waits behind it. 1 is
 	// resumed by a rejection and 2 by an answer, so both settlement paths are covered.
 	if _, err := callRealm(`(async () => {
 		const outcome = (call) => call.then(() => "answered", (e) => e.message);
@@ -672,9 +671,9 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 }
 
 // A detached host call's answer is a new turn of its realm, not the tail of the invocation
-// that made it (README §12.3): it resumes under the realm's own ceiling rather than that
-// invocation's spent remainder. realm-guest.test.mjs (testDetachedAnswerIsANewTurn) holds
-// safe-js.ts to the same scenario.
+// that made it (§12.3): it resumes under the realm's own ceiling instead of that
+// invocation's spent remainder. realm-guest.test.mjs (testDetachedAnswerIsANewTurn) tests
+// safe-js.ts with the same scenario.
 func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
 	guestSeamRealm(t)
 	// `deliver` detaches and never answers, so its own handoff deadline settles it;
@@ -713,9 +712,9 @@ func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
 	}
 }
 
-// An ownTurns realm runs every invocation on its own ceiling: a caller's deadline bounds that
-// caller's wait and nothing else (README §12.3). realm-guest.test.mjs (testOwnTurns) holds
-// safe-js.ts to the same scenario.
+// An ownTurns realm runs every invocation on its own ceiling: a caller's deadline bounds
+// that caller's wait and nothing else (§12.3). realm-guest.test.mjs (testOwnTurns) tests
+// safe-js.ts with the same scenario.
 func TestGuestRealmOwnTurns(t *testing.T) {
 	guestSeamRealm(t)
 	// `wait` answers when the harness says; `remaining` records the remainder guest.go
@@ -760,12 +759,12 @@ func TestGuestRealmOwnTurns(t *testing.T) {
 	}
 }
 
-// Closing a realm settles the calls it still owes, rather than stranding them.
+// Closing a realm settles the calls it still owes instead of leaving them hanging.
 //
-// Same failure mode as a budget kill and the same fix: an initiator's promise lives
+// The same failure as a budget interrupt, with the same fix: an initiator's promise lives
 // inside the realm, so a close with calls outstanding leaves the caller waiting on
-// something that can no longer be resolved. safe-js's dispose() fails its pending
-// callers for this reason; close() has to as well.
+// something that can no longer resolve. safe-js's dispose() fails its pending callers for
+// this reason, and close() has to as well.
 func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("setup.js", `
@@ -775,8 +774,8 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	`); err != nil {
 		t.Fatal("setup:", err)
 	}
-	// The transport never settles, so the guest parks forever and the realm is closed
-	// out from under a live call — the shape that used to hang.
+	// The transport never settles, so the guest waits forever and the realm is closed
+	// under a live call.
 	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
 		function fromHex(h) {
 		  const out = new Uint8Array(h.length / 2);

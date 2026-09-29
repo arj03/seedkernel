@@ -9,16 +9,15 @@ import (
 	"time"
 )
 
-// Serving (README §12.8, §12.10): the protocol id off the wire is resolved to the
-// installed app whose manifest claims it, and that app answers. There is no native
-// dispatch, which is what these pin — they drive the real boot path (boot → standUp →
-// loadBundle → serve), so what runs is the shell's `dispatch`, the same function the
-// Node and browser shells use.
+// Serving (§12.8, §12.10): the protocol id from the wire is resolved to the installed app
+// whose manifest claims it, and that app answers. Routing is the shared shell code, not
+// Go; these tests use the real boot path (boot, standUp, install, serve), so the routing
+// that runs is the same as on Node and in the browser.
 
 // The holder guest: type 1 = STORE (payload already framed for fs/put), type 2 = FETCH
-// (payload = key). Local fs only — and it AWAITS, because the fs names round-trip
-// (§12.2). A holder is therefore an ordinary async entrypoint like an initiator, and
-// the realm serializes the two rather than running one inside the other's parked window.
+// (payload = key). Local fs only, awaited, since the fs names are async (§12.2). A holder
+// is an ordinary async entrypoint like an initiator, and the realm serializes the two
+// instead of running one while the other waits.
 const holderGuestSource = `
 	async function handle(arg) {
 	  const sender = arg.slice(0, 32);
@@ -30,18 +29,17 @@ const holderGuestSource = `
 	}
 `
 
-// The echo guest: forwards its input to the bundle's own "fwd" module by its bare name
-// over the same host.call as everything else (§12.2) — the shape every app has now that
-// module-only apps are retired (§12.4): inbound delivery reaches the guest, and the guest
-// drives its module library.
+// The echo guest: forwards its input to the bundle's own "fwd" module by its bare name,
+// over the same host.call as everything else (§12.2). Every app has this shape (§12.4):
+// inbound delivery reaches the guest, and the guest calls its modules.
 const echoGuestSource = `
 	function handle(arg) { return host.call("fwd", arg); }
 `
 
-// requesterJS stands a second, bundle-less node up in the same realm — just a network
-// and a Transport — so a test can put a real request on a real socket. The node under
-// test is the one startNode stood; this is only the peer knocking on its door, under a
-// policy of its own that admits the probe app it asks through.
+// requesterJS boots a second node in the same realm, just a network and the transport, so
+// a test can send a real request over a real socket. The node under test is the one
+// startNode booted; this is only the peer calling it, under a policy of its own that
+// admits the probe app it sends through.
 const requesterJS = `
 "use strict";
 globalThis.startRequester = async function (holderId, port, contactSecretHex, policyJson) {
@@ -55,25 +53,24 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex, po
   globalThis.__requesterNode = node;
   const net = node.transport;
   globalThis.__net2 = net;
-  // The secret is taught WITH the address, not read from this node's own config: on a dial
-  // it is the PEER's contact secret (§12.6), and without it the holder answers a stranger's
-  // msg1 with silence — which is the whole point of the gate, and would show up here only
-  // as a request timeout.
+  // The secret is added with the address, not read from this node's own config: on a dial
+  // it is the peer's contact secret (§12.6), and without it the holder answers a stranger's
+  // msg1 with silence, which would show up here only as a request timeout.
   teachAddr(node.shell, holderId, "tcp://127.0.0.1:" + port, fromHex(contactSecretHex));
   await __net2.start();
   return new Uint8Array(0);
 };
-// Go stages bytes as ArrayBuffers; request takes the Uint8Array view every other
-// caller hands it, so make one here rather than loosening the shared signature.
+// Go passes bytes as ArrayBuffers; request takes a Uint8Array like every other caller, so
+// make one here instead of loosening the shared signature.
 globalThis.__requester = null;
-// The requester loads the probe app and asks through it: a request is an app calling
-// the id the transport claims, so there is nothing host-side to call instead.
+// The requester installs the probe app and sends through it: a request is an app calling
+// the id the transport claims.
 globalThis.loadIntoRequester = async (bytes) => {
   globalThis.__requester = await __requesterNode.shell.install(new Uint8Array(bytes));
 };
 globalThis.ask = async (sendArgs) => {
-  // The op is a NAME of the probe app's own vocabulary (the shell passes bytes unread;
-  // this file composes the frame the app's handle reads).
+  // The op name is the probe app's own (the shell passes bytes unread; this file builds
+  // the frame the app's handle reads).
   const op = "send", args = new Uint8Array(sendArgs);
   const framed = new Uint8Array(1 + op.length + args.length);
   framed[0] = op.length;
@@ -85,8 +82,8 @@ globalThis.ask = async (sendArgs) => {
 };
 `
 
-// startRequester boots the second node, loads the probe app into it, and returns its
-// peer id. The app is what actually sends: there is no host-side request facade.
+// startRequester boots the second node, installs the probe app, and returns its peer id.
+// The app is what sends.
 func startRequester(t *testing.T, holderID string, port int) string {
 	t.Helper()
 	if _, err := qc.Eval("requester.js", requesterJS); err != nil {
@@ -121,9 +118,8 @@ func ask(t *testing.T, holderID, proto string, payload []byte) []byte {
 	return out
 }
 
-// loadedLine is the console line a successful load prints (§12.4, §12.10): the app, its
-// version, its author, and the protocol ids the manifest claimed — the routing came with
-// the bundle, so the line reports it rather than the operator supplying it.
+// loadedLine is the console line a successful install prints (§12.4, §12.10): the app, its
+// version, its author, and the protocol ids the manifest claimed.
 func loadedLine(app string, version int, author []byte, serves string) string {
 	return fmt.Sprintf("%s v%d  author %s  serves %s", app, version, hex.EncodeToString(author), serves)
 }
@@ -135,18 +131,18 @@ func serveNode(t *testing.T, authorID []byte) nodeStatus {
 	return bootShell(t, t.TempDir(), authorsPolicy(authorID), &hostPort{Host: "127.0.0.1", Port: 0})
 }
 
-// A guest app serves its request side from its own confined realm: the shell resolves
-// the protocol to the app, then calls the guest's synchronous `handle` (§12.8). This
-// wires the whole stack — a real socket, the shared Transport, the protocol routing, the
-// guest seam the shell built from the manifest's declared domains, and the realm — and
-// proves it against a storage-shaped app: a peer stores a value and fetches it back.
+// A guest app serves requests from its own confined realm: the shell resolves the protocol
+// to the app, then calls the guest's `handle` (§12.8). This uses the whole stack (a real
+// socket, the transport, protocol routing, the guest seam built from the manifest's
+// requires, and the realm) with a storage-like app: a peer stores a value and fetches it
+// back.
 func TestServeGuestApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
 	bundlePath, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
-	// The load is the whole of it (§12.10): the manifest claims `holderapp`, so the
-	// bundle that landed is already the destination for that protocol, and its guest is
-	// already standing — there is no second call between installing and serving.
+	// Installing is enough (§12.10): the manifest claims `holderapp`, so the installed
+	// bundle already receives that protocol and its guest is already running, with no
+	// second step between installing and serving.
 	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, author.id(), "holderapp") {
 		t.Fatalf("bundle load: %s", status)
 	}
@@ -170,19 +166,16 @@ func TestServeGuestApp(t *testing.T) {
 	}
 }
 
-// Two apps on one node, and each protocol reaches ITS OWN app (§12.10) — the property the
-// native target could not hold while it assembled its own dispatch, which called the
-// single guest whatever the answer named, had no arm for a module-only app, and dropped
-// the sender. Only a node hosting two apps with different code shapes can tell.
+// Two apps on one node, and each protocol reaches its own app (§12.10), with the
+// authenticated sender passed along. Only a node hosting two different apps can show this.
 func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
 
-	// Two guest apps under two app labels — so they hold two slots (§5). The holder
-	// guest reads fs; the echo guest forwards to its own
-	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
-	// shell handed the guest. Each protocol reaches its own app because each manifest
-	// claims its own id (§12.10) and the two claims cannot collide.
+	// Two guest apps under two app labels, so two slots (§5). The holder guest reads fs;
+	// the echo guest forwards to its own "fwd" module, which echoes its input, so the echo
+	// app's response is exactly what the shell gave the guest. Each protocol reaches its
+	// own app because each manifest claims its own id (§12.10).
 	guestBundle, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(guestBundle); status != loadedLine("holderapp", 1, author.id(), "holderapp") {
 		t.Fatalf("guest bundle load: %s", status)
@@ -193,8 +186,8 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	}
 	peerID := startRequester(t, st.PeerID, st.Port)
 
-	// The module arm: the guest `handle` receives the input, forwards it through
-	// a bare-name module call, and the forwarder's echo makes both halves checkable — the
+	// The module case: the guest `handle` receives the input and forwards it through a
+	// bare-name module call, and the forwarder's echo makes both halves checkable: the
 	// authenticated sender arrives prepended (§12.8), inside the module's input.
 	payload := []byte("who is asking?")
 	got := ask(t, st.PeerID, "echoapp", payload)
@@ -202,18 +195,15 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 		t.Fatalf("echoapp module input = %x, want senderPk ‖ payload = %x", got, want)
 	}
 
-	// The guest arm, on the same node, in the same breath: a FETCH of a key nobody
-	// stored answers [0] — a MISS from the holder guest, which is proof it ran. The old
-	// dispatch would have sent this to whichever single guest it held regardless of the
-	// protocol, and would have had nothing at all to answer the echo request above with.
+	// The holder case, on the same node: a FETCH of a key nobody stored answers [0], a
+	// miss from the holder guest, which shows it ran.
 	if miss := ask(t, st.PeerID, "holderapp", append([]byte{2}, "absent"...)); len(miss) != 1 || miss[0] != 0 {
 		t.Fatalf("holderapp fetch of an absent key = %v, want [0] from its own guest", miss)
 	}
 
-	// A protocol bound to nothing reaches nobody. The shared Transport still answers the
-	// frame (a null dispatch result is an EMPTY response, not a dropped one — that is
-	// dispatchRequest's contract on every target), so the check is that the answer is
-	// empty rather than either app's.
+	// A protocol nothing claims reaches nobody. The transport still answers the frame (an
+	// unclaimed protocol gets an empty response, not a dropped one, on every target), so
+	// the check is that the answer is empty, not either app's.
 	if resp := ask(t, st.PeerID, "nobody-serves-this", []byte{2}); len(resp) != 0 {
 		t.Fatalf("an unbound protocol was answered with %d B — no app is bound to it", len(resp))
 	}

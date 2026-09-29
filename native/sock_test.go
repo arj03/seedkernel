@@ -1,9 +1,8 @@
 package main
 
-// sock_test.go — the direct tests for sockChannel (net.go/sock.go): the outbound queue
-// and its custody accounting, the close-vs-fail split, and the dial lifecycle. Until these
-// existed the channel was only exercised end-to-end through the transport tests, which
-// can't reach a deliberate close mid-flush or the dial races.
+// Direct tests for sockChannel (net.go/sock.go): the outbound queue and its accounting,
+// the close-vs-fail split, and the dial lifecycle, which the end-to-end transport tests
+// cannot reach (a deliberate close mid-flush, the dial races).
 //
 // net.Pipe gives each test a real net.Conn with deadlines but no ports: a channel
 // wraps one end and the test plays the peer on the other.
@@ -44,8 +43,8 @@ func waitOn(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// TestSockChannelRoundTrip pushes bytes both ways over one pipe: peer → readLoop →
-// onMsg, and send → writer → peer. It pins the raw-byte-duplex contract (no framing,
+// TestSockChannelRoundTrip pushes bytes both ways over one pipe: peer to readLoop to
+// onMsg, and send to writer to peer. It checks the raw byte duplex contract (no framing,
 // ownership of delivered slices, queue-then-flush order).
 func TestSockChannelRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
@@ -79,10 +78,10 @@ func TestSockChannelRoundTrip(t *testing.T) {
 	c.close(false)
 }
 
-// TestSockChannelReadBackpressure pins the native half of the realm-queue bound: one
+// TestSockChannelReadBackpressure checks the native half of the realm-queue bound: one
 // delivered read pauses the socket until the JS driver has finished that realm turn and
-// explicitly resumes it. The second write must remain in net.Pipe, not become another host
-// event queued behind the first.
+// resumes it. The second write must stay in net.Pipe, not become another host event
+// queued behind the first.
 func TestSockChannelReadBackpressure(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
@@ -125,8 +124,8 @@ func TestSockChannelReadBackpressure(t *testing.T) {
 	c.close(false)
 }
 
-// TestSockChannelCloseFlushesQueuedSends pins the deliberate-close contract: queued
-// sends drain to the peer before the socket closes, and close() never fires onClose.
+// TestSockChannelCloseFlushesQueuedSends checks the local close contract: queued sends
+// drain to the peer before the socket closes, and close() never fires onClose.
 func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
@@ -178,9 +177,9 @@ func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 	}
 }
 
-// TestSockChannelBufferedReportsQueue pins the fact the native RawLink exposes to the
-// host's outbound custody owner. No writer is started, so every byte remains deterministically
-// queued until a non-graceful close drops it.
+// TestSockChannelBufferedReportsQueue checks the backlog the native RawLink reports to the
+// host's outbound accounting. No writer is started, so every byte stays queued until a
+// non-graceful close drops it.
 func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	c := &sockChannel{wake: make(chan struct{}, 1)}
 	c.send([]byte("first"))
@@ -194,8 +193,8 @@ func TestSockChannelBufferedReportsQueue(t *testing.T) {
 	}
 }
 
-// TestSockChannelBufferedIncludesBlockedWrite pins the handoff edge: popping a slice from
-// the Go queue does not release its driver-visible bytes while conn.Write still retains it.
+// TestSockChannelBufferedIncludesBlockedWrite checks the handoff: taking a slice off the Go
+// queue does not release its bytes from buffered() while conn.Write still holds it.
 func TestSockChannelBufferedIncludesBlockedWrite(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
@@ -250,9 +249,9 @@ func TestSockChannelDialFailureFiresOnClose(t *testing.T) {
 	c.send([]byte("x")) // dead: dropped without a panic
 }
 
-// TestSockChannelCloseWhileDialing pins the pre-connect non-graceful close: whichever
-// side wins the race, queued sends are dropped, a deliberate close never fires onClose,
-// and the connection the dial produced always ends up closed.
+// TestSockChannelCloseWhileDialing checks the pre-connect non-graceful close: whichever
+// side wins the race, queued sends are dropped, a local close never fires onClose, and the
+// connection the dial produced always ends up closed.
 func TestSockChannelCloseWhileDialing(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -299,10 +298,10 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	}
 }
 
-// TestSockChannelSilentPeerTimesOut pins the pre-auth bound (silentReadTimeout): a
-// connection that opens and never sends a byte is failed and reclaimed on its own,
-// without the transport guest ever having to notice it — the slowloris shape, which
-// costs the attacker a SYN and costs this side two goroutines and a 64 KiB buffer.
+// TestSockChannelSilentPeerTimesOut checks the pre-auth bound (silentReadTimeout): a
+// connection that opens and never sends a byte is failed and reclaimed on its own, without
+// the transport guest noticing it. This is the slowloris case, which costs the attacker a
+// SYN and this side two goroutines and a 64 KiB buffer.
 func TestSockChannelSilentPeerTimesOut(t *testing.T) {
 	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
 	silentReadTimeout = 50 * time.Millisecond
@@ -315,10 +314,10 @@ func TestSockChannelSilentPeerTimesOut(t *testing.T) {
 	waitOn(t, onClosed, "a connection that never spoke must be reclaimed")
 }
 
-// TestSockChannelSpokenForSurvives is the other half of the same rule: the deadline is
-// cleared by the FIRST byte, so a link that has spoken is never killed for going quiet
-// afterwards. How long an established link may idle is the transport's policy (its own
-// idle clock), and a blind second clock here would cut established links behind it.
+// TestSockChannelSpokenForSurvives is the other half of the same rule: the first byte
+// clears the deadline, so a link that has spoken is never killed for going quiet later.
+// How long an established link may idle is the transport's policy (its own idle clock),
+// and a second clock here would cut established links behind its back.
 func TestSockChannelSpokenForSurvives(t *testing.T) {
 	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
 	silentReadTimeout = 50 * time.Millisecond
@@ -343,10 +342,10 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 	c.close(false)
 }
 
-// TestNetHostAcceptCeiling pins the accept bound (maxLiveChannels): past the ceiling an
-// inbound socket is closed on the spot, without an id, a channel or a goroutine — and
-// the listener keeps serving, so the node recovers as live channels drain rather than
-// going deaf.
+// TestNetHostAcceptCeiling checks the accept bound (maxLiveChannels): past the ceiling an
+// inbound socket is closed at once, without an id, a channel or a goroutine, and the
+// listener keeps serving, so the node recovers as live channels close instead of going
+// deaf.
 func TestNetHostAcceptCeiling(t *testing.T) {
 	n := &netHost{chans: map[int64]*sockChannel{}, maxLiveChannels: 2}
 	for i := 0; i < n.maxLiveChannels; i++ {
@@ -369,9 +368,9 @@ func TestNetHostAcceptCeiling(t *testing.T) {
 	}
 }
 
-// TestNetHostInboundReadAllowance pins the native side of the driver-wide inbound meter:
+// TestNetHostInboundReadAllowance checks the native side of the driver-wide inbound limit:
 // shared across links (not one allowance per sockChannel), admitted up to the exact byte
-// and slice ceilings, and fully returned after delivery.
+// and count ceilings, and fully returned after delivery.
 func TestNetHostInboundReadAllowance(t *testing.T) {
 	n := &netHost{maxInboundReadBytes: 8, maxInboundReadSlices: 2}
 	if !n.reserveInboundRead(5) || !n.reserveInboundRead(3) {
@@ -391,9 +390,9 @@ func TestNetHostInboundReadAllowance(t *testing.T) {
 	}
 }
 
-// TestNetHostInboundReadWaitsForSpace is the backpressure half: a full window parks the
-// reader goroutine — where stalling is free and the socket's receive window carries it to
-// the peer — instead of failing an honest link well below MAX_RAW_LINKS.
+// TestNetHostInboundReadWaitsForSpace is the backpressure half: a full window blocks the
+// reader goroutine (where waiting is free and the socket's receive window passes it on to
+// the peer) instead of failing a well-behaved link.
 func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
 	n := &netHost{maxInboundReadBytes: 4, maxInboundReadSlices: 1}
 	if !n.reserveInboundRead(4) {
@@ -422,9 +421,9 @@ func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
 	}
 }
 
-// TestNetHostOnMsgChargesBeforePost covers the exact pre-meter edge: the copy into the
-// event-loop queue happens only after custody is charged. A nil QuickJS context is
-// intentional — touching the delivery path would panic the test.
+// TestNetHostOnMsgChargesBeforePost checks the order: the copy into the event-loop queue
+// happens only after the read is charged. The QuickJS context is nil on purpose, so
+// touching the delivery path would panic the test.
 func TestNetHostOnMsgChargesBeforePost(t *testing.T) {
 	el := &eventLoop{tasks: make(chan func(), 1)}
 	n := &netHost{el: el, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
@@ -447,8 +446,8 @@ func TestNetHostOnMsgChargesBeforePost(t *testing.T) {
 	n.releaseInboundRead(2)
 }
 
-// TestSockChannelReadAdmissionRefusalIsTerminal ensures a peer cannot keep retrying a read
-// the staging meter can never admit: it closes the socket and reports the link down once.
+// TestSockChannelReadAdmissionRefusalIsTerminal checks a peer cannot keep retrying a read
+// the staging limit can never admit: it closes the socket and reports the link down once.
 func TestSockChannelReadAdmissionRefusalIsTerminal(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
@@ -469,9 +468,9 @@ func TestSockChannelReadAdmissionRefusalIsTerminal(t *testing.T) {
 	}
 }
 
-// TestSockChannelCloseFailRace hammers the close/fail split from many goroutines:
-// the dead flag must settle the channel once — at most one onClose, no panic, no
-// hang — no matter how the races interleave.
+// TestSockChannelCloseFailRace exercises the close/fail split from many goroutines: the
+// dead flag must settle the channel once (at most one onClose, no panic, no hang) however
+// the races interleave.
 func TestSockChannelCloseFailRace(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
@@ -501,9 +500,9 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 	}
 }
 
-// A reader parked on a full staging window waits for custody the event loop hands back.
-// Teardown means no loop, so close() must refuse it rather than leave the goroutine parked
-// for the life of the process.
+// A reader blocked on a full staging window waits for the event loop to release space.
+// After teardown there is no loop, so close() must wake and refuse it instead of leaving
+// the goroutine blocked for the life of the process.
 func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
 	n := &netHost{chans: map[int64]*sockChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
 	if !n.reserveInboundRead(4) {
@@ -530,9 +529,9 @@ func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
 	}
 }
 
-// boot() is idempotent — each one releases the previous one's engines. The network is not
-// an engine but outlives one just as badly: a listener nothing closes keeps its fd and its
-// accept goroutine, and the readers behind it post into a loop that no longer runs.
+// boot() can be called repeatedly; each call releases the previous engines. The network
+// must be released too: a listener nothing closes keeps its fd and its accept goroutine,
+// and the readers behind it post into a loop that no longer runs.
 func TestShutdownClosesTheNetwork(t *testing.T) {
 	before := runtime.NumGoroutine()
 	const boots = 3
@@ -554,9 +553,9 @@ func TestShutdownClosesTheNetwork(t *testing.T) {
 	}
 }
 
-// A node whose listener cannot bind fails its boot with the OS's reason — the error Go's own
-// net.Listen gives for that address — through the shim and the shared boot, so the operator
-// reads why rather than only that the bind failed.
+// A node whose listener cannot bind fails its boot with the OS's reason (the error Go's
+// net.Listen gives for that address), passed through the shim and the shared boot, so the
+// operator sees why, not just that the bind failed.
 func TestNodeBindFailureCarriesTheReason(t *testing.T) {
 	bootRealm(t)
 	held, err := net.Listen("tcp", "127.0.0.1:0")

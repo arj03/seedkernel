@@ -1,12 +1,13 @@
-// Link framing. The codec follows the stream shape and the destination or listener (§12.1).
+// Link framing. The codec depends on whether the link is a stream and on the destination
+// or listener (§12.1).
 
 /** Pre-auth frame cap, with room for the ML-KEM-768 encapsulation key (1184 B). */
 const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
-// Slices arrive arbitrarily small. The first small one is borrowed; a second starts a
-// doubling accumulator, so a dribbled frame costs linear copies.
+// Slices can be arbitrarily small. The first small one is borrowed; a second starts a
+// doubling accumulator, so a frame arriving in tiny pieces costs linear copying.
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {
@@ -15,7 +16,7 @@ class ByteParts {
     this.head = 0;     // index of the first live slice
     this.length = 0;   // live bytes across all slices
     this.tail = -1;    // index of the growable accumulator in `parts`, or -1 for none
-    this.tailOwned = false; // borrowed slices may have spare capacity we must not write
+    this.tailOwned = false; // a borrowed slice's spare capacity must not be written
   }
   push(chunk) {
     if (chunk.length === 0) return;
@@ -76,7 +77,7 @@ class ByteParts {
       else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = end; }
     }
     this.length -= n;
-    // Once consumed from, the accumulator's capacity is no longer ours to append into.
+    // Once consumed from, the accumulator must not be appended into.
     if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
     // Drop the consumed slices once they outnumber the live ones.
     if (this.head >= 8 && this.head * 2 >= this.parts.length) {
@@ -88,7 +89,7 @@ class ByteParts {
   }
 }
 
-/** A length-prefixed link is writable from birth — there is no negotiation. */
+/** A length-prefixed link is writable immediately; there is no negotiation. */
 class LengthFramer {
   constructor(put) {
     this.put = put;
@@ -108,15 +109,16 @@ class LengthFramer {
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
   discard() { this.parts = new ByteParts(); }
 
-  /** Feed inbound bytes, delivering each whole message. False for an over-cap frame, true
-   *  when waiting for more; before the cap is raised, a promise of either (`parse`). */
+  /** Feed inbound bytes, delivering each whole message. Returns false for an over-cap
+   *  frame, true when waiting for more; before the cap is raised, a promise of either
+   *  (`parse`). */
   push(chunk, deliver) {
     this.parts.push(chunk);
     return this.parse(deliver);
   }
 
-  /** Until the cap is raised, one message at a time: its step may raise the cap (ake.js
-   *  `becomeAuthed`) before the next frame in the same read is measured. */
+  /** Until the cap is raised, one message at a time, since handling it may raise the cap
+   *  (ake.js `becomeAuthed`) before the next frame in the same read is measured. */
   parse(deliver) {
     for (;;) {
       if (this.parts.length < 4) return true;
@@ -154,12 +156,12 @@ class WsFramer {
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
     this.parts = new ByteParts();      // inbound: handshake head, then frames
     this.open = false;
-    // `send` parks here until the upgrade completes, or fails with it (`abort`, §12.6).
+    // `send` waits on this until the upgrade completes, or fails with it (`abort`, §12.6).
     this.opened = new Promise((resolve, reject) => {
       this.resolveOpen = resolve;
       this.rejectOpen = reject;
     });
-    this.opened.catch(() => {}); // no unhandled rejection when nothing was parked
+    this.opened.catch(() => {}); // no unhandled rejection when nothing was waiting
     // Rolling scan state for the HTTP head terminator (`scanHead`).
     this.headLen = 0;
     this.h0 = -1; this.h1 = -1; this.h2 = -1; this.h3 = -1;
@@ -221,7 +223,7 @@ class WsFramer {
     return this.open ? this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL) : Promise.resolve();
   }
 
-  /** Terminal: no upgrade will complete, so fail whatever parked on it. */
+  /** Terminal: no upgrade will complete, so fail whatever is waiting on it. */
   abort() {
     this.rejectOpen(new Error("ws: link closed before the upgrade completed"));
   }
@@ -289,7 +291,7 @@ class WsFramer {
     return sep + 4;
   }
 
-  /** Parse whatever frames are complete. Until the cap is raised, each message's step runs
+  /** Parse whatever frames are complete. Until the cap is raised, each message is handled
    *  before the next frame is measured (`dispatch`). */
   async frames(deliver) {
     for (;;) {
@@ -306,7 +308,7 @@ class WsFramer {
       if (r[0] !== 1) return false;
       const fin = (r[1] & 0x80) !== 0;
       const opcode = r[1] & 0x0f;
-      // A view: each call answers a fresh buffer.
+      // A view is safe: each call returns a fresh buffer.
       const payload = r.subarray(10, 10 + readU32BE(r, 6));
       if (opcode === WS_OP_CONT) {
         if (this.fragOpcode < 0) return false;
@@ -337,7 +339,7 @@ class WsFramer {
   async dispatch(opcode, payload, deliver) {
     if (opcode === WS_OP_BINARY) {
       const step = deliver(payload);
-      // This step may raise the cap (LengthFramer `parse`).
+      // Handling it may raise the cap (see LengthFramer `parse`).
       if (this.cap !== maxFrameBytes) await step;
     } else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
@@ -345,7 +347,7 @@ class WsFramer {
   }
 
   /** The next frame's total length from its unvalidated header: -1 if not yet known,
-   *  Infinity once its payload is over the cap. Validation is the module's. */
+   *  Infinity if its payload is over the cap. The module does the validation. */
   frameLength() {
     const p = this.parts;
     if (p.length < 2) return -1;
@@ -370,15 +372,16 @@ class WsFramer {
   }
 }
 
-/** Case-insensitively pull a header value out of an HTTP head. A blank value does not
- *  match; the lookahead stops the lazy group returning a leading space as the value. */
+/** Case-insensitively read a header value from an HTTP head. A blank value does not
+ *  match; the lookahead keeps the lazy group from returning leading whitespace. */
 function headerValue(head, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const m = new RegExp("^" + escaped + ":[ \\t]*(?![ \\t])(.+?)[ \\t]*$", "im").exec(head);
   return m ? m[1] : null;
 }
 
-/** The listener label read as WebSocket (`--listen ws=host:port`); others are length framing. */
+/** The listener label that means WebSocket (`--listen ws=host:port`); others use length
+ *  framing. */
 const LISTENER_WS = "ws";
 
 function makeFramer(stream, linkId, dest, listener) {

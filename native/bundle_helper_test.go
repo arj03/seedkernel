@@ -19,28 +19,28 @@ import (
 // signed bundle with no sibling-repo dependency. Refresh with
 // `cp ../WASM/build/forwarder.wasm testdata/`.
 //
-// It carries the full AssemblyScript shim set — `env.abort`, `env.seed`, `env.trace` — so
-// every test that installs it proves this target resolves all three. A target resolving a
-// subset would refuse real AS modules a browser accepts, and would do it at instantiation,
-// far from anything that reads like an import problem.
+// It imports the full AssemblyScript shim set (`env.abort`, `env.seed`, `env.trace`), so
+// every test that installs it shows this target provides all three. A target providing a
+// subset would refuse real AS modules a browser accepts, at instantiation, far from
+// anything that looks like an import problem.
 //
 //go:embed testdata/forwarder.wasm
 var forwarderWasm []byte
 
-// The manifest signing vocabulary these test bundles are written against, READ OUT OF THE
-// SHARED BUNDLE (services/domains.ts) rather than restated here.
+// The manifest signing constants these test bundles use, read from the shared bundle
+// (services/domains.ts) instead of copied here.
 //
-// That is the line between the two kinds of duplication in this file: `bundleEnvelope` is a deliberate second *implementation* fed to the shared reader, so
-// a drift between them is the point. A constant has nothing to disagree with — a copy can
-// only be right or stale, and a stale one silently stops testing what it names.
+// `bundleEnvelope` below is a separate implementation on purpose, so a mismatch with the
+// shared reader shows up. A copied constant has nothing to check: it can only be right or
+// stale.
 type manifestVocab struct {
 	Manifest string `json:"manifest"` // DOMAIN_MANIFEST, hex
 	Author   string `json:"author"`   // DOMAIN_MANIFEST_AUTHOR, hex
 	Suite    int    `json:"suite"`    // SUITE_MANIFEST_HYBRID_PQ, the one manifest suite
 }
 
-// vocab reads that vocabulary from the booted realm. Cached: the values are the shared
-// bundle's constants, so they cannot differ between two boots in one process.
+// vocab reads those constants from the booted realm. Cached, since they cannot differ
+// between two boots in one process.
 var vocabCache *manifestVocab
 
 func vocab() manifestVocab {
@@ -72,8 +72,7 @@ func hexBytes(s string) []byte {
 }
 
 // authorKeys is a whole author identity (§12.4): an Ed25519 half and an ML-DSA-65 half,
-// neither of which is the identity on its own. There is one manifest suite and it signs
-// with both, so there is no half-identity shape for a test to hold by mistake.
+// neither of which is the identity on its own. The one manifest suite signs with both.
 type authorKeys struct {
 	edPriv ed25519.PrivateKey
 	edPub  []byte
@@ -90,9 +89,9 @@ func (a authorKeys) id() []byte {
 	return sd.genericHash(32, pre, nil)
 }
 
-// testAuthor mints a fresh author identity. Fresh per test so bundle-freshness marks
-// (keyed by author+app) never collide. Requires a booted realm — the id is hashed with
-// the booted sodium — which every caller has.
+// testAuthor creates a fresh author identity, per test, so freshness marks (keyed by
+// author and app) never collide. Requires a booted realm, since the id is hashed with the
+// booted sodium.
 func testAuthor(t testing.TB) authorKeys {
 	t.Helper()
 	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -108,11 +107,11 @@ func testAuthor(t testing.TB) authorKeys {
 }
 
 // testSigner is the ML-DSA-65 signing half the tests need and the shipped native binary
-// deliberately does not have (mldsa.go binds verify only, §12.4).
+// does not have (mldsa.go binds verify only, §12.4).
 //
-// One instance per RUNTIME, not per author: compiling it for every author would cost
-// seconds across the suite, but a boot tears its runtime down and a module cached past
-// that closes under the next test with `exit_code(0)`.
+// One instance per runtime, not per author: compiling it for every author would cost
+// seconds across the suite, but a boot tears its runtime down, and a module cached past
+// that fails in the next test with `exit_code(0)`.
 var (
 	signerCache   *mldsaSigner
 	signerCacheRt wazero.Runtime
@@ -127,9 +126,9 @@ func testSigner(t testing.TB) *mldsaSigner {
 }
 
 
-// realmString evaluates an expression in the booted host realm — `evalString`'s twin for
-// the helpers below, which have no `testing.TB` in hand. A failure here is a broken harness
-// rather than a failed assertion, so it panics.
+// realmString evaluates an expression in the booted host realm, like `evalString` but for
+// the helpers below, which have no `testing.TB`. A failure here means a broken harness,
+// not a failed assertion, so it panics.
 func realmString(expr string) string {
 	if qc == nil {
 		panic("realmString: the realm has not booted")
@@ -142,11 +141,11 @@ func realmString(expr string) string {
 	return v.String()
 }
 
-// The stub guest every test bundle that does not exercise the guest declares: every
-// app is a guest (§12.4), so the one app shape ships a guest program even when the
-// test's point is elsewhere (policy, freshness, suite admission…). It reads the payload
-// after the host's 32-byte caller with ITS OWN framing (the op-lead shape the test
-// harness composes around invokeApp) and forwards the arguments to its one module.
+// The stub guest for test bundles that do not exercise the guest: every app is a guest
+// (§12.4), so a bundle ships one even when the test is about something else (policy,
+// freshness, suite admission). It reads the payload after the host's 32-byte caller with
+// its own framing (the op header the harness builds in invokeApp) and forwards the
+// arguments to its one module.
 const stubGuestSrc = `function handle(arg) {
 	const n = arg.length > 32 ? arg[32] : -1;
 	let op = "";
@@ -154,17 +153,17 @@ const stubGuestSrc = `function handle(arg) {
 	return host.call("fwd", arg.subarray(33 + n));
 }`
 
-// writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
-// dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
-// at the given (app, version). See writeBundle for the general form.
+// writeTestBundle writes a minimal signed bundle file (§12.4) in a fresh temp dir: one
+// forwarder module and a stub guest with no requires, under an author-signed manifest at
+// the given (app, version). See writeBundle for the general form.
 func writeTestBundle(t testing.TB, a authorKeys, app string, version int) (string, string) {
 	t.Helper()
 	return writeBundle(t, a, app, version, "", nil)
 }
 
-// writeBundle assembles a signed bundle FILE: one forwarder module ("fwd") plus the given
-// guest, under an author-signed manifest. A zero guestSrc falls back to the stub — every
-// app is a guest (§12.4). Returns the bundle's path and the app label it installs under.
+// writeBundle writes a signed bundle file: one forwarder module ("fwd") plus the given
+// guest, under an author-signed manifest. An empty guestSrc uses the stub, since every app
+// is a guest (§12.4). Returns the bundle's path and the app label it installs under.
 func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
@@ -196,9 +195,9 @@ func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, m
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)
 }
 
-// claimManifest builds a manifest body claiming exactly the given protocol ids — the one
-// field the ordinary fixture derives, spelled out, so a test can feed the host an id the
-// format refuses (§12.10). Everything else matches manifestJSON.
+// claimManifest builds a manifest body claiming exactly the given protocol ids, so a test
+// can give the host an id the format refuses (§12.10). Everything else matches
+// manifestJSON.
 func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	t.Helper()
 	mjson, err := json.Marshal(map[string]any{
@@ -219,10 +218,9 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 }
 
 // appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
-// spellings carry no authority (§12.10) and the host ties nothing to one, so a fixture
-// deriving `_net` from a `link` requires would only be borrowing the transport's claim
-// and testing the CLAIM contest wherever it meant to test `link`. A claim has one
-// active owner, so two fixtures must not derive the same id.
+// names carry no authority (§12.10), so a fixture claiming `_net` because it requires
+// `link` would only collide with the transport's claim and test the wrong thing. A claim
+// has one owner, so two fixtures must not use the same id.
 func appProtocols(app string, _ []string) []string {
 	return []string{app}
 }
@@ -233,18 +231,18 @@ func manifestJSON(t testing.TB, app string, version int, guestSrc string, requir
 	return manifestJSONForModule(t, app, version, guestSrc, requires, "fwd", forwarderWasm)
 }
 
-// manifestJSONForModule is the same fixture shape with an explicitly supplied private
-// module. The RS benchmark uses it to exercise a loaded module through its guest instead
-// of reaching into the native module table (loaded modules have opaque slot ids). These
-// bytes ARE the signed bytes: there is no canonicalisation step.
+// manifestJSONForModule is the same fixture with an explicitly supplied private module.
+// The RS benchmark uses it to call an installed module through its guest instead of
+// reaching into the native module table (installed modules have opaque slot ids). These
+// bytes are the signed bytes; there is no canonicalization step.
 func manifestJSONForModule(t testing.TB, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
 	t.Helper()
 
 	type mod struct {
 		Name string `json:"name"`
 	}
-	// requires + config live inside `guest` (§12.4), so "no authority" is an empty
-	// `requires` list rather than an absent object.
+	// requires and config live inside `guest` (§12.4), so "no authority" is an empty
+	// `requires` list, not an absent object.
 	type guest struct {
 		Requires []string `json:"requires"`
 	}
@@ -256,9 +254,8 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		Guest     guest    `json:"guest"`
 	}{
 		App: app,
-		// The protocol this fixture claims (§12.10): the load itself is what routes, so a
-		// test wanting a protocol answered says so in the manifest, never through a second
-		// call.
+		// The protocol this fixture claims (§12.10): installing is what sets up routing,
+		// so a test that wants a protocol answered declares it in the manifest.
 		Protocols: appProtocols(app, requires),
 		Version:   version,
 		Modules: []mod{{
@@ -283,15 +280,14 @@ func writeBundleFile(t testing.TB, app string, blob []byte) string {
 	return path
 }
 
-// signedBundleBytes is writeBundle's twin for a caller that wants the blob rather than a
-// path: the same manifest, the same envelope, packed and handed back.
+// signedBundleBytes is writeBundle for a caller that wants the blob instead of a path.
 func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) []byte {
 	t.Helper()
 	return bundleEnvelope(t, a, manifestJSON(t, app, version, guestSrc, requires), guestSrc, forwarderWasm)
 }
 
-// signedModuleBundleBytes is the custom-module twin used by benchmarks whose real module
-// bytes are supplied out of tree.
+// signedModuleBundleBytes is the custom-module variant, for benchmarks whose module bytes
+// come from outside the repo.
 func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
 	t.Helper()
 	mjson := manifestJSONForModule(t, app, version, guestSrc, requires, moduleName, moduleBytes)
@@ -300,15 +296,13 @@ func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int
 
 // ── the probe app: how a native test puts a request on the wire ───────────────
 //
-// There is no host-side request facade: an app reaches the network by calling the id the
-// transport claims (`_net`, §12.10) and is reached by the id it claims itself, so a test
-// that sends a request has to BE an app — which means these tests drive the path a
-// deployment uses, end to end.
+// An app reaches the network by calling the id the transport claims (`_net`, §12.10) and
+// is reached by the id it claims itself, so a test that sends a request has to be an app,
+// and these tests use the path a deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given, and for a local loopback
-// the `send` op is one request out. The envelope after the host's 32-byte caller is
-// read and written with THIS probe's own copies, so the probe carries the call shape a
-// real app does — content, not a host ABI.
+// the `send` op sends one request. The framing after the host's 32-byte caller is the
+// probe's own, as in a real app; the host never reads it.
 const probeGuestSource = `
   function readOp(b) {
     const n = b.length > 0 ? b[0] : -1;
@@ -354,7 +348,7 @@ func probeSendArgs(toHexID, proto string, payload []byte) []byte {
 }
 
 // writeProbeBundle signs the probe app under `author`, claiming `app` as its protocol id
-// and declaring the one grant it needs: the transport's id.
+// and requiring the one service it needs: the transport's id.
 func writeProbeBundle(t testing.TB, author authorKeys, app string) string {
 	t.Helper()
 	path, _ := writeBundle(t, author, app, 1, probeGuestSource, []string{"_net"})

@@ -1,34 +1,31 @@
 /*
  * mlkem-native configuration for seedkernel's freestanding wasm32 build.
  *
- * The sibling of pq/config.h, and the same four choices for the same reasons —
- * each one removes something from the artifact rather than adding to it:
+ * The counterpart of pq/config.h, with the same four choices for the same reasons,
+ * each removing something from the artifact:
  *
  *  - PARAMETER_SET 768      the parameter set the transport bundle's `mlkem` module uses
- *  - NO_RANDOMIZED_API      leaves only keypair_derand / enc_derand / dec — the
+ *  - NO_RANDOMIZED_API      leaves only keypair_derand / enc_derand / dec, the
  *                           variants that take their randomness as an argument. The
- *                           randomized wrappers are what would pull randombytes()
- *                           in, and an import the host must satisfy is an import
- *                           the Go host must satisfy identically. The module has
- *                           none: no imports at all, only exports. It is also what
- *                           keeps the module PURELY FUNCTIONAL — the bundle draws
- *                           its coins from `RANDOM`, an authority, and hands them
- *                           in, exactly as an ephemeral X25519 pair is `RANDOM(32)`
- *                           plus `x25519/dh` (guest-seam.ts).
- *  - CUSTOM_MEMCPY/SET      mlkem-native's whole libc dependency is memcpy and
- *                           memset (STDLIB.md). Supplying both here means the build
- *                           needs no sysroot, no wasi-libc, no emscripten — just
- *                           clang's own freestanding headers.
- *  - CUSTOM_ZEROIZE         the default reaches for SecureZeroMemory or a memset
- *                           plus a compiler barrier. The replacement writes through
- *                           a volatile pointer, which is the portable way to keep
- *                           the compiler from eliding a wipe of memory that is
- *                           never read again.
+ *                           randomized wrappers would pull in randombytes(), an
+ *                           import every host (Go included) would have to provide
+ *                           identically. The module has no imports, only exports,
+ *                           and stays a pure function: the guest gets its coins from
+ *                           `crypto/random` and passes them in, just as an ephemeral
+ *                           X25519 pair is `crypto/random` plus `crypto/x25519/dh`.
+ *  - CUSTOM_MEMCPY/SET      mlkem-native's only libc dependency is memcpy and memset
+ *                           (STDLIB.md). Supplying both here means the build needs no
+ *                           sysroot, wasi-libc or emscripten, only clang's own
+ *                           freestanding headers.
+ *  - CUSTOM_ZEROIZE         the default uses SecureZeroMemory or a memset plus a
+ *                           compiler barrier. The replacement writes through a
+ *                           volatile pointer, the portable way to keep the compiler
+ *                           from eliding a wipe of memory that is never read again.
  */
 
 #define MLK_CONFIG_PARAMETER_SET 768
 
-/* Symbol prefix. Set explicitly because this file REPLACES mlkem_native_config.h
+/* Symbol prefix. Set explicitly because this file replaces mlkem_native_config.h
  * (that is what MLK_CONFIG_FILE means), and the upstream default is defined in the
  * file being replaced. */
 #define MLK_CONFIG_NAMESPACE_PREFIX mlk768

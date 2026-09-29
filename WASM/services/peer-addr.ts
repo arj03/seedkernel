@@ -1,16 +1,16 @@
-// Destinations and bind addresses, as the socket edges read them. A destination is the
-// opaque string `link/open` carries; only a target's `ChannelFactory` takes it apart, and
-// `parseDest` is the one parser the socket edges share. How a transport spells a PEER —
-// which key lives where — is that transport's own grammar, never read here.
+// Destinations and bind addresses, as the socket layer reads them. A destination is the
+// opaque string `link/open` carries; only a target's `ChannelFactory` parses it, using
+// `parseDest`. How a transport writes a peer address (which key lives where) is that
+// transport's own grammar and is never read here.
 
-/** The schemes a destination can name. `tcp` is node↔node LENGTH framing, `ws`/`wss` the
- *  RFC 6455 codec — and `wss` additionally asks for TLS, which only a target with a TLS
- *  stack under its sockets can honour. */
+/** The schemes a destination can name. `tcp` is node-to-node length framing, `ws` and
+ *  `wss` the RFC 6455 codec; `wss` also needs TLS, which only a target with a TLS stack
+ *  under its sockets supports. */
 export type DestScheme = "tcp" | "ws" | "wss";
 
-/** A destination taken apart: `scheme://host:port[/path]`. `null` rather than a throw for
- *  anything malformed, because the caller is a `ChannelFactory.connect` whose answer for an
- *  unroutable destination is "no route" and not an exception (services/socket-seam.ts). */
+/** Parse `scheme://host:port[/path]`. Returns `null` instead of throwing for anything
+ *  malformed, because the caller is a `ChannelFactory.connect`, which answers "no route"
+ *  for an unroutable destination (services/socket-seam.ts). */
 export function parseDest(dest: string): { scheme: DestScheme; host: string; port: number; path?: string } | null {
   const sep = dest.indexOf("://");
   if (sep < 0) return null;
@@ -28,17 +28,16 @@ export function parseDest(dest: string): { scheme: DestScheme; host: string; por
   }
 }
 
-/** Split a `host:port` address. The strict form (the default) is a peer dial
- *  address: an explicit host and a port in 1..65535. `defaultHost` fills an empty
- *  host (a bare `:port`), and `allowEphemeral` permits port 0 (ask the OS) — the
- *  two relaxations the operator's `--listen` entries need. */
+/** Split a `host:port` address. By default it must be a dialable address: an explicit
+ *  host and a port in 1..65535. `defaultHost` fills an empty host (a bare `:port`) and
+ *  `allowEphemeral` permits port 0 (let the OS pick), as `--listen` entries need. */
 export function parseHostPort(s: string, opts: { defaultHost?: string; allowEphemeral?: boolean } = {}): { host: string; port: number } {
   const colon = s.lastIndexOf(":");
   if (colon < 0) throw new Error(`expected host:port, got ${s}`);
   const host = s.slice(0, colon) || (opts.defaultHost ?? "");
   const port = Number(s.slice(colon + 1));
-  // Bounded, not merely positive: learning at connect time that a port names nothing
-  // makes a typo look like an unreachable peer.
+  // Range-checked here, since an invalid port found only at connect time looks like an
+  // unreachable peer.
   if (!Number.isInteger(port) || port < (opts.allowEphemeral ? 0 : 1) || port > 65535) throw new Error(`bad port in ${s}`);
   if (!host) throw new Error(`bad host in ${s}`);
   return { host, port };

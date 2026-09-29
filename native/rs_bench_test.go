@@ -1,12 +1,12 @@
 package main
 
-// Reed–Solomon codec perf for the native binary. RS lives in seedstore's codec.wasm;
-// this benchmark signs it into a tiny app and calls it through the loaded guest, the
-// same private-module path a deployment uses. The request shape matches
+// Reed-Solomon codec performance on the native binary. RS lives in seedstore's
+// codec.wasm; this benchmark signs it into a tiny app and calls it through the installed
+// guest, the same private-module path a deployment uses. The request shape matches
 // seedstore/WASM/tests/bench.mjs: RS(10,6), 64 KB blocks and 640 KB of data per chunk.
 //
-// Opt-in, since the native binary has no seedstore dependency: with SEEDSTORE_CODEC unset these
-// benchmarks skip.
+// Opt-in, since the native binary has no seedstore dependency: with SEEDSTORE_CODEC unset
+// these benchmarks skip.
 //
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench 'BenchmarkRS' -benchmem ./...
 //
@@ -25,18 +25,18 @@ import (
 )
 
 const (
-	rsK  = 10        // data blocks (RS(10,6), the seedstore default §4.1)
+	rsK  = 10        // data blocks (RS(10,6), the seedstore default)
 	rsM  = 6         // parity blocks
-	rsBS = 64 * 1024 // block size → 640 KB data / 384 KB parity per chunk
+	rsBS = 64 * 1024 // block size: 640 KB data / 384 KB parity per chunk
 )
 
 var (
 	rsOnce      sync.Once
 	rsApp       string
 	rsEncodeReq []byte // [OP_ENCODE][k][m][bs BE][640 KB data]
-	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks] — block 0 lost
+	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks], block 0 lost
 	rsReady     bool
-	rsSetupErr  error // non-nil ⇒ SEEDSTORE_CODEC was set but unusable: fail, don't skip
+	rsSetupErr  error // non-nil: SEEDSTORE_CODEC was set but unusable, so fail, don't skip
 )
 
 // invokeApp prefixes the host caller identity and its test op-frame. The guest removes
@@ -64,8 +64,8 @@ func setupRS(tb testing.TB) {
 
 	const app = "rsbench"
 	author := testAuthor(tb)
-	// The shared bench realm's node admits no app, so this bench stands its own, under a
-	// policy naming the author it just minted; the harness's loads and invocations reach it.
+	// The shared bench realm's node admits no app, so this bench boots its own, under a
+	// policy naming the author it just created; the harness's installs and invocations use it.
 	policy := authorsPolicy(author.id())
 	if _, err := startNode(nodeConfig{KeyHex: testKeyHex(tb), PolicyJSON: &policy}); err != nil {
 		rsSetupErr = fmt.Errorf("startNode: %w", err)

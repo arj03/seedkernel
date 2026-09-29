@@ -12,9 +12,9 @@ const RELAY_RETRY_MS = 2000;
 
 // ── the relay wire ────────────────────────────────────────────────────────────
 //
-// A relay is a room forwarding every frame to every other member, unauthenticated, so
-// everything here is a claim until the handshake proves it. A frame is UTF-8,
-// NUL-separated; each tag pins its field count:
+// A relay is a room that forwards every frame to every other member, unauthenticated, so
+// nothing here is trusted until the handshake proves it. A frame is UTF-8,
+// NUL-separated; each tag has a fixed field count:
 //
 //   h  from  to                      a hello; `to` empty is a broadcast
 //   o  from  to  sid  sdp            an offer, for negotiation `sid`
@@ -87,10 +87,10 @@ class Rtc {
     this.url = "";           // the relay this node has joined, "" for none
     this.relay = null;       // its live link
     this.retryAt = Infinity; // when a dropped relay is dialed again
-    this.byPeer = new Map(); // peer hex → negotiation
-    this.byCtl = new Map();  // negotiation link id → negotiation
-    // Data links announced before `open` has filed their negotiation.
-    this.early = new Map();  // negotiation link id → { linkId, stream }
+    this.byPeer = new Map(); // peer hex to negotiation
+    this.byCtl = new Map();  // negotiation link id to negotiation
+    // Data links announced before `open` has recorded their negotiation.
+    this.early = new Map();  // negotiation link id to { linkId, stream }
   }
 
   /** 0 not joined, 1 relay link up, 2 joined and waiting to redial. */
@@ -138,7 +138,7 @@ class Rtc {
     this.relay?.send(utf8Encode([tag, ownId, to, ...fields].join("\0")));
   }
 
-  /** Negotiations that have not produced an authenticated link — the ones the cap bounds. */
+  /** Negotiations that have not produced an authenticated link; the cap counts these. */
   pending() {
     let n = 0;
     for (const e of this.byPeer.values()) if (!authedData(e)) n++;
@@ -159,7 +159,7 @@ class Rtc {
     if (tag === "i" && f.length === 8) return this.onCandidate(from, f[3], f.slice(4).join("\0"));
   }
 
-  /** The smaller key offers, as the smaller key's dial wins a TCP double-connect. */
+  /** The smaller key offers, just as the smaller key's dial wins a TCP double-connect. */
   weOffer(peer) { return ownId < peer; }
 
   async onHello(from, broadcast) {
@@ -260,7 +260,7 @@ class Rtc {
     if (e.ctl !== 0) netLinkClose(e.ctl, false);
   }
 
-  /** A negotiation link went. If it carried an authenticated link, renegotiate: the
+  /** A negotiation link closed. If it carried an authenticated link, renegotiate: the
    *  offering side offers again, the answering side says hello. */
   gone(e) {
     this.byCtl.delete(e.ctl);

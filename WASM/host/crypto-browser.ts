@@ -1,9 +1,8 @@
-// Browser crypto seam — crypto-node.ts's loadCrypto for a target with no node:fs: the
-// ML-DSA verifier mixed onto one caller-readied core libsodium instance.
+// Browser crypto seam: crypto-node.ts's loadCrypto for a target without node:fs. Adds
+// ML-DSA-65 to a libsodium instance the caller supplies.
 import { loadMlDsa65, withMlDsa65, type MlDsa65Signer } from "./pq.js";
 
-/** Ready a caller's core libsodium with ML-DSA-65 — the browser counterpart to
- *  crypto-node.ts's Node-only `loadCrypto`. */
+/** Ready the caller's libsodium and add ML-DSA-65 to it. */
 export async function loadCrypto<T extends { ready: Promise<void> }>(
   sodium: T, baseUrl: string | URL = "./",
 ): Promise<T & MlDsa65Signer> {

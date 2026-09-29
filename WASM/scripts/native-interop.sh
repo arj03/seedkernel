@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# §12.9 interop — the definition of "done" for the native binary target.
+# §12.9 interop: the acceptance check for the native binary target.
 #
-# A native binary node and JS (node + bun) nodes share one seedstore cohort over real
-# loopback TCP, exercising the same signed bundle on the byte-identical genesis. It
-# proves wire + crypto + bundle parity in both directions:
-#   1. Go  put → node get   (Go writes blocks JS can read back)
-#   2. node put → Go  get   (Go reads blocks JS wrote)
-#   3. bun put → Go  get    (literal Bun ↔ Go, the read path)
-# all against a cohort of `node` StorageNode holders. Storage rides on the runtime
-# as signed content; neither side links the other's code — only the wire + the
-# bundle are shared.
+# A native binary node and JS (node and bun) nodes share one seedstore cohort over real
+# loopback TCP, running the same signed bundle. It checks wire, crypto and bundle parity
+# in both directions:
+#   1. Go put   -> node get  (Go writes blocks JS can read back)
+#   2. node put -> Go get    (Go reads blocks JS wrote)
+#   3. bun put  -> Go get    (Bun to Go, the read path)
+# all against a cohort of `node` holders. Storage runs on the runtime as a signed bundle;
+# neither side links the other's code, only the wire format and the bundle are shared.
 #
-# Manual integration check (NOT part of `go test`): needs `node` + `bun` on PATH
+# Manual integration check (not part of `go test`): needs `node` and `bun` on PATH
 # and a built Windows seedkernel.exe. Run from Git Bash on Windows:
 #   bash scripts/native-interop.sh [path/to/seedkernel.exe]
 set -euo pipefail
 
 SK=/c/Users/ander/Documents/GitHub/seedkernel/WASM
 SS=/c/Users/ander/Documents/GitHub/seedstore/WASM
-# A bundle is ONE blob (§12.4) — both targets read this file, not a directory.
+# A bundle is one blob (§12.4); both targets read this file.
 BUNDLE="$SS/bundle/seedstore.skb"
 NODEMAIN="$SK/build/host/main-node.js"
 GOEXE="${1:-$SK/../native/seedkernel.exe}"
@@ -30,10 +29,9 @@ BASEPORT=47100
 [ -f "$NODEMAIN" ] || { echo "missing built shell: $NODEMAIN (run: npm run build:host)"; exit 1; }
 [ -f "$BUNDLE" ]   || { echo "missing seedstore bundle: $BUNDLE (run: npm run build:bundle in seedstore/WASM)"; exit 1; }
 
-# Read the author through the shared install path rather than re-deriving container and
-# envelope offsets here: the bundle is a packed blob whose manifest envelope leads with
-# a suite byte (§12.4), so `bytes[0:32]` is not the author key and never was after the
-# suite byte landed. verifyBundle is the one definition of both layouts.
+# Read the author through verifyBundle instead of parsing offsets here: the envelope
+# starts with a suite byte and the author id is a hash of both keys (§12.4), so no fixed
+# byte range holds it.
 AUTHOR=$(cd "$SK" && node --input-type=module -e "
 const { verifyBundle } = await import('./build/host/bundle.js');
 const { loadCrypto } = await import('./build/host/crypto-node.js');
@@ -48,13 +46,13 @@ cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; rm 
 trap cleanup EXIT
 
 echo "{\"authors\":[\"$AUTHOR\"]}" > "$WORK/policy.json"
-# The §14 byte budget is OPERATOR policy: it is deliberately absent from the signed
-# bundle, and the guest FAILS CLOSED at 0 rather than guessing a generous default. Every
-# node here — holders and initiators — therefore needs one, or the holders answer every
-# OFFER and decline every STORE ("chunk landed 0/N distinct blocks").
+# seedstore's byte quota is operator policy: it is not in the signed bundle, and the guest
+# treats a missing quota as 0 instead of guessing a default. Every node here, holders and
+# initiators, needs one, or the holders decline every STORE ("chunk landed 0/N distinct
+# blocks").
 echo '{"quota": 67108864}' > "$WORK/app.json"
-SRC="$WORK/src.bin"; head -c 4096 /dev/urandom > "$SRC"   # > smallMaxBlocks ⇒ RS path
-echo "interop: author=$AUTHOR  transport=$TRANSPORT_AUTHOR  holders=$HOLDERS  src=$(wc -c < "$SRC") B"
+SRC="$WORK/src.bin"; head -c 4096 /dev/urandom > "$SRC"   # > smallMaxBlocks, so the RS path
+echo "interop: author=$AUTHOR  holders=$HOLDERS  src=$(wc -c < "$SRC") B"
 
 # ── a cohort of node holders, each on its own loopback port ──────────────────
 PEERS=""
@@ -74,18 +72,18 @@ for i in $(seq 0 $((HOLDERS-1))); do
 done
 echo "cohort up: $HOLDERS holders"
 
-# put through the runtime in $2…, writing the GET argument to the file named by $1.
+# put through the runtime in $2..., writing the GET argument to the file named by $1.
 #
-# The op takes its argument on stdin and answers on stdout — the runtime knows nothing
-# else about it (§12.8) — so a PUT is a plain redirect and its answer is seedstore's raw
+# The op takes its argument on stdin and answers on stdout, and the runtime knows nothing
+# else about it (§12.8), so a PUT is a plain redirect and its answer is seedstore's raw
 # PutResult envelope:
 #
-#   [K 32][chunkCount u32][placed u32][intended u32][rootLen u32][root …][idCount u32]…
+#   [K 32][chunkCount u32][placed u32][intended u32][rootLen u32][root ...][idCount u32]...
 #
-# and a GET's argument is [K 32][root …]. Cutting one from the other is storage's format
-# and belongs in the script driving storage, never in an application-neutral CLI. The
-# root is a signed DESCRIPTOR of variable length (§4.3), not a fixed id, which is why
-# `rootLen` is read rather than assumed.
+# and a GET's argument is [K 32][root ...]. Converting one to the other depends on
+# seedstore's format, so it belongs in this script, not in the application-neutral CLI.
+# The root is a signed descriptor of variable length, not a fixed id, so `rootLen` is
+# read, not assumed.
 put() {
   local getarg="$1"; shift
   local res="$WORK/put.$$.$RANDOM.bin"
@@ -96,18 +94,18 @@ fs.writeFileSync(process.argv[2], Buffer.concat([b.subarray(0,32), b.subarray(48
 }
 check() { cmp -s "$1" "$SRC" && echo "  ✓ $2" || { echo "  ✗ $2 (mismatch)"; exit 1; }; }
 
-# 1. Go put → node get
+# 1. Go put -> node get
 put "$WORK/a.arg" "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/ga" --key "$WORK/ga.key"
 node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" \
   --op get --dir "$WORK/ng" --key "$WORK/ng.key" < "$WORK/a.arg" > "$WORK/got1.bin" 2>/dev/null
 check "$WORK/got1.bin" "Go put → node get"
 
-# 2. node put → Go get
+# 2. node put -> Go get
 put "$WORK/b.arg" node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/np" --key "$WORK/np.key"
 "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg" --key "$WORK/gg.key" < "$WORK/b.arg" > "$WORK/got2.bin" 2>/dev/null
 check "$WORK/got2.bin" "node put → Go get"
 
-# 3. bun put → Go get
+# 3. bun put -> Go get
 put "$WORK/c.arg" bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/bp" --key "$WORK/bp.key"
 "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg3" --key "$WORK/gg3.key" < "$WORK/c.arg" > "$WORK/got3.bin" 2>/dev/null
 check "$WORK/got3.bin" "bun put → Go get"

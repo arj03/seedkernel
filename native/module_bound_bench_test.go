@@ -1,18 +1,17 @@
 package main
 
-// module_bound_bench_test.go — what the §4.3 module-call bound COSTS, which is what
-// decided it should be a default (SECURITY §14.1). Arming a runtime compiles a termination
-// check into every loop of every module on it, and this prices that check on real
-// module-shaped wasm: libsodium's Ed25519 and — opt-in — seedstore's
-// Reed–Solomon codec, an installed app module and so the code the bound exists to stop.
+// What the §4.3 module-call bound costs, which decided it should be on by default (§14.1).
+// Arming a runtime compiles a termination check into every loop of every module on it,
+// and this measures that check on real wasm: libsodium's Ed25519 and, opt-in, seedstore's
+// Reed-Solomon codec, an installed app module and so the kind of code the bound exists for.
 //
 //	go test -run x -bench BenchmarkBound -benchtime 2s -count 5 ./...
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench BenchmarkBound ./...
 //
 // Both configurations run in one process, so the comparison is not across two builds. The
-// ratio between them is the number SECURITY §14.1 quotes, and the one to re-measure after
-// any wazero bump: the native binary runs a patched wazero whose back-edge check is inline rather
-// than an exit into Go (see the go.mod replace), and this bench keeps that patch honest.
+// ratio between them is the number §14.1 quotes, and the one to re-measure after any wazero
+// upgrade: the native binary runs a patched wazero whose back-edge check is inline instead
+// of an exit into Go (see the go.mod replace), and this bench checks that patch still pays.
 
 import (
 	"bytes"
@@ -56,8 +55,8 @@ func BenchmarkBoundEd25519Verify(b *testing.B) {
 }
 
 // boundModuleCaller instantiates one §4 pure transform on its own runtime and returns a
-// caller with callModule's shape. Deliberately not callModule itself: this bench needs
-// two runtimes alive at once (armed and not), which boot()'s single table cannot hold.
+// caller with callModule's signature. Not callModule itself, because this bench needs two
+// runtimes alive at once (armed and not), which boot()'s single table cannot hold.
 func boundModuleCaller(b *testing.B, wasmBytes []byte, armed bool) func(payload []byte) []byte {
 	b.Helper()
 	rt := boundRuntime(b, armed)
@@ -90,9 +89,9 @@ func boundModuleCaller(b *testing.B, wasmBytes []byte, armed bool) func(payload 
 	}
 }
 
-// boundRSRequests stages the same RS(10,6) encode and single-loss decode setupRS does,
-// without a bundle — and checks the decode actually reconstructs the lost block, so a
-// configuration that changed the ANSWER could not be reported as a rate.
+// boundRSRequests builds the same RS(10,6) encode and single-loss decode setupRS does,
+// without a bundle, and checks the decode actually reconstructs the lost block, so a
+// configuration that changed the answer could not be reported as a rate.
 func boundRSRequests(b *testing.B, call func([]byte) []byte) (enc, dec []byte) {
 	b.Helper()
 	data := make([]byte, rsK*rsBS)
@@ -155,23 +154,21 @@ func benchBoundRS(b *testing.B, decode bool) {
 func BenchmarkBoundRSEncode(b *testing.B) { benchBoundRS(b, false) }
 func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 
-// BenchmarkBoundCallOverhead prices the OTHER half of the bound: the shared deadline
+// BenchmarkBoundCallOverhead measures the other half of the bound: the shared deadline
 // (module.go moduleDeadline) that a finite guest deadline makes callModule arm and disarm
-// per call, where an unbounded guest takes a no-op branch. The benchmarks
-// above measure the compiled checks, which are billed per back-edge and so are
-// invisible on a call that barely loops; this one measures what every call pays no
-// matter how little it does, on the smallest real module there is (the forwarder,
-// which copies its input back) and a 32-byte payload — the shape of a control frame,
-// where a fixed cost has nothing to hide behind.
+// per call, where an unbounded guest takes a no-op branch. The benchmarks above measure
+// the compiled checks, which cost per back-edge and so vanish on a call that barely loops;
+// this one measures what every call pays however little it does, on the smallest real
+// module (the forwarder, which copies its input back) and a 32-byte payload, the size of a
+// control frame, where a fixed cost is most visible.
 //
-// Both arms run against ONE boot, so the runtime is armed in both and only the context
-// differs. That is deliberate: it isolates the context, which is the part the native host
-// controls. wazero spawns a watchdog goroutine and channel per call whenever the
-// runtime is armed, whatever context it is handed (internal/wasm module_instance.go
-// CloseModuleOnCanceledOrTimeout), so that cost is in both arms and is not what this
-// measures. Measured ~400 ns → ~480 ns, 6 → 6 allocs: a fixed ~80 ns that a bound
-// deployment pays per call, against ~30 µs for the hop the JS targets pay per call for
-// the same bound, and against ~400 µs for the RS calls it actually sits in front of.
+// Both variants run against one boot, so the runtime is armed in both and only the
+// context differs, which isolates the part the native host controls. wazero starts a
+// watchdog goroutine and channel per call whenever the runtime is armed, whatever context
+// it gets (internal/wasm module_instance.go CloseModuleOnCanceledOrTimeout), so that cost
+// is in both and is not measured here. Measured ~400 ns to ~480 ns, 6 allocs both: a fixed
+// ~80 ns per call for a bounded deployment, against ~30 µs for the worker hop the JS
+// targets pay per call for the same bound, and ~400 µs for the RS calls it guards.
 func BenchmarkBoundCallOverhead(b *testing.B) {
 	ensureBooted(b)
 	key := "callcost"

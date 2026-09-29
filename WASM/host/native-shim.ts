@@ -1,6 +1,6 @@
-// The native binary's platform seam (§12.9): adapts Go's primitives — wazero modules,
-// libsodium, an `fs` directory, TCP sockets, one QuickJS realm per app — to what `bootShell`
-// consumes. Runs inside QuickJS as part of native/host-shell.gen.js.
+// The native binary's platform seam (§12.9): adapts Go's primitives (wazero modules,
+// libsodium, an `fs` directory, TCP sockets, one QuickJS realm per app) to what `bootShell`
+// takes. Runs inside QuickJS as part of native/host-shell.gen.js.
 import { policyFromJson } from "./policy.js";
 import { type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
@@ -26,8 +26,8 @@ import {
 } from "./wasm-limits.js";
 import { enc, errMessage } from "../services/util.js";
 
-/** `HostCall` as Go calls it. Always answers `null`: Go parks the guest's Promise under
- *  `callId` and `bridge.realmSettle` settles it. */
+/** `HostCall` as Go calls it. Always returns `null`: Go holds the guest's Promise under
+ *  `callId` until `bridge.realmSettle` settles it. */
 type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number, deadlineMs: number) => null;
 
 /** The opaque native-module slots and realm plumbing Go exposes (main.go). */
@@ -44,13 +44,13 @@ declare const bridge: {
   writeFile(path: string, bytes: Uint8Array, mode: number): void;
   /** One diagnostic line on stderr; stdout is the data channel. */
   log(line: string): void;
-  /** Raw bytes on stdout — `--op` writes the app's response verbatim. */
+  /** Raw bytes on stdout; `--op` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
-  /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
+  /** Raw bytes from stdin: `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
     maxOutstandingHostCalls: number, maxOutstandingHostCallBytes: number): number;
-  /** Invoke `handle`. Answers `elapsedNs * 2 | deferred` as one number, so dispatch
+  /** Invoke `handle`. Returns `elapsedNs * 2 | deferred` as one number, so dispatch
    *  allocates nothing. */
   realmCall(realm: number, payload: Uint8Array, callId: number,
     onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void,
@@ -85,8 +85,8 @@ export interface NativeSodium extends ShellSodium {
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
 
-/** libsodium-wrappers' shape over Go's primitives; a native `null` becomes the throw the
- *  wrappers use. */
+/** libsodium-wrappers' interface over Go's primitives; a native `null` becomes the error
+ *  the wrappers throw. */
 function wrapNativeSodium(N: typeof __sodium): NativeSodium {
   const u8 = (b: ArrayBuffer) => new Uint8Array(b);
   const kp = (k: { publicKey: ArrayBuffer; privateKey: ArrayBuffer }): Keypair =>
@@ -120,7 +120,7 @@ export const sodium: NativeSodium = wrapNativeSodium(__sodium);
 /** Go's synchronous `fs.*` primitive (native/fs.go); `fs` below adapts it to the async
  *  `Fs` seam. */
 declare const __fs: {
-  /** Open the operator's `--dir`. Until then the store reads empty and refuses writes. */
+  /** Open the operator's `--dir`. Until then the store reads as empty and refuses writes. */
   open(dir: string): void;
   get(key: string): ArrayBuffer | null;
   put(key: string, bytes: Uint8Array): void;
@@ -137,10 +137,10 @@ export const fs: Fs = {
   async get(key) { const r = __fs.get(key); return r === null ? null : new Uint8Array(r); },
   async put(key, bytes) { __fs.put(key, bytes); },
   async size(key) { return __fs.size(key); },
-  // An empty listing arrives as "", which must map to [] — split would yield [""].
+  // An empty listing arrives as "", which must map to [], not split's [""].
   async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
   async delete(key) { return __fs.delete(key); },
-  // Go's -1 becomes the seam's own sentinel.
+  // Go's -1 becomes the seam's sentinel.
   async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
@@ -159,20 +159,20 @@ declare const __net: {
   buffered(id: number): number;
   /** Release the next socket read after one serialized transport-realm invocation. */
   resume(id: number): void;
-  /** A deliberate close — never fires `__netClosed` (Go closes silently). */
+  /** A local close; never fires `__netClosed`. */
   close(id: number, graceful?: boolean): void;
   closeListeners(): void;
 };
 
-// Policy values cross once; Go enforces the ones that act before JS sees a socket.
+// Limits are passed once; Go enforces the ones that apply before JS sees a socket.
 __net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS,
   MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
 
-// ── the RawLink shaping ─────────────────────────────────────────────────────
-// Go's reader goroutines route deliveries through the three dispatchers at the end of this
-// block, retained by Go after the bundle evaluates (netHost.retain).
+// ── RawLink over Go sockets ─────────────────────────────────────────────────
+// Go's reader goroutines deliver through the three dispatchers at the end of this block,
+// which Go retains after the bundle evaluates (netHost.retain).
 
-/** Channel table + accept registry, keyed by Go's socket ids / bound ports. */
+/** Open channels by Go socket id, and accept callbacks by bound port. */
 const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
 const netAccepts = new Map<number, (id: number, remoteAddr: string) => void>();
 
@@ -188,7 +188,7 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
     remoteAddr,
     send: (bytes) => { __net.send(id, bytes); },
     buffered: () => __net.buffered(id),
-    // Go spends a one-read token before delivering, so only the true edge crosses.
+    // Go allows one read per resume, so only enabling needs to be passed on.
     setReadable: (enabled) => { if (enabled) __net.resume(id); },
     onData: (cb) => { onData = cb; },
     onClose: (cb) => { onClose = cb; },
@@ -209,16 +209,16 @@ function netListenRaw(host: string, port: number, onAccept: (s: RawLink) => void
 
 function netCloseListeners(): void {
   __net.closeListeners();
-  // Every accept closure is stale now; clearing them releases their graphs.
+  // Every accept callback is dead now; drop them so they can be collected.
   netAccepts.clear();
 }
 
 declare global {
-  /** A socket read landed — routes to the channel's onData (sock.go). */
+  /** A socket read arrived; routes to the channel's onData (sock.go). */
   var __netDeliver: (id: number, bytes: ArrayBuffer) => void;
-  /** A channel's fail path fired — the RawLink's onClose (sock.go). */
+  /** A channel failed or closed remotely; routes to the RawLink's onClose (sock.go). */
   var __netClosed: (id: number) => void;
-  /** An accepted socket landed — routes to the port's accept closure (sock.go). */
+  /** A socket was accepted; routes to the port's accept callback (sock.go). */
   var __netAccept: (port: number, id: number, remoteAddr: string) => void;
 }
 
@@ -228,7 +228,7 @@ globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed()
 globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(port); if (a) a(id, remoteAddr); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
-/** A deadline as the bridge carries it: `Infinity` → -1, omitted → the shared default. */
+/** A deadline as the bridge carries it: `Infinity` as -1, omitted as the shared default. */
 const bridgeMs = (ms: number | undefined): number =>
   ms === undefined ? DEFAULT_GUEST_DEADLINE_MS : ms === Infinity ? -1 : ms;
 
@@ -253,7 +253,7 @@ const modules: PureModuleLoader = {
   },
 };
 /** `CliFiles` over Go's file seam. A read throws for anything but a missing file; a write
- *  throws when it did not land, which `FreshnessMarks` relies on to roll back. */
+ *  throws when it fails, which `FreshnessMarks` relies on to roll back. */
 const files: CliFiles = {
   readFile(path) {
     const r = bridge.readFile(path);
@@ -276,11 +276,11 @@ const channels: ChannelFactory = {
   close: () => { netCloseListeners(); },
 };
 /** This target's realm factory (§12.3): a zero-authority quickjs-ng realm on Go's event
- *  loop, the same `Realm` contract as safe-js.ts. Promise plumbing stays here, so Go needs
- *  no promise primitive. guest.go enforces the deadline with QuickJS's interrupt handler,
- *  so an overrun throws inside the guest and the realm survives. */
+ *  loop, with the same `Realm` contract as safe-js.ts. Promise handling stays here, so Go
+ *  needs no promise primitive. guest.go enforces the deadline with QuickJS's interrupt
+ *  handler, so an overrun throws inside the guest and the realm survives. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs, ownTurns }) => {
-  // Wall-clock custody (§12.3), one queue per tier.
+  // Wall-clock deadlines (§12.3), one queue per tier.
   const deadlines = createRealmDeadlines();
   // Still 0 while top-level code runs; safe, since settlement is a host-realm microtask
   // that cannot run before the assignment below.
@@ -307,7 +307,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
       bridgeMs(deadlineMs),
       DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES);
   } catch (err) {
-    // No Realm is returned to own deadlines its top level armed, so end them here.
+    // No Realm is returned to own deadlines its top level armed, so clear them here.
     deadlines.disarmAll();
     throw err;
   }
@@ -315,7 +315,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
   let invocationSeq = 0;
   let disposed = false;
   return {
-    // Serialized in shared TS (realm-queue.ts) so both targets agree on entry order.
+    // Serialized in shared code (realm-queue.ts) so both targets agree on entry order.
     call: serializeCalls(
       deadlines.entry,
       (payload: Uint8Array, handoffDeadlineMs: number, causalClock?: CausalClock) => {
@@ -334,7 +334,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
             // Callers get the shared `REALM_DISPOSED` wording.
             (msg: string) => reject(new Error(disposed ? REALM_DISPOSED : msg)),
             bridgeMs(handoffDeadlineMs)));
-          // `elapsedNs * 2 | deferred` — see the bridge declaration above.
+          // `elapsedNs * 2 | deferred`; see the bridge declaration above.
           deferred = report % 2 === 1;
           causalClock?.charge(Math.floor(report / 2) / 1_000_000);
         });
@@ -352,14 +352,14 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     dispose: () => {
       disposed = true;
       // guest.go rejects every callback it owns before freeing anything; the host-side
-      // deadlines are ours to disarm.
+      // deadlines are cleared here.
       deadlines.disarmAll();
       bridge.realmDispose(realm);
     },
   };
 };
-/** Stand a node up here via `bootShell` (§12.9), for the operator flow and native tests.
- *  Go's `fs.*` serves one directory, so nodes in one realm share `cfg.dir`. The policy is
+/** Boot a node through `bootShell` (§12.9), for the operator flow and native tests. Go's
+ *  `fs.*` serves one directory, so nodes in one host realm share `cfg.dir`. The policy is
  *  parsed before anything is opened. */
 async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
   const admit = policyFromJson(cfg.policyJson);
@@ -375,7 +375,7 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
 }
 
 // ── the operator flow ────────────────────────────────────────────────────────
-/** This platform as `cli.ts` needs it; every decision is cli.ts's. */
+/** This platform as `cli.ts` needs it; cli.ts makes every decision. */
 function nativeCliHost(): CliHost {
   return {
     ...files,

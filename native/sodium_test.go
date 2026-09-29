@@ -11,8 +11,8 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// newSodium stands up an isolated libsodium instance (its own runtime) so the
-// crypto FFI can be exercised without the full shell boot.
+// newSodium creates an isolated libsodium instance (its own runtime) so the crypto FFI
+// can be tested without the full shell boot.
 func newSodium(t *testing.T) *libsodium {
 	t.Helper()
 	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
@@ -20,10 +20,10 @@ func newSodium(t *testing.T) *libsodium {
 	return bootSodium(rt)
 }
 
-// genericHash runs on native Go rather than libsodium (sodium.go header) and is the one
-// system hash, so a Go node and a Bun node MUST agree on it. Beyond the x/crypto
-// cross-check it is pinned to vectors captured from the libsodium.wasm this build embeds:
-// a divergence fails here rather than silently forking storage.
+// genericHash runs on native Go instead of libsodium (sodium.go header) and is the system
+// hash, so a Go node and a Bun node must agree on it. Besides the x/crypto cross-check it
+// is checked against vectors captured from the libsodium.wasm this build embeds, so a
+// difference fails here instead of silently splitting storage.
 func TestSodiumGenericHash(t *testing.T) {
 	s := newSodium(t)
 	for _, msg := range [][]byte{nil, []byte("hello"), bytes.Repeat([]byte{1}, 333)} {
@@ -45,17 +45,17 @@ func TestSodiumGenericHash(t *testing.T) {
 }
 
 // The ChaCha20-Poly1305-IETF record layer (§12.6) runs on native Go, not libsodium
-// (sodium.go header), and every node's frames must open on every peer's link — so the
-// ciphertext MUST be byte-identical to libsodium's. Pinned three ways: a round-trip plus
-// tamper/wrong-key check, KATs captured from the embedded libsodium.wasm (drift fails here
-// rather than forking the wire), and the independent RFC 8439 §2.8.2 vector.
+// (sodium.go header), and every node's frames must open on every peer's link, so the
+// ciphertext must be byte-identical to libsodium's. Checked three ways: a round trip plus
+// tamper and wrong-key checks, KATs captured from the embedded libsodium.wasm, and the
+// independent RFC 8439 §2.8.2 vector.
 func TestSodiumAead(t *testing.T) {
 	s := newSodium(t)
 	key := bytes.Repeat([]byte{0x42}, 32)
 	npub := bytes.Repeat([]byte{0x24}, 12)
 
-	// The wrapper is its own inverse; any bit flip in the tag, or a wrong key, fails
-	// the open (ok=false) rather than returning garbage.
+	// Decrypt inverts encrypt; any bit flip in the tag, or a wrong key, fails the open
+	// (ok=false) instead of returning garbage.
 	for _, msg := range [][]byte{nil, []byte("abc"), bytes.Repeat([]byte{0x5a}, 4096)} {
 		ct := s.aeadEncrypt(msg, nil, npub, key)
 		if len(ct) != len(msg)+16 {
@@ -76,8 +76,8 @@ func TestSodiumAead(t *testing.T) {
 	}
 
 	// KAT: crypto_aead_chacha20poly1305_ietf_encrypt(msg, npub=0x24×12, key=0x42×32),
-	// no AAD, captured from the embedded libsodium.wasm. Locks native Go to that exact
-	// binary — divergence fails here instead of forking the wire.
+	// no AAD, captured from the embedded libsodium.wasm, so native Go must match that
+	// binary exactly.
 	for _, kat := range []struct{ msg, hex string }{
 		{"", "3f51eace5bd1df2f4656bf812c77a1df"},
 		{"abc", "8565e611f66e1a31314e67413c37a2b2ef7474"},
@@ -88,9 +88,8 @@ func TestSodiumAead(t *testing.T) {
 		}
 	}
 
-	// Independent standard vector: RFC 8439 §2.8.2 (with AAD). The wrapper uses no AAD,
-	// so this drives the primitive directly — proves it's RFC-correct, not merely
-	// self-consistent with the libsodium build.
+	// Independent standard vector: RFC 8439 §2.8.2 (with AAD), showing the primitive is
+	// RFC-correct, not just consistent with the libsodium build.
 	rfcKey, _ := hex.DecodeString("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
 	rfcNonce, _ := hex.DecodeString("070000004041424344454647")
 	rfcAad, _ := hex.DecodeString("50515253c0c1c2c3c4c5c6c7")

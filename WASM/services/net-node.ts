@@ -1,9 +1,8 @@
-// The Node platform binding for the TCP/WS socket seam: a `ChannelFactory`
-// (services/socket-seam.ts) that opens node:net sockets and wraps them as RawLinks, and
-// nothing else. The handshake, link routing and request/response layer run in the transport
-// bundle's guest, driven by TransportHost.
+// The Node platform's socket seam: a `ChannelFactory` (services/socket-seam.ts) that opens
+// node:net sockets and wraps them as RawLinks. The handshake, link routing and
+// request/response layer run in the transport bundle's guest, driven by TransportHost.
 //
-// Every listener exposes the same byte stream; the transport bundle selects framing from
+// Every listener carries the same byte stream; the transport bundle chooses framing from
 // the destination or the listener's label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
@@ -16,23 +15,23 @@ import { parseDest } from "./peer-addr.js";
 function nodeRawStream(socket: Socket): RawLink {
   return {
     stream: true,
-    // The peer's IP, for the per-source half-open cap only (§12.6.2) — unauthenticated
-    // and never an identity. Captured now because `socket.remoteAddress` reads undefined
-    // once destroyed, and the limiter must release the bucket it took.
+    // The peer's IP, only for the per-source half-open cap (§12.6.2): unauthenticated and
+    // never an identity. Read now because `socket.remoteAddress` is undefined once the
+    // socket is destroyed, and the limiter must release the bucket it took.
     remoteAddr: socket.remoteAddress ?? undefined,
     send: (bytes: Uint8Array) => { socket.write(bytes); },
-    // Expose a plain view: the driver copies at admission/retention, and its slice()
-    // must keep Uint8Array's ownership semantics rather than Buffer's aliasing ones.
+    // Pass a plain Uint8Array view: the driver copies when it holds a read, and its
+    // slice() must copy as Uint8Array's does, not alias as Buffer's does.
     onData: (cb: (chunk: Uint8Array) => void) => {
       socket.on("data", (chunk: Uint8Array) => cb(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)));
     },
     setReadable: (enabled) => { if (enabled) socket.resume(); else socket.pause(); },
     // error and close both mean "gone"; the caller's teardown is idempotent.
     onClose: (cb: () => void) => { socket.on("close", cb); socket.on("error", cb); },
-    // A graceful stop must FLUSH: `destroy()` drops the write buffer, so the
-    // end-of-stream record the transport just wrote is discarded and the peer reads a
-    // clean shutdown as a truncation. `end()` writes the queued bytes then FINs; the
-    // linger timer is the backstop for a peer that never FINs back.
+    // A graceful close must flush: `destroy()` drops the write buffer, losing the
+    // end-of-stream record the transport just wrote, so the peer sees a clean shutdown as
+    // a truncation. `end()` writes the queued bytes then sends FIN; the linger timer
+    // covers a peer that never closes its side.
     close: (graceful?: boolean) => {
       if (!graceful) { socket.destroy(); return; }
       try {
@@ -47,16 +46,16 @@ function nodeRawStream(socket: Socket): RawLink {
 
 function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
   return new Promise<number>((resolve, reject) => {
-    // Detached below, because `reject` on a settled promise is silent AND `once`
-    // unregisters it: left armed, it eats the first post-bind error and leaves the
-    // second to reach a server with no `error` listener, which ends the process.
+    // Removed after bind. Left in place, it would swallow the first later error (reject
+    // on a settled promise is silent, and `once` then unregisters it), and the second
+    // would reach a server with no `error` listener, which ends the process.
     server.once("error", reject);
     server.listen(opt.port, opt.host, () => {
       server.removeListener("error", reject);
       const a = server.address() as { port: number } | null;
       const port = a && typeof a === "object" ? a.port : 0;
-      // A LISTENING server's error is an accept that failed (EMFILE and friends).
-      // The connection is lost, the listener is not: report and stay up.
+      // An error on a listening server is a failed accept (EMFILE and the like). The
+      // connection is lost but the listener is fine, so log it and keep going.
       server.on("error", (err) => {
         console.error(`[net] accept on ${opt.host}:${port}: ${errMessage(err)}`);
       });
@@ -66,11 +65,11 @@ function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
 }
 
 // The node:net ChannelFactory: every socket the transport driver opens or accepts is
-// created here, behind the RawLink shape.
+// created here, as a RawLink.
 export class NodeChannelFactory {
   private readonly servers: TcpServer[] = [];
-  /** Takes no crypto: the WebSocket client key and the frame masks are the transport
-   *  bundle's, which draws entropy from the ungated `crypto/random`. */
+  /** Takes no crypto: the transport bundle makes the WebSocket client key and frame masks
+   *  itself, with entropy from `crypto/random`. */
   constructor() {}
   /** Dial TCP-backed destinations; `wss://` is unsupported because this factory has no TLS. */
   connect(dest: string): RawLink | null {

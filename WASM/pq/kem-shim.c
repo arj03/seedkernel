@@ -1,23 +1,19 @@
 /*
- * kem-shim.c — the entire seedkernel-specific surface of mlkem768.wasm.
+ * The seedkernel-specific part of mlkem768.wasm.
  *
- * Three low-level exports over mlkem-native's derandomized core API, plus the generic
- * seedkernel pure-module `scratch`/`handle` ABI. The latter is what lets a signed bundle
- * carry this implementation as one of its own modules instead of growing the host's
- * guest vocabulary.
+ * Three low-level exports over mlkem-native's derandomized core API, plus the
+ * pure-module `scratch`/`handle` ABI (§4), so a signed bundle can carry this as one of
+ * its own modules instead of the host exposing a KEM to guests.
  *
- * Randomness is an *argument*, never a syscall — the same rule shim.c states for
- * ML-DSA, and here it does double duty. It keeps the module import-free, so one
- * artifact instantiates identically under Node, under a browser, and under wazero
- * in the Go host with no per-target glue to disagree about (§12.9). And it is what
- * lets the KEM remain a pure module: coins come from `node/random` — an authority the
- * guest already holds — and are explicit module input.
+ * Randomness is an argument, never a syscall, as in shim.c. The module has no imports,
+ * so one artifact instantiates identically under Node, a browser and wazero in the Go
+ * host (§12.9), and the KEM stays a pure module: the guest gets coins from
+ * `crypto/random` and passes them in.
  *
- * There is no `check_pk` / `check_sk` export. FIPS 203's modulus and hash checks
- * are not optional extras a caller might skip: enc_derand and dec run them
- * themselves and return failure, which is what the `ok` byte in the catalog's
- * output carries. Exporting them separately would offer a second, weaker way to
- * ask the same question.
+ * There is no `check_pk` / `check_sk` export. FIPS 203's modulus and hash checks are
+ * not optional: enc_derand and dec run them and return failure, which the `ok` byte in
+ * the module's output carries. Separate exports would only add a second way to ask
+ * the same question.
  */
 
 #include <stddef.h>
@@ -60,7 +56,7 @@ EXPORT int mlkem768_keypair(uint8_t *pk, uint8_t *sk, const uint8_t *coins)
 }
 
 /* Encaps_Internal (FIPS 203 Algorithm 17). `coins` is 32 bytes (m). Returns 0 when
- * the public key fails the modulus check of FIPS 203 §7.2 — a malformed peer key,
+ * the public key fails the modulus check of FIPS 203 §7.2: a malformed peer key,
  * which the caller must be able to tell from a good one. */
 EXPORT int mlkem768_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk,
                            const uint8_t *coins)
@@ -69,18 +65,17 @@ EXPORT int mlkem768_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk,
 }
 
 /* Decaps (FIPS 203 Algorithm 21). Returns 0 only when the secret key fails the hash
- * check of FIPS 203 §7.3 — a corrupt key, not a bad ciphertext. A ciphertext that
- * does not decrypt is NOT an error: ML-KEM's implicit rejection returns a shared
- * secret derived from the key's z instead, in constant time, and reporting that
- * apart from success is exactly the oracle implicit rejection exists to deny. */
+ * check of FIPS 203 §7.3: a corrupt key, not a bad ciphertext. A ciphertext that does
+ * not decrypt is not an error: ML-KEM's implicit rejection returns a shared secret
+ * derived from the key's z instead, in constant time, and reporting it separately
+ * would create the oracle implicit rejection is there to prevent. */
 EXPORT int mlkem768_decaps(uint8_t *ss, const uint8_t *ct, const uint8_t *sk)
 {
   return crypto_kem_dec(ss, ct, sk) == 0;
 }
 
-/* Field widths, exported so the JS and Go sides read them out of the artifact
- * instead of repeating them — a build against the wrong parameter set should fail
- * loudly at load, not silently produce a KEM for a different one. */
+/* Field widths, exported so callers can check them at load: a build against the
+ * wrong parameter set should fail there, not act as a KEM for a different one. */
 EXPORT int mlkem768_publickeybytes(void) { return MLKEM768_PUBLICKEYBYTES; }
 EXPORT int mlkem768_secretkeybytes(void) { return MLKEM768_SECRETKEYBYTES; }
 EXPORT int mlkem768_ciphertextbytes(void) { return MLKEM768_CIPHERTEXTBYTES; }
@@ -94,9 +89,11 @@ EXPORT int mlkem768_symbytes(void) { return MLKEM768_SYMBYTES; }
  *   1 [pk 1184][coins 32]    -> [ok 1][ct 1088][ss 32]
  *   2 [sk 2400][ct 1088]     -> [ok 1][ss 32]
  *
- * Inputs are copied out of scratch before the primitive runs, so output may safely
- * replace the request even when the upstream implementation does not permit overlap.
- * The generic module loaders require at least their 64 KiB default scratch window. */
+ * Inputs are copied out of scratch before the primitive runs, so output can replace
+ * the request even though the upstream implementation does not allow overlap.
+ * The largest request is 3489 bytes. No `scratchSize` is exported, so the host assumes
+ * its 128 KB default (§4.1), which is larger than this array; only the transport guest
+ * calls this module, always with the exact widths above. */
 #define MODULE_SCRATCH_BYTES 65536
 #define OP_KEYPAIR 0
 #define OP_ENCAPS 1
@@ -178,8 +175,8 @@ EXPORT int handle(int input_len)
     return 1 + MLKEM768_BYTES;
   }
 
-  /* A wrong tag/width may still carry a secret-shaped request. The module ABI supplies
-   * a non-negative length within scratch, but keep the exported shim safe on its own. */
+  /* A wrong tag or width may still carry secret bytes, so wipe it. The host passes a
+   * non-negative length, but bound it here anyway. */
   if (input_len > 0 && input_len <= MODULE_SCRATCH_BYTES)
   {
     wipe(scratch, (size_t)input_len);
