@@ -194,6 +194,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
   // Transport-only flags on a node with no network would otherwise be silently ignored.
   const relay = args.get("relay");
+  // Neither console target's sockets speak TLS, so a wss:// relay would only be redialed
+  // forever. A relay serves plain ws:// beside it (seedrelay's deployment guide).
+  if (relay !== undefined && /^wss:/i.test(relay.trim())) {
+    throw new Error("--relay: this node's sockets have no TLS, so it cannot reach wss://; use the relay's ws:// address");
+  }
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
   for (const flag of ["transport", "contact-secret", "advertise"]) {
     if (args.has(flag) && !network) {
