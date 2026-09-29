@@ -157,15 +157,16 @@ class Rtc {
   }
 
   /** The data channel of negotiation `via` arrived as `linkId`: the offering side dials
-   *  the peer it signaled, under that peer's contact secret, and the answering side
-   *  accepts whoever authenticates. */
+   *  the peer it signaled, and the answering side accepts whoever authenticates. Both run
+   *  open, with no contact secret: the channel exists only through signaling over the
+   *  authenticated link, so no stranger can reach it. */
   bindData(via, linkId, stream) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
     if (!e || e.data) { netLinkClose(linkId, false); return; }
     e.data = core.openLink({
       linkId, stream, dest: "", listener: "", source: undefined,
-      linkSecret: e.offer ? core.secretFor(e.peer) : null,
+      linkSecret: ZERO32,
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,

@@ -320,6 +320,25 @@ await test("two nodes in one room link through the relay, then move to WebRTC", 
   assert(relay.spliceBytes === before, "and not the relay");
 });
 
+await test("WebRTC runs without contact secrets: a callee offers to a caller it holds no secret for", async (keep) => {
+  const relay = new FakeRelay(), world = new FakeWebRtc();
+  const [small, large] = sortedIdentities(2);
+  // The smaller key is the callee, so it offers. The caller advertises nothing, so its own
+  // secret never reaches the callee, and the data link must not need it.
+  const calleeSecret = new Uint8Array(32).fill(3);
+  const B = keep(await rtcNode(relay, world, { identity: small, contactSecret: calleeSecret }));
+  const A = keep(await rtcNode(relay, world, { identity: large, contactSecret: new Uint8Array(32).fill(4) }));
+  await joinRelay(B, "ws://relay/");
+  await transportOp(A, new OpArgs("addr").blob(Buffer.from(B.peerId, "hex")).blob(calleeSecret).text("relay+ws://relay"));
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  assert(resp[0] === 1, "the relayed link carries a request");
+  await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the move to WebRTC");
+  assert(B.made.length === 1 && A.made.length === 1, "the callee offered, the caller answered");
+  const before = relay.spliceBytes;
+  const back = await B.request(A.peerId, PROTO, Uint8Array.of(2));
+  assert(back[0] === 2 && relay.spliceBytes === before, "the peers talk over the data channel");
+});
+
 await test("a peer without WebRTC declines, and the relayed link stays", async (keep) => {
   const relay = new FakeRelay(), world = new FakeWebRtc();
   const [small, large] = sortedIdentities(2);

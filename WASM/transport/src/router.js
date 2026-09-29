@@ -3,9 +3,9 @@
 /** A frame's first byte for the transport's own messages between two nodes, beside a
  *  request (0x00, 0x80 without reply) and a response (0x01): `[KIND_CTL][tag u8][body]`. */
 const KIND_CTL = 0x02;
-/** Control tags: this node's contact secret and direct addresses, sent over a relayed
- *  link (core.js `advertise`), and a request that the peer close the relayed link it
- *  arrived on, since a direct one has replaced it. rtc.js's signals are the other tags. */
+/** Control tags: this node's direct addresses with the contact secret they take, sent over
+ *  a relayed link (core.js `advertise`), and a request that the peer close the relayed link
+ *  it arrived on, since a direct one has replaced it. rtc.js's signals are the other tags. */
 const CTL_ADDRS = 0x64, CTL_RETIRE = 0x72;
 
 // ── the router ────────────────────────────────────────────────────────────────
@@ -107,6 +107,7 @@ class Router {
     this.pools.delete(pid);
     reqres.peerDown(pid);
     rtc.forget(pid);
+    core.onPeerDown(pid);
   }
 }
 

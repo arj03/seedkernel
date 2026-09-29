@@ -333,6 +333,9 @@ class Link {
       this.abort();
     } else if (t - this.lastSeen < linkIdleTimeoutMs) {
       this.due = this.lastSeen + linkIdleTimeoutMs;
+    } else if (relays.isMember(this.peerId) && router.linkCount(this.peerId) === 1 && router.routes(this)) {
+      // The last way to a member of this node's room stays: the room is who it keeps.
+      this.due = t + linkIdleTimeoutMs;
     } else {
       this.close();
     }

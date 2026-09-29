@@ -67,13 +67,34 @@ const cohort = configuredPeers.map(peerRef);
 // Where this node can be dialed directly, as `scheme://host:port[/path]`: sent to each peer
 // linked through a relay, with the contact secret, so it can move to a direct link. Only
 // the operator knows the public address, so it is theirs to set in LOCAL.
-const DEST_SHAPE = /^[a-z]+:\/\/[^\s\0]+$/;
 const advertise = LOCAL.advertise ?? APP.advertise;
-if (!Array.isArray(advertise) || advertise.some((d) => typeof d !== "string" || !DEST_SHAPE.test(d))) {
+if (!Array.isArray(advertise) || advertise.some((d) => typeof d !== "string" || !/^[a-z]+:\/\/[^\s\0]+$/.test(d))) {
   throw new Error("transport: config advertise must be an array of scheme://host:port destinations");
 }
 /** At most this many learned direct addresses per peer, each at most MAX_DEST_LEN. */
 const MAX_LEARNED_DESTS = 8, MAX_DEST_LEN = 256;
+/** Whether a destination a peer advertised may be dialed: `scheme://host:port[/path]` whose
+ *  host is a name, or a public IPv4 address in dotted form. A peer must not point this node
+ *  at its loopback, LAN or link-local services, so an IPv6 literal is refused rather than
+ *  classified. A name that resolves there draws only a msg1 the peer's secret opens. */
+function publicDest(dest) {
+  const m = /^[a-z]+:\/\/([a-z0-9.-]+):\d{1,5}(?:\/\S*)?$/i.exec(dest);
+  if (!m) return false;
+  const host = m[1].toLowerCase().replace(/\.$/, "");
+  // A numeric last label makes the host an IPv4 address, in whatever notation it is written.
+  if (!/^(?:\d+|0x[0-9a-f]*)$/.test(host.slice(host.lastIndexOf(".") + 1))) {
+    return host !== "localhost" && !host.endsWith(".localhost");
+  }
+  const q = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!q || q.slice(1).some((o) => Number(o) > 255 || (o.length > 1 && o[0] === "0"))) return false;
+  const a = Number(q[1]), b = Number(q[2]);
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128)
+    || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168));
+}
+/** A room member this node calls is called again when its link is lost or a call fails:
+ *  REDIAL_MS later, twice as long after each failure in a row, and not after MAX_REDIALS
+ *  of them until it joins again. */
+const REDIAL_MS = 1000, MAX_REDIALS = 6;
 const maxFrameBytes = policy("maxFrameBytes");
 // Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
@@ -152,6 +173,7 @@ function onWake() {
     const t = now();
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
+    wakeBy(core.redialDue(t));
     wakeBy(relays.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
@@ -260,6 +282,8 @@ class Core {
     // it directly (`onAddrs`), and the peers a move to a direct link is under way for.
     this.learned = new Map();
     this.upgrading = new Set();
+    // peerId to { tries, at }: a room member this node calls, to call again at `at`.
+    this.redials = new Map();
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
@@ -282,22 +306,51 @@ class Core {
 
   /** A key joined or left a room this node is in on the relay at `origin`. A member is
    *  reached through that relay unless the node was given another way, under this node's
-   *  own contact secret, which a room shares; the smaller key calls. */
+   *  own contact secret, which a room shares; the smaller key calls, and calls again when
+   *  the link is lost or the call fails (`redialLater`). */
   onRoomMember(origin, peer, present) {
     if (peer === ownId) return;
     const a = this.addrs.get(peer);
     if (!present) {
-      if (a && a.room === origin && !relays.isMember(peer)) this.addrs.delete(peer);
+      if (relays.isMember(peer)) return;
+      this.redials.delete(peer);
+      if (a && a.room === origin) this.addrs.delete(peer);
       return;
     }
     if (!a || a.dest === "") this.addrs.set(peer, { dest: RELAY_SCHEME + origin, secret: null, room: origin });
+    // Joining again gives a member that kept failing a fresh set of tries.
+    this.redials.delete(peer);
     if (ownId < peer && router.linkCount(peer) === 0) void this.dial(peer);
   }
 
-  /** The contact secret a dial to `peer` presents: what it last said over a link, else
-   *  what its address gave, else this node's own (a room's shared one). */
-  secretFor(peer) {
-    return this.learned.get(peer)?.secret ?? this.addrs.get(peer)?.secret ?? null;
+  /** Call `peer` again later if it is a room member this node calls, unless it has failed
+   *  MAX_REDIALS times in a row. */
+  redialLater(peer) {
+    if (!(ownId < peer && relays.isMember(peer))) return;
+    const r = this.redials.get(peer) || { tries: 0, at: Infinity };
+    if (r.tries >= MAX_REDIALS) return;
+    r.at = dueIn(REDIAL_MS * 2 ** r.tries++);
+    this.redials.set(peer, r);
+  }
+
+  /** One wake (`onWake`): call the members that are due and still unlinked. Returns the
+   *  soonest still waiting. */
+  redialDue(t) {
+    let next = Infinity;
+    for (const [peer, r] of this.redials) {
+      if (t < r.at) { next = Math.min(next, r.at); continue; }
+      r.at = Infinity;
+      if (!relays.isMember(peer)) this.redials.delete(peer);
+      else if (router.linkCount(peer) === 0) void this.dial(peer);
+    }
+    return next;
+  }
+
+  /** A peer lost its last link: forget what it said about reaching it directly, and call
+   *  it again if it is a room member this node calls. */
+  onPeerDown(peer) {
+    this.learned.delete(peer);
+    this.redialLater(peer);
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -315,7 +368,7 @@ class Core {
     if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      if (!(await this.dialDest(peerId, addr.dest, addr.secret))) return; // no route
+      if (!(await this.dialDest(peerId, addr.dest, addr.secret))) { this.redialLater(peerId); return; } // no route
     }
   }
 
@@ -360,9 +413,13 @@ class Core {
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.promote(peerId, link);
+    this.redials.delete(peerId);
     if (!router.routes(link)) return;
     if (link.relayed) {
-      link.send(concatBytes([Uint8Array.of(KIND_CTL, CTL_ADDRS), contactSecret, utf8Encode(advertise.join("\0"))]));
+      // The advertised destinations go with the contact secret that reaching them takes; a
+      // node that advertises none sends an empty message, and its secret stays home.
+      const addrs = advertise.length > 0 ? [contactSecret, utf8Encode(advertise.join("\0"))] : [];
+      link.send(concatBytes([Uint8Array.of(KIND_CTL, CTL_ADDRS), ...addrs]));
       void rtc.upgrade(peerId).catch(() => {});
     } else if (!link.weDialed) {
       router.retireRelayed(peerId);
@@ -387,14 +444,17 @@ class Core {
   }
 
   /** A peer linked through a relay says how to reach it directly: `[secret 32][dests]`,
-   *  the destinations NUL-separated. Dial them in turn, in the background, until one
+   *  the destinations NUL-separated, or nothing when it advertises none. Dial the public
+   *  ones, then an address given for it here, in turn and in the background, until one
    *  authenticates. */
   onAddrs(peerId, body) {
-    if (body.length < PK_LEN) return;
-    const dests = utf8Decode(body.subarray(PK_LEN)).split("\0")
-      .filter((d) => d.length <= MAX_DEST_LEN && DEST_SHAPE.test(d) && !d.startsWith(RELAY_SCHEME))
-      .slice(0, MAX_LEARNED_DESTS);
-    this.learned.set(peerId, { secret: body.slice(0, PK_LEN), dests });
+    if (body.length > 0) {
+      if (body.length < PK_LEN) return;
+      const dests = utf8Decode(body.subarray(PK_LEN)).split("\0")
+        .filter((d) => d.length <= MAX_DEST_LEN && publicDest(d))
+        .slice(0, MAX_LEARNED_DESTS);
+      this.learned.set(peerId, { secret: body.slice(0, PK_LEN), dests });
+    }
     void this.upgrade(peerId);
   }
 
@@ -402,12 +462,15 @@ class Core {
     if (this.upgrading.has(peerId)) return;
     this.upgrading.add(peerId);
     try {
-      const given = this.addrs.get(peerId)?.dest ?? "";
-      const dests = [...this.learned.get(peerId).dests];
-      if (given !== "" && !given.startsWith(RELAY_SCHEME) && !dests.includes(given)) dests.push(given);
+      const learned = this.learned.get(peerId);
+      const given = this.addrs.get(peerId) || { dest: "", secret: null };
+      const dests = learned ? [...learned.dests] : [];
+      if (given.dest !== "" && !given.dest.startsWith(RELAY_SCHEME) && !dests.includes(given.dest)) dests.push(given.dest);
+      // The secret the peer sent, else the one its address was given with.
+      const secret = learned ? learned.secret : given.secret;
       for (const dest of dests) {
         if (router.hasDirect(peerId) || router.linkCount(peerId) === 0) return;
-        const link = await this.dialDest(peerId, dest, this.secretFor(peerId));
+        const link = await this.dialDest(peerId, dest, secret);
         if (link && (await link.settled)) return;
       }
     } finally {
@@ -421,11 +484,15 @@ class Core {
     router.remove(link);
     if (link.ticket) relays.tickets.delete(link.ticket);
     // Its queued frames move to another link to the peer. A dial that dies as the last way
-    // to its peer fails what waits on it now, not at its timeout.
+    // to its peer fails what waits on it now, not at its timeout, and a room member it was
+    // for is called again later.
     const peerId = link.peerId || link.dialedPeerId;
     if (peerId) {
       for (const frame of link.takeQueued()) this.place(peerId, frame);
-      if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) reqres.peerDown(peerId);
+      if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) {
+        reqres.peerDown(peerId);
+        this.redialLater(peerId);
+      }
     }
     // Left in `linksById`: `linkClosed` still has to ask why it closed.
   }
@@ -587,10 +654,12 @@ entry("addr", (r) => {
 });
 
 /** Register on the relay at this `ws://`/`wss://` URL and join the room its path names,
- *  leaving any other; empty leaves (relay.js). */
-entry("relay", async (r) => {
-  await relays.join(utf8Decode(r.blob()));
-  return NOTHING;
+ *  leaving any other; empty leaves (relay.js). Deferred: registering waits on the relay's
+ *  challenge, which arrives in a later invocation. */
+entry("relay", (r) => {
+  const d = defer();
+  relays.join(utf8Decode(r.blob())).then(() => d.settle(NOTHING), d.fail);
+  return d.promise;
 });
 
 /** `[state u8]`: 0 no relay joined, 1 registered on it, 2 joined and waiting to redial. */

@@ -7,8 +7,10 @@
 const RELAY_SCHEME = "relay+";
 /** A relay frame past this is not relay wire, and closes the relay link. */
 const MAX_SIGNAL_BYTES = 64 * 1024;
-/** How long a dropped home relay waits before it is dialed again. */
-const RELAY_RETRY_MS = 2000;
+/** A dropped home relay is dialed again after a wait that starts at RELAY_RETRY_MS and
+ *  doubles with each drop in a row up to RELAY_RETRY_MAX_MS, drawn from its upper half so a
+ *  relay's clients do not all come back at once. */
+const RELAY_RETRY_MS = 2000, RELAY_RETRY_MAX_MS = 60_000;
 const NONCE_LEN = 32, TICKET_LEN = 16;
 
 // ── the relay wire ────────────────────────────────────────────────────────────
@@ -53,6 +55,7 @@ class RelayConn {
     this.linkId = 0;
     this.framer = null;
     this.registered = false;
+    this.upSince = Infinity;   // when it registered
     this.gone = false;
     this.members = new Set();  // the room's keys, hex
     this.waiters = [];         // settle(bool) once registered or gone
@@ -111,6 +114,7 @@ class RelayConn {
       this.send(concatBytes([Uint8Array.of(R_REGISTER), ownPk, sig]));
     } else if (type === R_REGISTER && !this.registered) {
       this.registered = true;
+      this.upSince = now();
       this.due = Infinity;
       for (const settle of this.waiters.splice(0)) settle(true);
     } else if ((type === R_MEMBERS || type === R_JOINED || type === R_LEFT) && body.length % PK_LEN === 0) {
@@ -120,7 +124,7 @@ class RelayConn {
         core.onRoomMember(this.origin, peer, type !== R_LEFT);
       }
     } else if (type === R_CALL && body.length === PK_LEN + TICKET_LEN) {
-      await relays.accept(this.origin, body.subarray(PK_LEN));
+      await relays.accept(this.origin, toHex(body.subarray(0, PK_LEN)), body.subarray(PK_LEN));
     } else if (type === R_UNREACHABLE && body.length === PK_LEN + TICKET_LEN) {
       relays.unreachable(toHex(body.subarray(PK_LEN)));
     }
@@ -150,6 +154,7 @@ class Relays {
     this.conns = new Map();    // origin to its one RelayConn
     this.home = null;          // { origin, room } of the joined relay, or null
     this.retryAt = Infinity;   // when a dropped home relay is dialed again
+    this.retryMs = RELAY_RETRY_MS; // the ceiling of the next redial's wait
     this.tickets = new Map();  // our splice sockets waiting on a call, ticket hex to link id
   }
 
@@ -160,8 +165,9 @@ class Relays {
     return c && c.registered && c.room === this.home.room ? 1 : 2;
   }
 
-  /** Join the room at `url` on its relay, leaving any other; "" leaves. Links already up
-   *  stay up. */
+  /** Join the room at `url` on its relay, leaving any other; "" leaves. Resolves once
+   *  registered there, or once that attempt has failed and a redial is due. Links already
+   *  up stay up. */
   async join(url) {
     const origin = url === "" ? null : relayOrigin(url);
     if (url !== "" && !origin) throw new Error("transport: relay needs a ws:// or wss:// URL");
@@ -171,6 +177,7 @@ class Relays {
     if (old) this.drop(old);
     this.home = origin ? { origin, room } : null;
     this.retryAt = Infinity;
+    this.retryMs = RELAY_RETRY_MS;
     if (origin) await this.dialHome();
   }
 
@@ -179,10 +186,13 @@ class Relays {
     const stale = this.conns.get(home.origin);
     // A socket there without the room (one opened to place a call) makes way.
     if (stale && stale.room !== home.room) this.drop(stale);
-    if (this.conns.has(home.origin)) return;
-    const c = new RelayConn(home.origin, home.room);
-    this.conns.set(home.origin, c);
-    await c.open();
+    let c = this.conns.get(home.origin);
+    if (!c) {
+      c = new RelayConn(home.origin, home.room);
+      this.conns.set(home.origin, c);
+      await c.open();
+    }
+    await c.ready();
   }
 
   /** Close a relay socket and forget the room it held. */
@@ -198,7 +208,11 @@ class Relays {
   onGone(c) {
     if (this.conns.get(c.origin) !== c) return;
     this.conns.delete(c.origin);
-    if (this.home && this.home.origin === c.origin) this.retryAt = dueIn(RELAY_RETRY_MS);
+    if (!this.home || this.home.origin !== c.origin) return;
+    // A registration that held longer than the longest wait starts the backoff over.
+    if (c.upSince < now() - RELAY_RETRY_MAX_MS) this.retryMs = RELAY_RETRY_MS;
+    this.retryAt = dueIn(this.retryMs * (1 + Math.random()) / 2);
+    this.retryMs = Math.min(2 * this.retryMs, RELAY_RETRY_MAX_MS);
   }
 
   /** Redial a dropped home relay. */
@@ -228,15 +242,19 @@ class Relays {
     return { linkId: opened.linkId, stream: opened.stream, dest, ticket: toHex(ticket) };
   }
 
-  /** A call for this node: open our end of the splice and accept whoever authenticates,
-   *  under the half-open budgets like any accept. */
-  async accept(origin, ticket) {
+  /** A call for this node from `from`, the key the relay registered: open our end of the
+   *  splice and accept whoever authenticates, under the half-open budgets with the caller's
+   *  key as its source. A caller outside `admitPeers`, or at the per-source cap, gets no
+   *  socket. */
+  async accept(origin, from, ticket) {
+    if (admitPeers !== null && !admitPeers.has(from)) return;
+    if ((core.limiter.perSource.get(from) || 0) >= core.limiter.maxPerSource) return;
     const dest = origin + "/?splice=" + toHex(ticket);
     const opened = await netLinkOpen(dest);
     if (opened.linkId === 0) return;
     core.openLink({
       linkId: opened.linkId, stream: opened.stream, dest, listener: "", linkSecret: null,
-      source: undefined, weDialed: false, limiter: core.limiter, dialedPeerId: null, relayed: true,
+      source: from, weDialed: false, limiter: core.limiter, dialedPeerId: null, relayed: true,
     });
   }
 

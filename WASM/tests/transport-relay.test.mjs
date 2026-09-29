@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { importBuilt, testkit } from "./testkit.mjs";
 import {
-  makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, LoopbackChannels,
+  makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, LoopbackChannels, generateKeyPair,
 } from "./transport-harness.mjs";
 import { FakeRelay } from "./fake-relay.mjs";
 
@@ -41,7 +41,7 @@ await test("a node reaches a key through a relay, the handshake running through 
   const B = keep(await relayNode(relay, { contactSecret: secret }));
   assert(await relayState(B) === 0, "no relay before one is joined");
   await joinRelay(B, RELAY + "/");
-  await until(async () => (await relayState(B)) === 1, 2000, "B registered");
+  assert(await relayState(B) === 1, "registered by the time `relay` answers");
   await addr(A, B.peerId, "relay+" + RELAY, secret);
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1, 2, 3));
   assert(resp.length === 3 && resp[2] === 3, "a request crosses the splice");
@@ -98,6 +98,18 @@ await test("the callee's contact secret still gates a relayed dial", async (keep
   assert(!(await linkedPeers(B)).includes(A.peerId));
 });
 
+await test("a caller outside the callee's admitPeers gets no socket", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay, { transportConfig: { handshakeTimeoutMs: 300 } }));
+  const B = keep(await relayNode(relay, { admitPeers: [generateKeyPair().publicKey] }));
+  await joinRelay(B, RELAY + "/");
+  await addr(A, B.peerId, "relay+" + RELAY);
+  let failed = false;
+  try { await A.request(B.peerId, PROTO, Uint8Array.of(1)); } catch { failed = true; }
+  assert(failed, "the request fails");
+  assert(relay.calls === 1 && relay.splices.length === 0, "the callee never opened its end");
+});
+
 await test("a relayed link moves to an advertised direct address, and the splice is retired", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const fabric = new LoopbackChannels();
@@ -122,6 +134,25 @@ await test("a relayed link moves to an advertised direct address, and the splice
   assert(relay.spliceBytes === before, "no traffic through the relay after the move");
 });
 
+await test("an advertised loopback, LAN or numeric-trick address is not dialed", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  // The fabric routes by port alone, so any of these would reach B's listener if dialed.
+  const fabric = new LoopbackChannels();
+  const contactSecret = new Uint8Array(32).fill(5);
+  const A = keep(await relayNode(relay, { fabric, contactSecret }));
+  const B = keep(await relayNode(relay, {
+    fabric,
+    listen: [{ label: "tcp", host: "127.0.0.1", port: 24002 }],
+    contactSecret,
+    transportConfig: { advertise: ["tcp://127.0.0.1:24002", "tcp://192.168.1.9:24002", "tcp://0x7f.1:24002",
+      "tcp://2130706433:24002", "tcp://localhost:24002", "tcp://[::1]:24002", "ws://169.254.169.254:24002/x"] },
+  }));
+  for (const n of [A, B]) await joinRelay(n, RELAY + "/room");
+  await until(async () => linked(A, B), 3000, "the relayed link");
+  await settle(300);
+  assert(relay.splices[0].every((e) => !e.dead), "the link stays on the relay");
+});
+
 await test("a restarted relay is redialed, and its room links again", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay));
@@ -134,6 +165,48 @@ await test("a restarted relay is redialed, and its room links again", async (kee
   await until(async () => linked(A, B), 3000, "the room to link again");
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
   assert(resp[0] === 1);
+});
+
+await test("a room member whose link is lost is called again", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  for (const n of [A, B]) await joinRelay(n, RELAY + "/room");
+  await until(async () => linked(A, B), 3000, "the relayed link");
+  for (const e of relay.splices[0]) e.kill();
+  await until(async () => !(await linked(A, B)), 2000, "the link to drop");
+  await until(async () => linked(A, B), 4000, "the smaller key to call again");
+  assert(relay.splices.length === 2, `a second splice, got ${relay.splices.length}`);
+});
+
+await test("a room call that fails is tried again", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  relay.refuseSplices = true;
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  for (const n of [A, B]) await joinRelay(n, RELAY + "/room");
+  await until(() => relay.calls >= 1, 2000, "the first call");
+  await settle(100);
+  assert(!(await linked(A, B)), "no splice, no link");
+  relay.refuseSplices = false;
+  await until(async () => linked(A, B), 5000, "a later call to get through");
+  assert(relay.calls >= 2, `the member was called again, ${relay.calls} call(s)`);
+});
+
+await test("the idle clock spares the last link to a room member, and only that", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay, { linkIdleTimeoutMs: 200 }));
+  const B = keep(await relayNode(relay, { linkIdleTimeoutMs: 200 }));
+  const C = keep(await relayNode(relay, { linkIdleTimeoutMs: 200 }));
+  for (const n of [A, B]) await joinRelay(n, RELAY + "/room");
+  await until(async () => linked(A, B), 3000, "the relayed link");
+  // C is in no room with B: it reaches B by address.
+  await addr(C, B.peerId, "relay+" + RELAY);
+  await C.request(B.peerId, PROTO, Uint8Array.of(1));
+  await settle(800);
+  assert(await linked(A, B), "the room's link outlives four idle windows");
+  assert(relay.splices[0].every((e) => !e.dead), "on its first splice");
+  assert(!(await linkedPeers(C)).includes(B.peerId), "a link outside the room still goes idle");
 });
 
 summary("Relays");
