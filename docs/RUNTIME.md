@@ -333,7 +333,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 
 - **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book, relays and WebRTC signaling (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
-- **What a replacement changes without a host release.** Everything in this section and §12.7's relays and signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers`, `--relay` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's calls into a transport are `relay` and `ready` on its service id, made when `--relay` and `--peers` are given (§12.8).
+- **What a replacement changes without a host release.** Everything in this section and §12.7's relays and signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers`, `--relay`, `--advertise` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's calls into a transport are `relay` and `ready` on its service id, made when `--relay` and `--peers` are given (§12.8).
 
 #### Framing
 
@@ -488,7 +488,7 @@ A node that cannot be dialed (a browser, or anything behind NAT) is reached thro
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
-     [--relay ws[s]://host:port/[room]] \
+     [--relay ws[s]://host:port/[room]] [--advertise scheme://host:port,…] \
      [--contact-secret ./contact.hex] [--local-config ./app.json] \
      [--revoke <hex,…>] [--uninstall <app,…>] \
      [--op name  < argument > response] \
@@ -503,6 +503,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 - **`--local-config`** requires `--bundle` and is that load's `LOCAL`; it never reaches the transport.
 - **`--peers`** becomes `transport.config.peers` on the automatic transport load, as typed: the shell parses neither flag, so a replacement transport can spell addresses and secrets its own way, and the transport's load refuses a malformed one. Once up, the CLI waits for the cohort with the transport's `ready` op on its service id; `null` means no transport is installed.
 - **`--relay`** registers the node on that relay through the transport's `relay` op, passing the URL unread, so a node nobody can dial is reached there (§12.7). A node on a relay keeps serving without a listener, and the console shows the relay but not its path, since a room name is a credential.
+- **`--advertise`** becomes `transport.config.advertise` as typed: the addresses this node can be dialed at directly, which peers linked through a relay dial to move off it (§12.7).
 - **`--op name`** invokes the app `--bundle` just loaded, through that load's handle: stdin is the argument, stdout the response, framed as `[opLen u8][op][args]`. Logs go to stderr on both targets.
 
 **The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.

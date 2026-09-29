@@ -19,7 +19,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 /** Every flag the shell accepts. An allowlist, so a mistyped `--polcy` fails instead of
  *  silently booting a deny-all node. */
 const FLAGS = new Set([
-  "policy", "dir", "key", "listen", "peers", "relay", "contact-secret",
+  "policy", "dir", "key", "listen", "peers", "relay", "advertise", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
@@ -195,7 +195,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // Transport-only flags on a node with no network would otherwise be silently ignored.
   const relay = args.get("relay");
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
-  for (const flag of ["transport", "contact-secret"]) {
+  for (const flag of ["transport", "contact-secret", "advertise"]) {
     if (args.has(flag) && !network) {
       throw new Error(`--${flag} requires --listen, --peers or --relay, which enable the network it configures`);
     }
@@ -214,6 +214,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const peers = list(args.get("peers"));
   const transportConfig: JsonObject = {};
   if (peers.length > 0) transportConfig.peers = peers;
+  const advertise = list(args.get("advertise"));
+  if (advertise.length > 0) transportConfig.advertise = advertise;
   if (contactSecretPath !== undefined) {
     transportConfig.contactSecret = dec.decode(mustRead(host, contactSecretPath, "--contact-secret")).trim();
   }
