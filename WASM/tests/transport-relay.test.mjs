@@ -1,19 +1,14 @@
 // Relays (§12.7): a node registers its key on a relay with a signature, and reaches any
 // registered key through a splice the relay joins end to end, the channel handshake running
-// straight through it. A relayed link then moves to a direct one the peer advertised, and
-// the splice is retired. The relay is the in-process fake in fake-relay.mjs, which speaks
+// straight through it. The move to WebRTC, and the splice's retirement, are
+// net-rtc.test.mjs's. The relay is the in-process fake in fake-relay.mjs, which speaks
 // seedrelay's wire. Run after `npm run build`.
 
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { importBuilt, testkit } from "./testkit.mjs";
+import { testkit } from "./testkit.mjs";
 import {
-  makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, LoopbackChannels, generateKeyPair,
+  makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
 } from "./transport-harness.mjs";
 import { FakeRelay } from "./fake-relay.mjs";
-
-const imp = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
-const { combineChannels } = await imp("build/services/socket-seam.js");
 
 const { test, assert, summary } = testkit();
 const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
@@ -25,18 +20,16 @@ const addr = (node, peer, dest, secret = new Uint8Array(32)) =>
   transportOp(node, new OpArgs("addr").blob(Buffer.from(peer, "hex")).blob(secret).text(dest));
 const linked = async (a, b) => (await linkedPeers(a)).includes(b.peerId) && (await linkedPeers(b)).includes(a.peerId);
 
-/** A node whose sockets are the relay and, optionally, a direct in-process fabric. */
+/** A node whose sockets are the relay's. */
 function relayNode(relay, opts = {}) {
-  const factories = [relay.factory()];
-  if (opts.fabric) factories.push(opts.fabric.view());
-  return makeTransportHost({ channels: combineChannels(...factories), ...opts });
+  return makeTransportHost({ channels: relay.factory(), ...opts });
 }
 
 /** Register both on the relay and link `a` to `b` through it, as an app that learned `b`'s
  *  key would. */
-async function relayed(a, b, secret) {
+async function relayed(a, b) {
   for (const n of [a, b]) await joinRelay(n);
-  await addr(a, b.peerId, "relay+" + RELAY, secret);
+  await addr(a, b.peerId, "relay+" + RELAY);
   await a.request(b.peerId, PROTO, Uint8Array.of(0));
 }
 
@@ -111,46 +104,6 @@ await test("a caller outside the callee's admitPeers gets no socket", async (kee
   try { await A.request(B.peerId, PROTO, Uint8Array.of(1)); } catch { failed = true; }
   assert(failed, "the request fails");
   assert(relay.calls === 1 && relay.splices.length === 0, "the callee never opened its end");
-});
-
-await test("a relayed link moves to an advertised direct address, and the splice is retired", async (keep) => {
-  const relay = new FakeRelay("relay:1");
-  const fabric = new LoopbackChannels();
-  const contactSecret = new Uint8Array(32).fill(5);
-  const A = keep(await relayNode(relay, { fabric, contactSecret }));
-  const B = keep(await relayNode(relay, {
-    fabric,
-    listen: [{ label: "tcp", host: "127.0.0.1", port: 24001 }],
-    contactSecret,
-    transportConfig: { advertise: ["tcp://b:24001"] },
-  }));
-  await relayed(A, B, contactSecret);
-  await until(() => relay.splices.every((pair) => pair.every((e) => e.dead)), 3000, "the splice to be retired");
-  assert(await linked(A, B), "still linked, now directly");
-  const before = relay.spliceBytes;
-  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(4, 5));
-  assert(resp[1] === 5, "a request after the move");
-  const back = await B.request(A.peerId, PROTO, Uint8Array.of(6));
-  assert(back[0] === 6, "and back");
-  assert(relay.spliceBytes === before, "no traffic through the relay after the move");
-});
-
-await test("an advertised loopback, LAN or numeric-trick address is not dialed", async (keep) => {
-  const relay = new FakeRelay("relay:1");
-  // The fabric routes by port alone, so any of these would reach B's listener if dialed.
-  const fabric = new LoopbackChannels();
-  const contactSecret = new Uint8Array(32).fill(5);
-  const A = keep(await relayNode(relay, { fabric, contactSecret }));
-  const B = keep(await relayNode(relay, {
-    fabric,
-    listen: [{ label: "tcp", host: "127.0.0.1", port: 24002 }],
-    contactSecret,
-    transportConfig: { advertise: ["tcp://127.0.0.1:24002", "tcp://192.168.1.9:24002", "tcp://0x7f.1:24002",
-      "tcp://2130706433:24002", "tcp://localhost:24002", "tcp://[::1]:24002", "ws://169.254.169.254:24002/x"] },
-  }));
-  await relayed(A, B, contactSecret);
-  await settle(300);
-  assert(relay.splices[0].every((e) => !e.dead), "the link stays on the relay");
 });
 
 await test("a restarted relay is redialed, and the next send links again", async (keep) => {

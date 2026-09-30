@@ -64,33 +64,6 @@ function peerRef(spec) {
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const cohort = configuredPeers.map(peerRef);
-// Where this node can be dialed directly, as `scheme://host:port[/path]`: sent to each peer
-// linked through a relay, with the contact secret, so it can move to a direct link. Only
-// the operator knows the public address, so it is theirs to set in LOCAL.
-const advertise = LOCAL.advertise ?? APP.advertise;
-if (!Array.isArray(advertise) || advertise.some((d) => typeof d !== "string" || !/^[a-z]+:\/\/[^\s\0]+$/.test(d))) {
-  throw new Error("transport: config advertise must be an array of scheme://host:port destinations");
-}
-/** At most this many learned direct addresses per peer, each at most MAX_DEST_LEN. */
-const MAX_LEARNED_DESTS = 8, MAX_DEST_LEN = 256;
-/** Whether a destination a peer advertised may be dialed: `scheme://host:port[/path]` whose
- *  host is a name, or a public IPv4 address in dotted form. A peer must not point this node
- *  at its loopback, LAN or link-local services, so an IPv6 literal is refused rather than
- *  classified. A name that resolves there draws only a msg1 the peer's secret opens. */
-function publicDest(dest) {
-  const m = /^[a-z]+:\/\/([a-z0-9.-]+):\d{1,5}(?:\/\S*)?$/i.exec(dest);
-  if (!m) return false;
-  const host = m[1].toLowerCase().replace(/\.$/, "");
-  // A numeric last label makes the host an IPv4 address, in whatever notation it is written.
-  if (!/^(?:\d+|0x[0-9a-f]*)$/.test(host.slice(host.lastIndexOf(".") + 1))) {
-    return host !== "localhost" && !host.endsWith(".localhost");
-  }
-  const q = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!q || q.slice(1).some((o) => Number(o) > 255 || (o.length > 1 && o[0] === "0"))) return false;
-  const a = Number(q[1]), b = Number(q[2]);
-  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128)
-    || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168));
-}
 const maxFrameBytes = policy("maxFrameBytes");
 // Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
@@ -271,10 +244,6 @@ class Core {
     this.addrs = new Map();      // peerId to { dest, secret }: the address book
     this.readyWaiters = [];      // [{check, d, due}], one per in-flight ready()
     this.dialing = new Map();    // peerId to in-flight dial, so concurrent senders share one
-    // peerId to { secret, dests }: what a peer linked through a relay said about reaching
-    // it directly (`onAddrs`), and the peers a move to a direct link is under way for.
-    this.learned = new Map();
-    this.upgrading = new Set();
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
@@ -293,11 +262,6 @@ class Core {
    *  this node cannot dial but `ready` still waits for. */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
-  }
-
-  /** A peer lost its last link: forget what it said about reaching it directly. */
-  onPeerDown(peer) {
-    this.learned.delete(peer);
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -354,74 +318,24 @@ class Core {
     return link;
   }
 
-  /** A link authenticated. A relayed one tells the peer how to reach this node directly
-   *  and starts the move to a direct link; a direct one this end accepted retires the
-   *  relayed links it replaces (router.js `retireRelayed`). */
+  /** A link authenticated. A relayed one starts the move to WebRTC; a direct one this end
+   *  accepted retires the relayed links it replaces (router.js `retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.promote(peerId, link);
     if (!router.routes(link)) return;
-    if (link.relayed) {
-      // The advertised destinations go with the contact secret that reaching them takes; a
-      // node that advertises none sends an empty message, and its secret stays home.
-      const addrs = advertise.length > 0 ? [contactSecret, utf8Encode(advertise.join("\0"))] : [];
-      link.send(concatBytes([Uint8Array.of(KIND_CTL, CTL_ADDRS), ...addrs]));
-      void rtc.upgrade(peerId).catch(() => {});
-    } else if (!link.weDialed) {
+    if (link.relayed) void rtc.upgrade(peerId).catch(() => {});
+    else if (!link.weDialed) {
       router.retireRelayed(peerId);
     }
   }
 
-  /** The transport's own message from a peer (router.js `KIND_CTL`). A relayed link
-   *  carries one address message; a retire closes it once a direct link routes, and
-   *  otherwise leaves it to the idle clock. */
+  /** The transport's own message from a peer (router.js `KIND_CTL`): a retire closes a
+   *  relayed link once a direct one routes, and otherwise leaves it to the idle clock. */
   onControl(peerId, frame, link) {
     const tag = frame[1];
-    const body = frame.subarray(2);
-    if (tag === CTL_ADDRS) {
-      if (!link.relayed || link.addrsSeen) return;
-      link.addrsSeen = true;
-      this.onAddrs(peerId, body);
-    } else if (tag === CTL_RETIRE) {
-      if (link.relayed && router.hasDirect(peerId)) link.close();
-    } else {
-      rtc.receive(peerId, tag, body);
-    }
-  }
-
-  /** A peer linked through a relay says how to reach it directly: `[secret 32][dests]`,
-   *  the destinations NUL-separated, or nothing when it advertises none. Dial the public
-   *  ones, then an address given for it here, in turn and in the background, until one
-   *  authenticates. */
-  onAddrs(peerId, body) {
-    if (body.length > 0) {
-      if (body.length < PK_LEN) return;
-      const dests = utf8Decode(body.subarray(PK_LEN)).split("\0")
-        .filter((d) => d.length <= MAX_DEST_LEN && publicDest(d))
-        .slice(0, MAX_LEARNED_DESTS);
-      this.learned.set(peerId, { secret: body.slice(0, PK_LEN), dests });
-    }
-    void this.upgrade(peerId);
-  }
-
-  async upgrade(peerId) {
-    if (this.upgrading.has(peerId)) return;
-    this.upgrading.add(peerId);
-    try {
-      const learned = this.learned.get(peerId);
-      const given = this.addrs.get(peerId) || { dest: "", secret: null };
-      const dests = learned ? [...learned.dests] : [];
-      if (given.dest !== "" && !given.dest.startsWith(RELAY_SCHEME) && !dests.includes(given.dest)) dests.push(given.dest);
-      // The secret the peer sent, else the one its address was given with.
-      const secret = learned ? learned.secret : given.secret;
-      for (const dest of dests) {
-        if (router.hasDirect(peerId) || router.linkCount(peerId) === 0) return;
-        const link = await this.dialDest(peerId, dest, secret);
-        if (link && (await link.settled)) return;
-      }
-    } finally {
-      this.upgrading.delete(peerId);
-    }
+    if (tag !== CTL_RETIRE) rtc.receive(peerId, tag, frame.subarray(2));
+    else if (link.relayed && router.hasDirect(peerId)) link.close();
   }
 
   /** A link leaving routing, as soon as it closes, not once its teardown has run. */

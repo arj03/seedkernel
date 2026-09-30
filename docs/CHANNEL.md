@@ -363,11 +363,6 @@ callee to the relay and to no one else (RUNTIME §12.7). The relay forwards only
 and cannot pose as either end, but it learns which pairs talk, when and how much, until the
 pair moves to a direct link. A deployment that must hide that runs its own relay.
 
-**Advertising an address hands out the contact secret.** Dialing an advertised address takes
-the node's contact secret, so a node that advertises one sends both to each peer it links
-with through a relay, inside that link's records (RUNTIME §12.7). Each such peer can then pass
-the gate as the node's own peers do. A node that advertises nothing sends neither.
-
 **A recorded msg1 can be replayed once.** Anyone who captures a valid msg1 can replay it and
 draw a msg2. They cannot open it without the ephemeral private key, but the answer itself says
 the holder of that contact secret is at the address replayed to, so a recording tracks the

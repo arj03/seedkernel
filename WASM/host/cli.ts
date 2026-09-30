@@ -19,7 +19,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 /** Every flag the shell accepts. An allowlist, so a mistyped `--polcy` fails instead of
  *  silently booting a deny-all node. */
 const FLAGS = new Set([
-  "policy", "dir", "key", "listen", "peers", "relay", "advertise", "contact-secret",
+  "policy", "dir", "key", "listen", "peers", "relay", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
@@ -200,7 +200,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     throw new Error("--relay: this node's sockets have no TLS, so it cannot reach wss://; use the relay's ws:// address");
   }
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
-  for (const flag of ["transport", "contact-secret", "advertise"]) {
+  for (const flag of ["transport", "contact-secret"]) {
     if (args.has(flag) && !network) {
       throw new Error(`--${flag} requires --listen, --peers or --relay, which enable the network it configures`);
     }
@@ -219,8 +219,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const peers = list(args.get("peers"));
   const transportConfig: JsonObject = {};
   if (peers.length > 0) transportConfig.peers = peers;
-  const advertise = list(args.get("advertise"));
-  if (advertise.length > 0) transportConfig.advertise = advertise;
   if (contactSecretPath !== undefined) {
     transportConfig.contactSecret = dec.decode(mustRead(host, contactSecretPath, "--contact-secret")).trim();
   }

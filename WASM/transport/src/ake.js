@@ -213,7 +213,6 @@ class Link {
     this.relayed = spec.relayed === true;
     this.relay = this.relayed ? relayOrigin(spec.dest) : ""; // its relay's origin
     this.ticket = spec.ticket || "";
-    this.addrsSeen = false; // a relayed link carries one address message (core.js `onControl`)
     // The peer this dial is for (msg2 must verify under it); empty for an accept.
     this.dialedPeerId = spec.dialedPeerId || "";
     // Resolves true once authenticated, false if the link ends first.

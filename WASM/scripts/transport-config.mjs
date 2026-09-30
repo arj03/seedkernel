@@ -23,9 +23,6 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   // Peers to dial, as `pk[.secret]@dest` (core.js `peerRef`). Deployment-specific, so set
   // in LOCAL (§12.6.3).
   peers: Object.freeze([]),
-  // Where this node can be dialed directly, told to peers linked through a relay so they
-  // can move to a direct link. Deployment-specific, so set in LOCAL.
-  advertise: Object.freeze([]),
   // The dialing side's whole handshake deadline.
   handshakeTimeoutMs: 10_000,
   // The shorter clock an accept runs until a msg1 opens under the contact secret.

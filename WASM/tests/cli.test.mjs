@@ -349,19 +349,6 @@ for (const flag of ["--transport", "--contact-secret"]) {
   catch (e) { msg = String(e.message); }
   ok(msg.includes("no TLS"), "--relay wss:// is refused, since no console target speaks TLS");
 }
-// --advertise reaches the transport as typed, and like every transport flag it needs a
-// network to configure.
-{
-  const host = fakeHost(["--key", join(work, "a.key"), "--listen", "127.0.0.1:0",
-    "--advertise", "tcp://203.0.113.5:7000, wss://node.example:443"]);
-  await runCli(host);
-  ok(JSON.stringify(host.stood.transport.config.advertise) === JSON.stringify(["tcp://203.0.113.5:7000", "wss://node.example:443"]),
-    "--advertise reaches the transport as typed");
-  let msg = "";
-  try { await runCli(fakeHost(["--key", join(work, "a2.key"), "--advertise", "tcp://203.0.113.5:7000"])); }
-  catch (e) { msg = String(e.message); }
-  ok(msg.includes("--advertise requires"), "--advertise without a network is refused by name");
-}
 {
   const host = fakeHost(["--key", join(work, "r2.key"), "--relay", "ws://127.0.0.1:1/"], { linkAvailable: false });
   let msg = "";

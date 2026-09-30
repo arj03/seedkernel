@@ -151,7 +151,7 @@
 
 **Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A party that tampered with SDP could bring DTLS up to itself, but could not produce the transcript signature without the peer's key, so the link would never authenticate and never deliver a byte. Signaling travels over the already authenticated link, so no relay sees SDP or candidates and none can offer in a peer's name. For the same reason the data channel needs no contact secret: nobody but the signaled peer can reach it, so neither side has to hold the other's.
 
-**A relayed peer is a key, not a promise.** A relay vouches that a key registered, not that it is anyone the node wants. A call through it goes through the same handshake, contact secret and peer lint as any dial. What a linked peer advertises decides where the node dials next, so only names and public addresses are taken from it.
+**A relayed peer is a key, not a promise.** A relay vouches that a key registered, not that it is anyone the node wants. A call through it goes through the same handshake and contact secret as any dial.
 
 
 **Media is the app's own connection.** Audio and video need a peer connection an app can add tracks to. Lending the transport's would put a platform object back across the seam and its renegotiation back into the host, so an app that wants media opens its own and signals it over its own protocol, authenticated by the channel.
