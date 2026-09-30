@@ -256,8 +256,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  // The URL's path is a room name, which is a credential, so only the relay is printed.
-  if (relay !== undefined) host.log(`  relay  ${/^[a-z]+:\/\/[^/?#]*/i.exec(relay)?.[0] ?? "(unparsed)"}`);
+  if (relay !== undefined) host.log(`  relay  ${relay}`);
   for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
 
   // Operator remedies (§12.5) before the bundle, so a node never briefly installs what it

@@ -36,6 +36,7 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   // long one may take to open its data channel.
   maxRtcNegotiating: 256,
   rtcConnectTimeoutMs: 30_000,
-  // STUN/TURN servers (RTCConfiguration.iceServers). Empty means LAN only.
+  // STUN/TURN servers (RTCConfiguration.iceServers) beside the relay's own STUN (rtc.js).
+  // Empty asks the relay alone.
   iceServers: Object.freeze([]),
 });

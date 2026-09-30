@@ -211,6 +211,7 @@ class Link {
     // A splice through a relay (relay.js), rather than a path of its own to the peer, and
     // the ticket a dial called it with.
     this.relayed = spec.relayed === true;
+    this.relay = this.relayed ? relayOrigin(spec.dest) : ""; // its relay's origin
     this.ticket = spec.ticket || "";
     this.addrsSeen = false; // a relayed link carries one address message (core.js `onControl`)
     // The peer this dial is for (msg2 must verify under it); empty for an accept.
@@ -333,9 +334,6 @@ class Link {
       this.abort();
     } else if (t - this.lastSeen < linkIdleTimeoutMs) {
       this.due = this.lastSeen + linkIdleTimeoutMs;
-    } else if (relays.isMember(this.peerId) && router.linkCount(this.peerId) === 1 && router.routes(this)) {
-      // The last way to a member of this node's room stays: the room is who it keeps.
-      this.due = t + linkIdleTimeoutMs;
     } else {
       this.close();
     }

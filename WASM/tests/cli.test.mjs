@@ -332,9 +332,9 @@ for (const flag of ["--transport", "--contact-secret"]) {
   ok(msg.includes("there is nothing to dial from"), "--peers with no transport claimant explains itself");
 }
 // --relay reaches the transport's `relay` op as typed, and a node on a relay serves through
-// it without a listener. Only the relay is printed: the room in its path is a credential.
+// it without a listener.
 {
-  const url = "ws://relay.example:80/secret-room";
+  const url = "ws://relay.example:80";
   const calls = [];
   const host = fakeHost(["--key", join(work, "r.key"), "--relay", url], {
     shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(new Uint8Array(0)); } },
@@ -343,10 +343,9 @@ for (const flag of ["--transport", "--contact-secret"]) {
   ok(calls.length === 1 && calls[0].startsWith("\x05relay") && calls[0].endsWith(url), "--relay is the transport's relay op, unread");
   ok(host.stood.transport !== false, "--relay enables the network");
   ok(result.serving, "a node on a relay keeps serving without a listener");
-  ok(host.lines.some((l) => l === "  relay  ws://relay.example:80") && !host.lines.some((l) => l.includes("secret-room")),
-    "the relay is printed, the room is not");
+  ok(host.lines.some((l) => l === "  relay  ws://relay.example:80"), "the relay is printed");
   let msg = "";
-  try { await runCli(fakeHost(["--key", join(work, "r3.key"), "--relay", "wss://relay.example/room"])); }
+  try { await runCli(fakeHost(["--key", join(work, "r3.key"), "--relay", "wss://relay.example"])); }
   catch (e) { msg = String(e.message); }
   ok(msg.includes("no TLS"), "--relay wss:// is refused, since no console target speaks TLS");
 }

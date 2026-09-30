@@ -175,7 +175,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys, meet in rooms and reach each other before moving to a direct link, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), which seedchat's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys and reach each other before moving to a direct link, and where the apps meet peers in rooms, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), which seedchat's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
 
 ## The rest of the spec
 

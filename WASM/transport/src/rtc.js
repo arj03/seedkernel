@@ -45,12 +45,13 @@ class RtcCtlLink {
 
 class Rtc {
   constructor() {
-    // ICE servers (STUN/TURN) as the platform takes them; empty offers host candidates only.
+    // ICE servers (STUN/TURN) as the platform takes them, beside the relay's own STUN
+    // (`configFor`).
     const iceServers = LOCAL.iceServers ?? APP.iceServers ?? [];
     if (!Array.isArray(iceServers) || iceServers.some((s) => typeof s !== "object" || s === null)) {
       throw new Error("transport: config iceServers must be an array of objects");
     }
-    this.configSuffix = iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
+    this.iceServers = iceServers;
     this.maxNegotiating = policy("maxRtcNegotiating");
     // How long a peer connection may take to open its data channel: ICE, DTLS and SCTP.
     this.connectTimeoutMs = policy("rtcConnectTimeoutMs");
@@ -63,6 +64,15 @@ class Rtc {
     // Signals are applied one at a time, in arrival order: records are not, and a
     // candidate must never reach the peer connection ahead of its description.
     this.signals = Promise.resolve();
+  }
+
+  /** The RTCConfiguration suffix for a negotiation with `peer`: STUN at the relay it is
+   *  linked through, which already sees this node's address, so asking it tells no one
+   *  new, then the configured servers. */
+  configFor(peer) {
+    const relay = router.relayOf(peer);
+    const iceServers = relay ? [{ urls: `stun:${relayHost(relay)}:${RELAY_STUN_PORT}` }, ...this.iceServers] : this.iceServers;
+    return iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
   }
 
   /** Negotiations that have not produced an authenticated link; the cap counts these. */
@@ -120,7 +130,7 @@ class Rtc {
     if (this.pending() >= this.maxNegotiating) return null;
     const e = { peer, offer, sid, ctl: 0, data: null, gone: false, due: Infinity };
     this.byPeer.set(peer, e);
-    const opened = await netLinkOpen((offer ? "rtc:offer" : "rtc:answer") + this.configSuffix);
+    const opened = await netLinkOpen((offer ? "rtc:offer" : "rtc:answer") + this.configFor(peer));
     const early = this.early.get(opened.linkId);
     this.early.delete(opened.linkId);
     if (e.gone || this.byPeer.get(peer) !== e || opened.linkId === 0) {

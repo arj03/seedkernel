@@ -234,12 +234,12 @@ class FakeWebRtc {
   pcs = new Map();
   made = [];
   next = 1;
-  factory = () => {
+  factory = (config) => {
     const world = this;
     const e = emitter();
     const id = this.next++;
     const pc = {
-      ...e, id, peer: null, closed: false, connectionState: "new", localDescription: null, remote: null, dc: null,
+      ...e, id, config, peer: null, closed: false, connectionState: "new", localDescription: null, remote: null, dc: null,
       candidates: [],
       createDataChannel() {
         const d = emitter();
@@ -282,14 +282,13 @@ class FakeWebRtc {
 }
 
 
-const relayState = async (node) => (await transportOp(node, new OpArgs("relayState")))[0];
 const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));
 
 /** A node whose sockets are the relay and the fake world, and nothing else. `made` lists
  *  the peer connections this node opened. */
 async function rtcNode(relay, world, opts = {}) {
   const made = [];
-  const factory = () => { const pc = world.factory(); made.push(pc); return pc; };
+  const factory = (config) => { const pc = world.factory(config); made.push(pc); return pc; };
   const channels = combineChannels(relay.factory(), new RtcNetwork({ peerConnectionFactory: factory }));
   const node = await makeTransportHost({ channels, ...opts });
   node.made = made;
@@ -302,18 +301,25 @@ function sortedIdentities(n) {
     .sort((a, b) => Buffer.compare(Buffer.from(a.publicKey), Buffer.from(b.publicKey)));
 }
 
-await test("two nodes in one room link through the relay, then move to WebRTC", async (keep) => {
-  const relay = new FakeRelay(), world = new FakeWebRtc();
+/** Register both on `relay` and link `a` to `b` through it. */
+async function relayLink(a, b, origin = "ws://relay") {
+  for (const n of [a, b]) await joinRelay(n, origin);
+  await transportOp(a, new OpArgs("addr").blob(Buffer.from(b.peerId, "hex")).blob(new Uint8Array(32)).text("relay+" + origin));
+  await a.request(b.peerId, PROTO, Uint8Array.of(0));
+}
+
+await test("two nodes linked through the relay move to WebRTC", async (keep) => {
+  const relay = new FakeRelay("relay:8080"), world = new FakeWebRtc();
   const A = keep(await rtcNode(relay, world));
   const B = keep(await rtcNode(relay, world));
-  await joinRelay(A, "ws://relay/room");
-  await joinRelay(B, "ws://relay/room");
-  await until(async () => (await relayState(A)) === 1, 2000, "A registered");
+  await relayLink(A, B, "ws://relay:8080");
   await until(async () => (await linkedPeers(A)).includes(B.peerId) && (await linkedPeers(B)).includes(A.peerId),
     4000, "the link");
   await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the splice to be retired");
   assert(world.made.length === 2, `one peer connection per side, got ${world.made.length}`);
   assert(world.made.every((pc) => pc.candidates.length >= 1), "candidates went over the relayed link and in");
+  assert(world.made.every((pc) => pc.config?.iceServers?.[0]?.urls === "stun:relay:3478"),
+    "each asks the relay it met its peer through for its address, and no one else");
   const before = relay.spliceBytes;
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
   assert(resp.length === 3 && resp[2] === 9, "a request crosses the data channel");
@@ -328,7 +334,7 @@ await test("WebRTC runs without contact secrets: a callee offers to a caller it 
   const calleeSecret = new Uint8Array(32).fill(3);
   const B = keep(await rtcNode(relay, world, { identity: small, contactSecret: calleeSecret }));
   const A = keep(await rtcNode(relay, world, { identity: large, contactSecret: new Uint8Array(32).fill(4) }));
-  await joinRelay(B, "ws://relay/");
+  await joinRelay(B, "ws://relay");
   await transportOp(A, new OpArgs("addr").blob(Buffer.from(B.peerId, "hex")).blob(calleeSecret).text("relay+ws://relay"));
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
   assert(resp[0] === 1, "the relayed link carries a request");
@@ -345,8 +351,7 @@ await test("a peer without WebRTC declines, and the relayed link stays", async (
   const A = keep(await rtcNode(relay, world, { identity: small }));
   // The larger key answers, and has no rtc: socket factory at all.
   const B = keep(await makeTransportHost({ identity: large, channels: relay.factory() }));
-  await joinRelay(A, "ws://relay/room");
-  await joinRelay(B, "ws://relay/room");
+  await relayLink(A, B);
   await until(async () => (await linkedPeers(A)).includes(B.peerId), 4000, "the relayed link");
   await until(() => A.made.length === 1 && A.made[0].closed, 2000, "the declined offer to be dropped");
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
@@ -363,7 +368,7 @@ await test("negotiations are capped, and one that never connects is dropped on i
   const A = keep(await rtcNode(relay, world, { identity: small, transportConfig: { maxRtcNegotiating: 1, rtcConnectTimeoutMs: 150 } }));
   const others = [];
   for (const identity of rest) others.push(keep(await rtcNode(relay, world, { identity })));
-  for (const n of [A, ...others]) await joinRelay(n, "ws://relay/room");
+  for (const n of others) await relayLink(A, n);
   await until(async () => (await linkedPeers(A)).length === 2, 4000, "A's relayed links");
   await settle(50);
   assert(A.made.length === 1, `the cap bounds the peer connections A opens, got ${A.made.length}`);

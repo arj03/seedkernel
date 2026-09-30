@@ -1,8 +1,8 @@
 // An in-process relay speaking the relay wire the transport bundle speaks (transport/src/
-// relay.js; the real server is seedrelay): signed registration, room membership, calls and
-// splices. Its links are whole-message `RawLink`s, as a browser WebSocket's are. It checks
-// registrations against the host's signing domain, so a wrong format fails here as it
-// would against seedrelay.
+// relay.js; the real server is seedrelay): signed registration, calls and splices. Its
+// links are whole-message `RawLink`s, as a browser WebSocket's are. It checks registrations
+// against the host's signing domain, so a wrong format fails here as it would against
+// seedrelay.
 
 import { createPublicKey, randomBytes, verify } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -13,8 +13,7 @@ const { DOMAIN_LINK_SCOPE } = await import(pathToFileURL(join(root, "build/servi
 
 const DOMAIN_RELAY = Buffer.from("seedkernel-relay-register-v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
-const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_MEMBERS = 0x02, T_JOINED = 0x03, T_LEFT = 0x04,
-  T_CALL = 0x05, T_UNREACHABLE = 0x06;
+const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_CALL = 0x05, T_UNREACHABLE = 0x06;
 
 export class FakeRelay {
   /** `authority` is the host[:port] the relay's URLs name, which registrations sign;
@@ -40,9 +39,9 @@ export class FakeRelay {
   }
 
   connect(dest) {
-    const m = /^wss?:\/\/([^/?#]+)(\/[^?#]*)?(?:\?splice=([0-9a-f]{32}))?$/.exec(dest);
+    const m = /^wss?:\/\/([^/?#]+)\/v1\/(?:\?splice=([0-9a-f]{32}))?$/.exec(dest);
     if (!m || m[1] !== this.authority) return null;
-    return m[3] ? this.spliceEnd(m[3]) : this.control((m[2] ?? "/").slice(1));
+    return m[2] ? this.spliceEnd(m[2]) : this.control();
   }
 
   /** A whole-message link: `deliver` hands it bytes, `kill` drops it from this side. */
@@ -60,19 +59,13 @@ export class FakeRelay {
     return end;
   }
 
-  control(room) {
-    const c = { room, key: null, nonce: randomBytes(32) };
+  control() {
+    const c = { key: null, nonce: randomBytes(32) };
     c.end = this.link((b) => this.onControl(c, Buffer.from(b)));
     c.end.gone = () => this.leave(c);
     this.controls.add(c);
     c.end.deliver(Buffer.concat([Buffer.of(T_CHALLENGE), c.nonce]));
     return c.end.raw;
-  }
-
-  roomKeys(room, except) {
-    const keys = new Set();
-    for (const o of this.controls) if (o.room && o.room === room && o.key && o.key !== except) keys.add(o.key);
-    return [...keys];
   }
 
   onControl(c, b) {
@@ -81,23 +74,14 @@ export class FakeRelay {
       const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, pk]), format: "der", type: "spki" });
       const msg = Buffer.concat([DOMAIN_LINK_SCOPE, DOMAIN_RELAY, Buffer.from(this.signedFor), c.nonce]);
       if (!verify(null, msg, key, sig)) { c.end.kill(); return; }
-      const hex = pk.toString("hex");
-      const known = this.roomKeys(c.room, hex);
-      const already = c.room && [...this.controls].some((o) => o !== c && o.room === c.room && o.key === hex);
-      c.key = hex;
-      this.registered.set(hex, c);
+      c.key = pk.toString("hex");
+      this.registered.set(c.key, c);
       c.end.deliver(Buffer.of(T_REGISTER));
-      if (!c.room) return;
-      c.end.deliver(Buffer.concat([Buffer.of(T_MEMBERS), ...known.map((k) => Buffer.from(k, "hex"))]));
-      if (already) return;
-      for (const o of this.controls) {
-        if (o.room === c.room && o.key && o.key !== hex) o.end.deliver(Buffer.concat([Buffer.of(T_JOINED), pk]));
-      }
     } else if (b[0] === T_CALL && b.length === 49 && c.key) {
       this.calls++;
       const to = b.subarray(1, 33), ticket = b.subarray(33);
       const callee = this.registered.get(to.toString("hex"));
-      if (!callee || callee === c || this.pending.has(ticket.toString("hex"))) {
+      if (!callee || callee.key === c.key || this.pending.has(ticket.toString("hex"))) {
         c.end.deliver(Buffer.concat([Buffer.of(T_UNREACHABLE), to, ticket]));
         return;
       }
@@ -110,14 +94,9 @@ export class FakeRelay {
 
   leave(c) {
     this.controls.delete(c);
-    if (c.key && this.registered.get(c.key) === c) {
-      this.registered.delete(c.key);
-      for (const o of this.controls) if (o.key === c.key) this.registered.set(c.key, o);
-    }
-    if (!c.room || !c.key || this.roomKeys(c.room).includes(c.key)) return;
-    for (const o of this.controls) {
-      if (o.room === c.room && o.key) o.end.deliver(Buffer.concat([Buffer.of(T_LEFT), Buffer.from(c.key, "hex")]));
-    }
+    if (!c.key || this.registered.get(c.key) !== c) return;
+    this.registered.delete(c.key);
+    for (const o of this.controls) if (o.key === c.key) this.registered.set(c.key, o);
   }
 
   spliceEnd(ticket) {

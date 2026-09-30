@@ -21,6 +21,8 @@ class Router {
 
   linkCount(peerId) { const p = this.pools.get(peerId); return p ? p.links.length : 0; }
   hasDirect(peerId) { const p = this.pools.get(peerId); return p !== undefined && p.direct > 0; }
+  /** The origin of the relay a peer's relayed link runs through, "" for none. */
+  relayOf(peerId) { const p = this.pools.get(peerId); return p?.links.find((l) => l.relay)?.relay ?? ""; }
   /** Whether `link` is routed, rather than held or lost to a tie-break. */
   routes(link) { const p = this.pools.get(link.peerId); return p !== undefined && p.links.includes(link); }
 
