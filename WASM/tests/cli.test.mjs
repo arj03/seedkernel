@@ -331,6 +331,60 @@ for (const flag of ["--transport", "--contact-secret"]) {
   try { await runCli(host); } catch (e) { msg = String(e.message); }
   ok(msg.includes("there is nothing to dial from"), "--peers with no transport claimant explains itself");
 }
+// --relay reaches the transport's `relay` op as typed, and a node on a relay serves through
+// it without a listener.
+{
+  const url = "ws://relay.example:80";
+  const calls = [];
+  const host = fakeHost(["--key", join(work, "r.key"), "--relay", url], {
+    shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(Uint8Array.of(1)); } },
+  });
+  const result = await runCli(host);
+  ok(calls.length === 1 && calls[0].startsWith("\x05relay") && calls[0].endsWith(url), "--relay is the transport's relay op, unread");
+  ok(host.stood.transport !== false, "--relay enables the network");
+  ok(result.serving, "a node on a relay keeps serving without a listener");
+  ok(host.lines.some((l) => l === "  relay  ws://relay.example:80 (registered)"), "the relay is printed, as registered");
+  // A relay that is down, or refuses the node (a wrong secret), boots the node all the same
+  // and says so: the transport keeps redialing.
+  const down = fakeHost(["--key", join(work, "r4.key"), "--relay", url], {
+    shell: { call: () => Promise.resolve(Uint8Array.of(2)) },
+  });
+  await runCli(down);
+  ok(down.lines.some((l) => l === "  relay  ws://relay.example:80 (not registered, redialing)"),
+    "a registration that did not take is printed as such");
+  for (const [flag, value] of [["--relay", "wss://relay.example"], ["--peers", "ab".repeat(32) + "@relay+wss://relay.example:443"]]) {
+    let msg = "";
+    try { await runCli(fakeHost(["--key", join(work, "r3.key"), flag, value])); }
+    catch (e) { msg = String(e.message); }
+    ok(msg.includes(flag + ":") && msg.includes("no TLS"), `${flag} with a wss:// address is refused, since no console target speaks TLS`);
+  }
+}
+// --relay-secret names a file, as --contact-secret does, and its contents follow the URL in
+// the `relay` op, unread.
+{
+  const url = "ws://relay.example:80";
+  const secretPath = join(work, "relay.secret");
+  const secret = "5ec7".repeat(16);
+  writeFileSync(secretPath, secret + "\n");
+  const calls = [];
+  const host = fakeHost(["--key", join(work, "rs.key"), "--relay", url, "--relay-secret", secretPath], {
+    shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(new Uint8Array(0)); } },
+  });
+  await runCli(host);
+  ok(calls.length === 1 && calls[0].includes(url) && calls[0].endsWith("\x00\x00\x00\x40" + secret),
+    "--relay-secret follows the URL in the relay op, as the file says it, less its line ending");
+  ok(!host.lines.some((l) => l.includes(secret)), "the secret is never printed");
+  let msg = "";
+  try { await runCli(fakeHost(["--key", join(work, "rs2.key"), "--peers", "", "--relay-secret", secretPath])); }
+  catch (e) { msg = String(e.message); }
+  ok(msg.includes("--relay-secret requires --relay"), "--relay-secret without --relay is refused");
+}
+{
+  const host = fakeHost(["--key", join(work, "r2.key"), "--relay", "ws://127.0.0.1:1/"], { linkAvailable: false });
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.includes("nothing to join it with"), "--relay with no transport claimant explains itself");
+}
 
 console.log("\n— the load line —");
 // One format on every target, so the line an operator reads is the one the native tests

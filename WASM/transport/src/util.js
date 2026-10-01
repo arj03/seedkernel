@@ -125,6 +125,8 @@ Reader.prototype.blob = function () {
   this.off += n;
   return s;
 };
+/** Whether an optional trailing field follows. */
+Reader.prototype.more = function () { return this.off < this.b.length; };
 
 // ── the caller prefix and op envelope ───────────────────────────────────────
 // Injected from services/op-frame.ts by scripts/guest-source.mjs; assembly fails without it.

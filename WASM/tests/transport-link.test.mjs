@@ -1057,9 +1057,9 @@ await test("SEVER: driver.reset() kills live links and keeps the binding owned",
 });
 
 await test("CONTACT SECRET: it never appears on the wire", async (keep) => {
-  // It is mixed into the key schedule and never transmitted, which also makes it a quantum
-  // hedge: an adversary who records today and breaks X25519 later still needs a value that
-  // was never sent.
+  // It is mixed into the key schedule and no handshake carries it, which also makes it a
+  // quantum hedge: an adversary who records a handshake and breaks X25519 later still needs
+  // a value that handshake never sent.
   const st = keep(await upPair());
   const wire = [...st.chans[0].sent, ...st.chans[1].sent].join("");
   assert(!wire.includes(hexOf(CONTACT)), "contact secret leaked onto the wire");

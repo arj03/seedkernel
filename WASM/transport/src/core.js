@@ -42,8 +42,9 @@ const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
 /** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is that
- *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp). The
- *  host never reads it (§12.8). */
+ *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp), or
+ *  `relay+ws[s]://host:port` for a peer reached through that relay. The host never reads
+ *  it (§12.8). */
 function peerRef(spec) {
   const bad = (why) => new Error(`transport: config peers entry ${JSON.stringify(spec)}: ${why}`);
   if (typeof spec !== "string" || spec.indexOf("@") < 0) throw bad("want pk[.secret]@dest");
@@ -55,6 +56,9 @@ function peerRef(spec) {
   const dest = where.includes("://") ? where : "tcp://" + where;
   const m = /^[a-z][a-z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^\s:/[\]]+):(\d{1,5})(?:\/\S*)?$/i.exec(dest);
   if (!m || Number(m[1]) < 1 || Number(m[1]) > 65535) throw bad("the destination must be [scheme://]host:port[/path]");
+  if (dest.startsWith(RELAY_SCHEME) && !relayOrigin(dest.slice(RELAY_SCHEME.length))) {
+    throw bad("a relay must be relay+ws:// or relay+wss://");
+  }
   return { peer: fromHex(pk), secret: secret === undefined ? ZERO32 : fromHex(secret), dest };
 }
 const configuredPeers = LOCAL.peers ?? APP.peers;
@@ -138,7 +142,7 @@ function onWake() {
     const t = now();
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
-    wakeBy(rtc.onWake(t));
+    wakeBy(relays.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
     walking = false;
@@ -255,7 +259,7 @@ class Core {
   }
 
   /** Record one peer: where to reach it and its contact secret. An empty `dest` is a peer
-   *  this node cannot dial but `ready` still waits for (a WebRTC peer from the relay). */
+   *  this node cannot dial but `ready` still waits for. */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }
@@ -275,18 +279,28 @@ class Core {
     if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const opened = await netLinkOpen(addr.dest);
-      if (opened.linkId === 0) return; // no route
-      this.openLink({
-        linkId: opened.linkId,
-        stream: opened.stream,
-        dest: addr.dest,
-        weDialed: true,
-        linkSecret: addr.secret,
-        limiter: null,
-        dialedPeerId: peerId,
-      });
+      if (!(await this.dialDest(peerId, addr.dest, addr.secret))) return; // no route
     }
+  }
+
+  /** Open one outbound link to `peerId` at `dest`, through the relay a `relay+` one names.
+   *  The link, or null for no route. */
+  async dialDest(peerId, dest, secret) {
+    const relayed = dest.startsWith(RELAY_SCHEME);
+    const opened = relayed
+      ? await relays.call(peerId, relayOrigin(dest.slice(RELAY_SCHEME.length)))
+      : { ...(await netLinkOpen(dest)), dest };
+    if (opened.linkId === 0) return null;
+    return this.openLink({
+      linkId: opened.linkId,
+      stream: opened.stream,
+      dest: opened.dest,
+      weDialed: true,
+      linkSecret: secret,
+      limiter: null,
+      dialedPeerId: peerId,
+      relayed,
+    });
   }
 
   /** An accepted channel or a fresh dial; `spec` passes through to `Link` whole. */
@@ -294,7 +308,7 @@ class Core {
     const link = new Link({
       ...spec,
       onAuth: (pid, l) => this.onAuth(pid, l),
-      onFrame: (pid, frame, pk) => reqres.onFrame(pid, frame, pk),
+      onFrame: (pid, frame, pk, l) => (frame[0] === KIND_CTL ? this.onControl(pid, frame, l) : reqres.onFrame(pid, frame, pk)),
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);
@@ -303,9 +317,21 @@ class Core {
     return link;
   }
 
+  /** A link authenticated. A relayed one starts the move to WebRTC; a direct one this end
+   *  accepted retires the relayed links it replaces (router.js `retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
-    router.promote(peerId, link);
+    if (!router.promote(peerId, link)) return;
+    if (link.relayed) void rtc.upgrade(peerId).catch(() => {});
+    else if (!link.weDialed) router.retireRelayed(peerId);
+  }
+
+  /** The transport's own message from a peer (router.js `KIND_CTL`): a retire closes a
+   *  relayed link once a direct one routes, and otherwise leaves it to the idle clock. */
+  onControl(peerId, frame, link) {
+    const tag = frame[1];
+    if (tag !== CTL_RETIRE) rtc.receive(peerId, tag, frame.subarray(2));
+    else if (link.relayed && router.hasDirect(peerId)) link.close();
   }
 
   /** A link leaving routing, as soon as it closes, not once its teardown has run. */
@@ -317,7 +343,9 @@ class Core {
     const peerId = link.peerId || link.dialedPeerId;
     if (peerId) {
       for (const frame of link.takeQueued()) this.place(peerId, frame);
-      if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) reqres.peerDown(peerId);
+      if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) {
+        reqres.peerDown(peerId);
+      }
     }
     // Left in `linksById`: `linkClosed` still has to ask why it closed.
   }
@@ -368,6 +396,7 @@ const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
 const rtc = new Rtc();
+const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
@@ -477,15 +506,21 @@ entry("addr", (r) => {
   core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
 
-/** Join the WebRTC signaling relay at this `ws://`/`wss://` URL, leaving any other; empty
- *  leaves (rtc.js). */
-entry("relay", async (r) => {
-  await rtc.join(utf8Decode(r.blob()));
-  return NOTHING;
+/** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through
+ *  it, leaving any other; empty leaves (relay.js). An optional second text is the relay's
+ *  secret, for a private one. Answers `relayState` as it stands once the attempt is over.
+ *  Deferred: registering waits on the relay's challenge, which arrives in a later
+ *  invocation. */
+entry("relay", (r) => {
+  const d = defer();
+  const url = utf8Decode(r.blob());
+  const secret = r.more() ? r.blob() : null;
+  relays.join(url, secret).then(() => d.settle(Uint8Array.of(relays.state())), d.fail);
+  return d.promise;
 });
 
-/** `[state u8]`: 0 no relay joined, 1 its link is up, 2 joined and waiting to redial. */
-entry("relayState", () => Uint8Array.of(rtc.state()));
+/** `[state u8]`: 0 no relay, 1 registered on it, 2 waiting to redial it. */
+entry("relayState", () => Uint8Array.of(relays.state()));
 
 /** Rotate the inbound contact secret (§12.6.3). */
 entry("contact", (r) => {

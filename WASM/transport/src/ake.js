@@ -208,8 +208,14 @@ class Link {
     this.linkId = spec.linkId;
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
+    // A splice through a relay (relay.js), rather than a path of its own to the peer.
+    this.relayed = spec.relayed === true;
+    this.relay = this.relayed ? relayOrigin(spec.dest) : ""; // its relay's origin
     // The peer this dial is for (msg2 must verify under it); empty for an accept.
     this.dialedPeerId = spec.dialedPeerId || "";
+    // The one peer this accept is for (msg3 must name it); empty takes whoever
+    // authenticates.
+    this.acceptPeerId = spec.acceptPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
@@ -661,9 +667,10 @@ class Link {
     if (w3.length !== M3_LEN) { this.stall(); return; }
     const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
-    // The lint, on a verified key. It closes instead of stalling, since the dialer already
-    // verified this node at msg2 (§12.6).
-    if (!admits(idI)) { this.abort(true); return; }
+    // The lint, on a verified key, and the one peer this accept is for, if it has one. It
+    // closes instead of stalling, since the dialer already verified this node at msg2
+    // (§12.6).
+    if (!admits(idI) || (this.acceptPeerId && toHex(idI) !== this.acceptPeerId)) { this.abort(true); return; }
     this.peerPubkey = idI; this.peerId = toHex(idI);
     this.th = await hash(this.th, w3);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
@@ -735,7 +742,7 @@ class Link {
     if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
     // Not awaited, so the next record never waits on an answer. Both forms of the peer's
     // id travel: hex for routing, bytes for attribution.
-    this.onFrame(this.peerId, r.pt, this.peerPubkey);
+    this.onFrame(this.peerId, r.pt, this.peerPubkey, this);
   }
 
   /** The socket went away. */
