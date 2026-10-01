@@ -133,7 +133,7 @@
 
 **Registration is signed.** Anyone could otherwise register a key and draw its calls. Such a caller would get only msg1, which names no one, and could not produce msg2's signature, so it would be denial of service, not impersonation. It still costs only one signature. The signed message names the relay's authority, and a relay accepts only its own names, never the Host a socket claims, so one relay cannot pass another's nonce through, and starts with a transport tag (`DOMAIN_relay`) beside `DOMAIN_channel` inside the host's link scope, so neither format's signature can stand for the other's.
 
-**Tickets decide who can open a splice.** A ticket is a random 16-byte name for one splice. The caller picks one and sends it with its call; the relay gives the callee a different one, on the callee's control link only. Each end opens its splice socket with its own ticket, and the relay joins the two. So only the two parties to a call can open its ends, and a ticket the relay never handed out opens nothing.
+**Tickets decide who can open a splice.** A ticket is a random 16-byte name for one splice. The caller picks one and sends it with its call; the relay gives the callee a different one, on the callee's control link only. Each end opens its splice socket with its own ticket, and the relay joins the two. So only the two parties to a call can open its ends, and a ticket the relay never handed out opens nothing. That refusal is also how a caller learns its callee is not there, so the transport reads no separate notice of it.
 
 **What a splice carries is the relay's to meter.** Keys cost nothing to make, so one party holding two keys can call itself and use the splice as a free pipe. seedrelay limits what splices carry per client address, and charges both sockets of a splice to the caller, who asked for it; the two tickets are how it tells the ends apart.
 
@@ -151,10 +151,11 @@
 
 **No bounds of its own.** Every byte of negotiation crosses a link, so the driver's link table, outbound custody and read windows already own it. A second set of caps would bound the same bytes twice, in a place a transport cannot tune.
 
-**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A party that tampered with SDP could bring DTLS up to itself, but could not produce the transcript signature without the peer's key, so the link would never authenticate and never deliver a byte. Signaling travels over the already authenticated link, so no relay sees SDP or candidates and none can offer in a peer's name. For the same reason the data channel needs no contact secret: nobody but the signaled peer can reach it, so neither side has to hold the other's.
+**Identity is proven in-channel.** The handshake runs inside the data channel, which is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` at the signaling layer (RFC 8827 §5.6.4). A party that tampered with SDP could bring DTLS up to itself, but could not produce the transcript signature without the peer's key, so the link would never authenticate and never deliver a byte. Signaling travels over the already authenticated link, so no relay sees SDP or candidates and none can offer in a peer's name. For the same reason the data channel needs no contact secret: nobody but the signaled peer can reach it, so neither side has to hold the other's. The answering side still takes that peer's key and no other, or a peer could bring a second key past a contact secret it never held.
+
+**A lost connection is redialed, not restarted.** An ICE restart needs a new offer to reach the peer, and once the splice is retired the only link left is the one whose path was lost. Keeping a splice open for that would hold a relay socket for every direct pair, so the transport lets the connection fail and dials through the relay again.
 
 **A relayed peer is a key, not a promise.** A relay vouches that a key registered, not that it is anyone the node wants. A call through it goes through the same handshake and contact secret as any dial.
-
 
 **Media is the app's own connection.** Audio and video need a peer connection an app can add tracks to. Lending the transport's would put a platform object back across the seam and its renegotiation back into the host, so an app that wants media opens its own and signals it over its own protocol, authenticated by the channel.
 

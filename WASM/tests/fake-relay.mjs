@@ -54,10 +54,14 @@ export class FakeRelay {
     return m[2] ? this.spliceEnd(m[2]) : this.control();
   }
 
-  /** A whole-message link: `deliver` hands it bytes, `kill` drops it from this side. */
+  /** A whole-message link: `deliver` hands it bytes, `delay` ms late for a slow path, and
+   *  `kill` drops it from this side. */
   link(onSend) {
-    const end = { msg: null, cls: null, dead: false, queued: [] };
-    end.deliver = (b) => queueMicrotask(() => { if (end.dead) return; if (end.msg) end.msg(Uint8Array.from(b)); else end.queued.push(b); });
+    const end = { msg: null, cls: null, dead: false, queued: [], delay: 0 };
+    end.deliver = (b) => {
+      const run = () => { if (end.dead) return; if (end.msg) end.msg(Uint8Array.from(b)); else end.queued.push(b); };
+      if (end.delay > 0) setTimeout(run, end.delay); else queueMicrotask(run);
+    };
     end.kill = () => { if (end.dead) return; end.dead = true; end.gone?.(); queueMicrotask(() => end.cls?.()); };
     end.raw = {
       send: (b) => { if (!end.dead) onSend(Uint8Array.from(b)); },

@@ -208,15 +208,14 @@ class Link {
     this.linkId = spec.linkId;
     this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
-    // A splice through a relay (relay.js), rather than a path of its own to the peer, and
-    // the ticket a dial called it with.
+    // A splice through a relay (relay.js), rather than a path of its own to the peer.
     this.relayed = spec.relayed === true;
     this.relay = this.relayed ? relayOrigin(spec.dest) : ""; // its relay's origin
-    this.ticket = spec.ticket || "";
     // The peer this dial is for (msg2 must verify under it); empty for an accept.
     this.dialedPeerId = spec.dialedPeerId || "";
-    // Resolves true once authenticated, false if the link ends first.
-    this.settled = new Promise((settle) => { this.settle = settle; });
+    // The one peer this accept is for (msg3 must name it); empty takes whoever
+    // authenticates.
+    this.acceptPeerId = spec.acceptPeerId || "";
     this.source = spec.source;               // remoteAddr for the limiter, if any
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
@@ -405,7 +404,6 @@ class Link {
   end(farewell, defensive) {
     if (this.closed) return;
     this.closed = true;
-    this.settle(false);
     this.closedLocally = true;
     if (defensive) this.aborted = true;
     this.severWire();
@@ -540,7 +538,6 @@ class Link {
     this.onAuth(this.peerId, this);
     // The tie-break may have closed this link, handing its queue to the winner.
     if (this.closed) return;
-    this.settle(true);
     for (const frame of this.takeQueued()) await this.wireRecord(frame);
   }
 
@@ -670,9 +667,10 @@ class Link {
     if (w3.length !== M3_LEN) { this.stall(); return; }
     const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
-    // The lint, on a verified key. It closes instead of stalling, since the dialer already
-    // verified this node at msg2 (§12.6).
-    if (!admits(idI)) { this.abort(true); return; }
+    // The lint, on a verified key, and the one peer this accept is for, if it has one. It
+    // closes instead of stalling, since the dialer already verified this node at msg2
+    // (§12.6).
+    if (!admits(idI) || (this.acceptPeerId && toHex(idI) !== this.acceptPeerId)) { this.abort(true); return; }
     this.peerPubkey = idI; this.peerId = toHex(idI);
     this.th = await hash(this.th, w3);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
@@ -751,7 +749,6 @@ class Link {
   onChannelClosed() {
     if (this.closed) return;
     this.closed = true;
-    this.settle(false);
     this.teardown();
     this.onClose(this);
   }

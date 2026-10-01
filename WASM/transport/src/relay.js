@@ -31,8 +31,9 @@ const RELAY_STUN_PORT = 3478;
 //
 // A control socket is `<origin>/v1/`, a splice socket `<origin>/v1/?splice=<ticket hex>`:
 // the caller's under the ticket it called with, the callee's under the one its `incoming`
-// names. The relay joins the two and forwards what one sends to the other.
-const R_CHALLENGE = 0x00, R_REGISTER = 0x01, R_CALL = 0x05, R_UNREACHABLE = 0x06;
+// names. The relay joins the two and forwards what one sends to the other. `unreachable`
+// is not read: the relay also refuses that call's splice socket, which fails the dial.
+const R_CHALLENGE = 0x00, R_REGISTER = 0x01, R_CALL = 0x05;
 
 // The registration's format tag: a second format under the host's link scope, beside
 // DOMAIN_CHANNEL, so neither signature can stand for the other.
@@ -43,9 +44,11 @@ const DOMAIN_RELAY = utf8Encode("seedkernel-relay-register-v1\0");
 // after the signature: proof of its secret that never sends it, and is good on this socket
 // only, since the signature is over its nonce. BLAKE2b cannot be length-extended, so
 // hashing the secret in needs no HMAC around it. Unkeyed, as the relay's Node has no keyed
-// BLAKE2b. seedrelay's tag. Only the home relay, the one the secret was given with, gets
-// the MAC: a relay this node only calls through could test guesses at the secret against
-// it. A relay without secrets ignores the MAC.
+// BLAKE2b. seedrelay's tag. Whoever sees a registration can test guesses at the secret
+// against its MAC, and on ws:// that is anyone on the path, so the secret has to be too
+// long and too random to guess (seedrelay refuses a short one). For the same reason only
+// the home relay, the one the secret was given with, gets the MAC, never a relay this node
+// only calls through. A relay without secrets ignores the MAC.
 const DOMAIN_SECRET = utf8Encode("seedrelay-secret-v1\0");
 const HASH_512 = new Uint8Array([64, 0]);
 
@@ -76,7 +79,7 @@ class RelayConn {
     this.upSince = Infinity;   // when it registered
     this.gone = false;
     this.waiters = [];         // settle(bool) once registered or gone
-    this.due = Infinity;       // registration deadline
+    this.due = Infinity;       // registration deadline, then the idle one (`touch`)
     this.closeReason = REASON_NONE; // a relay is not a peer: nothing to print
   }
 
@@ -104,11 +107,19 @@ class RelayConn {
     return new Promise((settle) => this.waiters.push(settle));
   }
 
-  send(bytes) {
+  /** A relay this node only calls through is left once no call has used it for the link
+   *  idle window, so the node stays registered on its home relay alone. */
+  touch() {
+    if (linkIdleTimeoutMs > 0 && this.origin !== relays.home) this.due = dueIn(linkIdleTimeoutMs);
+  }
+
+  /** Resolves true once the frame is written, false when it was lost (budget, or the
+   *  socket going). */
+  async send(bytes) {
     try {
-      const sent = this.framer ? this.framer.send(bytes) : netLinkSend(this.linkId, bytes);
-      void Promise.resolve(sent).catch(() => {});
-    } catch { /* budget: a lost frame, and the caller's dial times out */ }
+      await (this.framer ? this.framer.send(bytes) : netLinkSend(this.linkId, bytes));
+      return true;
+    } catch { return false; }
   }
 
   async onWire(bytes) {
@@ -130,16 +141,15 @@ class RelayConn {
         const secret = this.origin === relays.home ? relays.secret : null;
         if (secret) mac = await host.call(P_HASH, concatBytes([HASH_512, DOMAIN_SECRET, ownPk, sig, secret]));
       } catch { this.close(); return; }
-      this.send(concatBytes([Uint8Array.of(R_REGISTER), ownPk, sig, mac]));
+      void this.send(concatBytes([Uint8Array.of(R_REGISTER), ownPk, sig, mac]));
     } else if (type === R_REGISTER && !this.registered) {
       this.registered = true;
       this.upSince = now();
       this.due = Infinity;
+      this.touch();
       for (const settle of this.waiters.splice(0)) settle(true);
     } else if (type === R_CALL && body.length === PK_LEN + TICKET_LEN) {
       await relays.accept(this.origin, toHex(body.subarray(0, PK_LEN)), body.subarray(PK_LEN));
-    } else if (type === R_UNREACHABLE && body.length === PK_LEN + TICKET_LEN) {
-      relays.unreachable(toHex(body.subarray(PK_LEN)));
     }
   }
 
@@ -153,11 +163,13 @@ class RelayConn {
     relays.onGone(this);
   }
 
-  /** An unregistered socket past its deadline is closed. */
+  /** Past its deadline an unregistered socket is closed, and an idle one to a relay this
+   *  node only calls through is left. */
   onWake(t) {
     if (t < this.due) return this.due;
     this.due = Infinity;
     if (!this.registered) this.close();
+    else if (this.origin !== relays.home) relays.drop(this);
     return Infinity;
   }
 }
@@ -168,7 +180,6 @@ class Relays {
     this.home = null;          // origin of the relay this node stays registered on, or null
     this.retryAt = Infinity;   // when a dropped home relay is dialed again
     this.retryMs = RELAY_RETRY_MS; // the ceiling of the next redial's wait
-    this.tickets = new Map();  // our splice sockets waiting on a call, ticket hex to link id
     this.secret = null;        // the home relay's secret, proved only there, or null
   }
 
@@ -237,7 +248,9 @@ class Relays {
   }
 
   /** Call `peer` through the relay at `origin`: `{linkId, stream, dest}` of our end of the
-   *  splice, link id 0 when there is none. */
+   *  splice, link id 0 when there is none. The call is written before the splice socket is
+   *  opened: the relay refuses a socket whose ticket it has not heard, which is also how a
+   *  call to a key it cannot reach fails without waiting. */
   async call(peer, origin) {
     let c = this.conns.get(origin);
     if (!c) {
@@ -246,12 +259,11 @@ class Relays {
       if (!(await c.open())) return { linkId: 0 };
     }
     if (!(await c.ready())) return { linkId: 0 };
+    c.touch();
     const ticket = await randomBytes(TICKET_LEN);
-    c.send(concatBytes([Uint8Array.of(R_CALL), fromHex(peer), ticket]));
+    if (!(await c.send(concatBytes([Uint8Array.of(R_CALL), fromHex(peer), ticket])))) return { linkId: 0 };
     const dest = origin + RELAY_WIRE + "?splice=" + toHex(ticket);
-    const opened = await netLinkOpen(dest);
-    if (opened.linkId !== 0) this.tickets.set(toHex(ticket), opened.linkId);
-    return { linkId: opened.linkId, stream: opened.stream, dest, ticket: toHex(ticket) };
+    return { ...(await netLinkOpen(dest)), dest };
   }
 
   /** A call for this node from `from`, the key the relay registered: open our end of the
@@ -268,13 +280,5 @@ class Relays {
       linkId: opened.linkId, stream: opened.stream, dest, listener: "", linkSecret: null,
       source: from, weDialed: false, limiter: core.limiter, dialedPeerId: null, relayed: true,
     });
-  }
-
-  /** The relay has nobody to put our call through to: fail the dial now. */
-  unreachable(ticket) {
-    const linkId = this.tickets.get(ticket);
-    if (linkId === undefined) return;
-    this.tickets.delete(ticket);
-    netLinkClose(linkId, false);
   }
 }

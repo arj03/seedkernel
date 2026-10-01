@@ -4,8 +4,9 @@
  *  request (0x00, 0x80 without reply) and a response (0x01): `[KIND_CTL][tag u8][body]`. */
 const KIND_CTL = 0x02;
 /** The control tag asking the peer to close the relayed link it arrived on, since a
- *  direct one has replaced it. rtc.js's signals are the other tags. */
-const CTL_RETIRE = 0x72;
+ *  direct one has replaced it. rtc.js's signals are the other tags, all letters, so this
+ *  one is none. */
+const CTL_RETIRE = 0x00;
 
 // ── the router ────────────────────────────────────────────────────────────────
 
@@ -22,8 +23,6 @@ class Router {
   hasDirect(peerId) { const p = this.pools.get(peerId); return p !== undefined && p.direct > 0; }
   /** The origin of the relay a peer's relayed link runs through, "" for none. */
   relayOf(peerId) { const p = this.pools.get(peerId); return p?.links.find((l) => l.relay)?.relay ?? ""; }
-  /** Whether `link` is routed, rather than held or lost to a tie-break. */
-  routes(link) { const p = this.pools.get(link.peerId); return p !== undefined && p.links.includes(link); }
 
   /** Round-robin over the direct links, or over the relayed ones when there is none. */
   send(to, frame) {
@@ -36,14 +35,24 @@ class Router {
     return true;
   }
 
+  /** Send on the peer's first link, for frames that must arrive in the order they were
+   *  sent: two links deliver in no order between them. */
+  sendInOrder(to, frame) {
+    const pool = this.pools.get(to);
+    if (!pool || pool.links.length === 0) return false;
+    pool.links[0].send(frame);
+    return true;
+  }
+
   /** Add a newly authenticated link, after the double-connect tie-break, which compares
    *  it only with links of its own kind: a relayed link and a direct one are two paths,
-   *  not a double connect. A peer's first link marks it up. */
+   *  not a double connect. A peer's first link marks it up. False when the link lost the
+   *  tie-break, and so does not route. */
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
     const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed && l.relayed === link.relayed);
     if (rival) {
-      if (!this.canonicalKeep(link)) { this.retire(pool, link); return; }
+      if (!this.canonicalKeep(link)) { this.retire(pool, link); return false; }
       Router.unlist(pool, rival);
       this.retire(pool, rival);
     }
@@ -51,6 +60,7 @@ class Router {
     if (up) { pool = { links: [], direct: 0, held: [], next: 0 }; this.pools.set(peerId, pool); }
     Router.list(pool, link);
     if (up) core.checkReady();
+    return true;
   }
 
   static list(pool, link) {
@@ -107,7 +117,6 @@ class Router {
     }
     this.pools.delete(pid);
     reqres.peerDown(pid);
-    rtc.forget(pid);
   }
 }
 

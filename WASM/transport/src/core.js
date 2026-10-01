@@ -300,7 +300,6 @@ class Core {
       limiter: null,
       dialedPeerId: peerId,
       relayed,
-      ticket: opened.ticket,
     });
   }
 
@@ -322,12 +321,9 @@ class Core {
    *  accepted retires the relayed links it replaces (router.js `retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
-    router.promote(peerId, link);
-    if (!router.routes(link)) return;
+    if (!router.promote(peerId, link)) return;
     if (link.relayed) void rtc.upgrade(peerId).catch(() => {});
-    else if (!link.weDialed) {
-      router.retireRelayed(peerId);
-    }
+    else if (!link.weDialed) router.retireRelayed(peerId);
   }
 
   /** The transport's own message from a peer (router.js `KIND_CTL`): a retire closes a
@@ -342,7 +338,6 @@ class Core {
   forget(link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
-    if (link.ticket) relays.tickets.delete(link.ticket);
     // Its queued frames move to another link to the peer. A dial that dies as the last way
     // to its peer fails what waits on it now, not at its timeout.
     const peerId = link.peerId || link.dialedPeerId;
@@ -513,13 +508,14 @@ entry("addr", (r) => {
 
 /** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through
  *  it, leaving any other; empty leaves (relay.js). An optional second text is the relay's
- *  secret, for a private one. Deferred: registering waits on the relay's challenge, which
- *  arrives in a later invocation. */
+ *  secret, for a private one. Answers `relayState` as it stands once the attempt is over.
+ *  Deferred: registering waits on the relay's challenge, which arrives in a later
+ *  invocation. */
 entry("relay", (r) => {
   const d = defer();
   const url = utf8Decode(r.blob());
   const secret = r.more() ? r.blob() : null;
-  relays.join(url, secret).then(() => d.settle(NOTHING), d.fail);
+  relays.join(url, secret).then(() => d.settle(Uint8Array.of(relays.state())), d.fail);
   return d.promise;
 });
 

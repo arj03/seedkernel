@@ -194,10 +194,13 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
   // Transport-only flags on a node with no network would otherwise be silently ignored.
   const relay = args.get("relay");
-  // Neither console target's sockets speak TLS, so a wss:// relay would only be redialed
-  // forever. A relay serves plain ws:// beside it (seedrelay's deployment guide).
-  if (relay !== undefined && /^wss:/i.test(relay.trim())) {
-    throw new Error("--relay: this node's sockets have no TLS, so it cannot reach wss://; use the relay's ws:// address");
+  // Neither console target's sockets speak TLS, so a wss:// destination, the relay's or a
+  // peer's, would only be redialed forever. A relay serves plain ws:// beside it
+  // (seedrelay's deployment guide).
+  for (const flag of ["relay", "peers"]) {
+    if (/wss:\/\//i.test(args.get(flag) ?? "")) {
+      throw new Error(`--${flag}: this node's sockets have no TLS, so it cannot reach wss://; use the ws:// address`);
+    }
   }
   // A private relay's secret (seedrelay's `--secret`), from a file to keep it out of `ps`.
   const relaySecretPath = args.get("relay-secret");
@@ -244,13 +247,15 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });
   // Register on the relay through the transport's service id, passing the URL and any
-  // secret unread, so a node nobody can dial is reachable there (§12.7).
+  // secret unread, so a node nobody can dial is reachable there (§12.7). The answer says
+  // whether it registered; a relay that is down or refuses the node is redialed, not fatal.
+  let registered = false;
   if (relay !== undefined) {
     const op = new OpArgs("relay").text(relay);
     if (relaySecret !== undefined) op.text(relaySecret);
     const joined = shell.call(TRANSPORT_SERVICE, op.build());
     if (!joined) throw new Error("shell: --relay given, but there is nothing to join it with; enable transport first");
-    await joined;
+    registered = (await joined)[0] === 1;
   }
   // Wait for the cohort through the transport's service id. Best effort: `ready` settles
   // at its deadline instead of rejecting, so a missing peer delays boot but never fails it.
@@ -264,7 +269,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  if (relay !== undefined) host.log(`  relay  ${relay}`);
+  if (relay !== undefined) host.log(`  relay  ${relay} (${registered ? "registered" : "not registered, redialing"})`);
   for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
 
   // Operator remedies (§12.5) before the bundle, so a node never briefly installs what it

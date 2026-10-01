@@ -9,10 +9,13 @@ import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
 } from "./transport-harness.mjs";
 import { FakeRelay } from "./fake-relay.mjs";
+import { randomBytes } from "node:crypto";
 
 const { test, assert, summary } = testkit();
 const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
 const RELAY = "ws://relay:1";
+// A private relay's secret: random, since whoever sees a registration can test guesses at it.
+const SECRET = randomBytes(32).toString("hex");
 
 const relayState = async (node) => (await transportOp(node, new OpArgs("relayState")))[0];
 const joinRelay = (node, url = RELAY) => transportOp(node, new OpArgs("relay").text(url));
@@ -24,6 +27,13 @@ const linked = async (a, b) => (await linkedPeers(a)).includes(b.peerId) && (awa
 function relayNode(relay, opts = {}) {
   return makeTransportHost({ channels: relay.factory(), ...opts });
 }
+
+/** Sockets that reach either of two relays. */
+const either = (a, b) => ({
+  connect: (dest) => a.connect(dest) ?? b.connect(dest),
+  listen: async (addrs) => addrs.map(() => 0),
+  close() {},
+});
 
 /** Register both on the relay and link `a` to `b` through it, as an app that learned `b`'s
  *  key would. */
@@ -70,13 +80,13 @@ await test("a registration signed for another relay is refused", async (keep) =>
 });
 
 await test("a private relay registers only a node given its secret, which never crosses the wire", async (keep) => {
-  const secret = "correct horse battery";
+  const secret = SECRET;
   const relay = new FakeRelay("relay:1", { secret });
   const join = (node, s) => transportOp(node, new OpArgs("relay").text(RELAY).text(s));
   const none = keep(await relayNode(relay));
   await joinRelay(none);
   const wrong = keep(await relayNode(relay));
-  await join(wrong, "a wrong guess at it");
+  await join(wrong, randomBytes(32).toString("hex"));
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay));
   for (const n of [A, B]) await join(n, secret);
@@ -92,28 +102,38 @@ await test("a private relay registers only a node given its secret, which never 
 await test("a node given a secret still registers on a relay without one, which ignores the MAC", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay));
-  await transportOp(A, new OpArgs("relay").text(RELAY).text("correct horse battery"));
+  await transportOp(A, new OpArgs("relay").text(RELAY).text(SECRET));
   assert(await relayState(A) === 1, "registered");
   assert(relay.macs.length === 1, "and the MAC was sent");
 });
 
 await test("the secret is proved to the home relay alone, not to a relay a peer is called through", async (keep) => {
-  const home = new FakeRelay("relay:1", { secret: "correct horse battery" });
+  const home = new FakeRelay("relay:1", { secret: SECRET });
   const other = new FakeRelay("other:1");
-  const both = {
-    connect: (dest) => home.connect(dest) ?? other.connect(dest),
-    listen: async (addrs) => addrs.map(() => 0),
-    close() {},
-  };
-  const A = keep(await makeTransportHost({ channels: both }));
+  const A = keep(await makeTransportHost({ channels: either(home, other) }));
   const B = keep(await relayNode(other));
-  await transportOp(A, new OpArgs("relay").text(RELAY).text("correct horse battery"));
-  await transportOp(B, new OpArgs("relay").text("ws://other:1"));
+  await transportOp(A, new OpArgs("relay").text(RELAY).text(SECRET));
+  await joinRelay(B, "ws://other:1");
   await addr(A, B.peerId, "relay+ws://other:1");
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(5));
   assert(resp[0] === 5, "A calls B through the other relay");
   assert(home.macs.length === 1, "the home relay got the MAC");
   assert(other.registered.has(A.peerId) && other.macs.length === 0, "the other registered A without one");
+});
+
+await test("a relay a peer was only called through is left once it idles, and the home relay kept", async (keep) => {
+  const home = new FakeRelay("relay:1"), other = new FakeRelay("other:1");
+  const A = keep(await makeTransportHost({ channels: either(home, other), transportConfig: { linkIdleTimeoutMs: 200 } }));
+  const B = keep(await relayNode(other));
+  await joinRelay(A);
+  await joinRelay(B, "ws://other:1");
+  await addr(A, B.peerId, "relay+ws://other:1");
+  await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  assert(other.registered.has(A.peerId), "a call registers the caller on the relay it goes through");
+  await until(() => !other.registered.has(A.peerId), 3000, "the idle relay to be left");
+  assert(await relayState(A) === 1 && home.registered.has(A.peerId), "the home relay is kept");
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(2));
+  assert(resp[0] === 2, "the next call goes through it again");
 });
 
 await test("a key the relay does not know fails the request at once", async (keep) => {

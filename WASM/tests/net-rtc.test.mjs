@@ -231,6 +231,7 @@ await test("RtcChannel fails closed when a chunked write throws after a prefix",
 // ── the transport: a relayed link moving to WebRTC ────────────────────────────
 
 class FakeWebRtc {
+  hold = null; // a promise no negotiation starts before, for a test that sets the scene first
   pcs = new Map();
   made = [];
   next = 1;
@@ -247,7 +248,7 @@ class FakeWebRtc {
           send(b) { const p = this.peer; const copy = Uint8Array.from(b).buffer; queueMicrotask(() => { if (p && !p.closed) p.emit("message", { data: copy }); }); },
           close() { if (this.closed) return; this.closed = true; const p = this.peer; queueMicrotask(() => { this.emit("close"); if (p && !p.closed) p.close(); }); } };
         this.dc = dc;
-        queueMicrotask(() => e.emit("negotiationneeded"));
+        Promise.resolve(world.hold).then(() => e.emit("negotiationneeded"));
         return dc;
       },
       async setLocalDescription() {
@@ -343,6 +344,27 @@ await test("WebRTC runs without contact secrets: a callee offers to a caller it 
   const before = relay.spliceBytes;
   const back = await B.request(A.peerId, PROTO, Uint8Array.of(2));
   assert(back[0] === 2 && relay.spliceBytes === before, "the peers talk over the data channel");
+});
+
+await test("a negotiation's signals keep their order across two relayed links", async (keep) => {
+  // Two splices, one slow, either way round: a candidate sent on the fast one would pass
+  // the offer it belongs to on the slow one, and be dropped for want of it.
+  for (const slow of [0, 1]) {
+    const relay = new FakeRelay(), world = new FakeWebRtc();
+    let release;
+    world.hold = new Promise((r) => { release = r; });
+    const [small, large] = sortedIdentities(2);
+    const A = keep(await rtcNode(relay, world, { identity: small, transportConfig: { connsPerPeer: 2 } }));
+    const B = keep(await rtcNode(relay, world, { identity: large }));
+    await relayLink(A, B);
+    await until(() => relay.splices.length === 2, 4000, "both splices");
+    await settle(100);
+    for (const end of relay.splices[slow]) end.delay = 40;
+    release();
+    await until(() => relay.splices.every((pair) => pair.every((e) => e.dead)), 4000, "the move to WebRTC");
+    assert(world.made.length === 2 && world.made.every((pc) => pc.candidates.length >= 1),
+      `with splice ${slow} slow, each side's candidates still follow its description in`);
+  }
 });
 
 await test("a peer without WebRTC declines, and the relayed link stays", async (keep) => {

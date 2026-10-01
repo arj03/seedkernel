@@ -3,19 +3,23 @@
 // direct link. The host's `rtc:` socket factory holds only the RTCPeerConnection.
 
 // The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`): each message is
-// `[tag u8][UTF-8 text]`. Up: a local description, a local candidate, a connection state.
-// Down: a remote description, a remote candidate, an ICE restart. Signaling reuses the
-// description and candidate tags, and adds a decline.
-const RTC_OFFER = 0x6f, RTC_ANSWER = 0x61, RTC_CANDIDATE = 0x63, RTC_STATE = 0x73, RTC_RESTART = 0x72;
+// `[tag u8][UTF-8 text]`. Up: a local description, a local candidate, and a connection
+// state this transport does not read, since a connection that fails closes its links.
+// Down: a remote description, a remote candidate. An ICE restart is never asked for: its
+// offer would have to cross the very link whose path was lost, so a lost connection is
+// dialed again through the relay instead. Signaling reuses the description and candidate
+// tags, and adds a decline.
+const RTC_OFFER = 0x6f, RTC_ANSWER = 0x61, RTC_CANDIDATE = 0x63;
 /** Signaling only: the answering side has no WebRTC, so the offer is dropped. */
 const RTC_DECLINE = 0x78;
-/** A negotiation's id, chosen by the offering side, so a new negotiation is told apart
- *  from an ICE restart without reading the SDP. */
+/** A negotiation's id, chosen by the offering side, so a signal for a negotiation this end
+ *  has dropped or replaced is told from one for the negotiation it holds. */
 const SID_LEN = 8;
 
 // ── signaling ─────────────────────────────────────────────────────────────────
 //
-// A signal is a control frame on any link to the peer (router.js `KIND_CTL`):
+// A signal is a control frame on the peer's first link (router.js `KIND_CTL`,
+// `sendInOrder`), so a candidate never passes its description on another link:
 //
 //   [KIND_CTL][tag u8][sid 8][UTF-8 text]
 //
@@ -59,8 +63,6 @@ class Rtc {
     this.byCtl = new Map();  // negotiation link id to negotiation
     // Data links announced before `open` has recorded their negotiation.
     this.early = new Map();  // negotiation link id to { linkId, stream }
-    // Peers that declined an offer, not offered again while they stay linked.
-    this.declined = new Set();
     // Signals are applied one at a time, in arrival order: records are not, and a
     // candidate must never reach the peer connection ahead of its description.
     this.signals = Promise.resolve();
@@ -87,16 +89,13 @@ class Rtc {
 
   /** Offer a peer connection to a peer this node reaches only through a relay. */
   async upgrade(peer) {
-    if (!this.weOffer(peer) || this.byPeer.has(peer) || this.declined.has(peer) || router.hasDirect(peer)) return;
+    if (!this.weOffer(peer) || this.byPeer.has(peer) || router.hasDirect(peer)) return;
     await this.open(peer, true, toHex(await randomBytes(SID_LEN)));
   }
 
-  /** The peer went down: it may offer or answer differently next time. */
-  forget(peer) { this.declined.delete(peer); }
-
   signal(peer, tag, sid, text) {
     const frame = concatBytes([Uint8Array.of(KIND_CTL, tag), fromHex(sid), utf8Encode(text)]);
-    return frame.length <= maxFrameBytes - TAG_LEN && router.send(peer, frame);
+    return frame.length <= maxFrameBytes - TAG_LEN && router.sendInOrder(peer, frame);
   }
 
   /** One signal from `peer` (router.js `KIND_CTL`), queued behind the ones before it. */
@@ -121,7 +120,7 @@ class Rtc {
     if (!e || e.sid !== sid) return;
     if (tag === RTC_ANSWER && e.offer) this.down(e, RTC_ANSWER, text);
     else if (tag === RTC_CANDIDATE) this.down(e, RTC_CANDIDATE, text);
-    else if (tag === RTC_DECLINE && e.offer) { this.declined.add(peer); this.drop(e); }
+    else if (tag === RTC_DECLINE && e.offer) this.drop(e);
   }
 
   /** Open a negotiation link for one peer. Null when the cap is reached or no route (a
@@ -147,14 +146,10 @@ class Rtc {
     return e;
   }
 
-  /** Something the peer connection produced: send it to the peer, or act on its state. */
+  /** A description or candidate the peer connection produced: send it to the peer. */
   up(e, tag, text) {
-    if (tag === RTC_OFFER || tag === RTC_ANSWER || tag === RTC_CANDIDATE) {
-      if (!this.signal(e.peer, tag, e.sid, text)) this.drop(e);
-    } else if (tag === RTC_STATE && text === "disconnected" && e.offer) {
-      // A path went away (a network change, a NAT rebind): new candidates, same connection.
-      this.down(e, RTC_RESTART, "");
-    }
+    if (tag !== RTC_OFFER && tag !== RTC_ANSWER && tag !== RTC_CANDIDATE) return;
+    if (!this.signal(e.peer, tag, e.sid, text)) this.drop(e);
   }
 
   down(e, tag, text) {
@@ -167,9 +162,10 @@ class Rtc {
   }
 
   /** The data channel of negotiation `via` arrived as `linkId`: the offering side dials
-   *  the peer it signaled, and the answering side accepts whoever authenticates. Both run
+   *  the peer it signaled, and the answering side accepts that peer and no other. Both run
    *  open, with no contact secret: the channel exists only through signaling over the
-   *  authenticated link, so no stranger can reach it. */
+   *  authenticated link, so only that peer can reach it, and a key it brought along would
+   *  otherwise pass a gate it never opened. */
   bindData(via, linkId, stream) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
@@ -180,6 +176,7 @@ class Rtc {
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,
+      acceptPeerId: e.offer ? null : e.peer,
     });
   }
 
