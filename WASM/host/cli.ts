@@ -19,7 +19,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 /** Every flag the shell accepts. An allowlist, so a mistyped `--polcy` fails instead of
  *  silently booting a deny-all node. */
 const FLAGS = new Set([
-  "policy", "dir", "key", "listen", "peers", "relay", "contact-secret",
+  "policy", "dir", "key", "listen", "peers", "relay", "relay-secret", "contact-secret",
   "bundle", "op", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
@@ -199,6 +199,14 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   if (relay !== undefined && /^wss:/i.test(relay.trim())) {
     throw new Error("--relay: this node's sockets have no TLS, so it cannot reach wss://; use the relay's ws:// address");
   }
+  // A private relay's secret (seedrelay's `--secret`), from a file to keep it out of `ps`.
+  const relaySecretPath = args.get("relay-secret");
+  if (relaySecretPath !== undefined && relay === undefined) {
+    throw new Error("--relay-secret requires --relay, the relay it is the secret of");
+  }
+  const relaySecret = relaySecretPath === undefined
+    ? undefined
+    : dec.decode(mustRead(host, relaySecretPath, "--relay-secret")).trim();
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
   for (const flag of ["transport", "contact-secret"]) {
     if (args.has(flag) && !network) {
@@ -235,10 +243,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });
-  // Register on the relay through the transport's service id, passing the URL unread, so
-  // a node nobody can dial is reachable there (§12.7).
+  // Register on the relay through the transport's service id, passing the URL and any
+  // secret unread, so a node nobody can dial is reachable there (§12.7).
   if (relay !== undefined) {
-    const joined = shell.call(TRANSPORT_SERVICE, new OpArgs("relay").text(relay).build());
+    const op = new OpArgs("relay").text(relay);
+    if (relaySecret !== undefined) op.text(relaySecret);
+    const joined = shell.call(TRANSPORT_SERVICE, op.build());
     if (!joined) throw new Error("shell: --relay given, but there is nothing to join it with; enable transport first");
     await joined;
   }

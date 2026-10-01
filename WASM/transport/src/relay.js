@@ -24,7 +24,7 @@ const RELAY_STUN_PORT = 3478;
 // Binary frames, `[type u8][body]`. A ticket is 16 random bytes the caller picks.
 //
 //   relay → node                                  node → relay
-//   0x00 challenge   [nonce 32]                   0x01 register  [pk 32][sig 64]
+//   0x00 challenge   [nonce 32]                   0x01 register  [pk 32][sig 64][mac 64]?
 //   0x01 registered                               0x05 call      [to 32][ticket 16]
 //   0x05 incoming    [from 32][ticket 16]
 //   0x06 unreachable [to 32][ticket 16]
@@ -37,6 +37,17 @@ const R_CHALLENGE = 0x00, R_REGISTER = 0x01, R_CALL = 0x05, R_UNREACHABLE = 0x06
 // The registration's format tag: a second format under the host's link scope, beside
 // DOMAIN_CHANNEL, so neither signature can stand for the other.
 const DOMAIN_RELAY = utf8Encode("seedkernel-relay-register-v1\0");
+
+// A private relay (seedrelay's `--secret`) also wants the MAC
+//   BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret)
+// after the signature: proof of its secret that never sends it, and is good on this socket
+// only, since the signature is over its nonce. BLAKE2b cannot be length-extended, so
+// hashing the secret in needs no HMAC around it. Unkeyed, as the relay's Node has no keyed
+// BLAKE2b. seedrelay's tag. Only the home relay, the one the secret was given with, gets
+// the MAC: a relay this node only calls through could test guesses at the secret against
+// it. A relay without secrets ignores the MAC.
+const DOMAIN_SECRET = utf8Encode("seedrelay-secret-v1\0");
+const HASH_512 = new Uint8Array([64, 0]);
 
 /** `ws[s]://authority` of a relay URL, the name a relay is known by, or null. */
 function relayOrigin(url) {
@@ -113,11 +124,13 @@ class RelayConn {
     const body = m.subarray(1);
     const type = m[0];
     if (type === R_CHALLENGE && body.length === NONCE_LEN && !this.registered) {
-      let sig;
+      let sig, mac = new Uint8Array(0);
       try {
         sig = await host.call(N_SIGN, concatBytes([DOMAIN_RELAY, utf8Encode(relayAuthority(this.origin)), body]));
+        const secret = this.origin === relays.home ? relays.secret : null;
+        if (secret) mac = await host.call(P_HASH, concatBytes([HASH_512, DOMAIN_SECRET, ownPk, sig, secret]));
       } catch { this.close(); return; }
-      this.send(concatBytes([Uint8Array.of(R_REGISTER), ownPk, sig]));
+      this.send(concatBytes([Uint8Array.of(R_REGISTER), ownPk, sig, mac]));
     } else if (type === R_REGISTER && !this.registered) {
       this.registered = true;
       this.upSince = now();
@@ -156,6 +169,7 @@ class Relays {
     this.retryAt = Infinity;   // when a dropped home relay is dialed again
     this.retryMs = RELAY_RETRY_MS; // the ceiling of the next redial's wait
     this.tickets = new Map();  // our splice sockets waiting on a call, ticket hex to link id
+    this.secret = null;        // the home relay's secret, proved only there, or null
   }
 
   /** 0 no relay, 1 registered on it, 2 waiting to (re)connect. */
@@ -165,10 +179,11 @@ class Relays {
     return c && c.registered ? 1 : 2;
   }
 
-  /** Stay registered on the relay at `url`, leaving any other; "" leaves. Resolves once
-   *  registered there, or once that attempt has failed and a redial is due. Links already
-   *  up stay up. */
-  async join(url) {
+  /** Stay registered on the relay at `url`, leaving any other; "" leaves. A `secret` is
+   *  that relay's, when it is private (seedrelay's `--secret`), and is proved to it alone,
+   *  never to a relay this node only calls a peer through. Resolves once registered there,
+   *  or once that attempt has failed and a redial is due. Links already up stay up. */
+  async join(url, secret = null) {
     const origin = url === "" ? null : relayOrigin(url);
     if (url !== "" && (!origin || !/^\/?$/.test(url.slice(origin.length)))) {
       throw new Error("transport: relay needs a ws:// or wss:// URL with no path");
@@ -177,6 +192,7 @@ class Relays {
       const old = this.conns.get(this.home);
       if (old) this.drop(old);
     }
+    this.secret = origin && secret && secret.length > 0 ? secret.slice() : null;
     this.home = origin;
     this.retryAt = Infinity;
     this.retryMs = RELAY_RETRY_MS;

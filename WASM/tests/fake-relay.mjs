@@ -2,9 +2,9 @@
 // relay.js; the real server is seedrelay): signed registration, calls and splices. Its
 // links are whole-message `RawLink`s, as a browser WebSocket's are. It checks registrations
 // against the host's signing domain, so a wrong format fails here as it would against
-// seedrelay.
+// seedrelay, and, given a secret, checks a private relay's MAC as seedrelay does.
 
-import { createPublicKey, randomBytes, verify } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -12,15 +12,25 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { DOMAIN_LINK_SCOPE } = await import(pathToFileURL(join(root, "build/services/domains.js")).href);
 
 const DOMAIN_RELAY = Buffer.from("seedkernel-relay-register-v1\0");
+const DOMAIN_SECRET = Buffer.from("seedrelay-secret-v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
 const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_CALL = 0x05, T_UNREACHABLE = 0x06;
 
+/** seedrelay's MAC: BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret), which Node computes
+ *  unkeyed as the transport's `crypto/blake2b` does. */
+export function secretMac(secret, pk, sig) {
+  return createHash("blake2b512").update(DOMAIN_SECRET).update(pk).update(sig).update(secret).digest();
+}
+
 export class FakeRelay {
   /** `authority` is the host[:port] the relay's URLs name, which registrations sign;
-   *  `signedFor` makes it check them against another. */
-  constructor(authority = "relay", { signedFor = authority } = {}) {
+   *  `signedFor` makes it check them against another. With a `secret` it is a private
+   *  relay, taking only registrations that carry its MAC; without, it ignores a MAC. */
+  constructor(authority = "relay", { signedFor = authority, secret = null } = {}) {
     this.authority = authority;
     this.signedFor = signedFor;
+    this.secret = secret;
+    this.macs = [];              // every MAC a registration carried
     this.controls = new Set();
     this.registered = new Map(); // key hex to its control
     this.pending = new Map();    // ticket hex to { ends: [] }
@@ -69,11 +79,13 @@ export class FakeRelay {
   }
 
   onControl(c, b) {
-    if (b[0] === T_REGISTER && b.length === 97 && !c.key) {
-      const pk = b.subarray(1, 33), sig = b.subarray(33);
+    if (b[0] === T_REGISTER && (b.length === 97 || b.length === 161) && !c.key) {
+      const pk = b.subarray(1, 33), sig = b.subarray(33, 97), mac = b.subarray(97);
       const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, pk]), format: "der", type: "spki" });
       const msg = Buffer.concat([DOMAIN_LINK_SCOPE, DOMAIN_RELAY, Buffer.from(this.signedFor), c.nonce]);
       if (!verify(null, msg, key, sig)) { c.end.kill(); return; }
+      if (mac.length > 0) this.macs.push(Buffer.from(mac));
+      if (this.secret !== null && !secretMac(this.secret, pk, sig).equals(mac)) { c.end.kill(); return; }
       c.key = pk.toString("hex");
       this.registered.set(c.key, c);
       c.end.deliver(Buffer.of(T_REGISTER));

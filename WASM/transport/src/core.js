@@ -512,11 +512,14 @@ entry("addr", (r) => {
 });
 
 /** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through
- *  it, leaving any other; empty leaves (relay.js). Deferred: registering waits on the relay's
- *  challenge, which arrives in a later invocation. */
+ *  it, leaving any other; empty leaves (relay.js). An optional second text is the relay's
+ *  secret, for a private one. Deferred: registering waits on the relay's challenge, which
+ *  arrives in a later invocation. */
 entry("relay", (r) => {
   const d = defer();
-  relays.join(utf8Decode(r.blob())).then(() => d.settle(NOTHING), d.fail);
+  const url = utf8Decode(r.blob());
+  const secret = r.more() ? r.blob() : null;
+  relays.join(url, secret).then(() => d.settle(NOTHING), d.fail);
   return d.promise;
 });
 

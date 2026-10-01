@@ -349,6 +349,25 @@ for (const flag of ["--transport", "--contact-secret"]) {
   catch (e) { msg = String(e.message); }
   ok(msg.includes("no TLS"), "--relay wss:// is refused, since no console target speaks TLS");
 }
+// --relay-secret names a file, as --contact-secret does, and its contents follow the URL in
+// the `relay` op, unread.
+{
+  const url = "ws://relay.example:80";
+  const secretPath = join(work, "relay.secret");
+  writeFileSync(secretPath, "correct horse battery\n");
+  const calls = [];
+  const host = fakeHost(["--key", join(work, "rs.key"), "--relay", url, "--relay-secret", secretPath], {
+    shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(new Uint8Array(0)); } },
+  });
+  await runCli(host);
+  ok(calls.length === 1 && calls[0].includes(url) && calls[0].endsWith("\x00\x00\x00\x15correct horse battery"),
+    "--relay-secret follows the URL in the relay op, as the file says it, less its line ending");
+  ok(!host.lines.some((l) => l.includes("correct horse")), "the secret is never printed");
+  let msg = "";
+  try { await runCli(fakeHost(["--key", join(work, "rs2.key"), "--peers", "", "--relay-secret", secretPath])); }
+  catch (e) { msg = String(e.message); }
+  ok(msg.includes("--relay-secret requires --relay"), "--relay-secret without --relay is refused");
+}
 {
   const host = fakeHost(["--key", join(work, "r2.key"), "--relay", "ws://127.0.0.1:1/"], { linkAvailable: false });
   let msg = "";
