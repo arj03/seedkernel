@@ -443,6 +443,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 - Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls. A `dest` of `relay+ws[s]://host:port` reaches the peer through that relay (§12.7).
 - The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret, the one in the address book, else this node's own, for peers that share it.
 - The host-only `relay` op (one text: a `ws://`/`wss://` URL with no path, empty to leave; then optionally a second, a private relay's secret) registers on that relay and answers `[u8]` once registered or once that attempt has failed: 0 none, 1 registered, 2 redialing. `relayState` answers the same byte at any time. Every peer connection asks the relay its peer is linked through for STUN (§12.7), then `iceServers` (`RTCConfiguration.iceServers` as JSON, `LOCAL ?? APP`, empty by default), such as a TURN server.
+- The host-only `routes` op answers the linked peers, as `peers` does, with how each is reached: `[key 32][direct u8]` apiece, 1 while a direct link carries the peer's traffic and 0 while a relay forwards it (§12.7).
 
 ### 12.7 Relays and WebRTC
 

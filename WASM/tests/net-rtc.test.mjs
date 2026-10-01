@@ -285,6 +285,16 @@ class FakeWebRtc {
 
 const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));
 
+/** How `node` reaches each linked peer (`routes`): peer hex to whether the link is direct. */
+async function routes(node) {
+  const bytes = await transportOp(node, new OpArgs("routes"));
+  const out = new Map();
+  for (let off = 0; off + 33 <= bytes.length; off += 33) {
+    out.set(Buffer.from(bytes.slice(off, off + 32)).toString("hex"), bytes[off + 32] === 1);
+  }
+  return out;
+}
+
 /** A node whose sockets are the relay and the fake world, and nothing else. `made` lists
  *  the peer connections this node opened. */
 async function rtcNode(relay, world, opts = {}) {
@@ -325,6 +335,8 @@ await test("two nodes linked through the relay move to WebRTC", async (keep) => 
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
   assert(resp.length === 3 && resp[2] === 9, "a request crosses the data channel");
   assert(relay.spliceBytes === before, "and not the relay");
+  assert((await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true,
+    "`routes` reads the peer as direct at both ends");
 });
 
 await test("WebRTC runs without contact secrets: a callee offers to a caller it holds no secret for", async (keep) => {
@@ -379,6 +391,8 @@ await test("a peer without WebRTC declines, and the relayed link stays", async (
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
   assert(resp[0] === 1, "requests keep crossing the relay");
   assert(relay.splices[0].every((e) => !e.dead), "the splice stays up");
+  assert((await routes(A)).get(B.peerId) === false && (await routes(B)).get(A.peerId) === false,
+    "`routes` reads the peer as relayed at both ends");
 });
 
 await test("negotiations are capped, and one that never connects is dropped on its deadline", async (keep) => {

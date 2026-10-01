@@ -545,4 +545,12 @@ entry("peers", () => {
   return concatBytes(out);
 });
 
+/** The same peers with how each is reached, `[key 32][direct u8]` apiece: 1 while a direct
+ *  link carries the peer's traffic, 0 while a relay forwards it (§12.7). */
+entry("routes", () => {
+  const out = [];
+  for (const pool of router.pools.values()) out.push(pool.links[0].peerPubkey, Uint8Array.of(pool.direct > 0 ? 1 : 0));
+  return concatBytes(out);
+});
+
 // No `shutdown` op: the host closes its own sockets and timers (transport-host.ts `close`).
