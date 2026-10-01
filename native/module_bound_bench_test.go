@@ -10,7 +10,7 @@ package main
 //
 // Both configurations run in one process, so the comparison is not across two builds. The
 // ratio between them is the number §14.1 quotes, and the one to re-measure after any wazero
-// upgrade: the native binary runs a patched wazero whose back-edge check is inline instead
+// upgrade: the native binary runs a patched wazero whose termination check is inline instead
 // of an exit into Go (see the go.mod replace), and this bench checks that patch still pays.
 
 import (

@@ -6,7 +6,7 @@ package main
 //
 // Two wedges, because a module can fail to return in two places: its `handle` (the call,
 // below) and its start section, which instantiation runs; TestModuleBindBound checks the
-// deadline covers that too.
+// deadline covers that too. A third wedges `handle` without a loop, through calls alone.
 //
 // The wedge is a minimal hand-assembled module whose handle is an infinite loop; it
 // declares the §4.1 exports like any installed module. WAT:
@@ -127,6 +127,75 @@ func wedgeStartWasmBytes() []byte {
 	return out
 }
 
+// wedgeTreeWasmBytes is a wedge with no loop in it: `handle` starts a call tree in which
+// every level calls the next twice, so it makes 2^depth calls at a stack depth of only
+// `depth`. WAT:
+//
+//	(module
+//	  (memory (export "memory") 2)
+//	  (global (export "scratch") i32 (i32.const 16))
+//	  (global (export "scratchSize") i32 (i32.const 4096))
+//	  (func (export "handle") (param i32) (result i32)
+//	    (call $tree (i32.const 30))
+//	    i32.const 0)
+//	  (func $tree (param i32)
+//	    (if (i32.eqz (local.get 0)) (then return))
+//	    (call $tree (i32.sub (local.get 0) (i32.const 1)))
+//	    (call $tree (i32.sub (local.get 0) (i32.const 1)))))
+//
+// A check on loop back-edges alone never runs here, so this pins that the bound also
+// covers function entry. The depth is finite on purpose: a host that misses the deadline
+// runs the tree out in seconds and fails the test, where a deeper one would hang it.
+func wedgeTreeWasmBytes() []byte {
+	typ := sec(1, 2,
+		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   (handle)
+		0x60, 0x01, 0x7f, 0x00) //       type 1: (i32) -> ()    (tree)
+	fn := sec(3, 2, 0x00, 0x01)                    // func 0: type 0, func 1: type 1
+	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
+	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
+		0x7f, 0x00, 0x41, 0x80, 0x20, 0x0b) //          scratchSize = 4096
+	exp := sec(7,
+		4,                                              // exports:
+		0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, //   memory
+		0x07, 's', 'c', 'r', 'a', 't', 'c', 'h', 0x03, 0x00, //   scratch
+		0x0b, 's', 'c', 'r', 'a', 't', 'c', 'h', 'S', 'i', 'z', 'e', 0x03, 0x01, //   scratchSize
+		0x06, 'h', 'a', 'n', 'd', 'l', 'e', 0x00, 0x00) //   handle
+	handleBody := []byte{
+		0x00,       // no locals
+		0x41, 0x1e, // i32.const 30: the tree depth
+		0x10, 0x01, // call $tree
+		0x41, 0x00, // i32.const 0
+		0x0b, // end func
+	}
+	treeBody := []byte{
+		0x00,       // no locals
+		0x20, 0x00, // local.get 0
+		0x45,       // i32.eqz
+		0x04, 0x40, // if (void)
+		0x0f, //         return
+		0x0b, //       end if
+		0x20, 0x00, 0x41, 0x01, 0x6b, // local.get 0, i32.const 1, i32.sub
+		0x10, 0x01, // call $tree
+		0x20, 0x00, 0x41, 0x01, 0x6b, // and again
+		0x10, 0x01, // call $tree
+		0x0b, // end func
+	}
+	codeContent := []byte{2}
+	codeContent = append(codeContent, byte(len(handleBody)))
+	codeContent = append(codeContent, handleBody...)
+	codeContent = append(codeContent, byte(len(treeBody)))
+	codeContent = append(codeContent, treeBody...)
+	code := sec(10, codeContent...)
+	out := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00} // magic + version
+	out = append(out, typ...)
+	out = append(out, fn...)
+	out = append(out, mem...)
+	out = append(out, gbl...)
+	out = append(out, exp...)
+	out = append(out, code...)
+	return out
+}
+
 func TestModuleCallBound(t *testing.T) {
 	bootRealm(t)
 	key := "wedgeapp"
@@ -187,6 +256,26 @@ func TestModuleCallBound(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Fatalf("reinstalled wedge returned after %s, want ~50 ms", elapsed)
+	}
+}
+
+// TestModuleCallBoundLoopFree: the bound reaches a module that never loops. A call tree
+// burns unbounded time through calls alone, so the deadline has to be checked on function
+// entry as well as on back-edges.
+func TestModuleCallBoundLoopFree(t *testing.T) {
+	bootRealm(t)
+	key := "treewedge"
+	if err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeTreeWasmBytes()}, 0x1000, time.Second); err != nil {
+		t.Fatalf("buildModuleSlot refused: %v", err)
+	}
+	start := time.Now()
+	if r := callModule(key, "wedge", nil, 50*time.Millisecond); r != nil {
+		t.Fatalf("call tree returned %d B, want nil", len(r))
+	}
+	// Unbounded, the tree takes seconds to run out, so anything near the deadline is the
+	// bound firing and anything far past it is the tree finishing on its own.
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("call tree returned after %s, want ~50 ms: the bound did not fire", elapsed)
 	}
 }
 
