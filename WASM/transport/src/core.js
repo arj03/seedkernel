@@ -25,6 +25,10 @@ if (LOCAL.contactSecret !== undefined) {
   }
   contactSecret = fromHex(LOCAL.contactSecret);
 }
+// Peers this node welcomes, by key in hex: a call one of them places through a relay is
+// answered without the contact secret (relay.js `accept`). The host-only `welcome` op
+// names them.
+let welcomed = new Set();
 
 /** One policy number: the installation's override, else the author's signed default.
  *  Each bounds a resource, so a missing one fails the load instead of running unbounded. */
@@ -262,6 +266,17 @@ class Core {
    *  this node cannot dial but `ready` still waits for. */
   addAddr(peerBytes, secret, dest) {
     this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
+  }
+
+  /** Drop one peer: its address, and every link to it, dialing or up. */
+  forgetPeer(peerId) {
+    this.addrs.delete(peerId);
+    for (const link of [...(this.connecting.get(peerId) || [])]) link.abort();
+    const pool = router.pools.get(peerId);
+    if (pool) for (const link of [...pool.links, ...pool.held]) link.close();
+    // A peer connection still being negotiated has no data link to close it.
+    const e = rtc.byPeer.get(peerId);
+    if (e && e.data === null) rtc.drop(e);
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -529,6 +544,25 @@ entry("contact", (r) => {
     throw new Error("transport: contact needs 32 bytes, or none for an open node");
   }
   contactSecret = secret.length === 0 ? ZERO32 : secret.slice();
+});
+
+/** Welcome these peers and no others, `[key 32]*` in one blob: a call one of them places
+ *  through a relay is answered whether or not it presents the contact secret (relay.js
+ *  `accept`). They are whoever the app has agreed to be reached by, its room-mates or a
+ *  list of friends it keeps; the contact secret gates everyone else. */
+entry("welcome", (r) => {
+  const keys = r.blob();
+  if (keys.length % PK_LEN !== 0) throw new Error("transport: welcome needs 32-byte peer ids");
+  const next = new Set();
+  for (let off = 0; off < keys.length; off += PK_LEN) next.add(toHex(keys.subarray(off, off + PK_LEN)));
+  welcomed = next;
+});
+
+/** Forget one peer: its address, and every link to it (`forgetPeer`). */
+entry("forget", (r) => {
+  const peer = r.blob();
+  if (peer.length !== PK_LEN) throw new Error("transport: forget needs a 32-byte peer id");
+  core.forgetPeer(toHex(peer));
 });
 
 /** Wait until every known peer is linked, or the deadline passes. */

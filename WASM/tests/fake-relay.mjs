@@ -38,6 +38,7 @@ export class FakeRelay {
     this.calls = 0;
     this.spliceBytes = 0;        // bytes forwarded through splices
     this.refuseSplices = false;  // a relay that takes calls but joins nothing
+    this.callerName = null;      // a lying relay: the key hex it names every caller as
   }
 
   factory() {
@@ -102,7 +103,7 @@ export class FakeRelay {
         return;
       }
       this.pending.set(ticket.toString("hex"), { ends: [] });
-      callee.end.deliver(Buffer.concat([Buffer.of(T_CALL), Buffer.from(c.key, "hex"), ticket]));
+      callee.end.deliver(Buffer.concat([Buffer.of(T_CALL), Buffer.from(this.callerName ?? c.key, "hex"), ticket]));
     } else {
       c.end.kill();
     }

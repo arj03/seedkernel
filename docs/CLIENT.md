@@ -321,6 +321,12 @@ await taught;
 // Rotate this node's contact secret; an empty blob opens it.
 await shell.call(TRANSPORT_SERVICE, new OpArgs("contact").blob(newSecret).build());
 
+// Welcome these peers, [key 32]* in one blob, room-mates or a list of friends the app keeps:
+// their calls through a relay need no contact secret. The whole set each time. And forget
+// one peer: its address and its links.
+await shell.call(TRANSPORT_SERVICE, new OpArgs("welcome").blob(welcomedKeys).build());
+await shell.call(TRANSPORT_SERVICE, new OpArgs("forget").blob(peerId).build());
+
 // Wait for the cohort or the deadline; the op settles either way.
 await shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
 ```

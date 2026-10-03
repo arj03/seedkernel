@@ -22,6 +22,15 @@ const joinRelay = (node, url = RELAY) => transportOp(node, new OpArgs("relay").t
 const addr = (node, peer, dest, secret = new Uint8Array(32)) =>
   transportOp(node, new OpArgs("addr").blob(Buffer.from(peer, "hex")).blob(secret).text(dest));
 const linked = async (a, b) => (await linkedPeers(a)).includes(b.peerId) && (await linkedPeers(b)).includes(a.peerId);
+const welcome = (node, peers) =>
+  transportOp(node, new OpArgs("welcome").blob(Buffer.concat(peers.map((p) => Buffer.from(p, "hex")))));
+const forget = (node, peer) => transportOp(node, new OpArgs("forget").blob(Buffer.from(peer, "hex")));
+/** Whether `a`'s request reaches `b`. */
+const reaches = async (a, b) => {
+  try { await a.request(b.peerId, PROTO, Uint8Array.of(1)); return true; } catch { return false; }
+};
+// Short deadlines, for tests where a refused caller waits one out.
+const FAST = { transportConfig: { handshakeTimeoutMs: 300, unverifiedTimeoutMs: 300 } };
 
 /** A node whose sockets are the relay's. */
 function relayNode(relay, opts = {}) {
@@ -159,6 +168,72 @@ await test("the callee's contact secret still gates a relayed dial", async (keep
   try { await A.request(B.peerId, PROTO, Uint8Array.of(1)); } catch { failed = true; }
   assert(failed, "a caller without the secret gets nothing through the splice");
   assert(!(await linkedPeers(B)).includes(A.peerId));
+});
+
+await test("a welcomed caller is answered without the contact secret, and nobody else is", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const secret = new Uint8Array(32).fill(1);
+  const A = keep(await relayNode(relay, FAST));   // welcomed, and given no secret
+  const C = keep(await relayNode(relay, FAST));   // not welcomed
+  const B = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
+  for (const n of [A, B, C]) await joinRelay(n);
+  await welcome(B, [A.peerId]);
+  for (const n of [A, C]) await addr(n, B.peerId, "relay+" + RELAY);
+  assert(await reaches(A, B), "the welcomed caller links with no secret");
+  assert(!(await reaches(C, B)) && !(await linkedPeers(B)).includes(C.peerId),
+    "a caller B does not welcome still needs its secret");
+  await addr(C, B.peerId, "relay+" + RELAY, secret);
+  assert(await reaches(C, B), "and links once it presents it");
+});
+
+await test("a welcomed caller that holds the contact secret links with it too", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const secret = new Uint8Array(32).fill(1);
+  const A = keep(await relayNode(relay, FAST));
+  const B = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
+  for (const n of [A, B]) await joinRelay(n);
+  await welcome(B, [A.peerId]);
+  await addr(A, B.peerId, "relay+" + RELAY, secret);
+  assert(await reaches(A, B), "the secret opens a welcomed accept as it opens any");
+});
+
+await test("a welcome is for that key alone: nobody else passes the gate in its name", async (keep) => {
+  // A relay that names every caller as A, whom B welcomes. C's msg1 then opens with no
+  // secret, but C cannot prove A's key at msg3, and B takes no other.
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay, FAST));
+  const C = keep(await relayNode(relay, FAST));
+  const B = keep(await relayNode(relay, { contactSecret: new Uint8Array(32).fill(1), ...FAST }));
+  for (const n of [A, B, C]) await joinRelay(n);
+  await welcome(B, [A.peerId]);
+  relay.callerName = A.peerId;
+  await addr(C, B.peerId, "relay+" + RELAY);
+  assert(!(await reaches(C, B)), "the caller behind A's name gets nothing through");
+  assert((await linkedPeers(B)).length === 0, "and B holds no link to anyone");
+});
+
+await test("welcome names the whole set, and forget drops a peer's links and its address", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay, FAST));
+  const B = keep(await relayNode(relay, { contactSecret: new Uint8Array(32).fill(1), ...FAST }));
+  for (const n of [A, B]) await joinRelay(n);
+  await welcome(B, [A.peerId]);
+  await addr(A, B.peerId, "relay+" + RELAY);
+  assert(await reaches(A, B) && await linked(A, B), "linked while welcomed");
+  // B hangs up on A: the link goes at both ends, with a goodbye.
+  await forget(B, A.peerId);
+  await until(async () => !(await linkedPeers(A)).includes(B.peerId) && !(await linkedPeers(B)).includes(A.peerId),
+    2000, "the link to close at both ends");
+  // A still has B's address and calls again, but B no longer welcomes it.
+  await welcome(B, []);
+  assert(!(await reaches(A, B)), "a peer left out of the next welcome needs the secret again");
+  // And a forgotten address is no address: the request fails without a call.
+  const calls = relay.calls;
+  await forget(A, B.peerId);
+  assert(!(await reaches(A, B)) && relay.calls === calls, "a forgotten peer is not dialed");
+  let msg = "";
+  try { await transportOp(A, new OpArgs("welcome").blob(Uint8Array.of(1, 2, 3))); } catch (e) { msg = String(e.message ?? e); }
+  assert(msg.includes("32-byte"), `a malformed welcome is refused, got "${msg}"`);
 });
 
 await test("a caller outside the callee's admitPeers gets no socket", async (keep) => {

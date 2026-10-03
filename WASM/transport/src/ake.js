@@ -223,6 +223,8 @@ class Link {
     this.onClose = spec.onClose;
     // Dials use the peer's secret; accepts use this node's current one (§12.6.3).
     this.contactSecret = spec.linkSecret || contactSecret;
+    // An accept from a welcomed key: a msg1 that presents no secret opens it too.
+    this.welcome = spec.welcome === true;
     this.root = null; // set by the boot chain below
 
     this.peerPubkey = null;
@@ -596,9 +598,13 @@ class Link {
     if (w1.length !== M1_LEN || w1[0] !== SUITE_CHANNEL_CONCEALED) { this.stall(); return; }
     const ephI = w1.slice(SUITE_LEN, SUITE_LEN + EPH_LEN);
     const kemPkI = w1.slice(SUITE_LEN + EPH_LEN, SUITE_LEN + EPH_LEN + KEM_PK_LEN);
-    const probe = await this.openZero(
-      await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI),
-      w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN));
+    const seal = w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN);
+    let probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI), seal);
+    // A welcomed caller need not hold the contact secret: its msg1 may be sealed under none.
+    if (!probe.ok && this.welcome) {
+      this.contactSecret = ZERO32;
+      probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI), seal);
+    }
     if (!probe.ok) { this.stall(); return; }
     // A msg1 can be replayed, so each is accepted once, before any expensive work
     // (§12.6.2).

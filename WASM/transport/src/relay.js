@@ -269,16 +269,19 @@ class Relays {
   /** A call for this node from `from`, the key the relay registered: open our end of the
    *  splice and accept whoever authenticates, under the half-open budgets with the caller's
    *  key as its source. A caller outside `admitPeers`, or at the per-source cap, gets no
-   *  socket. */
+   *  socket. A welcomed caller (core.js `welcome`) needs no contact secret, and then the
+   *  accept is for that key alone, so nobody else passes the gate in its name. */
   async accept(origin, from, ticket) {
     if (admitPeers !== null && !admitPeers.has(from)) return;
     if ((core.limiter.perSource.get(from) || 0) >= core.limiter.maxPerSource) return;
     const dest = origin + RELAY_WIRE + "?splice=" + toHex(ticket);
     const opened = await netLinkOpen(dest);
     if (opened.linkId === 0) return;
+    const welcome = welcomed.has(from);
     core.openLink({
       linkId: opened.linkId, stream: opened.stream, dest, listener: "", linkSecret: null,
       source: from, weDialed: false, limiter: core.limiter, dialedPeerId: null, relayed: true,
+      welcome, acceptPeerId: welcome ? from : "",
     });
   }
 }
