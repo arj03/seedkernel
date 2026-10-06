@@ -6,9 +6,9 @@ That suits three kinds of work:
 
 - **Hosting third-party extensions.** The operator controls which authors can install code and what each extension can access. Extensions run in isolated slots without direct access to the host's file system, sockets or process.
 - **Distributing app updates as signed bundles.** A release is one blob (manifest, guest and modules under hybrid author signatures), verified at admission, checked against a version floor, and landed as one atomic slot commit. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
-- **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
+- **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and the apps in [seedshell](https://github.com/arj03/seedshell) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
 
-**Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, seedchat's guest is a couple of dozen lines of app logic over a small AssemblyScript text handler, while seedstore's storage orchestration runs to roughly a thousand. Neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
+**Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, the guest of seedshell's chat app is a few dozen lines of app logic over a small AssemblyScript module, while seedstore's storage orchestration runs to roughly a thousand. Neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
 
 ## What it costs
 
@@ -18,7 +18,7 @@ That suits three kinds of work:
 
 ## Status
 
-Beta: it works on all three targets, and everything measured below was measured on running code, but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and [seedchat](https://github.com/arj03/seedchat), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
+Beta: it works on all three targets, and everything measured below was measured on running code, but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and those in [seedshell](https://github.com/arj03/seedshell), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
 
 There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Peer authentication and `node/sign` are Ed25519 alone: breaking Ed25519 later would not reveal earlier session keys, which rest on the hybrid X25519 + ML-KEM-768 exchange, but it would let an attacker forge live handshakes until the host's signing interface and the transport bundle are upgraded, and long-lived signed app records need separate consideration. Treat the security properties as design intent, not as verified.
 
@@ -175,7 +175,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys and reach each other before moving to a direct link, and where the apps meet peers in rooms, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), which seedchat's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedshell](https://github.com/arj03/seedshell) (a browser page that hosts apps, the chat demo of §11 among them; it is built on the `Shell` of §12.8, which is this repo's). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys and reach each other before moving to a direct link, and where the apps meet peers in rooms, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), which seedshell's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
 
 ## The rest of the spec
 

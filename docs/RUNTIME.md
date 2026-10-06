@@ -42,20 +42,20 @@ This is the one place these figures live.
 
 ---
 
-## 11. Example app layer: chat ([seedchat](https://github.com/arj03/seedchat))
+## 11. Example app layer: chat ([seedshell](https://github.com/arj03/seedshell))
 
-Chat is the smallest complete app, and lives in [seedchat](https://github.com/arj03/seedchat), a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `net-ws`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
+Chat is the smallest complete app, and lives in [seedshell](https://github.com/arj03/seedshell), the browser page that hosts it and a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `net-ws`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
 
-- **The bundle** is a guest of a couple of dozen lines. A peer's frame goes straight to its one restartable module, whose render bytes are the answer; the page's `send` op goes out through the transport's `_net` service. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. Seedchat derives its consent key by hashing the verified WASM bytes it holds.
-- **The page** generates an Ed25519 channel identity, boots a host (§12.8), installs a policy approving the authors the user trusts (§12.5), and starts with an empty table. `v1` (text only) and `v2` (text, image and nick) are two bundles under one `(author, app)`; v1→v2 is an install naming that slot, re-stating the `chat` protocol claim (§12.10).
+- **The bundle** is a guest of a few dozen lines and one restartable module, with an HTML view carried in its signed manifest. A peer's frame is drawn only if it is for this node, written to a room its sender is in or addressed to this node, and the module's render bytes are the answer; a frame from the app's own view goes out through the transport's `_net` service to the peers it is for. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. The page names a consent by one hash over the whole verified bundle: author, manifest, guest and modules.
+- **The page** generates an Ed25519 channel identity, boots a host (§12.8) and loads two small bundles of its own beside the transport, pinned to the author it was built with. Every other bundle is admitted only if the user consented to it (§12.5). A later build of chat is another bundle under the same `(author, app)`: installing it names that slot and re-states the `chat` protocol claim (§12.10).
 - **Peers** meet in a room on the relay, which the page joins itself, then link through the relay and move to WebRTC, negotiated by the transport bundle (§12.7); chat rides the transport request plane as `[req][protocolId][chatType][body]`, and the host invokes the claiming slot's guest with the authenticated peer key prepended.
 - **Relayed bundles** travel in an `OFFER` frame; the recipient re-verifies both author signatures and applies its own policy (§12.4).
-- **Rendering** leaves the host: the guest returns render bytes to the page, which `postMessage`s them to an iframe sandboxed `allow-scripts allow-forms` with no same-origin access to the page's keys.
+- **Rendering** leaves the host: the guest returns render bytes to the page, which `postMessage`s them to an iframe sandboxed `allow-scripts allow-forms allow-downloads` with no same-origin access to the page's keys.
 - **The relay** hosts rooms the page joins with seedrelay's room client (`rooms.mjs`), which names each member to the transport as a `relay+` address; the relay sees only a room's hashed id, and the transport sees no rooms at all. A room is not authenticated: its members see which keys are in it, but cannot impersonate a peer (§12.7).
-- **Calls** are chat's own: the page opens a separate `RTCPeerConnection` per peer for audio and video and signals it over the authenticated transport, under a protocol a small boot bundle claims.
-- **`ui` and `app_meta`** WASM custom sections are seedchat conventions; the host reads neither.
+- **Calls** are the page's own: it opens a separate `RTCPeerConnection` per peer for audio and video and signals it over the authenticated transport, under a protocol a small boot bundle claims.
+- **An app's name, version, description and view** ride in its signed manifest under `guest.config.shell`, a seedshell convention; the host passes `guest.config` to the guest and reads none of it.
 
-To run it: `npm run build:browser` here, then follow seedchat's build steps (`npm run relay` runs the relay).
+To run it: `npm run build:browser` here, then follow seedshell's build steps (`npm run relay` runs the relay).
 
 ---
 
@@ -256,7 +256,7 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 | `guest.requires` | string[] | yes | Everything the guest reaches: host services by service name, and local service ids it calls. A method name is refused with the service to declare; a local id must follow the claim charset, stay out of host namespaces and not spell a module name. Empty means no authority. |
 | `guest.config` | JSON object | shape only | Injected unchanged as `APP`. Must be an object; absent ≡ `{}`. Opaque to the runtime. |
 
-The host reads no WASM custom sections; conventions such as seedchat's `ui` and `app_meta` belong to the app.
+The host reads no WASM custom sections. A convention such as seedshell's `shell` entry in `guest.config` belongs to the app.
 
 #### Install
 
