@@ -12,6 +12,7 @@ import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
 import { enc, fromHex, toHex, isHex64, errMessage, concatBytes } from "../services/util.js";
+import { sendProtocol } from "../services/op-frame.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../services/subkeys.js";
 
@@ -242,6 +243,18 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const slot = table.localClaimant(id);
     return slot ? enter(slot, caller, payload, deadlineMs, causalClock) : null;
   };
+  /** A slot's calls to the link occupant send only under the protocols it claims, as a peer's
+   *  frame reaches an app only under those: the id is all that says which app a frame is for
+   *  at the far end (§12.10). */
+  const sendsOwn = (app: string, protocols: readonly string[], call: LocalCall): LocalCall =>
+    (id, payload, deadlineMs, causalClock) => {
+      const callee = table.localClaimant(id);
+      const protocol = callee && reachesLink(callee.verifiedBundle.manifest) ? sendProtocol(payload) : null;
+      if (protocol !== null && !protocols.includes(protocol)) {
+        throw new Error(`shell: ${app} does not claim ${JSON.stringify(protocol)}, so it may not send under it`);
+      }
+      return call(id, payload, deadlineMs, causalClock);
+    };
   /** The `link` backend: the driver's raw links, plus peer-inbound delivery looked up in
    *  the peer book only, so a peer can never reach a `services` claim (§12.10). A refused
    *  claim and a failed handler both answer empty. */
@@ -280,7 +293,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       },
       // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
       // zeros is the host.
-      callLocal: callLocal(genesisHash(sodium, enc.encode(app))),
+      callLocal: sendsOwn(app, b.manifest.protocols ?? [], callLocal(genesisHash(sodium, enc.encode(app)))),
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
         call: slot.pureModules.call,

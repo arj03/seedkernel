@@ -5,7 +5,7 @@
 // must reference nothing outside themselves, not even this file's imports. The type system
 // cannot check that; `testGeneratedOpFrame` (tests/bundle-install.test.mjs) runs the
 // emitted source to catch a free variable, so a new code path here needs a case there.
-import { writeU32BE, enc } from "./util.js";
+import { writeU32BE, readU32BE, enc } from "./util.js";
 
 /** Split a `handle` argument: `[caller 32][body ...]`. The host id is all zeros, checked
  *  over all 32 bytes, since a caller id can be ground to match any short prefix. */
@@ -102,4 +102,24 @@ export class OpArgs {
     for (const p of this.parts) { out.set(p, off); off += p.length; }
     return out;
   }
+}
+
+/** The protocol id the transport's `send` op sends under, read off a `host.call` body, or
+ *  `null` for any other op. The layout is the one `OpArgs` writes and the transport's
+ *  `Reader` reads: `[noReply u8][to blob][proto blob][payload blob]`. A `send` whose `to`
+ *  or `proto` does not lie within the body throws; the payload is the transport's to read.
+ *  A byte is a character: a claim is ASCII, so a byte that is not one never equals any
+ *  claim. */
+export function sendProtocol(body: Uint8Array): string | null {
+  const { op, args } = readOp(body);
+  if (op !== "send") return null;
+  const blobEnd = (at: number): number => {
+    if (at + 4 > args.length || at + 4 + readU32BE(args, at) > args.length) throw new Error("op-frame: malformed send");
+    return at + 4 + readU32BE(args, at);
+  };
+  const at = blobEnd(1);                          // [noReply u8][to]
+  const end = blobEnd(at);
+  let proto = "";
+  for (let i = at + 4; i < end; i++) proto += String.fromCharCode(args[i]);
+  return proto;
 }

@@ -296,6 +296,8 @@ const admit = async (v) => (await basePolicy(v)) && approvedClaims(v);
 
 Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`; bundles requiring `link` bypass the predicate (§12.5).
 
+**Admitting is the whole permission.** The host confines a guest to its `guest.requires` and holds its sends to the protocol ids it claims (§12.10), but does not contain it within a service it was granted. Where a user decides what to install, show the bundle's `guest.requires` and `protocols` (§14).
+
 A load returns an **`AppHandle`**: the verified manifest and author, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot, so you drive the app through derivations the host has already made. Take the handle; do not re-derive its parts.
 
 `install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds (§12.3), and an `onInbound` observer (§12.10). None becomes signed bundle content; `localConfig` becomes `LOCAL` unchanged, for the transport too, whose keys are listed in §12.6. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network.

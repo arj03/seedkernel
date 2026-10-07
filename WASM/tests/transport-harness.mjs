@@ -323,6 +323,14 @@ export async function makeTransportHost(opts = {}) {
     return r.slice(1);
   };
   node.sendNoReply = (to, proto, payload) => call(to, proto, payload, undefined, true);
+  /** A request sent through the host's own door to the transport, as the embedder would, for
+   *  a protocol the harness app does not claim: an app sends only under its own claims. */
+  node.requestAsHost = async (to, proto, payload) => {
+    const r = await shell.call(TRANSPORT_SERVICE, new OpArgs("send").u8(0)
+      .blob(Buffer.from(to, "hex")).blob(enc.encode(proto)).blob(payload).build());
+    if (r[0] !== 1) throw new Error("net: request failed");
+    return r.slice(1);
+  };
   node.app = app;
   /** Name an arbitrary transport op from the app, for the tests about the caller boundary
    *  (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the name. */

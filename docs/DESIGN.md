@@ -191,6 +191,8 @@
 
 **The raw-link binding is a claim.** The driver has one event sink, so a second holder would take the node's sockets off the first while leaving its claims and realm in place: installed, routed, and silently off the network. Claiming it under the same rule as a name makes that a refusal. The occupant that sees plaintext is the one that attributes: holding the sockets *is* the authority to say which peer a request came from, because nothing else ever held the bytes.
 
+**A claim is also the right to send.** The far end knows a frame by its protocol id and this node's key; nothing in it says which local app wrote it, so an app free to name any id would speak as the node in every other app's protocol. The check sits in the host because the claim book does: asked from the transport, it would cost a host round trip on every send. The leading fields of the occupant's `send` are therefore the one part of its vocabulary the host reads, and one claimant per id means one sender per id on a node.
+
 **`onInbound` exists because the transport consumes the answer.** An embedder whose mounted app must paint what it just answered (seedshell relaying render bytes to an app's view) has no other path to those bytes. Scoping the callback to the load keeps it a hook, not a second owner kind in the claim map.
 
 **One slot per protocol.** Fan-out would be an authority-bearing observer model needing its own admission semantics; until then a single value is the honest shape.

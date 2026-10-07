@@ -296,9 +296,9 @@ func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int
 
 // ── the probe app: how a native test puts a request on the wire ───────────────
 //
-// An app reaches the network by calling the id the transport claims (`_net`, §12.10) and
-// is reached by the id it claims itself, so a test that sends a request has to be an app,
-// and these tests use the path a deployment uses, end to end.
+// An app reaches the network by calling the id the transport claims (`_net`, §12.10), is
+// reached by the id it claims itself, and sends only under that id. A test that sends as
+// an app uses the path a deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given, and for a local loopback
 // the `send` op sends one request. The framing after the host's 32-byte caller is the

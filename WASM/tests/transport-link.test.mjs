@@ -751,10 +751,35 @@ await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied",
   assert(refused.includes("over the frame cap"), `an over-cap send must be refused, got ${refused || "no error"}`);
   // And a malformed destination, checked before the hex conversion.
   let badTo = "";
-  const args = new Uint8Array(1 + 4 + 4 + 4); // noReply, to(0), proto(0), payload(0)
+  // noReply, to(0), proto (the harness app's own, which it may send under), payload(0)
+  const proto = new TextEncoder().encode(PROTO);
+  const args = new Uint8Array(1 + 4 + 4 + proto.length + 4);
+  args[8] = proto.length;
+  args.set(proto, 9);
   try { await st.A.op("send", args); } catch (e) { badTo = String(e); }
   assert(badTo.includes("32-byte peer id"), `a malformed peer id must be refused, got ${badTo || "no error"}`);
   assert(!st.a.closed && !st.b.closed, "a refused send must not disturb the link");
+});
+
+await test("SEND CLAIMS: an app sends only under the protocols it claims", async (keep) => {
+  // The protocol id is all that says which app a frame is for at the far end (§12.10), so a
+  // send under one the app does not claim is refused, as is one that does not lie within its
+  // bytes. The embedder's own door to the transport is not an app's.
+  const st = keep(await upPair());
+  let refused = "";
+  try { await st.A.request(st.B.peerId, "someone/else", Uint8Array.of(1)); }
+  catch (e) { refused = String(e); }
+  assert(refused.includes('does not claim "someone/else"'), `a send under another's id must be refused by name, got ${refused || "no error"}`);
+  const ok = await st.A.request(st.B.peerId, PROTO, Uint8Array.of(4, 5));
+  assert(ok.length === 2 && ok[1] === 5, "and one under its own still goes through");
+  const { sendProtocol, OpArgs } = await import("../build/services/op-frame.js");
+  const whole = new OpArgs("send").u8(1).blob(new Uint8Array(32)).blob(Uint8Array.of(0x63, 0x68)).blob(Uint8Array.of(9)).build();
+  assert(sendProtocol(whole) === "ch" && sendProtocol(new OpArgs("peers").build()) === null, "the protocol is read off a send, and off nothing else");
+  for (let cut = 0; cut < whole.length - 5; cut++) {
+    let threw = false;
+    try { sendProtocol(whole.subarray(0, cut)); } catch { threw = true; }
+    assert(threw, `a send cut at ${cut} bytes must be refused`);
+  }
 });
 
 await test("OUTBOUND QUEUE: authenticated encryption work is bounded", async (keep) => {
@@ -1363,7 +1388,7 @@ await test("a peer-inbound answer reaches the installer through onInbound", asyn
     onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
   });
 
-  const resp = await st.A.request(st.B.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
+  const resp = await st.A.requestAsHost(st.B.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
   assert(resp.length === 3 && resp[0] === 0xfe && resp[1] === 0xfd && resp[2] === 0xfc,
     `the caller must still get the app's own answer untouched, got ${[...resp]}`);
   assert(seen.length === 1, "onInbound must fire exactly once per peer-inbound answer");
@@ -1390,7 +1415,7 @@ await test("a peer cannot reach a bundle's local service claim, the transport's 
     const n = Buffer.from(op, "utf8");
     return Uint8Array.from([n.length, ...n]);
   };
-  const peers = await st.A.request(st.B.peerId, "_net", opEnvelope("peers"));
+  const peers = await st.A.requestAsHost(st.B.peerId, "_net", opEnvelope("peers"));
   assert(peers.length === 0,
     `the transport's own claim must not answer a peer, got ${peers.length} bytes: ${hexOf(peers)}`);
   // Never delivered, not just unanswered: the ordinary claim still works on the same link,

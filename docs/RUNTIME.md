@@ -131,7 +131,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the peer claim map (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
 | `timer/arm` | `[ms u32]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as the `wake` host event (§12.2). A realm that has spent its clock share has it slipped, not failed. |
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a notification already handed to the realm is not retracted. |
-| *declared local service id* | opaque bytes; the host prepends the **caller's** 32-byte id | what the claimant's `handle` returned. Refused by name when nothing claims it. |
+| *declared local service id* | opaque bytes; the host prepends the **caller's** 32-byte id. A call into the link occupant is the one the host reads, for the protocol a `send` names (§12.10) | what the claimant's `handle` returned. Refused by name when nothing claims it. |
 
 #### Settlement
 
@@ -545,6 +545,7 @@ A frame names a **protocol id**, never an app, author or module. Each installed 
 - **Claim charset**: alphanumeric or `_` first, then alphanumerics and `._/-`, at most 64 bytes. Uniqueness is per list; the same name in both lists is allowed. No spelling is reserved; `_net` is this repo's transport's convention.
 - **Peer delivery.** The link occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in `peerClaims` alone and invokes the slot's `handle` with `attribution ‖ payload`. An unclaimed protocol, or a `services`-only name, is answered empty.
 - **Local calls.** `host.call(id, …)` on a local service id in the caller's own `guest.requires` resolves through `localClaims`; the host prepends the caller's 32-byte id and the answer is the callee's `handle` result on a later turn.
+- **An app sends under its own claims.** A frame names only a protocol id, and the far end routes by it with this node's key in front, so a call from an app to the link occupant's `send` op is refused unless the protocol it names is in the caller's own `protocols`. An app that only sends under an id claims it too. The host reads the op envelope and `send`'s leading fields, `[noReply u8][to blob][proto blob]` (`sendProtocol`, `services/op-frame.ts`), and refuses a `send` whose `to` or `proto` does not lie within its bytes; that much of the op is the link occupant's contract with the host, and the rest of its vocabulary is its own. `Shell.call` is the embedder's own door and is not held to it.
 - **Host doors.** `AppHandle.invoke(payload)` is slot-bound (a bundle claiming nothing has one) and prepends 32 zero bytes. `Shell.call(serviceId, payload)` resolves `localClaims` with the host's caller id and returns `null` when nothing claims the name.
 - **The binding.** The driver follows the book, and the host wires the `link` service (the driver's raw links plus its own `deliver`) only into that slot.
 - **`InstallOptions.onInbound(claim, sender, answer)`** fires once a peer-inbound request to this load's slot resolves. It is observation only: it cannot change the answer, never fires for `invoke` or local calls, and a throw from it is reported and swallowed.

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,7 +40,7 @@ const echoGuestSource = `
 // requesterJS boots a second node in the same realm, just a network and the transport, so
 // a test can send a real request over a real socket. The node under test is the one
 // startNode booted; this is only the peer calling it, under a policy of its own that
-// admits the probe app it sends through.
+// admits the probe app.
 const requesterJS = `
 "use strict";
 globalThis.startRequester = async function (holderId, port, contactSecretHex, policyJson) {
@@ -63,27 +64,36 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex, po
 // Go passes bytes as ArrayBuffers; request takes a Uint8Array like every other caller, so
 // make one here instead of loosening the shared signature.
 globalThis.__requester = null;
-// The requester installs the probe app and sends through it: a request is an app calling
-// the id the transport claims.
 globalThis.loadIntoRequester = async (bytes) => {
   globalThis.__requester = await __requesterNode.shell.install(new Uint8Array(bytes));
 };
-globalThis.ask = async (sendArgs) => {
-  // The op name is the probe app's own (the shell passes bytes unread; this file builds
-  // the frame the app's handle reads).
-  const op = "send", args = new Uint8Array(sendArgs);
-  const framed = new Uint8Array(1 + op.length + args.length);
-  framed[0] = op.length;
-  for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
-  framed.set(args, 1 + op.length);
-  const r = await __requester.invoke(framed);
-  if (r[0] !== 1) throw new Error("net: request failed");
-  return r.slice(1);
-};
+// In a block, since this script is evaluated once per test.
+{
+  // The transport's send op and the probe app's own are both named "send", so one frame
+  // serves either door.
+  const sendFrame = (sendArgs) => {
+    const op = "send", args = new Uint8Array(sendArgs);
+    const framed = new Uint8Array(1 + op.length + args.length);
+    framed[0] = op.length;
+    for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
+    framed.set(args, 1 + op.length);
+    return framed;
+  };
+  const answered = (r) => {
+    if (r[0] !== 1) throw new Error("net: request failed");
+    return r.slice(1);
+  };
+  // Through the host's own door to the transport, which may name any protocol: an app
+  // sends only under its own claims (§12.10), and these tests ask for other apps'.
+  globalThis.ask = async (sendArgs) =>
+    answered(await __requesterNode.shell.call("_net", sendFrame(sendArgs)));
+  // Through the probe app, which is held to the one id it claims.
+  globalThis.askAsApp = async (sendArgs) =>
+    answered(await __requester.invoke(sendFrame(sendArgs)));
+}
 `
 
 // startRequester boots the second node, installs the probe app, and returns its peer id.
-// The app is what sends.
 func startRequester(t *testing.T, holderID string, port int) string {
 	t.Helper()
 	if _, err := qc.Eval("requester.js", requesterJS); err != nil {
@@ -206,6 +216,30 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// the check is that the answer is empty, not either app's.
 	if resp := ask(t, st.PeerID, "nobody-serves-this", []byte{2}); len(resp) != 0 {
 		t.Fatalf("an unbound protocol was answered with %d B — no app is bound to it", len(resp))
+	}
+}
+
+// An app sends only under the protocol ids it claims (§12.10): the id is all that says
+// which app a frame is for at the far end, so the probe, which claims `probe`, is refused
+// by name under another app's id, and the same request through the host's door is served.
+func TestAppSendsOnlyUnderItsOwnClaims(t *testing.T) {
+	author := testAuthor(t)
+	st := serveNode(t, author.id())
+	echoBundle, _ := writeBundle(t, author, "echoapp", 1, echoGuestSource, nil)
+	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, author.id(), "echoapp") {
+		t.Fatalf("echo bundle load: %s", status)
+	}
+	peerID := startRequester(t, st.PeerID, st.Port)
+	payload := []byte("not mine to send")
+
+	_, err := callRealm("askAsApp", 8*time.Second,
+		qc.NewArrayBuffer(probeSendArgs(st.PeerID, "echoapp", payload)))
+	if err == nil || !strings.Contains(err.Error(), `probe does not claim "echoapp"`) {
+		t.Fatalf("a send under another app's id must be refused by name, got: %v", err)
+	}
+	got := ask(t, st.PeerID, "echoapp", payload)
+	if want := append(mustHex(t, peerID), payload...); !bytes.Equal(got, want) {
+		t.Fatalf("the host's own send = %x, want senderPk ‖ payload = %x", got, want)
 	}
 }
 
