@@ -47,9 +47,10 @@ export interface LinkBackend extends RawNet {
    *  handler both answer empty. It enters another realm, so the caller must not wait on it
    *  in the same turn; the answer resumes the caller as a new turn (`CallBudget.detach`). */
   deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
-  /** The occupant's word on who is linked now, and how each is reached, as its `routes` op
-   *  answers it: told each time that changes. */
-  peers(routes: Uint8Array): void;
+  /** The occupant's word on its relay's state, and on who is linked now and how each is
+   *  reached, as its `relayState` and `routes` ops answer them: told each time either
+   *  changes. */
+  status(status: Uint8Array): void;
 }
 
 /** One replaceable wake, delivered as the `wake` host event. */
@@ -440,9 +441,10 @@ const SERVICES: {
       const attrAt = 1 + payload[0];
       return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
     },
-    // Who is linked now, `[key 32][direct u8]*`, said by the occupant when it changes.
-    "link/peers": (payload) => {
-      net.peers(payload.slice());
+    // The relay's state and who is linked now, `[relay u8][key 32][direct u8]*`, said by the
+    // occupant when either changes.
+    "link/status": (payload) => {
+      net.status(payload.slice());
       return NONE;
     },
   }),

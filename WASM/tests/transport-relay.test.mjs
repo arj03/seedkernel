@@ -261,6 +261,20 @@ await test("a restarted relay is redialed, and the next send links again", async
   assert(relay.splices.length === 2, `a second splice, got ${relay.splices.length}`);
 });
 
+await test("the host is told its status when the relay's state changes", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  // The relay's state is the status's first byte. A status may be told again unchanged.
+  const told = [];
+  const states = () => told.filter((s, i) => s !== told[i - 1]).join();
+  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status[0]) }));
+  await joinRelay(A);
+  assert(states() === "2,1", `joining tells it is on its way, then registered, got ${told}`);
+  relay.restart();
+  await until(() => states() === "2,1,2,1", 5000, "the drop and the redial to be told");
+  await joinRelay(A, "");
+  await until(() => states() === "2,1,2,1,0", 2000, "leaving to be told");
+});
+
 await test("a call the relay cannot join fails that send, and the next one goes through", async (keep) => {
   const relay = new FakeRelay("relay:1");
   relay.refuseSplices = true;
@@ -296,18 +310,20 @@ await test("what was sent to a peer before it is forgotten reaches it, ahead of 
   assert(reason === "clean", `and the goodbye behind them, got "${reason}"`);
 });
 
-await test("the host is told who is linked each time that changes, ahead of a new peer's first frame", async (keep) => {
+await test("the host is told its status when who is linked changes, ahead of a new peer's first frame", async (keep) => {
   const relay = new FakeRelay("relay:1");
-  // What B's host hears, in order: who is linked (`onPeers`), and each frame delivered.
+  // What B's host hears, in order: who is linked, which is the status behind its first
+  // byte (`onStatus`), and each frame delivered.
   const heard = [];
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay, {
-    onPeers: (routes) => heard.push(Buffer.from(routes).toString("hex")),
+    onStatus: (status) => heard.push(Buffer.from(status.subarray(1)).toString("hex")),
     onHostCall: (name) => { if (name === "link/deliver") heard.push("frame"); },
   }));
   // A's request is what dials, so its frame comes in right behind the handshake.
   await relayed(A, B);
-  assert(heard[0] === A.peerId + "00" && heard[1] === "frame",
+  const linked = heard.indexOf(A.peerId + "00");
+  assert(linked >= 0 && linked < heard.indexOf("frame"),
     `B is told A is linked, through the relay, before A's frame is delivered, got ${heard}`);
   await forget(B, A.peerId);
   await until(() => heard.at(-1) === "", 2000, "B to be told nobody is linked");

@@ -147,6 +147,7 @@ class RelayConn {
       this.upSince = now();
       this.due = Infinity;
       this.touch();
+      statusChanged();
       for (const settle of this.waiters.splice(0)) settle(true);
     } else if (type === R_CALL && body.length === PK_LEN + TICKET_LEN) {
       await relays.accept(this.origin, toHex(body.subarray(0, PK_LEN)), body.subarray(PK_LEN));
@@ -207,6 +208,7 @@ class Relays {
     this.home = origin;
     this.retryAt = Infinity;
     this.retryMs = RELAY_RETRY_MS;
+    statusChanged();
     if (origin) await this.dialHome();
   }
 
@@ -232,6 +234,7 @@ class Relays {
     if (this.conns.get(c.origin) !== c) return;
     this.conns.delete(c.origin);
     if (this.home !== c.origin) return;
+    statusChanged();
     // A registration that held longer than the longest wait starts the backoff over.
     if (c.upSince < now() - RELAY_RETRY_MAX_MS) this.retryMs = RELAY_RETRY_MS;
     this.retryAt = dueIn(this.retryMs * (1 + Math.random()) / 2);

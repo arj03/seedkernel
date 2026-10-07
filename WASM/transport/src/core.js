@@ -588,13 +588,17 @@ function routes() {
 }
 entry("routes", routes);
 
-/** A peer's links changed (router.js): tell the host what `routes` answers now. Once the
- *  turn is over, since a pool is not whole between two steps of one. */
-let peersDue = false;
-function peersChanged() {
-  if (peersDue) return;
-  peersDue = true;
-  void Promise.resolve().then(() => { peersDue = false; return host.call(N_LINK_PEERS, routes()); }).catch(() => {});
+/** The home relay's state changed (relay.js), or a peer's links did (router.js): tell the
+ *  host both, `[relay u8]` as `relayState` answers it and then what `routes` answers. Once
+ *  the turn is over, since a pool is not whole between two steps of one. */
+let statusDue = false;
+function statusChanged() {
+  if (statusDue) return;
+  statusDue = true;
+  void Promise.resolve().then(() => {
+    statusDue = false;
+    return host.call(N_LINK_STATUS, concatBytes([Uint8Array.of(relays.state()), routes()]));
+  }).catch(() => {});
 }
 
 // No `shutdown` op: the host closes its own sockets and timers (transport-host.ts `close`).

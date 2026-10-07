@@ -72,7 +72,7 @@ The host provides four **host services**, `node`, `fs`, `timer` and `link` (`HOS
 | `node` | `node/sign`, `node/verify` | The node key: signing and verification under this slot's scope (§12.2). The node's public key is not a call; every realm reads it as `HOST.identity` (§12.3). |
 | `fs` | `fs/get`, `fs/put`, `fs/list`, `fs/delete`, `fs/stat`, `fs/size` | Raw bytes under an opaque, flat key, scoped to the app label (§12.1). |
 | `timer` | `timer/arm`, `timer/clear` | The realm's one wake (§12.3). |
-| `link` | `link/open`, `link/send`, `link/close`, `link/deliver`, `link/peers` | Raw links over opaque link ids, attributed inbound delivery, and who is linked. **The link owner only** (§12.5). |
+| `link` | `link/open`, `link/send`, `link/close`, `link/deliver`, `link/status` | Raw links over opaque link ids, attributed inbound delivery, and the occupant's status. **The link owner only** (§12.5). |
 | `crypto/*` | `blake2b`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries, each over its algorithm's whole standard interface (§12.2). `random` is host entropy. **Not a grant.** |
 | *bare names* | the bundle's own module names | The asking bundle's private WASM modules. **Not a grant.** |
 
@@ -129,7 +129,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 | `link/send` | `[linkId u32][bytes ..]` | (empty) |
 | `link/close` | `[linkId u32][graceful u8]` | (empty) |
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the peer claim map (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
-| `link/peers` | `[key 32][direct u8]*`: the linked peers and how each is reached, as the shipped transport's `routes` op answers them (§12.6.3) | (empty). The occupant says it each time that changes, and the host hands it to the embedder's `onPeers` (`bootShell`'s transport options), so a host follows its links without polling them. |
+| `link/status` | `[relay u8][key 32][direct u8]*`: the state of the relay the node is registered on, then the linked peers and how each is reached, as the shipped transport's `relayState` and `routes` ops answer them (§12.6.3) | (empty). The occupant says it each time either changes, and the host hands it to the embedder's `onStatus` (`bootShell`'s transport options), so a host follows its relay and its links without polling them. |
 | `timer/arm` | `[ms u32]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as the `wake` host event (§12.2). A realm that has spent its clock share has it slipped, not failed. |
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a notification already handed to the realm is not retracted. |
 | *declared local service id* | opaque bytes; the host prepends the **caller's** 32-byte id. A call into the link occupant is the one the host reads, for the protocol a `send` names (§12.10) | what the claimant's `handle` returned. Refused by name when nothing claims it. |

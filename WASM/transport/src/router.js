@@ -60,7 +60,7 @@ class Router {
     if (up) { pool = { links: [], direct: 0, held: [], next: 0 }; this.pools.set(peerId, pool); }
     Router.list(pool, link);
     if (up) core.checkReady();
-    peersChanged();
+    statusChanged();
     return true;
   }
 
@@ -110,7 +110,7 @@ class Router {
     const h = pool.held.indexOf(link);
     if (h >= 0) { pool.held.splice(h, 1); return; }
     if (!Router.unlist(pool, link)) return;
-    peersChanged();
+    statusChanged();
     if (pool.links.length > 0) return;
     // The winner closed first: a held link is now the only way to the peer, so route it.
     if (pool.held.length > 0) {

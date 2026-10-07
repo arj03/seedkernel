@@ -13,8 +13,8 @@ const N_LINK_SEND = "link/send";
 const N_LINK_CLOSE = "link/close";
 // Inbound: a request decoded from a link, handed to the host's claim routing.
 const N_LINK_DELIVER = "link/deliver";
-// Who is linked, told to the host when it changes.
-const N_LINK_PEERS = "link/peers";
+// The home relay's state and who is linked, told to the host when either changes.
+const N_LINK_STATUS = "link/status";
 
 const N_TIMER_ARM = "timer/arm";
 

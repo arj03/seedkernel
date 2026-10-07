@@ -44,7 +44,7 @@ export const HOST_SERVICES = {
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
   timer: { calls: ["arm", "clear"] },
   link: {
-    calls: ["open", "send", "close", "deliver", "peers"],
+    calls: ["open", "send", "close", "deliver", "status"],
     events: ["linkOpen", "linkBytes", "linkClosed"],
   },
 } as const;
