@@ -243,6 +243,7 @@ class Link {
     this.outboundQueuedSlices = 0;
     this.peerEph = null;
     this.closed = false;
+    this.parting = false;     // closed deliberately, and still sending what came before
     this.stalled = false;
     // How this link ended, for `closeReason`: closed locally, provoked by the peer, or
     // timed out.
@@ -368,7 +369,7 @@ class Link {
       this.outboundQueuedBytes += frame.length;
       void this.enqueue(async () => {
         try {
-          if (this.closed) return;
+          if (this.closed && !this.parting) return;
           await this.wireRecord(frame);
         } finally {
           this.outboundQueuedSlices--;
@@ -404,10 +405,17 @@ class Link {
 
   /** End the link locally: it leaves routing at once and tears down behind the work
    *  chain, so an in-flight step keeps its keys. `farewell` sends the end-of-stream record
-   *  first; `defensive` records that the peer provoked it. */
+   *  first, behind the records handed to the link before it, which a failure drops;
+   *  `defensive` records that the peer provoked it. */
   end(farewell, defensive) {
-    if (this.closed) return;
+    if (this.closed) {
+      // A failure while a deliberate close is still sending ends the sending.
+      if (!farewell) this.parting = false;
+      return;
+    }
     this.closed = true;
+    // Nothing more is sent to a peer that has said goodbye, or with the epochs used up.
+    this.parting = farewell && !this.peerSaidGoodbye && this.sendEpoch < REJECT_AFTER_EPOCHS;
     this.closedLocally = true;
     if (defensive) this.aborted = true;
     this.severWire();

@@ -276,6 +276,26 @@ await test("a call the relay cannot join fails that send, and the next one goes 
   assert(resp[0] === 2);
 });
 
+await test("what was sent to a peer before it is forgotten reaches it, ahead of the goodbye", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  let reason = "";
+  // A seals slowly, as a busy link does: a record waits its turn behind the ones before
+  // it, so most of these are still queued when the close comes.
+  const slowSeal = (name, answer) => (name.endsWith("/seal") ? new Promise((r) => setTimeout(() => r(answer), 20)) : answer);
+  const A = keep(await relayNode(relay, { onHostAnswer: slowSeal }));
+  const B = keep(await relayNode(relay, { onLinkClosed: (_id, r) => { reason = r; } }));
+  await relayed(A, B);
+  const before = (await B.seen()).length;
+  const sends = [];
+  for (let i = 0; i < 10; i++) sends.push(A.sendNoReply(B.peerId, PROTO, Uint8Array.of(9, i)));
+  await Promise.all(sends);
+  await forget(A, B.peerId);
+  await until(() => reason !== "", 3000, "B's link to close");
+  const got = (await B.seen()).length - before;
+  assert(got === 10, `all 10 records arrive, got ${got}`);
+  assert(reason === "clean", `and the goodbye behind them, got "${reason}"`);
+});
+
 await test("the host is told who is linked each time that changes, ahead of a new peer's first frame", async (keep) => {
   const relay = new FakeRelay("relay:1");
   // What B's host hears, in order: who is linked (`onPeers`), and each frame delivered.

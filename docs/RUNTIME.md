@@ -387,7 +387,7 @@ Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   (node/sign; the prefix is the host'
 
 - Every post-handshake frame is a ChaCha20-Poly1305-IETF record: the initiator seals with `k_i2r` and opens with `k_r2i`, the responder mirrors. There is one post-handshake frame type.
 - The nonce is an implicit per-direction `(epoch, counter)`, strictly enforced on receive; a bad tag or out-of-order counter tears the link down. After `REKEY_AFTER_FRAMES` a direction ratchets its key; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
-- Only `close()` emits the authenticated end-of-stream record; every failure path is silent.
+- Only `close()` emits the authenticated end-of-stream record; every failure path is silent. The record goes out behind what was handed to the link before the close, so a frame sent and a peer forgotten right after still arrives; a failure drops what was waiting.
 - A graceful `link/close` asks the socket to flush its queued bytes before closing, bounded on TCP by `TCP_LINGER_MS` (`services/net-limits.ts`).
 - Records assume an ordered whole-message pipe, which every socket seam supplies.
 
