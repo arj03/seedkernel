@@ -241,6 +241,7 @@ export async function makeTransportHost(opts = {}) {
     // The occupant's reason per link teardown (transport/src/ake.js `REASON_*`), the only
     // place a test can read why a link went down.
     onLinkClosed: opts.onLinkClosed,
+    onPeers: opts.onPeers,
     // Most of this suite tears links down on purpose, so the driver's diagnostic would bury
     // the real output. Off by default here only; the line itself has its own test, which
     // turns it back on.

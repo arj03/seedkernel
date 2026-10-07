@@ -95,6 +95,9 @@ export interface TransportOptions extends TransportHostOptions {
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
+  /** Called each time who is linked changes, or how one of them is reached: the linked
+   *  peers as the transport's `routes` op answers them, `[key 32][direct u8]` apiece. */
+  onPeers?: (routes: Uint8Array) => void;
 }
 
 /** Assembly options (§12.8). Everything except `sodium` and `identity` has a default. */
@@ -274,6 +277,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         }, () => {});
       }
       return answer.catch(() => EMPTY);
+    },
+    peers: (routes) => {
+      try { net!.onPeers?.(routes); }
+      catch (err) { console.error(`[shell] the embedder's onPeers threw: ${errMessage(err)}`); }
     },
   } : undefined;
   /** Wire the `host.call` seam for one slot (guest-seam.ts): only the services its bundle

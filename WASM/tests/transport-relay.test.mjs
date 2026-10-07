@@ -276,4 +276,21 @@ await test("a call the relay cannot join fails that send, and the next one goes 
   assert(resp[0] === 2);
 });
 
+await test("the host is told who is linked each time that changes, ahead of a new peer's first frame", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  // What B's host hears, in order: who is linked (`onPeers`), and each frame delivered.
+  const heard = [];
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay, {
+    onPeers: (routes) => heard.push(Buffer.from(routes).toString("hex")),
+    onHostCall: (name) => { if (name === "link/deliver") heard.push("frame"); },
+  }));
+  // A's request is what dials, so its frame comes in right behind the handshake.
+  await relayed(A, B);
+  assert(heard[0] === A.peerId + "00" && heard[1] === "frame",
+    `B is told A is linked, through the relay, before A's frame is delivered, got ${heard}`);
+  await forget(B, A.peerId);
+  await until(() => heard.at(-1) === "", 2000, "B to be told nobody is linked");
+});
+
 summary("Relays");
