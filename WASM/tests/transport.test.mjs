@@ -124,6 +124,10 @@ test("destinations: a scheme and a path survive whole, and neither disturbs the 
   assert(proxied.path === "/chat/v1", `the path must survive whole, got ${proxied.path}`);
   // The scheme's own `//` is not a path, and a root path is kept as one.
   assert(parseDest("ws://h:1/").path === "/", "a bare root path is still a path");
+  // An IPv6 literal is bracketed in the string, so its colons are not the port's, and bare
+  // in the answer, which is how a socket takes it.
+  const v6 = parseDest("tcp://[::1]:9000");
+  assert(v6.host === "::1" && v6.port === 9000, `an IPv6 host must lose its brackets, got ${JSON.stringify(v6)}`);
 });
 
 test("destinations: anything malformed is no route, not a throw", () => {
@@ -132,6 +136,7 @@ test("destinations: anything malformed is no route, not a throw", () => {
   assert(parseDest("host:9") === null, "a destination with no scheme is unroutable");
   assert(parseDest("quic://host:9") === null, "a scheme no factory speaks is unroutable");
   assert(parseDest("tcp://host:abc") === null, "a destination with no usable port is unroutable");
+  assert(parseDest("tcp://[::1]") === null, "an IPv6 host with no port is unroutable");
 });
 
 summary("RFC 6455 module conformance");

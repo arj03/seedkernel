@@ -25,7 +25,18 @@ import (
 // bundle), so `standUp` is the function the binary boots through, not a separate harness.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
-	runTwoNode(t, "ws", `portOf("ws")`, `listen: [{ label: "ws", host: "127.0.0.1", port: 0 }],`)
+	runTwoNode(t, "ws", "127.0.0.1", `portOf("ws")`, `listen: [{ label: "ws", host: "127.0.0.1", port: 0 }],`)
+}
+
+// An IPv6 destination is bracketed as a peer writes it, and bare by the time it reaches
+// Go's sockets (services/peer-addr.ts), which bracket it themselves.
+func TestTwoNodeRequestResponseIPv6(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	ln.Close()
+	runTwoNode(t, "ws", "[::1]", `portOf("ws")`, `listen: [{ label: "ws", host: "::1", port: 0 }],`)
 }
 
 // TestNativeAcceptedLinksShareRemoteSourceBudget checks the native accept bridge carries
@@ -97,8 +108,9 @@ func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 }
 
 // listenArgs is A's listener, inside its standUp transport: which listener it binds, and
-// so which codec the pair speaks. Both nodes here are open (no contact secret).
-func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
+// so which codec the pair speaks; host is where B dials it. Both nodes here are open (no
+// contact secret).
+func runTwoNode(t *testing.T, transport, host, portField, listenArgs string) {
 	bootRealm(t)
 
 	// A listens; B dials A and asks; A's probe app echoes the payload back. Both ends
@@ -125,7 +137,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  await a.transport.start();
 		  await a.shell.install(__probe);
 		  const bApp = await b.shell.install(__probe);
-		  teachAddr(b.shell, aId, "%s://127.0.0.1:" + a.transport.%s);
+		  teachAddr(b.shell, aId, "%s://%s:" + a.transport.%s);
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][to blob][proto blob][payload blob]. The op name in front is the
 		  // app's framing, built here (the shell passes bytes unread and adds the caller
@@ -152,7 +164,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  if (r[0] !== 1) throw new Error("net: request failed");
 		  return r.slice(1);
 		};
-	`, senderHex, listenArgs, transport, portField)
+	`, senderHex, listenArgs, transport, host, portField)
 	if _, err := qc.Eval("transport-harness.js", harness); err != nil {
 		t.Fatal("harness:", err)
 	}

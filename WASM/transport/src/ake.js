@@ -78,10 +78,7 @@ function hash(...parts) {
   return host.call(P_HASH, concatBytes([HASH_256, ...parts]));
 }
 async function verify(pk, sig, msg) {
-  let len = pk.length + sig.length + msg.length;
-  const out = new Uint8Array(len);
-  out.set(pk, 0); out.set(sig, pk.length); out.set(msg, pk.length + sig.length);
-  const r = await host.call(N_VERIFY, out);
+  const r = await host.call(N_VERIFY, concatBytes([pk, sig, msg]));
   return r[0] === 1;
 }
 function randomBytes(n) {
@@ -557,10 +554,7 @@ class Link {
 
   /** Every handshake key comes through here, so every one mixes in the contact secret. */
   kdf(ikm, ctx, label) {
-    const parts = [];
-    for (const p of ikm) parts.push(p);
-    parts.push(this.contactSecret, ctx, label);
-    return hash(...parts);
+    return hash(...ikm, this.contactSecret, ctx, label);
   }
 
   async sealZero(key, plain) {

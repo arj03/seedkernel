@@ -1,8 +1,10 @@
 // Link router + request/response layer (§12.6): correlation and protocol ids.
 
-/** A frame's first byte for the transport's own messages between two nodes, beside a
- *  request (0x00, 0x80 without reply) and a response (0x01): `[KIND_CTL][tag u8][body]`. */
-const KIND_CTL = 0x02;
+/** A frame's first byte: a request, a response, or one of the transport's own messages
+ *  between two nodes, `[KIND_CTL][tag u8][body]`. */
+const KIND_REQ = 0x00, KIND_RES = 0x01, KIND_CTL = 0x02;
+/** OR'd into a request's kind when it wants no response. */
+const FLAG_NO_REPLY = 0x80;
 /** The control tag asking the peer to close the relayed link it arrived on, since a
  *  direct one has replaced it. rtc.js's signals are the other tags, all letters, so this
  *  one is none. */
@@ -126,6 +128,8 @@ class Router {
 
 /** A request frame's head: `[kind u8][corr u32][protoLen u8]`. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
+/** Where a request's head holds the length of its protocol id. */
+const REQ_PROTO_LEN_AT = REQ_HEAD_LEN - 1;
 /** A response frame's head: `[kind u8][corr u32]`. */
 const RES_HEAD_LEN = 1 + 4;
 
@@ -183,11 +187,11 @@ class ReqRes {
 
   buildReq(corr, noReply, proto, payload) {
     const frame = new Uint8Array(REQ_HEAD_LEN + proto.length + payload.length);
-    frame[0] = noReply ? 0x80 : 0; // KIND_REQ | FLAG_NO_REPLY
+    frame[0] = noReply ? KIND_REQ | FLAG_NO_REPLY : KIND_REQ;
     writeU32BE(frame, 1, corr);
-    frame[5] = proto.length;
-    frame.set(proto, 6);
-    frame.set(payload, 6 + proto.length);
+    frame[REQ_PROTO_LEN_AT] = proto.length;
+    frame.set(proto, REQ_HEAD_LEN);
+    frame.set(payload, REQ_HEAD_LEN + proto.length);
     return frame;
   }
 
@@ -195,20 +199,20 @@ class ReqRes {
     // An empty response (five bytes) is the shortest legal frame.
     if (frame.length < RES_HEAD_LEN) return;
     const kind = frame[0];
-    const noReply = !!(kind & 0x80);
+    const noReply = !!(kind & FLAG_NO_REPLY);
     const corr = readU32BE(frame, 1);
-    if ((kind & 1) === 1) {
-      // res = [1][corr u32][payload]
+    if (kind & KIND_RES) {
+      // res = [KIND_RES][corr u32][payload]
       const p = this.pending.get(corr);
       if (!p || p.to !== from) return; // only from the peer it went to
       this.finish(corr, frame.subarray(RES_HEAD_LEN));
       return;
     }
-    if (frame.length < 6) return; // no room for the protocol-id length byte
-    const idLen = frame[5];
-    if (frame.length < 6 + idLen) return;
-    const proto = frame.subarray(6, 6 + idLen);
-    const payload = frame.subarray(6 + idLen);
+    if (frame.length < REQ_HEAD_LEN) return; // no room for the protocol-id length byte
+    const idLen = frame[REQ_PROTO_LEN_AT];
+    if (frame.length < REQ_HEAD_LEN + idLen) return;
+    const proto = frame.subarray(REQ_HEAD_LEN, REQ_HEAD_LEN + idLen);
+    const payload = frame.subarray(REQ_HEAD_LEN + idLen);
     // Deliver to the host's claim routing, attributed to the authenticated sender. Not
     // awaited: the answer comes in another turn, and the closure keeps corr and sender.
     // Past the window, answer empty as for an unclaimed request.
@@ -228,7 +232,7 @@ class ReqRes {
     const fits = payload && RES_HEAD_LEN + payload.length <= maxFrameBytes - TAG_LEN;
     const body = fits ? payload : EMPTY;
     const frame = new Uint8Array(RES_HEAD_LEN + body.length);
-    frame[0] = 1; // KIND_RES
+    frame[0] = KIND_RES;
     writeU32BE(frame, 1, corr);
     frame.set(body, RES_HEAD_LEN);
     core.sendFrame(from, frame);

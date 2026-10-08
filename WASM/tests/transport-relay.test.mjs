@@ -236,6 +236,30 @@ await test("welcome names the whole set, and forget drops a peer's links and its
   assert(msg.includes("32-byte"), `a malformed welcome is refused, got "${msg}"`);
 });
 
+await test("a peer forgotten while its dial is in flight is not linked", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  // A's splice socket opens late, so the forget lands while the dial still waits on it.
+  let dialing = false, open;
+  const opened = new Promise((r) => { open = r; });
+  const lateSplice = (name, answer, payload) => {
+    if (name !== "link/open" || !Buffer.from(payload).includes("splice=")) return answer;
+    dialing = true;
+    return opened.then(() => answer);
+  };
+  const A = keep(await relayNode(relay, { onHostAnswer: lateSplice }));
+  const B = keep(await relayNode(relay));
+  for (const n of [A, B]) await joinRelay(n);
+  await addr(A, B.peerId, "relay+" + RELAY);
+  const sent = reaches(A, B);
+  await until(() => dialing, 2000, "A's dial to reach its splice");
+  await forget(A, B.peerId);
+  open();
+  assert(!(await sent), "what was waiting on the dial fails");
+  await settle(200);
+  assert(!(await linkedPeers(A)).includes(B.peerId) && !(await linkedPeers(B)).includes(A.peerId),
+    "and no link comes up behind the forget");
+});
+
 await test("a caller outside the callee's admitPeers gets no socket", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay, { transportConfig: { handshakeTimeoutMs: 300 } }));

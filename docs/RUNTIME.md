@@ -501,7 +501,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 
 - **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order (remedies, then the bundle, then the one-shots, then serve) and every printed line. A target supplies a `CliHost`: file reads and writes, argv and a banner, one console line, raw stdin and stdout, entropy, and `standUp` to stand a node up on that platform. Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
-- **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. The label reaches the transport with every link the listener accepts, unread (§12.1).
+- **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. An IPv6 host goes in brackets, `[::]:9000`. The label reaches the transport with every link the listener accepts, unread (§12.1).
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one.
 - **`--contact-secret`** names a file, never the secret itself; its contents, less the line ending, become `transport.config.contactSecret` unread.
 - **`--local-config`** requires `--bundle` and is that load's `LOCAL`; it never reaches the transport.

@@ -30,11 +30,14 @@ export function parseDest(dest: string): { scheme: DestScheme; host: string; por
 
 /** Split a `host:port` address. By default it must be a dialable address: an explicit
  *  host and a port in 1..65535. `defaultHost` fills an empty host (a bare `:port`) and
- *  `allowEphemeral` permits port 0 (let the OS pick), as `--listen` entries need. */
+ *  `allowEphemeral` permits port 0 (let the OS pick), as `--listen` entries need. An IPv6
+ *  literal is written in brackets, `[::1]:9000`, and returned without them, as a socket
+ *  takes it. */
 export function parseHostPort(s: string, opts: { defaultHost?: string; allowEphemeral?: boolean } = {}): { host: string; port: number } {
   const colon = s.lastIndexOf(":");
   if (colon < 0) throw new Error(`expected host:port, got ${s}`);
-  const host = s.slice(0, colon) || (opts.defaultHost ?? "");
+  let host = s.slice(0, colon) || (opts.defaultHost ?? "");
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
   const port = Number(s.slice(colon + 1));
   // Range-checked here, since an invalid port found only at connect time looks like an
   // unreachable peer.

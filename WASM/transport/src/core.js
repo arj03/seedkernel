@@ -299,13 +299,15 @@ class Core {
   }
 
   /** Open one outbound link to `peerId` at `dest`, through the relay a `relay+` one names.
-   *  The link, or null for no route. */
+   *  The link, or null for no route or a peer forgotten meanwhile. */
   async dialDest(peerId, dest, secret) {
     const relayed = dest.startsWith(RELAY_SCHEME);
     const opened = relayed
       ? await relays.call(peerId, relayOrigin(dest.slice(RELAY_SCHEME.length)))
       : { ...(await netLinkOpen(dest)), dest };
     if (opened.linkId === 0) return null;
+    // Forgotten while the dial was in flight: nothing wants this link now.
+    if (!this.addrs.has(peerId)) { netLinkClose(opened.linkId, false); return null; }
     return this.openLink({
       linkId: opened.linkId,
       stream: opened.stream,
