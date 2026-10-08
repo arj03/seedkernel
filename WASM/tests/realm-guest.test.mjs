@@ -7,6 +7,7 @@
 // `signTestBundle`; bundle-install.test.mjs's header explains the exceptions.
 
 import { readFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
 import {
@@ -21,6 +22,15 @@ import { bytesEqual } from "./bytes.mjs";
 
 const { ok, assertEqual, summary, sleep } = testkit({ verbose: false });
 const assert = ok;
+
+// Count module workers as they start. Patched before the first one: module-table.ts
+// resolves `Worker` once, on first use.
+const workerThreads = createRequire(import.meta.url)("node:worker_threads");
+let workersStarted = 0;
+workerThreads.Worker = class extends workerThreads.Worker {
+  constructor(...args) { super(...args); workersStarted++; }
+};
+syncBuiltinESMExports();
 
 // ─── Test: guest-side fan-out over the cross-realm call (Promise.all) ────────────
 // Fan-out is not a host op: with real promises at the seam, a confined guest sends one
@@ -830,6 +840,18 @@ async function testModuleCallBound() {
   host3.removeApp(spinKey);
   const dropped = await forever;
   assert(dropped === null, "removing the app settles the in-flight spin as a trap would");
+
+  // Calls still waiting their turn when the app is dropped settle the same way, and none
+  // of them starts a worker for a module that is gone.
+  const host4 = testHost(new ModuleTable({ deadlineMs: Infinity }));
+  await host4.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  const waiting = Array.from({ length: 4 }, () => host4.callModule(spinKey, "spin", new Uint8Array(), Infinity));
+  await sleep(30);
+  const startedBefore = workersStarted;
+  host4.removeApp(spinKey);
+  const settled = await Promise.all(waiting);
+  assert(settled.every((r) => r === null), "removing the app settles the queued calls too");
+  assertEqual(workersStarted, startedBefore, "and no queued call loads a worker only to kill it");
 
   console.log("  OK\n");
 }

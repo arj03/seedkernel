@@ -8,6 +8,7 @@ import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } fr
 import { MAX_LINK_READ_BYTES } from "../build/services/net-limits.js";
 import { MAX_FRAME_BYTES } from "../scripts/transport-config.mjs";
 import { parseDest } from "../build/services/peer-addr.js";
+import { WsNetwork } from "../build/services/net-ws.js";
 import { testkit } from "./testkit.mjs";
 import { readFileSync } from "node:fs";
 import { toHex } from "../build/services/util.js";
@@ -128,6 +129,21 @@ test("destinations: a scheme and a path survive whole, and neither disturbs the 
   // in the answer, which is how a socket takes it.
   const v6 = parseDest("tcp://[::1]:9000");
   assert(v6.host === "::1" && v6.port === 9000, `an IPv6 host must lose its brackets, got ${JSON.stringify(v6)}`);
+});
+
+test("destinations: a WebSocket URL gets an IPv6 host's brackets back", () => {
+  // `parseDest` hands a socket the bare host, and a URL is not one without the brackets.
+  const urls = [];
+  const ws = new WsNetwork({
+    webSocketFactory: (url) => {
+      urls.push(url);
+      return { binaryType: "", send() {}, close() {}, addEventListener() {} };
+    },
+  });
+  ws.connect("ws://[::1]:9000/v1/");
+  ws.connect("wss://relay.example.com:443");
+  assert(urls[0] === "ws://[::1]:9000/v1/" && urls[1] === "wss://relay.example.com:443",
+    `the URLs must reach the socket as written, got ${JSON.stringify(urls)}`);
 });
 
 test("destinations: anything malformed is no route, not a throw", () => {

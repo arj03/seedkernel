@@ -333,6 +333,8 @@ export class ModuleTable implements PureModuleLoader {
   /** Run one call on a module's worker, under `bound`. Never rejects: a dead worker, a
    *  failed reload and a deadline kill all give the same empty answer a trap does. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
+    // Released while this call waited its turn: loading would start a worker only to kill it.
+    if (w.dead) return { bytes: null, ms: 0 };
     // After a kill or crash there is no worker, so load a fresh instance with clean state.
     // Calls chain on `tail`, so this is the only load in flight. A failed load has killed
     // what it spawned; this call answers empty and the next one retries.

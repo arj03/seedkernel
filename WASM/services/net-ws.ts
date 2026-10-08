@@ -24,8 +24,10 @@ export class WsNetwork implements ChannelFactory {
   connect(dest: string): RawLink | null {
     const d = parseDest(dest);
     if (!d || d.scheme === "tcp") return null;
+    // `parseDest` hands back an IPv6 host bare, and a URL wants its brackets.
+    const host = d.host.includes(":") ? `[${d.host}]` : d.host;
     // Whole messages in order, so `MessageChannel` fits unchanged, pre-open buffer included.
-    return new MessageChannel(this.mkWs(`${d.scheme}://${d.host}:${d.port}${d.path ?? ""}`));
+    return new MessageChannel(this.mkWs(`${d.scheme}://${host}:${d.port}${d.path ?? ""}`));
   }
 
   /** A browser binds nothing. */

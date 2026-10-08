@@ -16,12 +16,19 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
+// boundModule is one installed module: its compiled code and the instance bound from it.
+// A deadline kill closes the instance and leaves `mod` nil until the next call binds a
+// fresh one (bind).
 type boundModule struct {
 	mod     api.Module
 	cmod    wazero.CompiledModule
 	fn      api.Function
 	scratch uint32 // §4.1 scratch offset
 	size    uint32 // bytes reserved there: scratchSize, or the default
+
+	// What bind instantiates with, kept for the instance after a kill.
+	scratchDefault uint32
+	bindDeadline   time.Duration
 }
 
 var (
@@ -120,7 +127,9 @@ func closeModule(w *boundModule) {
 	if w == nil {
 		return
 	}
-	_ = w.mod.Close(ctx)
+	if w.mod != nil {
+		_ = w.mod.Close(ctx)
+	}
 	_ = w.cmod.Close(ctx)
 }
 
@@ -139,6 +148,12 @@ func disposeModuleSlot(slot string) int {
 func callModule(slot, module string, payload []byte, deadline time.Duration) []byte {
 	w := moduleSlots[slot][module]
 	if w == nil {
+		return nil
+	}
+	// A deadline kill closed the instance (below). Bind a fresh one, as the JS target's
+	// next call loads a fresh worker (§4.3); a failed bind answers empty and the next call
+	// tries again.
+	if w.mod == nil && w.bind() != nil {
 		return nil
 	}
 	// §4: write input at scratch, call handle(input_len), read the response back, both
@@ -161,10 +176,11 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 	}
 	r, err := w.fn.Call(callCtx, uint64(len(payload)))
 	if err != nil {
-		// A trap leaves the module alive; a deadline closed it, so evict it.
+		// A trap leaves the instance alive; a deadline closed it. Drop the closed one, and
+		// the next call binds another from the compiled code.
 		if w.mod.IsClosed() {
-			closeModule(w)
-			delete(moduleSlots[slot], module)
+			_ = w.mod.Close(ctx)
+			w.mod, w.fn = nil, nil
 		}
 		return nil
 	}
@@ -216,54 +232,64 @@ func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault
 	return nil
 }
 
-// instantiateWasm compiles, instantiates and validates module bytes against the §4 ABI.
+// instantiateWasm compiles module bytes and binds their first instance.
 func instantiateWasm(wasm []byte, scratchDefault uint32, bindDeadline time.Duration) (*boundModule, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
+	w := &boundModule{cmod: cm, scratchDefault: scratchDefault, bindDeadline: bindDeadline}
+	if err := w.bind(); err != nil {
+		_ = cm.Close(ctx)
+		return nil, err
+	}
+	return w, nil
+}
+
+// bind instantiates the compiled module and validates the instance against the §4 ABI:
+// at install, and again on the first call after a deadline kill.
+func (w *boundModule) bind() error {
 	modSeq++
 	// Instantiation runs the start section, bound like module-table.ts bounds its load.
 	instCtx, cancel := ctx, func() {}
-	if bindDeadline >= 0 {
-		instCtx, cancel = context.WithTimeout(ctx, bindDeadline)
+	if w.bindDeadline >= 0 {
+		instCtx, cancel = context.WithTimeout(ctx, w.bindDeadline)
 	}
-	m, err := rt.InstantiateModule(instCtx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
+	m, err := rt.InstantiateModule(instCtx, w.cmod, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	cancel()
 	if err != nil {
-		_ = cm.Close(ctx)
-		return nil, fmt.Errorf("instantiate: %w", err)
+		return fmt.Errorf("instantiate: %w", err)
 	}
 	ok := false
 	defer func() {
 		if !ok {
 			_ = m.Close(ctx)
-			_ = cm.Close(ctx)
 		}
 	}()
 	g, fn := m.ExportedGlobal("scratch"), m.ExportedFunction("handle")
 	if g == nil || fn == nil || m.Memory() == nil {
-		return nil, fmt.Errorf("missing exports: memory=%v scratch=%v handle=%v", m.Memory() != nil, g != nil, fn != nil)
+		return fmt.Errorf("missing exports: memory=%v scratch=%v handle=%v", m.Memory() != nil, g != nil, fn != nil)
 	}
 	// §4.1: the module reserves [scratch, scratch+size); an exported `scratchSize` must be
 	// in bounds and at least the default.
 	mem, s := uint64(m.Memory().Size()), uint32(g.Get())
-	if s == 0 || uint64(s)+uint64(scratchDefault) > mem {
-		return nil, fmt.Errorf("scratch offset %d out of bounds (mem %d)", s, mem)
+	if s == 0 || uint64(s)+uint64(w.scratchDefault) > mem {
+		return fmt.Errorf("scratch offset %d out of bounds (mem %d)", s, mem)
 	}
-	size := scratchDefault
+	size := w.scratchDefault
 	if sg := m.ExportedGlobal("scratchSize"); sg != nil {
 		d := uint32(sg.Get())
-		if d < scratchDefault {
-			return nil, fmt.Errorf("scratchSize %d is below the %d default", d, scratchDefault)
+		if d < w.scratchDefault {
+			return fmt.Errorf("scratchSize %d is below the %d default", d, w.scratchDefault)
 		}
 		if uint64(s)+uint64(d) > mem {
-			return nil, fmt.Errorf("scratchSize %d overflows memory (scratch %d, mem %d)", d, s, mem)
+			return fmt.Errorf("scratchSize %d overflows memory (scratch %d, mem %d)", d, s, mem)
 		}
 		size = d
 	}
 	ok = true
-	return &boundModule{m, cm, fn, s, size}, nil
+	w.mod, w.fn, w.scratch, w.size = m, fn, s, size
+	return nil
 }
 
 // installModuleBridge adds the module-table calls to `bridge`.

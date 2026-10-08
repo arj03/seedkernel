@@ -14,7 +14,7 @@ import {
   sodium, root, toHex, concatBytes, hybridAuthorId, verifyTestBundle, verifyBundle,
   signTestBundle, authorBundle, testAuthor, testHost, installBundle,
   GUEST_TEXT, GUEST_BYTES, forwarderBytes,
-  JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN,
+  JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, imp,
 } from "./fixtures.mjs";
 
 const { ok, assertEqual, summary } = testkit({ verbose: false });
@@ -340,11 +340,30 @@ async function testHybridManifestSuite() {
   console.log("  OK\n");
 }
 
+// ─── Test: the browser seam names a wasm file it could not fetch ───────────────
+//
+// A page that serves no mldsa65.wasm answers the fetch with a 404 page, and compiling that
+// reports a bad magic number, which says nothing about the missing file.
+async function testBrowserCryptoFetch() {
+  console.log("Test: the browser crypto seam reports a wasm file that was not served");
+  const { loadCrypto } = await imp("build/host/crypto-browser.js");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("<html>not found</html>", { status: 404 });
+  let msg = "";
+  try { await loadCrypto({ ready: Promise.resolve() }, "https://node.example/"); }
+  catch (e) { msg = String(e?.message ?? e); }
+  finally { globalThis.fetch = realFetch; }
+  assert(msg.includes("https://node.example/mldsa65.wasm") && msg.includes("404"),
+    `the error names the file and the status, got "${msg}"`);
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();
 await testHybridManifestSuite();
+await testBrowserCryptoFetch();
 
 summary("Results");
