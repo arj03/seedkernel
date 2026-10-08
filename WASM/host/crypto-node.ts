@@ -5,7 +5,7 @@
 // readies its own crypto (docs/CLIENT.md).
 
 import { readFileSync } from "node:fs";
-import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "./pq.js";
+import { withMlDsa65, loadMlDsa65, randomBytes, ML_DSA65_SEED_LEN } from "./pq.js";
 
 // A static import so `bun build --compile` bundles the package into the standalone
 // binary. The cast gives the default export the module-namespace type the host uses.
@@ -28,6 +28,10 @@ function ensurePq(): Promise<void> {
 // refuses the hybrid manifest suite as unsupported.
 export async function ensureCrypto(): Promise<void> {
   await Promise.all([sodium.ready, ensurePq()]);
+  // libsodium's wasm build fills `randombytes_buf` one platform draw per byte, so a
+  // megabyte of `crypto/random` held the host thread for seconds. The platform CSPRNG it
+  // draws from goes under that name directly, once the wrappers are in place.
+  Object.assign(sodium, { randombytes_buf: randomBytes });
 }
 
 /** Ready the host crypto surface: core libsodium plus ML-DSA-65. */

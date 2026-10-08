@@ -151,6 +151,18 @@ function kemDecaps(sk, ct) {
       ? { ok: true, sharedSecret: r.slice(1) }
       : { ok: false, sharedSecret: null }));
 }
+/** The root every handshake starts from: the channel tag hashed over the network key.
+ *  Both are fixed for the bundle's life, so it is hashed once and every link shares the
+ *  answer; per link, any stranger who opened a socket bought a host call. Asked for on the
+ *  first link, since a host call at load is refused, and asked again after a failure. */
+let channelRoot = null;
+function rootKey() {
+  if (channelRoot === null) {
+    channelRoot = hash(DOMAIN_CHANNEL, networkKey);
+    channelRoot.catch(() => { channelRoot = null; });
+  }
+  return channelRoot;
+}
 /** The channel's identity-signature payload; the host prefixes its scope. */
 function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
@@ -276,7 +288,7 @@ class Link {
     // Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
     // contact secret (§12.6). A failed boot aborts, and the chain recovers.
     this.work = (async () => {
-      this.root = await hash(DOMAIN_CHANNEL, networkKey);
+      this.root = await rootKey();
       if (this.weDialed) {
         await this.ensureKeys();
         this.armDeadline(handshakeTimeoutMs);

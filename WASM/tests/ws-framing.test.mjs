@@ -58,6 +58,9 @@ const guestSrc =
     MAX_HANDSHAKE_FRAME_BYTES, MAX_WS_HANDSHAKE,
   };`;
 
+/** How many times a sandbox's framers have asked the host for entropy. */
+let entropyDraws = 0;
+
 function newSandbox(arrayType = Uint8Array) {
   const sandbox = {
     Uint8Array: arrayType, TextEncoder, TextDecoder, Promise, RegExp, console,
@@ -67,7 +70,7 @@ function newSandbox(arrayType = Uint8Array) {
     } },
     N_WS: "ws",
     maxFrameBytes: TEST_MAX_FRAME_BYTES,
-    randomBytes: async (n) => nodeRandomBytes(n),
+    randomBytes: async (n) => { entropyDraws++; return nodeRandomBytes(n); },
   };
   vm.createContext(sandbox);
   new vm.Script(guestSrc, { filename: "ws-framing-harness.js" }).runInContext(sandbox);
@@ -161,6 +164,20 @@ async function run() {
   }
   const client = frameFactory();
   const payload = (n, seed = 0) => Uint8Array.from({ length: n }, (_, i) => (i + seed) & 0xff);
+
+  {
+    // A client masks every frame under its own key, and the keys come out of one block of
+    // host entropy at a time: asking the host for four bytes per frame is a round trip
+    // that costs more than framing it.
+    const before = entropyDraws;
+    const keys = new Set();
+    for (let i = 0; i < 64; i++) {
+      const frame = await client.frame(WS.WS_OP_BINARY, payload(8, i));
+      keys.add(frame.slice(2, 6).join()); // [FIN|opcode][MASK|len7][key 4][payload]
+    }
+    ok(entropyDraws - before <= 1, `64 client frames asked for entropy ${entropyDraws - before} time(s), want at most one`);
+    ok(keys.size === 64, "and each frame still has a key of its own");
+  }
 
   // ── structured frame sequences ────────────────────────────────────────────────────────
 

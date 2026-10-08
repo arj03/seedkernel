@@ -148,6 +148,21 @@ function wsCall(req) {
   return host.call(N_WS, req);
 }
 
+// A client masks every frame under a fresh four-byte key (RFC 6455 §5.3). The keys come
+// out of one block of host entropy at a time: a host round trip per frame for four bytes
+// costs more than framing it.
+const MASK_POOL_BYTES = 1024;
+let maskPool = EMPTY;
+let maskAt = 0;
+async function maskKey() {
+  if (maskAt + 4 > maskPool.length) {
+    maskPool = await randomBytes(MASK_POOL_BYTES);
+    maskAt = 0;
+  }
+  maskAt += 4;
+  return maskPool.subarray(maskAt - 4, maskAt);
+}
+
 class WsFramer {
   /** `authority` and `path` are the dialed target, for the client's request. */
   constructor(put, weDialed, authority, path = "/") {
@@ -194,10 +209,8 @@ class WsFramer {
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
   discard() { this.parts = new ByteParts(); this.frags = []; this.fragBytes = 0; }
 
-  async mask() { return this.client ? await randomBytes(4) : null; }
-
   async frame(opcode, payload) {
-    const m = await this.mask();
+    const m = this.client ? await maskKey() : null;
     const req = new Uint8Array(3 + (m ? 4 : 0) + payload.length);
     req[0] = WS_OP_ENCODE;
     req[1] = opcode & 0x0f;

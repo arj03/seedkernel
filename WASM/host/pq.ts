@@ -135,14 +135,19 @@ export function createMlDsa65(instance: WebAssembly.Instance): MlDsa65Signer {
   };
 }
 
-/** The hedging randomness FIPS 204 mixes into a signature. Taken from the host's CSPRNG
- *  so mldsa65.wasm needs no imports. Unlike verification, it need not match across
- *  nodes. */
-function randomBytes(n: number): Uint8Array {
+/** WebCrypto fills at most this much per `getRandomValues` call. */
+const RANDOM_DRAW_BYTES = 65536;
+
+/** `n` bytes from the platform CSPRNG (WebCrypto, on Node and in browsers). It is the
+ *  hedging randomness FIPS 204 mixes into a signature, so mldsa65.wasm needs no imports;
+ *  unlike verification, that need not match across nodes. The JS crypto seams also put it
+ *  under libsodium's `randombytes_buf`, whose wasm build draws from this same source one
+ *  byte per call. */
+export function randomBytes(n: number): Uint8Array {
   const out = new Uint8Array(n);
   const c = (globalThis as { crypto?: Crypto }).crypto;
   if (!c?.getRandomValues) throw new Error("pq: no CSPRNG (globalThis.crypto.getRandomValues) available");
-  c.getRandomValues(out);
+  for (let at = 0; at < n; at += RANDOM_DRAW_BYTES) c.getRandomValues(out.subarray(at, at + RANDOM_DRAW_BYTES));
   return out;
 }
 

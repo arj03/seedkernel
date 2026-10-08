@@ -556,6 +556,22 @@ await test("CONTACT SECRET: the address book alone does not grant a probe", asyn
   assert(!(await aUp(st)) && !(await bUp(st)), "a wrong contact secret must not authenticate");
 });
 
+await test("a silent connection buys no hash: the session root is computed once", async (keep) => {
+  // Every handshake starts from the channel tag hashed over the network key, which is
+  // fixed for the bundle's life. Hashing it per link gave any stranger who opens a socket
+  // and says nothing a host call apiece.
+  let hashes = 0;
+  const factory = new InjectedChannels();
+  const B = await makeTransportHost({
+    channels: factory,
+    onHostCall: (name) => { if (name === "crypto/blake2b") hashes++; },
+  });
+  keep({ close() { try { B.shell.close(); } catch { /* already down */ } } });
+  for (let i = 0; i < 5; i++) factory.give(wirePair()[1]);
+  await settle(100);
+  assert(hashes === 1, `five silent connections cost ${hashes} hashes, want the one that computes the root`);
+});
+
 await test("FRAME CAP: an over-cap pre-auth frame draws the silence every refusal draws", async (keep) => {
   // A stranger who knows only host:port must not reserve memory by declaring a big frame
   // and sending the body slowly, nor learn anything from the refusal. Almost every random

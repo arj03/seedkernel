@@ -358,6 +358,40 @@ async function testBrowserCryptoFetch() {
   console.log("  OK\n");
 }
 
+// ─── Test: host entropy is drawn from the platform a block at a time ───────────
+//
+// libsodium's wasm build fills `randombytes_buf` with one platform draw per byte, which
+// made a megabyte of `crypto/random` seconds of host thread. Both JS seams put the
+// platform CSPRNG under that name instead, filling up to 64 KiB per draw.
+async function testRandomBytesInBlocks() {
+  console.log("Test: randombytes_buf draws from the platform CSPRNG a block at a time");
+  const platform = globalThis.crypto;
+  const draw = platform.getRandomValues;
+  let draws = 0;
+  platform.getRandomValues = function (view) { draws++; return draw.call(platform, view); };
+  let bytes;
+  try { bytes = sodium.randombytes_buf(100_000); }
+  finally { delete platform.getRandomValues; }
+  assertEqual(bytes.length, 100_000, "every byte asked for comes back");
+  assertEqual(draws, 2, "100,000 bytes take two draws, not one per byte");
+  assert(bytes.subarray(65_536).some((b) => b !== 0), "the bytes past the first draw are filled too");
+  assertEqual(sodium.randombytes_buf(0).length, 0, "and none is none");
+
+  // The browser seam does the same to the libsodium it is handed.
+  const { loadCrypto } = await imp("build/host/crypto-browser.js");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(readFileSync(join(root, "browser/mldsa65.wasm")));
+  let page;
+  try {
+    page = await loadCrypto({
+      ready: Promise.resolve(),
+      randombytes_buf: () => { throw new Error("libsodium's own randombytes_buf"); },
+    }, "https://node.example/");
+  } finally { globalThis.fetch = realFetch; }
+  assertEqual(page.randombytes_buf(8).length, 8, "the browser seam replaces it as well");
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testManifestSuiteByte();
@@ -365,5 +399,6 @@ await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();
 await testHybridManifestSuite();
 await testBrowserCryptoFetch();
+await testRandomBytesInBlocks();
 
 summary("Results");
