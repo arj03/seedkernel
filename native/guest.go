@@ -179,9 +179,10 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	}
 	loop.addContext(g.qc, g.pump)
 
-	// The single seam: (name, callId, payload) goes to the host-realm guest seam, the call
-	// parks, and realmSettle settles the preamble's Promise under callId. The fourth host
-	// argument is the segment's live module deadline; -1 means unbounded.
+	// The single seam: (name, callId, payload) goes to the host-realm guest seam. An answer
+	// it already has comes straight back; otherwise the call parks, and realmSettle settles
+	// the preamble's Promise under callId. The fourth host argument is the segment's live
+	// module deadline; -1 means unbounded.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		name := args[0].String()
 		callID := args[1].Int64()
@@ -216,9 +217,28 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 			g.hostCalls.release(callID)
 			return nil, err
 		}
-		res.Free() // always null: the call parked
-		// The settlement is a host microtask queued after this round's drain, and a local
-		// answer makes no I/O to wake the loop.
+		defer res.Free()
+		// An answer the handler already had (native-shim.ts) goes back in this frame: charged
+		// while it is copied in, as realmSettle charges one, and released at once. A refusal
+		// goes back as its message, which the preamble rejects with.
+		if !res.IsNull() && !res.IsUndefined() {
+			defer g.hostCalls.release(callID)
+			width, err := res.ByteLength()
+			if err != nil {
+				return qc.NewString("host call result not bytes"), nil
+			}
+			if err := g.hostCalls.reserve(callID, width); err != nil {
+				return qc.NewString(err.Error()), nil
+			}
+			// Borrowed from the host engine, copied once into the guest's (qjs.Value.View).
+			view, err := res.View()
+			if err != nil {
+				return qc.NewString("host call result not bytes"), nil
+			}
+			return qc.NewArrayBuffer(view), nil
+		}
+		// The call parked. Its settlement is a host microtask queued after this round's
+		// drain, and a local answer makes no I/O to wake the loop.
 		g.loop.wake()
 		return qc.NewNull(), nil
 	}))

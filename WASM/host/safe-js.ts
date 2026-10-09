@@ -1,7 +1,8 @@
 // Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus the shared preamble's
 // three host functions. The preamble's `__start` reports each invocation's answer through
-// `__callDone`/`__callFail`, and every `__host_call` waits and settles through
-// `__resolveHostCall`/`__rejectHostCall`, the same contract the native binary implements.
+// `__callDone`/`__callFail`. A `__host_call` the host can answer at once returns its
+// answer; any other waits and settles through `__resolveHostCall`/`__rejectHostCall`.
+// The native binary implements the same contract.
 // Invocations are serialized (realm-queue.ts).
 
 import {
@@ -288,8 +289,9 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     }
   };
 
-  // The single seam. It always returns null; the answer later settles the promise the
-  // preamble holds under callId, never inside the frame that issued the call.
+  // The single seam. An answer the handler already has is returned to the preamble; any
+  // other call returns null and its answer later settles the promise the preamble holds
+  // under callId, never inside the frame that issued the call.
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
@@ -305,6 +307,19 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     } catch (err) {
       activeHostCalls.release(callId);
       throw err;
+    }
+    // An answer the handler already has goes back in this frame. It is charged while it is
+    // copied in, like any answer, and a refusal goes back as its message, which the
+    // preamble rejects with: a failed round trip, not a refused call.
+    if (answer instanceof Uint8Array) {
+      try {
+        activeHostCalls.reserve(callId, answer.byteLength);
+        return ctx.newArrayBuffer(toArrayBuffer(answer));
+      } catch (err) {
+        return ctx.newString(errMessage(err));
+      } finally {
+        activeHostCalls.release(callId);
+      }
     }
     // One settlement either way, so a refused copy becomes a failure and the charge is
     // released once (as in native-shim.ts).

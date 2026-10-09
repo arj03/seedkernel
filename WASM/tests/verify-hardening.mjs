@@ -353,6 +353,41 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "settled host calls release their per-realm accounting");
   boundedCalls.dispose();
 
+  // An answer the host already has comes back in the frame that asked for it and holds
+  // nothing meanwhile: more unawaited calls than the cap all answer.
+  const asked = DEFAULT_MAX_OUTSTANDING_HOST_CALLS + 44;
+  const answeredAtOnce = await createSafeRealm({
+    source: `async function handle() {
+      const calls = [];
+      for (let i = 0; i < ${asked}; i++) calls.push(host.call("now", new Uint8Array([i & 255])));
+      const answers = await Promise.all(calls);
+      return new Uint8Array([answers.length & 255, answers[${asked - 1}][0]]);
+    }`,
+    hostCall: (_name, payload) => Uint8Array.of(payload[0] ^ 1),
+    deadlineMs: 1000,
+  });
+  const atOnce = await answeredAtOnce.call(new Uint8Array());
+  ok(atOnce[0] === (asked & 255) && atOnce[1] === (((asked - 1) & 255) ^ 1),
+    "a call the host answers at once is never held against the outstanding-call cap");
+  answeredAtOnce.dispose();
+
+  // Such an answer still has to fit the byte allowance beside what the realm already
+  // holds. One that does not is a failed round trip: a rejection, as for a late answer.
+  const overAllowance = await createSafeRealm({
+    source: `async function handle() {
+      host.call("hold", new Uint8Array(${DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES} - 8));
+      let thrown = 0, rejected = 0;
+      try { await host.call("now", new Uint8Array(4)).catch(() => { rejected = 1; }); } catch { thrown = 1; }
+      return new Uint8Array([thrown, rejected]);
+    }`,
+    hostCall: (name) => name === "hold" ? new Promise(() => {}) : new Uint8Array(64),
+    deadlineMs: 1000,
+  });
+  const over = await overAllowance.call(new Uint8Array());
+  ok(over[0] === 0 && over[1] === 1,
+    "an immediate answer past the byte allowance rejects at the await, not at the call site");
+  overAllowance.dispose();
+
   const duplicateHeld = [];
   const duplicateIds = await createSafeRealm({
     source: `function handle(a) {

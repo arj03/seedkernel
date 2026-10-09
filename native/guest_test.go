@@ -810,3 +810,38 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	}
 	t.Logf("caller settled with: %s", got)
 }
+
+// A host call whose handler has its answer comes back in the frame that asked, with nothing
+// parked: more unawaited calls than the outstanding-call cap all answer. An answer that
+// does not fit the byte allowance still rejects at the await, as it does when it arrives
+// late. The JS target's twin is in WASM/tests/verify-hardening.mjs.
+func TestGuestRealmAnswersAtOnceWhenTheHostAlreadyHasIt(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("at-once-seam.js", `
+		globalThis.__guestSeam = (name, payload) => name === "hold" ? new Promise(() => {})
+		  : name === "wide" ? new Uint8Array(64) : Uint8Array.of(payload[0] ^ 1);
+	`); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealm(t, "{}", `
+		async function handle(arg) {
+		  if (arg[33] === 109) { // "many"
+		    const calls = [];
+		    for (let i = 0; i < 300; i++) calls.push(host.call("now", new Uint8Array([i & 255])));
+		    const answers = await Promise.all(calls);
+		    return new Uint8Array([answers.length & 255, answers[299][0]]);
+		  }
+		  host.call("hold", new Uint8Array(16 * 1024 * 1024 - 8));
+		  let thrown = 0, rejected = 0;
+		  try { await host.call("wide", new Uint8Array(4)).catch(() => { rejected = 1; }); } catch { thrown = 1; }
+		  return new Uint8Array([thrown, rejected]);
+		}
+	`)
+	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
+	if got, err := realmCall("many", nil); err != nil || !bytes.Equal(got, []byte{300 & 255, 299&255 ^ 1}) {
+		t.Fatalf("300 unawaited calls answered %v, err = %v; want all of them, none held against the cap", got, err)
+	}
+	if got, err := realmCall("wide", nil); err != nil || !bytes.Equal(got, []byte{0, 1}) {
+		t.Fatalf("an answer past the byte allowance gave [thrown rejected] = %v, err = %v; want [0 1]", got, err)
+	}
+}

@@ -157,11 +157,12 @@ async function testGuestSeam() {
     const szAbsent = await seam("fs/size", new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "fs/size of an absent key → -1 (0xFFFFFFFF)");
 
-    // Every name, crypto included, answers a Promise the guest awaits, so a forgotten
-    // `await` reads a Promise instead of bytes for every name alike.
-    assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Promise, "a catalog primitive answers a Promise like every name");
+    // The host half hands back an answer it already has, and a Promise of one it has to
+    // wait for. The guest reads a Promise for every name alike, so a forgotten `await`
+    // never reads bytes (testPreviousAbiRefused, through a realm).
+    assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Uint8Array, "a catalog primitive has its answer at once");
     assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise");
-    assert(prim("random", U(0, 0, 0, 1)) instanceof Promise, "crypto/random returns a Promise");
+    assert(prim("random", U(0, 0, 0, 1)) instanceof Uint8Array, "crypto/random has its answer at once");
 
     // The cross-realm call: a declared local service is another realm, reached on a later
     // turn, so it is a Promise like fs. There is no `net` host service; the network is a

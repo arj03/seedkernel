@@ -26,9 +26,10 @@ import {
 } from "./wasm-limits.js";
 import { enc, errMessage } from "../services/util.js";
 
-/** `HostCall` as Go calls it. Always returns `null`: Go holds the guest's Promise under
- *  `callId` until `bridge.realmSettle` settles it. */
-type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number, deadlineMs: number) => null;
+/** `HostCall` as Go calls it. An answer the handler already has is returned, and Go hands
+ *  it to the guest in the same frame. Otherwise it returns `null`: Go holds the guest's
+ *  Promise under `callId` until `bridge.realmSettle` settles it. */
+type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number, deadlineMs: number) => Uint8Array | null;
 
 /** The opaque native-module slots and realm plumbing Go exposes (main.go). */
 declare const bridge: {
@@ -294,6 +295,7 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     const budget = new CallBudget(deadlineMs < 0 ? Infinity : deadlineMs, causalClock, undefined);
     // A synchronous throw is a refused name; guest.go releases the admitted call.
     const answer = hostCall(name, new Uint8Array(payload), budget);
+    if (answer instanceof Uint8Array) return answer;
     settleByDeadline(deadlines.hostCall, budget.remainingMs, answer, HOST_CALL_LATE, (bytes, error) =>
       causalContext.run(causalClock, () => {
         const elapsedNs = bridge.realmSettle(realm, callId, bytes,

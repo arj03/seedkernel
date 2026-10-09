@@ -134,8 +134,11 @@ export class CallBudget {
   }
 }
 
-/** The host half of `host.call`: every name answers a Promise. */
-export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>;
+/** The host half of `host.call`. A handler that already has its answer returns the bytes,
+ *  and the realm hands them to the guest in the frame that asked: no host promise, no
+ *  deadline and no later turn, which is most of what a call costs. One that has to wait
+ *  returns a Promise. The guest sees a Promise either way. */
+export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
 export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
 
@@ -146,8 +149,8 @@ type CryptoName = `crypto/${HostTransformName}`;
 /** Argument bytes in, response bytes out, inline or async. */
 type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
-/** A resolved name: every one answers a Promise. */
-type Route = (payload: Uint8Array, budget: CallBudget) => Promise<Uint8Array>;
+/** A resolved name: its answer, or a Promise of it. */
+type Route = SeamHandler;
 
 /** The host crypto transforms (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
@@ -226,9 +229,13 @@ globalThis.host = {
       : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
         ? bytes.buffer
         : bytes.slice().buffer;
-    // Called before the table entry exists: every target settles on a later microtask,
-    // and a synchronous refusal then leaves nothing to clean up.
-    __host_call(name, callId, ab);
+    // The host answers in this frame when it already has the answer: with the bytes, or
+    // with why they could not be handed over, which rejects. Otherwise it parks the call
+    // and settles it on a later turn. Called before the table entry exists, so an answer
+    // or a synchronous refusal leaves nothing to clean up.
+    const now = __host_call(name, callId, ab);
+    if (typeof now === "string") return Promise.reject(new Error(now));
+    if (now !== null && now !== undefined) return Promise.resolve(new Uint8Array(now));
     let resolve, reject;
     const answer = new Promise((res, rej) => { resolve = res; reject = rej; });
     __pending[callId] = { resolve, reject };
@@ -459,10 +466,10 @@ const SERVICES: {
 function charged(fn: SeamHandler): Route {
   return (payload, budget) => {
     const owner = budget.causalClock;
-    if (owner === undefined) return Promise.resolve(fn(payload, budget));
+    if (owner === undefined) return fn(payload, budget);
     const at = monotonicMs();
     try {
-      return Promise.resolve(fn(payload, budget));
+      return fn(payload, budget);
     } finally {
       owner.charge(monotonicMs() - at);
     }

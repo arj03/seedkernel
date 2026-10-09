@@ -125,7 +125,10 @@ export class FakeRelay {
       end.peer.deliver(b);
     });
     end.early = [];
-    end.gone = () => { end.peer?.kill(); };
+    // A closing end takes its peer down behind what it already sent, as a relay forwards
+    // a socket's last bytes before it closes the other one. A node may write its goodbye
+    // and close in one turn.
+    end.gone = () => { queueMicrotask(() => end.peer?.kill()); };
     p.ends.push(end);
     if (p.ends.length === 2) {
       this.pending.delete(ticket);
