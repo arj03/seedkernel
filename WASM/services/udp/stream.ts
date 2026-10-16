@@ -11,8 +11,9 @@
 // - An ack carries ranges of packet numbers. A packet is lost once one sent three later is
 //   acked, or once it is 9/8 of a round trip older than one that was. A probe timeout finds
 //   a lost tail, which has no later packet to give it away.
-// - NewReno congestion control: slow start, the window halved once per loss episode, then
-//   grown by a packet a round trip, and only while it is what holds the sender back.
+// - NewReno congestion control, run as `FLOWS` flows at once: slow start, the window cut
+//   by 1/(2 FLOWS) once per loss episode, then grown by `FLOWS` packets a round trip, and
+//   only while it is what holds the sender back.
 // - Every ack says how far the receiver will take the stream, so a reader the driver holds
 //   back (`setReadable`) stops the sender.
 //
@@ -32,6 +33,10 @@ const PACKET_BYTES = 1200;
 const CHUNK = PACKET_BYTES - PATH_HEADER - 12;
 const INITIAL_WINDOW = 10 * PACKET_BYTES;
 const MIN_WINDOW = 2 * PACKET_BYTES;
+/** How many NewReno flows the window behaves as (MulTCP): it grows by this many packets a
+ *  round trip and a loss cuts it by 1/(2 FLOWS), as that many TCP connections would
+ *  together, which is what a TCP peer opens to fill a lossy path. */
+const FLOWS = 8;
 /** How far past what its reader has taken a receiver takes the stream. */
 const CREDIT = 1 << 20;
 /** The receive and send buffers a platform asks for on a path's socket, one stream's. A
@@ -334,7 +339,7 @@ export class UdpStream implements RawLink {
           // NewReno growth, but not for what was sent before the last loss, or while the
           // window is not what holds the sender back.
           if (s.time > this.recoveryStart && this.windowLimited)
-            this.window += this.window < this.threshold ? s.size : PACKET_BYTES * s.size / this.window;
+            this.window += this.window < this.threshold ? s.size : FLOWS * PACKET_BYTES * s.size / this.window;
         }
       }
       if (this.suspects.size > 0) {
@@ -397,7 +402,7 @@ export class UdpStream implements RawLink {
       this.recoveryStart = now;
       this.undo = { window: this.window, threshold: this.threshold };
       this.suspects.clear();
-      this.window = this.threshold = Math.max(this.window / 2, MIN_WINDOW);
+      this.window = this.threshold = Math.max(this.window * (1 - 1 / (2 * FLOWS)), MIN_WINDOW);
     }
     if (this.undo) for (const pn of lost) this.suspects.add(pn);
     this.advanceOldest();
