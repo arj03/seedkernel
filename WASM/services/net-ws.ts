@@ -1,5 +1,6 @@
-// The browser's socket seam (§12.6): a `ChannelFactory` that dials platform WebSockets to
-// a directly reachable node. The transport decides what to dial and when. The WebSocket
+// The WebSocket socket seam (§12.6): a `ChannelFactory` that dials the platform's WebSocket
+// (a browser's, Node 22's or Bun's) to a node that listens on one, or to a relay. The
+// transport decides what to dial and when. The WebSocket
 // global is used only inside `connect`, so importing this is safe where it is absent.
 import type { ChannelFactory, ListenAddress, RawLink } from "./socket-seam.js";
 import { MessageChannel, type MessageTransport } from "./net-channel.js";

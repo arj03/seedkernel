@@ -96,10 +96,26 @@ export interface TransportOptions extends TransportHostOptions {
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
   /** Called each time the transport's standing changes: the state of the relay it is
-   *  registered on, who is linked, or how one of them is reached. One byte as its
-   *  `relayState` op answers it, then the linked peers as its `routes` op answers them,
-   *  `[key 32][direct u8]` apiece. */
-  onStatus?: (status: Uint8Array) => void;
+   *  registered on, who is linked, or how one of them is reached. */
+  onStatus?: (status: TransportStatus) => void;
+}
+
+/** The transport's standing, as its `link/status` says it (§12.2). */
+export interface TransportStatus {
+  /** The relay it is registered on, as its `relayState` op answers it: 0 none, 1
+   *  registered, 2 redialing (§12.6.3). */
+  relay: number;
+  /** The linked peers, as its `routes` op answers them: each one's key, and whether a
+   *  direct link carries its traffic rather than a relay (§12.7). */
+  linked: { key: Uint8Array; direct: boolean }[];
+}
+
+/** `[relay u8][key 32][direct u8]*`, decoded. */
+function readStatus(status: Uint8Array): TransportStatus {
+  const linked: TransportStatus["linked"] = [];
+  for (let off = 1; off + 33 <= status.length; off += 33)
+    linked.push({ key: status.subarray(off, off + 32), direct: status[off + 32] === 1 });
+  return { relay: status[0], linked };
 }
 
 /** Assembly options (§12.8). Everything except `sodium` and `identity` has a default. */
@@ -281,7 +297,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return answer.catch(() => EMPTY);
     },
     status: (status) => {
-      try { net!.onStatus?.(status); }
+      try { net!.onStatus?.(readStatus(status)); }
       catch (err) { console.error(`[shell] the embedder's onStatus threw: ${errMessage(err)}`); }
     },
   } : undefined;

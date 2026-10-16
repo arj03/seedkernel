@@ -287,10 +287,10 @@ await test("a restarted relay is redialed, and the next send links again", async
 
 await test("the host is told its status when the relay's state changes", async (keep) => {
   const relay = new FakeRelay("relay:1");
-  // The relay's state is the status's first byte. A status may be told again unchanged.
+  // A status may be told again unchanged.
   const told = [];
   const states = () => told.filter((s, i) => s !== told[i - 1]).join();
-  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status[0]) }));
+  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status.relay) }));
   await joinRelay(A);
   assert(states() === "2,1", `joining tells it is on its way, then registered, got ${told}`);
   relay.restart();
@@ -336,17 +336,17 @@ await test("what was sent to a peer before it is forgotten reaches it, ahead of 
 
 await test("the host is told its status when who is linked changes, ahead of a new peer's first frame", async (keep) => {
   const relay = new FakeRelay("relay:1");
-  // What B's host hears, in order: who is linked, which is the status behind its first
-  // byte (`onStatus`), and each frame delivered.
+  // What B's host hears, in order: who is linked (`onStatus`), each as its key in hex and
+  // then "d" for a direct link or "r" for a relayed one, and each frame delivered.
   const heard = [];
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay, {
-    onStatus: (status) => heard.push(Buffer.from(status.subarray(1)).toString("hex")),
+    onStatus: (status) => heard.push(status.linked.map(({ key, direct }) => Buffer.from(key).toString("hex") + (direct ? "d" : "r")).join()),
     onHostCall: (name) => { if (name === "link/deliver") heard.push("frame"); },
   }));
   // A's request is what dials, so its frame comes in right behind the handshake.
   await relayed(A, B);
-  const linked = heard.indexOf(A.peerId + "00");
+  const linked = heard.indexOf(A.peerId + "r");
   assert(linked >= 0 && linked < heard.indexOf("frame"),
     `B is told A is linked, through the relay, before A's frame is delivered, got ${heard}`);
   await forget(B, A.peerId);
