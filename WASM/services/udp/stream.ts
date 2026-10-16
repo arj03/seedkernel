@@ -16,6 +16,8 @@
 //   only while it is what holds the sender back.
 // - Every ack says how far the receiver will take the stream, so a reader the driver holds
 //   back (`setReadable`) stops the sender.
+// - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
+//   from not at all for `DEAD_MS`, ends the path: the peer is gone.
 //
 // A packet is the path's header, `[type u8][receiver's token 8]`, then:
 //   DATA   [pn 6][offset 6][bytes]
@@ -55,6 +57,11 @@ const INITIAL_RTT_MS = 333;
 const KEEPALIVE_MS = 5_000;
 /** A path that has said nothing for this long is gone. */
 const SILENT_MS = 30_000;
+/** Data in flight through this many probe timeouts in a row, with the peer silent for
+ *  `DEAD_MS`, means the peer is gone. The floor is above twice the host's default guest
+ *  deadline, since a peer whose loop a guest holds acks nothing until it lets go. */
+const MAX_PTOS = 6;
+const DEAD_MS = 10_000;
 /** How long a graceful close waits for what was written to be acked. */
 const LINGER_MS = 10_000;
 
@@ -536,6 +543,7 @@ export class UdpStream implements RawLink {
       this.flush();
       return;
     }
+    if (this.ptoCount >= MAX_PTOS && performance.now() - this.lastHeard > DEAD_MS) { this.giveUp(); return; }
     this.ptoCount++;
     this.flush(2);
   };
@@ -552,6 +560,7 @@ export class UdpStream implements RawLink {
   private tick(): void {
     const now = performance.now();
     if (now - this.lastHeard > SILENT_MS) { this.fail(); return; }
+    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && now - this.lastHeard > DEAD_MS) { this.giveUp(); return; }
     if (now - this.lastSent >= KEEPALIVE_MS) this.sendAck();
     this.liveTimer = setTimeout(() => this.tick(), KEEPALIVE_MS);
   }
@@ -567,6 +576,13 @@ export class UdpStream implements RawLink {
    *  goes three times. */
   private sendClose(): void {
     if (this.out) for (let i = 0; i < 3; i++) this.emit(packet(TYPE_CLOSE, 0));
+  }
+
+  /** The peer stopped answering what is in flight: tell it, in case it only cannot be
+   *  heard, then stop and tell the driver. */
+  private giveUp(): void {
+    this.sendClose();
+    this.fail();
   }
 
   /** The peer closed or went silent: stop, and tell the driver. */

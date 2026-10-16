@@ -30,11 +30,13 @@ const CREDIT = 1 << 20;
 // ── the stream, over an in-memory path ───────────────────────────────────────
 
 /** Two streams joined by a path that drops `loss` of the packets, sends `dup` of them
- *  twice, and holds `late` of them back 5 ms, behind packets sent after them. */
+ *  twice, and holds `late` of them back 5 ms, behind packets sent after them. `cut()` drops
+ *  everything from then on. */
 function streamPair({ loss = 0, dup = 0, late = 0 } = {}) {
   const a = new UdpStream(() => {}), b = new UdpStream(() => {});
+  const pair = { a, b, dead: false, cut: () => { pair.dead = true; } };
   const wire = (to) => (p) => {
-    const copies = Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
+    const copies = pair.dead || Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
     for (let i = 0; i < copies; i++) {
       const bytes = p.slice();
       if (Math.random() < late) setTimeout(() => to.receive(bytes), 5);
@@ -43,7 +45,7 @@ function streamPair({ loss = 0, dup = 0, late = 0 } = {}) {
   };
   a.start(wire(b), 1);
   b.start(wire(a), 1);
-  return { a, b };
+  return pair;
 }
 
 /** What a stream's reader is handed, and whether the stream closed under it. */
@@ -92,6 +94,17 @@ await test("a reader held back stops the sender at its credit, and lets it go ag
   assert(atB.bytes().equals(data), "and in order");
   assert(atB.largest === 256 * 1024, `what was held is handed over in large reads, the largest ${atB.largest}`);
   a.close(); b.close();
+});
+
+await test("data the peer stops answering ends the stream well inside the silent path's 30 s", async () => {
+  const pair = streamPair();
+  const atA = reader(pair.a);
+  const t0 = performance.now();
+  pair.cut();
+  pair.a.send(randomBytes(64 * 1024));
+  await until(() => atA.closed, 20_000, "the sender to give up");
+  const s = (performance.now() - t0) / 1000;
+  assert(s >= 10 && s < 20, `it gives up after the 10 s floor, and before 20 s, at ${s.toFixed(1)} s`);
 });
 
 await test("a graceful close lets what was written arrive first, then the peer hears the close", async () => {
