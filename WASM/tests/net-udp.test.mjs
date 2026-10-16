@@ -32,16 +32,23 @@ const CREDIT = 1 << 20;
 /** Two streams joined by a path that drops `loss` of the packets, sends `dup` of them
  *  twice, and holds `late` of them back 5 ms, behind packets sent after them. `cut()` drops
  *  everything from then on, and a packet larger than `mtu`, which can change, is dropped.
- *  `largest` is the largest DATA packet sent from a to b since it was last set to 0. */
+ *  While `held` is an array, what b sends a waits in it, as the acks of a peer whose loop is
+ *  held do, and `release()` hands it all to a at once. `largest` is the largest DATA packet
+ *  sent from a to b since it was last set to 0, and `toB` counts them. */
 function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity } = {}) {
   const a = new UdpStream(() => {}), b = new UdpStream(() => {});
-  const pair = { a, b, dead: false, mtu, largest: 0, cut: () => { pair.dead = true; } };
+  const pair = {
+    a, b, dead: false, mtu, largest: 0, toB: 0, held: null,
+    cut: () => { pair.dead = true; },
+    release: () => { const held = pair.held ?? []; pair.held = null; for (const p of held) a.receive(p); },
+  };
   const wire = (to) => (p) => {
-    if (to === b && p[0] === 0x64) pair.largest = Math.max(pair.largest, p.length);
+    if (to === b && p[0] === 0x64) { pair.largest = Math.max(pair.largest, p.length); pair.toB++; }
     const copies = pair.dead || p.length > pair.mtu || Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
     for (let i = 0; i < copies; i++) {
       const bytes = p.slice();
-      if (Math.random() < late) setTimeout(() => to.receive(bytes), 5);
+      if (to === a && pair.held) pair.held.push(bytes);
+      else if (Math.random() < late) setTimeout(() => to.receive(bytes), 5);
       else setImmediate(() => to.receive(bytes));
     }
   };
@@ -157,6 +164,28 @@ await test("a stall drops packets to 1200 too, and the probe once the peer acks 
   await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
   assert(pair.largest === 1452, `packets are 1452 again: ${pair.largest}`);
   pair.a.close(); pair.b.close();
+});
+
+await test("losses through three probe timeouts start the window over at two packets, and a peer that only stalls keeps it", async () => {
+  const burst = {};
+  for (const outage of [true, false]) {
+    const pair = streamPair();
+    const atB = reader(pair.b);
+    writeInPieces(pair.a, randomBytes(8 * CREDIT));
+    await until(() => atB.length > 2 * CREDIT, 10_000, "the window to open");
+    // Nothing gets across for a second, or everything does and only the acks wait.
+    if (outage) pair.dead = true; else pair.held = [];
+    await settle(1000);
+    pair.dead = false;
+    pair.held ??= [];
+    await until(() => pair.held.length > 0, 10_000, "an ack from b");
+    const before = pair.toB;
+    pair.release();
+    burst[outage ? "outage" : "stall"] = pair.toB - before;
+    pair.a.close(); pair.b.close();
+  }
+  assert(burst.outage <= 2, `after the outage, the first acks let out two packets: ${burst.outage}`);
+  assert(burst.stall > 100, `after the stall, the acks let out the window: ${burst.stall}`);
 });
 
 await test("a graceful close lets what was written arrive first, then the peer hears the close", async () => {

@@ -13,7 +13,8 @@
 //   a lost tail, which has no later packet to give it away.
 // - NewReno congestion control, run as `FLOWS` flows at once: slow start, the window cut
 //   by 1/(2 FLOWS) once per loss episode, then grown by `FLOWS` packets a round trip, and
-//   only while it is what holds the sender back.
+//   only while it is what holds the sender back. Losses through `PERSISTENT_PTOS` probe
+//   timeouts, with nothing acked between, start the window over at two packets.
 // - Every ack says how far the receiver will take the stream, so a reader the driver holds
 //   back (`setReadable`) stops the sender.
 // - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
@@ -49,6 +50,10 @@ const MIN_WINDOW = 2 * BASE_PACKET;
  *  round trip and a loss cuts it by 1/(2 FLOWS), as that many TCP connections would
  *  together, which is what a TCP peer opens to fill a lossy path. */
 const FLOWS = 8;
+/** Lost packets sent further apart than this many probe timeouts, with none acked between,
+ *  are persistent congestion (RFC 9002 §7.6): nothing got across for that long, so what the
+ *  window learned no longer holds. */
+const PERSISTENT_PTOS = 3;
 /** How far past what its reader has taken a receiver takes the stream. */
 const CREDIT = 1 << 20;
 /** The receive and send buffers a platform asks for on a path's socket, one stream's. A
@@ -440,28 +445,37 @@ export class UdpStream implements RawLink {
   private detectLoss(now: number): void {
     this.lossTime = Infinity;
     const delay = Math.max(9 / 8 * Math.max(this.latestRtt, this.srtt), 1);
-    let lostSentAt = -Infinity;
+    const persistence = PERSISTENT_PTOS * this.pto();
+    let lostSentAt = -Infinity, runFrom = Infinity, persistent = false;
     const lost: number[] = [];
     this.advanceOldest();
     for (let pn = this.oldestPn; pn < this.largestAcked; pn++) {
       const s = this.inFlight.get(pn);
-      if (!s) continue;
+      // A run of losses goes unbroken by number: a packet acked, or not in flight, ends it.
+      if (!s) { runFrom = Infinity; continue; }
       if (this.largestAcked - pn >= 3 || s.time <= now - delay) {
         this.inFlight.delete(pn);
         this.bytesInFlight -= s.size;
         if (this.chunks.has(s.offset)) this.lost.add(s.offset);
         lostSentAt = Math.max(lostSentAt, s.time);
         lost.push(pn);
+        // Of what was sent since the last cut only, as for the cut, so what went to an
+        // address the path has left does not count against the new one.
+        if (s.time <= this.recoveryStart) continue;
+        if (runFrom === Infinity) runFrom = s.time;
+        else if (s.time - runFrom > persistence) persistent = true;
       } else {
         this.lossTime = Math.min(this.lossTime, s.time + delay);
       }
     }
-    // One halving per episode: losses among packets sent before it began are the same one.
+    // One cut per episode: losses among packets sent before it began are the same one.
     if (lostSentAt > this.recoveryStart) {
       this.recoveryStart = now;
       this.undo = { window: this.window, threshold: this.threshold };
       this.suspects.clear();
       this.window = this.threshold = Math.max(this.window * (1 - 1 / (2 * FLOWS)), MIN_WINDOW);
+      // Persistent congestion: slow start again from two packets, up to the cut.
+      if (persistent) this.window = MIN_WINDOW;
     }
     if (this.undo) for (const pn of lost) this.suspects.add(pn);
     this.advanceOldest();
@@ -520,8 +534,9 @@ export class UdpStream implements RawLink {
   }
 
   /** The chunk at `offset`, cut to what a packet now carries. One cut when packets were
-   *  larger is split, and the rest becomes a chunk of its own, next to go. The receiver may
-   *  then have the bytes twice, whole and in pieces, which it takes either way. */
+   *  larger is split, and the rest becomes a chunk of its own, sent again behind what is
+   *  already lost. The receiver may then have the bytes twice, whole and in pieces, which it
+   *  takes either way. */
   private fit(offset: number, chunk: Uint8Array): Uint8Array {
     const max = this.packetBytes - DATA_HEADER;
     if (chunk.length <= max) return chunk;
