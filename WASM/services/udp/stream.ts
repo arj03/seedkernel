@@ -188,6 +188,23 @@ export class UdpStream implements RawLink {
     this.flush();
   }
 
+  /** The path moved to another address, `rttMs` away: what was learned of the old one no
+   *  longer holds, so the window starts over, and a loss among what was sent before the
+   *  move does not cut the new one. */
+  repath(rttMs: number): void {
+    if (this.gone) return;
+    this.window = INITIAL_WINDOW;
+    this.threshold = Infinity;
+    this.recoveryStart = performance.now();
+    this.undo = null;
+    this.suspects.clear();
+    this.sampled = false;
+    this.sample(rttMs, 0);
+    this.ptoCount = 0;
+    this.sendAck();
+    this.flush();
+  }
+
   /** One packet from the peer, header included. */
   receive(p: Uint8Array): void {
     if (this.gone) return;

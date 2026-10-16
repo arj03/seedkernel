@@ -19,7 +19,14 @@
 // A probe carries its sender's token, so it can be answered, and the path taken, before
 // the peer's description has come the long way round. Its source is a candidate too.
 // The stream's packets (stream.ts) share the socket; a STUN answer is told apart by its
-// cookie. A node with no `datagrams` of its own gets Node's (node.ts).
+// cookie.
+//
+// A path can move. A stream packet from another address means the peer's NAT, or the
+// peer, now sends from there, but a packet only shows its token, which anyone who has seen
+// one can copy. So this end probes the new address with a random challenge in the stamp's
+// place, and moves only when the answer echoes it, from there, and only if that address
+// has been heard from more recently than the old one, so a late packet cannot pull the path
+// back. A node with no `datagrams` of its own gets Node's (node.ts).
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../socket-seam.js";
 import { dec, enc, fromHex, toHex } from "../util.js";
 import { bindingRequest, isStun, mappedAddress } from "./stun.js";
@@ -111,6 +118,10 @@ class UdpNegotiation implements RawLink {
   private held: string[] | null = [];
   private socket: DatagramSocket | null = null;
   private path: Addr | null = null;
+  /** When the path last carried a packet from the peer. */
+  private pathHeard = 0;
+  /** An address the peer's packets now come from, being probed before the path moves. */
+  private moving: { addr: Addr; challenge: Uint8Array; sentAt: number; heard: number } | null = null;
   private probing: ReturnType<typeof setTimeout> | undefined;
   private readonly asking: { txn: Uint8Array; timer?: ReturnType<typeof setTimeout> }[] = [];
   private dead = false;
@@ -212,22 +223,58 @@ class UdpNegotiation implements RawLink {
       this.addPeer({ host, port });
     } else if (p[0] === TYPE_PROBE_ACK) {
       if (p.length !== PROBE_ACK_BYTES) return;
-      this.choose(host, port, performance.now() - new DataView(p.buffer, p.byteOffset).getFloat64(1 + TOKEN));
+      if (this.path) this.moved(host, port, p.subarray(1 + TOKEN));
+      else this.choose(host, port, performance.now() - new DataView(p.buffer, p.byteOffset).getFloat64(1 + TOKEN));
     } else {
       // The peer has its path, and this is the way back to it.
-      this.choose(host, port);
+      if (!this.path) this.choose(host, port);
+      else if (host === this.path.host && port === this.path.port) this.pathHeard = performance.now();
+      else this.probeMove(host, port);
       this.data.receive(p);
     }
+  }
+
+  /** The peer's packets come from an address that is not the path: challenge it, at most
+   *  once a `PROBE_MS` while they keep coming. */
+  private probeMove(host: string, port: number): void {
+    const now = performance.now();
+    let m = this.moving;
+    if (m && m.addr.host === host && m.addr.port === port) {
+      m.heard = now;
+      if (now - m.sentAt < PROBE_MS) return;
+    } else {
+      m = this.moving = { addr: { host, port }, challenge: crypto.getRandomValues(new Uint8Array(8)), sentAt: 0, heard: now };
+    }
+    m.sentAt = now;
+    const probe = new Uint8Array(PROBE_BYTES);
+    probe[0] = TYPE_PROBE;
+    probe.set(this.peerToken!, 1);
+    probe.set(this.token, 1 + TOKEN);
+    probe.set(m.challenge, 1 + 2 * TOKEN);
+    this.socket?.send(probe, port, host);
+  }
+
+  /** An answer to a challenge: the path moves, if it came from the address challenged and
+   *  that address is the one the peer was heard from last. */
+  private moved(host: string, port: number, echoed: Uint8Array): void {
+    const m = this.moving;
+    if (!m || m.addr.host !== host || m.addr.port !== port || m.heard < this.pathHeard) return;
+    for (let i = 0; i < 8; i++) if (echoed[i] !== m.challenge[i]) return;
+    this.moving = null;
+    this.path = m.addr;
+    this.pathHeard = m.heard;
+    this.data.repath(performance.now() - m.sentAt);
   }
 
   private choose(host: string, port: number, rttMs?: number): void {
     if (this.path || !this.peerToken) return;
     this.path = { host, port };
+    this.pathHeard = performance.now();
     clearTimeout(this.probing);
     const token = this.peerToken;
     this.data.start((p) => {
       p.set(token, 1);
-      this.socket?.send(p, port, host);
+      this.socket?.send(p, this.path!.port, this.path!.host);
     }, rttMs);
     this.onOpen();
   }

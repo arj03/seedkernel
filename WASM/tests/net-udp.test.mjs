@@ -208,6 +208,71 @@ await test("two seams punch a path, and its data link carries bytes both ways", 
   A.net.close(); B.net.close();
 });
 
+/** Node's datagrams, with `rebind()` moving the socket to a new port, as a NAT that drops
+ *  its mapping does: the peer sees this end arrive from another address. */
+function rebindable() {
+  let cur, handler;
+  return {
+    addresses: () => ["127.0.0.1"],
+    async bind() {
+      cur = await nodeDatagrams.bind();
+      const socket = {
+        send: (b, port, host) => cur.socket.send(b, port, host),
+        onMessage: (cb) => { handler = cb; cur.socket.onMessage(cb); },
+        close: () => cur.socket.close(),
+      };
+      return { port: cur.port, socket };
+    },
+    async rebind() {
+      const old = cur;
+      cur = await nodeDatagrams.bind();
+      cur.socket.onMessage(handler);
+      old.socket.close();
+    },
+  };
+}
+
+await test("a peer that moves to another address keeps its data link, once the new address answers", async () => {
+  const moving = rebindable();
+  const A = await seam({ datagrams: moving }), B = await seam();
+  const { a, b } = await negotiate(A, B);
+  const atA = reader(a), atB = reader(b);
+  const before = randomBytes(200_000);
+  a.send(before);
+  await until(() => atB.length === before.length, 5000, "the bytes before the move");
+  await moving.rebind();
+  // Well inside the 30 s a silent path is given: only a path that moved gets these across.
+  const there = randomBytes(300_000), back = randomBytes(300_000);
+  a.send(there);
+  b.send(back);
+  await until(() => atB.length === before.length + there.length && atA.length === back.length, 3000,
+    "both directions after the move");
+  assert(atB.bytes().equals(Buffer.concat([before, there])) && atA.bytes().equals(back), "intact, and in order");
+  assert(!atA.closed && !atB.closed, "neither data link closed");
+  A.net.close(); B.net.close();
+});
+
+await test("a packet that copies the token from another address draws a challenge, and moves nothing", async () => {
+  const A = await seam(), B = await seam();
+  const { answer, a, b } = await negotiate(A, B);
+  // A stranger that has seen B's token, from a socket that never answers.
+  const stranger = createSocket("udp4");
+  const challenges = [];
+  stranger.on("message", (m) => challenges.push(m));
+  await new Promise((r) => stranger.bind(0, "127.0.0.1", r));
+  const bPort = Number(answer.up.find(([tag]) => tag === RTC_TAG.CANDIDATE)[1].split(":")[1]);
+  const forged = Buffer.concat([Buffer.of(0x00), Buffer.from(answer.up[0][1], "hex"), Buffer.alloc(8)]);
+  stranger.send(forged, bPort, "127.0.0.1");
+  await until(() => challenges.length > 0, 2000, "B to challenge the stranger's address");
+  const atA = reader(a);
+  const back = randomBytes(100_000);
+  b.send(back);
+  await until(() => atA.length === back.length, 3000, "B's bytes, still on the old path");
+  assert(atA.bytes().equals(back), "intact");
+  stranger.close();
+  A.net.close(); B.net.close();
+});
+
 await test("a peer's candidates are probed up to a cap, so it cannot aim this node's probes at a crowd", async () => {
   // A platform whose socket records where it sends, and a peer that names 40 candidates.
   const sentTo = new Set();
