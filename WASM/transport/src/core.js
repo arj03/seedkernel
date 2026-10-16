@@ -334,13 +334,16 @@ class Core {
     return link;
   }
 
-  /** A link authenticated. A relayed one starts the move to WebRTC; a direct one this end
-   *  accepted retires the relayed links it replaces (router.js `retireRelayed`). */
+  /** A link authenticated. A relayed one starts the move to a direct path; a direct one
+   *  takes the requests held back from the relay (router.js `pumpRelayed`), and one this
+   *  end accepted retires the relayed links it replaces (`retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     if (!router.promote(peerId, link)) return;
-    if (link.relayed) void rtc.upgrade(peerId).catch(() => {});
-    else if (!link.weDialed) router.retireRelayed(peerId);
+    if (link.relayed) { void rtc.upgrade(peerId).catch(() => {}); return; }
+    // The requests held back from the relay go out on the direct link.
+    reqres.pumpRelayed(peerId);
+    if (!link.weDialed) router.retireRelayed(peerId);
   }
 
   /** The transport's own message from a peer (router.js `KIND_CTL`): a retire closes a

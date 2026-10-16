@@ -36,6 +36,7 @@ var (
 	qrt    *qjs.Runtime
 	el     *eventLoop
 	nh     *netHost
+	uh     *udpHost
 )
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
@@ -62,15 +63,19 @@ func boot() error {
 	exposeSodium(qc, sd)
 	exposeFs(qc)
 	nh = exposeNet(qc, el)
+	uh = exposeUdp(qc, el)
 	exposeBridge(qc)
 	done, err := qc.Eval("host-shell.gen.js", hostShellJS)
 	if err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
 	}
 	done.Free()
-	// The shim defined the __net dispatchers; retain them.
+	// The shim defined the __net and __udp dispatchers; retain them.
 	if err := nh.retain(); err != nil {
 		return fmt.Errorf("net retain: %w", err)
+	}
+	if err := uh.retain(); err != nil {
+		return fmt.Errorf("udp retain: %w", err)
 	}
 	return nil
 }
@@ -81,6 +86,10 @@ func shutdown() {
 	if nh != nil {
 		nh.close()
 		nh = nil
+	}
+	if uh != nil {
+		uh.close()
+		uh = nil
 	}
 	for _, g := range realms {
 		g.discard()

@@ -127,7 +127,7 @@
 
 **A request inherits its caller's deadline, and neither clock is waited out needlessly.** Transport content cannot extend an owner's time because bytes happen to be moving; that is why `buffered()` is host-only and why `requestTimeoutMs` only retires the transport's own bookkeeping.
 
-## 12.7 Relays and WebRTC
+## 12.7 Relays, WebRTC and UDP paths
 
 **A relay joins two sockets and nothing more.** The channel handshake already proves who is at the other end, so a relay needs to know only which two sockets belong together, not to be trusted with the traffic. A splice is one socket per peer pair, so the relay's backpressure is TCP's and one slow peer cannot stall another's link, and the records are encrypted once, end to end. Multiplexing many peers over one relay socket would need a window per peer inside the transport, and a relay that could read or drop single records would break the record layer's strict nonce order.
 
@@ -148,6 +148,10 @@
 **Roles instead of perfect negotiation.** With only one side ever offering, glare cannot happen, so the seam needs no rollback and the occupant no view of the signaling state. The pre-agreed data channel makes the two ends symmetric below the handshake: neither is a dialer to the host.
 
 **The data link arrives with its channel.** A handshake clock started at `link/open` would spend itself on ICE; announcing the link once its channel opens keeps the handshake deadlines meaning what they mean on TCP, and connecting gets a deadline of its own.
+
+**A UDP path is WebRTC less what a browser requires.** Off the browser, WebRTC costs a whole ICE, DTLS and SCTP stack for what a node with UDP sockets can do itself, and DTLS is redundant under the channel anyway. Punching is the small part: probes from the socket the peer was told of. The part that costs is getting a byte stream across, so the stream takes QUIC's recovery, which is a few hundred lines because the transport above already authenticates, encrypts, frames, bounds its sending and times links out. Being a seam like `rtc:`, it reuses the negotiation link and the transport's signaling, and adds only an offer tag.
+
+**The stream belongs to the host.** It runs a packet at a time, on timers; in the transport guest every datagram would be a host crossing. This is the place a browser's SCTP has, below the seam, and the transport sees one more byte-stream link.
 
 **No bounds of its own.** Every byte of negotiation crosses a link, so the driver's link table, outbound custody and read windows already own it. A second set of caps would bound the same bytes twice, in a place a transport cannot tune.
 

@@ -5,10 +5,23 @@
 // First in the native host bundle, so the globals exist before any module uses one at load
 // time (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
 
-/** The one `bridge` member this file uses (native-shim.ts declares the whole of it). */
+/** The `bridge` and `__sodium` members this file uses (native-shim.ts declares the whole
+ *  of each). */
 declare const bridge: { log(line: string): void };
+declare const __sodium: { randombytes_buf(n: number): ArrayBuffer };
 
-const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown };
+const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown; crypto?: unknown };
+
+// crypto.getRandomValues, Web Crypto's entropy call, which the UDP path draws its tokens
+// from (services/udp); Go's libsodium serves it.
+if (web.crypto === undefined) {
+  web.crypto = {
+    getRandomValues<T extends ArrayBufferView>(a: T): T {
+      new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(new Uint8Array(__sodium.randombytes_buf(a.byteLength)));
+      return a;
+    },
+  };
+}
 
 if (web.TextEncoder === undefined) {
   web.TextEncoder = class TextEncoder {

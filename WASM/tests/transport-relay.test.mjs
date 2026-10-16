@@ -353,4 +353,25 @@ await test("the host is told its status when who is linked changes, ahead of a n
   await until(() => heard.at(-1) === "", 2000, "B to be told nobody is linked");
 });
 
+await test("a peer reached only through a relay is handed one frame's worth of requests at a time, the rest held until answers free room", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  await relayed(A, B);
+  // A relay forwarding nothing: what A hands it is all it would ever have to drain.
+  relay.paused = true;
+  // Six of 600 KB, so three fit in one 2 MiB frame's worth and a fourth does not. Sent
+  // through the host's door, which does not wait for one answer before the next request;
+  // B's app claims no such protocol, so each is answered empty.
+  const size = 600_000;
+  const answers = [];
+  for (let i = 0; i < 6; i++) answers.push(A.requestAsHost(B.peerId, "unclaimed", new Uint8Array(size).fill(i)));
+  await until(() => relay.pausedBytes >= 3 * size, 3000, "A to hand the relay three");
+  await settle(300);
+  assert(relay.pausedBytes < 4 * size, `A hands the relay three and holds the rest, got ${relay.pausedBytes} bytes`);
+  relay.resume();
+  const got = await Promise.all(answers);
+  assert(got.length === 6, "every request is answered once the relay forwards");
+});
+
 summary("Relays");

@@ -39,6 +39,10 @@ export class FakeRelay {
     this.spliceBytes = 0;        // bytes forwarded through splices
     this.refuseSplices = false;  // a relay that takes calls but joins nothing
     this.callerName = null;      // a lying relay: the key hex it names every caller as
+    // A relay too slow to forward anything: splice bytes wait here, counted, until resume().
+    this.paused = false;
+    this.pausedBytes = 0;
+    this.stalled = [];
   }
 
   factory() {
@@ -121,6 +125,7 @@ export class FakeRelay {
     if (!p || p.ends.length >= 2 || this.refuseSplices) return null;
     const end = this.link((b) => {
       if (!end.peer) { end.early.push(b); return; }
+      if (this.paused) { this.pausedBytes += b.length; this.stalled.push(() => end.peer.deliver(b)); return; }
       this.spliceBytes += b.length;
       end.peer.deliver(b);
     });
@@ -138,6 +143,12 @@ export class FakeRelay {
       for (const e of p.ends) for (const m of e.early.splice(0)) { this.spliceBytes += m.length; e.peer.deliver(m); }
     }
     return end.raw;
+  }
+
+  /** Forward what a pause held, in order, and stop holding. */
+  resume() {
+    this.paused = false;
+    for (const f of this.stalled.splice(0)) f();
   }
 
   /** Drop every socket, as a relay restart would. */

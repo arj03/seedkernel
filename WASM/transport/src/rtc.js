@@ -1,17 +1,25 @@
-// WebRTC upgrades (§12.7): once a peer is linked through a relay, the smaller key offers a
-// peer connection, signaled over that authenticated link, and the data channel becomes a
-// direct link. The host's `rtc:` socket factory holds only the RTCPeerConnection.
+// Direct upgrades (§12.7): once a peer is linked through a relay, the smaller key offers a
+// direct path, signaled over that authenticated link, and the path's data link becomes a
+// direct link. A path is one of two kinds, each a host socket factory that holds the path
+// and decides nothing: `udp:`, the host's own UDP sockets (services/udp), tried first, and
+// `rtc:`, a WebRTC peer connection. A node offers the first its host routes, and the next
+// when the peer declines.
 
-// The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`): each message is
-// `[tag u8][UTF-8 text]`. Up: a local description, a local candidate, and a connection
-// state this transport does not read, since a connection that fails closes its links.
-// Down: a remote description, a remote candidate. An ICE restart is never asked for: its
-// offer would have to cross the very link whose path was lost, so a lost connection is
-// dialed again through the relay instead. Signaling reuses the description and candidate
-// tags, and adds a decline.
+// The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`), the same for both
+// kinds: each message is `[tag u8][UTF-8 text]`. Up: a local description, a local
+// candidate, and a connection state this transport does not read, since a connection that
+// fails closes its links. Down: a remote description, a remote candidate. An ICE restart is
+// never asked for: its offer would have to cross the very link whose path was lost, so a
+// lost connection is dialed again through the relay instead. Signaling reuses the
+// description and candidate tags, and adds a UDP offer and a decline.
 const RTC_OFFER = 0x6f, RTC_ANSWER = 0x61, RTC_CANDIDATE = 0x63;
-/** Signaling only: the answering side has no WebRTC, so the offer is dropped. */
+/** Signaling only: an offer of a UDP path, answered and trickled as a WebRTC one is. */
+const UDP_OFFER = 0x75;
+/** Signaling only: the answering side has no path of the kind offered, so the offer is
+ *  dropped. */
 const RTC_DECLINE = 0x78;
+/** The kinds of path, in the order they are offered. */
+const SCHEMES = ["udp", "rtc"];
 /** A negotiation's id, chosen by the offering side, so a signal for a negotiation this end
  *  has dropped or replaced is told from one for the negotiation it holds. */
 const SID_LEN = 8;
@@ -23,9 +31,9 @@ const SID_LEN = 8;
 //
 //   [KIND_CTL][tag u8][sid 8][UTF-8 text]
 //
-// with tag `o` (offer SDP), `a` (answer SDP), `c` (candidate: `candidate`, `sdpMid`,
-// `sdpMLineIndex` and `usernameFragment`, NUL-separated) or `x` (decline, empty). It
-// comes from the authenticated peer, so nothing in it needs checking beyond its shape.
+// with tag `o` (offer), `u` (UDP offer), `a` (answer), `c` (candidate) or `x` (decline,
+// empty), the text as the path's host gives it. It comes from the authenticated peer, so
+// nothing in it needs checking beyond its shape.
 
 /** A negotiation link: the host's peer connection for one peer, and the deadline its data
  *  channel has to open by. */
@@ -87,10 +95,12 @@ class Rtc {
   /** The smaller key offers, just as the smaller key's dial wins a double connect. */
   weOffer(peer) { return ownId < peer; }
 
-  /** Offer a peer connection to a peer this node reaches only through a relay. */
-  async upgrade(peer) {
+  /** Offer a direct path to a peer this node reaches only through a relay: the first of
+   *  `schemes` its host routes. */
+  async upgrade(peer, schemes = SCHEMES) {
     if (!this.weOffer(peer) || this.byPeer.has(peer) || router.hasDirect(peer)) return;
-    await this.open(peer, true, toHex(await randomBytes(SID_LEN)));
+    const sid = toHex(await randomBytes(SID_LEN));
+    for (const scheme of schemes) if (await this.open(peer, true, sid, scheme)) return;
   }
 
   signal(peer, tag, sid, text) {
@@ -108,11 +118,11 @@ class Rtc {
     const sid = toHex(body.subarray(0, SID_LEN));
     const text = utf8Decode(body.subarray(SID_LEN));
     let e = this.byPeer.get(peer);
-    if (tag === RTC_OFFER) {
+    if (tag === RTC_OFFER || tag === UDP_OFFER) {
       if (this.weOffer(peer)) return;
       // A new negotiation from the peer replaces ours: it restarted.
       if (e && e.sid !== sid) { this.drop(e); e = undefined; }
-      if (!e) e = await this.open(peer, false, sid);
+      if (!e) e = await this.open(peer, false, sid, tag === UDP_OFFER ? "udp" : "rtc");
       if (!e) { this.signal(peer, RTC_DECLINE, sid, ""); return; }
       this.down(e, RTC_OFFER, text);
       return;
@@ -120,16 +130,20 @@ class Rtc {
     if (!e || e.sid !== sid) return;
     if (tag === RTC_ANSWER && e.offer) this.down(e, RTC_ANSWER, text);
     else if (tag === RTC_CANDIDATE) this.down(e, RTC_CANDIDATE, text);
-    else if (tag === RTC_DECLINE && e.offer) this.drop(e);
+    else if (tag === RTC_DECLINE && e.offer) {
+      this.drop(e);
+      const rest = SCHEMES.slice(SCHEMES.indexOf(e.scheme) + 1);
+      if (rest.length > 0) void this.upgrade(peer, rest).catch(() => {});
+    }
   }
 
-  /** Open a negotiation link for one peer. Null when the cap is reached or no route (a
-   *  host without WebRTC). */
-  async open(peer, offer, sid) {
+  /** Open a negotiation link of `scheme` for one peer. Null when the cap is reached or no
+   *  route (a host without that kind of path). */
+  async open(peer, offer, sid, scheme) {
     if (this.pending() >= this.maxNegotiating) return null;
-    const e = { peer, offer, sid, ctl: 0, data: null, gone: false, due: Infinity };
+    const e = { peer, offer, sid, scheme, ctl: 0, data: null, gone: false, due: Infinity };
     this.byPeer.set(peer, e);
-    const opened = await netLinkOpen((offer ? "rtc:offer" : "rtc:answer") + this.configFor(peer));
+    const opened = await netLinkOpen(`${scheme}:${offer ? "offer" : "answer"}${this.configFor(peer)}`);
     const early = this.early.get(opened.linkId);
     this.early.delete(opened.linkId);
     if (e.gone || this.byPeer.get(peer) !== e || opened.linkId === 0) {
@@ -146,10 +160,10 @@ class Rtc {
     return e;
   }
 
-  /** A description or candidate the peer connection produced: send it to the peer. */
+  /** A description or candidate the path's host produced: send it to the peer. */
   up(e, tag, text) {
     if (tag !== RTC_OFFER && tag !== RTC_ANSWER && tag !== RTC_CANDIDATE) return;
-    if (!this.signal(e.peer, tag, e.sid, text)) this.drop(e);
+    if (!this.signal(e.peer, tag === RTC_OFFER && e.scheme === "udp" ? UDP_OFFER : tag, e.sid, text)) this.drop(e);
   }
 
   down(e, tag, text) {

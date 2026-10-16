@@ -23,6 +23,8 @@ class Router {
 
   linkCount(peerId) { const p = this.pools.get(peerId); return p ? p.links.length : 0; }
   hasDirect(peerId) { const p = this.pools.get(peerId); return p !== undefined && p.direct > 0; }
+  /** Whether the peer routes, and only through relays. */
+  relayedOnly(peerId) { const p = this.pools.get(peerId); return p !== undefined && p.direct === 0; }
   /** The origin of the relay a peer's relayed link runs through, "" for none. */
   relayOf(peerId) { const p = this.pools.get(peerId); return p?.links.find((l) => l.relay)?.relay ?? ""; }
 
@@ -141,6 +143,9 @@ class ReqRes {
     // By peerId: the weight of its requests waiting on `link/deliver`; plus the total.
     this.delivering = new Map();
     this.deliveringWeight = 0;
+    // By peerId, for a peer reached only through relays: { bytes: the requests sent there
+    // and not yet answered, waiting: corrs held back, oldest first }.
+    this.relayed = new Map();
   }
 
   /** Settle an outstanding request: `[1][payload]`, or `[0]` when `payload` is null (peer
@@ -149,6 +154,10 @@ class ReqRes {
     const p = this.pending.get(corr);
     if (!p) return;
     this.pending.delete(corr);
+    if (p.relayedBytes > 0) {
+      const q = this.relayed.get(p.to);
+      if (q) { q.bytes -= p.relayedBytes; this.pumpRelayed(p.to); }
+    }
     p.d.settle(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
   }
 
@@ -178,9 +187,43 @@ class ReqRes {
     // corr is a u32 on the wire; 0 is noReply's.
     if (this.nextCorr > 0xffffffff) this.nextCorr = 1;
     const frame = this.buildReq(corr, noReply, proto, payload);
-    if (!noReply) {
-      this.pending.set(corr, { to, d, due: requestTimeoutMs > 0 ? dueIn(requestTimeoutMs) : Infinity });
+    if (noReply) { this.put(0, to, frame); return; }
+    const p = { to, d, due: requestTimeoutMs > 0 ? dueIn(requestTimeoutMs) : Infinity, relayedBytes: 0, held: null };
+    this.pending.set(corr, p);
+    if (!router.relayedOnly(to)) { this.put(corr, to, frame); return; }
+    // A relay may meter its splices, and whatever is handed to one waits there, past
+    // recall, even once a direct link replaces it. So a peer reached only through relays
+    // has one frame's worth of requests unanswered at a time, the rest held here, unsealed,
+    // for that direct link or for the answers that free room.
+    let q = this.relayed.get(to);
+    if (!q) this.relayed.set(to, (q = { bytes: 0, waiting: [] }));
+    p.held = frame;
+    q.waiting.push(corr);
+    this.pumpRelayed(to);
+  }
+
+  /** Send what a peer's relay window has room for, or everything once a direct link
+   *  routes. A request may fill an empty window alone, however large. */
+  pumpRelayed(to) {
+    const q = this.relayed.get(to);
+    if (!q) return;
+    const direct = !router.relayedOnly(to);
+    while (q.waiting.length > 0) {
+      const corr = q.waiting[0];
+      const p = this.pending.get(corr);
+      if (!p) { q.waiting.shift(); continue; }
+      const frame = p.held;
+      if (!direct && q.bytes > 0 && q.bytes + frame.length > maxFrameBytes) break;
+      q.waiting.shift();
+      p.held = null;
+      if (!direct) { p.relayedBytes = frame.length; q.bytes += frame.length; }
+      this.put(corr, to, frame);
     }
+    if (q.waiting.length === 0 && (direct || q.bytes === 0)) this.relayed.delete(to);
+  }
+
+  /** Hand a request frame to a link; one no link takes fails its request at once. */
+  put(corr, to, frame) {
     const unanswerable = () => this.finish(corr, null);
     core.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
   }
@@ -239,6 +282,8 @@ class ReqRes {
   }
 
   peerDown(peerId) {
+    // First, so the failures below free no room to send into.
+    this.relayed.delete(peerId);
     for (const [corr, p] of this.pending) {
       if (p.to === peerId) this.finish(corr, null);
     }

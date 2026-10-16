@@ -61,14 +61,21 @@ const sharedRows = [
   { find: /`host\/cli\.ts`/,
     files: ["WASM/host/cli.ts"] },
   { find: /`services\/\*\.ts` \(\d+ shared files\)/,
-    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/")) },
+    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/") && !f.startsWith("WASM/services/udp/")) },
 ];
 
-// In the shared bundle but counted elsewhere: the native target's own files, and
-// transport-bundle.ts, which is one line of signed bundle base64, not host code. Listed
-// so reconciliation can tell them from files counted nowhere.
+/** The UDP path, counted on its own line: a directory under services/ that the JS row,
+ *  which reads only the top level, leaves out, and that the shared bundle carries for the
+ *  native target. */
+const udpFiles = readdirSync(resolve(wasmDir, "services/udp"))
+  .filter((f) => f.endsWith(".ts"))
+  .map((f) => `WASM/services/udp/${f}`);
+
+// In the shared bundle but counted elsewhere: the native target's own files, the UDP path,
+// and transport-bundle.ts, which is one line of signed bundle base64, not host code.
+// Listed so reconciliation can tell them from files counted nowhere.
 const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
-const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
+const countedElsewhere = [...nativeTs, ...udpFiles.filter((f) => sharedSet.has(f)), "WASM/host/transport-bundle.ts"];
 
 /** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
  *  not include. Derived, so a new backend is counted automatically. */
@@ -155,6 +162,7 @@ const proseFigures = [
   ["shared total (heading)", /(?<=all three targets \()[\d,]+(?= LOC\))/, sharedTotal],
   ["transport/src/*.js", /[\d,]+(?= lines of `transport\/src\/\*\.js`)/,
     sum(guestSourcePaths())],
+  ["services/udp/*.ts", /[\d,]+(?= lines of `services\/udp\/\*\.ts`)/, sum(udpFiles)],
 ];
 for (const [label, re, n] of proseFigures) {
   const m = readme.match(re);

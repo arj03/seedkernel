@@ -1,5 +1,5 @@
 // The native binary's platform seam (§12.9): adapts Go's primitives (wazero modules,
-// libsodium, an `fs` directory, TCP sockets, one QuickJS realm per app) to what `bootShell`
+// libsodium, an `fs` directory, TCP and UDP sockets, one QuickJS realm per app) to what `bootShell`
 // takes. Runs inside QuickJS as part of native/host-shell.gen.js.
 import { policyFromJson } from "./policy.js";
 import { type PureModuleLoader } from "./bundle.js";
@@ -8,7 +8,8 @@ import { parseDest } from "../services/peer-addr.js";
 import { bootShell, type ShellSodium } from "./shell-core.js";
 import { CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
-import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
+import { combineChannels, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
+import { UdpNetwork, type DatagramPlatform } from "../services/udp/net-udp.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
@@ -228,6 +229,56 @@ globalThis.__netDeliver = (id, bytes) => { const c = netChans.get(id); if (c) c.
 globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed(); };
 globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(port); if (a) a(id, remoteAddr); };
 
+/** Go's datagram primitive (native/udp.go), for the UDP path (§12.7). */
+declare const __udp: {
+  /** An IPv4 socket on a port the OS picks; a failure throws the OS's reason. */
+  bind(): { id: number; port: number };
+  /** One datagram; a failure is a lost one. A name rather than an address resolves in Go. */
+  send(id: number, host: string, port: number, bytes: Uint8Array): void;
+  close(id: number): void;
+  /** This machine's IPv4 addresses, newline-separated: the outward ones, or loopback. */
+  addresses(): string;
+};
+
+const udpSockets = new Map<number, (bytes: Uint8Array, host: string, port: number) => void>();
+
+/** The UDP path's platform over Go's sockets. */
+const nativeDatagrams: DatagramPlatform = {
+  async bind() {
+    const { id, port } = __udp.bind();
+    let onMessage: (bytes: Uint8Array, host: string, port: number) => void = () => {};
+    udpSockets.set(id, (bytes, host, from) => onMessage(bytes, host, from));
+    return {
+      port,
+      socket: {
+        send: (bytes, to, host) => { __udp.send(id, host, to, bytes); },
+        onMessage: (cb) => { onMessage = cb; },
+        close: () => { udpSockets.delete(id); __udp.close(id); },
+      },
+    };
+  },
+  addresses: () => { const s = __udp.addresses(); return s === "" ? [] : s.split("\n"); },
+};
+
+declare global {
+  /** What a socket read in one loop turn, as `[ip 4][port u16][len u16][bytes]` per
+   *  datagram (udp.go). */
+  var __udpDeliver: (id: number, batch: ArrayBuffer) => void;
+}
+globalThis.__udpDeliver = (id, batch) => {
+  const deliver = udpSockets.get(id);
+  const b = new Uint8Array(batch);
+  // A batch is mostly one peer's, so its address is spelled once, not once a datagram.
+  let host = "", ip = -1;
+  for (let at = 0; deliver && at + 8 <= b.length;) {
+    const len = (b[at + 6] << 8) | b[at + 7];
+    const from = ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
+    if (from !== ip) { ip = from; host = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
+    deliver(b.subarray(at + 8, at + 8 + len), host, (b[at + 4] << 8) | b[at + 5]);
+    at += 8 + len;
+  }
+};
+
 // ── The platform ─────────────────────────────────────────────────────────────
 /** A deadline as the bridge carries it: `Infinity` as -1, omitted as the shared default. */
 const bridgeMs = (ms: number | undefined): number =>
@@ -262,8 +313,8 @@ const files: CliFiles = {
   },
   writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
 };
-/** The driver's ChannelFactory over Go's sockets, shaped like the node:net one. */
-const channels: ChannelFactory = {
+/** The driver's ChannelFactory over Go's TCP sockets, shaped like the node:net one. */
+const goChannels: ChannelFactory = {
   // Go has no TLS socket here, so `wss://` is unroutable (§12.1).
   connect: (dest) => {
     const d = parseDest(dest);
@@ -276,6 +327,11 @@ const channels: ChannelFactory = {
   // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
   close: () => { netCloseListeners(); },
 };
+/** A node's sockets on this platform: Go's TCP, and the UDP path over Go's datagrams. A
+ *  factory per node, since a UDP factory keeps the one node's accept sink. */
+export function nativeChannels(): ChannelFactory {
+  return combineChannels(goChannels, new UdpNetwork({ datagrams: nativeDatagrams }));
+}
 /** This target's realm factory (§12.3): a zero-authority quickjs-ng realm on Go's event
  *  loop, with the same `Realm` contract as safe-js.ts. Promise handling stays here, so Go
  *  needs no promise primitive. guest.go enforces the deadline with QuickJS's interrupt
@@ -369,8 +425,8 @@ async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
   return bootShell({
     sodium, identity: cfg.identity, modules, fs, createRealm, admit,
     freshnessStore: freshnessStoreFor(files, cfg.dir),
-    // The network as configured, over Go's sockets.
-    transport: cfg.transport && { ...cfg.transport, channels },
+    // The network as configured, over Go's sockets unless the caller brings its own.
+    transport: cfg.transport && { ...cfg.transport, channels: cfg.transport.channels ?? nativeChannels() },
     guestDeadlineMs: cfg.guestDeadlineMs,
     realmMemoryBytes: cfg.realmMemoryBytes,
   });

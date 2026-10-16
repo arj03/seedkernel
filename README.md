@@ -151,9 +151,11 @@ Sharing this code keeps admission and confinement rules consistent across target
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,298 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (291) and `native-polyfills.ts` (67), both TypeScript and riding in the shared bundle | 2,243 Go + 358 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (333) and `native-polyfills.ts` (76), both TypeScript and riding in the shared bundle | 2,427 Go + 409 TS |
 
-The transport bundle sits outside these host totals: 1,935 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays and WebRTC signaling across the targets that support them.
+The transport bundle sits outside these host totals: 1,975 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays and the signaling of direct paths across the targets that support them.
+
+The UDP path is outside them too: 741 lines of `services/udp/*.ts`, which find a direct path between two nodes with UDP sockets of their own and run a reliable stream over it (§12.7). It runs on Node and in the native binary, which carries it in the shared bundle over its own datagram socket (`native/udp.go`).
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 
