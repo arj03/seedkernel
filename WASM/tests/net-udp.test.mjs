@@ -31,12 +31,14 @@ const CREDIT = 1 << 20;
 
 /** Two streams joined by a path that drops `loss` of the packets, sends `dup` of them
  *  twice, and holds `late` of them back 5 ms, behind packets sent after them. `cut()` drops
- *  everything from then on. */
-function streamPair({ loss = 0, dup = 0, late = 0 } = {}) {
+ *  everything from then on, and a packet larger than `mtu`, which can change, is dropped.
+ *  `largest` is the largest DATA packet sent from a to b since it was last set to 0. */
+function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity } = {}) {
   const a = new UdpStream(() => {}), b = new UdpStream(() => {});
-  const pair = { a, b, dead: false, cut: () => { pair.dead = true; } };
+  const pair = { a, b, dead: false, mtu, largest: 0, cut: () => { pair.dead = true; } };
   const wire = (to) => (p) => {
-    const copies = pair.dead || Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
+    if (to === b && p[0] === 0x64) pair.largest = Math.max(pair.largest, p.length);
+    const copies = pair.dead || p.length > pair.mtu || Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
     for (let i = 0; i < copies; i++) {
       const bytes = p.slice();
       if (Math.random() < late) setTimeout(() => to.receive(bytes), 5);
@@ -105,6 +107,56 @@ await test("data the peer stops answering ends the stream well inside the silent
   await until(() => atA.closed, 20_000, "the sender to give up");
   const s = (performance.now() - t0) / 1000;
   assert(s >= 10 && s < 20, `it gives up after the 10 s floor, and before 20 s, at ${s.toFixed(1)} s`);
+});
+
+await test("packets grow to 1452 bytes on a path a probe shows carries them, and stay 1200 on one that does not", async () => {
+  for (const [mtu, want] of [[Infinity, 1452], [1451, 1200]]) {
+    const pair = streamPair({ mtu });
+    const atB = reader(pair.b);
+    await settle(100);
+    const data = randomBytes(512 * 1024);
+    writeInPieces(pair.a, data);
+    await until(() => atB.length === data.length, 10_000, "the data to arrive");
+    assert(atB.bytes().equals(data), "intact");
+    assert(pair.largest === want, `on a path carrying ${mtu}, the largest packet is ${want}: ${pair.largest}`);
+    pair.a.close(); pair.b.close();
+  }
+});
+
+await test("a path that stops carrying the larger packets drops back to 1200, splitting what was cut larger", async () => {
+  const pair = streamPair({ loss: 0.02, late: 0.02 });
+  const atB = reader(pair.b);
+  await settle(100);
+  const data = randomBytes(2 * CREDIT);
+  writeInPieces(pair.a, data);
+  await until(() => atB.length > 256 * 1024, 10_000, "the first of it at the larger size");
+  pair.mtu = 1451;
+  await until(() => atB.length === data.length, 20_000, "the rest at 1200");
+  assert(atB.bytes().equals(data), "what was in flight at 1452 arrived intact, split");
+  await until(() => pair.a.buffered() === 0, 5000, "everything to be acked");
+  pair.largest = 0;
+  writeInPieces(pair.a, randomBytes(256 * 1024));
+  await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
+  assert(pair.largest === 1200, `the probe after the drop finds 1452 gone, so packets stay 1200: ${pair.largest}`);
+  pair.a.close(); pair.b.close();
+});
+
+await test("a stall drops packets to 1200 too, and the probe once the peer acks again raises them back", async () => {
+  const pair = streamPair();
+  const atB = reader(pair.b);
+  await settle(100);
+  pair.dead = true;
+  const data = randomBytes(256 * 1024);
+  writeInPieces(pair.a, data);
+  await settle(300);
+  pair.dead = false;
+  await until(() => atB.length === data.length, 20_000, "the data after the stall");
+  assert(atB.bytes().equals(data), "intact");
+  pair.largest = 0;
+  writeInPieces(pair.a, randomBytes(256 * 1024));
+  await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
+  assert(pair.largest === 1452, `packets are 1452 again: ${pair.largest}`);
+  pair.a.close(); pair.b.close();
 });
 
 await test("a graceful close lets what was written arrive first, then the peer hears the close", async () => {
