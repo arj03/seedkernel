@@ -40,7 +40,9 @@ export const nodeDatagrams: DatagramPlatform = {
     const sent = () => { if (--sending === 0 && closing) shut(); };
     const to = (bytes: Uint8Array, port: number, host: string) => {
       sending++;
-      s.send(bytes, port, host, sent);
+      // A port or address the OS refuses (port 0 throws synchronously) is a lost datagram,
+      // as the contract says, not an exception out of the socket callback.
+      try { s.send(bytes, port, host, sent); } catch { sent(); }
     };
     return {
       port: s.address().port,
@@ -54,7 +56,7 @@ export const nodeDatagrams: DatagramPlatform = {
             sending++;
             lookup(host, { family: 4 }, (err, address) => {
               if (err || closing) sent();
-              else s.send(bytes, port, MAPPED + address, sent);
+              else try { s.send(bytes, port, MAPPED + address, sent); } catch { sent(); }
             });
           }
         },

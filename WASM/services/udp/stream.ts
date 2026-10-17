@@ -19,8 +19,9 @@
 //   only while it is what holds the sender back. Losses through `PERSISTENT_PTOS` probe
 //   timeouts, with nothing acked between, start the window over at two packets.
 // - Every ack says how far the receiver will take the stream, so a reader the driver holds
-//   back (`setReadable`) stops the sender. Nothing acks an ack, so the one that lets a
-//   sender that has used all it was given go on is sent three times.
+//   back (`setReadable`) stops the sender, and a credit read in under two round trips
+//   doubles it, up to `MAX_CREDIT`. Nothing acks an ack, so the one that lets a sender
+//   that has used all it was given go on is sent three times.
 // - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
 //   from not at all for `DEAD_MS`, ends the path: the peer is gone.
 // - A path starts at QUIC's 1200-byte packets and probes for `MAX_PACKET` (RFC 8899): a
@@ -58,8 +59,15 @@ const FLOWS = 8;
  *  are persistent congestion (RFC 9002 §7.6): nothing got across for that long, so what the
  *  window learned no longer holds. */
 const PERSISTENT_PTOS = 3;
-/** How far past what its reader has taken a receiver takes the stream. */
-const CREDIT = 1 << 20;
+/** The most packets a loss episode can declare lost and still have its cut undone. Reordering
+ *  holds back a few; more at once is congestion, and every ack tests each one. */
+const MAX_SUSPECTS = 32;
+/** How far past what its reader has taken a receiver takes the stream, to begin with, and
+ *  at most: a sender has one credit a round trip, so this is 84 MB/s at 100 ms. */
+const CREDIT = 1 << 20, MAX_CREDIT = 8 * CREDIT;
+/** What each buffered datagram is charged against the credit as a count, so the slices held
+ *  for the reader are bounded whatever their size: a datagram costs this much host heap or so. */
+const MIN_CHUNK = 256;
 /** The receive and send buffers a platform asks for on a path's socket, one stream's. A
  *  sender may put a whole credit on the wire in a burst, and a kernel charges a datagram
  *  well past its payload, so a smaller buffer drops the burst's tail and every drop halves
@@ -114,6 +122,8 @@ class Pieces {
   /** Where in `list[0]` the next byte is. */
   private at = 0;
   bytes = 0;
+  /** The datagrams held, each a slice the platform will not reuse. */
+  get slices(): number { return this.list.length; }
 
   push(piece: Uint8Array): void {
     this.list.push(piece);
@@ -180,9 +190,10 @@ export class UdpStream implements RawLink {
   private window = INITIAL_WINDOW;
   private threshold = Infinity;
   private recoveryStart = -Infinity;
-  /** The packets the current loss episode declared lost, and the window it cut. Should every
-   *  one of them be acked after all, they were late, not lost, and the cut is undone. */
-  private readonly suspects = new Set<number>();
+  /** The packets the current loss episode declared lost, up to `MAX_SUSPECTS`, and the window
+   *  it cut. Should every one of them be acked after all, they were late, not lost, and the
+   *  cut is undone. */
+  private readonly suspects: number[] = [];
   private undo: { window: number; threshold: number } | null = null;
   private windowLimited = false;
   private peerCredit = CREDIT;
@@ -218,6 +229,10 @@ export class UdpStream implements RawLink {
   private ranges: [number, number][] = [];
   private largestAt = 0;
   private unacked = 0;
+  /** How far past `taken` this end takes the stream, and when its reader began this credit. */
+  private credit = CREDIT;
+  private creditAt = -Infinity;
+  private creditEnd = 0;
   private advertised = CREDIT;
 
   // ── life ──
@@ -253,7 +268,7 @@ export class UdpStream implements RawLink {
     this.threshold = Infinity;
     this.recoveryStart = performance.now();
     this.undo = null;
-    this.suspects.clear();
+    this.suspects.length = 0;
     this.minRtt = Infinity;
     this.sample(rttMs, 0);
     this.ptoCount = 0;
@@ -316,7 +331,7 @@ export class UdpStream implements RawLink {
 
   private onChunk(pn: number, offset: number, floor: number, bytes: Uint8Array): void {
     // Past the credit this end gave: not taken and not acked, so it comes again.
-    if (offset + bytes.length > this.taken + CREDIT) return;
+    if (offset + bytes.length > this.taken + this.credit) return;
     this.received(pn);
     // The sender waits on nothing below `floor`, which is never past `pn`.
     const r = this.ranges;
@@ -340,8 +355,10 @@ export class UdpStream implements RawLink {
       // An honest sender has a credit of chunks past a gap, which a split overlaps a little.
       // Chunks at every offset in it, each overlapping the next, would be a credit per byte.
       this.aheadBytes += DATA_HEADER + bytes.length;
-      if (this.aheadBytes > 2 * CREDIT) this.fail();
     }
+    // Bound the datagrams held by their count as well as their bytes: a credit of one-byte
+    // chunks is a credit of slices, each costing far more than its byte in host heap.
+    if (this.aheadBytes > 2 * this.credit || this.held.slices + this.ahead.size > 2 * this.credit / MIN_CHUNK) this.fail();
   }
 
   /** Note `pn` as received, and see it acked. */
@@ -373,7 +390,14 @@ export class UdpStream implements RawLink {
       this.taken += bytes.length;
       this.onMsg(bytes);
     }
-    if (this.taken + CREDIT - this.advertised >= CREDIT / 2) this.sendAck();
+    // A credit read in under two round trips held the sender back (quiche's autotune).
+    if (this.taken >= this.creditEnd) {
+      const now = performance.now();
+      if (now - this.creditAt < 2 * this.srtt) this.credit = Math.min(2 * this.credit, MAX_CREDIT);
+      this.creditAt = now;
+      this.creditEnd = this.taken + this.credit;
+    }
+    if (this.taken + this.credit - this.advertised >= this.credit / 2) this.sendAck();
   }
 
   /** Note a packet number as received, merging it into the ranges. */
@@ -395,7 +419,7 @@ export class UdpStream implements RawLink {
     this.unacked = 0;
     const r = this.ranges;
     const p = packet(TYPE_ACK, 9 + 12 * r.length);
-    const credit = this.taken + CREDIT;
+    const credit = this.taken + this.credit;
     // More credit for a sender that has used all it had, which may have nothing in flight to
     // draw another ack: one lost would leave it waiting for the keepalive, so it goes three
     // times, as a close does.
@@ -435,8 +459,11 @@ export class UdpStream implements RawLink {
         }
       }
       if (this.probes.length > 0) this.probeAcked(p, count);
-      if (this.suspects.size > 0) for (const pn of this.suspects) if (names(p, count, pn)) this.suspects.delete(pn);
-      if (this.undo && this.suspects.size === 0) {
+      // A suspect the ack names was late, not lost.
+      for (let i = this.suspects.length - 1; i >= 0; i--) {
+        if (names(p, count, this.suspects[i])) this.suspects.splice(i, 1);
+      }
+      if (this.undo && this.suspects.length === 0) {
         this.window = Math.max(this.window, this.undo.window);
         this.threshold = this.undo.threshold;
         this.undo = null;
@@ -497,12 +524,20 @@ export class UdpStream implements RawLink {
     if (lostSentAt > this.recoveryStart) {
       this.recoveryStart = now;
       this.undo = { window: this.window, threshold: this.threshold };
-      this.suspects.clear();
+      this.suspects.length = 0;
       this.window = this.threshold = Math.max(this.window * (1 - 1 / (2 * FLOWS)), MIN_WINDOW);
       // Persistent congestion: slow start again from two packets, up to the cut.
       if (persistent) this.window = MIN_WINDOW;
     }
-    if (this.undo) for (const pn of lost) this.suspects.add(pn);
+    if (this.undo) {
+      if (this.suspects.length + lost.length > MAX_SUSPECTS) {
+        // So many at once were lost, not late: the cut stands, and acks stop testing them.
+        this.undo = null;
+        this.suspects.length = 0;
+      } else {
+        for (const pn of lost) this.suspects.push(pn);
+      }
+    }
     this.advanceOldest();
   }
 

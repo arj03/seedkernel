@@ -30,20 +30,29 @@
 // random ports at the hard end's address until one of its probes lands on one of them.
 // Two hard ends cannot meet this way, and stay on the relay.
 //
-//   PROBE      [type][receiver's token 8][sender's token 8][stamp f64]
-//   PROBE_ACK  [type][receiver's token 8][the probe's stamp f64]
+//   PROBE      [type][receiver's token 8][sender's token 8][challenge 8]
+//   PROBE_ACK  [type][receiver's token 8][the probe's challenge 8]
 //
-// A probe carries its sender's token, so it can be answered, and the path taken, before
-// the peer's description has come the long way round. Its source is a candidate too.
+// A probe carries its sender's token, so it can be answered, and a random challenge. The
+// token is in every packet in the clear and so proves nothing; the path is taken only on an
+// ack that echoes the challenge from the address it was sent to, which only something that
+// received the probe can send, never on a DATA or other packet that merely shows the token.
+// A probe can be answered before the peer's description has come the long way round, and its
+// source is a candidate too.
 // The stream's packets (stream.ts) share the socket; a STUN answer is told apart by its
 // cookie.
 //
 // A path can move. A stream packet from another address means the peer's NAT, or the
 // peer, now sends from there, but a packet only shows its token, which anyone who has seen
-// one can copy. So this end probes the new address with a random challenge in the stamp's
-// place, and moves only when the answer echoes it, from there, and only if that address
+// one can copy. So this end probes the new address with a fresh challenge, as it did to take
+// the path at all, and moves only when the answer echoes it, from there, and only if that address
 // has been heard from more recently than the old one, so a late packet cannot pull the path
-// back. A node with no `datagrams` of its own gets Node's (node.ts).
+// back. A machine with several addresses sends from the one its route to the destination
+// takes, so two ends can each see the other arrive from an address that is not its path,
+// and both following at once only swaps them, round after round. So the offering end
+// follows at once, and the answering end only once nothing has come from its path for
+// `FOLLOW_MS`, by when an offering end that followed has settled it. A node with no
+// `datagrams` of its own gets Node's (node.ts).
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../socket-seam.js";
 import { dec, enc, fromHex, toHex } from "../util.js";
 import { bindingRequest, isStun, mappedAddress } from "./stun.js";
@@ -83,6 +92,9 @@ const TOKEN = 8;
 const PROBE_BYTES = 1 + 2 * TOKEN + 8, PROBE_ACK_BYTES = 1 + TOKEN + 8;
 /** How often every candidate is probed until one answers. */
 const PROBE_MS = 50;
+/** How long the answering end's path stays quiet before it follows the peer elsewhere: well
+ *  past the round trip in which the offering end follows (the header). */
+const FOLLOW_MS = 1000;
 /** The most of a peer's candidates probed. The peer names them, so without a cap it could
  *  aim this node's probes at any number of addresses. */
 const MAX_PEER_CANDIDATES = 16;
@@ -91,6 +103,10 @@ const STUN_TRIES = 4, STUN_RETRY_MS = 500;
 const BIRTHDAY_AFTER_MS = 1000;
 /** The hard end's extra sockets, and so the ports it opens toward the peer. */
 const BIRTHDAY_SOCKETS = 256;
+/** The sockets all a node's birthday punches at once may hold, since each punch wants
+ *  `BIRTHDAY_SOCKETS` and the transport may run many negotiations: without a shared ceiling
+ *  a peer (or a relay forcing `host:*`) could make a node open tens of thousands at once. */
+const MAX_NODE_BIRTHDAY_SOCKETS = 1024;
 /** The easy end's random probes: how many each `PROBE_MS` to each of the peer's `host:*`,
  *  and how many in all, since the peer names those addresses. With 256 ports open among
  *  the 64,512 a NAT draws from, a probe lands with odds of 1 in 252, so the first 1,160
@@ -167,6 +183,8 @@ class UdpNegotiation implements RawLink {
   private onMsg: ((bytes: Uint8Array) => void) | null = null;
   private onCls: (() => void) | null = null;
   private readonly token = crypto.getRandomValues(new Uint8Array(TOKEN));
+  /** The challenge every probe carries, which an ack must echo for the path to be taken. */
+  private readonly challenge = crypto.getRandomValues(new Uint8Array(8));
   private peerToken: Uint8Array | null = null;
   private readonly peerCandidates: Addr[] = [];
   /** The addresses of a hard peer's NAT, from its `host:*` candidates. */
@@ -194,11 +212,15 @@ class UdpNegotiation implements RawLink {
   private readonly mapped: string[] = [];
   private spraying = false;
   private sprayed = 0;
+  /** Birthday sockets taken from the node-wide budget, returned once a path is found or the
+   *  negotiation ends. */
+  private reservedExtra = 0;
   private dead = false;
   readonly data: UdpStream;
 
   constructor(private readonly offer: boolean, stun: Addr[], platform: Promise<DatagramPlatform>,
-    private readonly onGone: (n: UdpNegotiation) => void, private readonly onOpen: () => void) {
+    private readonly onGone: (n: UdpNegotiation) => void, private readonly onOpen: () => void,
+    private readonly takeSockets: (n: number) => number, private readonly freeSockets: (n: number) => void) {
     // The stream stopping, for whatever reason, ends the negotiation.
     this.data = new UdpStream(() => this.fail());
     void this.start(platform, stun);
@@ -280,14 +302,20 @@ class UdpNegotiation implements RawLink {
   /** Two STUN servers saw this socket at one address: its NAT keeps one port for all. */
   private easy(): boolean { return this.mapped.length >= 2 && !this.hard(); }
 
-  /** `[PROBE][peer's token][own token][stamp]`, the stamp now. */
+  /** `[PROBE][peer's token][own token][challenge]`. */
   private probePacket(): Uint8Array {
     const p = new Uint8Array(PROBE_BYTES);
     p[0] = TYPE_PROBE;
     p.set(this.peerToken!, 1);
     p.set(this.token, 1 + TOKEN);
-    new DataView(p.buffer).setFloat64(1 + 2 * TOKEN, performance.now());
+    p.set(this.challenge, 1 + 2 * TOKEN);
     return p;
+  }
+
+  /** Whether `echoed` is this end's challenge, so an ack answers a probe this end sent. */
+  private echoes(echoed: Uint8Array): boolean {
+    for (let i = 0; i < 8; i++) if (echoed[i] !== this.challenge[i]) return false;
+    return true;
   }
 
   /** Probe every candidate the peer has, a round each `PROBE_MS` until a path is found, and
@@ -315,7 +343,8 @@ class UdpNegotiation implements RawLink {
     if (this.rounds * PROBE_MS < BIRTHDAY_AFTER_MS || this.dead || this.path || !this.peerToken) return;
     if (this.hard() && this.peerHard.length === 0 && this.peerCandidates.length > 0 && this.extra === null) {
       this.extra = [];
-      for (let i = 0; i < BIRTHDAY_SOCKETS; i++) void this.platform!.bind().then(({ socket }) => this.addExtra(socket), () => {});
+      this.reservedExtra = this.takeSockets(BIRTHDAY_SOCKETS);
+      for (let i = 0; i < this.reservedExtra; i++) void this.platform!.bind().then(({ socket }) => this.addExtra(socket), () => {});
     }
     this.spraying ||= this.easy() && this.peerHard.length > 0;
   }
@@ -330,7 +359,7 @@ class UdpNegotiation implements RawLink {
   }
 
   private onPacket(socket: DatagramSocket, p: Uint8Array, host: string, port: number): void {
-    if (this.dead) return;
+    if (this.dead || port < 1) return;
     if (isStun(p)) {
       for (let i = 0; i < this.asking.length; i++) {
         const mapped = mappedAddress(p, this.asking[i].txn);
@@ -347,24 +376,30 @@ class UdpNegotiation implements RawLink {
       // byte of this end's token: the bytes are this end's to keep.
       p[TOKEN] = TYPE_PROBE_ACK;
       socket.send(p.subarray(TOKEN), port, host);
+      // Probe back from this socket, so this end's own challenge makes the round trip here
+      // and the path can be taken, even when the source is a candidate already known (which
+      // a birthday socket's peer always is) and the probe loop would not reach it.
+      if (!this.path) socket.send(this.probePacket(), port, host);
       this.addPeer({ host, port });
     } else if (p[0] === TYPE_PROBE_ACK) {
       if (p.length !== PROBE_ACK_BYTES) return;
-      if (this.path) this.moved(host, port, p.subarray(1 + TOKEN));
-      else this.choose(socket, host, port, performance.now() - new DataView(p.buffer, p.byteOffset).getFloat64(1 + TOKEN));
-    } else {
-      // The peer has its path, and this is the way back to it.
-      if (!this.path) this.choose(socket, host, port);
-      else if (host === this.path.host && port === this.path.port) this.pathHeard = performance.now();
+      const echoed = p.subarray(1 + TOKEN);
+      if (this.path) this.moved(host, port, echoed);
+      else if (this.echoes(echoed)) this.choose(socket, host, port);
+    } else if (this.path) {
+      // The data link, once there is one: the way back, the peer having moved, or the path.
+      if (host === this.path.host && port === this.path.port) this.pathHeard = performance.now();
       else this.probeMove(host, port);
       this.data.receive(p);
     }
   }
 
   /** The peer's packets come from an address that is not the path: challenge it, at most
-   *  once a `PROBE_MS` while they keep coming. */
+   *  once a `PROBE_MS` while they keep coming, and on the answering end only once the path
+   *  has been quiet for `FOLLOW_MS`. */
   private probeMove(host: string, port: number): void {
     const now = performance.now();
+    if (!this.offer && now - this.pathHeard < FOLLOW_MS) return;
     let m = this.moving;
     if (m && m.addr.host === host && m.addr.port === port) {
       m.heard = now;
@@ -392,17 +427,19 @@ class UdpNegotiation implements RawLink {
 
   /** The path is the peer's `host`:`port` from `socket`, which may be a birthday socket:
    *  the other sockets close, and the STUN servers are not asked again. */
-  private choose(socket: DatagramSocket, host: string, port: number, rttMs?: number): void {
+  private choose(socket: DatagramSocket, host: string, port: number): void {
     if (this.path || !this.peerToken) return;
     this.path = { host, port };
     this.pathHeard = performance.now();
     this.keepOnly(socket);
     this.stopPunching();
     const token = this.peerToken;
+    // No round-trip time is passed: the peer's own clock is not trusted for it, and the
+    // stream's first data acks measure the path (stream.ts).
     this.data.start((p) => {
       p.set(token, 1);
       this.socket?.send(p, this.path!.port, this.path!.host);
-    }, rttMs);
+    });
     this.onOpen();
   }
 
@@ -445,11 +482,13 @@ class UdpNegotiation implements RawLink {
     this.onGone(this);
   }
 
-  /** Close every socket but `keep`, which is the path's from now on. */
+  /** Close every socket but `keep`, which is the path's from now on, and return the birthday
+   *  sockets to the node-wide budget. */
   private keepOnly(keep: DatagramSocket | null): void {
     for (const s of [this.socket, ...this.extra ?? []]) if (s !== keep) s?.close();
     this.socket = keep;
     this.extra = [];
+    if (this.reservedExtra > 0) { this.freeSockets(this.reservedExtra); this.reservedExtra = 0; }
   }
 
   private stopPunching(): void {
@@ -469,6 +508,14 @@ export class UdpNetwork implements ChannelFactory {
   private readonly platform: () => Promise<DatagramPlatform>;
   private onAccept: ((channel: RawLink, arrival?: Arrival) => void) | null = null;
   private readonly live = new Set<UdpNegotiation>();
+  /** Birthday sockets this node may still open, shared across every negotiation. */
+  private birthdayBudget = MAX_NODE_BIRTHDAY_SOCKETS;
+  private readonly takeSockets = (n: number): number => {
+    const got = Math.min(n, this.birthdayBudget);
+    this.birthdayBudget -= got;
+    return got;
+  };
+  private readonly freeSockets = (n: number): void => { this.birthdayBudget += n; };
 
   constructor(opts: UdpNetworkOptions = {}) {
     const given = opts.datagrams;
@@ -482,7 +529,7 @@ export class UdpNetwork implements ChannelFactory {
     const accept = this.onAccept;
     if (!d || !accept) return null;
     const n = new UdpNegotiation(d.offer, d.stun, this.platform(), (gone) => this.live.delete(gone),
-      () => accept(n.data, { via: n }));
+      () => accept(n.data, { via: n }), this.takeSockets, this.freeSockets);
     this.live.add(n);
     return n;
   }

@@ -30,13 +30,15 @@ const CREDIT = 1 << 20;
 // ── the stream, over an in-memory path ───────────────────────────────────────
 
 /** Two streams joined by a path that drops `loss` of the packets, sends `dup` of them
- *  twice, and holds `late` of them back 5 ms, behind packets sent after them. `cut()` drops
+ *  twice, and holds `late` of them back 5 ms, behind packets sent after them, or every one
+ *  `delay` ms, a path's one-way delay. `cut()` drops
  *  everything from then on, and a packet larger than `mtu` is dropped; both it and `loss`
  *  can change. The next `dropToA` packets b sends a are dropped. While `held` is an array,
  *  what b sends a waits in it, as the acks of a peer whose loop is held do, and `release()`
  *  hands it all to a at once. `largest` is the largest DATA packet sent from a to b since it
- *  was last set to 0, `toB` counts them, and `ackToA` is the size of the last ACK b sent a. */
-function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity } = {}) {
+ *  was last set to 0, `toB` counts them, and `ackToA` is the size of the last ACK b sent a,
+ *  `onAck` called with the credit it grants. */
+function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0 } = {}) {
   const a = new UdpStream(() => {}), b = new UdpStream(() => {});
   const pair = {
     a, b, dead: false, loss, mtu, largest: 0, toB: 0, dropToA: 0, ackToA: 0, held: null,
@@ -45,18 +47,19 @@ function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity } = {}) {
   };
   const wire = (to) => (p) => {
     if (to === b && p[0] === 0x64) { pair.largest = Math.max(pair.largest, p.length); pair.toB++; }
-    if (to === a && p[0] === 0x61) pair.ackToA = p.length;
+    if (to === a && p[0] === 0x61) { pair.ackToA = p.length; pair.onAck?.(Buffer.from(p.buffer, p.byteOffset).readUIntBE(9, 6)); }
     if (to === a && pair.dropToA > 0) { pair.dropToA--; return; }
     const copies = pair.dead || p.length > pair.mtu || Math.random() < pair.loss ? 0 : Math.random() < dup ? 2 : 1;
     for (let i = 0; i < copies; i++) {
       const bytes = p.slice();
       if (to === a && pair.held) pair.held.push(bytes);
+      else if (delay > 0) setTimeout(() => to.receive(bytes), delay);
       else if (Math.random() < late) setTimeout(() => to.receive(bytes), 5);
       else setImmediate(() => to.receive(bytes));
     }
   };
-  a.start(wire(b), 1);
-  b.start(wire(a), 1);
+  a.start(wire(b), 2 * delay || 1);
+  b.start(wire(a), 2 * delay || 1);
   return pair;
 }
 
@@ -124,6 +127,37 @@ await test("a sender held at its credit goes on at once, though the ack that let
   pair.a.close(); pair.b.close();
 });
 
+await test("a reader that pauses for each read, as the host's does, takes a long stream that never drains", async () => {
+  const pair = streamPair();
+  const atB = reader(pair.b);
+  // The host holds the link from each read until the realm has taken it (transport-host.ts).
+  const parts = [];
+  pair.b.onData((bytes) => {
+    parts.push(Buffer.from(bytes)); atB.length += bytes.length;
+    pair.b.setReadable(false);
+    setTimeout(() => pair.b.setReadable(true), 2);
+  });
+  const data = randomBytes(24 * CREDIT);
+  writeInPieces(pair.a, data);
+  await until(() => atB.length === data.length || atB.closed, 30_000, "all of it");
+  assert(!atB.closed && Buffer.concat(parts).equals(data), `in order and open, ${atB.length} of ${data.length}`);
+  pair.a.close(); pair.b.close();
+});
+
+await test("a sender held by its credit alone, its reader keeping up, is given more, up to eight credits", async () => {
+  // 50 ms a round trip: one credit a round trip is 21 MB/s, which the path beats.
+  const pair = streamPair({ delay: 25 });
+  const atB = reader(pair.b);
+  let most = 0;
+  pair.onAck = (granted) => { most = Math.max(most, granted - atB.length); };
+  const data = randomBytes(24 * CREDIT);
+  writeInPieces(pair.a, data);
+  await until(() => atB.length === data.length, 30_000, "all of it");
+  assert(atB.bytes().equals(data), "in order");
+  assert(most >= 2 * CREDIT && most <= 8 * CREDIT, `the credit grew to ${most / CREDIT} credits`);
+  pair.a.close(); pair.b.close();
+});
+
 await test("acks name only what the sender still waits on, so a lossy stretch leaves them one range", async () => {
   const pair = streamPair({ loss: 0.05 });
   const atB = reader(pair.b);
@@ -155,6 +189,20 @@ await test("chunks past a gap at overlapping offsets end the stream at two credi
     b.receive(p);
   }
   assert(atB.closed && sent < 1500, `the stream closes at two credits held, after ${sent} chunks`);
+});
+
+await test("a flood of tiny in-order chunks to a held reader ends the stream, bounded by their count", async () => {
+  const b = new UdpStream(() => {});
+  b.start(() => {}, 1);
+  const atB = reader(b);
+  b.setReadable(false);
+  const put48 = (p, at, n) => { for (let i = 5; i >= 0; i--, n = Math.floor(n / 256)) p[at + i] = n % 256; };
+  // DATA [type][token 8][pn 6][offset 6][floor 6][1 byte], one byte at each consecutive offset.
+  const p = new Uint8Array(27 + 1);
+  p[0] = 0x64;
+  let sent = 0;
+  while (!atB.closed && sent < 100_000) { put48(p, 9, sent); put48(p, 15, sent); b.receive(p); sent++; }
+  assert(atB.closed && sent < 2 * CREDIT / 256 + 2, `the stream closes on the slice count, after ${sent} chunks`);
 });
 
 await test("data the peer stops answering ends the stream well inside the silent path's 30 s", async () => {
@@ -400,23 +448,77 @@ await test("a peer that moves to another address keeps its data link, once the n
 
 await test("a packet that copies the token from another address draws a challenge, and moves nothing", async () => {
   const A = await seam(), B = await seam();
-  const { answer, a, b } = await negotiate(A, B);
-  // A stranger that has seen B's token, from a socket that never answers.
+  const { offer, a, b } = await negotiate(A, B);
+  // A stranger that has seen A's token, from a socket that never answers. A is the offering
+  // end, which challenges at once; the answering end would wait for its path to go quiet.
   const stranger = createSocket("udp4");
   const challenges = [];
   stranger.on("message", (m) => challenges.push(m));
   await new Promise((r) => stranger.bind(0, "127.0.0.1", r));
-  const bPort = Number(answer.up.find(([tag]) => tag === RTC_TAG.CANDIDATE)[1].split(":")[1]);
-  const forged = Buffer.concat([Buffer.of(0x00), Buffer.from(answer.up[0][1], "hex"), Buffer.alloc(8)]);
-  stranger.send(forged, bPort, "127.0.0.1");
-  await until(() => challenges.length > 0, 2000, "B to challenge the stranger's address");
-  const atA = reader(a);
-  const back = randomBytes(100_000);
-  b.send(back);
-  await until(() => atA.length === back.length, 3000, "B's bytes, still on the old path");
-  assert(atA.bytes().equals(back), "intact");
+  const aPort = Number(offer.up.find(([tag]) => tag === RTC_TAG.CANDIDATE)[1].split(":")[1]);
+  const forged = Buffer.concat([Buffer.of(0x00), Buffer.from(offer.up[0][1], "hex"), Buffer.alloc(8)]);
+  stranger.send(forged, aPort, "127.0.0.1");
+  await until(() => challenges.length > 0, 2000, "A to challenge the stranger's address");
+  const atB = reader(b);
+  const there = randomBytes(100_000);
+  a.send(there);
+  await until(() => atB.length === there.length, 3000, "A's bytes, still on the old path");
+  assert(atB.bytes().equals(there), "intact");
   stranger.close();
   A.net.close(); B.net.close();
+});
+
+/** Two machines on two networks, 10.1/16 and 10.2/16, with an address on each, listed in
+ *  opposite orders. A datagram leaves from the sender's address on the network it goes to,
+ *  as a route picks it, so each end sees the other arrive from the address it sent to. It
+ *  takes 20 ms, so each end's own probes are answered before the other's reach it, and the
+ *  two take paths on different networks. */
+function twoNetworks() {
+  const sockets = new Map();
+  let nextPort = 40000;
+  const machine = (n, nets) => ({
+    addresses: () => nets.map((net) => `10.${net}.0.${n}`),
+    async bind() {
+      const port = nextPort++;
+      const socket = {
+        handler: null, closed: false,
+        send(bytes, toPort, toHost) {
+          const from = `10.${toHost.split(".")[1]}.0.${n}`, copy = Uint8Array.from(bytes);
+          setTimeout(() => {
+            const to = sockets.get(`${toHost}:${toPort}`);
+            if (!socket.closed && to && !to.closed) to.handler?.(copy, from, port);
+          }, 20);
+        },
+        onMessage(cb) { socket.handler = cb; },
+        close() { socket.closed = true; },
+      };
+      for (const net of nets) sockets.set(`10.${net}.0.${n}:${port}`, socket);
+      return { port, socket };
+    },
+  });
+  return [machine(1, [1, 2]), machine(2, [2, 1])];
+}
+
+await test("two ends with two addresses each settle on one path, though each first takes the other's", async () => {
+  let moves = 0;
+  const repath = UdpStream.prototype.repath;
+  UdpStream.prototype.repath = function (...args) { moves++; return repath.apply(this, args); };
+  try {
+    const [one, two] = twoNetworks();
+    const A = await seam({ datagrams: one }), B = await seam({ datagrams: two });
+    const { a, b } = await negotiate(A, B);
+    const atA = reader(a), atB = reader(b);
+    const there = randomBytes(500_000), back = randomBytes(500_000);
+    a.send(there);
+    b.send(back);
+    await until(() => atB.length === there.length && atA.length === back.length, 10_000, "the bytes");
+    assert(atB.bytes().equals(there) && atA.bytes().equals(back), "intact");
+    // One end follows the other's address, once; both following at once swaps them forever.
+    assert(moves >= 1 && moves <= 2, `the paths settle, after ${moves} moves`);
+    A.net.close(); B.net.close();
+  } finally {
+    UdpStream.prototype.repath = repath;
+  }
 });
 
 await test("a peer's candidates are probed up to a cap, so it cannot aim this node's probes at a crowd", async () => {
