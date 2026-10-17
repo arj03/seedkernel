@@ -133,11 +133,11 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (2,430 LOC)**
+**Shared: one implementation for all three targets (2,432 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 480 |
+| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts` | 482 |
 | Transport driver: channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 318 |
 | Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 661 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 404 |
@@ -150,12 +150,12 @@ Sharing this code keeps admission and confinement rules consistent across target
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,302 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (340) and `native-polyfills.ts` (76), both TypeScript and riding in the shared bundle | 2,432 Go + 416 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed private modules, manifest-verifier plumbing, entry points, key derivation | 1,309 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and private modules over wazero, raw net and fs, plus `native-shim.ts` (340) and `native-polyfills.ts` (76), both TypeScript and riding in the shared bundle | 2,440 Go + 416 TS |
 
-The transport bundle sits outside these host totals: 1,976 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays and the signaling of direct paths across the targets that support them.
+The transport bundle sits outside these host totals: 1,977 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays and the signaling of direct paths across the targets that support them.
 
-The UDP path is outside them too: 978 lines of `services/udp/*.ts`, which find a direct path between two nodes with UDP sockets of their own and run a reliable stream over it (§12.7). It runs on Node and in the native binary, which carries it in the shared bundle over its own datagram socket (`native/udp.go`).
+The UDP path is outside them too: 991 lines of `services/udp/*.ts`, which find a direct path between two nodes with UDP sockets of their own and run a reliable stream over it (§12.7). It runs on Node and in the native binary, which carries it in the shared bundle over its own datagram socket (`native/udp.go`).
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm` host artifacts, including verification for manifest suite `0x02`. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 

@@ -36,6 +36,7 @@
 //   CLOSE  nothing
 // The stream writes the type and leaves the token to the path (net-udp.ts).
 import { type RawLink } from "../socket-seam.js";
+import { Fifo } from "../util.js";
 
 const TYPE_DATA = 0x64, TYPE_ACK = 0x61, TYPE_PROBE = 0x6d, TYPE_CLOSE = 0x78;
 /** The path's header in front of every packet. */
@@ -118,12 +119,14 @@ function names(p: Uint8Array, count: number, pn: number): boolean {
 /** Bytes in pieces, taken from the front: what was written and is not yet sent, and what
  *  arrived in order and is not yet read. */
 class Pieces {
-  private readonly list: Uint8Array[] = [];
-  /** Where in `list[0]` the next byte is. */
+  /** A `Fifo`, not an array: draining a credit of tiny datagrams with `shift` would be
+   *  quadratic. */
+  private readonly list = new Fifo<Uint8Array>();
+  /** Where in the front piece the next byte is. */
   private at = 0;
   bytes = 0;
   /** The datagrams held, each a slice the platform will not reuse. */
-  get slices(): number { return this.list.length; }
+  get slices(): number { return this.list.size; }
 
   push(piece: Uint8Array): void {
     this.list.push(piece);
@@ -134,10 +137,10 @@ class Pieces {
    *  copy across pieces. */
   take(n: number): Uint8Array {
     this.bytes -= n;
-    if (this.at === 0 && this.list[0].length === n) return this.list.shift()!;
+    if (this.at === 0 && this.list.peek()!.length === n) return this.list.shift()!;
     let out: Uint8Array | undefined;
     for (let got = 0; got < n;) {
-      const piece = this.list[0], k = Math.min(piece.length - this.at, n - got);
+      const piece = this.list.peek()!, k = Math.min(piece.length - this.at, n - got);
       if (k === n) out = piece.subarray(this.at, this.at + k);
       else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
       got += k;
@@ -438,13 +441,18 @@ export class UdpStream implements RawLink {
     this.peerCredit = Math.max(this.peerCredit, get48(p, B));
     const count = p[B + 8];
     if (count > 0) {
-      // A range is clamped to what was sent, so a peer naming numbers never sent costs nothing.
+      // Ranges are newest first. Each is clamped below the previous range's floor, so a
+      // peer cannot make overlapping ranges walk the same packet numbers again: the work
+      // is bounded by the packets sent, not by the range count.
       const sent = this.nextPn - 1;
       const largest = Math.min(get48(p, B + 9), sent);
       let newest: Sent | undefined;
+      let below = Infinity;
       for (let i = 0; i < count; i++) {
-        const hi = Math.min(get48(p, B + 9 + 12 * i), sent);
-        for (let pn = Math.max(get48(p, B + 15 + 12 * i), this.oldestPn); pn <= hi; pn++) {
+        const hi = Math.min(get48(p, B + 9 + 12 * i), sent, below);
+        const lo = Math.max(get48(p, B + 15 + 12 * i), this.oldestPn);
+        if (lo > hi) continue;
+        for (let pn = lo; pn <= hi; pn++) {
           const s = this.inFlight.get(pn);
           if (!s) continue;
           this.inFlight.delete(pn);
@@ -457,6 +465,7 @@ export class UdpStream implements RawLink {
           if (s.time > this.recoveryStart && this.windowLimited)
             this.window += this.window < this.threshold ? s.size : FLOWS * this.packetBytes * s.size / this.window;
         }
+        below = lo - 1;
       }
       if (this.probes.length > 0) this.probeAcked(p, count);
       // A suspect the ack names was late, not lost.

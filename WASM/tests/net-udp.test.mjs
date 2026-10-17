@@ -16,7 +16,7 @@ import {
 
 const imp = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
 const { UdpNetwork, isIPv6, ipv6Text } = await imp("build/services/udp/net-udp.js");
-const { UdpStream } = await imp("build/services/udp/stream.js");
+const { UdpStream, PATH_HEADER } = await imp("build/services/udp/stream.js");
 const { bindingRequest, isStun, mappedAddress } = await imp("build/services/udp/stun.js");
 const { nodeDatagrams } = await imp("build/services/udp/node.js");
 const { RTC_TAG } = await imp("build/services/net-rtc.js");
@@ -80,6 +80,11 @@ function writeInPieces(stream, bytes) {
     at += n;
   }
 }
+
+/** Write `n` as the stream's 48-bit big-endian packet and offset fields. */
+const put48 = (p, at, n) => {
+  for (let i = 5; i >= 0; i--, n = Math.floor(n / 256)) p[at + i] = n % 256;
+};
 
 console.log("\nUDP: the stream (§12.7)\n");
 
@@ -172,6 +177,57 @@ await test("acks name only what the sender still waits on, so a lossy stretch le
   assert(pair.ackToA === 9 + 9 + 12, `the last ack is one range, ${pair.ackToA} bytes`);
   assert(atB.length === 2 * CREDIT + 320 * 1024, "everything arrived");
   pair.a.close(); pair.b.close();
+});
+
+await test("an ack with overlapping ranges walks each packet once, not once per range", async () => {
+  const a = new UdpStream(() => {});
+  a.start(() => {}, 1);
+  for (let i = 0; i < 20; i++) a.send(new Uint8Array(1000));
+  const inFlight = a.inFlight.size;
+  assert(inFlight > 0, "the sender has packets in flight");
+  const ranges = 255, sent = a.nextPn - 1;
+  // ACK [type][token 8][credit 6][delay u16][count u8]([largest 6][smallest 6])*,
+  // every range covering every packet sent, as a peer trying to multiply the work would.
+  const p = new Uint8Array(PATH_HEADER + 9 + 12 * ranges);
+  p[0] = 0x61;
+  put48(p, PATH_HEADER, 1 << 20);
+  p[PATH_HEADER + 8] = ranges;
+  for (let i = 0; i < ranges; i++) {
+    put48(p, PATH_HEADER + 9 + 12 * i, sent);
+    put48(p, PATH_HEADER + 15 + 12 * i, 0);
+  }
+  const get = a.inFlight.get;
+  let gets = 0;
+  a.inFlight.get = function (pn) { gets++; return get.call(this, pn); };
+  try { a.receive(p); } finally { a.inFlight.get = get; }
+  assert(gets <= inFlight + 2, `walks ${gets} packet numbers for ${inFlight} in flight`);
+  a.close();
+});
+
+await test("draining a held queue of tiny datagrams is linear, not quadratic", async () => {
+  const b = new UdpStream(() => {});
+  let delivered = 0;
+  b.onData((bytes) => { delivered += bytes.length; });
+  b.setReadable(false);
+  const heldMax = 2 * CREDIT / 256;
+  // DATA [type][token 8][pn 6][offset 6][floor 6][1 byte], one byte at each offset.
+  const p = new Uint8Array(PATH_HEADER + 19);
+  p[0] = 0x64;
+  for (let i = 0; i < heldMax; i++) {
+    put48(p, PATH_HEADER, i);
+    put48(p, PATH_HEADER + 6, i);
+    p[PATH_HEADER + 18] = 1;
+    b.receive(p);
+  }
+  assert(b.held.slices === heldMax, `holds ${b.held.slices} datagrams`);
+  // The old queue called Array.prototype.shift once per piece, which is O(n) per piece.
+  const shift = Array.prototype.shift;
+  let shifts = 0;
+  Array.prototype.shift = function (...args) { shifts++; return shift.apply(this, args); };
+  try { b.setReadable(true); } finally { Array.prototype.shift = shift; }
+  assert(shifts < 4, `draining ${heldMax} datagrams shifted the queue ${shifts} times`);
+  assert(delivered === heldMax && b.held.slices === 0, "every held byte is handed over once");
+  b.close();
 });
 
 await test("chunks past a gap at overlapping offsets end the stream at two credits, not at memory", async () => {

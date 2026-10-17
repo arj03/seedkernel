@@ -144,7 +144,7 @@ class ReqRes {
     this.delivering = new Map();
     this.deliveringWeight = 0;
     // By peerId, for a peer reached only through relays: { bytes: the requests sent there
-    // and not yet answered, waiting: corrs held back, oldest first }.
+    // and not yet answered, waiting: corrs held back, oldest first, from index head }.
     this.relayed = new Map();
   }
 
@@ -196,7 +196,7 @@ class ReqRes {
     // has one frame's worth of requests unanswered at a time, the rest held here, unsealed,
     // for that direct link or for the answers that free room.
     let q = this.relayed.get(to);
-    if (!q) this.relayed.set(to, (q = { bytes: 0, waiting: [] }));
+    if (!q) this.relayed.set(to, (q = { bytes: 0, waiting: [], head: 0 }));
     p.held = frame;
     q.waiting.push(corr);
     this.pumpRelayed(to);
@@ -208,18 +208,21 @@ class ReqRes {
     const q = this.relayed.get(to);
     if (!q) return;
     const direct = !router.relayedOnly(to);
-    while (q.waiting.length > 0) {
-      const corr = q.waiting[0];
+    while (q.head < q.waiting.length) {
+      const corr = q.waiting[q.head];
       const p = this.pending.get(corr);
-      if (!p) { q.waiting.shift(); continue; }
+      if (!p) { q.head++; continue; }
       const frame = p.held;
       if (!direct && q.bytes > 0 && q.bytes + frame.length > maxFrameBytes) break;
-      q.waiting.shift();
+      q.head++;
       p.held = null;
       if (!direct) { p.relayedBytes = frame.length; q.bytes += frame.length; }
       this.put(corr, to, frame);
     }
-    if (q.waiting.length === 0 && (direct || q.bytes === 0)) this.relayed.delete(to);
+    // A head index: `shift()` would go quadratic draining a backlog. Compact once the
+    // consumed prefix outnumbers what waits.
+    if (q.head >= 8 && q.head * 2 >= q.waiting.length) { q.waiting.splice(0, q.head); q.head = 0; }
+    if (q.head === q.waiting.length && (direct || q.bytes === 0)) this.relayed.delete(to);
   }
 
   /** Hand a request frame to a link; one no link takes fails its request at once. */
