@@ -143,30 +143,23 @@ function candidateOf(text: string): Addr | null {
 /** `udp:offer` or `udp:answer`, optionally `?` and an RTCConfiguration as JSON, of which
  *  only the `stun:` servers are read. */
 function parseUdpDest(dest: string): { offer: boolean; stun: Addr[] } | null {
-  const q = dest.indexOf("?");
-  const role = q < 0 ? dest : dest.slice(0, q);
-  if (role !== "udp:offer" && role !== "udp:answer") return null;
-  let config: unknown = {};
-  if (q >= 0) {
-    try { config = JSON.parse(dest.slice(q + 1)); } catch { return null; }
-  }
-  if (typeof config !== "object" || config === null || Array.isArray(config)) return null;
+  const [, role, json] = /^udp:(offer|answer)(?:\?(.*))?$/s.exec(dest) ?? [];
+  if (!role) return null;
+  let servers: unknown;
+  try {
+    const config = json === undefined ? {} : JSON.parse(json);
+    if (config?.constructor !== Object) return null;
+    servers = config.iceServers;
+  } catch { return null; }
   const stun: Addr[] = [];
-  const servers = (config as { iceServers?: unknown }).iceServers;
   for (const s of Array.isArray(servers) ? servers : []) {
-    const urls = (s as { urls?: unknown } | null)?.urls;
-    for (const u of Array.isArray(urls) ? urls : [urls]) {
+    for (const u of [(s as { urls?: unknown } | null)?.urls].flat()) {
       const m = typeof u === "string" ? /^stun:([^:[\]?]+)(?::(\d{1,5}))?$/.exec(u) : null;
       if (m) stun.push({ host: m[1], port: m[2] ? Number(m[2]) : 3478 });
     }
   }
-  return { offer: role === "udp:offer", stun };
+  return { offer: role === "offer", stun };
 }
-
-const sameToken = (p: Uint8Array, token: Uint8Array) => {
-  for (let i = 0; i < TOKEN; i++) if (p[1 + i] !== token[i]) return false;
-  return true;
-};
 
 /** The negotiation link: its sockets, its candidates and the punch, and the stream that
  *  becomes the data link once a path is found. */
@@ -192,14 +185,14 @@ class UdpNegotiation implements RawLink {
   private pathHeard = 0;
   /** An address the peer's packets now come from, being probed before the path moves. */
   private moving: { addr: Addr; challenge: Uint8Array; sentAt: number; heard: number } | null = null;
+  /** The probe loop, and the rounds it has sent. */
   private probing: ReturnType<typeof setTimeout> | undefined;
-  private readonly asking: { txn: Uint8Array; answered: boolean; timer?: ReturnType<typeof setTimeout> }[] = [];
-  /** Each STUN server's answer, the address it saw. */
+  private rounds = 0;
+  /** The STUN servers not yet answered, and each one's answer, the address it saw. */
+  private readonly asking: { server: Addr; txn: Uint8Array }[] = [];
+  private asked: ReturnType<typeof setTimeout> | undefined;
   private readonly mapped: string[] = [];
-  /** Set once the plain punch has had `BIRTHDAY_AFTER_MS`. */
-  private birthdayTimer: ReturnType<typeof setTimeout> | undefined;
-  private birthdayDue = false;
-  private spraying: ReturnType<typeof setTimeout> | undefined;
+  private spraying = false;
   private sprayed = 0;
   private dead = false;
   readonly data: UdpStream;
@@ -226,7 +219,8 @@ class UdpNegotiation implements RawLink {
     this.listen(bound.socket);
     if (this.offer) this.describe();
     for (const a of p.addresses()) this.addOwn(endpoint(a, bound.port));
-    for (const s of stun) this.askStun(s);
+    for (const server of stun) this.asking.push({ server, txn: crypto.getRandomValues(new Uint8Array(12)) });
+    this.askStun(STUN_TRIES);
     this.probe();
   }
 
@@ -266,18 +260,11 @@ class UdpNegotiation implements RawLink {
     this.probe();
   }
 
-  private askStun(server: Addr): void {
-    const txn = crypto.getRandomValues(new Uint8Array(12));
-    const request = bindingRequest(txn);
-    const entry: { txn: Uint8Array; answered: boolean; timer?: ReturnType<typeof setTimeout> } = { txn, answered: false };
-    let tries = 0;
-    const ask = () => {
-      if (this.dead || tries++ >= STUN_TRIES) return;
-      this.socket?.send(request, server.port, server.host);
-      entry.timer = setTimeout(ask, STUN_RETRY_MS);
-    };
-    this.asking.push(entry);
-    ask();
+  /** Ask every STUN server not yet answered, `tries` more times, `STUN_RETRY_MS` apart. */
+  private askStun(tries: number): void {
+    if (this.dead || tries === 0 || this.asking.length === 0) return;
+    for (const a of this.asking) this.socket?.send(bindingRequest(a.txn), a.server.port, a.server.host);
+    this.asked = setTimeout(() => this.askStun(tries - 1), STUN_RETRY_MS);
   }
 
   /** A STUN server's answer: a candidate, and with two that differ, `host:*` for each
@@ -303,72 +290,63 @@ class UdpNegotiation implements RawLink {
     return p;
   }
 
-  /** Probe every candidate the peer has, until a path is found. */
+  /** Probe every candidate the peer has, a round each `PROBE_MS` until a path is found, and
+   *  once spraying, random ports at a hard peer's addresses too (the header). */
   private probe(): void {
     if (this.dead || this.path || this.probing || !this.peerToken || !this.socket || this.peerCandidates.length === 0) return;
-    const send = () => {
+    const round = () => {
       const p = this.probePacket();
       for (const c of this.peerCandidates) this.socket?.send(p, c.port, c.host);
-      this.probing = setTimeout(send, PROBE_MS);
+      if (this.spraying && this.sprayed < SPRAY_MAX) {
+        const ports = crypto.getRandomValues(new Uint16Array(SPRAY_EACH));
+        for (const host of this.peerHard) for (const r of ports) this.socket?.send(p, SPRAY_LOW + (r % SPRAY_PORTS), host);
+        this.sprayed += SPRAY_EACH * this.peerHard.length;
+      }
+      if (++this.rounds * PROBE_MS === BIRTHDAY_AFTER_MS) this.birthday();
+      this.probing = setTimeout(round, PROBE_MS);
     };
-    send();
-    this.birthdayTimer ??= setTimeout(() => { this.birthdayDue = true; this.birthday(); }, BIRTHDAY_AFTER_MS);
+    round();
   }
 
   /** Once the plain punch has had its time, a hard end facing an easy one opens its
    *  birthday sockets, and an easy end facing a hard one sprays (the header). Each waits
    *  for what it needs to know, and each happens once. */
   private birthday(): void {
-    if (!this.birthdayDue || this.dead || this.path || !this.peerToken) return;
+    if (this.rounds * PROBE_MS < BIRTHDAY_AFTER_MS || this.dead || this.path || !this.peerToken) return;
     if (this.hard() && this.peerHard.length === 0 && this.peerCandidates.length > 0 && this.extra === null) {
-      void this.openExtra();
+      this.extra = [];
+      for (let i = 0; i < BIRTHDAY_SOCKETS; i++) void this.platform!.bind().then(({ socket }) => this.addExtra(socket), () => {});
     }
-    if (this.easy() && this.peerHard.length > 0 && this.spraying === undefined) this.spray();
+    this.spraying ||= this.easy() && this.peerHard.length > 0;
   }
 
-  private async openExtra(): Promise<void> {
-    const platform = this.platform!;
-    this.extra = [];
-    const bound = await Promise.all(Array.from({ length: BIRTHDAY_SOCKETS }, () => platform.bind().catch(() => null)));
-    const sockets = bound.flatMap((b) => (b ? [b.socket] : []));
-    if (this.dead || this.path) { for (const s of sockets) s.close(); return; }
-    this.extra = sockets;
+  /** A birthday socket, bound: it probes the peer, and so opens a port toward it. */
+  private addExtra(socket: DatagramSocket): void {
+    if (this.dead || this.path) { socket.close(); return; }
+    this.extra!.push(socket);
+    this.listen(socket);
     const p = this.probePacket();
-    for (const s of sockets) {
-      this.listen(s);
-      for (const c of this.peerCandidates) s.send(p, c.port, c.host);
-    }
-  }
-
-  private spray(): void {
-    const send = () => {
-      if (this.dead || this.path || this.sprayed >= SPRAY_MAX) return;
-      const p = this.probePacket();
-      const ports = crypto.getRandomValues(new Uint16Array(SPRAY_EACH));
-      for (const host of this.peerHard) for (const r of ports) this.socket?.send(p, SPRAY_LOW + (r % SPRAY_PORTS), host);
-      this.sprayed += SPRAY_EACH * this.peerHard.length;
-      this.spraying = setTimeout(send, PROBE_MS);
-    };
-    send();
+    for (const c of this.peerCandidates) socket.send(p, c.port, c.host);
   }
 
   private onPacket(socket: DatagramSocket, p: Uint8Array, host: string, port: number): void {
     if (this.dead) return;
     if (isStun(p)) {
-      for (const a of this.asking) {
-        const mapped = a.answered ? null : mappedAddress(p, a.txn);
-        if (mapped) { a.answered = true; clearTimeout(a.timer); this.onMapped(mapped); }
+      for (let i = 0; i < this.asking.length; i++) {
+        const mapped = mappedAddress(p, this.asking[i].txn);
+        if (mapped) { this.asking.splice(i, 1); this.onMapped(mapped); return; }
       }
       return;
     }
-    if (p.length < PATH_HEADER || !sameToken(p, this.token)) return;
+    if (p.length < PATH_HEADER) return;
+    for (let i = 0; i < TOKEN; i++) if (p[1 + i] !== this.token[i]) return;
     if (p[0] === TYPE_PROBE) {
       if (p.length !== PROBE_BYTES) return;
-      const ack = new Uint8Array(PROBE_ACK_BYTES);
-      ack[0] = TYPE_PROBE_ACK;
-      ack.set(p.subarray(1 + TOKEN), 1);
-      socket.send(ack, port, host);
       this.peerToken ??= p.slice(1 + TOKEN, 1 + 2 * TOKEN);
+      // The ack is the probe from the sender's token on, its type written over the last
+      // byte of this end's token: the bytes are this end's to keep.
+      p[TOKEN] = TYPE_PROBE_ACK;
+      socket.send(p.subarray(TOKEN), port, host);
       this.addPeer({ host, port });
     } else if (p[0] === TYPE_PROBE_ACK) {
       if (p.length !== PROBE_ACK_BYTES) return;
@@ -418,10 +396,7 @@ class UdpNegotiation implements RawLink {
     if (this.path || !this.peerToken) return;
     this.path = { host, port };
     this.pathHeard = performance.now();
-    if (socket !== this.socket) this.socket?.close();
-    this.socket = socket;
-    for (const s of this.extra ?? []) if (s !== socket) s.close();
-    this.extra = [];
+    this.keepOnly(socket);
     this.stopPunching();
     const token = this.peerToken;
     this.data.start((p) => {
@@ -466,18 +441,20 @@ class UdpNegotiation implements RawLink {
     this.dead = true;
     this.stopPunching();
     this.data.end();
-    this.socket?.close();
-    this.socket = null;
-    for (const s of this.extra ?? []) s.close();
-    this.extra = [];
+    this.keepOnly(null);
     this.onGone(this);
+  }
+
+  /** Close every socket but `keep`, which is the path's from now on. */
+  private keepOnly(keep: DatagramSocket | null): void {
+    for (const s of [this.socket, ...this.extra ?? []]) if (s !== keep) s?.close();
+    this.socket = keep;
+    this.extra = [];
   }
 
   private stopPunching(): void {
     clearTimeout(this.probing);
-    clearTimeout(this.birthdayTimer);
-    clearTimeout(this.spraying);
-    for (const a of this.asking) clearTimeout(a.timer);
+    clearTimeout(this.asked);
   }
 
   /** The path ended, or never began: close both links and tell the driver about this one. */
