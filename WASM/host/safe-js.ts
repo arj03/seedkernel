@@ -349,12 +349,20 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   hostCallFn.dispose();
 
   // The preamble's two reports. The answer is copied out as bytes, so no guest handle
-  // outlives them.
+  // outlives them. The id is taken first, as native's takeCall: a guest can call these
+  // globals itself, and a made-up id must not buy a host copy.
   const callDoneFn = ctx.newFunction("__callDone", (idHandle, bytesHandle) => {
-    const answer = ctx.getArrayBuffer(bytesHandle);
+    const invocation = takeInvocation(ctx.getNumber(idHandle));
+    if (!invocation) return;
     let bytes: Uint8Array;
-    try { bytes = answer.value.slice(); } finally { answer.dispose(); }
-    takeInvocation(ctx.getNumber(idHandle))?.resolve(bytes);
+    try {
+      const answer = ctx.getArrayBuffer(bytesHandle);
+      try { bytes = answer.value.slice(); } finally { answer.dispose(); }
+    } catch (err) {
+      invocation.reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    invocation.resolve(bytes);
   });
   const callFailFn = ctx.newFunction("__callFail", (idHandle, messageHandle) => {
     takeInvocation(ctx.getNumber(idHandle))?.reject(new Error(ctx.getString(messageHandle)));

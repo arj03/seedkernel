@@ -331,6 +331,12 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(Date.now() - t1 >= 4000, "the default budget is the documented 5s, not something tighter");
   defaulted.dispose();
 
+  // A guest can call the preamble's reports itself: a made-up id settles nothing, and a
+  // non-buffer answer fails its own invocation instead of stranding it.
+  const fake = await createSafeRealm({ source: 'function handle() { __callDone(1e9, 0); return Uint8Array.of(7); }', hostCall: noop });
+  ok((await fake.call(new Uint8Array()))[0] === 7, "a fake __callDone id is ignored");
+  fake.dispose();
+
   // Fire-and-forget calls retain copied payloads and promise state in the host. Once the
   // per-realm count is reached, the next call fails before its payload crosses; settling
   // the retained calls returns the allowance to the realm.

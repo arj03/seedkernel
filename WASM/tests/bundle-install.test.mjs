@@ -1088,6 +1088,9 @@ async function testAppNameLengthRefused() {
     ["a 256-byte app name", mk("a".repeat(256))],
     // The limit counts UTF-8 bytes, the unit the scope uses.
     ["a 200-char (600-byte) UTF-8 app name", mk("\u{1f600}".repeat(200))],
+    // A lone surrogate encodes as U+FFFD and would share another label's scope.
+    ["an app name with a lone surrogate", mk("a\ud800")],
+    ["an app name with a newline", mk("chat\nserves evil")],
   ]) {
     let threw = false;
     try { verifyTestBundle(sodium, env); } catch { threw = true; }

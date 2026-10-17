@@ -425,8 +425,14 @@ func (g *guestRealm) pump() {
 	if _, err := g.within(func() (*qjs.Value, error) {
 		return nil, g.qc.Pump()
 	}); err != nil {
-		// Jobs may remain, and the queued rejection needs another round.
-		g.loop.wake()
+		// Jobs may remain, and the queued rejection needs another round, but only while
+		// time is left: a spent budget interrupts every round at once, so waking would spin
+		// the loop on a self-requeueing job. The next entry pumps under its own deadline.
+		spent := (g.invocationBudget > 0 && g.consumed >= g.invocationBudget) ||
+			(!g.invocationDeadline.IsZero() && !time.Now().Before(g.invocationDeadline))
+		if !spent {
+			g.loop.wake()
+		}
 		return
 	}
 	g.jobsPending = false

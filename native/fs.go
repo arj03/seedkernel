@@ -20,6 +20,10 @@ func fsKeySafe(k string) bool {
 // fsTmpPrefix marks put()'s temp files; '~' is outside the key charset.
 const fsTmpPrefix = "~put-"
 
+// fsMaxValueBytes is DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES (host/wasm-limits.ts): no
+// fs/put can carry more.
+const fsMaxValueBytes = 16 << 20
+
 // nodeFs runs on the loop goroutine. `used` is the total size of its files, seeded at
 // open and kept by put/delete.
 type nodeFs struct {
@@ -76,6 +80,11 @@ func (f *nodeFs) path(key string) (string, bool) {
 func (f *nodeFs) get(key string) []byte {
 	p, ok := f.path(key)
 	if !ok {
+		return nil
+	}
+	// A value above what a guest could have put (the host-call byte allowance) is refused
+	// before it is read, so a file planted in the store cannot become a host allocation.
+	if fi, err := os.Stat(p); err != nil || fi.Size() > fsMaxValueBytes {
 		return nil
 	}
 	b, err := os.ReadFile(p)

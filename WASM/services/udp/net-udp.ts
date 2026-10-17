@@ -105,7 +105,8 @@ const BIRTHDAY_AFTER_MS = 1000;
 const BIRTHDAY_SOCKETS = 256;
 /** The sockets all a node's birthday punches at once may hold, since each punch wants
  *  `BIRTHDAY_SOCKETS` and the transport may run many negotiations: without a shared ceiling
- *  a peer (or a relay forcing `host:*`) could make a node open tens of thousands at once. */
+ *  a peer (or a relay forcing `host:*`) could make a node open tens of thousands at once.
+ *  A spray holds the same share, which bounds the node's concurrent sprays too. */
 const MAX_NODE_BIRTHDAY_SOCKETS = 1024;
 /** The easy end's random probes: how many each `PROBE_MS` to each of the peer's `host:*`,
  *  and how many in all, since the peer names those addresses. With 256 ports open among
@@ -346,7 +347,17 @@ class UdpNegotiation implements RawLink {
       this.reservedExtra = this.takeSockets(BIRTHDAY_SOCKETS);
       for (let i = 0; i < this.reservedExtra; i++) void this.platform!.bind().then(({ socket }) => this.addExtra(socket), () => {});
     }
-    this.spraying ||= this.easy() && this.peerHard.length > 0;
+    // A spray holds a birthday's share of the node budget, so a peer cannot aim many
+    // negotiations' probes at once; one refused goes on with the plain punch.
+    if (!this.spraying && this.easy() && this.peerHard.length > 0) {
+      const got = this.takeSockets(BIRTHDAY_SOCKETS);
+      if (got === BIRTHDAY_SOCKETS) {
+        this.reservedExtra = got;
+        this.spraying = true;
+      } else {
+        this.freeSockets(got);
+      }
+    }
   }
 
   /** A birthday socket, bound: it probes the peer, and so opens a port toward it. */

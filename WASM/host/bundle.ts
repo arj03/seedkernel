@@ -185,13 +185,19 @@ export function isJsonObject(value: unknown): value is JsonObject {
   return isJsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Control, line-separator, bidi and zero-width characters. */
+const UNSAFE_LABEL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+
 /** Shape check on a verified manifest, so an author's mistake is rejected up front
- *  instead of surfacing as a TypeError deep in install. Not a security boundary. */
+ *  instead of surfacing as a TypeError deep in install. */
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
   const o = m as Record<string, unknown>;
-  // appSignScope encodes the name in one length byte.
+  // appSignScope encodes the name in one length byte. A lone surrogate would encode as
+  // U+FFFD and share another label's scope; a control or bidi character could forge the
+  // operator's console line.
   if (typeof o.app !== "string" || o.app.length === 0) return false;
+  if (dec.decode(enc.encode(o.app)) !== o.app || UNSAFE_LABEL.test(o.app)) return false;
   if (enc.encode(o.app).length > 255) return false;
   if (typeof o.version !== "number" || !Number.isSafeInteger(o.version) || o.version < 0) return false;
   // Uniqueness is per list (§12.10); the same name in both is reachable either way.
