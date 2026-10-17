@@ -1,7 +1,7 @@
 // STUN Binding (RFC 8489), the one request a UDP path makes of a server: what address the
 // internet sees this socket at. The request carries no attributes and only
 // XOR-MAPPED-ADDRESS is read from the answer, which is all a server must send, and all
-// seedrelay's `--stun` does. IPv4 only, as the path's sockets are.
+// seedrelay's `--stun` does. IPv4 only, since the servers are asked over IPv4 (net-udp.ts).
 
 const COOKIE = 0x2112a442;
 const BINDING_REQUEST = 0x0001, BINDING_SUCCESS = 0x0101, XOR_MAPPED_ADDRESS = 0x0020;

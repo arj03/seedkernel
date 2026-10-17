@@ -231,12 +231,14 @@ globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(po
 
 /** Go's datagram primitive (native/udp.go), for the UDP path (§12.7). */
 declare const __udp: {
-  /** An IPv4 socket on a port the OS picks; a failure throws the OS's reason. */
+  /** A socket on a port the OS picks, dual-stack where the machine has IPv6; a failure
+   *  throws the OS's reason. */
   bind(): { id: number; port: number };
   /** One datagram; a failure is a lost one. A name rather than an address resolves in Go. */
   send(id: number, host: string, port: number, bytes: Uint8Array): void;
   close(id: number): void;
-  /** This machine's IPv4 addresses, newline-separated: the outward ones, or loopback. */
+  /** This machine's addresses, newline-separated: the outward IPv4 ones, or loopback, then
+   *  IPv6 but for loopback and link-local. */
   addresses(): string;
 };
 

@@ -8,7 +8,9 @@
 //   round-trip sample is never ambiguous.
 // - The stream is cut into chunks at their first send, and a lost chunk is resent whole at
 //   its offset, so the receiver reassembles by offset alone.
-// - An ack carries ranges of packet numbers. A packet is lost once one sent three later is
+// - An ack carries ranges of packet numbers, of those the sender still waits on: every
+//   DATA packet names the oldest, and the receiver forgets the ranges below it, so a lost
+//   packet is not named in every ack after. A packet is lost once one sent three later is
 //   acked, or once it is 9/8 of a round trip older than one that was. A probe timeout finds
 //   a lost tail, which has no later packet to give it away.
 // - NewReno congestion control, run as `FLOWS` flows at once: slow start, the window cut
@@ -16,7 +18,8 @@
 //   only while it is what holds the sender back. Losses through `PERSISTENT_PTOS` probe
 //   timeouts, with nothing acked between, start the window over at two packets.
 // - Every ack says how far the receiver will take the stream, so a reader the driver holds
-//   back (`setReadable`) stops the sender.
+//   back (`setReadable`) stops the sender. Nothing acks an ack, so the one that lets a
+//   sender that has used all it was given go on is sent three times.
 // - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
 //   from not at all for `DEAD_MS`, ends the path: the peer is gone.
 // - A path starts at QUIC's 1200-byte packets and probes for `MAX_PACKET` (RFC 8899): a
@@ -25,7 +28,7 @@
 //   cheaper. A chunk cut larger than the path now carries is split when it is resent.
 //
 // A packet is the path's header, `[type u8][receiver's token 8]`, then:
-//   DATA   [pn 6][offset 6][bytes]
+//   DATA   [pn 6][offset 6][floor 6][bytes]   no packet below floor is waited on
 //   ACK    [credit 6][delay u16 ms][count u8]([largest 6][smallest 6])*   newest range first
 //   PROBE  [pn 6], padded to `MAX_PACKET`
 //   CLOSE  nothing
@@ -36,7 +39,7 @@ const TYPE_DATA = 0x64, TYPE_ACK = 0x61, TYPE_PROBE = 0x6d, TYPE_CLOSE = 0x78;
 /** The path's header in front of every packet. */
 export const PATH_HEADER = 9;
 /** A DATA packet's bytes ahead of its chunk. */
-const DATA_HEADER = PATH_HEADER + 12;
+const DATA_HEADER = PATH_HEADER + 18;
 /** The size a path starts at: QUIC's floor, which every path is taken to carry. */
 const BASE_PACKET = 1200;
 /** The size a probe asks a path to carry: Ethernet's 1500 bytes less IPv6's and UDP's
@@ -96,6 +99,12 @@ const get48 = (p: Uint8Array, at: number) =>
   ((p[at] << 8) | p[at + 1]) * 2 ** 32 + p[at + 2] * 2 ** 24 + ((p[at + 3] << 16) | (p[at + 4] << 8) | p[at + 5]);
 /** Where a packet's body starts. */
 const B = PATH_HEADER;
+
+/** Whether an ACK's `count` ranges name packet `pn`. */
+function names(p: Uint8Array, count: number, pn: number): boolean {
+  for (let i = 0; i < count; i++) if (pn <= get48(p, B + 9 + 12 * i) && pn >= get48(p, B + 15 + 12 * i)) return true;
+  return false;
+}
 
 /** The first `n` bytes of `parts`, removed from it. */
 function take(parts: Uint8Array[], n: number): Uint8Array {
@@ -244,7 +253,7 @@ export class UdpStream implements RawLink {
     if (this.gone) return;
     this.lastHeard = performance.now();
     const body = p.length - B;
-    if (p[0] === TYPE_DATA && body > 12) this.onChunk(get48(p, B), get48(p, B + 6), p.subarray(B + 12));
+    if (p[0] === TYPE_DATA && body > 18) this.onChunk(get48(p, B), get48(p, B + 6), get48(p, B + 12), p.subarray(B + 18));
     else if (p[0] === TYPE_ACK && body >= 9 && body >= 9 + 12 * p[B + 8]) this.onAck(p);
     else if (p[0] === TYPE_PROBE && body >= 6) this.received(get48(p, B));
     else if (p[0] === TYPE_CLOSE) this.fail();
@@ -289,10 +298,13 @@ export class UdpStream implements RawLink {
 
   // ── receiving ──
 
-  private onChunk(pn: number, offset: number, bytes: Uint8Array): void {
+  private onChunk(pn: number, offset: number, floor: number, bytes: Uint8Array): void {
     // Past the credit this end gave: not taken and not acked, so it comes again.
     if (offset + bytes.length > this.taken + CREDIT) return;
     this.received(pn);
+    // The sender waits on nothing below `floor`, which is never past `pn`.
+    const r = this.ranges;
+    while (r.length > 1 && r[r.length - 1][0] < floor) r.pop();
     this.furthest = Math.max(this.furthest, offset + bytes.length);
     let end = this.taken + this.heldBytes;
     if (offset === end) {
@@ -369,12 +381,17 @@ export class UdpStream implements RawLink {
     this.unacked = 0;
     const r = this.ranges;
     const p = packet(TYPE_ACK, 9 + 12 * r.length);
-    this.advertised = this.taken + CREDIT;
-    put48(p, B, this.advertised);
+    const credit = this.taken + CREDIT;
+    // More credit for a sender that has used all it had, which may have nothing in flight to
+    // draw another ack: one lost would leave it waiting for the keepalive, so it goes three
+    // times, as a close does.
+    const copies = credit > this.advertised && this.furthest >= this.advertised ? 3 : 1;
+    this.advertised = credit;
+    put48(p, B, credit);
     const delay = Math.min(0xffff, Math.round(performance.now() - this.largestAt));
     p[B + 6] = delay >>> 8; p[B + 7] = delay; p[B + 8] = r.length;
     r.forEach(([hi, lo], i) => { put48(p, B + 9 + 12 * i, hi); put48(p, B + 15 + 12 * i, lo); });
-    this.emit(p);
+    for (let i = 0; i < copies; i++) this.emit(p);
   }
 
   // ── sending ──
@@ -404,12 +421,7 @@ export class UdpStream implements RawLink {
         }
       }
       if (this.probes.length > 0) this.probeAcked(p, count);
-      if (this.suspects.size > 0) {
-        for (let i = 0; i < count; i++) {
-          const hi = get48(p, B + 9 + 12 * i), lo = get48(p, B + 15 + 12 * i);
-          for (const pn of this.suspects) if (pn >= lo && pn <= hi) this.suspects.delete(pn);
-        }
-      }
+      if (this.suspects.size > 0) for (const pn of this.suspects) if (names(p, count, pn)) this.suspects.delete(pn);
       if (this.undo && this.suspects.size === 0) {
         this.window = Math.max(this.window, this.undo.window);
         this.threshold = this.undo.threshold;
@@ -569,10 +581,13 @@ export class UdpStream implements RawLink {
 
   private sendChunk(offset: number, chunk: Uint8Array): void {
     const pn = this.nextPn++;
-    const p = packet(TYPE_DATA, 12 + chunk.length);
+    const p = packet(TYPE_DATA, 18 + chunk.length);
     put48(p, B, pn);
     put48(p, B + 6, offset);
-    p.set(chunk, B + 12);
+    // What the peer's acks must still name: a packet in flight, and a probe not answered. A
+    // suspect arriving late is out of order, so it is acked at once, below the floor or not.
+    put48(p, B + 12, Math.min(this.oldestPn, this.probes[0] ?? Infinity));
+    p.set(chunk, B + 18);
     const now = performance.now();
     this.inFlight.set(pn, { offset, size: p.length, time: now });
     this.bytesInFlight += p.length;
@@ -643,15 +658,11 @@ export class UdpStream implements RawLink {
 
   /** Whether an ack names a probe: then the path carries `MAX_PACKET`. */
   private probeAcked(p: Uint8Array, count: number): void {
-    for (let i = 0; i < count; i++) {
-      const hi = get48(p, B + 9 + 12 * i), lo = get48(p, B + 15 + 12 * i);
-      if (!this.probes.some((pn) => pn >= lo && pn <= hi)) continue;
-      clearTimeout(this.probeTimer);
-      this.probeTimer = undefined;
-      this.probes = [];
-      this.packetBytes = MAX_PACKET;
-      return;
-    }
+    if (!this.probes.some((pn) => names(p, count, pn))) return;
+    clearTimeout(this.probeTimer);
+    this.probeTimer = undefined;
+    this.probes = [];
+    this.packetBytes = MAX_PACKET;
   }
 
   private emit(p: Uint8Array): void {

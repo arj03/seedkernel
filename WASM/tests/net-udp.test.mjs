@@ -31,20 +31,23 @@ const CREDIT = 1 << 20;
 
 /** Two streams joined by a path that drops `loss` of the packets, sends `dup` of them
  *  twice, and holds `late` of them back 5 ms, behind packets sent after them. `cut()` drops
- *  everything from then on, and a packet larger than `mtu`, which can change, is dropped.
- *  While `held` is an array, what b sends a waits in it, as the acks of a peer whose loop is
- *  held do, and `release()` hands it all to a at once. `largest` is the largest DATA packet
- *  sent from a to b since it was last set to 0, and `toB` counts them. */
+ *  everything from then on, and a packet larger than `mtu` is dropped; both it and `loss`
+ *  can change. The next `dropToA` packets b sends a are dropped. While `held` is an array,
+ *  what b sends a waits in it, as the acks of a peer whose loop is held do, and `release()`
+ *  hands it all to a at once. `largest` is the largest DATA packet sent from a to b since it
+ *  was last set to 0, `toB` counts them, and `ackToA` is the size of the last ACK b sent a. */
 function streamPair({ loss = 0, dup = 0, late = 0, mtu = Infinity } = {}) {
   const a = new UdpStream(() => {}), b = new UdpStream(() => {});
   const pair = {
-    a, b, dead: false, mtu, largest: 0, toB: 0, held: null,
+    a, b, dead: false, loss, mtu, largest: 0, toB: 0, dropToA: 0, ackToA: 0, held: null,
     cut: () => { pair.dead = true; },
     release: () => { const held = pair.held ?? []; pair.held = null; for (const p of held) a.receive(p); },
   };
   const wire = (to) => (p) => {
     if (to === b && p[0] === 0x64) { pair.largest = Math.max(pair.largest, p.length); pair.toB++; }
-    const copies = pair.dead || p.length > pair.mtu || Math.random() < loss ? 0 : Math.random() < dup ? 2 : 1;
+    if (to === a && p[0] === 0x61) pair.ackToA = p.length;
+    if (to === a && pair.dropToA > 0) { pair.dropToA--; return; }
+    const copies = pair.dead || p.length > pair.mtu || Math.random() < pair.loss ? 0 : Math.random() < dup ? 2 : 1;
     for (let i = 0; i < copies; i++) {
       const bytes = p.slice();
       if (to === a && pair.held) pair.held.push(bytes);
@@ -103,6 +106,38 @@ await test("a reader held back stops the sender at its credit, and lets it go ag
   assert(atB.bytes().equals(data), "and in order");
   assert(atB.largest === 256 * 1024, `what was held is handed over in large reads, the largest ${atB.largest}`);
   a.close(); b.close();
+});
+
+await test("a sender held at its credit goes on at once, though the ack that lets it go is lost", async () => {
+  const pair = streamPair();
+  const atB = reader(pair.b);
+  pair.b.setReadable(false);
+  const data = randomBytes(2 * CREDIT);
+  writeInPieces(pair.a, data);
+  await settle(300);
+  pair.dropToA = 1;
+  const t0 = performance.now();
+  pair.b.setReadable(true);
+  await until(() => atB.length === data.length, 5000, "the rest, without waiting for a keepalive");
+  const ms = performance.now() - t0;
+  assert(ms < 1000 && atB.bytes().equals(data), `it arrives in order in ${ms.toFixed(0)} ms`);
+  pair.a.close(); pair.b.close();
+});
+
+await test("acks name only what the sender still waits on, so a lossy stretch leaves them one range", async () => {
+  const pair = streamPair({ loss: 0.05 });
+  const atB = reader(pair.b);
+  writeInPieces(pair.a, randomBytes(2 * CREDIT));
+  await until(() => pair.a.buffered() === 0, 20_000, "the lossy stretch to be acked");
+  pair.loss = 0;
+  for (const n of [256 * 1024, 64 * 1024]) {
+    writeInPieces(pair.a, randomBytes(n));
+    await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
+    await settle(200);
+  }
+  assert(pair.ackToA === 9 + 9 + 12, `the last ack is one range, ${pair.ackToA} bytes`);
+  assert(atB.length === 2 * CREDIT + 320 * 1024, "everything arrived");
+  pair.a.close(); pair.b.close();
 });
 
 await test("data the peer stops answering ends the stream well inside the silent path's 30 s", async () => {
