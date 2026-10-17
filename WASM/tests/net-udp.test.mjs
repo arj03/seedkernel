@@ -15,7 +15,7 @@ import {
 } from "./transport-harness.mjs";
 
 const imp = importBuilt(join(dirname(fileURLToPath(import.meta.url)), ".."));
-const { UdpNetwork } = await imp("build/services/udp/net-udp.js");
+const { UdpNetwork, isIPv6, ipv6Text } = await imp("build/services/udp/net-udp.js");
 const { UdpStream } = await imp("build/services/udp/stream.js");
 const { bindingRequest, isStun, mappedAddress } = await imp("build/services/udp/stun.js");
 const { nodeDatagrams } = await imp("build/services/udp/node.js");
@@ -408,35 +408,48 @@ await test("the address a STUN server sees is a candidate, and a path can be fou
  *  random public port of the 64,512 above 1023 (endpoint-dependent), as Linux's
  *  `masquerade random` does. Both let in only an address and port a socket has sent to.
  *  Each NAT is a platform, whose machine's own address the world cannot reach, and which
- *  counts the sockets bound and the datagrams sent. */
+ *  counts the sockets bound and the datagrams sent. With `v6`, the machine also has an IPv6
+ *  address, `ip6`, routed end to end with no NAT, behind a firewall that lets in only an
+ *  address and port a socket has sent to, as a home router's IPv6 is. */
 function natWorld() {
   const STUN_IP = "198.51.100.1", STUN_PORTS = [3478, 3479];
-  const nats = new Map();
+  const nats = new Map(), hosts6 = new Map();
   const deliver = (fromIp, fromPort, toIp, toPort, bytes) => setImmediate(() => {
     if (toIp === STUN_IP && STUN_PORTS.includes(toPort)) deliver(STUN_IP, toPort, fromIp, fromPort, stunAnswer(bytes, fromIp, fromPort));
-    else nats.get(toIp)?.(fromIp, fromPort, toPort, bytes);
+    else (toIp.includes(":") ? hosts6 : nats).get(toIp)?.(fromIp, fromPort, toPort, bytes);
   });
   return {
     config: `?${JSON.stringify({ iceServers: STUN_PORTS.map((p) => ({ urls: `stun:${STUN_IP}:${p}` })) })}`,
-    nat(kind) {
-      const ip = `203.0.113.${nats.size + 1}`;
-      const byPublic = new Map(), byKey = new Map();
+    nat(kind, { v6 = false } = {}) {
+      const n = nats.size + 1;
+      const ip = `203.0.113.${n}`, ip6 = v6 ? `2001:db8::${n}` : null;
+      const byPublic = new Map(), byKey = new Map(), byOwn = new Map();
       let nextPort = 40000;
       nats.set(ip, (fromIp, fromPort, port, bytes) => {
         const m = byPublic.get(port);
         if (m && m.allowed.has(`${fromIp}:${fromPort}`) && !m.socket.closed) m.socket.handler?.(new Uint8Array(bytes), fromIp, fromPort);
       });
+      if (ip6) hosts6.set(ip6, (fromIp, fromPort, port, bytes) => {
+        const socket = byOwn.get(port);
+        if (socket && socket.allowed6.has(`${fromIp}|${fromPort}`) && !socket.closed) socket.handler?.(new Uint8Array(bytes), fromIp, fromPort);
+      });
       const platform = {
-        ip, bound: 0, sent: 0,
-        addresses: () => [`10.0.0.${nats.size}`],
+        ip, ip6, bound: 0, sent: 0,
+        addresses: () => [`10.0.0.${n}`, ...(ip6 ? [ip6] : [])],
         async bind() {
           platform.bound++;
           const own = nextPort++;
           const socket = {
-            closed: false, handler: null,
+            closed: false, handler: null, allowed6: new Set(),
             send(bytes, port, host) {
               if (socket.closed) return;
               platform.sent++;
+              if (host.includes(":")) {
+                if (!ip6) return;
+                socket.allowed6.add(`${host}|${port}`);
+                deliver(ip6, own, host, port, Uint8Array.from(bytes));
+                return;
+              }
               const key = kind === "strict" ? `${own}>${host}:${port}` : own;
               let pub = byKey.get(key);
               if (pub === undefined) {
@@ -451,6 +464,7 @@ function natWorld() {
             onMessage(cb) { socket.handler = cb; },
             close() { socket.closed = true; },
           };
+          byOwn.set(own, socket);
           return { port: own, socket };
         },
       };
@@ -496,6 +510,79 @@ await test("two ends that both give each destination their own port stay apart, 
   assert(one.bound === 1 && two.bound === 1, "no birthday sockets");
   // The plain punch: a probe each 50 ms to each of a handful of candidates, and no spray.
   assert(one.sent < 300 && two.sent < 300, `no random ports probed, sent ${one.sent} and ${two.sent}`);
+  A.net.close(); B.net.close();
+});
+
+await test("two ends behind strict NATs meet over IPv6, through firewalls that let only replies in", async () => {
+  const world = natWorld();
+  const one = world.nat("strict", { v6: true }), two = world.nat("strict", { v6: true });
+  const A = await seam({ datagrams: one }), B = await seam({ datagrams: two });
+  const { offer, answer, a, b } = await negotiate(A, B, world.config);
+  assert(offer.up.some(([tag, text]) => tag === RTC_TAG.CANDIDATE && text === `[${one.ip6}]:40000`) &&
+    answer.up.some(([tag, text]) => tag === RTC_TAG.CANDIDATE && text === `[${two.ip6}]:40000`),
+    "each end names its IPv6 address, in brackets");
+  assert(one.bound === 1 && two.bound === 1, "no birthday sockets: both ends are hard over IPv4");
+  const atA = reader(a), atB = reader(b);
+  const there = randomBytes(50_000), back = randomBytes(5000);
+  a.send(there);
+  b.send(back);
+  await until(() => atB.length === there.length && atA.length === back.length, 5000, "the bytes");
+  assert(atB.bytes().equals(there) && atA.bytes().equals(back), "intact");
+  A.net.close(); B.net.close();
+});
+
+await test("an IPv6 address is written as RFC 5952 writes it, and read back from a candidate only in that shape", async () => {
+  const bytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
+  for (const [hex, text] of [
+    ["00000000000000000000000000000000", "::"],
+    ["00000000000000000000000000000001", "::1"],
+    ["20010db8000000000000000000000001", "2001:db8::1"],
+    ["20010db8000000010000000000000001", "2001:db8:0:1::1"],
+    ["20010db8000000000001000000000001", "2001:db8::1:0:0:1"],
+    ["20010db8000000010001000100010001", "2001:db8:0:1:1:1:1:1"],
+    ["fe800000000000000000000000000000", "fe80::"],
+  ]) assert(ipv6Text(bytes(hex)) === text, `${hex} is ${text}, got ${ipv6Text(bytes(hex))}`);
+  // Against the WHATWG URL serializer, which writes RFC 5952's form, over addresses heavy
+  // in zero groups, where the rules bite.
+  for (let i = 0; i < 500; i++) {
+    const b = new Uint8Array(16);
+    for (let g = 0; g < 8; g++) if (Math.random() < 0.4) { b[2 * g] = Math.random() * 256; b[2 * g + 1] = Math.random() * 256; }
+    const want = new URL(`http://[${Buffer.from(b).toString("hex").match(/..../g).join(":")}]/`).hostname.slice(1, -1);
+    assert(ipv6Text(b) === want && isIPv6(want), `${want}, got ${ipv6Text(b)}`);
+  }
+  // The seam probes a well-formed IPv6 candidate, and refuses any other.
+  const sentTo = new Set();
+  const recording = { addresses: () => ["127.0.0.1"], async bind() {
+    return { port: 1, socket: { send: (_b, port, host) => sentTo.add(`${host} ${port}`), onMessage() {}, close() {} } };
+  } };
+  const { net, open } = await seam({ datagrams: recording });
+  const answer = open("udp:answer");
+  await settle(10);
+  answer.link.send(msg(RTC_TAG.OFFER, "00".repeat(8)));
+  answer.link.send(msg(RTC_TAG.CANDIDATE, "[2001:db8::7]:9"));
+  for (const bad of ["[2001:db8::7]", "2001:db8::7:9", "[2001:DB8::7]:9", "[fe80::1%eth0]:9", "[1:2:3:4:5:6:7:8:9]:9",
+    "[::ffff:1.2.3.4]:9", "[1::2::3]:9", "[12345::]:9", "[::1]:0", "[::1]:65536"]) {
+    let threw = false;
+    try { answer.link.send(msg(RTC_TAG.CANDIDATE, bad)); } catch { threw = true; }
+    assert(threw, `${bad} is refused`);
+  }
+  await settle(80);
+  assert(sentTo.has("2001:db8::7 9") && sentTo.size === 1, `probes go to the IPv6 candidate alone, went to ${[...sentTo]}`);
+  net.close();
+});
+
+await test("two seams punch a path over IPv6 on this machine", async () => {
+  const sixOnly = { bind: nodeDatagrams.bind, addresses: () => ["::1"] };
+  const A = await seam({ datagrams: sixOnly }), B = await seam({ datagrams: sixOnly });
+  const { offer, answer, a, b } = await negotiate(A, B);
+  const candidates = [...offer.up, ...answer.up].filter(([tag]) => tag === RTC_TAG.CANDIDATE).map(([, t]) => t);
+  assert(candidates.length === 2 && candidates.every((c) => /^\[::1\]:\d+$/.test(c)), `[::1] candidates, got ${candidates}`);
+  const atA = reader(a), atB = reader(b);
+  const there = randomBytes(300_000), back = randomBytes(5000);
+  a.send(there);
+  b.send(back);
+  await until(() => atB.length === there.length && atA.length === back.length, 5000, "the bytes");
+  assert(atB.bytes().equals(there) && atA.bytes().equals(back), "intact");
   A.net.close(); B.net.close();
 });
 

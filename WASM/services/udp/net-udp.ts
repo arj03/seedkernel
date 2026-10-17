@@ -4,15 +4,21 @@
 // transport signals both the same way. What differs is what the messages hold:
 //
 //   description  this end's token, 8 random bytes in hex, which every packet to it carries
-//   candidate    an IPv4 `host:port` this end's socket may be reached at: its own
-//                addresses, then what each STUN server in the configuration sees; or
-//                `host:*`, this end's NAT gives each destination its own port (below)
+//   candidate    an IPv4 `host:port` or IPv6 `[host]:port` this end's socket may be
+//                reached at: its own addresses, then what each STUN server in the
+//                configuration sees; or `host:*`, this end's NAT gives each destination its
+//                own port (below)
 //
 // Punching is ICE's idea without its machinery. Once an end has the peer's token and a
 // candidate it probes every candidate until one answers, and the first answer is its path.
 // A probe leaving through a NAT opens it for the peer's probes back, so two ends whose
 // NATs keep one public port per socket meet. Nothing here is trusted beyond the token:
 // the transport runs its handshake over the data link, as over any other.
+//
+// A socket is dual-stack where the machine has IPv6. An IPv6 address is mostly routed end
+// to end, behind a firewall that lets replies in, which the same probes open as they open
+// a NAT that keeps one port, so two ends with IPv6 meet whatever NATs their IPv4 is
+// behind. The STUN servers are asked over IPv4: an IPv6 address needs no one to name it.
 //
 // A NAT that gives each destination its own random port (endpoint-dependent mapping, a
 // symmetric NAT) is hard: its STUN address is good for the STUN server alone. Two STUN
@@ -43,8 +49,10 @@ import { dec, enc, fromHex, toHex } from "../util.js";
 import { bindingRequest, isStun, mappedAddress } from "./stun.js";
 import { PATH_HEADER, UdpStream } from "./stream.js";
 
-/** One UDP socket. A send that fails (an unresolved name, a full buffer) is a lost
- *  datagram, and `close` lets what is being sent go first. */
+/** One UDP socket. A host is an IPv4 address dotted, an IPv6 one as `ipv6Text` writes it,
+ *  or a name, which resolves to IPv4. A send that fails (an unresolved name, a full buffer,
+ *  IPv6 on a machine without it) is a lost datagram, and `close` lets what is being sent
+ *  go first. */
 export interface DatagramSocket {
   send(bytes: Uint8Array, port: number, host: string): void;
   /** Each datagram's bytes are the receiver's to keep: the platform does not reuse them. */
@@ -54,9 +62,11 @@ export interface DatagramSocket {
 
 /** What a platform gives the seam: sockets, and its own addresses. */
 export interface DatagramPlatform {
-  /** An IPv4 socket on a port the OS picks, and that port. */
+  /** A socket on a port the OS picks, and that port: dual-stack where the machine has
+   *  IPv6, IPv4 otherwise. */
   bind(): Promise<{ socket: DatagramSocket; port: number }>;
-  /** This machine's IPv4 addresses, its host candidates. */
+  /** This machine's addresses its sockets are reached at, its host candidates: IPv4, and
+   *  IPv6 but for link-local, which needs a zone no candidate carries. */
   addresses(): string[];
 }
 
@@ -89,16 +99,45 @@ const SPRAY_EACH = 64, SPRAY_MAX = 4096;
 /** The ports a NAT maps to: those above the privileged ones. */
 const SPRAY_LOW = 1024, SPRAY_PORTS = 65536 - SPRAY_LOW;
 const DESCRIPTION = /^[0-9a-f]{16}$/;
-const CANDIDATE = /^((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}):(\d{1,5}|\*)$/;
+const CANDIDATE = /^(?:((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})|\[([0-9a-f:]{2,39})\]):(\d{1,5}|\*)$/;
 
 /** An address, where port 0 is `host:*`: any port of a hard NAT. */
 interface Addr { host: string; port: number }
 
+/** Whether `text` is an IPv6 address in lowercase hex: eight groups, or fewer around one
+ *  `::`, with no zone and no IPv4 tail. */
+export function isIPv6(text: string): boolean {
+  const halves = text.split("::");
+  if (halves.length > 2) return false;
+  const groups = halves.flatMap((h) => (h === "" ? [] : h.split(":")));
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return false;
+  return halves.length === 2 ? groups.length <= 7 : groups.length === 8;
+}
+
+/** The 16 bytes of an IPv6 address at `at`, as RFC 5952 writes them: lowercase, no leading
+ *  zeros, and the longest run of two or more zero groups, the first of equals, as `::`. */
+export function ipv6Text(b: Uint8Array, at = 0): string {
+  const g: string[] = [];
+  let run = -1, runLen = 1;
+  for (let i = 0, zeros = 0; i < 8; i++) {
+    const v = (b[at + 2 * i] << 8) | b[at + 2 * i + 1];
+    g.push(v.toString(16));
+    zeros = v === 0 ? zeros + 1 : 0;
+    if (zeros > runLen) { run = i - zeros + 1; runLen = zeros; }
+  }
+  return run < 0 ? g.join(":") : `${g.slice(0, run).join(":")}::${g.slice(run + runLen).join(":")}`;
+}
+
+/** `host:port`, with an IPv6 host in brackets. */
+const endpoint = (host: string, port: number) => (host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`);
+
 function candidateOf(text: string): Addr | null {
   const m = CANDIDATE.exec(text);
-  if (m && m[2] === "*") return { host: m[1], port: 0 };
-  const port = m ? Number(m[2]) : 0;
-  return m && port > 0 && port < 65536 ? { host: m[1], port } : null;
+  if (!m || (m[2] !== undefined && !isIPv6(m[2]))) return null;
+  const host = m[1] ?? m[2];
+  if (m[3] === "*") return { host, port: 0 };
+  const port = Number(m[3]);
+  return port > 0 && port < 65536 ? { host, port } : null;
 }
 
 /** `udp:offer` or `udp:answer`, optionally `?` and an RTCConfiguration as JSON, of which
@@ -186,7 +225,7 @@ class UdpNegotiation implements RawLink {
     this.socket = bound.socket;
     this.listen(bound.socket);
     if (this.offer) this.describe();
-    for (const a of p.addresses()) this.addOwn(`${a}:${bound.port}`);
+    for (const a of p.addresses()) this.addOwn(endpoint(a, bound.port));
     for (const s of stun) this.askStun(s);
     this.probe();
   }

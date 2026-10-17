@@ -9,7 +9,7 @@ import { bootShell, type ShellSodium } from "./shell-core.js";
 import { CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline, HOST_CALL_LATE, REALM_DISPOSED, type CausalClock, type RealmFactory } from "./realm-queue.js";
 import { CallBudget } from "./guest-seam.js";
 import { combineChannels, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
-import { UdpNetwork, type DatagramPlatform } from "../services/udp/net-udp.js";
+import { UdpNetwork, ipv6Text, type DatagramPlatform } from "../services/udp/net-udp.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
@@ -243,7 +243,7 @@ declare const __udp: {
 const udpSockets = new Map<number, (bytes: Uint8Array, host: string, port: number) => void>();
 
 /** The UDP path's platform over Go's sockets. */
-const nativeDatagrams: DatagramPlatform = {
+export const nativeDatagrams: DatagramPlatform = {
   async bind() {
     const { id, port } = __udp.bind();
     let onMessage: (bytes: Uint8Array, host: string, port: number) => void = () => {};
@@ -261,21 +261,29 @@ const nativeDatagrams: DatagramPlatform = {
 };
 
 declare global {
-  /** What a socket read in one loop turn, as `[ip 4][port u16][len u16][bytes]` per
-   *  datagram (udp.go). */
+  /** What a socket read in one loop turn, as `[n u8][ip n][port u16][len u16][bytes]` per
+   *  datagram, n 4 for IPv4 and 16 for IPv6 (udp.go). */
   var __udpDeliver: (id: number, batch: ArrayBuffer) => void;
 }
 globalThis.__udpDeliver = (id, batch) => {
   const deliver = udpSockets.get(id);
   const b = new Uint8Array(batch);
-  // A batch is mostly one peer's, so its address is spelled once, not once a datagram.
+  // A batch is mostly one peer's, so its address is spelled once, not once a datagram: an
+  // IPv4 one is told from the last by its four bytes as a number, an IPv6 one by its text.
   let host = "", ip = -1;
-  for (let at = 0; deliver && at + 8 <= b.length;) {
-    const len = (b[at + 6] << 8) | b[at + 7];
-    const from = ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
-    if (from !== ip) { ip = from; host = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
-    deliver(b.subarray(at + 8, at + 8 + len), host, (b[at + 4] << 8) | b[at + 5]);
-    at += 8 + len;
+  for (let at = 0; deliver && at < b.length;) {
+    const n = b[at++];
+    if (n === 4) {
+      const from = ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
+      if (from !== ip) { ip = from; host = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
+    } else {
+      ip = -1;
+      host = ipv6Text(b, at);
+    }
+    at += n;
+    const len = (b[at + 2] << 8) | b[at + 3];
+    deliver(b.subarray(at + 4, at + 4 + len), host, (b[at] << 8) | b[at + 1]);
+    at += 4 + len;
   }
 };
 

@@ -1,9 +1,10 @@
 // The UDP socket primitive exposed to QuickJS as `__udp`, the datagram platform of the UDP
 // path (services/udp/net-udp.ts `DatagramPlatform`, shaped by host/native-shim.ts). A
-// socket is IPv4 on a port the OS picks. Its reader goroutine holds what it reads until the
-// loop takes it, and the loop hands each batch to __udpDeliver in one call, as
-// `[ip 4][port u16][len u16][bytes]` per datagram: the stream (stream.ts) reads and acks
-// once a turn, so a crossing per turn is all it needs.
+// socket is on a port the OS picks, dual-stack where the machine has IPv6. Its reader
+// goroutine holds what it reads until the loop takes it, and the loop hands each batch to
+// __udpDeliver in one call, as `[n u8][ip n][port u16][len u16][bytes]` per datagram, n 4
+// for IPv4 and 16 for IPv6: the stream (stream.ts) reads and acks once a turn, so a
+// crossing per turn is all it needs.
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -53,7 +55,8 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 	u := &udpHost{el: el, qc: qc, und: qc.NewUndefined(), socks: map[int64]*udpSock{}}
 	o := qc.NewObject()
 	o.SetPropertyStr("bind", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+		// Go binds [::] dual-stack where the machine has IPv6, and 0.0.0.0 where it has not.
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 		if err != nil {
 			return nil, err
 		}
@@ -72,17 +75,18 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		r.SetPropertyStr("port", qc.NewInt32(int32(conn.LocalAddr().(*net.UDPAddr).Port)))
 		return r, nil
 	}))
-	// A send that fails is a lost datagram. An address is sent to at once, from a view of
-	// the bytes; a name is resolved off the loop goroutine, from a copy.
+	// A send that fails is a lost datagram, IPv6 from an IPv4 socket among them. An address
+	// is sent to at once, from a view of the bytes; a name is resolved to IPv4 off the loop
+	// goroutine, from a copy.
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		s := u.get(args[0].Int64())
 		if s == nil {
 			return nil, nil
 		}
 		host, port := args[1].String(), int(args[2].Int32())
-		if ip := net.ParseIP(host).To4(); ip != nil {
+		if ip, err := netip.ParseAddr(host); err == nil {
 			if b, err := args[3].View(); err == nil {
-				s.conn.WriteToUDP(b, &net.UDPAddr{IP: ip, Port: port})
+				s.conn.WriteToUDPAddrPort(b, netip.AddrPortFrom(ip, uint16(port)))
 			}
 		} else if b, err := args[3].Bytes(); err == nil {
 			go func() {
@@ -105,7 +109,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		return nil, nil
 	}))
 	o.SetPropertyStr("addresses", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewString(strings.Join(localIPv4(), "\n")), nil
+		return qc.NewString(strings.Join(localAddresses(), "\n")), nil
 	}))
 	qc.Global().SetPropertyStr("__udp", o)
 	return u
@@ -131,24 +135,23 @@ func (u *udpHost) get(id int64) *udpSock {
 func (u *udpHost) read(id int64, s *udpSock) {
 	buf := make([]byte, 64<<10)
 	for {
-		n, from, err := s.conn.ReadFromUDP(buf)
+		n, from, err := s.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			continue
 		}
-		ip := from.IP.To4()
-		if ip == nil {
-			continue
-		}
+		// IPv4 as itself, though a dual-stack socket hears it as IPv4-mapped IPv6.
+		ip := from.Addr().Unmap().AsSlice()
 		s.mu.Lock()
-		if len(s.held)+8+n > udpHeldMax {
+		if len(s.held)+5+len(ip)+n > udpHeldMax {
 			s.mu.Unlock()
 			continue
 		}
+		s.held = append(s.held, byte(len(ip)))
 		s.held = append(s.held, ip...)
-		s.held = binary.BigEndian.AppendUint16(s.held, uint16(from.Port))
+		s.held = binary.BigEndian.AppendUint16(s.held, from.Port())
 		s.held = binary.BigEndian.AppendUint16(s.held, uint16(n))
 		s.held = append(s.held, buf[:n]...)
 		post := !s.posted
@@ -191,14 +194,20 @@ func (u *udpHost) close() {
 	}
 }
 
-// localIPv4 is this machine's outward IPv4 addresses, or loopback on one with none, as
-// services/udp/node.ts answers.
-func localIPv4() []string {
+// localAddresses is this machine's outward IPv4 addresses, or loopback on one with none,
+// then its IPv6 ones but loopback and link-local, as services/udp/node.ts answers.
+func localAddresses() []string {
 	addrs, _ := net.InterfaceAddrs()
-	var outward, all []string
+	var outward, all, v6 []string
 	for _, a := range addrs {
 		n, ok := a.(*net.IPNet)
-		if !ok || n.IP.To4() == nil {
+		if !ok {
+			continue
+		}
+		if n.IP.To4() == nil {
+			if !n.IP.IsLoopback() && !n.IP.IsLinkLocalUnicast() {
+				v6 = append(v6, n.IP.String())
+			}
 			continue
 		}
 		all = append(all, n.IP.String())
@@ -207,7 +216,7 @@ func localIPv4() []string {
 		}
 	}
 	if len(outward) > 0 {
-		return outward
+		all = outward
 	}
-	return all
+	return append(all, v6...)
 }

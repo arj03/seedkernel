@@ -5,6 +5,10 @@
 # relay; the transport then tries to punch a UDP path (§12.7). Each sim records whether
 # the link went direct.
 #
+# A side with IPv6 (a dual-stack router, and its firewall step run) also has an address
+# routed end to end, with no NAT, behind a stateful firewall (firewall6.nft), as a home
+# router's IPv6 is.
+#
 # patchbay's NAT presets (RFC 4787 terms):
 #   none      public address, no NAT
 #   open      endpoint-independent mapping and filtering (full cone)
@@ -19,15 +23,18 @@
 name = "nat-@A@-@B@"
 
 [[router]]
-name = "dc"
+name       = "dc"
+ip_support = "dual-stack"
 
 [[router]]
-name = "nat-a"
-nat  = "@A@"
+name       = "nat-a"
+nat        = "@A@"
+ip_support = "@IPA@"
 
 [[router]]
-name = "nat-b"
-nat  = "@B@"
+name       = "nat-b"
+nat        = "@B@"
+ip_support = "@IPB@"
 
 [device.relay.eth0]
 gateway = "dc"
@@ -37,6 +44,19 @@ gateway = "nat-a"
 
 [device.bob.eth0]
 gateway = "nat-b"
+
+# The IPv6 firewalls, before anything listens.
+[[step]]
+action = "run"
+device = "alice"
+when   = "@V6A@"
+cmd    = ["sh", "-c", "nft -f \"$NATLAB/firewall6.nft\""]
+
+[[step]]
+action = "run"
+device = "bob"
+when   = "@V6B@"
+cmd    = ["sh", "-c", "nft -f \"$NATLAB/firewall6.nft\""]
 
 # The relay: registrations and splices over WebSocket, and by default STUN on UDP 3478 and
 # 3479, where the transport looks for it (stun:<relay host>:3478 and :3479).

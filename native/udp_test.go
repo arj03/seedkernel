@@ -220,6 +220,28 @@ func TestUdpPathNative(t *testing.T) {
 	awaitOK(t, "udpCheck", `udpCheck()`, 20*time.Second)
 }
 
+// A native socket is dual-stack: it hears IPv4 and IPv6 alike, and names each sender as
+// the seam writes it, IPv4 dotted though the socket hears it IPv4-mapped, IPv6 as RFC 5952
+// writes it.
+func TestUdpDualStackNative(t *testing.T) {
+	bootRealm(t)
+	got := awaitOK(t, "dual-stack", `(async () => {
+	  const a = await nativeDatagrams.bind(), b = await nativeDatagrams.bind();
+	  const heard = [];
+	  b.socket.onMessage((bytes, host, port) => heard.push(host + " " + (port === a.port) + " " + bytes[0]));
+	  a.socket.send(Uint8Array.of(4), b.port, "127.0.0.1");
+	  a.socket.send(Uint8Array.of(6), b.port, "::1");
+	  const until = Date.now() + 5000;
+	  while (heard.length < 2 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+	  a.socket.close();
+	  b.socket.close();
+	  return new TextEncoder().encode(heard.sort().join(","));
+	})()`, 10*time.Second)
+	if want := "127.0.0.1 true 4,::1 true 6"; string(got) != want {
+		t.Fatalf("heard %q, want %q", got, want)
+	}
+}
+
 func BenchmarkUdpRoundTrip(b *testing.B) {
 	ensureBooted(b)
 	setupUdpPair(b)

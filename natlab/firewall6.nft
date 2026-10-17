@@ -1,0 +1,12 @@
+# An RFC 6092 router's IPv6 firewall, as every home router ships with: replies to what
+# went out come in, and nothing else does. patchbay gives a router built from a sim file
+# no firewall, so a sim loads this into the node's own namespace instead, which filters
+# what reaches the node the same way.
+table ip6 natlab_firewall {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+		meta l4proto ipv6-icmp accept
+	}
+}

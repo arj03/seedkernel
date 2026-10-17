@@ -7,17 +7,19 @@ Two native nodes sit behind a pair of NAT routers, register on a public seedrela
 answers STUN, and Alice dials Bob by key. The question is whether the link then goes direct.
 
 ```sh
-natlab/run.sh                     # every pair of none, open, moderate, strict
+natlab/run.sh                     # every pair of none, open, moderate, strict, and the IPv6 pairs
 natlab/run.sh moderate strict     # one pair
+natlab/run.sh strict+v6 strict    # +v6: IPv6 too, behind a firewall
 NATS="open strict" natlab/run.sh  # every pair of the kinds named
 ```
 
 It prints one line per pair:
 
 ```
-alice     bob       expected  got            ms
-moderate  moderate  direct    direct         71  ok
-strict    strict    relayed   relayed         -  ok
+alice       bob         expected  got            ms
+moderate    strict      direct    direct       1123  ok
+strict      strict      relayed   relayed         -  ok
+strict+v6   strict+v6   direct    direct         65  ok
 ```
 
 `ms` is how long after the relayed link came up the path went direct. A pair that never
@@ -41,6 +43,9 @@ Logs for each sim, each node's console and its probe's output, are under
   the NAT kinds filled in; patchbay's own `[matrix]` cannot set a router's NAT.
 - `probe.mjs` runs a node with a fresh key and watches the `link <key> direct|relayed|gone`
   lines the CLI prints, reporting the outcome as NDJSON for patchbay's captures.
+- `firewall6.nft` is a home router's IPv6 firewall (RFC 6092): replies to what went out come
+  in, and nothing else. patchbay gives a router built from a sim file none, so a `+v6` node
+  loads it into its own namespace, which filters what reaches the node the same way.
 - `run.sh` writes the sims, runs patchbay and judges the results.
 
 ## NAT kinds
@@ -57,6 +62,17 @@ so the strict end sees its two answers differ, and the UDP path then has it open
 toward the peer while the moderate end probes random ports until one lands (RUNTIME
 §12.7). Two `strict` ends would each have to guess the other's random port for the other's
 random port, so that pair is expected to stay on the relay.
+
+## IPv6
+
+A kind with `+v6` puts its router on both families: the node also gets an IPv6 address,
+routed to the other side with no NAT, behind `firewall6.nft`. Its IPv4 is behind the NAT
+kind as before. The UDP path's sockets are dual-stack and its candidates include the
+node's IPv6 addresses, so two `+v6` ends meet over IPv6 whatever their IPv4 NATs, as the
+firewall lets in the peer's probes once a probe has gone out to it. A full run adds three
+pairs: `strict+v6` against `strict+v6`, direct only over IPv6; `strict+v6` against
+`strict`, which stays relayed, since one side has no IPv6; and `moderate+v6` against
+`strict+v6`, which IPv4 punches too.
 
 Worth adding next: link conditions (`set-link-condition` with loss and latency, for the
 stream's congestion control and path MTU probing), two nodes behind the same NAT (hairpin),
