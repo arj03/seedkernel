@@ -107,17 +107,35 @@ function names(p: Uint8Array, count: number, pn: number): boolean {
   return false;
 }
 
-/** The first `n` bytes of `parts`, removed from it. */
-function take(parts: Uint8Array[], n: number): Uint8Array {
-  if (parts[0].length === n) return parts.shift()!;
-  const out = new Uint8Array(n);
-  for (let at = 0; at < n;) {
-    const part = parts[0], k = Math.min(part.length, n - at);
-    out.set(part.subarray(0, k), at);
-    at += k;
-    if (k === part.length) parts.shift(); else parts[0] = part.subarray(k);
+/** Bytes in pieces, taken from the front: what was written and is not yet sent, and what
+ *  arrived in order and is not yet read. */
+class Pieces {
+  private readonly list: Uint8Array[] = [];
+  /** Where in `list[0]` the next byte is. */
+  private at = 0;
+  bytes = 0;
+
+  push(piece: Uint8Array): void {
+    this.list.push(piece);
+    this.bytes += piece.length;
   }
-  return out;
+
+  /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
+   *  copy across pieces. */
+  take(n: number): Uint8Array {
+    this.bytes -= n;
+    if (this.at === 0 && this.list[0].length === n) return this.list.shift()!;
+    let out: Uint8Array | undefined;
+    for (let got = 0; got < n;) {
+      const piece = this.list[0], k = Math.min(piece.length - this.at, n - got);
+      if (k === n) out = piece.subarray(this.at, this.at + k);
+      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
+      got += k;
+      this.at += k;
+      if (this.at === piece.length) { this.list.shift(); this.at = 0; }
+    }
+    return out!;
+  }
 }
 
 /** A packet with `body` bytes behind the header, its type written. */
@@ -140,10 +158,7 @@ export class UdpStream implements RawLink {
   private out: ((packet: Uint8Array) => void) | null = null;
 
   // ── sending ──
-  private readonly queue: Uint8Array[] = [];
-  /** Where the next chunk starts in `queue[0]`. */
-  private queueAt = 0;
-  private queued = 0;
+  private readonly unsent = new Pieces();
   /** The stream offset past the last byte written, and past the last ever sent. */
   private written = 0;
   private nextOffset = 0;
@@ -173,9 +188,9 @@ export class UdpStream implements RawLink {
   private peerCredit = CREDIT;
   private srtt = INITIAL_RTT_MS;
   private rttvar = INITIAL_RTT_MS / 2;
+  /** Infinity until the first round-trip sample. */
   private minRtt = Infinity;
   private latestRtt = 0;
-  private sampled = false;
   private ptoCount = 0;
   private lastSentData = 0;
   private lossTime = Infinity;
@@ -191,8 +206,7 @@ export class UdpStream implements RawLink {
   // ── receiving ──
   /** The offset the reader has been handed up to, and what follows it in order. */
   private taken = 0;
-  private readonly held: Uint8Array[] = [];
-  private heldBytes = 0;
+  private readonly held = new Pieces();
   /** Chunks past a gap, by offset, and the packet bytes they came in. */
   private readonly ahead = new Map<number, Uint8Array>();
   private aheadBytes = 0;
@@ -240,7 +254,7 @@ export class UdpStream implements RawLink {
     this.recoveryStart = performance.now();
     this.undo = null;
     this.suspects.clear();
-    this.sampled = false;
+    this.minRtt = Infinity;
     this.sample(rttMs, 0);
     this.ptoCount = 0;
     this.packetBytes = BASE_PACKET;
@@ -266,8 +280,7 @@ export class UdpStream implements RawLink {
   send(bytes: Uint8Array): void {
     if (this.gone || this.closing) throw new Error("udp: link is closed");
     if (bytes.length === 0) return;
-    this.queue.push(bytes.slice());
-    this.queued += bytes.length;
+    this.unsent.push(bytes.slice());
     this.written += bytes.length;
     this.flush();
   }
@@ -291,7 +304,8 @@ export class UdpStream implements RawLink {
     }
     this.finish();
   }
-  /** The negotiation link closed: this closes too, and the peer and the driver hear it. */
+  /** The negotiation link closed, or the peer stopped answering: tell it, in case it can
+   *  still hear, then stop and tell the driver. */
   end(): void {
     if (this.gone) return;
     this.sendClose();
@@ -308,14 +322,14 @@ export class UdpStream implements RawLink {
     const r = this.ranges;
     while (r.length > 1 && r[r.length - 1][0] < floor) r.pop();
     this.furthest = Math.max(this.furthest, offset + bytes.length);
-    let end = this.taken + this.heldBytes;
+    let end = this.taken + this.held.bytes;
     if (offset === end) {
       // Held as it came: a platform hands over datagrams it does not reuse (net-udp.ts).
-      this.hold(bytes);
-      for (let next; (next = this.ahead.get(end = this.taken + this.heldBytes));) {
+      this.held.push(bytes);
+      for (let next; (next = this.ahead.get(end = this.taken + this.held.bytes));) {
         this.ahead.delete(end);
         this.aheadBytes -= DATA_HEADER + next.length;
-        this.hold(next);
+        this.held.push(next);
       }
       // A chunk split on its way can arrive both whole and in pieces, and a piece waiting
       // inside a whole one is never reached; once nothing is missing, none is of use.
@@ -351,19 +365,12 @@ export class UdpStream implements RawLink {
     }
   }
 
-  private hold(chunk: Uint8Array): void {
-    this.held.push(chunk);
-    this.heldBytes += chunk.length;
-  }
-
   /** Hand the reader what is in order, while it reads, and tell the sender once that has
    *  freed half the credit. */
   private deliver(): void {
-    while (this.readable && this.onMsg && this.heldBytes > 0 && !this.gone) {
-      const n = Math.min(this.heldBytes, MAX_READ);
-      const bytes = take(this.held, n);
-      this.heldBytes -= n;
-      this.taken += n;
+    while (this.readable && this.onMsg && this.held.bytes > 0 && !this.gone) {
+      const bytes = this.held.take(Math.min(this.held.bytes, MAX_READ));
+      this.taken += bytes.length;
       this.onMsg(bytes);
     }
     if (this.taken + CREDIT - this.advertised >= CREDIT / 2) this.sendAck();
@@ -448,8 +455,7 @@ export class UdpStream implements RawLink {
 
   private sample(latest: number, delay: number): void {
     this.latestRtt = latest;
-    if (!this.sampled) {
-      this.sampled = true;
+    if (this.minRtt === Infinity) {
       this.minRtt = this.srtt = latest;
       this.rttvar = latest / 2;
       return;
@@ -517,7 +523,7 @@ export class UdpStream implements RawLink {
     if (!this.out || this.gone) return;
     for (;;) {
       if (probes === 0 && this.bytesInFlight + this.packetBytes > this.window) {
-        this.windowLimited = this.lost.size > 0 || (this.queued > 0 && this.nextOffset < this.peerCredit);
+        this.windowLimited = this.lost.size > 0 || (this.unsent.bytes > 0 && this.nextOffset < this.peerCredit);
         break;
       }
       const next = this.nextChunk(probes > 0);
@@ -538,11 +544,10 @@ export class UdpStream implements RawLink {
         if (chunk) return [offset, this.fit(offset, chunk)];
       }
     }
-    const n = Math.min(this.queued, this.packetBytes - DATA_HEADER, this.peerCredit - this.nextOffset);
+    const n = Math.min(this.unsent.bytes, this.packetBytes - DATA_HEADER, this.peerCredit - this.nextOffset);
     if (n > 0) {
-      const chunk = this.takeQueued(n);
+      const chunk = this.unsent.take(n);
       const offset = this.nextOffset;
-      this.queued -= n;
       this.nextOffset += n;
       this.chunks.set(offset, chunk);
       this.sentOffsets.push(offset);
@@ -565,25 +570,6 @@ export class UdpStream implements RawLink {
     this.sentOffsets.splice(this.sentOffsets.indexOf(offset, this.sentHead) + 1, 0, rest);
     this.lost.add(rest);
     return head;
-  }
-
-  /** The next `n` bytes written: a view of the write they sit in, or a copy across writes. */
-  private takeQueued(n: number): Uint8Array {
-    const head = this.queue[0];
-    if (head.length - this.queueAt >= n) {
-      const out = head.subarray(this.queueAt, this.queueAt += n);
-      if (this.queueAt === head.length) { this.queue.shift(); this.queueAt = 0; }
-      return out;
-    }
-    const out = new Uint8Array(n);
-    for (let at = 0; at < n;) {
-      const part = this.queue[0], k = Math.min(part.length - this.queueAt, n - at);
-      out.set(part.subarray(this.queueAt, this.queueAt + k), at);
-      at += k;
-      this.queueAt += k;
-      if (this.queueAt === part.length) { this.queue.shift(); this.queueAt = 0; }
-    }
-    return out;
   }
 
   private sendChunk(offset: number, chunk: Uint8Array): void {
@@ -632,7 +618,7 @@ export class UdpStream implements RawLink {
       this.flush();
       return;
     }
-    if (this.ptoCount >= MAX_PTOS && performance.now() - this.lastHeard > DEAD_MS) { this.giveUp(); return; }
+    if (this.ptoCount >= MAX_PTOS && performance.now() - this.lastHeard > DEAD_MS) { this.end(); return; }
     // A second timeout in a row: the path may have stopped carrying the larger packets.
     if (this.ptoCount >= 1 && this.packetBytes > BASE_PACKET) {
       this.packetBytes = BASE_PACKET;
@@ -684,7 +670,7 @@ export class UdpStream implements RawLink {
   private tick(): void {
     const now = performance.now();
     if (now - this.lastHeard > SILENT_MS) { this.fail(); return; }
-    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && now - this.lastHeard > DEAD_MS) { this.giveUp(); return; }
+    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && now - this.lastHeard > DEAD_MS) { this.end(); return; }
     if (now - this.lastSent >= KEEPALIVE_MS) this.sendAck();
     this.liveTimer = setTimeout(() => this.tick(), KEEPALIVE_MS);
   }
@@ -702,13 +688,6 @@ export class UdpStream implements RawLink {
     if (this.out) for (let i = 0; i < 3; i++) this.emit(packet(TYPE_CLOSE, 0));
   }
 
-  /** The peer stopped answering what is in flight: tell it, in case it only cannot be
-   *  heard, then stop and tell the driver. */
-  private giveUp(): void {
-    this.sendClose();
-    this.fail();
-  }
-
   /** The peer closed or went silent: stop, and tell the driver. */
   private fail(): void {
     if (this.gone) return;
@@ -716,18 +695,13 @@ export class UdpStream implements RawLink {
     this.onCls?.();
   }
 
+  /** What the stream holds goes with it, once the driver and the negotiation let go. */
   private stop(): void {
     this.gone = true;
     clearTimeout(this.recoveryTimer);
     clearTimeout(this.lingerTimer);
     clearTimeout(this.liveTimer);
     clearTimeout(this.probeTimer);
-    this.queue.length = 0;
-    this.sentOffsets.length = 0;
-    this.chunks.clear();
-    this.inFlight.clear();
-    this.held.length = 0;
-    this.ahead.clear();
     this.onGone();
   }
 }

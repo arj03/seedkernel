@@ -431,13 +431,9 @@ class UdpNegotiation implements RawLink {
     this.onOpen();
   }
 
+  /** `[tag][text]`, the tags ASCII, so one byte each. */
   private up(tag: number, text: string): void {
-    if (this.dead || !this.onMsg) return;
-    const body = enc.encode(text);
-    const msg = new Uint8Array(1 + body.length);
-    msg[0] = tag;
-    msg.set(body, 1);
-    this.onMsg(msg);
+    if (!this.dead && this.onMsg) this.onMsg(enc.encode(String.fromCharCode(tag) + text));
   }
 
   send(bytes: Uint8Array): void {
