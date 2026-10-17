@@ -1,0 +1,97 @@
+# Two native nodes behind a pair of NAT kinds, meeting on a public relay that also answers
+# STUN, as seedrelay does. run.sh writes one sim per pair from this template, putting the
+# NAT kinds in place of @A@ and @B@: patchbay's own [matrix] cannot set a router's NAT,
+# since it reads the raw file once before expanding. Alice dials Bob by key through the
+# relay; the transport then tries to punch a UDP path (§12.7). Each sim records whether
+# the link went direct.
+#
+# patchbay's NAT presets (RFC 4787 terms):
+#   none      public address, no NAT
+#   open      endpoint-independent mapping and filtering (full cone)
+#   moderate  endpoint-independent mapping, address+port-dependent filtering (most home
+#             routers, Linux masquerade)
+#   strict    endpoint-dependent mapping with random ports (symmetric: enterprise
+#             firewalls, cloud NAT gateways)
+#
+# run.sh also supplies $SEEDKERNEL, $SEEDRELAY and $NATLAB to the steps.
+
+[sim]
+name = "nat-@A@-@B@"
+
+[[router]]
+name = "dc"
+
+[[router]]
+name = "nat-a"
+nat  = "@A@"
+
+[[router]]
+name = "nat-b"
+nat  = "@B@"
+
+[device.relay.eth0]
+gateway = "dc"
+
+[device.alice.eth0]
+gateway = "nat-a"
+
+[device.bob.eth0]
+gateway = "nat-b"
+
+# The relay: registrations and splices over WebSocket, and by default STUN on UDP 3478 and
+# 3479, where the transport looks for it (stun:<relay host>:3478 and :3479).
+[[step]]
+action = "spawn"
+id     = "relay"
+device = "relay"
+cmd    = ["sh", "-c", "exec node \"$SEEDRELAY/server.mjs\" --host 0.0.0.0 --port 8080 --authority $NETSIM_IP_RELAY:8080"]
+[step.captures.ready]
+regex = "seedrelay listening"
+
+# Bob registers on the relay and waits to be called. His deadline outlasts Alice's, so he
+# is still there when she gives up, and he stops on his own soon after.
+[[step]]
+action   = "spawn"
+id       = "bob"
+device   = "bob"
+requires = ["relay.ready"]
+parser   = "ndjson"
+cmd      = ["sh", "-c", "exec node \"$NATLAB/probe.mjs\" \"$SEEDKERNEL\" --deadline 24 -- --relay ws://$NETSIM_IP_RELAY:8080"]
+[step.captures.key]
+match = { kind = "up" }
+pick  = ".key"
+[step.captures.route]
+match = { kind = "result" }
+pick  = ".route"
+
+# Alice registers too, and dials Bob by key through the relay.
+[[step]]
+action   = "spawn"
+id       = "alice"
+device   = "alice"
+requires = ["bob.key"]
+parser   = "ndjson"
+cmd      = ["sh", "-c", "exec node \"$NATLAB/probe.mjs\" \"$SEEDKERNEL\" --deadline 20 -- --relay ws://$NETSIM_IP_RELAY:8080 --peers ${bob.key}@relay+ws://$NETSIM_IP_RELAY:8080"]
+[step.captures.route]
+match = { kind = "result" }
+pick  = ".route"
+[step.captures.ms]
+match = { kind = "result" }
+pick  = ".ms"
+
+# Both probes stop on their own, so patchbay never has to kill a node at the end.
+[[step]]
+action  = "wait-for"
+id      = "alice"
+timeout = "40s"
+
+[[step]]
+action  = "wait-for"
+id      = "bob"
+timeout = "40s"
+
+# Whatever the NATs, the relay must link them: a pair that never links is a bug, not a
+# hard NAT. Whether the link went direct is judged by run.sh against its expectations.
+[[step]]
+action = "assert"
+checks = ["alice.route matches ^(direct|relayed)$"]

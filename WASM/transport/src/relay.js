@@ -16,8 +16,9 @@ const NONCE_LEN = 32, TICKET_LEN = 16;
 /** Every relay path starts with the wire version it speaks, so a relay that speaks
  *  another refuses the socket instead of misreading it. */
 const RELAY_WIRE = "/v1/";
-/** The UDP port a relay answers STUN on, beside its WebSocket port. */
-const RELAY_STUN_PORT = 3478;
+/** The UDP ports a relay answers STUN on, beside its WebSocket port. Two, so a UDP path
+ *  can tell a NAT that gives each destination its own port (services/udp). */
+const RELAY_STUN_PORTS = [3478, 3479];
 
 // ── the relay wire ────────────────────────────────────────────────────────────
 //

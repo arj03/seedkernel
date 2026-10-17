@@ -77,11 +77,12 @@ class Rtc {
   }
 
   /** The RTCConfiguration suffix for a negotiation with `peer`: STUN at the relay it is
-   *  linked through, which already sees this node's address, so asking it tells no one
-   *  new, then the configured servers. */
+   *  linked through, on both its ports, which already sees this node's address, so asking
+   *  it tells no one new, then the configured servers. */
   configFor(peer) {
     const relay = router.relayOf(peer);
-    const iceServers = relay ? [{ urls: `stun:${relayHost(relay)}:${RELAY_STUN_PORT}` }, ...this.iceServers] : this.iceServers;
+    const atRelay = relay ? RELAY_STUN_PORTS.map((port) => ({ urls: `stun:${relayHost(relay)}:${port}` })) : [];
+    const iceServers = [...atRelay, ...this.iceServers];
     return iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
   }
 

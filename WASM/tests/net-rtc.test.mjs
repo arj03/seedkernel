@@ -329,7 +329,7 @@ await test("two nodes linked through the relay move to WebRTC", async (keep) => 
   await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the splice to be retired");
   assert(world.made.length === 2, `one peer connection per side, got ${world.made.length}`);
   assert(world.made.every((pc) => pc.candidates.length >= 1), "candidates went over the relayed link and in");
-  assert(world.made.every((pc) => pc.config?.iceServers?.[0]?.urls === "stun:relay:3478"),
+  assert(world.made.every((pc) => pc.config?.iceServers?.map((s) => s.urls).join() === "stun:relay:3478,stun:relay:3479"),
     "each asks the relay it met its peer through for its address, and no one else");
   const before = relay.spliceBytes;
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));

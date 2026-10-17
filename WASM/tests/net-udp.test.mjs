@@ -402,6 +402,103 @@ await test("the address a STUN server sees is a candidate, and a path can be fou
   server.close();
 });
 
+/** An in-memory internet of NATs, in RFC 4787's terms, with a STUN server answering on two
+ *  ports at 198.51.100.1, as seedrelay's `--stun` does. A `moderate` NAT keeps one public
+ *  port per socket (endpoint-independent mapping); a `strict` one gives each destination a
+ *  random public port of the 64,512 above 1023 (endpoint-dependent), as Linux's
+ *  `masquerade random` does. Both let in only an address and port a socket has sent to.
+ *  Each NAT is a platform, whose machine's own address the world cannot reach, and which
+ *  counts the sockets bound and the datagrams sent. */
+function natWorld() {
+  const STUN_IP = "198.51.100.1", STUN_PORTS = [3478, 3479];
+  const nats = new Map();
+  const deliver = (fromIp, fromPort, toIp, toPort, bytes) => setImmediate(() => {
+    if (toIp === STUN_IP && STUN_PORTS.includes(toPort)) deliver(STUN_IP, toPort, fromIp, fromPort, stunAnswer(bytes, fromIp, fromPort));
+    else nats.get(toIp)?.(fromIp, fromPort, toPort, bytes);
+  });
+  return {
+    config: `?${JSON.stringify({ iceServers: STUN_PORTS.map((p) => ({ urls: `stun:${STUN_IP}:${p}` })) })}`,
+    nat(kind) {
+      const ip = `203.0.113.${nats.size + 1}`;
+      const byPublic = new Map(), byKey = new Map();
+      let nextPort = 40000;
+      nats.set(ip, (fromIp, fromPort, port, bytes) => {
+        const m = byPublic.get(port);
+        if (m && m.allowed.has(`${fromIp}:${fromPort}`) && !m.socket.closed) m.socket.handler?.(new Uint8Array(bytes), fromIp, fromPort);
+      });
+      const platform = {
+        ip, bound: 0, sent: 0,
+        addresses: () => [`10.0.0.${nats.size}`],
+        async bind() {
+          platform.bound++;
+          const own = nextPort++;
+          const socket = {
+            closed: false, handler: null,
+            send(bytes, port, host) {
+              if (socket.closed) return;
+              platform.sent++;
+              const key = kind === "strict" ? `${own}>${host}:${port}` : own;
+              let pub = byKey.get(key);
+              if (pub === undefined) {
+                pub = own;
+                if (kind === "strict") do pub = 1024 + Math.floor(Math.random() * 64512); while (byPublic.has(pub));
+                byKey.set(key, pub);
+                byPublic.set(pub, { socket, allowed: new Set() });
+              }
+              byPublic.get(pub).allowed.add(`${host}:${port}`);
+              deliver(ip, pub, host, port, Uint8Array.from(bytes));
+            },
+            onMessage(cb) { socket.handler = cb; },
+            close() { socket.closed = true; },
+          };
+          return { port: own, socket };
+        },
+      };
+      return platform;
+    },
+  };
+}
+
+await test("an end whose NAT gives each destination its own port meets a NAT that keeps one, either way round", async () => {
+  for (const hardOffers of [true, false]) {
+    const world = natWorld();
+    const hard = world.nat("strict"), easy = world.nat("moderate");
+    const H = await seam({ datagrams: hard }), E = await seam({ datagrams: easy });
+    const { offer, answer, a, b } = hardOffers ? await negotiate(H, E, world.config) : await negotiate(E, H, world.config);
+    const [atHard, atEasy] = hardOffers ? [offer, answer] : [answer, offer];
+    assert(atHard.up.some(([tag, text]) => tag === RTC_TAG.CANDIDATE && text === `${hard.ip}:*`),
+      "the hard end, its two STUN answers differing, says so");
+    assert(!atEasy.up.some(([, text]) => text.endsWith(":*")), "the easy end does not");
+    assert(hard.bound === 257 && easy.bound === 1, `only the hard end opened more sockets, ${hard.bound} and ${easy.bound}`);
+    const atA = reader(a), atB = reader(b);
+    const there = randomBytes(50_000), back = randomBytes(5000);
+    a.send(there);
+    b.send(back);
+    await until(() => atB.length === there.length && atA.length === back.length, 5000, "the bytes");
+    assert(atB.bytes().equals(there) && atA.bytes().equals(back), "intact");
+    H.net.close(); E.net.close();
+  }
+});
+
+await test("two ends that both give each destination their own port stay apart, and spend nothing trying", async () => {
+  const world = natWorld();
+  const one = world.nat("strict"), two = world.nat("strict");
+  const A = await seam({ datagrams: one }), B = await seam({ datagrams: two });
+  const offer = A.open(`udp:offer${world.config}`), answer = B.open(`udp:answer${world.config}`);
+  const carried = [0, 0];
+  const timer = setInterval(() => {
+    for (; carried[0] < offer.up.length; carried[0]++) answer.link.send(msg(...offer.up[carried[0]]));
+    for (; carried[1] < answer.up.length; carried[1]++) offer.link.send(msg(...answer.up[carried[1]]));
+  }, 5);
+  await settle(1500);
+  clearInterval(timer);
+  assert(A.accepted.length === 0 && B.accepted.length === 0, "no path");
+  assert(one.bound === 1 && two.bound === 1, "no birthday sockets");
+  // The plain punch: a probe each 50 ms to each of a handful of candidates, and no spray.
+  assert(one.sent < 300 && two.sent < 300, `no random ports probed, sent ${one.sent} and ${two.sent}`);
+  A.net.close(); B.net.close();
+});
+
 // ── the transport, over real UDP ─────────────────────────────────────────────
 
 const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));

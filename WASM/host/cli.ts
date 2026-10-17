@@ -9,7 +9,7 @@ import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { ListenAddress } from "../services/socket-seam.js";
-import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
+import type { AppHandle, BootShellOptions, Shell, TransportStatus } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted, on every target. */
 export const DEFAULT_DIR = "./data";
@@ -234,6 +234,17 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     transportConfig.contactSecret = dec.decode(mustRead(host, contactSecretPath, "--contact-secret")).trim();
   }
 
+  // One line each time a peer is linked, changes how it is reached, or goes, so an
+  // operator, or a script driving the node, sees a relayed link move to a direct path
+  // (§12.7). The status repeats every link on each change, so only differences print.
+  let routes = new Map<string, boolean>();
+  const onStatus = (s: TransportStatus) => {
+    const now = new Map(s.linked.map((l) => [toHex(l.key), l.direct] as const));
+    for (const [k, direct] of now) if (routes.get(k) !== direct) host.log(`  link   ${k} ${direct ? "direct" : "relayed"}`);
+    for (const k of routes.keys()) if (!now.has(k)) host.log(`  link   ${k} gone`);
+    routes = now;
+  };
+
   const { shell, transport: net } = await host.standUp({
     dir,
     policyJson,
@@ -242,6 +253,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       listen,
       bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
       config: transportConfig,
+      onStatus,
     } : false,
     guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
