@@ -81,6 +81,48 @@ func TestGuestRealmPendingPromiseSourceDoesNotWedge(t *testing.T) {
 	}
 }
 
+// A guest that swaps the preamble's entry points for getters that never return must not
+// reach the host through them: read after the guest ran, one would spin outside the budget.
+// In a child for the same reason as the tests above.
+func TestGuestRealmEntryGettersNeverRun(t *testing.T) {
+	const marker = "SEEDKERNEL_TEST_GUEST_ENTRY_GETTERS"
+	if os.Getenv(marker) == "1" {
+		guestSeamRealm(t)
+		if _, err := qc.Eval("seam.js", `
+			globalThis.__guestSeam = (name) => name === "fail"
+			  ? Promise.reject(new Error("refused")) : Promise.resolve(new Uint8Array([7]));
+		`); err != nil {
+			t.Fatal("build seam:", err)
+		}
+		newTestRealmBudget(t, "{}", `
+			for (const name of ["__start", "__resolveHostCall", "__rejectHostCall"])
+			  Object.defineProperty(globalThis, name, { get() { for (;;) {} } });
+			async function handle(arg) {
+			  try { return await host.call(arg[arg.length - 1] === 1 ? "fail" : "park", new Uint8Array()); }
+			  catch { return new Uint8Array([8]); }
+			}
+		`, 300)
+		for _, c := range []struct{ arg, want byte }{{0, 7}, {1, 8}} {
+			if out, err := realmCall("op", []byte{c.arg}); err != nil || !bytes.Equal(out, []byte{c.want}) {
+				t.Fatalf("parked call %d: got %v, %v", c.arg, out, err)
+			}
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestGuestRealmEntryGettersNeverRun$", "-test.v")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("a guest's getter wedged its host process: %v\n%s", ctx.Err(), out)
+	}
+	if err != nil {
+		t.Fatalf("entry getter probe failed: %v\n%s", err, out)
+	}
+}
+
 func TestGuestRealmFailedConstructionClearsHostDeadlines(t *testing.T) {
 	bootRealm(t)
 	before := len(el.timers)

@@ -246,9 +246,8 @@ export const createSafeRealm: RealmFactory = async (opts) => {
 
   // Settle a pending host.call through the preamble's __resolveHostCall/__rejectHostCall,
   // then pump. `made` is the invocation the call was made under.
-  const settleHostCall = (fn: "__resolveHostCall" | "__rejectHostCall", callId: number,
+  const settleHostCall = (settler: QuickJSHandle, callId: number,
     arg: QuickJSHandle, budget: CallBudget, made: InvocationBudget): void => {
-    const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
     // Resume on the invocation that made the call, or on a fresh record for a detached one.
     const under = budget.detached ? clock.create() : made;
@@ -268,7 +267,6 @@ export const createSafeRealm: RealmFactory = async (opts) => {
         clock.end();
         id.dispose();
         arg.dispose();
-        settler.dispose();
       }
     });
   };
@@ -331,14 +329,14 @@ export const createSafeRealm: RealmFactory = async (opts) => {
             if (!ctx.alive) return;
             // Request and response coexist during the copy in, so reserve both.
             activeHostCalls.reserve(callId, bytes.byteLength);
-            settleHostCall("__resolveHostCall", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), budget, made);
+            settleHostCall(resolveHostCall, callId, ctx.newArrayBuffer(toArrayBuffer(bytes)), budget, made);
             return;
           } catch (err) {
             failure = err;
           }
         }
         if (ctx.alive) {
-          settleHostCall("__rejectHostCall", callId, ctx.newString(errMessage(failure)), budget, made);
+          settleHostCall(rejectHostCall, callId, ctx.newString(errMessage(failure)), budget, made);
         }
       } finally {
         activeHostCalls.release(callId);
@@ -366,8 +364,14 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   ctx.setProp(ctx.global, "__callFail", callFailFn);
   callFailFn.dispose();
 
-  // Load the preamble, then the guest; dispose each completion value (leaks assert).
+  // Load the preamble, then the guest; dispose each completion value (leaks assert). The
+  // preamble's entry points are taken in between: read once the guest has run, one could
+  // be its getter, which would run off the budget. Held for every dispatch.
   ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
+  const start = ctx.getProp(ctx.global, "__start");
+  const resolveHostCall = ctx.getProp(ctx.global, "__resolveHostCall");
+  const rejectHostCall = ctx.getProp(ctx.global, "__rejectHostCall");
+  const entries = [start, resolveHostCall, rejectHostCall];
   // Top level runs on a fresh budget too, or `for (;;) {}` would wedge the install.
   clock.begin(clock.create());
   try {
@@ -379,7 +383,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
     deadlines.disarmAll();
     disposePhantoms();
     try {
-      if (ctx.alive) ctx.dispose();
+      if (ctx.alive) {
+        for (const h of entries) h.dispose();
+        ctx.dispose();
+      }
     } finally {
       runtime.dispose();
     }
@@ -387,9 +394,6 @@ export const createSafeRealm: RealmFactory = async (opts) => {
   } finally {
     clock.end();
   }
-
-  /** The preamble's entrypoint, retained once for every dispatch. */
-  const start = ctx.getProp(ctx.global, "__start");
 
   /** One invocation, once the queue has given it the realm. Not `async`, because the
    *  queue needs the `Invocation` when the synchronous part ends, before the answer exists. */
@@ -437,10 +441,10 @@ export const createSafeRealm: RealmFactory = async (opts) => {
       // Nothing will consume unanswered calls now, so release their charges and deadlines.
       activeHostCalls.releaseAll();
       deadlines.disarmAll();
-      // Context before runtime; `start` is the only handle held between calls, and one live
-      // handle would abort the whole wasm module.
+      // Context before runtime; the entry points are the only handles held between calls,
+      // and one live handle would abort the whole wasm module.
       if (!ctx.alive) return;
-      start.dispose();
+      for (const h of entries) h.dispose();
       ctx.dispose();
       runtime.dispose();
     },

@@ -7,7 +7,8 @@
 // - Every packet gets a new number, a resent chunk's too, so an ack names one send and a
 //   round-trip sample is never ambiguous.
 // - The stream is cut into chunks at their first send, and a lost chunk is resent whole at
-//   its offset, so the receiver reassembles by offset alone.
+//   its offset, so the receiver reassembles by offset alone. What waits past a gap is
+//   capped at two credits, counted as the packets it came in; a peer past that is gone.
 // - An ack carries ranges of packet numbers, of those the sender still waits on: every
 //   DATA packet names the oldest, and the receiver forgets the ranges below it, so a lost
 //   packet is not named in every ack after. A packet is lost once one sent three later is
@@ -192,8 +193,9 @@ export class UdpStream implements RawLink {
   private taken = 0;
   private readonly held: Uint8Array[] = [];
   private heldBytes = 0;
-  /** Chunks past a gap, by offset. */
+  /** Chunks past a gap, by offset, and the packet bytes they came in. */
   private readonly ahead = new Map<number, Uint8Array>();
+  private aheadBytes = 0;
   /** The offset past the furthest byte received. */
   private furthest = 0;
   private readable = true;
@@ -312,14 +314,19 @@ export class UdpStream implements RawLink {
       this.hold(bytes);
       for (let next; (next = this.ahead.get(end = this.taken + this.heldBytes));) {
         this.ahead.delete(end);
+        this.aheadBytes -= DATA_HEADER + next.length;
         this.hold(next);
       }
       // A chunk split on its way can arrive both whole and in pieces, and a piece waiting
       // inside a whole one is never reached; once nothing is missing, none is of use.
-      if (end === this.furthest && this.ahead.size > 0) this.ahead.clear();
+      if (end === this.furthest && this.ahead.size > 0) { this.ahead.clear(); this.aheadBytes = 0; }
     } else if (offset > end && !this.ahead.has(offset)) {
       // A copy, so a chunk waiting on a gap keeps no whole batch of datagrams alive.
       this.ahead.set(offset, bytes.slice());
+      // An honest sender has a credit of chunks past a gap, which a split overlaps a little.
+      // Chunks at every offset in it, each overlapping the next, would be a credit per byte.
+      this.aheadBytes += DATA_HEADER + bytes.length;
+      if (this.aheadBytes > 2 * CREDIT) this.fail();
     }
   }
 

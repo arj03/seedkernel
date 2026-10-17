@@ -140,6 +140,23 @@ await test("acks name only what the sender still waits on, so a lossy stretch le
   pair.a.close(); pair.b.close();
 });
 
+await test("chunks past a gap at overlapping offsets end the stream at two credits, not at memory", async () => {
+  const b = new UdpStream(() => {});
+  b.start(() => {}, 1);
+  const atB = reader(b);
+  const put48 = (p, at, n) => { for (let i = 5; i >= 0; i--, n = Math.floor(n / 256)) p[at + i] = n % 256; };
+  // DATA [type][token 8][pn 6][offset 6][floor 6][1400 bytes], at every offset but 0.
+  const p = new Uint8Array(27 + 1400);
+  p[0] = 0x64;
+  let sent = 0;
+  while (!atB.closed && sent < 4000) {
+    sent++;
+    put48(p, 9, sent); put48(p, 15, sent);
+    b.receive(p);
+  }
+  assert(atB.closed && sent < 1500, `the stream closes at two credits held, after ${sent} chunks`);
+});
+
 await test("data the peer stops answering ends the stream well inside the silent path's 30 s", async () => {
   const pair = streamPair();
   const atA = reader(pair.a);

@@ -272,6 +272,11 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	if _, err := g.qc.Eval("guest-preamble.js", hostFnString(hostQc, "guestPreamble")); err != nil {
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
+	// Guest-realm values, freed by rt.Close(). Taken before the guest runs: read after, one
+	// could be its getter, which would run off the budget.
+	g.start = g.qc.Global().GetPropertyStr("__start")
+	g.resolveHostCall = g.qc.Global().GetPropertyStr("__resolveHostCall")
+	g.rejectHostCall = g.qc.Global().GetPropertyStr("__rejectHostCall")
 	// Top-level code runs under a fresh budget, so it cannot wedge installation; jobs it
 	// queues run at the next budgeted pump.
 	g.consumed = 0
@@ -282,10 +287,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return fail(fmt.Errorf("guest source: %w", err))
 	}
 	done.Free()
-	// Guest-realm values, freed by rt.Close().
-	g.start = g.qc.Global().GetPropertyStr("__start")
-	g.resolveHostCall = g.qc.Global().GetPropertyStr("__resolveHostCall")
-	g.rejectHostCall = g.qc.Global().GetPropertyStr("__rejectHostCall")
 	return g, nil
 }
 

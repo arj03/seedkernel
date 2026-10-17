@@ -261,6 +261,11 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   });
   ok(initProbe.status === 0 && !initProbe.error,
     `top-level guest code is interrupted during realm construction (${initProbe.error?.message ?? initProbe.stderr.trim()})`);
+  const getterProbe = spawnSync(process.execPath, [join(root, "tests/fixtures/guest-entry-getters.mjs")], {
+    timeout: 3000, encoding: "utf8",
+  });
+  ok(getterProbe.status === 0 && !getterProbe.error,
+    `a guest that swaps the preamble's entry points for getters never runs them (${getterProbe.error?.message ?? getterProbe.stderr.trim()})`);
 
   // A guest that loops forever is interrupted instead of wedging the host thread.
   const spinner = await createSafeRealm({
