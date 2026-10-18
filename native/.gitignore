@@ -20,3 +20,6 @@
 # The shared loader script (WASM/host/slots.ts) this binary embeds, copied in by
 # `npm run build:native`.
 /loader.js
+
+# A compiled test binary (`go test -c`).
+*.test
