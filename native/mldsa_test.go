@@ -38,11 +38,11 @@ const mldsaSkBytes = 4032
 
 func newMlDsaSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
-	cm, err := rt.CompileModule(ctx, mldsaWasm)
+	cm, err := moduleRT.CompileModule(ctx, mldsaWasm)
 	if err != nil {
 		t.Fatal("mldsa65 test signer: compile:", err)
 	}
-	mod, err := rt.InstantiateModule(ctx, cm,
+	mod, err := moduleRT.InstantiateModule(ctx, cm,
 		wazero.NewModuleConfig().WithName("mldsa65-test-signer").WithStartFunctions())
 	if err != nil {
 		t.Fatal("mldsa65 test signer: instantiate:", err)
@@ -64,8 +64,6 @@ func newMlDsaSigner(t testing.TB) *mldsaSigner {
 // keypair derives an ML-DSA-65 key set from a 32-byte seed.
 func (s *mldsaSigner) keypair(t testing.TB, seed []byte) (pk, sk []byte) {
 	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.reset()
 	pkP, skP, seedP := s.alloc(mldsaPkBytes), s.alloc(mldsaSkBytes), s.put(seed)
 	r, err := s.keys.Call(ctx, uint64(pkP), uint64(skP), uint64(seedP))
@@ -88,8 +86,6 @@ func (s *mldsaSigner) signDetached(t testing.TB, msg, sk []byte) []byte {
 // included, since the ACVP vectors use both.
 func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.reset()
 	sigP, msgP := s.alloc(mldsaSigBytes), s.put(msg)
 	ctxP, rndP, skP := s.put(sctx), s.put(rnd), s.put(sk)
@@ -105,8 +101,6 @@ func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 // empty, so vectors with a context call the export directly, on the same module.
 func (s *mldsaSigner) verifyCtx(t testing.TB, sig, msg, sctx, pk []byte) bool {
 	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.reset()
 	sigP, msgP := s.put(sig), s.put(msg)
 	ctxP, pkP := s.put(sctx), s.put(pk)

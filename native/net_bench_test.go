@@ -3,7 +3,7 @@ package main
 // Network round-trip performance on the native binary: the transport bundle's
 // request/response over a real loopback socket, covering dial/accept, the AKE and record
 // layer (amortized: the warmup request establishes the link), routing, the TCP stream
-// (net.go), the Go-to-JS delivery boundary (sock.go), and the correlation/timeout layer.
+// (tcp.go), the Go-to-JS delivery boundary (net.go), and the correlation/timeout layer.
 // This is the wall-clock time around the crypto and RS work the other benches cover.
 //
 //   - BenchmarkNetRoundTrip: a tiny control-plane request (like seedstore's HAVE/OFFER);

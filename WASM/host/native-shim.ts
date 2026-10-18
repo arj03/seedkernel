@@ -216,11 +216,11 @@ function netCloseListeners(): void {
 }
 
 declare global {
-  /** A socket read arrived; routes to the channel's onData (sock.go). */
+  /** A socket read arrived; routes to the channel's onData (net.go). */
   var __netDeliver: (id: number, bytes: ArrayBuffer) => void;
-  /** A channel failed or closed remotely; routes to the RawLink's onClose (sock.go). */
+  /** A channel failed or closed remotely; routes to the RawLink's onClose (net.go). */
   var __netClosed: (id: number) => void;
-  /** A socket was accepted; routes to the port's accept callback (sock.go). */
+  /** A socket was accepted; routes to the port's accept callback (net.go). */
   var __netAccept: (port: number, id: number, remoteAddr: string) => void;
 }
 

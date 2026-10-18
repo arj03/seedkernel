@@ -41,11 +41,10 @@ func BenchmarkSodiumEd25519Verify(b *testing.B) {
 }
 
 func BenchmarkSodiumBlake2b64K(b *testing.B) {
-	s := benchSodium(b)
 	block := bytes.Repeat([]byte{0x5a}, 64*1024)
 	b.SetBytes(int64(len(block)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = s.genericHash(32, block, nil)
+		_ = genericHash(32, block, nil)
 	}
 }

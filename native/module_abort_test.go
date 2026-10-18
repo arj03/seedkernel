@@ -41,7 +41,7 @@ var abortingWasm = []byte{
 // the guest seam rejects (§12.2).
 func TestAbortShimTraps(t *testing.T) {
 	ensureBooted(t)
-	m, err := rt.Instantiate(ctx, abortingWasm)
+	m, err := moduleRT.Instantiate(ctx, abortingWasm)
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}

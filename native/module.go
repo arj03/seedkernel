@@ -32,8 +32,8 @@ type boundModule struct {
 }
 
 var (
-	// rt holds every installed app module and the env shims they import.
-	rt          wazero.Runtime
+	// moduleRT holds every installed app module and the env shims they import.
+	moduleRT    wazero.Runtime
 	moduleSlots = map[string]map[string]*boundModule{}
 	// modSeq names wazero instances (h1, h2, …) so two installs never collide.
 	modSeq = 0
@@ -91,11 +91,11 @@ func disarmModuleDeadline() {
 // bootModuleTable stands up the app module runtime and the imports it resolves.
 func bootModuleTable() error {
 	// WithCloseOnContextDone compiles in the check that enforces the §4.3 bound.
-	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
+	moduleRT = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
 		WithCloseOnContextDone(true))
 	// AssemblyScript's three imports, as the JS host resolves them. `seed` is a constant,
 	// `trace` drops its args, and `abort` traps (§4.2).
-	env := rt.NewHostModuleBuilder("env")
+	env := moduleRT.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, line, col uint32) {
 		panic(fmt.Sprintf("module abort at %d:%d", line, col))
 	}).Export("abort")
@@ -109,9 +109,9 @@ func bootModuleTable() error {
 
 // closeModuleTable releases the runtime, every instance and the slot map.
 func closeModuleTable() {
-	if rt != nil {
-		_ = rt.Close(ctx)
-		rt = nil
+	if moduleRT != nil {
+		_ = moduleRT.Close(ctx)
+		moduleRT = nil
 	}
 	moduleSlots = map[string]map[string]*boundModule{}
 }
@@ -184,7 +184,6 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 		}
 		return nil
 	}
-	// An empty response is a non-nil slice, distinct from failure (nil).
 	if len(r) == 0 {
 		return nil
 	}
@@ -195,6 +194,7 @@ func callModule(slot, module string, payload []byte, deadline time.Duration) []b
 	if int(outLen) > wipeLen {
 		wipeLen = int(outLen)
 	}
+	// An empty response is a non-nil slice, distinct from failure (nil).
 	out := make([]byte, outLen)
 	if len(out) > 0 {
 		b, ok := mem.Read(w.scratch, uint32(len(out)))
@@ -234,7 +234,7 @@ func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault
 
 // instantiateWasm compiles module bytes and binds their first instance.
 func instantiateWasm(wasm []byte, scratchDefault uint32, bindDeadline time.Duration) (*boundModule, error) {
-	cm, err := rt.CompileModule(ctx, wasm)
+	cm, err := moduleRT.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
@@ -255,7 +255,7 @@ func (w *boundModule) bind() error {
 	if w.bindDeadline >= 0 {
 		instCtx, cancel = context.WithTimeout(ctx, w.bindDeadline)
 	}
-	m, err := rt.InstantiateModule(instCtx, w.cmod, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
+	m, err := moduleRT.InstantiateModule(instCtx, w.cmod, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	cancel()
 	if err != nil {
 		return fmt.Errorf("instantiate: %w", err)

@@ -1,11 +1,10 @@
 // The driver for the no-import ML-DSA wasm module: instantiate, cross-check its widths,
-// and bump-allocate from its linear memory, rewound at the start of each op. Ops are
-// serialized by mu.
+// and bump-allocate from its linear memory, rewound at the start of each op. Ops run on
+// the loop goroutine, one at a time.
 package main
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -16,8 +15,7 @@ type wasmModule struct {
 	mod      api.Module
 	mem      api.Memory
 	heapBase uint32
-	top      uint32 // bump pointer over the module's own heap, valid only while mu is held
-	mu       sync.Mutex
+	top      uint32 // bump pointer over the module's own heap, valid for the op in progress
 	name     string
 }
 
@@ -51,7 +49,7 @@ func newWasmModule(rt wazero.Runtime, name string, wasm []byte, widths map[strin
 	return m
 }
 
-// reset rewinds the bump pointer. Call once at the top of every op, under mu.
+// reset rewinds the bump pointer. Call once at the top of every op.
 func (m *wasmModule) reset() { m.top = m.heapBase }
 
 // alloc sub-allocates n 16-aligned bytes, growing linear memory if needed.

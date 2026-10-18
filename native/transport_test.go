@@ -17,7 +17,7 @@ import (
 // dial/accept/promote/deliver path and the correlation/timeout layer, none of it Go code.
 //
 // Only WebSocket framing is exercised here, which covers the full WS path: the raw Go byte
-// stream (sock.go), the guest's WsFramer and the RFC 6455 codec in ws.wasm. The TCP
+// stream (tcp.go), the guest's WsFramer and the RFC 6455 codec in ws.wasm. The TCP
 // counterpart is asyncnet_test, and scripts/native-interop.sh covers both against real
 // node/bun nodes.
 //

@@ -172,12 +172,16 @@ func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 	return el.stepTimer.C
 }
 
-// callJS invokes a retained JS callback with no arguments (timer / deferred work).
-func (el *eventLoop) callJS(cb *qjs.Value) {
-	res, err := el.c.Invoke(cb, el.c.NewUndefined())
+// dispatch calls a retained JS callback and frees its result and `args`. A throw is the
+// callback's own failure, so it is logged under `who`, not returned.
+func dispatch(c *qjs.Context, who string, cb *qjs.Value, args ...*qjs.Value) {
+	res, err := c.Invoke(cb, c.NewUndefined(), args...)
 	res.Free()
+	for _, a := range args {
+		a.Free()
+	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "eventLoop: callback error:", err)
+		fmt.Fprintln(os.Stderr, who+":", err)
 	}
 }
 
@@ -190,7 +194,7 @@ func (el *eventLoop) step() {
 	for len(el.timers) > 0 && !el.timers[0].deadline.After(now) {
 		t := heap.Pop(&el.timers).(*jsTimer)
 		delete(el.byID, t.id)
-		el.callJS(t.cb)
+		dispatch(el.c, "eventLoop: callback error", t.cb)
 		t.cb.Free()
 		el.pumpAll()
 		if el.stopped {

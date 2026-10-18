@@ -86,7 +86,7 @@ type authorKeys struct {
 func (a authorKeys) id() []byte {
 	pre := append(domainManifestAuthor(), manifestSuite())
 	pre = append(append(pre, a.edPub...), a.mlPk...)
-	return sd.genericHash(32, pre, nil)
+	return genericHash(32, pre, nil)
 }
 
 // testAuthor creates a fresh author identity, per test, so freshness marks (keyed by
@@ -119,8 +119,8 @@ var (
 
 func testSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
-	if signerCache == nil || signerCacheRt != rt {
-		signerCache, signerCacheRt = newMlDsaSigner(t), rt
+	if signerCache == nil || signerCacheRt != moduleRT {
+		signerCache, signerCacheRt = newMlDsaSigner(t), moduleRT
 	}
 	return signerCache
 }
@@ -189,7 +189,7 @@ func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, m
 		body = append(body, part...)
 	}
 	pre := append(domainManifest(), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), sd.genericHash(32, body, nil)...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), genericHash(32, body, nil)...)
 	env := append([]byte{manifestSuite()}, a.edPub...)
 	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)

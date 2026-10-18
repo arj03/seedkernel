@@ -1,255 +1,307 @@
-// The TCP socket primitive: a raw byte duplex (sockChannel) with no message boundaries.
-// Framing, handshake and routing are the transport bundle's, reached via __net (sock.go).
+// The socket primitive exposed to QuickJS as `__net`. Reader goroutines hand each read to
+// el.post, and the loop delivers it through the __netDeliver/__netClosed/__netAccept
+// dispatchers defined in host/native-shim.ts.
 package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
-	"runtime"
+	"strconv"
 	"sync"
 	"time"
+
+	"seedkernel/qjs"
 )
 
-// tcpKeepAlive reclaims a socket whose peer vanished without a FIN.
-const tcpKeepAlive = 30 * time.Second
+// acceptErrBackoff paces the accept loop after a non-fatal error such as EMFILE.
+const acceptErrBackoff = 20 * time.Millisecond
 
-// silentReadTimeout bounds a connection that never sends a byte, before any transport
-// deadline can arm. The first read clears it; after that the transport owns idleness.
-// A var so tests can shrink it.
-var silentReadTimeout = 30 * time.Second
+type netHost struct {
+	el *eventLoop
+	qc *qjs.Context
 
-// dialTCP dials with kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables
-// autotuning.
-func dialTCP(addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: tcpKeepAlive}
-	return d.DialContext(context.Background(), "tcp", addr)
+	mu        sync.Mutex
+	chans     map[int64]*sockChannel
+	nextID    int64
+	listeners []net.Listener
+	// Set by close, releasing readers parked on the staging allowance.
+	closed bool
+
+	// Installed by host/native-shim.ts before any socket opens.
+	maxLiveChannels      int
+	closeGrace           time.Duration
+	maxInboundReadBytes  int
+	maxInboundReadSlices int
+
+	// Staging custody: reads posted to the loop but not yet handed to TransportHost.
+	inboundReadBytes  int
+	inboundReadSlices int
+	readSpace         *sync.Cond // signalled as staging custody is released
+
+	fnDeliver *qjs.Value
+	fnClosed  *qjs.Value
+	fnAccept  *qjs.Value
 }
 
-// ───────────────────────── RawLink: a byte duplex ──────────────────────────────
+// exposeNet installs `__net`, shaped into RawLinks by host/native-shim.ts.
+func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
+	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
+	o := qc.NewObject()
 
-// sockChannel is a RawLink (services/socket-seam.ts): each delivery is an arbitrary slice
-// of the stream, borrowed only for the onMsg call. It owns one socket, a reader and a
-// writer goroutine. send only queues, so a peer that stops draining never blocks the loop
-// goroutine; the FIFO also buffers pre-connect sends.
-type sockChannel struct {
-	onMsg   func([]byte) bool // false: the read can never fit the staging allowance
-	onClose func()
+	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		maxLive := int(args[0].Int64())
+		grace := time.Duration(args[1].Int64()) * time.Millisecond
+		maxInboundBytes := int(args[2].Int64())
+		maxInboundSlices := int(args[3].Int64())
+		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
+			return nil, errors.New("net: invalid socket limits")
+		}
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.maxLiveChannels != 0 || n.closeGrace != 0 ||
+			n.maxInboundReadBytes != 0 || n.maxInboundReadSlices != 0 {
+			return nil, errors.New("net: socket limits already installed")
+		}
+		n.maxLiveChannels = maxLive
+		n.closeGrace = grace
+		n.maxInboundReadBytes = maxInboundBytes
+		n.maxInboundReadSlices = maxInboundSlices
+		return qc.NewUndefined(), nil
+	}))
 
-	mu         sync.Mutex
-	conn       net.Conn // set once, under mu, before the reader/writer start
-	queue      [][]byte // sends awaiting the writer, in order
-	queued     int      // bytes held in queue, reported by buffered()
-	dead       bool
-	closeGrace time.Duration
-
-	wake     chan struct{} // cap 1: nudges the writer; coalesces bursts
-	readGate chan struct{} // one token permits one socket read
+	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		addr := net.JoinHostPort(args[0].String(), strconv.Itoa(int(args[1].Int32())))
+		return qc.NewInt64(n.dial(addr)), nil
+	}))
+	o.SetPropertyStr("listen", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		bound, err := n.listen(args[0].String(), int(args[1].Int32()))
+		if err != nil {
+			return nil, err
+		}
+		return qc.NewInt32(int32(bound)), nil
+	}))
+	// No answer: the driver has already charged these bytes (sockChannel.send).
+	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
+			// A copy, not a View: the bytes outlive this turn in the send queue.
+			if b, err := args[1].Bytes(); err == nil {
+				ch.send(b)
+			}
+		}
+		return nil, nil
+	}))
+	o.SetPropertyStr("buffered", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
+			return qc.NewInt64(int64(ch.buffered())), nil
+		}
+		return qc.NewInt64(0), nil
+	}))
+	o.SetPropertyStr("resume", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		if ch := n.get(args[0].Int64()); ch != nil {
+			ch.resume()
+		}
+		return nil, nil
+	}))
+	o.SetPropertyStr("closeListeners", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		n.closeListeners()
+		return nil, nil
+	}))
+	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		// A deliberate close never fires onClose, so the entry is dropped here.
+		id := args[0].Int64()
+		if ch := n.get(id); ch != nil {
+			graceful := len(args) >= 2 && args[1].Int32() != 0
+			ch.close(graceful)
+			n.mu.Lock()
+			delete(n.chans, id)
+			n.mu.Unlock()
+		}
+		return nil, nil
+	}))
+	qc.Global().SetPropertyStr("__net", o)
+	return n
 }
 
-func newReadGate() chan struct{} {
-	gate := make(chan struct{}, 1)
-	gate <- struct{}{} // the first read may start immediately
-	return gate
+// retain picks up the dispatchers host/native-shim.ts defines when the bundle evaluates.
+func (n *netHost) retain() error {
+	g := n.qc.Global()
+	n.fnDeliver = g.GetPropertyStr("__netDeliver")
+	n.fnClosed = g.GetPropertyStr("__netClosed")
+	n.fnAccept = g.GetPropertyStr("__netAccept")
+	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
+		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
+	}
+	return nil
 }
 
-// newDialChannel returns a channel that connects in the background; sends queue until then.
-func newDialChannel(addr string, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
-		wake: make(chan struct{}, 1), readGate: newReadGate()}
+func (n *netHost) get(id int64) *sockChannel {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.chans[id]
+}
+
+// waitSpace is built lazily, so a zero-value netHost works; called under mu.
+func (n *netHost) waitSpace() *sync.Cond {
+	if n.readSpace == nil {
+		n.readSpace = sync.NewCond(&n.mu)
+	}
+	return n.readSpace
+}
+
+// reserveInboundRead charges a read to the staging allowance (§16.1) before it is posted.
+// A full window parks the reader, so backpressure reaches the peer through TCP; only a
+// read that can never fit is refused.
+func (n *netHost) reserveInboundRead(length int) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if length < 0 || length > n.maxInboundReadBytes || n.maxInboundReadSlices <= 0 {
+		return false
+	}
+	for !n.closed && (n.inboundReadSlices >= n.maxInboundReadSlices ||
+		length > n.maxInboundReadBytes-n.inboundReadBytes) {
+		n.waitSpace().Wait()
+	}
+	if n.closed {
+		return false
+	}
+	n.inboundReadSlices++
+	n.inboundReadBytes += length
+	return true
+}
+
+func (n *netHost) releaseInboundRead(length int) {
+	n.mu.Lock()
+	n.inboundReadSlices--
+	n.inboundReadBytes -= length
+	n.waitSpace().Broadcast()
+	n.mu.Unlock()
+}
+
+// allocInbound mints an id for an accepted socket, refusing at maxLiveChannels.
+func (n *netHost) allocInbound() (int64, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.chans) >= n.maxLiveChannels {
+		return 0, false
+	}
+	n.nextID++
+	return n.nextID, true
+}
+
+// dial opens an outbound byte duplex that JS can send on before it connects.
+func (n *netHost) dial(addr string) int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.nextID++
+	id := n.nextID
+	n.chans[id] = newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
+	return id
+}
+
+// listen accepts inbound byte duplexes. Each reader starts only after __netAccept has
+// made the JS channel it delivers to.
+func (n *netHost) listen(host string, port int) (int, error) {
+	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
+	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return 0, err
+	}
+	bound := ln.Addr().(*net.TCPAddr).Port
+	n.mu.Lock()
+	n.listeners = append(n.listeners, ln)
+	n.mu.Unlock()
 	go func() {
-		conn, err := dialTCP(addr)
-		if err != nil {
-			c.fail()
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				// Descriptor exhaustion or an early reset: pause and keep serving.
+				time.Sleep(acceptErrBackoff)
+				continue
+			}
+			id, ok := n.allocInbound()
+			if !ok {
+				conn.Close()
+				continue
+			}
+			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
+			// The IP alone: the transport's half-open budget groups by source IP.
+			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+			n.mu.Lock()
+			n.chans[id] = ch
+			n.mu.Unlock()
+			n.el.post(func() {
+				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(id), n.qc.NewString(remoteAddr))
+				go ch.readLoop()
+			})
 		}
-		c.mu.Lock()
-		if c.dead { // closed before the dial landed
-			c.mu.Unlock()
-			conn.Close()
-			return
-		}
-		c.conn = conn
-		c.mu.Unlock()
-		go c.writeLoop()
-		c.readLoop()
 	}()
-	return c
+	return bound, nil
 }
 
-// newInboundChannel wraps an accepted socket; the caller starts readLoop once the JS
-// channel is registered.
-func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
-		wake: make(chan struct{}, 1), readGate: newReadGate()}
-	go c.writeLoop()
-	return c
-}
-
-// send queues bytes for the writer and takes ownership of them. A send on a dead channel
-// is dropped. There is no refusal here: `LinkOutboundOwner` (host/transport-host.ts)
-// bounds a link against buffered() before it sends.
-func (c *sockChannel) send(bytes []byte) {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.queue = append(c.queue, bytes)
-	c.queued += len(bytes)
-	c.mu.Unlock()
-	c.signal()
-	// Let the woken writer put the frame on the wire now (~10% round-trip latency).
-	runtime.Gosched()
-}
-
-// buffered is the bytes accepted by send whose conn.Write has not completed.
-func (c *sockChannel) buffered() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.queued
-}
-
-// resume returns the read token, once a delivery's realm turn has settled; until then
-// excess bytes stay in the socket's receive window.
-func (c *sockChannel) resume() {
-	c.wakeReader()
-}
-
-// waitReadable parks for the read token and reports whether the channel is still alive.
-func (c *sockChannel) waitReadable() bool {
-	<-c.readGate
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return !c.dead
-}
-
-func (c *sockChannel) wakeReader() {
-	select {
-	case c.readGate <- struct{}{}:
-	default:
+// closeListeners closes every bound listener, ending its accept goroutine.
+func (n *netHost) closeListeners() {
+	n.mu.Lock()
+	lns := n.listeners
+	n.listeners = nil
+	n.mu.Unlock()
+	for _, ln := range lns {
+		ln.Close()
 	}
 }
 
-// signal nudges the writer without blocking; a spurious wake is harmless.
-func (c *sockChannel) signal() {
-	select {
-	case c.wake <- struct{}{}:
-	default:
+// close tears the network down with its realm: every listener and channel, hard, without
+// firing onClose.
+func (n *netHost) close() {
+	n.closeListeners()
+	n.mu.Lock()
+	chans := n.chans
+	n.chans = map[int64]*sockChannel{}
+	n.mu.Unlock()
+	// Kill channels before releasing parked readers, so a woken reader finds its own dead.
+	for _, ch := range chans {
+		ch.close(false)
 	}
+	n.mu.Lock()
+	n.closed = true
+	n.waitSpace().Broadcast()
+	n.mu.Unlock()
 }
 
-// writeLoop is the channel's sole writer, draining the queue in order. It exits once the
-// channel is dead and the queue empty; a graceful close leaves the queue to flush under
-// closeGrace.
-func (c *sockChannel) writeLoop() {
-	for {
-		c.mu.Lock()
-		if len(c.queue) == 0 {
-			if c.dead {
-				c.mu.Unlock()
-				c.conn.Close()
-				return
-			}
-			c.mu.Unlock()
-			<-c.wake
-			continue
+// onMsg/onClose run on a reader goroutine and hand the work to the loop goroutine.
+func (n *netHost) onMsg(id int64) func([]byte) bool {
+	return func(b []byte) bool {
+		if !n.reserveInboundRead(len(b)) {
+			return false
 		}
-		// Take the whole backlog, for one writev.
-		batch := c.queue
-		c.queue = nil
-		c.mu.Unlock()
-		n := c.writeMsgs(batch)
-		c.mu.Lock()
-		// The batch counts in buffered() until written. A hard close may already have
-		// zeroed it.
-		if c.queued >= n {
-			c.queued -= n
-		}
-		c.mu.Unlock()
+		// b is the reader's buffer, borrowed: the spent read token keeps the next read
+		// from overwriting it before the task copies it.
+		n.el.post(func() {
+			// Staging custody ends once __netDeliver has handed off, however it returns.
+			defer n.releaseInboundRead(len(b))
+			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
+		})
+		return true
 	}
 }
 
-// terminate is the channel's one dead transition; the first of close/fail wins. flush
-// leaves the queue to drain under closeGrace; notify fires onClose, for the error path.
-func (c *sockChannel) terminate(flush, notify bool) {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	// Before connect no writer will start, so nothing flushes.
-	if !flush || c.conn == nil {
-		c.queue, c.queued = nil, 0
-	}
-	conn := c.conn
-	c.mu.Unlock()
-	// A nil conn is a dial in flight, which closes its conn on seeing dead.
-	if conn != nil {
-		if flush {
-			conn.SetWriteDeadline(time.Now().Add(c.closeGrace))
-		} else {
-			conn.Close() // also unblocks a writer mid-Write
-		}
-	}
-	c.signal()
-	c.wakeReader()
-	if notify {
-		c.onClose()
+func (n *netHost) onClose(id int64) func() {
+	return func() {
+		n.el.post(func() {
+			// Dropped first, so a close from the JS handler is a no-op.
+			n.mu.Lock()
+			delete(n.chans, id)
+			n.mu.Unlock()
+			n.invoke(n.fnClosed, n.qc.NewInt64(id))
+		})
 	}
 }
 
-func (c *sockChannel) close(graceful bool) { c.terminate(graceful, false) }
-func (c *sockChannel) fail()               { c.terminate(false, true) }
-
-// writeMsgs writes a batch verbatim and returns its byte total.
-func (c *sockChannel) writeMsgs(batch [][]byte) int {
-	total := 0
-	for _, b := range batch {
-		total += len(b)
-	}
-	if len(batch) == 1 {
-		if _, err := c.conn.Write(batch[0]); err != nil {
-			c.fail()
-		}
-		return total
-	}
-	// net.Buffers consumes the slice header; the batch already left the queue.
-	bufs := net.Buffers(batch)
-	if _, err := bufs.WriteTo(c.conn); err != nil {
-		c.fail()
-	}
-	return total
-}
-
-func (c *sockChannel) readLoop() {
-	chunk := make([]byte, 64<<10)
-	conn := c.conn
-	conn.SetReadDeadline(time.Now().Add(silentReadTimeout))
-	spoke := false
-	for {
-		if !c.waitReadable() {
-			return
-		}
-		n, err := conn.Read(chunk)
-		if n > 0 {
-			if !spoke {
-				spoke = true
-				conn.SetReadDeadline(time.Time{})
-			}
-			// onMsg charges the §12.6 staging allowance, stalling while it is full; false
-			// means the read can never fit.
-			if !c.onMsg(chunk[:n]) {
-				c.fail()
-				return
-			}
-		} else if err == nil {
-			// No delivery, so no realm turn returns the token.
-			c.resume()
-		}
-		if err != nil {
-			c.fail()
-			return
-		}
-	}
+// invoke calls a retained JS dispatcher and frees the arguments.
+func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
+	dispatch(n.qc, "netHost: dispatcher error", fn, args...)
 }

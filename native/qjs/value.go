@@ -84,11 +84,6 @@ func (c *Context) NewInt32(v int32) *Value {
 }
 func (c *Context) NewInt64(v int64) *Value { return c.callV("QJS_NewInt64", c.handle, uint64(v)) }
 
-// NewFloat64 makes a JS number; it crosses as bits, keeping the ABI integer-only.
-func (c *Context) NewFloat64(v float64) *Value {
-	return c.callV("QJS_NewFloat64", c.handle, math.Float64bits(v))
-}
-
 // NewString makes a JS string from s; it crosses with its length, so NULs survive.
 func (c *Context) NewString(s string) *Value {
 	ptr := c.rt.writeCStr(s)

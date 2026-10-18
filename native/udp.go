@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,9 +30,8 @@ const udpHeldMax = 4 << 20
 const udpSocketBuffer = 4 << 20
 
 type udpHost struct {
-	el  *eventLoop
-	qc  *qjs.Context
-	und *qjs.Value
+	el *eventLoop
+	qc *qjs.Context
 
 	mu     sync.Mutex
 	socks  map[int64]*udpSock
@@ -52,7 +50,7 @@ type udpSock struct {
 
 // exposeUdp installs `__udp`.
 func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
-	u := &udpHost{el: el, qc: qc, und: qc.NewUndefined(), socks: map[int64]*udpSock{}}
+	u := &udpHost{el: el, qc: qc, socks: map[int64]*udpSock{}}
 	o := qc.NewObject()
 	o.SetPropertyStr("bind", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// Go binds [::] dual-stack where the machine has IPv6, and 0.0.0.0 where it has not.
@@ -174,15 +172,7 @@ func (u *udpHost) deliver(id int64, s *udpSock) {
 	if u.get(id) == nil {
 		return
 	}
-	args := []*qjs.Value{u.qc.NewInt64(id), u.qc.NewArrayBuffer(batch)}
-	res, err := u.qc.Invoke(u.fnDeliver, u.und, args...)
-	res.Free()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "udpHost: dispatcher error:", err)
-	}
-	for _, a := range args {
-		a.Free()
-	}
+	dispatch(u.qc, "udpHost: dispatcher error", u.fnDeliver, u.qc.NewInt64(id), u.qc.NewArrayBuffer(batch))
 }
 
 // close tears the sockets down with their realm.

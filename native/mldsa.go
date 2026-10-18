@@ -50,8 +50,6 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 	if len(sig) != mldsaSigBytes || len(pk) != mldsaPkBytes {
 		return false
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	m.reset()
 	sigP, msgP, pkP := m.put(sig), m.put(msg), m.put(pk)

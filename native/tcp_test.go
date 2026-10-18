@@ -1,6 +1,6 @@
 package main
 
-// Direct tests for sockChannel (net.go/sock.go): the outbound queue and its accounting,
+// Direct tests for sockChannel (tcp.go/net.go): the outbound queue and its accounting,
 // the close-vs-fail split, and the dial lifecycle, which the end-to-end transport tests
 // cannot reach (a deliberate close mid-flush, the dial races).
 //

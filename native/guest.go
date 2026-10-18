@@ -6,7 +6,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"seedkernel/qjs"
@@ -504,12 +503,7 @@ func (g *guestRealm) takeCall(id int64) *initiatorCall {
 
 // reportCall hands one result to a host-realm callback and frees `arg`; `cb` is borrowed.
 func (g *guestRealm) reportCall(cb *qjs.Value, arg *qjs.Value) {
-	res, err := g.hostQc.Invoke(cb, g.hostQc.NewUndefined(), arg)
-	arg.Free()
-	res.Free()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "guest: call settlement error:", err)
-	}
+	dispatch(g.hostQc, "guest: call settlement error", cb, arg)
 	// The reaction is a host microtask queued after this round's host pump.
 	g.loop.wake()
 }
