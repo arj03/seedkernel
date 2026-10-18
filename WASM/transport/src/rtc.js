@@ -89,7 +89,9 @@ class Rtc {
   /** Negotiations that have not produced an authenticated link; the cap counts these. */
   pending() {
     let n = 0;
-    for (const e of this.byPeer.values()) if (!authedData(e)) n++;
+    for (const e of this.byPeer.values()) {
+      if (!authedData(e)) n++;
+    }
     return n;
   }
 
@@ -101,7 +103,9 @@ class Rtc {
   async upgrade(peer, schemes = SCHEMES) {
     if (!this.weOffer(peer) || this.byPeer.has(peer) || router.hasDirect(peer)) return;
     const sid = toHex(await randomBytes(SID_LEN));
-    for (const scheme of schemes) if (await this.open(peer, true, sid, scheme)) return;
+    for (const scheme of schemes) {
+      if (await this.open(peer, true, sid, scheme)) return;
+    }
   }
 
   signal(peer, tag, sid, text) {
@@ -195,9 +199,10 @@ class Rtc {
     });
   }
 
+  /** End a negotiation this end gave up on. It leaves `byCtl` at once, so a data link it
+   *  announced meanwhile is closed (`bindData`) rather than run on a closing channel. */
   drop(e) {
-    e.gone = true;
-    if (this.byPeer.get(e.peer) === e) this.byPeer.delete(e.peer);
+    this.gone(e);
     if (e.ctl !== 0) netLinkClose(e.ctl, false);
   }
 

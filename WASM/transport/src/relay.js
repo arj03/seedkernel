@@ -70,6 +70,11 @@ function relayAuthority(origin) {
   return origin.slice(origin.indexOf("://") + 3).replace(/:(?:80|443)$/, "");
 }
 
+/** The splice socket the relay at `origin` joins under `ticket`. */
+function spliceDest(origin, ticket) {
+  return origin + RELAY_WIRE + "?splice=" + toHex(ticket);
+}
+
 /** One control socket to a relay, registered under this node's key. */
 class RelayConn {
   constructor(origin) {
@@ -213,14 +218,20 @@ class Relays {
     if (origin) await this.dialHome();
   }
 
-  async dialHome() {
-    let c = this.conns.get(this.home);
+  /** The one socket to the relay at `origin`, dialed if there is none. A dial that fails
+   *  leaves it gone, so its `ready` answers false. */
+  async conn(origin) {
+    let c = this.conns.get(origin);
     if (!c) {
-      c = new RelayConn(this.home);
-      this.conns.set(this.home, c);
+      c = new RelayConn(origin);
+      this.conns.set(origin, c);
       await c.open();
     }
-    await c.ready();
+    return c;
+  }
+
+  async dialHome() {
+    await (await this.conn(this.home)).ready();
   }
 
   /** Close a relay socket. */
@@ -256,17 +267,12 @@ class Relays {
    *  opened: the relay refuses a socket whose ticket it has not heard, which is also how a
    *  call to a key it cannot reach fails without waiting. */
   async call(peer, origin) {
-    let c = this.conns.get(origin);
-    if (!c) {
-      c = new RelayConn(origin);
-      this.conns.set(origin, c);
-      if (!(await c.open())) return { linkId: 0 };
-    }
+    const c = await this.conn(origin);
     if (!(await c.ready())) return { linkId: 0 };
     c.touch();
     const ticket = await randomBytes(TICKET_LEN);
     if (!(await c.send(concatBytes([Uint8Array.of(R_CALL), fromHex(peer), ticket])))) return { linkId: 0 };
-    const dest = origin + RELAY_WIRE + "?splice=" + toHex(ticket);
+    const dest = spliceDest(origin, ticket);
     return { ...(await netLinkOpen(dest)), dest };
   }
 
@@ -278,7 +284,7 @@ class Relays {
   async accept(origin, from, ticket) {
     if (admitPeers !== null && !admitPeers.has(from)) return;
     if ((core.limiter.perSource.get(from) || 0) >= core.limiter.maxPerSource) return;
-    const dest = origin + RELAY_WIRE + "?splice=" + toHex(ticket);
+    const dest = spliceDest(origin, ticket);
     const opened = await netLinkOpen(dest);
     if (opened.linkId === 0) return;
     const welcome = welcomed.has(from);

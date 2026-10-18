@@ -273,7 +273,9 @@ class Core {
     this.addrs.delete(peerId);
     for (const link of [...(this.connecting.get(peerId) || [])]) link.abort();
     const pool = router.pools.get(peerId);
-    if (pool) for (const link of [...pool.links, ...pool.held]) link.close();
+    if (pool) {
+      for (const link of [...pool.links, ...pool.held]) link.close();
+    }
     // A peer connection still being negotiated has no data link to close it.
     const e = rtc.byPeer.get(peerId);
     if (e && e.data === null) rtc.drop(e);
@@ -426,8 +428,6 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 // an app (its id), which may only name APP_OPS. Ops whose answer comes in a later
 // invocation use `defer()`, so they do not hold the realm's queue (realm-queue.ts).
 
-const NOTHING = new Uint8Array(0);
-
 // Answer on a later turn; `__deferred` tells the host the realm is free.
 const defer = () => {
   let settle, fail;
@@ -451,7 +451,7 @@ function handle(argBytes) {
   if (!fn) throw new Error("transport: no op '" + op + "'");
   // The caller id is written by the host, so this is a real boundary.
   if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
-  return fn(r, caller) || NOTHING;
+  return fn(r, caller) || EMPTY;
 }
 
 /** The realm's wake (§12.3): walk the deadlines (`onWake`). */
@@ -482,7 +482,7 @@ entry("linkOpen", (r) => {
 entry("linkBytes", async (r) => {
   const link = linksById.get(r.u32());
   if (link) await link.onWire(r.blob());
-  return NOTHING; // an async op bypasses `handle`'s `|| NOTHING`
+  return EMPTY; // an async op bypasses `handle`'s `|| EMPTY`
 });
 
 /** The socket closed. Answers `[severity u8][reason utf8]` (`closeReason`, ake.js), once
@@ -490,7 +490,7 @@ entry("linkBytes", async (r) => {
 entry("linkClosed", (r) => {
   const linkId = r.u32();
   const link = linksById.get(linkId);
-  if (!link) return NOTHING;
+  if (!link) return EMPTY;
   link.onChannelClosed();
   linksById.delete(linkId);
   const why = link.closeReason;
