@@ -149,9 +149,6 @@ type CryptoName = `crypto/${HostTransformName}`;
 /** Argument bytes in, response bytes out, inline or async. */
 type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
-/** A resolved name: its answer, or a Promise of it. */
-type Route = SeamHandler;
-
 /** The host crypto transforms (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
@@ -463,7 +460,7 @@ const SERVICES: {
  *  rejected tag still did the work. Not `budget.charge`: this paces self-initiated work,
  *  it is not the realm's segment (§4.3). Only wakes carry a clock, so the frame path pays
  *  nothing. */
-function charged(fn: SeamHandler): Route {
+function charged(fn: SeamHandler): SeamHandler {
   return (payload, budget) => {
     const owner = budget.causalClock;
     if (owner === undefined) return fn(payload, budget);
@@ -486,7 +483,7 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
   }
   // Every reachable name. Install keeps modules, local ids and host names disjoint
   // (bundle.ts), so insertion order does not matter.
-  const routes = new Map<string, Route>();
+  const routes = new Map<string, SeamHandler>();
   const addHost = (handlers: Record<string, SeamHandler>) => {
     for (const [name, fn] of Object.entries(handlers)) routes.set(name, charged(fn));
   };

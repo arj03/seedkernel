@@ -199,22 +199,6 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
   };
 }
 
-function netConnectRaw(host: string, port: number): RawLink {
-  return makeGoLink(__net.connect(host, port));
-}
-
-function netListenRaw(host: string, port: number, onAccept: (s: RawLink) => void): number {
-  const bound = __net.listen(host, port);
-  netAccepts.set(bound, (id, remoteAddr) => onAccept(makeGoLink(id, remoteAddr)));
-  return bound;
-}
-
-function netCloseListeners(): void {
-  __net.closeListeners();
-  // Every accept callback is dead now; drop them so they can be collected.
-  netAccepts.clear();
-}
-
 declare global {
   /** A socket read arrived; routes to the channel's onData (net.go). */
   var __netDeliver: (id: number, bytes: ArrayBuffer) => void;
@@ -330,12 +314,19 @@ const goChannels: ChannelFactory = {
     const d = parseDest(dest);
     if (!d || d.scheme === "wss")
       return null;
-    return netConnectRaw(d.host, d.port);
+    return makeGoLink(__net.connect(d.host, d.port));
   },
-  listen: (addrs, onAccept) => Promise.resolve(addrs.map((a) =>
-    netListenRaw(a.host, a.port, (s) => onAccept(s, { listener: a.label })))),
-  // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
-  close: () => { netCloseListeners(); },
+  listen: (addrs, onAccept) => Promise.resolve(addrs.map((a) => {
+    const bound = __net.listen(a.host, a.port);
+    netAccepts.set(bound, (id, remoteAddr) => onAccept(makeGoLink(id, remoteAddr), { listener: a.label }));
+    return bound;
+  })),
+  // Close the bound listeners (and, in Go, their accept goroutines) on teardown. Every
+  // accept callback is dead then; drop them so they can be collected.
+  close: () => {
+    __net.closeListeners();
+    netAccepts.clear();
+  },
 };
 /** A node's sockets on this platform: Go's TCP, and the UDP path over Go's datagrams. A
  *  factory per node, since a UDP factory keeps the one node's accept sink. */

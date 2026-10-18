@@ -7,7 +7,7 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { errMessage } from "./util.js";
-import { type Arrival, type ListenAddress, type RawLink } from "./socket-seam.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
 import { TCP_LINGER_MS } from "./net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
@@ -66,11 +66,8 @@ function listenOn(server: TcpServer, opt: ListenAddress): Promise<number> {
 
 // The node:net ChannelFactory: every socket the transport driver opens or accepts is
 // created here, as a RawLink.
-export class NodeChannelFactory {
+export class NodeChannelFactory implements ChannelFactory {
   private readonly servers: TcpServer[] = [];
-  /** Takes no crypto: the transport bundle makes the WebSocket client key and frame masks
-   *  itself, with entropy from `crypto/random`. */
-  constructor() {}
   /** Dial TCP-backed destinations; `wss://` is unsupported because this factory has no TLS. */
   connect(dest: string): RawLink | null {
     const d = parseDest(dest);

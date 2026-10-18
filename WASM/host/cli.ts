@@ -240,8 +240,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   let routes = new Map<string, boolean>();
   const onStatus = (s: TransportStatus) => {
     const now = new Map(s.linked.map((l) => [toHex(l.key), l.direct] as const));
-    for (const [k, direct] of now) if (routes.get(k) !== direct) host.log(`  link   ${k} ${direct ? "direct" : "relayed"}`);
-    for (const k of routes.keys()) if (!now.has(k)) host.log(`  link   ${k} gone`);
+    for (const [k, direct] of now) {
+      if (routes.get(k) !== direct) host.log(`  link   ${k} ${direct ? "direct" : "relayed"}`);
+    }
+    for (const k of routes.keys()) {
+      if (!now.has(k)) host.log(`  link   ${k} gone`);
+    }
     routes = now;
   };
 

@@ -295,7 +295,11 @@ class UdpNegotiation implements RawLink {
   private onMapped(addr: string): void {
     this.addOwn(addr);
     this.mapped.push(addr);
-    if (this.hard()) for (const m of this.mapped) this.addOwn(`${m.slice(0, m.lastIndexOf(":"))}:*`);
+    if (this.hard()) {
+      for (const m of this.mapped) {
+        this.addOwn(`${m.slice(0, m.lastIndexOf(":"))}:*`);
+      }
+    }
     this.birthday();
   }
 
@@ -313,9 +317,12 @@ class UdpNegotiation implements RawLink {
     return p;
   }
 
-  /** Whether `echoed` is this end's challenge, so an ack answers a probe this end sent. */
-  private echoes(echoed: Uint8Array): boolean {
-    for (let i = 0; i < 8; i++) if (echoed[i] !== this.challenge[i]) return false;
+  /** Whether `echoed` is `challenge`, by default this end's own, so an ack answers a probe
+   *  this end sent. */
+  private echoes(echoed: Uint8Array, challenge: Uint8Array = this.challenge): boolean {
+    for (let i = 0; i < 8; i++) {
+      if (echoed[i] !== challenge[i]) return false;
+    }
     return true;
   }
 
@@ -328,7 +335,11 @@ class UdpNegotiation implements RawLink {
       for (const c of this.peerCandidates) this.socket?.send(p, c.port, c.host);
       if (this.spraying && this.sprayed < SPRAY_MAX) {
         const ports = crypto.getRandomValues(new Uint16Array(SPRAY_EACH));
-        for (const host of this.peerHard) for (const r of ports) this.socket?.send(p, SPRAY_LOW + (r % SPRAY_PORTS), host);
+        for (const host of this.peerHard) {
+          for (const r of ports) {
+            this.socket?.send(p, SPRAY_LOW + (r % SPRAY_PORTS), host);
+          }
+        }
         this.sprayed += SPRAY_EACH * this.peerHard.length;
       }
       if (++this.rounds * PROBE_MS === BIRTHDAY_AFTER_MS) this.birthday();
@@ -379,7 +390,9 @@ class UdpNegotiation implements RawLink {
       return;
     }
     if (p.length < PATH_HEADER) return;
-    for (let i = 0; i < TOKEN; i++) if (p[1 + i] !== this.token[i]) return;
+    for (let i = 0; i < TOKEN; i++) {
+      if (p[1 + i] !== this.token[i]) return;
+    }
     if (p[0] === TYPE_PROBE) {
       if (p.length !== PROBE_BYTES) return;
       this.peerToken ??= p.slice(1 + TOKEN, 1 + 2 * TOKEN);
@@ -429,7 +442,7 @@ class UdpNegotiation implements RawLink {
   private moved(host: string, port: number, echoed: Uint8Array): void {
     const m = this.moving;
     if (!m || m.addr.host !== host || m.addr.port !== port || m.heard < this.pathHeard) return;
-    for (let i = 0; i < 8; i++) if (echoed[i] !== m.challenge[i]) return;
+    if (!this.echoes(echoed, m.challenge)) return;
     this.moving = null;
     this.path = m.addr;
     this.pathHeard = m.heard;
@@ -496,7 +509,9 @@ class UdpNegotiation implements RawLink {
   /** Close every socket but `keep`, which is the path's from now on, and return the birthday
    *  sockets to the node-wide budget. */
   private keepOnly(keep: DatagramSocket | null): void {
-    for (const s of [this.socket, ...this.extra ?? []]) if (s !== keep) s?.close();
+    for (const s of [this.socket, ...this.extra ?? []]) {
+      if (s !== keep) s?.close();
+    }
     this.socket = keep;
     this.extra = [];
     if (this.reservedExtra > 0) { this.freeSockets(this.reservedExtra); this.reservedExtra = 0; }

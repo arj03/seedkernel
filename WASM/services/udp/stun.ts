@@ -28,7 +28,9 @@ export function mappedAddress(msg: Uint8Array, txn: Uint8Array): string | null {
   if (!isStun(msg)) return null;
   const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
   if (v.getUint16(0) !== BINDING_SUCCESS || v.getUint16(2) !== msg.length - 20) return null;
-  for (let i = 0; i < 12; i++) if (msg[8 + i] !== txn[i]) return null;
+  for (let i = 0; i < 12; i++) {
+    if (msg[8 + i] !== txn[i]) return null;
+  }
   for (let at = 20; at + 4 <= msg.length; at += 4 + ((v.getUint16(at + 2) + 3) & ~3)) {
     const len = v.getUint16(at + 2);
     if (at + 4 + len > msg.length) return null;

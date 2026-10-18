@@ -7,12 +7,15 @@ import { mkdirSync } from "node:fs";
 // block its only thread on disk. `mkdirSync` is the exception: it runs once, in the
 // constructor, which cannot return a promise.
 import {
-  readdir, readFile, writeFile, unlink, stat, statfs,
+  readdir, readFile, writeFile, rename, unlink, stat, statfs,
 } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Fs, FsStat } from "./fs.js";
 import { FS_AVAILABLE_UNKNOWN } from "./fs.js";
+
+/** Marks `put`'s temp files, as native/fs.go does; `~` is outside the key charset. */
+const TMP_PREFIX = "~put-";
 
 export class NodeFs implements Fs {
   private used = 0;
@@ -23,15 +26,20 @@ export class NodeFs implements Fs {
 
   /** One scan before the first mutation or `stat`. This instance assumes it is the only
    *  writer to its directory; reopen it to pick up outside changes, as on native. The scan
-   *  limits concurrent stats so opening a large store does not flood the I/O pool. */
+   *  limits concurrent stats so opening a large store does not flood the I/O pool, and
+   *  reclaims the temp files a crash left behind. */
   private initialize(): Promise<void> {
     if (this.initialized) return this.initialized;
     const scan = (async () => {
       const names = await readdir(this.dir);
       let used = 0;
       for (let i = 0; i < names.length; i += 32) {
-        const sizes = await Promise.all(names.slice(i, i + 32).map((n) => this.size(n)));
-        for (const size of sizes) if (size >= 0) used += size;
+        const sizes = await Promise.all(names.slice(i, i + 32).map((n) => (n.startsWith(TMP_PREFIX)
+          ? unlink(join(this.dir, n)).then(() => -1, () => -1)
+          : this.size(n))));
+        for (const size of sizes) {
+          if (size >= 0) used += size;
+        }
       }
       this.used = used;
     })();
@@ -82,14 +90,17 @@ export class NodeFs implements Fs {
     const path = this.path(key);
     return this.mutate(key, async () => {
       const old = Math.max(0, await this.size(key));
-      let next = bytes.byteLength;
-      try { await writeFile(path, bytes); }
-      catch (err) {
-        // A failed write may already have truncated or partially replaced the file.
-        next = Math.max(0, await this.size(key));
+      // Through a temp file and a rename, as on native: a torn value would be served after
+      // a crash. `mutate` serializes the key, so its temp name is never shared.
+      const tmp = join(this.dir, TMP_PREFIX + key);
+      try {
+        await writeFile(tmp, bytes);
+        await rename(tmp, path);
+      } catch (err) {
+        await unlink(tmp).catch(() => {});
         throw err;
       }
-      finally { this.used += next - old; }
+      this.used += bytes.byteLength - old;
     });
   }
   async size(key: string): Promise<number> {
@@ -98,7 +109,7 @@ export class NodeFs implements Fs {
   async list(prefix?: string): Promise<string[]> {
     let names: string[];
     try { names = await readdir(this.dir); } catch { return []; }
-    return prefix ? names.filter((n) => n.startsWith(prefix)) : names;
+    return names.filter((n) => !n.startsWith(TMP_PREFIX) && (!prefix || n.startsWith(prefix)));
   }
   async delete(key: string): Promise<boolean> {
     try {

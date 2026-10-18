@@ -1146,9 +1146,12 @@ await test("DIAGNOSTIC: a socket that dies mid-handshake reads DROPPED, not the 
   // covers local failures (a half-open budget evicting this link), nor as `timeout`, which
   // means the socket stayed open and went quiet.
   const chans = wirePair();
+  // A's msg1 is held, never delivered, so the handshake cannot finish before the kill: on
+  // a wire that delivers at once it would, and the close would read as an authed link's.
+  chans[0].hold();
   let reason = null;
   const st = keep(await linked(chans, { onLinkClosed: (_id, r) => { reason = r; } }));
-  await until(() => chans[0].sent.length > 0, 4000, "msg1 on the wire");
+  await until(() => chans[0].held.length > 0, 4000, "msg1 on the wire");
   chans[0].kill(); // the socket goes away with the handshake unfinished
   await until(() => reason !== null, 3000, "the dead socket to report down");
   assert(reason === "dropped",

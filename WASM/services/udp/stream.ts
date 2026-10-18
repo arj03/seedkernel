@@ -112,7 +112,9 @@ const B = PATH_HEADER;
 
 /** Whether an ACK's `count` ranges name packet `pn`. */
 function names(p: Uint8Array, count: number, pn: number): boolean {
-  for (let i = 0; i < count; i++) if (pn <= get48(p, B + 9 + 12 * i) && pn >= get48(p, B + 15 + 12 * i)) return true;
+  for (let i = 0; i < count; i++) {
+    if (pn <= get48(p, B + 9 + 12 * i) && pn >= get48(p, B + 15 + 12 * i)) return true;
+  }
   return false;
 }
 
@@ -729,7 +731,10 @@ export class UdpStream implements RawLink {
   /** Nothing acks a CLOSE, and one lost would leave the peer waiting out `SILENT_MS`, so it
    *  goes three times. */
   private sendClose(): void {
-    if (this.out) for (let i = 0; i < 3; i++) this.emit(packet(TYPE_CLOSE, 0));
+    if (!this.out) return;
+    for (let i = 0; i < 3; i++) {
+      this.emit(packet(TYPE_CLOSE, 0));
+    }
   }
 
   /** The peer closed or went silent: stop, and tell the driver. */

@@ -375,7 +375,7 @@ async function testInstallerRemove() {
 async function testFs() {
   console.log("Test: fs service — opaque key → bytes (NodeFs + MemoryFs)");
 
-  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { mkdtempSync, rmSync, readdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
@@ -446,7 +446,7 @@ async function testFs() {
 
   // A cold store must seed its byte total before concurrent mutations start changing it.
   // Only same-file mutations need ordering, and a failed write must not poison the queue
-  // or leave the old size charged after the file was partially overwritten.
+  // or touch the value it was replacing.
   const disk = (await import("node:fs/promises")).default;
   const { syncBuiltinESMExports } = await import("node:module");
   const cachedDir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-cached-"));
@@ -478,8 +478,9 @@ async function testFs() {
     assert(!(await fs.delete("shared")), "NodeFs: deleting a missing value leaves accounting alone");
     assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: shrinking and deleting adjust the total");
 
+    // A write torn partway through: it lands in the temp file, never on the key's own.
     disk.writeFile = async (path, data, ...args) => {
-      if (path === pjoin(cachedDir, "existing")) {
+      if (path === pjoin(cachedDir, "~put-existing")) {
         await write(path, data.subarray(0, 3), ...args);
         throw new Error("injected failure after partial write");
       }
@@ -489,12 +490,18 @@ async function testFs() {
     let failed = false;
     try { await fs.put("existing", new Uint8Array(20)); } catch { failed = true; }
     assert(failed, "NodeFs: a partial write still rejects");
-    assertEqual((await fs.stat()).used, 3 + 2 + 528, "NodeFs: partial-write failure accounts for the bytes actually left");
+    assertEqual((await fs.get("existing"))?.length, 5, "NodeFs: a torn write leaves the old value in place");
+    assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: a torn write leaves the accounting unchanged");
+    assert(!readdirSync(cachedDir).some((n) => n.startsWith("~")), "NodeFs: a torn write leaves no temp file");
     disk.writeFile = write;
     syncBuiltinESMExports();
     await fs.put("existing", new Uint8Array(8));
     assertEqual((await fs.stat()).used, 8 + 2 + 528, "NodeFs: a failed write does not poison later writes");
+    // A temp file a crash left behind is neither listed nor counted, and a reopen reclaims it.
+    await write(pjoin(cachedDir, "~put-block-0"), new Uint8Array(99));
+    assert(!(await fs.list()).some((n) => n.startsWith("~")), "NodeFs: list skips temp files");
     assertEqual((await new NodeFs(cachedDir).stat()).used, (await fs.stat()).used, "NodeFs: reopening reconstructs the same total");
+    assert(!readdirSync(cachedDir).includes("~put-block-0"), "NodeFs: reopening reclaims an orphaned temp file");
   } finally {
     disk.writeFile = write;
     syncBuiltinESMExports();

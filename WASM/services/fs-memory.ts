@@ -53,7 +53,9 @@ export class MemoryFs implements Fs {
   }
   async list(prefix?: string): Promise<string[]> {
     const out: string[] = [];
-    for (const k of this.map.keys()) if (!prefix || k.startsWith(prefix)) out.push(k);
+    for (const k of this.map.keys()) {
+      if (!prefix || k.startsWith(prefix)) out.push(k);
+    }
     return out;
   }
   async delete(key: string): Promise<boolean> {
