@@ -42,9 +42,9 @@ func hostAuthor(t *testing.T) authorKeys {
 		t.Fatal(err)
 	}
 	edPriv := ed25519.NewKeyFromSeed(seed)
-	mlPk, mlSk := testSigner(t).keypair(t, genericHash(32, append(seed, "seedkernel-author-mldsa-v1"...), nil))
+	mlPk, mlSk := testSigner(t).keypair(t, blake2b256(append(seed, "seedkernel-author-mldsa-v1"...)))
 	a := authorKeys{edPriv: edPriv, edPub: edPriv.Public().(ed25519.PublicKey), mlPk: mlPk, mlSk: mlSk}
-	if !bytes.Equal(a.id(), host.author) {
+	if !bytes.Equal(a.edPub, genesisHost[offEdPk:offMlPk]) || !bytes.Equal(a.mlPk, genesisHost[offMlPk:offEdSig]) {
 		t.Fatal("host-author.key is not the genesis blob's author: rebuild (cd WASM && npm run build:native)")
 	}
 	return a
@@ -104,9 +104,10 @@ func (r *loaderRun) exit(t *testing.T) (error, string) {
 }
 
 // The native loader keeps the update rules end to end, as the Node loader does
-// (WASM/tests/host-updates.test.mjs): an app stages a host over `host/stage`, the next start
-// tries it and commits it after its window, a host that fails before that is dropped for
-// the committed one, and under `now` the node reboots into a staged host in place.
+// (WASM/tests/host-updates.test.mjs): an app stages a host over `host/stage`, the running
+// host checks it, the next start tries it and commits it after its window, a host that
+// fails before that is dropped for the committed one, and under `now` the node reboots
+// into a staged host in place.
 func TestHostUpdatesNative(t *testing.T) {
 	bootRealm(t)
 	hostKeys := hostAuthor(t)
@@ -132,7 +133,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		if err != nil {
 			return 0
 		}
-		h, err := verifyHostBlob(env)
+		h, err := readHostBlob(env)
 		if err != nil {
 			t.Fatal("committed:", err)
 		}
@@ -143,26 +144,38 @@ func TestHostUpdatesNative(t *testing.T) {
 	}
 	serve := append(base, "--listen", "127.0.0.1:0")
 
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host), "off"); err == nil || !strings.Contains(log, "updates are off") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "off"); err == nil || !strings.Contains(log, "updates are off") {
 		t.Fatalf("staging with updates off: %v\n%s", err, log)
 	}
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host), "next"); err != nil || !strings.Contains(log, "staged v2") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "next"); err != nil || !strings.Contains(log, "staged v2") {
 		t.Fatalf("staging v2: %v\n%s", err, log)
 	}
 	log := startLoader(t, work, nil, serve...).until(t, "committed after")
 	if !strings.Contains(log, "trying v2 (committed is v1)") || committed() != 2 {
 		t.Fatalf("v2 was not tried and committed (committed v%d):\n%s", committed(), log)
 	}
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host), "next"); err == nil || !strings.Contains(log, "v2 is not above v2") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "next"); err == nil || !strings.Contains(log, "v2 is not above v2") {
 		t.Fatalf("staging at the floor: %v\n%s", err, log)
 	}
-	if err, log := stage(hostEnvelope(t, testAuthor(t), 5, platformABI, host), "next"); err == nil || !strings.Contains(log, "not this binary's host author") {
+	if err, log := stage(hostEnvelope(t, testAuthor(t), 5, platformABI, host.script), "next"); err == nil || !strings.Contains(log, "not the running host's author") {
 		t.Fatalf("staging another author's host: %v\n%s", err, log)
 	}
+	tampered := hostEnvelope(t, hostKeys, 5, platformABI, host.script)
+	tampered[len(tampered)-1] ^= 1
+	appBundle, err := os.ReadFile(updater)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for what, blob := range map[string][]byte{"a tampered host": tampered, "an app bundle": appBundle} {
+		if err, log := stage(blob, "next"); err == nil || !strings.Contains(log, "host: signature invalid") {
+			t.Fatalf("staging %s: %v\n%s", what, err, log)
+		}
+	}
+	if _, err := os.Stat(slot(pendingFile)); err == nil {
+		t.Fatal("a refused host was kept")
+	}
 
-	broken := *host
-	broken.script = `throw new Error("broken host");`
-	if err, log := stage(hostEnvelope(t, hostKeys, 3, platformABI, &broken), "next"); err != nil {
+	if err, log := stage(hostEnvelope(t, hostKeys, 3, platformABI, `throw new Error("broken host");`), "next"); err != nil {
 		t.Fatalf("staging v3: %v\n%s", err, log)
 	}
 	log = startLoader(t, work, nil, serve...).until(t, "listening on")
@@ -173,7 +186,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		t.Fatal("the broken host is still pending")
 	}
 
-	if err := os.WriteFile(slot(pendingFile), hostEnvelope(t, hostKeys, 4, platformABI, host), 0o600); err != nil {
+	if err := os.WriteFile(slot(pendingFile), hostEnvelope(t, hostKeys, 4, platformABI, host.script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(slot(triedFile), nil, 0o600); err != nil {
@@ -184,7 +197,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		t.Fatalf("a host marked tried was run again:\n%s", log)
 	}
 
-	log = startLoader(t, work, hostEnvelope(t, hostKeys, 6, platformABI, host),
+	log = startLoader(t, work, hostEnvelope(t, hostKeys, 6, platformABI, host.script),
 		append(serve, "--host-updates", "now", "--op", "stage")...).until(t, "committed after")
 	if !strings.Contains(log, "staged v6") || !strings.Contains(log, "trying v6") || committed() != 6 {
 		t.Fatalf("under now, v6 did not boot in place and commit (committed v%d):\n%s", committed(), log)

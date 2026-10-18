@@ -159,11 +159,12 @@ func bootRealmIn(tb testing.TB, dir string) {
 	if _, err := qc.Eval("native-handle-harness.js", nativeHandleHarness); err != nil {
 		tb.Fatal("native handle harness:", err)
 	}
-	// This realm's data directory, which Go's boot knows nothing about. Opened through the
-	// platform's own `fs.open` for tests that use `fs` with no node running, and kept as
-	// `__dir` for every `standUp` a test calls: the Go primitive serves one directory, so
-	// all nodes in a realm share it (host/platform.ts).
-	evalString(tb, "__fs.open("+jsonString(dir)+"), globalThis.__dir = "+jsonString(dir))
+	// The realm engine, for tests that drive the engine table by hand.
+	qc.Global().SetPropertyStr("__qjsWasm", qc.NewArrayBuffer(host.qjs))
+	// This realm's data directory, which Go's boot knows nothing about: `__dir` for every
+	// `standUp` a test calls, and `fs`, the store a node keeps there, for tests that use
+	// one with no node running.
+	evalString(tb, "globalThis.__dir = "+jsonString(dir)+", globalThis.fs = new FilesFs(__fs, __dir), ''")
 }
 
 // jsonString quotes a Go string as a JS string literal, for the few test helpers that

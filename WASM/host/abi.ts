@@ -10,6 +10,7 @@
 // loader. Timers are the standard setTimeout and clearTimeout.
 
 import type { EngineImports } from "./engine-realm.js";
+import type { RawFiles } from "../services/fs-files.js";
 
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;
@@ -68,30 +69,17 @@ export interface PlatformBridge {
   engineRead(id: number, ptr: number, len: number): Bytes;
   engineWrite(id: number, ptr: number, bytes: Uint8Array): void;
   engineDispose(id: number): void;
-  /** The engine guest realms run on. */
-  qjsWasm(): Bytes;
-  /** Keep a host blob as the one to run next, under the loader's rules and the operator's
-   *  --host-updates; a refusal throws its reason. */
+  /** The running host blob (host-blob.ts), which carries the realm engine and the host's
+   *  crypto. */
+  hostBlob(): Bytes;
+  /** Keep a host blob, which the running host has checked (host-blob.ts
+   *  `checkStagedHost`), as the one to try next, under the operator's --host-updates; a
+   *  refusal throws its reason. */
   stageHost(blob: Uint8Array): Maybe<void>;
-  /** The host's crypto: libsodium, and the ML-DSA-65 verifier (host/sodium-engine.ts). */
-  sodiumWasm(): Bytes;
-  mldsaWasm(): Bytes;
 }
 
-/** One flat file per key under the directory `open` names. */
-export interface PlatformFs {
-  /** Open the operator's `--dir`. Until then the store reads as empty and refuses writes. */
-  open(dir: string): void;
-  get(key: string): Maybe<Bytes | null>;
-  put(key: string, bytes: Uint8Array): Maybe<void>;
-  /** -1 when absent. */
-  size(key: string): Maybe<number>;
-  /** `\n`-joined; keys cannot contain `\n`. */
-  list(prefix?: string): Maybe<string>;
-  delete(key: string): Maybe<boolean>;
-  /** `available` is -1 when the platform cannot tell. */
-  stat(): Maybe<{ used: number; available: number }>;
-}
+/** Whole files by path, which the node's store (services/fs-files.ts) is kept in. */
+export type PlatformFs = RawFiles;
 
 /** Byte streams (§12.1). Reads arrive through `__netDeliver`, one per `resume`. */
 export interface PlatformNet {
@@ -125,14 +113,18 @@ export interface PlatformUdp {
   addresses(): string;
 }
 
-/** What the host script defines for the loader to call. */
-export interface PlatformDispatchers {
+/** How a platform delivers socket events. */
+export interface NetDispatchers {
   /** A socket read. */
   __netDeliver(id: number, bytes: Bytes): void;
   /** A channel failed or closed remotely. */
   __netClosed(id: number): void;
   /** A socket was accepted on listener `port`. */
   __netAccept(port: number, id: number, remoteAddr: string): void;
+}
+
+/** What the host script defines for the loader to call. */
+export interface PlatformDispatchers extends NetDispatchers {
   /** Datagrams as `[n u8][ip n][port u16][len u16][bytes]` each, n 4 for IPv4 and 16 for
    *  IPv6. */
   __udpDeliver(id: number, batch: Bytes): void;

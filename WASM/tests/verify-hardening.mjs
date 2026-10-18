@@ -976,7 +976,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 console.log("\n§12.6 — host socket send queues are bounded");
 {
   const { MessageChannel } = await imp("build/services/net-channel.js");
-  const { NodeChannelFactory } = await imp("build/services/net-node.js");
+  const { nodeChannels } = await imp("build/host/shell-node.js");
   const { TransportHost } = await imp("build/host/transport-host.js");
   const ownedChannel = (channel, limits = {}) => {
     let ownerClosed = false;
@@ -1114,7 +1114,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
   // while this synchronous loop runs, so both exact boundaries are deterministic without
   // depending on a peer or on kernel socket-buffer sizes.
   const nodeLink = () => {
-    const link = new NodeChannelFactory().connect("tcp://127.0.0.1:1");
+    const link = nodeChannels().connect("tcp://127.0.0.1:1");
     if (!link) throw new Error("node test link was not created");
     link.onClose(() => {}); // consume the expected destroy/connect-error events
     return ownedChannel(link);

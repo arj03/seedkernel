@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/tetratelabs/wazero"
+	"golang.org/x/crypto/blake2b"
 )
 
 // forwarderWasm is a minimal pure-transform module (WASM/tests/fixtures/forwarder: exports
@@ -86,7 +87,13 @@ type authorKeys struct {
 func (a authorKeys) id() []byte {
 	pre := append(domainManifestAuthor(), manifestSuite())
 	pre = append(append(pre, a.edPub...), a.mlPk...)
-	return genericHash(32, pre, nil)
+	return blake2b256(pre)
+}
+
+// blake2b256 is the one system hash (§16.1), as the host's libsodium computes it.
+func blake2b256(b []byte) []byte {
+	h := blake2b.Sum256(b)
+	return h[:]
 }
 
 // testAuthor creates a fresh author identity, per test, so freshness marks (keyed by
@@ -107,7 +114,7 @@ func testAuthor(t testing.TB) authorKeys {
 }
 
 // testSigner is the ML-DSA-65 signing half the tests need and the shipped native binary
-// does not have (mldsa.go binds verify only, §12.4).
+// does not have: it holds no crypto at all (§12.9).
 //
 // One instance per runtime, not per author: compiling it for every author would cost
 // seconds across the suite, but a boot tears its runtime down, and a module cached past
@@ -120,11 +127,10 @@ var (
 func testSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
 	if signerCache == nil || signerCacheRt != moduleRT {
-		signerCache, signerCacheRt = newMlDsaSigner(t), moduleRT
+		signerCache, signerCacheRt = newMlDsaSigner(t, moduleRT), moduleRT
 	}
 	return signerCache
 }
-
 
 // realmString evaluates an expression in the booted host realm, like `evalString` but for
 // the helpers below, which have no `testing.TB`. A failure here means a broken harness,
@@ -189,7 +195,7 @@ func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, m
 		body = append(body, part...)
 	}
 	pre := append(domainManifest(), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), genericHash(32, body, nil)...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), blake2b256(body)...)
 	env := append([]byte{manifestSuite()}, a.edPub...)
 	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)

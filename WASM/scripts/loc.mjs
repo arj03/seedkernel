@@ -51,7 +51,7 @@ const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
   { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
-    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts"] },
+    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts"] },
   { find: /`host\/transport-host\.ts`/,
     files: ["WASM/host/transport-host.ts"] },
   { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,
@@ -64,7 +64,7 @@ const sharedRows = [
   { find: /`host\/engine-realm\.ts`, `host\/sodium-engine\.ts`/,
     files: ["WASM/host/engine-realm.ts", "WASM/host/sodium-engine.ts", "WASM/host/pq.ts"] },
   { find: /`host\/platform\.ts`, `host\/abi\.ts`/,
-    files: ["WASM/host/platform.ts", "WASM/host/abi.ts", "WASM/host/native-polyfills.ts"] },
+    files: ["WASM/host/platform.ts", "WASM/host/abi.ts", "WASM/host/host-main.ts", "WASM/host/native-polyfills.ts"] },
   { find: /`services\/\*\.ts` \(\d+ shared files\)/,
     files: [...sharedSet].filter((f) => f.startsWith("WASM/services/") && !f.startsWith("WASM/services/udp/")) },
 ];

@@ -1,7 +1,8 @@
-// seedkernel native loader (§12.9). It verifies a signed host blob (hostblob.go) and runs
-// the host script in it on QuickJS, over the platform ABI (WASM/host/abi.ts): the module
-// table (§3), files, sockets, entropy, and the engine table realms and the host's crypto
-// run on (engine.go). Everything a node does is in the blob. Pure Go, one static binary.
+// seedkernel native loader (§12.9). It runs the host script in a host blob (hostblob.go)
+// on QuickJS, over the platform ABI (WASM/host/abi.ts): the module table (§3), files,
+// sockets, entropy, and the engine table realms and the host's crypto run on (engine.go).
+// Everything a node does is in the blob, the checks on its successor included; the loader
+// keeps the slots it is staged in (hostslots.go). Pure Go, one static binary.
 package main
 
 import (
@@ -20,8 +21,6 @@ import (
 	"time"
 
 	"seedkernel/qjs"
-
-	"github.com/tetratelabs/wazero"
 )
 
 // platformABI is the version of the platform ABI (host/abi.ts) this binary implements.
@@ -35,17 +34,15 @@ var genesisHost []byte
 
 var (
 	ctx = context.Background()
-	// rtCore is the loader's own crypto runtime (libsodium, ML-DSA), not budget-armed.
-	rtCore wazero.Runtime
-	qc     *qjs.Context
-	qrt    *qjs.Runtime
-	el     *eventLoop
-	nh     *netHost
-	uh     *udpHost
+	qc  *qjs.Context
+	qrt *qjs.Runtime
+	el  *eventLoop
+	nh  *netHost
+	uh  *udpHost
 
 	// bootBlob is the host blob boot runs: genesisHost, or the operator's --host.
 	bootBlob = genesisHost
-	// host is the running host blob, verified.
+	// host is the running host blob.
 	host *hostBlob
 	// hostArgs are the arguments the host sees: the command line less the loader's own.
 	hostArgs []string
@@ -57,7 +54,7 @@ var (
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
-// boot checks bootBlob, then stands up the engines, the host realm and its primitives, and
+// boot reads bootBlob, then stands up the engines, the host realm and its primitives, and
 // runs the host script. Each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
@@ -65,12 +62,8 @@ func boot() error {
 	if err = bootModuleTable(); err != nil {
 		return err
 	}
-	loaderCrypto()
-	if host, err = verifyHostBlob(bootBlob); err != nil {
+	if host, err = readHostBlob(bootBlob); err != nil {
 		return err
-	}
-	if host.abi != platformABI {
-		return fmt.Errorf("host: the blob needs platform ABI %d, this loader implements %d", host.abi, platformABI)
 	}
 
 	// An unhandled rejection ends the process, as on Node.
@@ -97,16 +90,6 @@ func boot() error {
 		return fmt.Errorf("udp retain: %w", err)
 	}
 	return nil
-}
-
-// loaderCrypto stands up the loader's own crypto once: it checks host blobs before any
-// boot, and outlives every host it checks.
-func loaderCrypto() {
-	if rtCore == nil {
-		rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-		sd = bootSodium(rtCore)
-		md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
-	}
 }
 
 // shutdown releases a previous boot: the network, every realm, and the wazero runtimes.
@@ -171,19 +154,23 @@ func exposeBridge(qc *qjs.Context) {
 			return nil, err
 		}
 		// Atomic, so a torn write never replaces the freshness state.
-		if err := writeFileAtomic(path, bytes, ".seedkernel-", mode); err != nil {
+		if err := writeFileAtomic(path, bytes, mode); err != nil {
 			return nil, err
 		}
 		return qc.NewUndefined(), nil
 	}))
-	// Keep a host blob as the pending host (hostslots.go). Under --host-updates now, the
-	// loop stops after this turn and the loader boots it.
+	// The running host blob, which carries the realm engine and the host's crypto.
+	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewArrayBuffer(host.env), nil
+	}))
+	// Keep a host blob, which the running host checked, as the pending host (hostslots.go).
+	// Under --host-updates now, the loop stops after this turn and the loader boots it.
 	b.SetPropertyStr("stageHost", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		env, err := args[0].Bytes()
 		if err != nil {
 			return nil, err
 		}
-		now, err := updates.stage(env, host)
+		now, err := updates.stage(env)
 		if err != nil {
 			return nil, err
 		}
@@ -272,14 +259,13 @@ func main() {
 		return
 	}
 	hostArgs = flags.rest
-	loaderCrypto()
 	if flags.hostFile != "" {
 		if bootBlob, err = os.ReadFile(flags.hostFile); err != nil {
 			fatal("--host", err)
 			return
 		}
 	} else {
-		genesis, err := verifyHostBlob(genesisHost)
+		genesis, err := readHostBlob(genesisHost)
 		if err != nil {
 			fatal("genesis host", err)
 			return
@@ -351,7 +337,7 @@ type loaderOptions struct {
 // `--name=value`. The rest is the host's.
 //
 //   - `--host <file>` boots that host blob instead of the slots' choice, by the operator's
-//     explicit choice and from any author.
+//     explicit choice, unchecked and from any author.
 //   - `--host-updates off|next|now` is whether a running host may stage a new one, and
 //     when it runs: refused (the default), at the next start, or at once.
 func loaderFlags(argv []string) (loaderOptions, error) {

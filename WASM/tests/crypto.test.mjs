@@ -401,27 +401,13 @@ async function testRandomBytesInBlocks() {
 async function testHostSodium() {
   console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
   const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
-  const { wasiImports } = await imp("build/host/engine-web.js");
+  const { syncWebEngine } = await imp("build/host/engine-web.js");
   const glue = readFileSync(join(root, "browser/libsodium-core.mjs"), "utf8");
   for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
     assert(glue.includes(`._${name}=A.${min},`) || glue.includes(`._${name}=A.${min};`),
       `${name} is export ${min} in the glue`);
   }
-  const engine = (wasm, imports) => {
-    const mod = new WebAssembly.Module(wasm);
-    let memory;
-    const exports = new WebAssembly.Instance(mod, { ...imports, wasi_snapshot_preview1: wasiImports(mod, () => memory) }).exports;
-    memory = Object.values(exports).find((v) => v instanceof WebAssembly.Memory);
-    return {
-      exported: (name) => exports[name],
-      read: (ptr, len) => new Uint8Array(memory.buffer, ptr, len).slice(),
-      write: (ptr, bytes) => { new Uint8Array(memory.buffer).set(bytes, ptr); },
-      grow: (pages) => { try { return memory.grow(pages); } catch { return -1; } },
-      global: (name) => (exports[name] instanceof WebAssembly.Global ? Number(exports[name].value) : null),
-      dispose() {},
-    };
-  };
-  const host = engineSodium(engine, readFileSync(join(root, "browser/libsodium.wasm")),
+  const host = engineSodium(syncWebEngine, readFileSync(join(root, "browser/libsodium.wasm")),
     readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n));
   const msg = new Uint8Array(70000).map((_, i) => i * 7);
   const key = new Uint8Array(32).fill(5), npub = new Uint8Array(12).fill(6), ad = Uint8Array.of(1, 2, 3);

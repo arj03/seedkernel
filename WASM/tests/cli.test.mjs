@@ -179,10 +179,10 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
   ok(msg.startsWith(`--key: cannot read ${keyPath}`) && host.written.size === 0 && host.stood === null,
     "an unreadable --key fails the boot and mints nothing over it");
 }
-// The Node binding keeps that contract, as native does (shell-node.ts `nodeFiles`). A
+// The Node binding keeps that contract, as native does (platform-node.ts `nodeFiles`). A
 // directory at the path is a portable read failure that cannot be mistaken for ENOENT.
 {
-  const { nodeFiles } = await imp("build/host/shell-node.js");
+  const { nodeFiles } = await imp("build/host/platform-node.js");
   ok(nodeFiles.readFile(join(work, "never-written")) === null, "Node: only a missing file reads as absent");
   const keyDir = mkdtempSync(join(work, "keydir-"));
   throws(() => nodeFiles.readFile(keyDir), "Node: a path that exists and cannot be read throws");

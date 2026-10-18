@@ -145,6 +145,18 @@ export function ipv6Text(b: Uint8Array, at = 0): string {
   return run < 0 ? g.join(":") : `${g.slice(0, run).join(":")}::${g.slice(run + runLen).join(":")}`;
 }
 
+/** The 16 bytes of an IPv6 address's text, as an OS spells one: `ipv6Text` reversed, any
+ *  zone dropped. */
+export function ipv6Bytes(text: string): Uint8Array {
+  const [head, tail] = text.split("%")[0].split("::");
+  const groups = (part?: string) => (part ? part.split(":").map((g) => parseInt(g, 16)) : []);
+  const front = groups(head), back = groups(tail);
+  const all = tail === undefined ? front : [...front, ...new Array<number>(8 - front.length - back.length).fill(0), ...back];
+  const out = new Uint8Array(16);
+  all.forEach((w, i) => { out[2 * i] = w >> 8; out[2 * i + 1] = w & 255; });
+  return out;
+}
+
 /** `host:port`, with an IPv6 host in brackets. */
 const endpoint = (host: string, port: number) => (host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`);
 

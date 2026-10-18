@@ -1,6 +1,7 @@
 // Host updates through the Node loader (host/loader-node.ts, §12.9): an app stages a signed
-// host blob over the `host` service, the loader tries it once, commits it after a health
-// window, and drops it for the committed host when it fails first. The native loader keeps
+// host blob over the `host` service, the running host checks it, the loader tries it once,
+// commits it after a health window, and drops it for the committed host when it fails
+// first. The native loader keeps
 // the same rules (native/hostslots.go); its tests check them in Go.
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -84,9 +85,14 @@ try {
   ok(r.code !== 0 && /v2 is not above v2/.test(r.err), "the committed version is the floor");
   const stranger = hybridAuthorKeysFromSeed(sodium, new Uint8Array(32).fill(9));
   r = await stage(hostBlob(5, stranger));
-  ok(r.code !== 0 && /not this loader's host author/.test(r.err), "another author's host is refused");
+  ok(r.code !== 0 && /not the running host's author/.test(r.err), "another author's host is refused");
   r = await stage(readFileSync(join(work, "updater.skb")));
   ok(r.code !== 0 && /host: signature invalid/.test(r.err), "an app bundle does not pass as a host");
+  const tampered = hostBlob(7);
+  tampered[tampered.length - 1] ^= 1;
+  r = await stage(tampered);
+  ok(r.code !== 0 && /host: signature invalid/.test(r.err), "a tampered host is refused");
+  ok(!existsSync(slot("pending.skb")), "…and none of the refused ones is kept");
 
   console.log("Test: a host that fails before it is committed is dropped for the committed one");
   r = await stage(hostBlob(3, hostKeys, new TextEncoder().encode('throw new Error("broken host");')));
@@ -116,11 +122,6 @@ try {
   writeFileSync(join(work, "stranger.skb"), hostBlob(1, stranger));
   log = await serveUntil(/listening on/, ["--host", join(work, "stranger.skb")]);
   ok(!/trying|discarded/.test(log), "the slots are not consulted");
-  const tampered = hostBlob(7);
-  tampered[tampered.length - 1] ^= 1;
-  writeFileSync(join(work, "tampered.skb"), tampered);
-  r = await start(["--host", join(work, "tampered.skb")]).exit;
-  ok(r.code !== 0 && /host: signature invalid/.test(r.err), "a tampered blob is refused before any of it runs");
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

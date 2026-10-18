@@ -1,26 +1,21 @@
 package main
 
 // fs.* performance on the native binary: the storage hot path, where a seedstore holder
-// turns every FETCH into fs.get (os.ReadFile) and every STORE into fs.put (os.WriteFile),
-// one ~64 KB block at a time. Timed at two levels:
+// turns every FETCH into fs.get and every STORE into fs.put, one ~64 KB block at a time,
+// through the shared key store (services/fs-files.ts) over fs.go's file primitive, which is
+// the storage guest's actual fs surface. The difference from a bare os.ReadFile is the
+// per-block ArrayBuffer copy across JS and Go and the store's own bookkeeping.
 //
-//   - BenchmarkNodeFs{Get,Put}64K: the bare Go nodeFs, in MB/s to compare with the
-//     BLAKE2b/XChaCha20 rates, which shows whether GET is disk- or crypto-bound.
-//   - BenchmarkFs{Get,Put}JS64K: the same op through the QuickJS shim, so the difference
-//     is the per-block ArrayBuffer copy the storage guest pays across JS and Go.
+// Plus BenchmarkFsOpenScan: the store sums its directory at open (one list, then a size per
+// file), so that O(N) scan is a startup cost, not a per-request one. The sweep over
+// directory size shows its scaling.
 //
-// Plus BenchmarkNodeFsOpenScan: seedstore's FsBlobStore rebuilds its index at open by
-// listing the fs and stat-ing every block (store-fs.ts), so that O(N) scan is a startup
-// cost, not a per-request one. The sweep over directory size shows its scaling.
-//
-// Native-internal numbers: node uses node:fs, so there is no byte-identical twin to
-// compare against.
-//
-//	go test -run x -bench 'BenchmarkNodeFs|BenchmarkFs' -benchmem ./...
+//	go test -run x -bench BenchmarkFs -benchmem ./...
 
 import (
-	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -28,51 +23,11 @@ import (
 // blockBytes is the block size every fs bench moves per op (seedstore's block size).
 const blockBytes = 64 * 1024
 
-func benchBlock() []byte { return bytes.Repeat([]byte{0x5a}, blockBytes) }
-
-// ── bare Go nodeFs ─────────────────────────────────────────────────────────
-
-func BenchmarkNodeFsPut64K(b *testing.B) {
-	fs, err := newNodeFs(b.TempDir())
-	if err != nil {
-		b.Fatal(err)
-	}
-	block := benchBlock()
-	b.SetBytes(blockBytes)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := fs.put("benchblk", block); err != nil { // overwrite: steady-state write throughput
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkNodeFsGet64K(b *testing.B) {
-	fs, err := newNodeFs(b.TempDir())
-	if err != nil {
-		b.Fatal(err)
-	}
-	block := benchBlock()
-	if err := fs.put("benchblk", block); err != nil {
-		b.Fatal(err)
-	}
-	b.SetBytes(blockBytes)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if got := fs.get("benchblk"); len(got) != blockBytes { // reads back through the OS page cache (hot block)
-			b.Fatalf("get returned %d bytes, want %d", len(got), blockBytes)
-		}
-	}
-}
-
-// ── through the QuickJS shim (the storage guest's actual fs surface) ─────────
-//
-// The `fs` the guest reaches is the async `Fs` seam (platform.ts over fs.go's
-// synchronous primitive), so a put/get settles through the event loop like every other
+// The `fs` seam is async, so a put/get settles through the event loop like every other
 // async op; running b.N ops in one JS await loop keeps the el.await cost out of the per-op
 // number, as the net benches do.
 
-func BenchmarkFsPutJS64K(b *testing.B) {
+func BenchmarkFsPut64K(b *testing.B) {
 	setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
@@ -80,7 +35,7 @@ func BenchmarkFsPutJS64K(b *testing.B) {
 	b.StopTimer()
 }
 
-func BenchmarkFsGetJS64K(b *testing.B) {
+func BenchmarkFsGet64K(b *testing.B) {
 	setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
@@ -105,57 +60,26 @@ func setupFsJS(b *testing.B) {
 	awaitOK(b, "seed put", `__benchPut(1)`, 8*time.Second)
 }
 
-// ── node-open index scan (FsBlobStore constructor: one ReadDir + N stats) ────
+// ── the open scan ─────────────────────────────────────────────────────────────
 
-func BenchmarkNodeFsOpenScan(b *testing.B) {
+func BenchmarkFsOpenScan(b *testing.B) {
+	ensureBooted(b)
 	for _, n := range []int{1_000, 10_000} { // 100k shows the cliff but is slow to seed on NTFS
 		b.Run(fmt.Sprintf("files=%d", n), func(b *testing.B) {
-			fs, err := newNodeFs(b.TempDir())
-			if err != nil {
-				b.Fatal(err)
-			}
-			for i := 0; i < n; i++ { // seed n block files (hex stem + .blk, like store-fs.ts)
-				if err := fs.put(fmt.Sprintf("%064x.blk", i), []byte("x")); err != nil {
+			dir := b.TempDir()
+			for i := 0; i < n; i++ { // n block files (hex stem + .blk, like store-fs.ts)
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%064x.blk", i)), []byte("x"), 0o644); err != nil {
 					b.Fatal(err)
 				}
 			}
 			b.ResetTimer()
-			for j := 0; j < b.N; j++ {
-				keys := fs.list("") // the open scan: list the dir, then stat every entry
-				used := 0
-				for _, k := range keys {
-					used += fs.size(k)
+			benchAwait(b, fmt.Sprintf(`(async () => {
+				for (let i = 0; i < %d; i++) {
+					const s = await new FilesFs(__fs, %s).stat();
+					if (s.used !== %d) throw new Error("used " + s.used);
 				}
-				if len(keys) != n {
-					b.Fatalf("listed %d keys, want %d", len(keys), n)
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkNodeFsStat times the used-bytes query the storage guest runs per block.offer.
-// The cached counter (maintained by put/delete) makes it O(1) regardless of directory
-// size, so the sweep should stay flat, unlike BenchmarkNodeFsOpenScan's one-time O(N)
-// walk that initializes the counter.
-func BenchmarkNodeFsStat(b *testing.B) {
-	for _, n := range []int{1_000, 10_000} {
-		b.Run(fmt.Sprintf("files=%d", n), func(b *testing.B) {
-			fs, err := newNodeFs(b.TempDir())
-			if err != nil {
-				b.Fatal(err)
-			}
-			for i := 0; i < n; i++ {
-				if err := fs.put(fmt.Sprintf("%064x.blk", i), []byte("x")); err != nil {
-					b.Fatal(err)
-				}
-			}
-			b.ResetTimer()
-			for j := 0; j < b.N; j++ {
-				if fs.stat() != int64(n) { // n files of 1 byte each
-					b.Fatalf("stat used=%d, want %d", fs.stat(), n)
-				}
-			}
+				return new Uint8Array(0);
+			})()`, b.N, jsonString(dir), n))
 		})
 	}
 }

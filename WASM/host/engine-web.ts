@@ -2,7 +2,7 @@
 // (engine-realm.ts) from the same qjs.wasm the native binary runs, so every target has one
 // engine and one realm driver.
 
-import { engineRealms, type Engine, type EngineImports } from "./engine-realm.js";
+import { engineRealms, type Engine, type EngineImports, type EngineInstance } from "./engine-realm.js";
 import type { RealmFactory } from "./realm-queue.js";
 
 /** WASI errno values, the spec's numbers. */
@@ -13,7 +13,7 @@ const compiled = new WeakMap<Uint8Array, Promise<WebAssembly.Module>>();
 
 /** The engine's WASI imports, answered as native answers them (native/qjs/qjs.go): the
  *  clock, and ENOSYS for everything else. */
-export function wasiImports(module: WebAssembly.Module, memory: () => WebAssembly.Memory): Record<string, () => number> {
+function wasiImports(module: WebAssembly.Module, memory: () => WebAssembly.Memory): Record<string, () => number> {
   const fns: Record<string, (...args: never[]) => number> = {};
   for (const imp of WebAssembly.Module.imports(module)) {
     if (imp.module !== "wasi_snapshot_preview1" || imp.kind !== "function") continue;
@@ -31,40 +31,58 @@ export function wasiImports(module: WebAssembly.Module, memory: () => WebAssembl
   return fns as Record<string, () => number>;
 }
 
+/** `imports` with the engine's WASI beside them, and the view of the instance they link. */
+function link(mod: WebAssembly.Module, imports: EngineImports) {
+  let memory!: WebAssembly.Memory;
+  const all = { ...imports, wasi_snapshot_preview1: wasiImports(mod, () => memory) } as WebAssembly.Imports;
+  const view = (instance: WebAssembly.Instance): EngineInstance => {
+    const exports = instance.exports as Record<string, unknown>;
+    memory = Object.values(exports).find((v) => v instanceof WebAssembly.Memory) as WebAssembly.Memory;
+    // A reactor initializes wasi-libc once, before any other export.
+    (exports._initialize as (() => void) | undefined)?.();
+    return {
+      exported: (name) => {
+        const fn = exports[name];
+        if (typeof fn !== "function") throw new Error(`engine: no export "${name}"`);
+        return fn as (...args: number[]) => number;
+      },
+      grow: (pages) => { try { return memory.grow(pages); } catch { return -1; } },
+      global: (name) => {
+        const g = exports[name];
+        return g instanceof WebAssembly.Global ? Number(g.value) : null;
+      },
+      read: (ptr, len) => new Uint8Array(memory.buffer, ptr, len).slice(),
+      write: (ptr, bytes) => { new Uint8Array(memory.buffer).set(bytes, ptr); },
+      // Nothing to release: the instance goes with its last reference.
+      dispose: () => {},
+    };
+  };
+  return { all, view };
+}
+
 /** The engine table over WebAssembly. Instantiation is asynchronous because browsers refuse
  *  to compile or instantiate a large module synchronously on the main thread. */
-export const webEngine: Engine = async (wasm, imports: EngineImports) => {
+export const webEngine: Engine = async (wasm, imports) => {
   let module = compiled.get(wasm);
   if (!module) {
     module = WebAssembly.compile(wasm as BufferSource);
     compiled.set(wasm, module);
   }
   const mod = await module;
-  let memory!: WebAssembly.Memory;
-  const instance = await WebAssembly.instantiate(mod, {
-    ...imports,
-    wasi_snapshot_preview1: wasiImports(mod, () => memory),
-  } as WebAssembly.Imports);
-  const exports = instance.exports as Record<string, unknown>;
-  memory = Object.values(exports).find((v) => v instanceof WebAssembly.Memory) as WebAssembly.Memory;
-  // A reactor initializes wasi-libc once, before any other export.
-  (exports._initialize as (() => void) | undefined)?.();
-  return {
-    exported: (name) => {
-      const fn = exports[name];
-      if (typeof fn !== "function") throw new Error(`engine: no export "${name}"`);
-      return fn as (...args: number[]) => number;
-    },
-    grow: (pages) => { try { return memory.grow(pages); } catch { return -1; } },
-    global: (name) => {
-      const g = exports[name];
-      return g instanceof WebAssembly.Global ? Number(g.value) : null;
-    },
-    read: (ptr, len) => new Uint8Array(memory.buffer, ptr, len).slice(),
-    write: (ptr, bytes) => { new Uint8Array(memory.buffer).set(bytes, ptr); },
-    // Nothing to release: the instance goes with its last reference.
-    dispose: () => {},
-  };
+  const { all, view } = link(mod, imports);
+  return view(await WebAssembly.instantiate(mod, all));
+};
+
+const compiledSync = new WeakMap<Uint8Array, WebAssembly.Module>();
+/** The same table, synchronous, where the platform may compile on its own thread (Node). */
+export const syncWebEngine = (wasm: Uint8Array, imports: EngineImports): EngineInstance => {
+  let mod = compiledSync.get(wasm);
+  if (!mod) {
+    mod = new WebAssembly.Module(wasm as BufferSource);
+    compiledSync.set(wasm, mod);
+  }
+  const { all, view } = link(mod, imports);
+  return view(new WebAssembly.Instance(mod, all));
 };
 
 let qjsBytes: Promise<Uint8Array> | undefined;

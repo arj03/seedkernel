@@ -1,10 +1,10 @@
 package main
 
 // The native half of "one implementation, three targets" (§12.9, §14.1). The JS suite
-// checks mldsa65.wasm from Node; these check that this target's embedded copy, under
-// wazero, reaches the same verdicts, on NIST's vectors and on a whole hybrid-signed bundle
-// through the production install path. A verifier's accept/reject boundary is consensus,
-// so the embedded copy needs its own check.
+// checks mldsa65.wasm from Node; these check that the copy the host blob carries, under
+// wazero as the native host runs it, reaches the same verdicts, on NIST's vectors and on a
+// whole hybrid-signed bundle through the production install path. A verifier's
+// accept/reject boundary is consensus, so this target's runtime needs its own check.
 
 import (
 	"crypto/ed25519"
@@ -20,39 +20,38 @@ import (
 
 // ─── a test-only signer ──────────────────────────────────────────────────────────
 //
-// The shipped native binary binds mldsa65_verify and nothing else, so it cannot be used as
-// a signing oracle (§12.4). A test still has to produce a hybrid bundle for it to accept,
-// so it instantiates its own copy of the same artifact and binds the signing exports
-// there, keeping signing in _test files.
+// The host blob's mldsa65.wasm, instantiated on its own with the signing exports bound, so
+// a test can produce a hybrid bundle for the host to accept. Signing stays in _test files.
 
 type mldsaSigner struct {
-	mldsa
+	mem      api.Memory
+	heapBase uint32
+	top      uint32 // bump pointer over the module's own heap, rewound per op
 
-	sign api.Function
-	keys api.Function
+	sign, keys, verify api.Function
 }
 
 // ML-DSA-65 secret key width (FIPS 204). Only signing needs it, so it is here, not with
 // the envelope's format constants in mldsa.go.
 const mldsaSkBytes = 4032
 
-func newMlDsaSigner(t testing.TB) *mldsaSigner {
+func newMlDsaSigner(t testing.TB, rt wazero.Runtime) *mldsaSigner {
 	t.Helper()
-	cm, err := moduleRT.CompileModule(ctx, mldsaWasm)
+	cm, err := rt.CompileModule(ctx, hostPart(t, genesisHost, partMldsa))
 	if err != nil {
 		t.Fatal("mldsa65 test signer: compile:", err)
 	}
-	mod, err := moduleRT.InstantiateModule(ctx, cm,
+	mod, err := rt.InstantiateModule(ctx, cm,
 		wazero.NewModuleConfig().WithName("mldsa65-test-signer").WithStartFunctions())
 	if err != nil {
 		t.Fatal("mldsa65 test signer: instantiate:", err)
 	}
 	s := &mldsaSigner{
-		mldsa: mldsa{wasmModule: &wasmModule{mod: mod, mem: mod.Memory(), name: "mldsa65-test-signer"}},
-		sign:  mod.ExportedFunction("mldsa65_sign"),
-		keys:  mod.ExportedFunction("mldsa65_keypair"),
+		mem:    mod.Memory(),
+		sign:   mod.ExportedFunction("mldsa65_sign"),
+		keys:   mod.ExportedFunction("mldsa65_keypair"),
+		verify: mod.ExportedFunction("mldsa65_verify"),
 	}
-	s.verify = mod.ExportedFunction("mldsa65_verify")
 	hb := mod.ExportedGlobal("__heap_base")
 	if s.sign == nil || s.keys == nil || s.verify == nil || hb == nil {
 		t.Fatal("mldsa65 test signer: missing an export")
@@ -61,10 +60,26 @@ func newMlDsaSigner(t testing.TB) *mldsaSigner {
 	return s
 }
 
+// alloc bump-allocates n 16-aligned bytes, growing memory as needed; put also copies b in.
+func (s *mldsaSigner) alloc(n int) uint32 {
+	p := (s.top + 15) &^ 15
+	s.top = p + uint32(n)
+	if pages, _ := s.mem.Grow(0); s.top > pages*0x10000 {
+		s.mem.Grow((s.top - pages*0x10000 + 0xffff) / 0x10000)
+	}
+	return p
+}
+
+func (s *mldsaSigner) put(b []byte) uint32 {
+	p := s.alloc(len(b))
+	s.mem.Write(p, b)
+	return p
+}
+
 // keypair derives an ML-DSA-65 key set from a 32-byte seed.
 func (s *mldsaSigner) keypair(t testing.TB, seed []byte) (pk, sk []byte) {
 	t.Helper()
-	s.reset()
+	s.top = s.heapBase
 	pkP, skP, seedP := s.alloc(mldsaPkBytes), s.alloc(mldsaSkBytes), s.put(seed)
 	r, err := s.keys.Call(ctx, uint64(pkP), uint64(skP), uint64(seedP))
 	if err != nil || r[0] != 1 {
@@ -86,7 +101,7 @@ func (s *mldsaSigner) signDetached(t testing.TB, msg, sk []byte) []byte {
 // included, since the ACVP vectors use both.
 func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	t.Helper()
-	s.reset()
+	s.top = s.heapBase
 	sigP, msgP := s.alloc(mldsaSigBytes), s.put(msg)
 	ctxP, rndP, skP := s.put(sctx), s.put(rnd), s.put(sk)
 	r, err := s.sign.Call(ctx, uint64(sigP), uint64(msgP), uint64(len(msg)),
@@ -97,11 +112,11 @@ func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	return s.read(t, sigP, mldsaSigBytes)
 }
 
-// verifyCtx is the same for verification. The production wrapper fixes the context to
-// empty, so vectors with a context call the export directly, on the same module.
+// verifyCtx is the same for verification. The host fixes the context to empty
+// (sodium-engine.ts), so vectors with a context call the export directly.
 func (s *mldsaSigner) verifyCtx(t testing.TB, sig, msg, sctx, pk []byte) bool {
 	t.Helper()
-	s.reset()
+	s.top = s.heapBase
 	sigP, msgP := s.put(sig), s.put(msg)
 	ctxP, pkP := s.put(sctx), s.put(pk)
 	r, err := s.verify.Call(ctx, uint64(sigP), uint64(msgP), uint64(len(msg)),
@@ -137,8 +152,8 @@ type acvpCase struct {
 	Sig    string `json:"sig"`
 }
 
-// TestMlDsaAcvpVectors runs NIST's published ACVP vectors against the wasm this binary
-// embeds. It reads the same fixture as the JS suite, so both targets are checked against
+// TestMlDsaAcvpVectors runs NIST's published ACVP vectors against the host blob's wasm on
+// wazero. It reads the same fixture as the JS suite, so both targets are checked against
 // the same vectors.
 func TestMlDsaAcvpVectors(t *testing.T) {
 	bootRealm(t)
@@ -161,7 +176,7 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 		return b
 	}
 
-	s := newMlDsaSigner(t)
+	s := newMlDsaSigner(t, moduleRT)
 	for _, v := range kat.SigVer {
 		got := s.verifyCtx(t, unhex(v.Sig), unhex(v.Msg), unhex(v.Ctx), unhex(v.Pk))
 		if got != v.Pass {
@@ -177,23 +192,6 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 		}
 	}
 
-	// The production wrapper's path (mldsa.go): it agrees with the artifact, and a
-	// wrong-width input is `false`, not an error, as crypto_sign_verify_detached gives, so
-	// both halves of the suite fail the same way.
-	pk, sk := s.keypair(t, make([]byte, 32))
-	msg := []byte("native adapter path")
-	sig := s.signDetached(t, msg, sk)
-	if !md.verifyDetached(sig, msg, pk) {
-		t.Fatal("the binary's verifier rejects a signature made by the same artifact")
-	}
-	flipped := append([]byte(nil), sig...)
-	flipped[0] ^= 1
-	if md.verifyDetached(flipped, msg, pk) {
-		t.Fatal("a flipped bit verified")
-	}
-	if md.verifyDetached(sig[:10], msg, pk) || md.verifyDetached(sig, msg, pk[:10]) {
-		t.Fatal("a wrong-width input must be false, not a pass")
-	}
 	t.Logf("%d NIST vectors", len(kat.SigVer)+len(kat.SigGen))
 }
 

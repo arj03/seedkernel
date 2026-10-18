@@ -264,25 +264,17 @@ export interface VerifiedEnvelope {
 /** Authenticate a suite 0x02 envelope signed under `domain`; errors name `what` it is. */
 export function verifyEnvelope(sodium: ManifestVerifier, env: Uint8Array, domain: Uint8Array,
   what: string): VerifiedEnvelope {
-  if (env.length < SUITE_LEN) throw new Error(`${what}: signature invalid`);
-  // Suite first, since other suites have other widths. An unknown suite is reported as
-  // such, not as a bad signature; the byte is public (§14.1).
-  const suite = env[0];
-  if (suite !== SUITE_MANIFEST_HYBRID_PQ) {
-    throw new Error(`${what}: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
-  }
   // Never fall back to Ed25519 alone: that is the downgrade the suite exists to prevent.
-  if (!sodium.ml_dsa65_verify_detached) {
+  if (env[0] === SUITE_MANIFEST_HYBRID_PQ && !sodium.ml_dsa65_verify_detached) {
     throw new Error(`${what}: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier`);
   }
-  if (env.length < OFF_BODY) throw new Error(`${what}: signature invalid`);
+  const body = envelopeBody(env, what);
   // Only the keys outlive this call (`authorKeys`), so only they are copied. A Node
   // Buffer's slice() aliases.
   const edPk = new Uint8Array(env.subarray(OFF_ED_PK, OFF_ML_PK));
   const mlPk = new Uint8Array(env.subarray(OFF_ML_PK, OFF_ED_SIG));
   const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
   const mlSig = env.slice(OFF_ML_SIG, OFF_BODY);
-  const body = env.subarray(OFF_BODY);
   const pre = envelopeSigningInput(sodium, domain, edPk, mlPk, body);
   // Always check both, so a broken half rejects valid ones instead of admitting forged ones.
   if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk)) throw new Error(`${what}: signature invalid`);
@@ -290,8 +282,21 @@ export function verifyEnvelope(sodium: ManifestVerifier, env: Uint8Array, domain
   return { author: hybridAuthorId(sodium, edPk, mlPk), authorKeys: { ed: edPk, mlDsa: mlPk }, body };
 }
 
-/** A body's u32 big-endian length-prefixed parts, read in order. Lengths are interpreted
- *  only after the signatures over them authenticate. */
+/** A suite 0x02 envelope's body, unauthenticated: what a loader reads of a host blob, whose
+ *  signatures the host that staged it checked (§12.9). */
+export function envelopeBody(env: Uint8Array, what: string): Uint8Array {
+  if (env.length < SUITE_LEN) throw new Error(`${what}: signature invalid`);
+  // Suite first, since other suites have other widths. An unknown suite is reported as
+  // such, not as a bad signature; the byte is public (§14.1).
+  if (env[0] !== SUITE_MANIFEST_HYBRID_PQ) {
+    throw new Error(`${what}: unsupported manifest suite 0x${env[0].toString(16).padStart(2, "0")}`);
+  }
+  if (env.length < OFF_BODY) throw new Error(`${what}: signature invalid`);
+  return env.subarray(OFF_BODY);
+}
+
+/** A body's u32 big-endian length-prefixed parts, read in order. A bundle's lengths are
+ *  interpreted only after the signatures over them authenticate. */
 export function bodyReader(body: Uint8Array, what: string): { next(): Uint8Array; done(): boolean } {
   const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
   let off = 0;

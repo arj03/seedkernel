@@ -15,7 +15,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { bootShell } = await imp("build/host/shell-core.js");
-const { NodeChannelFactory } = await imp("build/services/net-node.js");
+const { nodeChannels } = await imp("build/host/shell-node.js");
 const { createWebRealm } = await imp("build/host/engine-web.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
@@ -38,7 +38,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     authors: [appAuthorHex],
   }));
   const transportOptions = {
-    channels: new NodeChannelFactory(),
+    channels: nodeChannels(),
     listen: [
       { label: "tcp", host: HOST, port: 0 },
       ...(ws ? [{ label: "ws", host: HOST, port: 0 }] : []),

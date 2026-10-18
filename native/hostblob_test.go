@@ -3,9 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,66 +12,85 @@ import (
 	"time"
 )
 
+// The parts of a host blob's body, in order (WASM/host/host-blob.ts).
+const (
+	partManifest = iota
+	partScript
+	partQjs
+	partSodium
+	partMldsa
+)
+
+// hostPart is one part of env's body, read independently of readHostBlob.
+func hostPart(t testing.TB, env []byte, part int) []byte {
+	t.Helper()
+	body := env[offBody:]
+	for i := 0; ; i++ {
+		n := binary.BigEndian.Uint32(body)
+		if i == part {
+			return body[4 : 4+n]
+		}
+		body = body[4+n:]
+	}
+}
+
 // hostEnvelope independently frames and signs a host blob (WASM/host/host-blob.ts) under
-// DOMAIN_host as the realm spells it, so a disagreement with either reader shows up.
-func hostEnvelope(t testing.TB, a authorKeys, version, abi int, h *hostBlob) []byte {
+// DOMAIN_host as the realm spells it, with the genesis blob's engine and crypto and this
+// script, so a disagreement with either reader shows up.
+func hostEnvelope(t testing.TB, a authorKeys, version, abi int, script string) []byte {
 	t.Helper()
 	manifest, err := json.Marshal(map[string]int{"version": version, "abi": abi})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var body []byte
-	for _, part := range [][]byte{manifest, []byte(h.script), h.qjs, h.sodium, h.mldsa} {
+	for _, part := range [][]byte{manifest, []byte(script), hostPart(t, genesisHost, partQjs),
+		hostPart(t, genesisHost, partSodium), hostPart(t, genesisHost, partMldsa)} {
 		body = binary.BigEndian.AppendUint32(body, uint32(len(part)))
 		body = append(body, part...)
 	}
 	pre := append(hexBytes(realmString(`toHex(DOMAIN_HOST)`)), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), genericHash(32, body, nil)...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), blake2b256(body)...)
 	env := append([]byte{manifestSuite()}, a.edPub...)
 	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)
 }
 
-// The binary boots the blob it was built with, signed under the prefix the host script
-// names, by the author of its own record.
-func TestGenesisHostVerifies(t *testing.T) {
+// The binary boots the blob it was built with, and reads the layout the realm writes.
+func TestGenesisHostReads(t *testing.T) {
 	bootRealm(t)
-	if got := realmString(`toHex(DOMAIN_HOST)`); got != hex.EncodeToString(domainHost) {
-		t.Fatalf("DOMAIN_HOST is %s in the host script and %x here", got, domainHost)
-	}
-	h, err := verifyHostBlob(genesisHost)
+	h, err := readHostBlob(genesisHost)
 	if err != nil {
 		t.Fatal("genesis:", err)
 	}
-	if h.abi != platformABI || h.version < 1 || len(h.author) != 32 {
-		t.Fatalf("genesis manifest: abi %d, version %d, author %x", h.abi, h.version, h.author)
+	if h.version < 1 || h.script == "" || len(h.qjs) == 0 {
+		t.Fatalf("genesis: version %d, script %d B, qjs %d B", h.version, len(h.script), len(h.qjs))
 	}
-	if !reflect.DeepEqual(h.author, host.author) {
+	if &host.env[0] != &genesisHost[0] {
 		t.Fatal("the running host is not the genesis blob")
+	}
+	again, err := readHostBlob(hostEnvelope(t, testAuthor(t), 7, platformABI, h.script))
+	if err != nil || again.version != 7 || again.script != h.script || !reflect.DeepEqual(again.qjs, h.qjs) {
+		t.Fatalf("a blob framed here reads back as %+v, %v", again, err)
 	}
 }
 
-// Any change to a signed byte refuses the blob, and an app bundle is not a host blob: the
-// two are signed under different prefixes, so neither passes as the other.
-func TestHostBlobRefusesWhatIsNotItsAuthorsHost(t *testing.T) {
+// What is not a host blob is refused before any of it runs, and a host blob is not an
+// app: the two are signed under different prefixes, so the host refuses one as the other.
+func TestHostBlobRefusesWhatIsNotAHost(t *testing.T) {
 	bootRealm(t)
-	tampered := append([]byte(nil), genesisHost...)
-	tampered[len(tampered)-1] ^= 1
-	if _, err := verifyHostBlob(tampered); !errors.Is(err, errHostSignature) {
-		t.Fatalf("a tampered body: %v", err)
-	}
-	tampered = append([]byte(nil), genesisHost...)
-	tampered[offEdSig] ^= 1
-	if _, err := verifyHostBlob(tampered); !errors.Is(err, errHostSignature) {
-		t.Fatalf("a tampered signature: %v", err)
-	}
-	tampered[0] = 0x01
-	if _, err := verifyHostBlob(tampered); err == nil || !strings.Contains(err.Error(), "unsupported manifest suite 0x01") {
-		t.Fatalf("another suite: %v", err)
-	}
-	app := bundleEnvelope(t, testAuthor(t), manifestJSON(t, "probe", 1, stubGuestSrc, nil), stubGuestSrc, forwarderWasm)
-	if _, err := verifyHostBlob(app); !errors.Is(err, errHostSignature) {
-		t.Fatalf("an app bundle read as a host: %v", err)
+	for _, tc := range []struct {
+		what string
+		env  []byte
+		want string
+	}{
+		{"another suite", append([]byte{0x01}, genesisHost[1:]...), "not a suite 0x02 envelope"},
+		{"a truncated body", genesisHost[:len(genesisHost)-1], "truncated body"},
+		{"trailing bytes", append(append([]byte(nil), genesisHost...), 0), "trailing bytes"},
+	} {
+		if _, err := readHostBlob(tc.env); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: %v", tc.what, err)
+		}
 	}
 	if _, err := startNode(nodeConfig{KeyHex: testKeyHex(t)}); err != nil {
 		t.Fatal("startNode:", err)
@@ -91,7 +108,7 @@ func TestHostBlobRefusesWhatIsNotItsAuthorsHost(t *testing.T) {
 // A blob for another platform ABI is refused before any of it runs.
 func TestBootRefusesAnotherABI(t *testing.T) {
 	bootRealm(t)
-	other := hostEnvelope(t, testAuthor(t), 2, platformABI+1, host)
+	other := hostEnvelope(t, testAuthor(t), 2, platformABI+1, host.script)
 	defer func() {
 		bootBlob = genesisHost
 		bootRealm(t)

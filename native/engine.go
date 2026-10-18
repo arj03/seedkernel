@@ -21,29 +21,25 @@ var (
 	// engines are the live instances, keyed by a handle this map mints.
 	engines   = map[int64]*engineInstance{}
 	engineSeq int64
-
 )
 
 type engineInstance struct {
 	rt      wazero.Runtime
 	mod     api.Module
 	mem     api.Memory
-	imports []*qjs.Value // retained import handlers, freed on dispose
-	pools   []*enginePool // by export handle (engineExport)
+	imports []*qjs.Value    // retained import handlers, freed on dispose
+	exports []*engineExport // by export handle (engineExport)
 }
 
-// enginePool is one export's free list of resolved functions and their stacks: a call can
-// re-enter the same export through an import, and each in-flight call needs its own stack.
-type enginePool struct {
-	name    string
-	free    []engineFn
-	params  []api.ValueType
-	results []api.ValueType
-}
-
-type engineFn struct {
-	fn    api.Function
-	stack []uint64
+// engineExport is one export's signature, and a resolved function with its own stack per
+// nesting depth: a call can re-enter the same export through an import, and each call in
+// flight needs its own stack.
+type engineExport struct {
+	name            string
+	params, results []api.ValueType
+	fns             []api.Function
+	stacks          [][]uint64
+	depth           int
 }
 
 func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
@@ -60,43 +56,37 @@ func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
 		engines[engineSeq] = e
 		return qc.NewInt64(engineSeq), nil
 	}))
-	b.SetPropertyStr("engineExport", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		h, err := e.export(args[1].String())
+	// The rest name an instance first.
+	on := func(name string, f func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error)) {
+		b.SetPropertyStr(name, qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+			e := engines[args[0].Int64()]
+			if e == nil {
+				return nil, errors.New("engine: no such instance")
+			}
+			return f(e, args[1:])
+		}))
+	}
+	on("engineExport", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		h, err := e.export(args[0].String())
 		if err != nil {
 			return nil, err
 		}
 		return qc.NewInt32(int32(h)), nil
-	}))
-	b.SetPropertyStr("engineCall", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		return e.call(qc, args[1].Int64(), args[2:])
-	}))
-	b.SetPropertyStr("engineRead", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		view, ok := e.mem.Read(uint32(args[1].Int64()), uint32(args[2].Int64()))
+	})
+	on("engineCall", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		return e.call(qc, args[0].Int64(), args[1:])
+	})
+	on("engineRead", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		view, ok := e.mem.Read(uint32(args[0].Int64()), uint32(args[1].Int64()))
 		if !ok {
 			return nil, errors.New("engine: read out of bounds")
 		}
 		return qc.NewArrayBuffer(view), nil
-	}))
-	b.SetPropertyStr("engineWrite", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		ptr := uint32(args[1].Int64())
+	})
+	on("engineWrite", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		ptr := uint32(args[0].Int64())
 		// Borrowed last (qjs.Value.View).
-		bytes, err := args[2].View()
+		bytes, err := args[1].View()
 		if err != nil {
 			return nil, err
 		}
@@ -104,39 +94,21 @@ func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
 			return nil, errors.New("engine: write out of bounds")
 		}
 		return nil, nil
-	}))
-	b.SetPropertyStr("engineGlobal", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		g := e.mod.ExportedGlobal(args[1].String())
+	})
+	on("engineGlobal", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		g := e.mod.ExportedGlobal(args[0].String())
 		if g == nil {
 			return qc.NewNull(), nil
 		}
 		return numberToJS(qc, g.Type(), g.Get()), nil
-	}))
-	b.SetPropertyStr("engineGrow", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		e := engines[args[0].Int64()]
-		if e == nil {
-			return nil, errors.New("engine: no such instance")
-		}
-		before, ok := e.mem.Grow(uint32(args[1].Int64()))
+	})
+	on("engineGrow", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		before, ok := e.mem.Grow(uint32(args[0].Int64()))
 		if !ok {
 			return qc.NewInt32(-1), nil
 		}
 		return qc.NewInt64(int64(before)), nil
-	}))
-	// The wasm the host script runs on the table: the running host blob's own.
-	for name, wasm := range map[string]func() []byte{
-		"qjsWasm":    func() []byte { return host.qjs },
-		"sodiumWasm": func() []byte { return host.sodium },
-		"mldsaWasm":  func() []byte { return host.mldsa },
-	} {
-		b.SetPropertyStr(name, qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-			return qc.NewArrayBuffer(wasm()), nil
-		}))
-	}
+	})
 	b.SetPropertyStr("engineDispose", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		id := args[0].Int64()
 		if e := engines[id]; e != nil {
@@ -273,10 +245,8 @@ func (e *engineInstance) export(name string) (int, error) {
 		return 0, fmt.Errorf("engine: no export %q", name)
 	}
 	def := fn.Definition()
-	p := &enginePool{name: name, params: def.ParamTypes(), results: def.ResultTypes()}
-	p.free = append(p.free, p.newFn(fn))
-	e.pools = append(e.pools, p)
-	return len(e.pools) - 1, nil
+	e.exports = append(e.exports, &engineExport{name: name, params: def.ParamTypes(), results: def.ResultTypes()})
+	return len(e.exports) - 1, nil
 }
 
 // call runs export `handle` with numeric arguments and answers its result as a number.
@@ -285,36 +255,31 @@ func (e *engineInstance) call(qc *qjs.Context, handle int64, args []*qjs.Value) 
 	if e.mod == nil || e.mod.IsClosed() {
 		return nil, errors.New("engine: instance is closed")
 	}
-	if handle < 0 || handle >= int64(len(e.pools)) {
+	if handle < 0 || handle >= int64(len(e.exports)) {
 		return nil, errors.New("engine: no such export handle")
 	}
-	p := e.pools[handle]
-	if len(args) < len(p.params) {
-		return nil, fmt.Errorf("engine: %s takes %d arguments, not %d", p.name, len(p.params), len(args))
+	x := e.exports[handle]
+	if len(args) < len(x.params) {
+		return nil, fmt.Errorf("engine: %s takes %d arguments, not %d", x.name, len(x.params), len(args))
 	}
-	var f engineFn
-	if n := len(p.free); n > 0 {
-		f, p.free = p.free[n-1], p.free[:n-1]
-	} else {
-		f = p.newFn(e.mod.ExportedFunction(p.name))
+	if x.depth == len(x.fns) {
+		x.fns = append(x.fns, e.mod.ExportedFunction(x.name))
+		x.stacks = append(x.stacks, make([]uint64, max(len(x.params), len(x.results), 1)))
 	}
-	for i, t := range p.params {
-		f.stack[i] = numberFromJS(t, args[i])
+	fn, stack := x.fns[x.depth], x.stacks[x.depth]
+	for i, t := range x.params {
+		stack[i] = numberFromJS(t, args[i])
 	}
-	err := f.fn.CallWithStack(ctx, f.stack)
-	res := f.stack[0]
-	p.free = append(p.free, f)
+	x.depth++
+	err := fn.CallWithStack(ctx, stack)
+	x.depth--
 	if err != nil {
-		return nil, fmt.Errorf("engine: %s trapped: %w", p.name, err)
+		return nil, fmt.Errorf("engine: %s trapped: %w", x.name, err)
 	}
-	if len(p.results) == 0 {
+	if len(x.results) == 0 {
 		return nil, nil
 	}
-	return numberToJS(qc, p.results[0], res), nil
-}
-
-func (p *enginePool) newFn(fn api.Function) engineFn {
-	return engineFn{fn: fn, stack: make([]uint64, max(len(p.params), len(p.results), 1))}
+	return numberToJS(qc, x.results[0], stack[0]), nil
 }
 
 func (e *engineInstance) close() {

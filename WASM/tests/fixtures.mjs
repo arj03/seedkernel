@@ -45,7 +45,8 @@ export const testBackends = () => ({
   link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
 });
 export const enc = new TextEncoder();
-export const { NodeFs } = await imp("build/services/fs-node.js");
+export const { NodeFs, nodeRawFiles } = await imp("build/services/fs-node.js");
+export const { FilesFs } = await imp("build/services/fs-files.js");
 export const { createWebRealm } = await imp("build/host/engine-web.js");
 export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
 export { bytesEqual } from "./bytes.mjs";

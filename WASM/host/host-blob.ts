@@ -7,17 +7,18 @@
 //   sodium     libsodium.wasm, the host's crypto
 //   mldsa      mldsa65.wasm, the host's ML-DSA-65 verifier
 //
-// A loader checks a blob before running any of it (abi.ts): both signatures, the author
-// against the host it already runs, `abi` against its own, `version` against its floor.
-// The native loader does the same in Go (native/hostblob.go), so both read this layout.
+// The running host checks a blob before it hands it to the loader (`checkStagedHost`), with
+// its own crypto, as it checks an app bundle. A loader holds no crypto: it reads the layout
+// (`readHostBlob`) of what is in its slots, which only a host put there. The native loader
+// reads the same layout in Go (native/hostblob.go).
 
 import { DOMAIN_HOST } from "../services/domains.js";
-import { dec } from "../services/util.js";
-import { bodyReader, isJsonObject, verifyEnvelope, type ManifestAuthorKeys, type ManifestVerifier } from "./bundle.js";
+import { dec, toHex } from "../services/util.js";
+import { bodyReader, envelopeBody, isJsonObject, verifyEnvelope, type ManifestVerifier } from "./bundle.js";
 
 /** What a host blob declares about itself. */
 export interface HostManifest {
-  /** Monotonic per author: a loader runs none at or below its floor. */
+  /** Monotonic per author: a host stages none at or below its own. */
   version: number;
   /** The platform ABI the script needs (abi.ts `PLATFORM_ABI`). */
   abi: number;
@@ -31,18 +32,18 @@ export interface HostParts {
   mldsa: Uint8Array;
 }
 
-export interface VerifiedHost extends HostParts {
-  author: Uint8Array;
-  authorKeys: ManifestAuthorKeys;
+export interface HostBlob extends HostParts {
   manifest: HostManifest;
 }
 
 export const HOST_PART_NAMES = ["script", "qjs", "sodium", "mldsa"] as const;
 
-/** Authenticate a host blob and split it. It says nothing about whether this loader should
- *  run it: the author, ABI and floor are the loader's to check. */
-export function verifyHostBlob(crypto: ManifestVerifier, env: Uint8Array): VerifiedHost {
-  const { author, authorKeys, body } = verifyEnvelope(crypto, env, DOMAIN_HOST, "host");
+/** Split a host blob without authenticating it. The parts alias `env`. */
+export function readHostBlob(env: Uint8Array): HostBlob {
+  return parseBody(envelopeBody(env, "host"));
+}
+
+function parseBody(body: Uint8Array): HostBlob {
   const parts = bodyReader(body, "host");
   let manifest: unknown;
   try {
@@ -54,8 +55,31 @@ export function verifyHostBlob(crypto: ManifestVerifier, env: Uint8Array): Verif
     || !Number.isSafeInteger(manifest.abi) || (manifest.abi as number) < 1) {
     throw new Error("host: the manifest needs a positive integer version and abi");
   }
-  const out = {} as HostParts;
-  for (const name of HOST_PART_NAMES) out[name] = new Uint8Array(parts.next());
+  const out = { manifest: { version: manifest.version as number, abi: manifest.abi as number } } as HostBlob;
+  for (const name of HOST_PART_NAMES) out[name] = parts.next();
   if (!parts.done()) throw new Error("host: trailing bytes in body");
-  return { author, authorKeys, manifest: { version: manifest.version as number, abi: manifest.abi as number }, ...out };
+  return out;
+}
+
+/** Authenticate a host blob and split it; the parts alias `env`. */
+export function verifyHostBlob(crypto: ManifestVerifier, env: Uint8Array): HostBlob & { author: Uint8Array } {
+  const { author, body } = verifyEnvelope(crypto, env, DOMAIN_HOST, "host");
+  return { author, ...parseBody(body) };
+}
+
+/** Whether the running host (`running`, its own blob) may stage `env` as its successor:
+ *  signed by the same author, for this loader's ABI, and newer than itself. A loader boots
+ *  nothing at or below its committed host, which is never newer than the running one. */
+export function checkStagedHost(crypto: ManifestVerifier, running: Uint8Array, abi: number, env: Uint8Array): void {
+  const self = verifyHostBlob(crypto, running);
+  const h = verifyHostBlob(crypto, env);
+  if (toHex(h.author) !== toHex(self.author)) {
+    throw new Error(`host: signed by ${toHex(h.author)}, not the running host's author`);
+  }
+  if (h.manifest.abi !== abi) {
+    throw new Error(`host: the blob needs platform ABI ${h.manifest.abi}, this loader implements ${abi}`);
+  }
+  if (h.manifest.version <= self.manifest.version) {
+    throw new Error(`host: v${h.manifest.version} is not above v${self.manifest.version}`);
+  }
 }

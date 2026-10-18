@@ -249,7 +249,7 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 func TestEngineIDsAreMintedByTheirOwner(t *testing.T) {
 	bootRealm(t)
 	const mk = `bridge.engineInstantiate(__qjs, { env: { callGo() {} }, realm: { hostCall() { return 0; }, callDone() {}, callFail() {} } })`
-	if _, err := qc.Eval("mk.js", `globalThis.__qjs = new Uint8Array(bridge.qjsWasm()); globalThis.__engineIds = [`+mk+`, `+mk+`];`); err != nil {
+	if _, err := qc.Eval("mk.js", `globalThis.__qjs = new Uint8Array(__qjsWasm); globalThis.__engineIds = [`+mk+`, `+mk+`];`); err != nil {
 		t.Fatalf("create engines: %v", err)
 	}
 	if got := evalString(t, "String(__engineIds[0] > 0 && __engineIds[1] > __engineIds[0])"); got != "true" {
@@ -347,7 +347,7 @@ func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 // of its parked call in __got and answers it to a non-empty invocation.
 const rawRealm = `
 	globalThis.__raw = (() => {
-	  const id = bridge.engineInstantiate(new Uint8Array(bridge.qjsWasm()), {
+	  const id = bridge.engineInstantiate(new Uint8Array(__qjsWasm), {
 	    env: { callGo() { throw new Error("unserved"); } },
 	    realm: {
 	      hostCall: (callId) => { __raw.parked = callId; return 0; },

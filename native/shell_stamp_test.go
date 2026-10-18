@@ -46,35 +46,15 @@ func requireFreshShell(tb testing.TB) {
 	}
 }
 
-// genesisParts splits the genesis blob without checking its signatures, which boot does:
-// this only asks what it was built from.
-func genesisParts() (script string, qjsWasm []byte, err error) {
-	if len(genesisHost) < offBody {
-		return "", nil, errors.New("host.skb is shorter than an envelope")
-	}
-	body := genesisHost[offBody:]
-	var parts [][]byte
-	for len(body) >= 4 && len(parts) < 3 {
-		n := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
-		if n > len(body)-4 {
-			return "", nil, errors.New("host.skb: truncated body")
-		}
-		parts, body = append(parts, body[4:4+n]), body[4+n:]
-	}
-	if len(parts) < 3 {
-		return "", nil, errors.New("host.skb: truncated body")
-	}
-	return string(parts[1]), parts[2], nil
-}
-
 // shellSourceDrift reports which stamped sources no longer hash to what they did when
 // host.skb was built, or nil when the artifact is current.
 func shellSourceDrift() error {
-	hostJS, engine, err := genesisParts()
+	genesis, err := readHostBlob(genesisHost)
 	if err != nil {
 		return err
 	}
-	if disk, err := os.ReadFile(filepath.Join("qjs", "qjs.wasm")); err != nil || !bytes.Equal(disk, engine) {
+	hostJS := genesis.script
+	if disk, err := os.ReadFile(filepath.Join("qjs", "qjs.wasm")); err != nil || !bytes.Equal(disk, genesis.qjs) {
 		return errors.New("host.skb carries another engine than qjs/qjs.wasm")
 	}
 	at := strings.Index(hostJS, shellSourceMarker)

@@ -1,8 +1,9 @@
 // Host updates (§12.9): the slots a host blob is staged into and committed from, under the
-// rules every loader keeps (WASM/host/loader-node.ts keeps the same ones):
+// rules every loader keeps (WASM/host/loader-node.ts keeps the same ones). The running host
+// checked a staged blob's signatures, author, ABI and version before it handed it over
+// (host-blob.ts checkStagedHost); the loader keeps the rest:
 //
-//   - one author, the genesis blob's: a blob from anyone else runs only by --host;
-//   - a floor, the committed host's version: nothing at or below it is staged or booted;
+//   - a floor, the committed host's version: nothing at or below it is booted;
 //   - a staged blob is tried once: marked tried before it boots, so a crash is not retried;
 //   - it is committed only after a health window it ran through with no fatal error, and
 //     anything that fails before that is discarded and the committed host booted again.
@@ -12,7 +13,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -55,7 +55,7 @@ type hostUpdates struct {
 	reboot bool
 }
 
-// newHostUpdates checks the mode and the genesis blob the slots are pinned to.
+// newHostUpdates checks the mode; genesis is the host to fall back on.
 func newHostUpdates(dataDir, mode string, genesis *hostBlob) (*hostUpdates, error) {
 	switch mode {
 	case updatesOff, updatesNext, updatesNow:
@@ -81,23 +81,15 @@ func hostLog(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "  host   "+format+"\n", args...)
 }
 
-// load reads and checks one slot: nil when it is absent, or not the pinned author's for
-// this ABI, which it reports.
+// load reads one slot: nil when it is absent, or not a blob for this ABI, which it reports.
 func (u *hostUpdates) load(name string) *hostBlob {
 	env, err := os.ReadFile(u.path(name))
 	if err != nil {
 		return nil
 	}
-	h, err := verifyHostBlob(env)
-	switch {
-	case err != nil:
+	h, err := readHostBlob(env)
+	if err != nil {
 		hostLog("ignored %s: %v", name, err)
-		return nil
-	case !bytes.Equal(h.author, u.genesis.author):
-		hostLog("ignored %s: signed by %x, not this binary's host author", name, h.author)
-		return nil
-	case h.abi != platformABI:
-		hostLog("ignored %s: it needs platform ABI %d, this loader implements %d", name, h.abi, platformABI)
 		return nil
 	}
 	return h
@@ -132,7 +124,7 @@ func (u *hostUpdates) choose() []byte {
 		u.discard("it is not above the floor")
 		return base.env
 	}
-	if err := writeFileAtomic(u.path(triedFile), nil, ".tried-", 0o600); err != nil {
+	if err := writeFileAtomic(u.path(triedFile), nil, 0o600); err != nil {
 		hostLog("cannot mark v%d tried, so it is not run: %v", p.version, err)
 		return base.env
 	}
@@ -201,35 +193,22 @@ func (u *hostUpdates) commit(gen int) {
 	hostLog("committed after %s", u.window)
 }
 
-// stage checks a host blob a running host hands over and keeps it as pending. Answers
-// whether it should boot now.
-func (u *hostUpdates) stage(env []byte, running *hostBlob) (bool, error) {
+// stage keeps a host blob the running host checked as pending. Answers whether it should
+// boot now.
+func (u *hostUpdates) stage(env []byte) (bool, error) {
 	if u == nil || u.mode == updatesOff {
 		return false, errors.New("host: updates are off on this node (--host-updates next|now)")
 	}
-	h, err := verifyHostBlob(env)
+	h, err := readHostBlob(env)
 	if err != nil {
 		return false, err
 	}
-	if !bytes.Equal(h.author, u.genesis.author) {
-		return false, fmt.Errorf("host: signed by %x, not this binary's host author", h.author)
-	}
-	if h.abi != platformABI {
-		return false, fmt.Errorf("host: the blob needs platform ABI %d, this loader implements %d", h.abi, platformABI)
-	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	floor := u.base().version
-	if running.version > floor {
-		floor = running.version
-	}
-	if h.version <= floor {
-		return false, fmt.Errorf("host: v%d is not above v%d", h.version, floor)
-	}
 	if err := os.MkdirAll(u.dir, 0o700); err != nil {
 		return false, err
 	}
-	if err := writeFileAtomic(u.path(pendingFile), env, ".pending-", 0o600); err != nil {
+	if err := writeFileAtomic(u.path(pendingFile), env, 0o600); err != nil {
 		return false, err
 	}
 	os.Remove(u.path(triedFile))

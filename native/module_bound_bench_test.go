@@ -2,8 +2,9 @@ package main
 
 // What the §4.3 module-call bound costs, which decided it should be on by default (§14.1).
 // Arming a runtime compiles a termination check into every loop of every module on it,
-// and this measures that check on real wasm: libsodium's Ed25519 and, opt-in, seedstore's
-// Reed-Solomon codec, an installed app module and so the kind of code the bound exists for.
+// and this measures that check on real wasm: the host's ML-DSA-65 verifier and, opt-in,
+// seedstore's Reed-Solomon codec, an installed app module and so the kind of code the bound
+// exists for.
 //
 //	go test -run x -bench BenchmarkBound -benchtime 2s -count 5 ./...
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench BenchmarkBound ./...
@@ -38,15 +39,16 @@ func boundRuntime(b *testing.B, armed bool) wazero.Runtime {
 	return rt
 }
 
-func BenchmarkBoundEd25519Verify(b *testing.B) {
+func BenchmarkBoundMlDsaVerify(b *testing.B) {
+	msg := bytes.Repeat([]byte{0x5a}, 4096)
 	for _, c := range boundConfigs {
 		b.Run(c.name, func(b *testing.B) {
-			s := bootSodium(boundRuntime(b, c.armed))
-			pk, sk := s.signSeedKeypair(bytes.Repeat([]byte{7}, 32))
-			sig := s.signDetached(benchMsg, sk)
+			s := newMlDsaSigner(b, boundRuntime(b, c.armed))
+			pk, sk := s.keypair(b, bytes.Repeat([]byte{7}, 32))
+			sig := s.signDetached(b, msg, sk)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if !s.verifyDetached(sig, benchMsg, pk) {
+				if !s.verifyCtx(b, sig, msg, nil, pk) {
 					b.Fatal("verify failed")
 				}
 			}
