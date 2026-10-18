@@ -20,7 +20,7 @@ The message path does **no asymmetric cryptography and no recursion**: routing a
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6).
 - **Per bundle load:** one BLAKE2b-256 hash of the body and verification of both Ed25519 and ML-DSA-65 signatures (§12.4).
 
-The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (§12.9); `npm test` from `WASM/` exercises them end-to-end on the JS target, and seedstore's `WASM/tests/bench.mjs` measures storage throughput.
+All of it runs on the host's libsodium on the platform's engine table (§12.9), on every target. The Go/native target carries `*_bench_test.go` benchmarks over these hot paths; `npm test` from `WASM/` exercises them end-to-end on the JS target, and seedstore's `WASM/tests/bench.mjs` measures storage throughput.
 
 ### 10.2 Distribution Size
 
@@ -30,13 +30,14 @@ This is the one place these figures live.
 |---|---|
 | `services/*.js` + hand-written `host/*.js` a page can reach, minified (`build-min`, excluding the embedded transport) | ~114 KB |
 | the embedded transport bundle (`host/transport-bundle.js`: the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~155 KB |
-| libsodium.wasm (core build: the host trust root and current channel fast paths) | 217 KB |
+| libsodium.wasm (core build: the host's crypto, and each loader's own blob check) | 217 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 135 KB |
 | mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
 | **Total browser deployment** | **~637 KB** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, counted inside the transport bundle |
-| QuickJS realm engine (`quickjs/`, loaded only when a guest runs) | ~570 KB |
-| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB) and the Go runtime (~2.4 MB) | ~7.5 MB |
+| `qjs.wasm`, the realm engine (`browser/qjs.wasm`, loaded only when a guest runs) | 1.2 MB |
+| **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium and ML-DSA-65, signed (§12.9) | 1.9 MB |
+| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~8.0 MB |
 
 `npm run build` emits the readable `build/` (~392 KB of JS) and the comment-stripped `build-min/` (~268 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach. It prints the gzipped size before and after minifying on every run.
 
@@ -65,7 +66,7 @@ The host knows nothing about chat or storage: it offers a fixed, generic surface
 
 ### 12.1 Host services: raw-byte backends
 
-The host provides four **host services**, `node`, `fs`, `timer` and `link` (`HOST_SERVICES`, `services/domains.ts`), and two ungated name families. All of them move raw bytes; the host never interprets what an app means by them.
+The host provides five **host services**, `node`, `fs`, `timer`, `link` and `host` (`HOST_SERVICES`, `services/domains.ts`), and two ungated name families. All of them move raw bytes; the host never interprets what an app means by them.
 
 | Service | Methods | Backs |
 | --- | --- | --- |
@@ -73,6 +74,7 @@ The host provides four **host services**, `node`, `fs`, `timer` and `link` (`HOS
 | `fs` | `fs/get`, `fs/put`, `fs/list`, `fs/delete`, `fs/stat`, `fs/size` | Raw bytes under an opaque, flat key, scoped to the app label (§12.1). |
 | `timer` | `timer/arm`, `timer/clear` | The realm's one wake (§12.3). |
 | `link` | `link/open`, `link/send`, `link/close`, `link/deliver`, `link/status` | Raw links over opaque link ids, attributed inbound delivery, and the occupant's status. **The link owner only** (§12.5). |
+| `host` | `host/stage` | Hands the loader a host blob to run next (§12.9). The blob authenticates itself, so any app may declare it; the loader's rules and the operator's `--host-updates` decide. A node with no loader slots (a library embedding, §12.8) refuses an app that declares it. |
 | `crypto/*` | `blake2b`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries, each over its algorithm's whole standard interface (§12.2). `random` is host entropy. **Not a grant.** |
 | *bare names* | the bundle's own module names | The asking bundle's private WASM modules. **Not a grant.** |
 
@@ -184,7 +186,7 @@ The driver prints a reason above severity 0 verbatim as `[transport] link N from
 
 ### 12.3 Zero-authority JS realms
 
-A guest runs as confined JS in a QuickJS realm (`host/safe-js.ts`) holding only the ECMAScript intrinsics and the injected preamble. It cannot name `fs`, `net`, `process` or `fetch`.
+A guest runs as confined JS in a QuickJS realm holding only the ECMAScript intrinsics and the injected preamble. It cannot name `fs`, `net`, `process` or `fetch`. A realm is one `qjs.wasm` instance on the platform's engine table (§12.9), driven by one shared driver, `host/engine-realm.ts`, on every target. What runs on every call, arming the deadline, draining the job queue and the host-call ledger, is compiled into the engine's realm ABI (`native/qjs/csrc/realm.c`); the driver moves bytes and numbers only.
 
 - **One entrypoint.** `realm.call(bytes)` invokes the guest's `handle` with `[caller 32][body …]`. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, 32 zero bytes for the host itself and its events (the wake and the raw-link events). The body format is the callee's. A guest declares `handle`; nothing else is ever invoked.
 - **Invocations are serialized per realm** (`host/realm-queue.ts`, shared by both targets): one invocation holds the queue until it completes or sets `__deferred`.
@@ -497,7 +499,7 @@ A node that cannot be dialed (a browser, or anything behind NAT) is reached thro
 - **A path that moves.** A stream packet from an address other than the path's means the peer, or its NAT, now sends from there. The token alone proves nothing, since anyone who has seen a packet can copy it, so the end probes that address with 8 random bytes in the timestamp's place, at most once every 50 ms while such packets keep coming. The path moves when the answer echoes them, from that address, and only if that address was heard from no less recently than the old one, so a late packet cannot pull the path back. The stream then starts its window over and takes the probe's round trip as its first sample; a loss among what was sent before the move does not cut the new window. Ends that both move at once, or an end that sends nothing to show where it went, fall back on the 30 s silence and a new path through the relay.
 - **The data link** (`services/udp/stream.ts`) is a reliable, ordered byte stream over the path. It follows QUIC's loss recovery (RFC 9002), without the handshake or encryption the transport's channel already supplies: packets sized to the path, a new packet number for every send, acks as ranges of the packets the sender still waits on (every data packet names the oldest, and the receiver forgets the ranges below it), loss by a packet (3) and a time (9/8 RTT) threshold with a probe timeout behind them, and NewReno congestion control run as eight flows at once (MulTCP): the window grows by eight packets a round trip and a loss episode cuts it by 1/16, as eight TCP connections would together, and the cut is undone when every packet a loss episode declared lost turns out acked. Losses consecutive by packet number and sent more than three probe timeouts apart, with nothing acked between, are persistent congestion (RFC 9002 §7.6): the window starts over at two packets, in slow start up to the cut. A 1 MiB receive credit, which a reader held back by `setReadable` stops renewing, bounds the sender. Nothing acks an ack, so the one that renews the credit for a sender that has used all of it goes three times. What waits past a gap is capped at two credits, counted as the packets it came in, since chunks at overlapping offsets would otherwise hold a credit per byte; a peer past the cap closes the path. A receiver reads and acks once a turn of the event loop, for everything that arrived in it, and acks a gap at once. `buffered()` is what was written and not yet acked. Something goes out after 5 s of silence, which keeps NAT mappings open; 30 s with nothing heard closes the path, and so does data in flight through 6 probe timeouts in a row from a peer silent for 10 s, which sends a close first. The 10 s floor is twice the host's default guest deadline, since a peer whose loop a guest holds acks nothing until it lets go. A close is sent three times, since nothing acks it.
 - **Packet size.** A path starts at QUIC's 1200-byte floor, which every path is taken to carry, and probes for 1452 bytes (Ethernet's 1500 less IPv6 and UDP headers) as RFC 8899 does: a probe is one padded packet with a packet number, outside the window and loss recovery, sent up to three times a probe timeout apart, and an ack naming one raises the size. A second probe timeout in a row drops it back to 1200 and probes again once the peer acks, so a stall costs the size only until then. A path that moves starts at 1200 again. A chunk cut larger than the path now carries is split when it is resent, so the receiver may get the bytes both whole and in pieces, and takes whichever comes first. Every cost of the stream is per packet, so 1452 bytes is about 17% fewer of them.
-- **The platform** is `DatagramPlatform`: a socket (bind, send, receive, close), dual-stack where the machine has IPv6 and IPv4 otherwise, which names a peer by its IPv4 address dotted, though a dual-stack socket hears it IPv4-mapped, and resolves a name to IPv4; and the machine's addresses, over which the seam needs only `setTimeout` and `crypto.getRandomValues`. `services/udp/node.ts` is Node's and the default. Each socket asks for 4 MiB receive and send buffers, four credits, since a sender may put a whole credit on the wire at once and a buffer that drops a burst's tail cuts the sender's window; a kernel that grants less is taken at its word. The native binary's is `native/udp.go` behind `host/native-shim.ts`: a reader goroutine per socket, reading into 2 KiB since an end behind a hard NAT opens hundreds of sockets, holds what it reads until the loop takes it, so a turn's datagrams cross into the host realm in one call, each as `[n u8][ip n][port u16][len u16][bytes]` with n 4 for IPv4 and 16 for IPv6, and each node gets its own `UdpNetwork`, since a factory keeps one accept sink.
+- **The platform** is `DatagramPlatform`: a socket (bind, send, receive, close), dual-stack where the machine has IPv6 and IPv4 otherwise, which names a peer by its IPv4 address dotted, though a dual-stack socket hears it IPv4-mapped, and resolves a name to IPv4; and the machine's addresses, over which the seam needs only `setTimeout` and `crypto.getRandomValues`. `services/udp/node.ts` is Node's and the default. Each socket asks for 4 MiB receive and send buffers, four credits, since a sender may put a whole credit on the wire at once and a buffer that drops a burst's tail cuts the sender's window; a kernel that grants less is taken at its word. The native binary's is `native/udp.go` behind the platform ABI (`host/platform.ts`): a reader goroutine per socket, reading into 2 KiB since an end behind a hard NAT opens hundreds of sockets, holds what it reads until the loop takes it, so a turn's datagrams cross into the host realm in one call, each as `[n u8][ip n][port u16][len u16][bytes]` with n 4 for IPv4 and 16 for IPv6, and each node gets its own `UdpNetwork`, since a factory keeps one accept sink.
 - **Signaling.** The transport offers a UDP path before WebRTC: the offering side opens the first kind its host routes, and on a decline, the next. A UDP offer travels as `u`; answers, candidates and declines use the WebRTC tags. Bounds, deadlines and the binding of the data link are the same for both.
 
 ### 12.8 The shell: node assembly and the CLI
@@ -505,7 +507,7 @@ A node that cannot be dialed (a browser, or anything behind NAT) is reached thro
 `bootShell(opts)` (`host/shell-core.ts`) assembles the host and returns its `Shell` plus the channel adapter. `bootNodeShell(opts)` (`host/shell-node.ts`) selects Node crypto, `NodeFs`, file-backed freshness and `NodeChannelFactory`, and adds file-path bundle loading. The CLI is `host/cli.ts`:
 
 ```sh
-node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
+node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
      [--relay ws://host:port [--relay-secret ./relay.secret]] \
@@ -515,7 +517,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
      [--guest-timeout <ms>] [--guest-memory <MiB>]
 ```
 
-- **`runCli` is shared by both targets.** It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order (remedies, then the bundle, then the one-shots, then serve) and every printed line. A target supplies a `CliHost`: file reads and writes, argv and a banner, one console line, raw stdin and stdout, entropy, and `standUp` to stand a node up on that platform. Unknown flags are errors.
+- **`runCli` is shared by both loaders**, in the host script (§12.9). It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order (remedies, then the bundle, then the one-shots, then serve) and every printed line. A target supplies a `CliHost`: file reads and writes, argv and a banner, one console line, raw stdin and stdout, entropy, and `standUp` to stand a node up on that platform. Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
 - **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. An IPv6 host goes in brackets, `[::]:9000`. The label reaches the transport with every link the listener accepts, unread (§12.1).
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one.
@@ -528,22 +530,29 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
 
 **The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
 
-### 12.9 The native binary: the primary non-browser deployment
+### 12.9 Loaders and the host blob
 
-The Go/native target (`native/`) is the recommended non-browser deployment: one cgo-free binary, `seedkernel`, with no Node, Bun or separate JS engine.
+A node is a **loader** running a **host blob**. The loader is the only code fixed when a node is deployed; everything the node does, from admission to the CLI, is the host script inside the blob, and the same script runs on every loader.
 
-- **Shared code, Go primitives.** `scripts/bundle-native-host.mjs` (`npm run build:native-host`) compiles the shared TypeScript into one `native/host-shell.gen.js`, which the binary `//go:embed`s and evaluates in QuickJS. `host/native-shim.ts` satisfies `PureModuleLoader`, `FreshnessStore`, the channel and realm interfaces by forwarding to Go's byte bridge, then calls the shared `bootShell`. Nothing under `native/` re-implements protocol, admission, routing or boot order; Go supplies only platform primitives.
-- **`bootShell` is the one assembly.** A target supplies `{ sodium, identity, modules, fs, freshnessStore, transport, createRealm }`; all but the first two have defaults.
-- **Embedded engines** over [wazero](https://wazero.io): the same core `libsodium.wasm` and `mldsa65.wasm` as the JS targets; a QuickJS built from the same quickjs-ng v0.16.2 pin as the JS platform (`native/qjs/build-qjs.sh`, `WASM/quickjs/build-quickjs-ng.sh`). Go owns the event loop: timers, the JS job queue, socket delivery. The guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`. Bundle modules, `ws.wasm` included, go through the ordinary private-module builder (§3.2).
-- **Primitives**: `os` for fs (synchronous; `native-shim.ts` wraps it async), `net` for one raw TCP socket kind (node↔node and browser↔node, the codec chosen per link above Go), `crypto/rand` for entropy. The CLI is the shared `runCli` over a `CliHost` built from those primitives, plus `__fs.open` for the data directory.
-- **Native fast paths.** A target may substitute a native implementation of a primitive only if (1) it is standardized, (2) its output is byte-identical, pinned by a known-answer test against the shared blob, and (3) no protocol judgement lives inside it. BLAKE2b-256 and the ChaCha20-Poly1305 record layer are native Go; Ed25519 and ML-DSA-65 verification stay on the shared wasm.
-- **Interop.** A Go node and a Node/Bun node join one cohort against the same signed bundles (`WASM/scripts/native-interop.sh`).
+- **The host blob** (`host/host-blob.ts`, `build/host.skb`) is a suite `0x02` envelope (§12.4) under `DOMAIN_host`, so it never passes as an app bundle or an app bundle as a host. Its body is the manifest `{version, abi}`, the host script (`build/host.js`, the shared TypeScript bundled by `scripts/bundle-host.mjs`), `qjs.wasm`, `libsodium.wasm` and `mldsa65.wasm`. `npm run build` signs it with `host-author.key`, which the first build writes, at `package.json`'s `hostVersion`.
+- **The platform ABI** (`host/abi.ts`) is what a loader gives the host script: process I/O and entropy, private modules (§4), the engine table, files, TCP and UDP sockets, timers, and `stageHost`. Every member is a raw primitive. A call a platform can only answer asynchronously is awaited by the host on every loader. The script refuses a loader that implements another ABI version, and a loader refuses a blob that needs one.
+- **The engine table** instantiates wasm from bytes, calls its exports with numbers and reads and writes its memory. Guest realms (§12.3) and the host's crypto (`host/sodium-engine.ts`) run on it, so the engine and the crypto ship in the blob.
+- **Two loaders.** The native binary (`native/`) is Go over [wazero](https://wazero.io): the host script runs in a `qjs.wasm` instance from the blob, and Go owns the event loop (timers, the JS job queue, socket delivery). The Node loader (`host/loader-node.ts`, `npm run shell`) implements the ABI over `node:net`, `node:dgram`, `node:fs` and `WebAssembly`, and runs the host script in V8. A browser page has no loader: it embeds the host as a library (§12.8), and the origin that serves it is its trust root.
+- **Checked before it runs.** Each loader verifies a blob with its own copies of libsodium and ML-DSA-65 (`native/hostblob.go`; `loadCrypto` on Node): both signatures, then the parts.
+- **Updates** follow one set of rules in both loaders (`native/hostslots.go`, `host/loader-node.ts`), over slots beside the data directory: `<dir>.host/committed.skb`, `pending.skb` and the `tried` mark.
+  - **Who and what.** A blob is staged only from the author of the loader's genesis blob, the one it was built with, at a version above the floor (the committed host's version, or the running one's if higher), for the loader's ABI.
+  - **Staging.** A running host hands a blob to `stageHost`, which apps reach through `host/stage` (§12.1). The loader checks it and keeps it as pending. `--host-updates off`, the default, refuses staging; `next` boots a pending host at the next start; `now` reboots into it in place once the operator flow has ended. A reboot drops a completed `--op`, so the one-shot runs once.
+  - **Tried once.** The `tried` mark is written before a pending host boots, so a pending host found marked never committed, and is dropped unrun.
+  - **Committed after a health window.** A pending host that serves for 30 s with no fatal error is renamed over `committed.skb`, which raises the floor. A failure before that, at boot or while serving, drops it and boots the committed host; a crash is caught by the mark at the next start. A run that only performs an `--op` and exits proves nothing either way and leaves it pending.
+  - **A newer loader wins.** A loader whose genesis blob is newer than the committed host runs the genesis blob.
+- **Loader flags.** `--host <file>` boots that blob instead of the slots' choice, from any author, by the operator's explicit choice, and leaves the slots alone. `--host` and `--host-updates` are the loader's; the host never sees them.
+- **Interop.** A Go node and a Node node join one cohort against the same signed bundles (`WASM/scripts/native-interop.sh`).
 
 ```sh
 seedkernel --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000[,ws=0.0.0.0:7001] \
      --bundle ./app-bundle [--local-config ./app.json] [--peers <pk>@host:port,…] \
-     [--op name  < argument > response]
+     [--op name  < argument > response] [--host ./host.skb] [--host-updates off|next|now]
 ```
 
 Benchmarks: `wsl bash gorun.sh test -run x -bench . -benchmem ./...` from `native/`; `node tests/bench-module-call.mjs` from `WASM/` for the JS module-call hop.

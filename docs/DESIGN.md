@@ -66,6 +66,8 @@
 
 **Bounds cross every seam or they do not exist.** A bound the host accepts but no target can set is a bound nobody has; one the realm factory takes and nothing upstream carries is dead. `--guest-timeout 0` reads as "no budget" so that disabling one is something an operator says, never what a mistyped flag does. Edge values the two engines would read differently (a heap limit of 0 means "none" to the JS engine) are refused.
 
+**One realm driver for every target.** A realm is one `qjs.wasm` instance driven over the engine table by shared code, so the rules for its budget, its host calls and its disposal exist once, rather than as two implementations kept equal by hand. The engine is the same build on every target, so a behavioural difference between targets is a build difference, not a version difference.
+
 **Execution time is the operator's.** Module memory is the author's to declare because it is a property of the code; how long *this* node will spend on one message is a property of the deployment. It matters most on the holder path, where an inbound frame runs guest code on the node's only thread: an interrupted guest throws, the transport answers a throwing guest empty, and a wedged guest costs one empty response rather than the link.
 
 ## 12.4 Signed bundles
@@ -163,7 +165,7 @@
 
 **Media is the app's own connection.** Audio and video need a peer connection an app can add tracks to. Lending the transport's would put a platform object back across the seam and its renegotiation back into the host, so an app that wants media opens its own and signals it over its own protocol, authenticated by the channel.
 
-**The peer-connection factory is the app's.** The seam the runtime owns is a byte duplex; an ICE/DTLS/SCTP implementation is one way to produce one, so the runtime depends on none. A console peer wants a pure-JS library, since it must bundle into `bun --compile`, where a native binding like `node-datachannel` segfaults.
+**The peer-connection factory is the app's.** The seam the runtime owns is a byte duplex; an ICE/DTLS/SCTP implementation is one way to produce one, so the runtime depends on none. A console peer wants a pure-JS library, so a node carries no native binding.
 
 ## 12.8 The shell: node assembly and the CLI
 
@@ -175,13 +177,23 @@
 
 **`--contact-secret` is a file** because an argument is visible in `ps` output and shell history.
 
-## 12.9 The native binary: the primary non-browser deployment
+## 12.9 Loaders and the host blob
 
-**A platform target, not a reimplementation.** Go grows with primitives, never with logic: protocol is never re-derived in a second language, and verification, admission, scope derivation, freshness and routing each have one implementation to audit. The generated bundle makes a missed target change a compile error. Both QuickJS builds come from one pin, so a behavioural difference between targets is a build difference, not a version difference.
+**The host is updatable because the fixed part is small.** A node that can only change by redeploying its binary changes on its operator's schedule, not when a fix ships. Everything a confined app cannot do for itself still has to live below the confinement, but very little of it has to be fixed: the syscalls, the wasm engine and the check of what runs next. So that is all the loader is, and the rest arrives signed. The trust that moves is real: the host author's key now decides what every updating node runs, which is why updates are off unless the operator turns them on (§14).
 
-**Why the fast-path rule has three conditions.** A standardized primitive with byte-identical, KAT-pinned output differs only in speed. A verifier fails condition 3, because its accept/reject boundary is consensus (§14.1). So BLAKE2b-256 and the record-layer AEAD, which only transform bytes, are native; Ed25519 and ML-DSA-65, which decide acceptance, stay on the shared wasm. It is the same trade as `ws.wasm` against a native RFC 6455, and it will come up again for every suite added.
+**The ABI is primitives because primitives stay put.** The frozen interface is the one thing every loader must keep implementing, so it is drawn where the host's decisions are not: bytes in files, bytes on sockets, numbers in and out of wasm. A bridge shaped around the host's internals (a realm call, a settle with a budget report) would freeze those internals with it. Calls a platform can only answer asynchronously are awaited by the host everywhere, so one script serves a loader that answers in the call and one that cannot.
 
-**Size.** The binary is one larger artifact (~7.5 MB) with zero external dependencies, the right shape for a server or appliance; a JS host needs a Node/Bun install plus the lazily loaded QuickJS. The protocol's own footprint is tens of KB. QuickJS is lazy on the JS targets because a host with no installed slot should not pay for a realm.
+**One script, two engines.** The native loader runs the host script in QuickJS because it has no other JS engine; the Node loader runs it in V8 because it has one, and the host realm is the busiest code a node runs. Running it in QuickJS on Node too would make the loaders identical in shape and the node slower, which is the wrong way round.
+
+**What runs per call is compiled, not interpreted.** On native the host script is interpreted, so its per-call costs are paid in QuickJS. Measured on the realm driver: a dozen small JS operations per host call cost 12 µs, against 2.3 µs once the deadline, the job drain and the host-call ledger moved into the engine's realm ABI (`realm.c`). It ships in the blob like the script, so it is no harder to change. And every realm runs on one compiled copy of the engine: two copies, one for the host realm and one for the guests, cost the round trip a fifth in instruction-cache misses alone.
+
+**The crypto rides with the host.** The host's libsodium and ML-DSA-65 run on the engine table from the blob, so a fix to either ships as a host update. It costs the native round trip about a tenth and 64 KiB transfers about a quarter, against the record layer's assembly ChaCha20-Poly1305 in Go; end-to-end throughput was measured to have room for it. Each loader keeps its own copies of the two to check a blob, since a verifier cannot be delivered through the format it verifies (§14).
+
+**Tried once, committed after a window, decided by the loader.** A blob that boots and then dies on its first link is the failure that matters, and only something that outlives the host can see it. The mark written before a trial turns a crash into a rollback at the next start without trusting the crashed code to report it; the window turns "it started" into "it served". The floor rises only at commit, so a rollback never goes below it, and there is never more than one known-good host to return to.
+
+**The browser has no loader.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
+
+**Size.** The binary is one artifact (~8 MB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install plus the lazily loaded `qjs.wasm`. The protocol's own footprint is tens of KB. `qjs.wasm` is lazy on the JS targets because a host with no installed slot should not pay for a realm.
 
 **Minification is a second `tsc` pass**, not a bundler: no new dependency, and the compiler is the one tool on hand that can tell a regex literal from a division, so nothing hand-written lexes the host.
 

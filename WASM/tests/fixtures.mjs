@@ -46,7 +46,7 @@ export const testBackends = () => ({
 });
 export const enc = new TextEncoder();
 export const { NodeFs } = await imp("build/services/fs-node.js");
-export const { createSafeRealm } = await imp("build/host/safe-js.js");
+export const { createWebRealm } = await imp("build/host/engine-web.js");
 export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
 export { bytesEqual } from "./bytes.mjs";
 

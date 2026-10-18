@@ -1,23 +1,21 @@
-// The Web globals the shared host code uses that quickjs-ng lacks, for the native host
-// realm only. Browser and Node have them all, and guest realms get only ECMAScript
-// intrinsics on every target (§12.3).
+// The Web globals the shared host code uses that quickjs-ng lacks, each filled only where
+// the loader's engine has none: all of them on native, none on Node. Guest realms get only
+// ECMAScript intrinsics on every target (§12.3).
 //
-// First in the native host bundle, so the globals exist before any module uses one at load
+// First in the host script, so the globals exist before any module uses one at load
 // time (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
 
-/** The `bridge` and `__sodium` members this file uses (native-shim.ts declares the whole
- *  of each). */
-declare const bridge: { log(line: string): void };
-declare const __sodium: { randombytes_buf(n: number): ArrayBuffer };
+/** The `bridge` members this file uses (abi.ts declares the whole of it). */
+declare const bridge: { log(line: string): void; random(n: number): ArrayBuffer | Uint8Array };
 
 const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown; crypto?: unknown };
 
 // crypto.getRandomValues, Web Crypto's entropy call, which the UDP path draws its tokens
-// from (services/udp); Go's libsodium serves it.
+// from (services/udp); the loader's CSPRNG serves it.
 if (web.crypto === undefined) {
   web.crypto = {
     getRandomValues<T extends ArrayBufferView>(a: T): T {
-      new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(new Uint8Array(__sodium.randombytes_buf(a.byteLength)));
+      new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(new Uint8Array(bridge.random(a.byteLength)));
       return a;
     },
   };
@@ -86,7 +84,7 @@ if (web.TextDecoder === undefined) {
 // console: quickjs-ng defines none, and shared host code logs through it (for example
 // when reporting a wedged transport guest). Everything goes to stderr through
 // `bridge.log`, because stdout carries the app's raw response bytes for --op.
-{
+if (web.console === undefined) {
   const show = (a: unknown): string => {
     if (typeof a === "string") return a;
     // Message first: quickjs's `stack` holds only the frames, not the message.

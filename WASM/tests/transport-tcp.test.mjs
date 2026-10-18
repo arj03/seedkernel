@@ -16,7 +16,7 @@ const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { bootShell } = await imp("build/host/shell-core.js");
 const { NodeChannelFactory } = await imp("build/services/net-node.js");
-const { createSafeRealm } = await imp("build/host/safe-js.js");
+const { createWebRealm } = await imp("build/host/engine-web.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
@@ -54,7 +54,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: { ...transportOptions, config: transportConfig },
-    createRealm: async (o) => createSafeRealm(o),
+    createRealm: async (o) => createWebRealm(o),
     admit: policy,
   });
   const app = await shell.install(harnessAppBlob(appAuthor));

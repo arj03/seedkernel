@@ -1,5 +1,5 @@
 // The private module table (§3): the wazero runtime app modules run on, the opaque slots
-// holding their instances, and the calls host/native-shim.ts makes into them. Modules are
+// holding their instances, and the calls host/platform.ts makes into them. Modules are
 // pure transforms (§4.3) and cannot call back.
 package main
 

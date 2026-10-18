@@ -19,7 +19,7 @@ const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { bootShell } = await imp("build/host/shell-core.js");
 const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
-const { createSafeRealm } = await imp("build/host/safe-js.js");
+const { createWebRealm } = await imp("build/host/engine-web.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const bundleApi = await imp("build/host/bundle.js");
 const authorApi = await imp("build/scripts/bundle-author.js");
@@ -157,7 +157,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     fs: false,
     transport: { ...transportOptions, config: transportConfig },
     createRealm: async (o) => {
-      const realm = await createSafeRealm(o);
+      const realm = await createWebRealm(o);
       const pause = realmControl.pauseNext;
       if (pause) { realmControl.pauseNext = null; await pause(); }
       return realm;

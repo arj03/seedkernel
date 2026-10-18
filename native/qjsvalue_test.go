@@ -133,9 +133,9 @@ func TestValueBytesHostileProperties(t *testing.T) {
 }
 
 // A conversion that cannot succeed must clear its own exception. Every entry point on a
-// context assumes a clean one, and all three conversions get arguments a guest chose
-// (guest.go's __host_call), so one left pending would fail the next call there, rejecting
-// an invocation that had already produced its answer.
+// context assumes a clean one, and all three conversions get arguments the host realm's
+// JS chose (every bridge call), so one left pending would fail the next call there, failing
+// a call that had already produced its answer.
 func TestFailedConversionsTakeTheirException(t *testing.T) {
 	bootRealm(t)
 	for _, tc := range []struct {

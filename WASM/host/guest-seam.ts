@@ -60,6 +60,12 @@ export interface HostTimers {
   clear(): void;
 }
 
+/** The loader's host slots (§12.9): keep a host blob as the one to run next, or refuse it
+ *  with the reason. */
+export interface HostStaging {
+  stage(blob: Uint8Array): void | Promise<void>;
+}
+
 /** What stands behind each host service. */
 export interface SeamBackends {
   /** This slot's signing scope (`slotSignScope`): signing is never raw. */
@@ -68,6 +74,7 @@ export interface SeamBackends {
   fs: Fs;
   timer: HostTimers;
   link: LinkBackend;
+  host: HostStaging;
 }
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
@@ -218,7 +225,7 @@ globalThis.__rejectHostCall = (callId, msg) => {
 };
 globalThis.host = {
   // Every name answers a Promise. A refused name throws here, at the call site. The
-  // payload crosses as a plain ArrayBuffer: quickjs-emscripten rejects a view.
+  // payload crosses as a plain ArrayBuffer, which is what the realm reads (realm.c).
   call(name, bytes) {
     const callId = ++__callSeq;
     const ab = bytes instanceof ArrayBuffer
@@ -406,6 +413,9 @@ const SERVICES: {
       return out;
     }),
     "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
+  }),
+  host: (staging) => ({
+    "host/stage": async (payload) => { await staging.stage(payload); return NONE; },
   }),
   timer: (timers) => ({
     "timer/arm": (payload) => {

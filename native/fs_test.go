@@ -92,7 +92,7 @@ func TestNodeFsNoEscape(t *testing.T) {
 //
 // Every call is awaited, because the seam is async on every target: no browser backend
 // could implement a synchronous `get`, so the native target does not offer one either. Go
-// still answers from disk within the call; host/native-shim.ts wraps it in a promise, and
+// still answers from disk within the call; host/platform.ts wraps it in a promise, and
 // this test uses that real code.
 func TestFsExposedToRealm(t *testing.T) {
 	bootRealm(t) // opens a store on a fresh temp dir, the way --dir does

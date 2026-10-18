@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -114,6 +115,17 @@ var ownedRealmDir string
 // bootRealm starts a fresh realm on a temp data dir: the engines, the platform
 // primitives, and the shared bundle, but no node. For tests of a primitive (fs, the byte
 // seam) or the shared JS directly.
+// testEngine is qjs.wasm for a test that builds a bare runtime: the checked-in engine, which
+// the genesis blob carries too (shell_stamp_test.go).
+func testEngine(tb testing.TB) []byte {
+	tb.Helper()
+	wasm, err := os.ReadFile(filepath.Join("qjs", "qjs.wasm"))
+	if err != nil {
+		tb.Fatal("qjs.wasm:", err)
+	}
+	return wasm
+}
+
 func bootRealm(tb testing.TB) {
 	tb.Helper()
 	dir, err := os.MkdirTemp("", "seedkernel-realm-")
@@ -150,7 +162,7 @@ func bootRealmIn(tb testing.TB, dir string) {
 	// This realm's data directory, which Go's boot knows nothing about. Opened through the
 	// platform's own `fs.open` for tests that use `fs` with no node running, and kept as
 	// `__dir` for every `standUp` a test calls: the Go primitive serves one directory, so
-	// all nodes in a realm share it (host/native-shim.ts).
+	// all nodes in a realm share it (host/platform.ts).
 	evalString(tb, "__fs.open("+jsonString(dir)+"), globalThis.__dir = "+jsonString(dir))
 }
 
@@ -348,7 +360,7 @@ func guestSeamRealm(tb testing.TB) {
 }
 
 // newTestRealm creates a confined realm through the same factory production uses
-// (createRealm, host/native-shim.ts) over a seam the caller has already installed at
+// (createRealm, host/platform.ts) over a seam the caller has already installed at
 // `__guestSeam`, and stores it at `__realm`. `source` is prefixed with the given APP
 // fixture and an empty LOCAL value, as the shell does for a real bundle's guest (no HOST).
 func newTestRealm(tb testing.TB, appJSON, source string) {

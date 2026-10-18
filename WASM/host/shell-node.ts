@@ -55,7 +55,7 @@ export interface NodeShellRuntime extends CliNodeRuntime {
   shell: NodeShell;
 }
 
-// No realm factory (§12.3) is passed: bootShell's default, a lazy safe-js import that
+// No realm factory (§12.3) is passed: bootShell's default, a lazy engine-web import that
 // loads the engine on the first realm, is what this platform wants.
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
  *  `bootShell` (which installs the selected transport bundle, §12.6), then add the

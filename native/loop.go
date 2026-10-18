@@ -21,9 +21,6 @@ type eventLoop struct {
 	tasks   chan func()
 	stopped bool
 
-	// extra are the guest realms pumped alongside el.c, each through its budgeted pump.
-	extra []pumpEntry
-
 	// onSettle is the in-flight await's result sink, which __settle routes into.
 	onSettle func(kind int, bytes []byte, msg string)
 
@@ -70,39 +67,12 @@ func newEventLoop(c *qjs.Context) *eventLoop {
 	return el
 }
 
-// pumpEntry pairs a registered context with the func that drains it.
-type pumpEntry struct {
-	c    *qjs.Context
-	pump func()
-}
-
-// addContext registers another context to be drained by `pump` alongside el.c.
-func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
-	el.extra = append(el.extra, pumpEntry{c: c, pump: pump})
-}
-
-// removeContext drops a context registered with addContext; a no-op otherwise.
-func (el *eventLoop) removeContext(c *qjs.Context) {
-	for i, x := range el.extra {
-		if x.c == c {
-			copy(el.extra[i:], el.extra[i+1:])
-			el.extra[len(el.extra)-1] = pumpEntry{}
-			el.extra = el.extra[:len(el.extra)-1]
-			return
-		}
-	}
-}
-
-// pumpAll drains el.c, then every extra context, so a host job that schedules guest work
-// runs it in the same round; guest-to-host work needs a wake. A failed host drain stops
-// the loop (eventLoop.err).
+// pumpAll drains the host realm. A guest realm drains its own jobs inside each entry
+// (host/engine-realm.ts). A failed host drain stops the loop (eventLoop.err).
 func (el *eventLoop) pumpAll() {
 	if err := el.c.Pump(); err != nil && el.err == nil {
 		el.err = err
 		el.stopped = true
-	}
-	for _, x := range el.extra {
-		x.pump()
 	}
 }
 

@@ -43,7 +43,7 @@ func (v *Value) Free() {
 		return
 	}
 	// Immediates hold no reference, and a closed runtime has nothing left to free.
-	if !v.IsUndefined() && !v.IsNull() && v.c.rt.Alive() {
+	if !v.isInt() && !v.IsUndefined() && !v.IsNull() && v.c.rt.Alive() {
 		v.c.rt.call("QJS_FreeValue", v.c.handle, v.raw)
 	}
 	v.raw = 0
@@ -80,9 +80,31 @@ func (c *Context) NewBool(b bool) *Value {
 }
 
 func (c *Context) NewInt32(v int32) *Value {
+	if c.rt.fastInt {
+		return c.value(uint64(uint32(v)))
+	}
 	return c.callV("QJS_NewInt32", c.handle, uint64(uint32(v)))
 }
-func (c *Context) NewInt64(v int64) *Value { return c.callV("QJS_NewInt64", c.handle, uint64(v)) }
+
+func (c *Context) NewInt64(v int64) *Value {
+	if v == int64(int32(v)) {
+		return c.NewInt32(int32(v))
+	}
+	return c.callV("QJS_NewInt64", c.handle, uint64(v))
+}
+
+// NewFloat64 makes a JS number; the double crosses as its bits. An integral value in int32
+// range is the same number as an int, so it is made as one.
+func (c *Context) NewFloat64(f float64) *Value {
+	if f == float64(int32(f)) && !(f == 0 && math.Signbit(f)) {
+		return c.NewInt32(int32(f))
+	}
+	return c.callV("QJS_NewFloat64", c.handle, math.Float64bits(f))
+}
+
+// isInt reports whether v is an int immediate, which Go decodes without the engine: tag 0
+// in the high word under NaN boxing (New checks this build boxes them so).
+func (v *Value) isInt() bool { return v.c.rt.fastInt && v.raw>>32 == 0 }
 
 // NewString makes a JS string from s; it crosses with its length, so NULs survive.
 func (c *Context) NewString(s string) *Value {
@@ -134,10 +156,16 @@ func (v *Value) String() string {
 }
 
 func (v *Value) Int64() int64 {
+	if v.isInt() {
+		return int64(int32(uint32(v.raw)))
+	}
 	return int64(v.c.rt.call("QJS_ToInt64", v.c.handle, v.raw))
 }
 
 func (v *Value) Int32() int32 {
+	if v.isInt() {
+		return int32(uint32(v.raw))
+	}
 	return int32(uint32(v.c.rt.call("QJS_ToInt32", v.c.handle, v.raw)))
 }
 

@@ -8,7 +8,6 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // newSodium creates an isolated libsodium instance (its own runtime) so the crypto FFI
@@ -21,7 +20,7 @@ func newSodium(t *testing.T) *libsodium {
 }
 
 // genericHash runs on native Go instead of libsodium (sodium.go header) and is the system
-// hash, so a Go node and a Bun node must agree on it. Besides the x/crypto cross-check it
+// hash, so a Go node and a Node node must agree on it. Besides the x/crypto cross-check it
 // is checked against vectors captured from the libsodium.wasm this build embeds, so a
 // difference fails here instead of silently splitting storage.
 func TestSodiumGenericHash(t *testing.T) {
@@ -43,62 +42,36 @@ func TestSodiumGenericHash(t *testing.T) {
 	}
 }
 
-// The ChaCha20-Poly1305-IETF record layer (§12.6) runs on native Go, not libsodium
-// (sodium.go header), and every node's frames must open on every peer's link, so the
-// ciphertext must be byte-identical to libsodium's. Checked three ways: a round trip plus
-// tamper and wrong-key checks, KATs captured from the embedded libsodium.wasm, and the
-// independent RFC 8439 §2.8.2 vector.
-func TestSodiumAead(t *testing.T) {
-	key := bytes.Repeat([]byte{0x42}, 32)
-	npub := bytes.Repeat([]byte{0x24}, 12)
-
-	// Decrypt inverts encrypt; any bit flip in the tag, or a wrong key, fails the open
-	// (ok=false) instead of returning garbage.
-	for _, msg := range [][]byte{nil, []byte("abc"), bytes.Repeat([]byte{0x5a}, 4096)} {
-		ct := aeadEncrypt(msg, nil, npub, key)
-		if len(ct) != len(msg)+16 {
-			t.Fatalf("seal length = %d, want %d", len(ct), len(msg)+16)
-		}
-		pt, ok := aeadDecrypt(ct, nil, npub, key)
-		if !ok || !bytes.Equal(pt, msg) {
-			t.Fatalf("aead round trip: ok=%v pt=%x want %x", ok, pt, msg)
-		}
-		bad := append([]byte(nil), ct...)
-		bad[len(bad)-1] ^= 1 // flip a tag bit
-		if _, ok := aeadDecrypt(bad, nil, npub, key); ok {
-			t.Fatal("aead opened a tampered tag")
-		}
-		if _, ok := aeadDecrypt(ct, nil, npub, bytes.Repeat([]byte{0x43}, 32)); ok {
-			t.Fatal("aead opened under the wrong key")
-		}
-	}
-
-	// KAT: crypto_aead_chacha20poly1305_ietf_encrypt(msg, npub=0x24×12, key=0x42×32),
-	// no AAD, captured from the embedded libsodium.wasm, so native Go must match that
-	// binary exactly.
-	for _, kat := range []struct{ msg, hex string }{
-		{"", "3f51eace5bd1df2f4656bf812c77a1df"},
-		{"abc", "8565e611f66e1a31314e67413c37a2b2ef7474"},
-		{"the quick brown fox", "906fe02e9aab31cbee4beaf98b6073b899a63132dc8f227697aa57eb0d9c797f19636c"},
-	} {
-		if g := hex.EncodeToString(aeadEncrypt([]byte(kat.msg), nil, npub, key)); g != kat.hex {
-			t.Fatalf("aead(%q) = %s, want %s (native vs libsodium drift?)", kat.msg, g, kat.hex)
-		}
-	}
-
-	// Independent standard vector: RFC 8439 §2.8.2 (with AAD), showing the primitive is
-	// RFC-correct, not just consistent with the libsodium build.
-	rfcKey, _ := hex.DecodeString("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
-	rfcNonce, _ := hex.DecodeString("070000004041424344454647")
-	rfcAad, _ := hex.DecodeString("50515253c0c1c2c3c4c5c6c7")
-	rfcPlain := []byte("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
-	const rfcWant = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691"
-	aead, err := chacha20poly1305.New(rfcKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if g := hex.EncodeToString(aead.Seal(nil, rfcNonce, rfcPlain, rfcAad)); g != rfcWant {
-		t.Fatalf("RFC 8439 §2.8.2 vector: got %s want %s", g, rfcWant)
+// The host's ChaCha20-Poly1305-IETF (§12.6) runs on libsodium.wasm through the engine
+// table (host/sodium-engine.ts), and every node's frames must open on every peer's link.
+// Checked against KATs captured from that libsodium and the independent RFC 8439 §2.8.2
+// vector, with a round trip that a flipped tag bit fails.
+func TestHostSodiumAead(t *testing.T) {
+	bootRealm(t)
+	got := evalString(t, `(() => {
+	  const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+	  const unhex = (h) => new Uint8Array(h.match(/../g).map((x) => parseInt(x, 16)));
+	  const key = new Uint8Array(32).fill(0x42), npub = new Uint8Array(12).fill(0x24);
+	  const seal = (m, ad, n, k) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(m, ad, null, n, k);
+	  const out = ["", "abc", "the quick brown fox"].map((m) => hex(seal(new TextEncoder().encode(m), null, npub, key)));
+	  const rfc = seal(new TextEncoder().encode("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."),
+	    unhex("50515253c0c1c2c3c4c5c6c7"), unhex("070000004041424344454647"),
+	    unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"));
+	  out.push(hex(rfc));
+	  const ct = seal(new Uint8Array(4096).fill(0x5a), null, npub, key);
+	  const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, null, npub, key);
+	  ct[ct.length - 1] ^= 1;
+	  let tampered = "opened";
+	  try { sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, null, npub, key); } catch { tampered = "refused"; }
+	  out.push(String(pt.length === 4096 && pt.every((x) => x === 0x5a)), tampered);
+	  return out.join(",");
+	})()`)
+	want := "3f51eace5bd1df2f4656bf812c77a1df,8565e611f66e1a31314e67413c37a2b2ef7474," +
+		"906fe02e9aab31cbee4beaf98b6073b899a63132dc8f227697aa57eb0d9c797f19636c," +
+		"d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691," +
+		"true,refused"
+	if got != want {
+		t.Fatalf("host AEAD = %s\nwant %s", got, want)
 	}
 }
 

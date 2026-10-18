@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Rebuilds qjs.wasm, the engine every realm runs on (main.go, guest.go).
+# Rebuilds qjs.wasm, the engine every realm runs on, on every target.
 #
 # Inputs:
 #   csrc/shim.c      the flat QJS_* ABI the Go bridge drives (qjs.go, value.go).
+#   csrc/realm.c     the realm ABI (R_*) guest realms are driven through (engine-realm.ts).
 #   csrc/*.patch     applied to the engine before the build (see each patch's hunks).
 #   quickjs-ng       the engine, fetched at the pin below. Not vendored: it is ~2 MB of C,
 #                    and a pinned SHA plus the patches identify it exactly.
@@ -24,9 +25,8 @@ work="$here/.build"
 wasi_sdk="${WASI_SDK:-/opt/wasi-sdk}"
 
 # quickjs-ng v0.16.2. Changing it is an engine upgrade: re-run the Go suite, which uses
-# every export the bridge needs, and check the patches still apply. The JS targets'
-# emscripten build (WASM/quickjs/build-quickjs-ng.sh) pins the same commit, so both
-# engines stay on one version.
+# every export the bridge needs, and the JS suite, which drives the realm ABI, and check
+# the patches still apply.
 quickjs_repo="https://github.com/quickjs-ng/quickjs"
 quickjs_pin="1ab8676f4b6d6d669baeb5f21790fb9734636a20"
 

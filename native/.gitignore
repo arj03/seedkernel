@@ -1,7 +1,3 @@
-# Generated host JS bundles — the shared services/ + host/ TS, bundled for //go:embed.
-# Regenerate from WASM/: `npm run build:native`.
-*.gen.js
-
 # WASM artifacts copied in by `npm run build:native` (WASM/scripts/copy-native-wasm.mjs):
 # libsodium from the upstream npm dist, ML-DSA-65 built from the mldsa-native submodule.
 # qjs/qjs.wasm is NOT ignored — it is checked in, built from qjs/csrc/ by
@@ -20,3 +16,7 @@
 # The engine rebuild's work tree: a quickjs-ng checkout at the pinned commit plus
 # cmake's output (qjs/build-qjs.sh). Disposable — the built qjs.wasm is what we keep.
 /qjs/.build/
+
+# The host blob this binary embeds as its genesis host, copied in by `npm run build:native`
+# (WASM/scripts/build-host-blob.mjs).
+/host.skb

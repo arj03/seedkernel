@@ -392,6 +392,62 @@ async function testRandomBytesInBlocks() {
   console.log("  OK\n");
 }
 
+// ─── Test: the host's crypto on the engine table ──────────────────────────
+//
+// The host runs libsodium.wasm and mldsa65.wasm on the platform's engine table
+// (host/sodium-engine.ts), by the build's minified export names. The table must name what
+// the emscripten glue names, and every operation must agree with libsodium-wrappers, the
+// same wasm driven by its own glue.
+async function testHostSodium() {
+  console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
+  const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
+  const { wasiImports } = await imp("build/host/engine-web.js");
+  const glue = readFileSync(join(root, "browser/libsodium-core.mjs"), "utf8");
+  for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
+    assert(glue.includes(`._${name}=A.${min},`) || glue.includes(`._${name}=A.${min};`),
+      `${name} is export ${min} in the glue`);
+  }
+  const engine = (wasm, imports) => {
+    const mod = new WebAssembly.Module(wasm);
+    let memory;
+    const exports = new WebAssembly.Instance(mod, { ...imports, wasi_snapshot_preview1: wasiImports(mod, () => memory) }).exports;
+    memory = Object.values(exports).find((v) => v instanceof WebAssembly.Memory);
+    return {
+      exported: (name) => exports[name],
+      read: (ptr, len) => new Uint8Array(memory.buffer, ptr, len).slice(),
+      write: (ptr, bytes) => { new Uint8Array(memory.buffer).set(bytes, ptr); },
+      grow: (pages) => { try { return memory.grow(pages); } catch { return -1; } },
+      global: (name) => (exports[name] instanceof WebAssembly.Global ? Number(exports[name].value) : null),
+      dispose() {},
+    };
+  };
+  const host = engineSodium(engine, readFileSync(join(root, "browser/libsodium.wasm")),
+    readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n));
+  const msg = new Uint8Array(70000).map((_, i) => i * 7);
+  const key = new Uint8Array(32).fill(5), npub = new Uint8Array(12).fill(6), ad = Uint8Array.of(1, 2, 3);
+  assertEqual(toHex(host.crypto_generichash(32, msg, null)), toHex(sodium.crypto_generichash(32, msg, null)), "BLAKE2b-256");
+  assertEqual(toHex(host.crypto_generichash(64, msg, key)), toHex(sodium.crypto_generichash(64, msg, key)), "keyed BLAKE2b-512");
+  const seed = new Uint8Array(32).fill(9);
+  const kp = host.crypto_sign_seed_keypair(seed);
+  assertEqual(toHex(kp.privateKey), toHex(sodium.crypto_sign_seed_keypair(seed).privateKey), "Ed25519 keypair from a seed");
+  const sig = host.crypto_sign_detached(msg, kp.privateKey);
+  assertEqual(toHex(sig), toHex(sodium.crypto_sign_detached(msg, kp.privateKey)), "Ed25519 signature");
+  assert(host.crypto_sign_verify_detached(sig, msg, kp.publicKey), "Ed25519 verify accepts");
+  assert(!host.crypto_sign_verify_detached(sig, msg.subarray(1), kp.publicKey), "Ed25519 verify refuses another message");
+  assertEqual(toHex(host.crypto_scalarmult(key, kp.publicKey)), toHex(sodium.crypto_scalarmult(key, kp.publicKey)), "X25519");
+  const ct = host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key);
+  assertEqual(toHex(ct), toHex(sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key)), "ChaCha20-Poly1305 seal");
+  assertEqual(toHex(host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key)), toHex(msg), "ChaCha20-Poly1305 open");
+  ct[5] ^= 1;
+  let refused = false;
+  try { host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key); } catch { refused = true; }
+  assert(refused, "a tampered record does not open");
+  const author = testAuthor();
+  const signed = signTestBundle(sodium, author, { app: "host-crypto", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } });
+  assert(verifyBundle(host, signed).manifest.app === "host-crypto", "a hybrid bundle verifies on the host's crypto");
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testManifestSuiteByte();
@@ -400,5 +456,6 @@ await testMlKemAcvpVectors();
 await testHybridManifestSuite();
 await testBrowserCryptoFetch();
 await testRandomBytesInBlocks();
+await testHostSodium();
 
 summary("Results");

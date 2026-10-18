@@ -1,7 +1,5 @@
-// The realm contract and the per-realm pieces both realm factories (safe-js.ts,
-// native-shim.ts) build on: serialized entry into one confined realm, and the deadlines
-// that bound it. Unanswered host calls are counted per target: after the copy out of the
-// guest heap on JS (safe-js.ts), before it on native (native/hostcalls.go).
+// The realm contract and the per-realm pieces the realm driver (engine-realm.ts) builds
+// on: serialized entry into one confined realm, and the deadlines that bound it.
 
 import { Fifo } from "../services/util.js";
 import type { HostCall } from "./guest-seam.js";

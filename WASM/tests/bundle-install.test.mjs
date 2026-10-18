@@ -513,7 +513,7 @@ async function testFs() {
 
 // ─── Test: the fs key space is one rule, shared by every target ──────────
 // Which keys a node accepts decides which blocks it stores and advertises, so it is
-// consensus: a Go node and a Bun node that disagree about it disagree about their
+// consensus: a Go node and a Node node that disagree about it disagree about their
 // contents. The rule lives in shared code (services/fs.ts `isSafeFsKey`), applied over
 // whatever backend a target supplies (`validatedFs`, host/fs-view.ts).
 

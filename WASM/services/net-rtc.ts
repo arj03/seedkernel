@@ -26,7 +26,7 @@ import { enc, dec } from "./util.js";
 
 export interface RtcNetworkOptions {
   /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
-   *  Node or Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
+   *  Node console node supplies its own (a pure-JS WebRTC library wrapped to the
    *  W3C interface used here) so this seam runs outside the browser. */
   peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
 }

@@ -4,3 +4,4 @@ build/
 build-min/
 host/transport-bundle.ts
 transport/author.key
+/browser/qjs.wasm

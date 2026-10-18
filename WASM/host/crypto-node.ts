@@ -8,8 +8,7 @@ import { readFileSync } from "node:fs";
 import { withMlDsa65, loadMlDsa65, randomBytes, ML_DSA65_SEED_LEN } from "./pq.js";
 import type { Keypair } from "../services/subkeys.js";
 
-// A static import so `bun build --compile` bundles the package into the standalone
-// binary. The cast gives the default export the module-namespace type the host uses.
+// A static import, so a bundler carries the package along. The cast gives the default export the module-namespace type the host uses.
 import sodiumDefault from "libsodium-wrappers";
 const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers");
 

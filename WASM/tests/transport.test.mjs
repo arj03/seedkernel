@@ -12,13 +12,13 @@ import { WsNetwork } from "../build/services/net-ws.js";
 import { testkit } from "./testkit.mjs";
 import { readFileSync } from "node:fs";
 import { toHex } from "../build/services/util.js";
-import { createSafeRealm } from "../build/host/safe-js.js";
+import { createWebRealm } from "../build/host/engine-web.js";
 
 const { test, assert, summary } = testkit();
 
 await test("host and confined transport hex preserve unsigned words, padding, tails and views", async () => {
   const source = readFileSync(new URL("../transport/src/util.js", import.meta.url), "utf8");
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source: source + '\nfunction handle(b) { return Uint8Array.from(toHex(b), c => c.charCodeAt(0)); }',
     hostCall: async () => new Uint8Array(),
   });

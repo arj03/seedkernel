@@ -13,7 +13,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 export const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 export const sodium = await loadCrypto();
 export const { bootShell } = await imp("build/host/shell-core.js");
-export const { createSafeRealm } = await imp("build/host/safe-js.js");
+export const { createWebRealm } = await imp("build/host/engine-web.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { ModuleTable } = await imp("build/host/module-table.js");
@@ -279,7 +279,7 @@ export async function makeTransportHost(opts = {}) {
     // `onHostCall` sees every host call this node's realms make and refuses one by
     // throwing; `onHostAnswer(name, answer, payload)` can replace its answer (with a slow
     // one, say).
-    createRealm: async (o) => createSafeRealm(opts.onHostCall || opts.onHostAnswer
+    createRealm: async (o) => createWebRealm(opts.onHostCall || opts.onHostAnswer
       ? {
         ...o,
         hostCall: (...args) => {

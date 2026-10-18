@@ -7,7 +7,7 @@ import "testing"
 // value of every kind, doubles included, since a NaN-boxed double spreads over the high
 // word a tag occupies.
 func TestImmediatesMatchEngine(t *testing.T) {
-	rt, err := New()
+	rt, err := New(engine(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,8 +7,6 @@ import (
 	_ "embed"
 	"fmt"
 
-	"seedkernel/qjs"
-
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -58,11 +56,4 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 		panic(fmt.Sprintf("mldsa65: verify trapped: %v", err))
 	}
 	return r[0] == 1
-}
-
-// exposeMlDsa adds ml_dsa65_verify_detached to the realm's `__sodium` object.
-func exposeMlDsa(qc *qjs.Context, o *qjs.Value, m *mldsa) {
-	o.SetPropertyStr("ml_dsa65_verify_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewBool(m.verifyDetached(argView(args, 0), argView(args, 1), argView(args, 2))), nil
-	}))
 }

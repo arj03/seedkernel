@@ -19,7 +19,7 @@ import (
 // Only WebSocket framing is exercised here, which covers the full WS path: the raw Go byte
 // stream (tcp.go), the guest's WsFramer and the RFC 6455 codec in ws.wasm. The TCP
 // counterpart is asyncnet_test, and scripts/native-interop.sh covers both against real
-// node/bun nodes.
+// Node nodes.
 //
 // The realm is the production one (boot() installs the primitives and evaluates the shared
 // bundle), so `standUp` is the function the binary boots through, not a separate harness.
@@ -42,7 +42,7 @@ func TestTwoNodeRequestResponseIPv6(t *testing.T) {
 // TestNativeAcceptedLinksShareRemoteSourceBudget checks the native accept bridge carries
 // the peer IP all the way into RawLink.remoteAddr. Eight silent loopback connections fill
 // the transport's per-source budget; the ninth must be closed while the first eight stay
-// open. If the Go callback or native-shim drops the address, all nine remain admitted.
+// open. If the Go callback or platform.ts drops the address, all nine remain admitted.
 func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
 	bootRealm(t)
 	if _, err := qc.Eval("source-cap-harness.js", `

@@ -67,7 +67,7 @@ func BenchmarkNodeFsGet64K(b *testing.B) {
 
 // ── through the QuickJS shim (the storage guest's actual fs surface) ─────────
 //
-// The `fs` the guest reaches is the async `Fs` seam (native-shim.ts over fs.go's
+// The `fs` the guest reaches is the async `Fs` seam (platform.ts over fs.go's
 // synchronous primitive), so a put/get settles through the event loop like every other
 // async op; running b.N ops in one JS await loop keeps the el.await cost out of the per-op
 // number, as the net benches do.

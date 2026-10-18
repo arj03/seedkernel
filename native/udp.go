@@ -1,5 +1,5 @@
 // The UDP socket primitive exposed to QuickJS as `__udp`, the datagram platform of the UDP
-// path (services/udp/net-udp.ts `DatagramPlatform`, shaped by host/native-shim.ts). A
+// path (services/udp/net-udp.ts `DatagramPlatform`, shaped by host/platform.ts). A
 // socket is on a port the OS picks, dual-stack where the machine has IPv6. Its reader
 // goroutine holds what it reads until the loop takes it, and the loop hands each batch to
 // __udpDeliver in one call, as `[n u8][ip n][port u16][len u16][bytes]` per datagram, n 4
@@ -113,11 +113,11 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 	return u
 }
 
-// retain picks up the dispatcher host/native-shim.ts defines when the bundle evaluates.
+// retain picks up the dispatcher host/platform.ts defines when the bundle evaluates.
 func (u *udpHost) retain() error {
 	u.fnDeliver = u.qc.Global().GetPropertyStr("__udpDeliver")
 	if u.fnDeliver.IsUndefined() {
-		return fmt.Errorf("udp: __udpDeliver not defined (host/native-shim.ts)")
+		return fmt.Errorf("udp: __udpDeliver not defined (host/platform.ts)")
 	}
 	return nil
 }

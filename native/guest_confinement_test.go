@@ -42,7 +42,7 @@ func requireUndefined(t *testing.T, c *qjs.Context, names []string) {
 }
 
 func TestRuntimesHaveNoLibcGlobals(t *testing.T) {
-	bare, err := qjs.New()
+	bare, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal("qjs.New:", err)
 	}

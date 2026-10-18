@@ -6,7 +6,7 @@
 
 import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, until, PROTO,
-  authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
+  authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createWebRealm,
   transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
   LoopbackChannels, generatorRequest,
 } from "./transport-harness.mjs";

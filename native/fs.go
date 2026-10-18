@@ -199,7 +199,7 @@ func (f *nodeFs) stat() int64 {
 	return f.used
 }
 
-// exposeFs installs `__fs`, shaped into the async `Fs` seam by host/native-shim.ts. It
+// exposeFs installs `__fs`, shaped into the async `Fs` seam by host/platform.ts. It
 // stays closed until `__fs.open` names the operator's `--dir`.
 func exposeFs(qc *qjs.Context) {
 	var fs *nodeFs

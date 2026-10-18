@@ -243,23 +243,26 @@ func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
 	}
 }
 
-// TestGuestRealmIDsAreMintedByTheirOwner checks the bridge's handle contract on the Go
-// side: the map that owns realms also assigns their opaque ids, so callers cannot reuse or
-// forge an id and one realm can never silently replace another.
-func TestGuestRealmIDsAreMintedByTheirOwner(t *testing.T) {
+// TestEngineIDsAreMintedByTheirOwner checks the engine table's handle contract on the Go
+// side: the map that owns instances also assigns their opaque ids, so callers cannot reuse
+// or forge an id and one realm's engine can never silently replace another's.
+func TestEngineIDsAreMintedByTheirOwner(t *testing.T) {
 	bootRealm(t)
-	const mk = `bridge.createRealm("function handle(){ return new Uint8Array(); }", () => {}, 67108864, 1000, 10, 1048576)`
-	if _, err := qc.Eval("mk.js", `globalThis.__realmIds = [`+mk+`, `+mk+`];`); err != nil {
-		t.Fatalf("create realms: %v", err)
+	const mk = `bridge.engineInstantiate(__qjs, { env: { callGo() {} }, realm: { hostCall() { return 0; }, callDone() {}, callFail() {} } })`
+	if _, err := qc.Eval("mk.js", `globalThis.__qjs = new Uint8Array(bridge.qjsWasm()); globalThis.__engineIds = [`+mk+`, `+mk+`];`); err != nil {
+		t.Fatalf("create engines: %v", err)
 	}
-	if got := evalString(t, "String(__realmIds[0] > 0 && __realmIds[1] > __realmIds[0])"); got != "true" {
-		t.Fatalf("realm ids are not positive and strictly increasing: %s", got)
+	if got := evalString(t, "String(__engineIds[0] > 0 && __engineIds[1] > __engineIds[0])"); got != "true" {
+		t.Fatalf("engine ids are not positive and strictly increasing: %s", got)
+	}
+	if got := evalString(t, "(() => { try { bridge.engineExport(__engineIds[1] + 1, 'R_Buf'); return 'accepted'; } catch (e) { return String(e.message); } })()"); got != "engine: no such instance" {
+		t.Fatalf("a forged engine id was answered: %s", got)
 	}
 }
 
-// TestGuestRealmCarriesModuleDeadline checks the native-only half of CallBudget: guest.go
-// owns the running execution segment, so it must pass that remainder into the shared
-// seam, which passes exactly that value to this slot's private module call.
+// TestGuestRealmCarriesModuleDeadline checks the native-only half of CallBudget: realm.c
+// measures the running execution segment, so its remainder reaches the shared seam,
+// which passes exactly that value to this slot's private module call.
 func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("module-budget-seam.js", `
@@ -288,7 +291,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 		t.Fatalf("module probe = %v, err = %v", got, err)
 	}
 	deadline := evalString(t, "String(__seenModuleDeadline)")
-	ms, err := strconv.Atoi(deadline)
+	ms, err := strconv.ParseFloat(deadline, 64)
 	if err != nil || ms <= 0 || ms > 250 {
 		t.Fatalf("module deadline = %q ms, want the live remainder of a 250 ms segment", deadline)
 	}
@@ -339,75 +342,82 @@ func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 	}
 }
 
-func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
-	guestSeamRealm(t)
-	if _, err := qc.Eval("build-seam.js", `
-		globalThis.__guestSeam = () => new Promise(() => {});
-	`); err != nil {
-		t.Fatal("build seam:", err)
-	}
-	newTestRealm(t, "{}", `
-		function handle() {
-		  host.call("hold", new Uint8Array([1]));
-		  return new Uint8Array();
-		}
-	`)
-	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
+// rawRealm drives realm.c through the engine table directly, without the shared driver,
+// so a test can make the calls the driver never makes. The guest records each settlement
+// of its parked call in __got and answers it to a non-empty invocation.
+const rawRealm = `
+	globalThis.__raw = (() => {
+	  const id = bridge.engineInstantiate(new Uint8Array(bridge.qjsWasm()), {
+	    env: { callGo() { throw new Error("unserved"); } },
+	    realm: {
+	      hostCall: (callId) => { __raw.parked = callId; return 0; },
+	      callDone: (_id, ptr, len) => { __raw.answer = new Uint8Array(bridge.engineRead(id, ptr, len)); },
+	      callFail: (_id, ptr, len) => { __raw.failed = new Uint8Array(bridge.engineRead(id, ptr, len)); },
+	    },
+	  });
+	  const call = (name, a, b, c, d) => bridge.engineCall(id, bridge.engineExport(id, name), a, b, c, d);
+	  const stage = (text) => {
+	    const bytes = new TextEncoder().encode(text);
+	    bridge.engineWrite(id, call("R_Buf", bytes.length), bytes);
+	    return bytes.length;
+	  };
+	  const raw = { parked: -1, call };
+	  if (call("R_Init", 64 * 1024 * 1024, 4, 1024) !== 0) throw new Error("R_Init");
+	  if (call("R_Eval", stage(guestPreamble()), 1, 0) !== 0) throw new Error("preamble");
+	  if (call("R_Eval", stage('let got = 0; function handle(b) { if (b.length) return new Uint8Array([got]); host.call("hold", new Uint8Array([1])).then(() => { got++; }); return new Uint8Array(); }'), 0, 0) !== 0) throw new Error("guest");
+	  raw.got = () => { call("R_Invoke", 99, stage("?"), 0); return raw.answer[0]; };
+	  return raw;
+	})();
+`
 
-	// realm id 1: guestSeamRealm's bootRealm() calls boot(), which starts a fresh host realm
-	// (host-shell.gen.js re-evaluates, resetting the realm id counter), and newTestRealm
-	// above is the first createRealm this test makes.
-	g := realms[1]
-	if _, err := realmCall("park", nil); err != nil {
-		t.Fatal("park host call:", err)
-	}
-	if len(g.hostCalls.live) != 1 {
-		t.Fatalf("parked call count = %d, want 1", len(g.hostCalls.live))
-	}
-	var liveID int64
-	for id := range g.hostCalls.live {
-		liveID = id
-	}
-
-	g.settleHostCall(liveID+1000, []byte{}, "", false)
-	if len(g.hostCalls.live) != 1 {
-		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls.live))
-	}
-	g.settleHostCall(liveID, []byte{}, "", false)
-	if len(g.hostCalls.live) != 0 {
-		t.Fatalf("live settlement left %d parked calls", len(g.hostCalls.live))
+// A settlement of a call that is not parked, or of one already settled, changes nothing;
+// the parked call still settles once.
+func TestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
+	bootRealm(t)
+	evalString(t, rawRealm+`; __raw.call("R_Invoke", 1, 0, 0); String(__raw.parked)`)
+	steps := evalString(t, `[
+	  __raw.call("R_Settle", __raw.parked + 1000, 1, 0, 0), __raw.got(),
+	  __raw.call("R_Settle", __raw.parked, 1, 0, 0), __raw.got(),
+	  __raw.call("R_Settle", __raw.parked, 1, 0, 0), __raw.got(),
+	].join(",")`)
+	if steps != "0,0,0,1,0,1" {
+		t.Fatalf("settle results and settlements seen = %s, want 0,0,0,1,0,1", steps)
 	}
 }
 
-// TestGuestRealmCloseReleasesParkedCalls: closing a realm releases the charges of calls it
-// still had pending. The guest that would have consumed those answers is gone, so keeping
-// the charge would pin the realm's allowance on any backend that never answers, with
-// nothing left to release it.
+// TestGuestRealmCloseReleasesParkedCalls: disposing a realm with a call still parked frees
+// its engine, ledger and all, and the answer that arrives afterwards is dropped. The guest
+// that would have consumed it is gone, so nothing may hold the realm alive for it.
 func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("park-close-seam.js", `
-		globalThis.__guestSeam = () => new Promise(() => {});
+		globalThis.__guestSeam = () => new Promise((resolve) => { globalThis.__answerHeld = resolve; });
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
+	// The host's own crypto engines stand throughout; the realm adds one.
+	standing := len(engines)
 	newTestRealm(t, "{}", `
 		function handle() {
 		  host.call("hold", new Uint8Array([1, 2, 3]));
 		  return new Uint8Array();
 		}
 	`)
-	g := realms[1]
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
 	}
-	if len(g.hostCalls.live) != 1 || g.hostCalls.bytes != 3 {
-		t.Fatalf("parked call not charged: %d calls, %d bytes", len(g.hostCalls.live), g.hostCalls.bytes)
+	if len(engines) != standing+1 {
+		t.Fatalf("live engines = %d, want the realm's one beside %d", len(engines), standing)
 	}
 	if _, err := qc.Eval("dispose.js", `__realm.dispose()`); err != nil {
 		t.Fatal("dispose:", err)
 	}
-	if len(g.hostCalls.live) != 0 || g.hostCalls.bytes != 0 {
-		t.Fatalf("close left %d parked calls and %d bytes charged", len(g.hostCalls.live), g.hostCalls.bytes)
+	if len(engines) != standing {
+		t.Fatalf("dispose left %d engines, want %d", len(engines), standing)
+	}
+	awaitOK(t, "late answer", `(async () => { __answerHeld(new Uint8Array([9])); await null; return new Uint8Array(); })()`, 2*time.Second)
+	if el.err != nil {
+		t.Fatalf("a late answer to a disposed realm failed the loop: %v", el.err)
 	}
 }
 
@@ -449,7 +459,7 @@ function handle(arg) {
     });
   }
   if (op === "probe") {
-    const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process", "Bun"];
+    const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process"];
     const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
     return ascii(leaked.join(","));
   }
@@ -542,9 +552,8 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 
 // A guest that never yields is stopped by its execution budget (§12.3, §16.1).
 //
-// The native counterpart of safe-js.ts's interrupt handler, using the same mechanism:
-// QuickJS's own, armed through qjs.Runtime.Budget. So the result checked below matches
-// safe-js: the overrun is a throw, the caller gets an error, and the realm is still usable.
+// QuickJS's own interrupt, armed by the realm on every entry (realm.c), as on the JS
+// targets: the overrun is a throw, the caller gets an error, and the realm is still usable.
 // A guest that spends its allowance fails one invocation, not the whole app.
 //
 // The trivial call before is the control; the trivial call after is what is tested.
@@ -589,11 +598,10 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 // hanging.
 //
 // The dangerous case is an entrypoint that waits on a host call and then burns its budget
-// in the continuation: the interrupt lands inside settleHostCall, after the initiator's
-// promise reached the shell but before anything settled it. safe-js has no such problem
-// (its interrupt throws and the guest's promise rejects), so a native realm that just
-// stopped answering would hang the node instead of failing, which is worse, since the
-// caller cannot retry, time out, or tell anything went wrong.
+// in the continuation: the interrupt lands inside R_Settle, after the initiator's promise
+// reached the shell but before anything settled it. A realm that just stopped answering
+// would hang the node instead of failing, which is worse, since the caller cannot retry,
+// time out, or tell anything went wrong.
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -661,11 +669,11 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 // after another invocation has entered must resume under, and can only fail, the
 // invocation that made it; otherwise it borrows the later entry's remainder, and one
 // overrun fails every waiting caller. realm-guest.test.mjs (testDeferredKeepsItsDeadline)
-// tests safe-js.ts with the same scenario.
+// runs the same scenario on the JS targets.
 func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 	guestSeamRealm(t)
 	// `park` waits until the harness settles it by tag; `remaining` records the remainder
-	// guest.go handed it.
+	// the realm handed it.
 	if _, err := qc.Eval("parking-seam.js", `
 		globalThis.__parked = new Map();
 		globalThis.__remaining = new Map();
@@ -714,12 +722,12 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 
 // A detached host call's answer is a new turn of its realm, not the tail of the invocation
 // that made it (§12.3): it resumes under the realm's own ceiling instead of that
-// invocation's spent remainder. realm-guest.test.mjs (testDetachedAnswerIsANewTurn) tests
-// safe-js.ts with the same scenario.
+// invocation's spent remainder. realm-guest.test.mjs (testDetachedAnswerIsANewTurn) runs
+// the same scenario on the JS targets.
 func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
 	guestSeamRealm(t)
 	// `deliver` detaches and never answers, so its own handoff deadline settles it;
-	// `remaining` records the remainder guest.go handed the continuation.
+	// `remaining` records the remainder the realm handed the continuation.
 	if _, err := qc.Eval("detaching-seam.js", `
 		globalThis.__remaining = [];
 		globalThis.__guestSeam = (name, tag, budget) => {
@@ -755,11 +763,11 @@ func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
 }
 
 // An ownTurns realm runs every invocation on its own ceiling: a caller's deadline bounds
-// that caller's wait and nothing else (§12.3). realm-guest.test.mjs (testOwnTurns) tests
-// safe-js.ts with the same scenario.
+// that caller's wait and nothing else (§12.3). realm-guest.test.mjs (testOwnTurns) runs
+// the same scenario on the JS targets.
 func TestGuestRealmOwnTurns(t *testing.T) {
 	guestSeamRealm(t)
-	// `wait` answers when the harness says; `remaining` records the remainder guest.go
+	// `wait` answers when the harness says; `remaining` records the remainder the realm
 	// handed the turn by then.
 	if _, err := qc.Eval("own-turns-seam.js", `
 		globalThis.__remaining = [];
@@ -805,8 +813,7 @@ func TestGuestRealmOwnTurns(t *testing.T) {
 //
 // The same failure as a budget interrupt, with the same fix: an initiator's promise lives
 // inside the realm, so a close with calls outstanding leaves the caller waiting on
-// something that can no longer resolve. safe-js's dispose() fails its pending callers for
-// this reason, and close() has to as well.
+// something that can no longer resolve, so dispose() fails its pending callers.
 func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("setup.js", `

@@ -128,7 +128,7 @@ const udpPairHarness = `
 	    return out;
 	  };
 	  const node = (identity) => standUp({ dir: __dir, policyJson: __udpPolicy, identity,
-	    transport: { channels: combineChannels(__udpRelay.factory(), nativeChannels()) } });
+	    transport: { channels: combineChannels(__udpRelay.factory(), platformChannels()) } });
 	  const c = await node(idC), d = await node(idD);
 	  globalThis.udpC = c;
 	  globalThis.udpD = d;
@@ -226,7 +226,7 @@ func TestUdpPathNative(t *testing.T) {
 func TestUdpDualStackNative(t *testing.T) {
 	bootRealm(t)
 	got := awaitOK(t, "dual-stack", `(async () => {
-	  const a = await nativeDatagrams.bind(), b = await nativeDatagrams.bind();
+	  const a = await platformDatagrams.bind(), b = await platformDatagrams.bind();
 	  const heard = [];
 	  b.socket.onMessage((bytes, host, port) => heard.push(host + " " + (port === a.port) + " " + bytes[0]));
 	  a.socket.send(Uint8Array.of(4), b.port, "127.0.0.1");

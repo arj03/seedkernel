@@ -16,7 +16,7 @@ import (
 //  2. Pump does run it, draining that pending microtask, and returns promptly: the engine
 //     has no timers or I/O of its own, so the drain has nothing to wait on.
 func TestQjsPumpModel(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestAwaitIgnoresStaleSettle(t *testing.T) {
 // take only the tasks queued when its drain began, or the timers wait until the producers
 // pause.
 func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
 // zero delay (as a guest can re-arm a 0 ms wake from inside its own wake) must not keep the
 // timer phase running, just as Node never runs a timer armed during that phase.
 func TestLoopTaskRunsDuringZeroDelayTimers(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 // The socket primitive exposed to QuickJS as `__net`. Reader goroutines hand each read to
 // el.post, and the loop delivers it through the __netDeliver/__netClosed/__netAccept
-// dispatchers defined in host/native-shim.ts.
+// dispatchers defined in host/platform.ts.
 package main
 
 import (
@@ -29,7 +29,7 @@ type netHost struct {
 	// Set by close, releasing readers parked on the staging allowance.
 	closed bool
 
-	// Installed by host/native-shim.ts before any socket opens.
+	// Installed by host/platform.ts before any socket opens.
 	maxLiveChannels      int
 	closeGrace           time.Duration
 	maxInboundReadBytes  int
@@ -45,7 +45,7 @@ type netHost struct {
 	fnAccept  *qjs.Value
 }
 
-// exposeNet installs `__net`, shaped into RawLinks by host/native-shim.ts.
+// exposeNet installs `__net`, shaped into RawLinks by host/platform.ts.
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
 	o := qc.NewObject()
@@ -124,14 +124,14 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	return n
 }
 
-// retain picks up the dispatchers host/native-shim.ts defines when the bundle evaluates.
+// retain picks up the dispatchers host/platform.ts defines when the bundle evaluates.
 func (n *netHost) retain() error {
 	g := n.qc.Global()
 	n.fnDeliver = g.GetPropertyStr("__netDeliver")
 	n.fnClosed = g.GetPropertyStr("__netClosed")
 	n.fnAccept = g.GetPropertyStr("__netAccept")
 	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
-		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
+		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/platform.ts)")
 	}
 	return nil
 }

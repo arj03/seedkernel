@@ -2,11 +2,12 @@
 // sign or pack; this module reuses the verifier's manifest validation so an author cannot
 // sign what install would refuse.
 import { concatBytes, enc } from "../services/util.js";
-import { AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
+import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
 import { callerOf, readOp, writeOp } from "../services/op-frame.js";
+import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
 import {
   hybridAuthorId,
-  bundleSigningInput,
+  envelopeSigningInput,
   validateManifest,
   type BundleGuest,
   type BundleManifest,
@@ -61,11 +62,11 @@ export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Ar
   };
 }
 
-/** Frame the signed body: manifest, guest, modules in manifest order. Every length is
- *  a u32 big-endian byte count and is covered by both signatures. */
-export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+/** Frame parts as a signed body: each a u32 big-endian byte count, then the bytes, all
+ *  covered by both signatures. */
+export function encodeParts(fields: Uint8Array[]): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const bytes of [encodeManifest(m), guest, ...modules]) {
+  for (const bytes of fields) {
     if (bytes.length > 0xffffffff) throw new Error("bundle: body field exceeds u32 length");
     const length = new Uint8Array(4);
     new DataView(length.buffer).setUint32(0, bytes.length, false);
@@ -74,21 +75,38 @@ export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: 
   return concatBytes(parts);
 }
 
-/** Sign the whole bundle. A low-level writer used by authorBundle and by tests; it does
- *  not validate, so tests can sign malformed manifests and body layouts. */
-export function signBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest,
-  guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+/** Frame a bundle's body: manifest, guest, modules in manifest order. */
+export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+  return encodeParts([encodeManifest(m), guest, ...modules]);
+}
+
+/** Sign a body under `domain` as a suite 0x02 envelope. */
+export function signEnvelope(sodium: ManifestCrypto, keys: HybridAuthorKeys, domain: Uint8Array,
+  body: Uint8Array): Uint8Array {
   if (!sodium.ml_dsa65_sign_detached) {
-    throw new Error("bundle: no ML-DSA-65 signer — cannot sign a bundle");
+    throw new Error("bundle: no ML-DSA-65 signer — cannot sign");
   }
-  const body = encodeBundleBody(m, guest, modules);
-  const pre = bundleSigningInput(sodium, keys.ed.publicKey, keys.mlDsa.publicKey, body);
+  const pre = envelopeSigningInput(sodium, domain, keys.ed.publicKey, keys.mlDsa.publicKey, body);
   const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
   const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
   return concatBytes([
     Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), keys.ed.publicKey, keys.mlDsa.publicKey,
     edSig, mlSig, body,
   ]);
+}
+
+/** Sign the whole bundle. A low-level writer used by authorBundle and by tests; it does
+ *  not validate, so tests can sign malformed manifests and body layouts. */
+export function signBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest,
+  guest: Uint8Array, modules: Uint8Array[]): Uint8Array {
+  return signEnvelope(sodium, keys, DOMAIN_MANIFEST, encodeBundleBody(m, guest, modules));
+}
+
+/** Sign a host blob (host-blob.ts). */
+export function signHostBlob(sodium: ManifestCrypto, keys: HybridAuthorKeys, manifest: HostManifest,
+  parts: HostParts): Uint8Array {
+  return signEnvelope(sodium, keys, DOMAIN_HOST,
+    encodeParts([enc.encode(JSON.stringify(manifest)), ...HOST_PART_NAMES.map((n) => parts[n])]));
 }
 
 /** The raw materials for a new signed bundle. */

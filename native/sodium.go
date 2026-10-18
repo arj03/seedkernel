@@ -1,7 +1,7 @@
-// The crypto primitive: the shared browser/libsodium.wasm driven over wazero, exposed with
-// libsodium-wrappers method names. BLAKE2b and ChaCha20-Poly1305-IETF run on native Go
-// (§12.9); Ed25519 and X25519 stay on the shared wasm, since Ed25519's accept/reject
-// boundary is consensus.
+// The loader's own crypto, for checking a host blob before anything in it runs: BLAKE2b
+// on native Go, and Ed25519 verification on the shared browser/libsodium.wasm over wazero,
+// since Ed25519's accept/reject boundary is consensus. The host runs its own copy of the
+// same libsodium on the engine table (host/sodium-engine.ts).
 package main
 
 import (
@@ -11,12 +11,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"seedkernel/qjs"
-
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 //go:embed wasm/libsodium.wasm
@@ -56,8 +53,6 @@ var sodiumExports = map[string]string{
 	"crypto_sign_verify_detached": "xd",
 	"crypto_sign_keypair":         "td",
 	"crypto_sign_seed_keypair":    "sd",
-	// X25519 for the §12.6 AKE; against the base point it also derives public keys.
-	"crypto_scalarmult": "Jc",
 }
 
 // The EM_JS entropy snippets randombytes reaches through import `a.b`, served from
@@ -217,17 +212,6 @@ func genericHash(outLen int, msg, key []byte) []byte {
 	return h.Sum(nil)
 }
 
-func (s *libsodium) signDetached(msg, sk []byte) []byte {
-	if len(sk) != 64 {
-		panic("crypto_sign_detached: secret key must be 64 bytes")
-	}
-	s.arenaReset(alignUp(len(msg)) + alignUp(len(sk)) + alignUp(64))
-	in, skp, sig := s.takeIn(msg), s.takeIn(sk), s.take(64)
-	lo, hi := lenArgs(len(msg))
-	s.mustCall("crypto_sign_detached", uint64(sig), 0 /*siglen_p=NULL*/, uint64(in), lo, hi, uint64(skp))
-	return s.read(sig, 64)
-}
-
 func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	// Fixed widths are passed without lengths, so check them before staging.
 	if len(sig) != 64 || len(pk) != 32 {
@@ -239,133 +223,3 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
 }
 
-func (s *libsodium) signKeypair() (pk, sk []byte) {
-	s.arenaReset(alignUp(32) + alignUp(64))
-	pkp, skp := s.take(32), s.take(64)
-	s.mustCall("crypto_sign_keypair", uint64(pkp), uint64(skp))
-	return s.read(pkp, 32), s.read(skp, 64)
-}
-
-func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
-	if len(seed) != 32 {
-		panic("crypto_sign_seed_keypair: seed must be 32 bytes")
-	}
-	s.arenaReset(alignUp(32) + alignUp(64) + alignUp(len(seed)))
-	pkp, skp, sp := s.take(32), s.take(64), s.takeIn(seed)
-	s.mustCall("crypto_sign_seed_keypair", uint64(pkp), uint64(skp), uint64(sp))
-	return s.read(pkp, 32), s.read(skp, 64)
-}
-
-// ── §12.6 transport AKE primitives ──
-
-// scalarmult computes the X25519 point q = n·p, or ok=false on a low-order result.
-func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
-	if len(n) != 32 || len(p) != 32 {
-		return nil, false
-	}
-	s.arenaReset(alignUp(32) + alignUp(len(n)) + alignUp(len(p)))
-	q, np, pp := s.take(32), s.takeIn(n), s.takeIn(p)
-	if s.call("crypto_scalarmult", uint64(q), uint64(np), uint64(pp)) != 0 {
-		return nil, false
-	}
-	return s.read(q, 32), true
-}
-
-// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, binding ad; the
-// result is ciphertext ‖ tag. A wrong key width is an invariant violation.
-func aeadEncrypt(msg, ad, npub, key []byte) []byte {
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
-	}
-	return aead.Seal(nil, npub, msg, ad)
-}
-
-// aeadDecrypt opens a ChaCha20-Poly1305-IETF record; a bad tag or short ct is ok=false.
-func aeadDecrypt(ct, ad, npub, key []byte) ([]byte, bool) {
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
-	}
-	pt, err := aead.Open(nil, npub, ct, ad)
-	if err != nil {
-		return nil, false
-	}
-	return pt, true
-}
-
-// ───────────────────────── QuickJS exposure ─────────────────────────
-
-// argView borrows the i-th argument's bytes, or nil if it is not bytes. Every primitive
-// below is done with them before the engine runs again (qjs.Value.View).
-func argView(args []*qjs.Value, i int) []byte {
-	b, _ := args[i].View()
-	return b
-}
-
-// optView is argView for an optional argument: absent, null or undefined reads as nil.
-func optView(args []*qjs.Value, i int) []byte {
-	if i >= len(args) || args[i].IsNull() || args[i].IsUndefined() {
-		return nil
-	}
-	return argView(args, i)
-}
-
-// exposeSodium installs `__sodium`, shaped by `wrapNativeSodium` (host/native-shim.ts).
-func exposeSodium(qc *qjs.Context, s *libsodium) {
-	o := qc.NewObject()
-
-	o.SetPropertyStr("crypto_generichash", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// crypto_generichash(hashLength, message, key), with libsodium's ranges.
-		outLen, key := int(args[0].Int32()), optView(args, 2)
-		if outLen < 1 || outLen > 64 || len(key) > 64 {
-			return nil, fmt.Errorf("crypto_generichash: output 1..64 and key 0..64 bytes, got %d and %d", outLen, len(key))
-		}
-		return qc.NewArrayBuffer(genericHash(outLen, argView(args, 1), key)), nil
-	}))
-	o.SetPropertyStr("crypto_sign_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewArrayBuffer(s.signDetached(argView(args, 0), argView(args, 1))), nil
-	}))
-	o.SetPropertyStr("crypto_sign_verify_detached", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewBool(s.verifyDetached(argView(args, 0), argView(args, 1), argView(args, 2))), nil
-	}))
-	o.SetPropertyStr("crypto_scalarmult", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		q, ok := s.scalarmult(argView(args, 0), argView(args, 1))
-		if !ok {
-			return qc.NewNull(), nil
-		}
-		return qc.NewArrayBuffer(q), nil
-	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewArrayBuffer(aeadEncrypt(argView(args, 0), optView(args, 1), argView(args, 2), argView(args, 3))), nil
-	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		pt, ok := aeadDecrypt(argView(args, 0), optView(args, 1), argView(args, 2), argView(args, 3))
-		if !ok {
-			return qc.NewNull(), nil
-		}
-		return qc.NewArrayBuffer(pt), nil
-	}))
-	o.SetPropertyStr("crypto_sign_keypair", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		pk, skv := s.signKeypair()
-		return keypairObj(qc, pk, skv), nil
-	}))
-	o.SetPropertyStr("crypto_sign_seed_keypair", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		pk, skv := s.signSeedKeypair(argView(args, 0))
-		return keypairObj(qc, pk, skv), nil
-	}))
-	o.SetPropertyStr("randombytes_buf", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		b := make([]byte, args[0].Int32())
-		crand.Read(b)
-		return qc.NewArrayBuffer(b), nil
-	}))
-	exposeMlDsa(qc, o, md)
-	qc.Global().SetPropertyStr("__sodium", o)
-}
-
-func keypairObj(qc *qjs.Context, pk, sk []byte) *qjs.Value {
-	o := qc.NewObject()
-	o.SetPropertyStr("publicKey", qc.NewArrayBuffer(pk))
-	o.SetPropertyStr("privateKey", qc.NewArrayBuffer(sk))
-	return o
-}

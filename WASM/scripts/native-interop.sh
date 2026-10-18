@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # §12.9 interop: the acceptance check for the native binary target.
 #
-# A native binary node and JS (node and bun) nodes share one seedstore cohort over real
+# A native binary node and Node nodes share one seedstore cohort over real
 # loopback TCP, running the same signed bundle. It checks wire, crypto and bundle parity
 # in both directions:
 #   1. Go put   -> node get  (Go writes blocks JS can read back)
 #   2. node put -> Go get    (Go reads blocks JS wrote)
-#   3. bun put  -> Go get    (Bun to Go, the read path)
 # all against a cohort of `node` holders. Storage runs on the runtime as a signed bundle;
 # neither side links the other's code, only the wire format and the bundle are shared.
 #
-# Manual integration check (not part of `go test`): needs `node` and `bun` on PATH
+# Manual integration check (not part of `go test`): needs `node` on PATH
 # and a built Windows seedkernel.exe. Run from Git Bash on Windows:
 #   bash scripts/native-interop.sh [path/to/seedkernel.exe]
 set -euo pipefail
@@ -19,14 +18,14 @@ SK=/c/Users/ander/Documents/GitHub/seedkernel/WASM
 SS=/c/Users/ander/Documents/GitHub/seedstore/WASM
 # A bundle is one blob (§12.4); both targets read this file.
 BUNDLE="$SS/bundle/seedstore.skb"
-NODEMAIN="$SK/build/host/main-node.js"
+NODEMAIN="$SK/build/host/loader-node.js"
 GOEXE="${1:-$SK/../native/seedkernel.exe}"
 
 HOLDERS=6
 BASEPORT=47100
 
 [ -f "$GOEXE" ]    || { echo "missing seedkernel exe: $GOEXE"; exit 1; }
-[ -f "$NODEMAIN" ] || { echo "missing built shell: $NODEMAIN (run: npm run build:host)"; exit 1; }
+[ -f "$NODEMAIN" ] || { echo "missing built loader: $NODEMAIN (run: npm run build)"; exit 1; }
 [ -f "$BUNDLE" ]   || { echo "missing seedstore bundle: $BUNDLE (run: npm run build:bundle in seedstore/WASM)"; exit 1; }
 
 # Read the author through verifyBundle instead of parsing offsets here: the envelope
@@ -105,9 +104,4 @@ put "$WORK/b.arg" node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.jso
 "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg" --key "$WORK/gg.key" < "$WORK/b.arg" > "$WORK/got2.bin" 2>/dev/null
 check "$WORK/got2.bin" "node put → Go get"
 
-# 3. bun put -> Go get
-put "$WORK/c.arg" bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --dir "$WORK/bp" --key "$WORK/bp.key"
-"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --local-config "$WORK/app.json" --peers "$PEERS" --op get --dir "$WORK/gg3" --key "$WORK/gg3.key" < "$WORK/c.arg" > "$WORK/got3.bin" 2>/dev/null
-check "$WORK/got3.bin" "bun put → Go get"
-
-echo "INTEROP OK — Go ↔ JS (node + bun) parity across the cohort"
+echo "INTEROP OK — Go ↔ Node parity across the cohort"
