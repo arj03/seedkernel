@@ -28,5 +28,10 @@ export const MAX_NODE_OUTBOUND_QUEUE_SLICES = 4 * MAX_OUTBOUND_QUEUE_SLICES;
 /** Live raw sockets one host holds; native also refuses at accept with it. */
 export const DEFAULT_MAX_RAW_LINKS = 4096;
 
+/** How long a TCP socket may stay silent before its first byte (host/platform.ts
+ *  `tcpChannels`): the slowloris bound, which costs an attacker a SYN and this side a
+ *  socket and its reader until it fires. */
+export const SILENT_SOCKET_MS = 30_000;
+
 /** How long a gracefully closed TCP socket may linger while queued bytes flush. */
 export const TCP_LINGER_MS = 5_000;

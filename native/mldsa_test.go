@@ -31,9 +31,15 @@ type mldsaSigner struct {
 	sign, keys, verify api.Function
 }
 
-// ML-DSA-65 secret key width (FIPS 204). Only signing needs it, so it is here, not with
-// the envelope's format constants in mldsa.go.
-const mldsaSkBytes = 4032
+// ML-DSA-65 widths (FIPS 204), and where the envelope keeps the keys (host/bundle.ts).
+const (
+	mldsaPkBytes  = 1952
+	mldsaSigBytes = 3309
+	mldsaSkBytes  = 4032
+	offEdPk       = 1
+	offMlPk       = offEdPk + 32
+	offEdSig      = offMlPk + mldsaPkBytes
+)
 
 func newMlDsaSigner(t testing.TB, rt wazero.Runtime) *mldsaSigner {
 	t.Helper()
@@ -176,7 +182,7 @@ func TestMlDsaAcvpVectors(t *testing.T) {
 		return b
 	}
 
-	s := newMlDsaSigner(t, moduleRT)
+	s := testSigner(t)
 	for _, v := range kat.SigVer {
 		got := s.verifyCtx(t, unhex(v.Sig), unhex(v.Msg), unhex(v.Ctx), unhex(v.Pk))
 		if got != v.Pass {

@@ -4,12 +4,19 @@
 // from qjs.wasm. An import outside WASI calls the JS function the instantiation names for
 // it, as WebAssembly's importObject does. WASI is answered as a realm's is (qjs.go): the
 // clock and nothing else.
+//
+// A bounded instance is the one a private module runs on (§4.3): its runtime compiles in
+// the check that lets a deadline end a call mid-loop, instantiation runs under its own
+// deadline, and engineCallBounded arms one per call. The module ABI itself is the host's
+// (host/pure-module.ts).
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"seedkernel/qjs"
 
@@ -48,7 +55,13 @@ func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
 		if err != nil {
 			return nil, err
 		}
-		e, err := newEngineInstance(qc, bytes, args[1])
+		// A third argument, the bind deadline in ms (-1 for none), makes it bounded.
+		bounded := len(args) > 2 && !args[2].IsUndefined()
+		bind := time.Duration(-1)
+		if bounded {
+			bind = time.Duration(args[2].Int64()) * time.Millisecond
+		}
+		e, err := newEngineInstance(qc, bytes, args[1], bounded, bind)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +87,21 @@ func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
 		return qc.NewInt32(int32(h)), nil
 	})
 	on("engineCall", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
-		return e.call(qc, args[0].Int64(), args[1:])
+		return e.call(qc, ctx, args[0].Int64(), args[1:])
+	})
+	// A call under a deadline in ms (-1 for none): past it the instance is closed and the
+	// call answers null, while a trap still throws.
+	on("engineCallBounded", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
+		callCtx := ctx
+		if d := args[1].Int64(); d >= 0 {
+			callCtx = armModuleDeadline(time.Duration(d) * time.Millisecond)
+			defer disarmModuleDeadline()
+		}
+		r, err := e.call(qc, callCtx, args[0].Int64(), args[2:])
+		if err != nil && e.mod != nil && e.mod.IsClosed() {
+			return qc.NewNull(), nil
+		}
+		return r, err
 	})
 	on("engineRead", func(e *engineInstance, args []*qjs.Value) (*qjs.Value, error) {
 		view, ok := e.mem.Read(uint32(args[0].Int64()), uint32(args[1].Int64()))
@@ -121,11 +148,16 @@ func installEngineBridge(qc *qjs.Context, b *qjs.Value) {
 
 // newEngineInstance compiles and instantiates bytes, wiring each non-WASI import to
 // importObject[module][name], a JS function of numbers.
-func newEngineInstance(qc *qjs.Context, bytes []byte, importObject *qjs.Value) (_ *engineInstance, err error) {
+func newEngineInstance(qc *qjs.Context, bytes []byte, importObject *qjs.Value, bounded bool, bind time.Duration) (_ *engineInstance, err error) {
 	e := &engineInstance{}
 	// The process-wide cache the host realm compiled qjs.wasm into, so every realm runs
 	// one copy of the engine's machine code.
-	e.rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(qjs.SharedCache()))
+	cfg := wazero.NewRuntimeConfig()
+	if bounded {
+		// WithCloseOnContextDone compiles in the check that enforces the §4.3 bound.
+		cfg = wazero.NewRuntimeConfigCompiler().WithCloseOnContextDone(true)
+	}
+	e.rt = wazero.NewRuntimeWithConfig(ctx, cfg.WithCompilationCache(qjs.SharedCache()))
 	defer func() {
 		if err != nil {
 			e.close()
@@ -173,11 +205,18 @@ func newEngineInstance(qc *qjs.Context, bytes []byte, importObject *qjs.Value) (
 		}
 	}
 	// A reactor runs `_initialize` once, before any other export.
-	cfg := wazero.NewModuleConfig().WithName("")
+	mcfg := wazero.NewModuleConfig().WithName("")
 	if code.ExportedFunctions()["_initialize"] != nil {
-		cfg = cfg.WithStartFunctions("_initialize")
+		mcfg = mcfg.WithStartFunctions("_initialize")
 	}
-	if e.mod, err = e.rt.InstantiateModule(ctx, code, cfg); err != nil {
+	// Instantiation runs the start section, so a bounded instance binds under its deadline.
+	instCtx, cancel := ctx, func() {}
+	if bind >= 0 {
+		instCtx, cancel = context.WithTimeout(ctx, bind)
+	}
+	e.mod, err = e.rt.InstantiateModule(instCtx, code, mcfg)
+	cancel()
+	if err != nil {
 		return nil, fmt.Errorf("engine: instantiate: %w", err)
 	}
 	e.mem = e.mod.Memory()
@@ -251,7 +290,7 @@ func (e *engineInstance) export(name string) (int, error) {
 
 // call runs export `handle` with numeric arguments and answers its result as a number.
 // Arguments past the export's parameters are ignored, so a caller can pass a fixed count.
-func (e *engineInstance) call(qc *qjs.Context, handle int64, args []*qjs.Value) (*qjs.Value, error) {
+func (e *engineInstance) call(qc *qjs.Context, callCtx context.Context, handle int64, args []*qjs.Value) (*qjs.Value, error) {
 	if e.mod == nil || e.mod.IsClosed() {
 		return nil, errors.New("engine: instance is closed")
 	}
@@ -271,7 +310,7 @@ func (e *engineInstance) call(qc *qjs.Context, handle int64, args []*qjs.Value) 
 		stack[i] = numberFromJS(t, args[i])
 	}
 	x.depth++
-	err := fn.CallWithStack(ctx, stack)
+	err := fn.CallWithStack(callCtx, stack)
 	x.depth--
 	if err != nil {
 		return nil, fmt.Errorf("engine: %s trapped: %w", x.name, err)
@@ -292,4 +331,53 @@ func (e *engineInstance) close() {
 		e.rt = nil
 	}
 	e.mod = nil
+}
+
+// moduleDeadline is the context a bounded call runs under (§4.3): a reusable one, since a
+// context.WithTimeout per call cost more than the calls it bounded. Its channel closes
+// only on an overrun, which ends the instance anyway, so a spent one is replaced then.
+// Loop goroutine only.
+type moduleDeadline struct {
+	done  chan struct{}
+	timer *time.Timer
+	fired atomic.Bool
+}
+
+func (d *moduleDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (d *moduleDeadline) Done() <-chan struct{}       { return d.done }
+func (d *moduleDeadline) Value(any) any               { return nil }
+func (d *moduleDeadline) Err() error {
+	if d.fired.Load() {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// moduleCall is the deadline the next bounded call arms.
+var moduleCall = newModuleDeadline()
+
+func newModuleDeadline() *moduleDeadline {
+	d := &moduleDeadline{done: make(chan struct{})}
+	// An expiry racing a replacement must not close twice.
+	d.timer = time.AfterFunc(time.Hour, func() {
+		if d.fired.CompareAndSwap(false, true) {
+			close(d.done)
+		}
+	})
+	d.timer.Stop()
+	return d
+}
+
+// armModuleDeadline starts the shared deadline and returns the context to call under.
+func armModuleDeadline(after time.Duration) context.Context {
+	moduleCall.timer.Reset(after)
+	return moduleCall
+}
+
+// disarmModuleDeadline stops it, replacing one that fired or is firing: a closed Done
+// stays closed. Deferred by the caller, so an engine panic cannot skip it.
+func disarmModuleDeadline() {
+	if !moduleCall.timer.Stop() {
+		moduleCall = newModuleDeadline()
+	}
 }

@@ -181,4 +181,36 @@ assert(stalledClosed, "the handshake deadline closed a link parked on an upgrade
 await e.transport.close();
 await new Promise((resolve) => stalling.close(resolve));
 
+// The slowloris bound, in the shared sockets every platform's TCP goes through: a socket
+// that never speaks is failed on its own, and the first byte clears the clock, so a link
+// that has spoken may go quiet for as long as its transport allows.
+console.log("\nTest: a socket that never speaks is failed; one that has spoken may idle");
+{
+  const { tcpChannels } = await imp("build/host/platform.js");
+  const { nodePlatform } = await imp("build/host/platform-node.js");
+  const tcp = { __udpDeliver() {} };
+  Object.assign(tcp, tcpChannels(nodePlatform({ host: () => tcp }).net, 100));
+  const peers = [];
+  const server = createServer((s) => { s.on("error", () => {}); peers.push(s); });
+  await new Promise((resolve) => server.listen(0, HOST, resolve));
+  const dial = async () => {
+    const link = tcp.connect(`tcp://${HOST}:${server.address().port}`);
+    const state = { closed: false, read: false };
+    link.onClose(() => { state.closed = true; });
+    link.onData(() => { state.read = true; });
+    const n = peers.length;
+    while (peers.length === n) await new Promise((r) => setTimeout(r, 5));
+    return { link, state, peer: peers[n] };
+  };
+  const silent = await dial();
+  const spoken = await dial();
+  spoken.peer.write("hi");
+  await new Promise((r) => setTimeout(r, 500));
+  assert(silent.state.closed, "a socket whose peer never spoke was failed");
+  assert(spoken.state.read && !spoken.state.closed, "a socket that has spoken outlives the silent bound");
+  spoken.link.close(false);
+  for (const p of peers) p.destroy();
+  await new Promise((resolve) => server.close(resolve));
+}
+
 summary("transport TCP smoke");

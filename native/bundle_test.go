@@ -11,35 +11,23 @@ import (
 // no `scratchSize` gets the 128 KB default, and the host clamps its I/O to that, not to
 // whatever its linear memory allows. The forwarder reserves a second buffer past
 // `scratch`, so an over-default payload would fit its memory and only the clamp refuses
-// it. (The declared-scratchSize case covers modules like seedstore's RS codec, which
-// reserves 2 MB; no in-repo fixture declares one.)
-//
-// The default is the shared host's number (host/wasm-limits.ts DEFAULT_SCRATCH_SIZE),
-// passed by the shim at every slot build; Go has no constant of its own.
+// it. The ABI itself is shared (host/pure-module.ts); this checks native runs it.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
-	key := "scratchapp"
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
-		t.Fatalf("buildModuleSlot(forwarder) refused: %v", err)
+	if err := buildModules(t, "scratchapp", []string{"fwd"}, forwarderWasm); err != nil {
+		t.Fatalf("the forwarder was refused: %v", err)
 	}
-	w := moduleSlots[key]["fwd"]
-	if w.size != 0x20000 {
-		t.Fatalf("a module exporting no scratchSize should get the 128 KB default, got %d",
-			w.size)
-	}
-	// The installed module runs: an in-bounds payload echoes back unchanged, showing the
-	// host writes input at `scratch`, calls handle, and reads the response from the same
-	// region (§4).
+	// An in-bounds payload echoes back unchanged: the host writes input at `scratch`,
+	// calls handle, and reads the response from the same region (§4).
 	msg := []byte("hello module")
-	if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
+	if r := callMod(t, "scratchapp", "fwd", msg, time.Second); !bytes.Equal(r, msg) {
 		t.Fatalf("echo module returned %q, want %q", r, msg)
 	}
-	residue, ok := w.mod.Memory().Read(w.scratch, uint32(len(msg)))
-	if !ok || !bytes.Equal(residue, make([]byte, len(msg))) {
-		t.Fatalf("module scratch retained the staged request after return: %x", residue)
+	if r := callMod(t, "scratchapp", "fwd", make([]byte, 0x20000), time.Second); len(r) != 0x20000 {
+		t.Fatalf("a payload filling the 128 KB default came back as %d B", len(r))
 	}
 	// A payload past the reserved region is refused by the clamp, not by memory bounds.
-	if r := callModule(key, "fwd", make([]byte, w.size+1), time.Second); r != nil {
+	if r := callMod(t, "scratchapp", "fwd", make([]byte, 0x20000+1), time.Second); r != nil {
 		t.Fatalf("a payload past the reserved region must be refused, got %d B", len(r))
 	}
 }

@@ -17,6 +17,9 @@ import type { EngineExport, EngineInstance } from "./engine-realm.js";
 import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type PlatformBridge, type PlatformDispatchers, type PlatformNet, type PlatformUdp } from "./abi.js";
 
+/** Keepalive probes on every socket, as native/tcp.go sets them. */
+const TCP_KEEPALIVE_MS = 30_000;
+
 /** The process's own timer, which a loader's teardown of host timers never reaches. */
 const platformSetTimeout = globalThis.setTimeout;
 
@@ -74,8 +77,6 @@ export function nodePlatform(o: NodePlatformOptions): Platform & { teardown(): v
   const bridge: PlatformBridge = {
     abi: PLATFORM_ABI,
     banner: "seedkernel-shell",
-    // A module call runs in a worker, outside the guest's segment.
-    modulesInSegment: false,
     argv: o.argv ?? (() => "[]"),
     readFile: (path) => nodeFiles.readFile(path),
     writeFile: (path, bytes, mode) => nodeFiles.writeFile(path, bytes, mode === 0 ? undefined : mode),
@@ -90,9 +91,10 @@ export function nodePlatform(o: NodePlatformOptions): Platform & { teardown(): v
     async buildModules(slot, mods) {
       slots.set(slot, await moduleTable.build(mods));
     },
-    callModule(slot, module, payload, deadlineMs) {
+    // Each module in a worker of its own (module-table.ts), the only way V8 stops a call.
+    async callModule(slot, module, payload, deadlineMs) {
       const mods = slots.get(slot);
-      return mods ? mods.call(module, payload, deadlineMs < 0 ? Infinity : deadlineMs) : null;
+      return mods ? mods.call(module, payload, deadlineMs < 0 ? Infinity : deadlineMs) : { bytes: null, ms: 0 };
     },
     disposeModules(slot) {
       slots.get(slot)?.dispose();
@@ -127,6 +129,8 @@ export function nodePlatform(o: NodePlatformOptions): Platform & { teardown(): v
   function adopt(socket: Socket): number {
     const id = ++socketSeq;
     sockets.set(id, socket);
+    // Reclaims a socket whose peer vanished without a FIN, as native's does.
+    socket.setKeepAlive(true, TCP_KEEPALIVE_MS);
     socket.on("data", (chunk: Buffer) => {
       socket.pause();
       o.host().__netDeliver(id, new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));

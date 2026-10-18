@@ -1,63 +1,47 @@
-// The Node loader (§12.9): runs a host blob's script (host-blob.ts) on the Node platform
-// (platform-node.ts), the same blob the native binary runs. Everything a node does is in
-// the blob, the checks on its successor included; this file only keeps the slots that blob
-// is staged in and boots the one they choose.
+// The Node loader (§12.9): runs a host blob's script on the Node platform
+// (platform-node.ts), the same blob the native binary runs, booting the one the host slots
+// choose (slots.ts, shared with the native loader). Everything a node does is in the blob,
+// the checks on its successor included.
 //
 //   node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64] [--host <blob>]
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { runInThisContext } from "node:vm";
 import { errMessage } from "../services/util.js";
 import { nodeFiles, nodePlatform } from "./platform-node.js";
-import { readHostBlob, type HostBlob } from "./host-blob.js";
-import { PLATFORM_ABI, type PlatformDispatchers } from "./abi.js";
+import { readHostBlob } from "./host-blob.js";
+import { HostSlots, dataDirOf, loaderFlags, withoutOp, type SlotFiles } from "./slots.js";
+import type { PlatformDispatchers } from "./abi.js";
 
 /** The host script's dispatchers, once it has evaluated. */
 const host = globalThis as unknown as PlatformDispatchers;
 
-/** The loader's own flags, out of what the host sees, as `--name value` or
- *  `--name=value`:
- *  - `--host <file>` boots that blob instead of the slots' choice, by the operator's
- *    explicit choice, unchecked and from any author;
- *  - `--host-updates off|next|now` is whether a running host may stage a new one, and when
- *    it runs: refused (the default), at the next start, or at once. */
-function loaderFlags(argv: string[]): { rest: string[]; hostFile?: string; updates: string } {
-  const out: { rest: string[]; hostFile?: string; updates: string } = { rest: [], updates: "off" };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    const eq = a.indexOf("=");
-    const name = a.startsWith("--") ? a.slice(2, eq < 0 ? undefined : eq) : "";
-    if (name !== "host" && name !== "host-updates") {
-      out.rest.push(a);
-      continue;
-    }
-    let value = eq < 0 ? undefined : a.slice(eq + 1);
-    if (value === undefined) {
-      if (i + 1 >= argv.length) throw new Error(`--${name} needs a value`);
-      value = argv[++i];
-    }
-    if (name === "host") out.hostFile = value;
-    else out.updates = value;
-  }
-  return out;
-}
 const flags = loaderFlags(process.argv.slice(2));
 let hostArgs = flags.rest;
-
-/** The arguments less `--op`: a host booted after an operator flow ran, in the same
- *  process, does not repeat its one-shot op. */
-function withoutOp(args: string[]): string[] {
-  return args.filter((a, i) => a !== "--op" && !a.startsWith("--op=") && args[i - 1] !== "--op");
-}
 /** The running host blob. */
-let blob!: Loaded;
+let blob!: Uint8Array;
+
+/** The slots' files, answered in the call as the shared rules expect. */
+const slotFiles: SlotFiles = {
+  mkdir: (dir) => { mkdirSync(dir, { recursive: true, mode: 0o700 }); },
+  read(path, maxBytes) {
+    try { return statSync(path).size > maxBytes ? null : new Uint8Array(readFileSync(path)); } catch { return null; }
+  },
+  write: (path, bytes) => { nodeFiles.writeFile(path, bytes, 0o600); },
+  remove(path) {
+    try { unlinkSync(path); return true; } catch { return false; }
+  },
+  size(path) {
+    try { return statSync(path).size; } catch { return -1; }
+  },
+};
+const hostLog = (line: string) => { console.error("  host   " + line); };
 
 const platform = nodePlatform({
   host: () => host,
   argv: () => JSON.stringify(hostArgs),
-  hostBlob: () => blob.env,
+  hostBlob: () => blob,
   stageHost: (env) => {
     if (!hostSlots) throw new Error("host: updates are off on this node (--host-updates next|now)");
     if (!hostSlots.stage(env)) return;
@@ -67,120 +51,6 @@ const platform = nodePlatform({
     else rebootWaiting = true;
   },
 });
-
-// ── host slots ───────────────────────────────────────────────────────────────
-// The rules the native loader keeps (native/hostslots.go): a floor, the committed host's
-// version; a staged blob tried once, marked before it boots; committed after a health
-// window it served through, and dropped if it fails before that. The running host checked
-// a staged blob's author, ABI and version before handing it over. The slots sit beside the
-// data directory: <dir>.host/committed.skb, pending.skb, tried.
-
-const HEALTH_MS = Number(process.env.SEEDKERNEL_HOST_HEALTH_MS ?? 30_000);
-const hostLog = (line: string) => { console.error("  host   " + line); };
-type Loaded = HostBlob & { env: Uint8Array };
-const loaded = (env: Uint8Array): Loaded => ({ ...readHostBlob(env), env });
-
-class HostSlots {
-  private trying = false;
-  private gen = 0;
-  constructor(private readonly dir: string, private readonly mode: string, private readonly genesis: Loaded) {
-    if (!["off", "next", "now"].includes(mode)) throw new Error(`--host-updates must be off, next or now (got "${mode}")`);
-  }
-  private path(name: string) { return join(this.dir, name); }
-  /** A slot's blob, or null when it is absent or not for this loader's ABI. */
-  private load(name: string): Loaded | null {
-    let env: Uint8Array;
-    try { env = new Uint8Array(readFileSync(this.path(name))); } catch { return null; }
-    try {
-      const h = loaded(env);
-      if (h.manifest.abi === PLATFORM_ABI) return h;
-      hostLog(`ignored ${name}: it needs platform ABI ${h.manifest.abi}, this loader implements ${PLATFORM_ABI}`);
-    } catch (err) {
-      hostLog(`ignored ${name}: ${errMessage(err)}`);
-    }
-    return null;
-  }
-  /** The committed host when it is newer than the genesis blob, which a newer loader can be. */
-  private base(): Loaded {
-    const c = this.load("committed.skb");
-    return c && c.manifest.version > this.genesis.manifest.version ? c : this.genesis;
-  }
-  private discard(reason: string) {
-    rmSync(this.path("pending.skb"), { force: true });
-    rmSync(this.path("tried"), { force: true });
-    this.trying = false;
-    hostLog(`discarded the pending host: ${reason}`);
-  }
-  /** The blob the next boot runs. */
-  choose(): Loaded {
-    this.gen++;
-    this.trying = false;
-    const base = this.base();
-    if (!existsSync(this.path("pending.skb"))) return base;
-    if (existsSync(this.path("tried"))) {
-      this.discard("it was tried and never committed");
-      return base;
-    }
-    const p = this.load("pending.skb");
-    if (!p || p.manifest.version <= base.manifest.version) {
-      this.discard("it is not above the floor");
-      return base;
-    }
-    try {
-      nodeFiles.writeFile(this.path("tried"), new Uint8Array(0), 0o600);
-    } catch (err) {
-      hostLog(`cannot mark v${p.manifest.version} tried, so it is not run: ${errMessage(err)}`);
-      return base;
-    }
-    this.trying = true;
-    hostLog(`trying v${p.manifest.version} (committed is v${base.manifest.version})`);
-    return p;
-  }
-  /** Whether a failure is a pending host's, which is then dropped for the committed one. */
-  failed(err: unknown): boolean {
-    if (!this.trying) return false;
-    this.discard(errMessage(err));
-    return true;
-  }
-  /** A pending host that serves is committed once it has served for the window; one that
-   *  only ran an op proved nothing, so it stays pending, untried. */
-  started(serving: boolean) {
-    if (!this.trying) return;
-    if (!serving) {
-      rmSync(this.path("tried"), { force: true });
-      this.trying = false;
-      return;
-    }
-    const gen = this.gen;
-    loaderSetTimeout(() => {
-      if (!this.trying || this.gen !== gen) return;
-      try { renameSync(this.path("pending.skb"), this.path("committed.skb")); }
-      catch (err) { hostLog(`cannot commit the pending host: ${errMessage(err)}`); return; }
-      rmSync(this.path("tried"), { force: true });
-      this.trying = false;
-      hostLog(`committed after ${HEALTH_MS}ms`);
-    }, HEALTH_MS).unref();
-  }
-  /** Keep a blob the running host checked as pending; answers whether to boot it now. */
-  stage(env: Uint8Array): boolean {
-    if (this.mode === "off") throw new Error("host: updates are off on this node (--host-updates next|now)");
-    const h = loaded(env);
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    nodeFiles.writeFile(this.path("pending.skb"), env, 0o600);
-    rmSync(this.path("tried"), { force: true });
-    hostLog(`staged v${h.manifest.version}`);
-    return this.mode === "now";
-  }
-}
-
-/** The host's --dir, which the slots sit beside, or the CLI's default (cli.ts DEFAULT_DIR). */
-function dataDirOf(args: string[]): string {
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--dir" && i + 1 < args.length) return args[i + 1];
-    if (args[i].startsWith("--dir=")) return args[i].slice("--dir=".length);
-  }
-  return "./data";
-}
 
 // ── run ──────────────────────────────────────────────────────────────────────
 let hostSlots: HostSlots | null = null;
@@ -204,9 +74,9 @@ function teardown(): void {
 }
 
 /** Run a blob's host script: the operator flow, which answers whether the node serves. */
-async function runHost(env: Loaded): Promise<boolean> {
+async function runHost(env: Uint8Array): Promise<boolean> {
   blob = env;
-  runInThisContext(new TextDecoder().decode(env.script), { filename: "host.js" });
+  runInThisContext(new TextDecoder().decode(readHostBlob(env).script), { filename: "host.js" });
   const out = await host.runMain();
   hostArgs = withoutOp(hostArgs);
   return (JSON.parse(new TextDecoder().decode(out)) as { serving: boolean }).serving;
@@ -214,17 +84,18 @@ async function runHost(env: Loaded): Promise<boolean> {
 
 /** Boot the slots' choice (or --host), falling back to the committed host when a pending
  *  one fails before it is committed. */
-async function bootHost(choose: () => Loaded): Promise<void> {
+async function bootHost(choose: () => Uint8Array): Promise<void> {
   for (;;) {
     let up: boolean;
     try {
       up = await runHost(choose());
     } catch (err) {
       teardown();
-      if (hostSlots?.failed(err)) continue;
+      if (hostSlots?.failed(errMessage(err))) continue;
       throw err;
     }
-    hostSlots?.started(up);
+    const gen = hostSlots?.started(up) ?? null;
+    if (gen !== null) loaderSetTimeout(() => hostSlots!.commit(gen), hostSlots!.windowMs).unref();
     if (up && rebootWaiting) {
       rebootWaiting = false;
       teardown();
@@ -235,7 +106,7 @@ async function bootHost(choose: () => Loaded): Promise<void> {
   }
 }
 
-let chooseHost!: () => Loaded;
+let chooseHost!: () => Uint8Array;
 const fatal = (e: unknown) => { console.error("ERROR: " + errMessage(e)); process.exit(1); };
 async function restart(): Promise<void> {
   teardown();
@@ -244,12 +115,13 @@ async function restart(): Promise<void> {
 
 async function main(): Promise<void> {
   if (flags.hostFile !== undefined) {
-    const chosen = loaded(new Uint8Array(readFileSync(flags.hostFile)));
+    const chosen = new Uint8Array(readFileSync(flags.hostFile));
     chooseHost = () => chosen;
   } else {
-    const genesis = loaded(new Uint8Array(readFileSync(new URL("../host.skb", import.meta.url))));
-    hostSlots = new HostSlots(dataDirOf(hostArgs).replace(/[/\\]+$/, "") + ".host", flags.updates, genesis);
-    chooseHost = () => hostSlots!.choose();
+    const genesis = new Uint8Array(readFileSync(new URL("../host.skb", import.meta.url)));
+    hostSlots = new HostSlots(slotFiles, dataDirOf(hostArgs), flags.updates, genesis,
+      process.env.SEEDKERNEL_HOST_HEALTH_MS, hostLog);
+    chooseHost = () => hostSlots!.choose() ?? genesis;
   }
   Object.assign(globalThis, {
     bridge: platform.bridge, __fs: platform.fs, __net: platform.net, __udp: platform.udp,
@@ -263,7 +135,7 @@ async function main(): Promise<void> {
   // A pending host that fails while it serves is dropped for the committed one, as a
   // failure at boot is; any other failure ends the process, as Node's default would.
   const onFailure = (err: unknown) => {
-    if (hostSlots?.failed(err)) void restart();
+    if (hostSlots?.failed(errMessage(err))) void restart();
     else fatal(err);
   };
   process.on("uncaughtException", onFailure);

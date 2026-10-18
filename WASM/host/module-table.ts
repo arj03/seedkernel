@@ -6,6 +6,7 @@ import {
   DEFAULT_SCRATCH_SIZE,
 } from "./wasm-limits.js";
 import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
+import { moduleShims, scratchModule } from "./pure-module.js";
 
 // ─── module routing ─────────────────────────────────────────────────────
 
@@ -65,12 +66,15 @@ interface ModuleWorker {
   kill(): void;
 }
 
-/** The worker script, one per module: instantiate on `load`, run `handle` on `call`, post
- *  the response back. The §4 ABI checks run here, in the isolate that holds the instance;
- *  a module that fails them reports `loadError` and the whole app is refused (§3.1). */
+/** The worker script, one per module: instantiate on `load`, run calls on `call`, post the
+ *  response back. The §4 ABI is `scratchModule` (pure-module.ts), carried here by its
+ *  source and run in the isolate that holds the instance; a module that fails it reports
+ *  `loadError` and the whole app is refused (§3.1). */
 const moduleWorkerSrc = (): string => `"use strict";
-// The module instance's state, one per worker. A kill and respawn resets it (§4.3).
-let memory = null, scratch = 0, scratchSize = ${DEFAULT_SCRATCH_SIZE}, handle = null;
+const scratchModule = ${scratchModule.toString()};
+const moduleShims = ${moduleShims.toString()};
+// The module, once loaded. A kill and respawn resets it (§4.3).
+let module = null;
 // Node's eval:true workers have no Web globals, so the port is parentPort via require. In
 // a browser dedicated worker, self is the port.
 const port = (typeof require === "function" ? require("node:worker_threads").parentPort : null) ?? self;
@@ -78,59 +82,29 @@ const fail = (message) => port.postMessage({ type: "loadError", message: String(
 port.onmessage = (e) => {
   const m = e.data;
   if (m.type === "load") {
-    let instance;
     try {
-      const mod = new WebAssembly.Module(m.wasm);
-      // The three AssemblyScript runtime shims and nothing else, the same set every target
-      // provides, so whether a module loads never depends on the target. \`seed\` is a
-      // constant (a pure transform reads no clock, §4.2) and \`trace\` is a no-op.
-      instance = new WebAssembly.Instance(mod, {
-        env: {
-          abort: (_m, _f, l, c) => { throw new Error("dynamic module abort at " + l + ":" + c); },
-          seed: () => 0,
-          trace: () => {},
-        },
-      });
+      const exps = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), moduleShims()).exports;
+      const mem = exps.memory instanceof WebAssembly.Memory ? exps.memory : null;
+      module = scratchModule({
+        handle: typeof exps.handle === "function" ? exps.handle : undefined,
+        global: (name) => (exps[name] instanceof WebAssembly.Global ? exps[name].value : null),
+        memoryBytes: () => (mem ? mem.buffer.byteLength : -1),
+        read: (ptr, len) => new Uint8Array(mem.buffer, ptr, len).slice(),
+        write: (ptr, bytes) => { new Uint8Array(mem.buffer).set(bytes, ptr); },
+        wipe: (ptr, len) => { new Uint8Array(mem.buffer, ptr, len).fill(0); },
+      }, ${DEFAULT_SCRATCH_SIZE});
     } catch (err) { fail(err && err.message !== undefined ? err.message : err); return; }
-    const exps = instance.exports;
-    if (!(exps.memory instanceof WebAssembly.Memory)) { fail("module missing export: memory"); return; }
-    if (!(exps.scratch instanceof WebAssembly.Global)) { fail("module missing export: scratch"); return; }
-    if (typeof exps.handle !== "function") { fail("module missing export: handle"); return; }
-    const offset = exps.scratch.value;
-    let size = ${DEFAULT_SCRATCH_SIZE};
-    if (exps.scratchSize instanceof WebAssembly.Global) {
-      const declared = exps.scratchSize.value;
-      if (typeof declared !== "number" || declared < ${DEFAULT_SCRATCH_SIZE}) {
-        fail("invalid scratchSize " + declared + " (must be >= ${DEFAULT_SCRATCH_SIZE})"); return;
-      }
-      size = declared;
-    }
-    if (typeof offset !== "number" || offset <= 0 || offset + size > exps.memory.buffer.byteLength) {
-      fail("scratch offset " + offset + " out of bounds"); return;
-    }
-    memory = exps.memory; scratch = offset; scratchSize = size; handle = exps.handle;
-    port.postMessage({ type: "ready", scratchSize });
+    port.postMessage({ type: "ready", scratchSize: module.size });
     return;
   }
   if (m.type === "call") {
-    // A trap, an oversized result or a negative length all give null, which the seam
-    // rejects (§12.2); a zero-length answer is still a value. ms is the time spent inside
-    // handle, excluding queue wait, and is what the caller's budget is billed (§12.3).
-    let bytes = null, wipeLen = m.payload.byteLength;
+    // A trap gives null, which the seam rejects (§12.2); a zero-length answer is still a
+    // value. ms is the time spent inside the call, excluding queue wait, and is what the
+    // caller's budget is billed (§12.3).
+    let bytes = null;
     const t0 = performance.now();
-    try {
-      new Uint8Array(memory.buffer, scratch, m.payload.byteLength).set(new Uint8Array(m.payload));
-      const len = handle(m.payload.byteLength);
-      if (typeof len === "number" && len >= 0 && len <= scratchSize) {
-        bytes = new Uint8Array(memory.buffer, scratch, len).slice().buffer;
-        wipeLen = Math.max(wipeLen, len);
-      }
-    } catch { bytes = null; }
-    finally {
-      // The response has been copied out. Wipe the scratch window so neither the request
-      // nor a secret-bearing response lingers in a long-lived instance.
-      try { new Uint8Array(memory.buffer, scratch, wipeLen).fill(0); } catch { /* trapped/grown memory */ }
-    }
+    try { const r = module.call(new Uint8Array(m.payload)); bytes = r === null ? null : r.buffer; }
+    catch { bytes = null; }
     const ms = performance.now() - t0;
     port.postMessage({ type: "result", bytes, ms }, bytes === null ? [] : [bytes]);
   }

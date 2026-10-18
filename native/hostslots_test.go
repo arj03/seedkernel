@@ -129,15 +129,15 @@ func TestHostUpdatesNative(t *testing.T) {
 		"--bundle", updater}
 	slot := func(name string) string { return filepath.Join(work, "data.host", name) }
 	committed := func() int {
-		env, err := os.ReadFile(slot(committedFile))
+		env, err := os.ReadFile(slot("committed.skb"))
 		if err != nil {
 			return 0
 		}
-		h, err := readHostBlob(env)
-		if err != nil {
+		var m struct{ Version int }
+		if err := json.Unmarshal(hostPart(t, env, partManifest), &m); err != nil {
 			t.Fatal("committed:", err)
 		}
-		return h.version
+		return m.Version
 	}
 	stage := func(blob []byte, mode string) (error, string) {
 		return startLoader(t, work, blob, append(base, "--host-updates", mode, "--op", "stage")...).exit(t)
@@ -171,7 +171,7 @@ func TestHostUpdatesNative(t *testing.T) {
 			t.Fatalf("staging %s: %v\n%s", what, err, log)
 		}
 	}
-	if _, err := os.Stat(slot(pendingFile)); err == nil {
+	if _, err := os.Stat(slot("pending.skb")); err == nil {
 		t.Fatal("a refused host was kept")
 	}
 
@@ -182,14 +182,14 @@ func TestHostUpdatesNative(t *testing.T) {
 	if !strings.Contains(log, "trying v3") || !strings.Contains(log, "discarded the pending host") || committed() != 2 {
 		t.Fatalf("a broken v3 was not dropped for v2 (committed v%d):\n%s", committed(), log)
 	}
-	if _, err := os.Stat(slot(pendingFile)); err == nil {
+	if _, err := os.Stat(slot("pending.skb")); err == nil {
 		t.Fatal("the broken host is still pending")
 	}
 
-	if err := os.WriteFile(slot(pendingFile), hostEnvelope(t, hostKeys, 4, platformABI, host.script), 0o600); err != nil {
+	if err := os.WriteFile(slot("pending.skb"), hostEnvelope(t, hostKeys, 4, platformABI, host.script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(slot(triedFile), nil, 0o600); err != nil {
+	if err := os.WriteFile(slot("tried"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	log = startLoader(t, work, nil, serve...).until(t, "listening on")

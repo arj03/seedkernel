@@ -116,18 +116,14 @@ func testAuthor(t testing.TB) authorKeys {
 // testSigner is the ML-DSA-65 signing half the tests need and the shipped native binary
 // does not have: it holds no crypto at all (§12.9).
 //
-// One instance per runtime, not per author: compiling it for every author would cost
-// seconds across the suite, but a boot tears its runtime down, and a module cached past
-// that fails in the next test with `exit_code(0)`.
-var (
-	signerCache   *mldsaSigner
-	signerCacheRt wazero.Runtime
-)
+// One instance for the process, on a runtime of its own, since compiling it for every
+// author would cost seconds across the suite.
+var signerCache *mldsaSigner
 
 func testSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
-	if signerCache == nil || signerCacheRt != moduleRT {
-		signerCache, signerCacheRt = newMlDsaSigner(t, moduleRT), moduleRT
+	if signerCache == nil {
+		signerCache = newMlDsaSigner(t, wazero.NewRuntime(ctx))
 	}
 	return signerCache
 }

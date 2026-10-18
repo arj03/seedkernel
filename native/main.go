@@ -42,12 +42,16 @@ var (
 
 	// bootBlob is the host blob boot runs: genesisHost, or the operator's --host.
 	bootBlob = genesisHost
-	// host is the running host blob.
-	host *hostBlob
+	// host is the running host blob and the parts boot runs of it.
+	host struct {
+		env    []byte
+		script string
+		qjs    []byte
+	}
 	// hostArgs are the arguments the host sees: the command line less the loader's own.
 	hostArgs []string
-	// updates are the host slots (hostslots.go); nil when --host chose the blob.
-	updates *hostUpdates
+	// ldr is the loader script's realm (hostslots.go); nil in tests that boot directly.
+	ldr *loader
 	// serving is set while the loop runs for a serving node, after its operator flow.
 	serving bool
 )
@@ -59,10 +63,8 @@ var (
 func boot() error {
 	shutdown()
 	var err error
-	if err = bootModuleTable(); err != nil {
-		return err
-	}
-	if host, err = readHostBlob(bootBlob); err != nil {
+	host.env = bootBlob
+	if host.script, host.qjs, err = hostParts(bootBlob); err != nil {
 		return err
 	}
 
@@ -111,7 +113,6 @@ func shutdown() {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil
 	}
-	closeModuleTable()
 }
 
 // exposeBridge installs `bridge`, typed in host/platform.ts.
@@ -121,11 +122,6 @@ func exposeBridge(qc *qjs.Context) {
 	// The platform ABI this loader implements, which the host script checks first.
 	b.SetPropertyStr("abi", qc.NewInt32(platformABI))
 	b.SetPropertyStr("banner", qc.NewString("seedkernel-native"))
-	// A module call runs on the loop inside the guest's segment, which counts it.
-	b.SetPropertyStr("modulesInSegment", qc.NewBool(true))
-
-	installModuleBridge(qc, b) // module.go
-
 	// The operator's world (host/cli.ts): arguments, files, stdio.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// JSON, since an argument may contain any separator.
@@ -170,7 +166,7 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		now, err := updates.stage(env)
+		now, err := ldr.stage(env)
 		if err != nil {
 			return nil, err
 		}
@@ -253,45 +249,51 @@ func main() {
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(1)
 	}
-	flags, err := loaderFlags(os.Args[1:])
+	// The loader script runs on the genesis blob's engine, which the host's realm then
+	// shares from the compile cache.
+	_, engine, err := hostParts(genesisHost)
+	if err == nil {
+		ldr, err = newLoader(engine)
+	}
+	if err != nil {
+		fatal("genesis host", err)
+		return
+	}
+	flags, err := ldr.flags(os.Args[1:])
 	if err != nil {
 		fatal("seedkernel", err)
 		return
 	}
-	hostArgs = flags.rest
-	if flags.hostFile != "" {
-		if bootBlob, err = os.ReadFile(flags.hostFile); err != nil {
+	hostArgs = flags.Rest
+	if flags.HostFile != "" {
+		if bootBlob, err = os.ReadFile(flags.HostFile); err != nil {
 			fatal("--host", err)
 			return
 		}
-	} else {
-		genesis, err := readHostBlob(genesisHost)
-		if err != nil {
-			fatal("genesis host", err)
-			return
-		}
-		if updates, err = newHostUpdates(dataDirOf(hostArgs), flags.updates, genesis); err != nil {
-			fatal("seedkernel", err)
-			return
-		}
+	} else if err := ldr.open(hostArgs, flags.Updates, genesisHost); err != nil {
+		fatal("seedkernel", err)
+		return
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; os.Exit(0) }()
 	for {
-		if updates != nil {
-			bootBlob = updates.choose()
+		if flags.HostFile == "" {
+			if bootBlob, err = ldr.choose(genesisHost); err != nil {
+				fatal("host slots", err)
+				return
+			}
 		}
 		up, err := runHost()
 		if err != nil {
 			// A pending host that fails is dropped, and the committed one boots instead.
-			if updates.failed(err) {
+			if ldr.failed(err) {
 				continue
 			}
 			fatal("seedkernel", err)
 			return
 		}
-		if !up || !updates.takeReboot() {
+		if !up || !ldr.takeReboot() {
 			return
 		}
 	}
@@ -310,13 +312,15 @@ func runHost() (serving bool, err error) {
 		return false, err
 	}
 	// A host booted after this one, in this process, does not repeat the one-shot op.
-	hostArgs = withoutOp(hostArgs)
+	if hostArgs, err = ldr.withoutOp(hostArgs); err != nil {
+		return false, err
+	}
 	var st struct{ Serving bool }
 	if err := json.Unmarshal(out, &st); err != nil {
 		return false, err
 	}
-	updates.started(st.Serving)
-	if !st.Serving || updates.rebootWaiting() {
+	ldr.started(st.Serving)
+	if !st.Serving || ldr.rebootWaiting() {
 		return st.Serving, nil
 	}
 	serving = true
@@ -324,74 +328,6 @@ func runHost() (serving bool, err error) {
 	el.stopped = false
 	el.run()
 	return true, el.err
-}
-
-// The loader's own flags (loaderFlags), and the host's arguments without them.
-type loaderOptions struct {
-	rest     []string
-	hostFile string
-	updates  string
-}
-
-// loaderFlags takes the loader's own flags out of the command line, as `--name value` or
-// `--name=value`. The rest is the host's.
-//
-//   - `--host <file>` boots that host blob instead of the slots' choice, by the operator's
-//     explicit choice, unchecked and from any author.
-//   - `--host-updates off|next|now` is whether a running host may stage a new one, and
-//     when it runs: refused (the default), at the next start, or at once.
-func loaderFlags(argv []string) (loaderOptions, error) {
-	o := loaderOptions{rest: []string{}, updates: updatesOff}
-	for i := 0; i < len(argv); i++ {
-		a := argv[i]
-		name, value, inline := strings.Cut(strings.TrimPrefix(a, "--"), "=")
-		if !strings.HasPrefix(a, "--") || (name != "host" && name != "host-updates") {
-			o.rest = append(o.rest, a)
-			continue
-		}
-		if !inline {
-			if i+1 >= len(argv) {
-				return o, fmt.Errorf("--%s needs a value", name)
-			}
-			i++
-			value = argv[i]
-		}
-		if name == "host" {
-			o.hostFile = value
-		} else {
-			o.updates = value
-		}
-	}
-	return o, nil
-}
-
-// withoutOp is args less --op and its value.
-func withoutOp(args []string) []string {
-	out := []string{}
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--op":
-			i++
-		case strings.HasPrefix(args[i], "--op="):
-		default:
-			out = append(out, args[i])
-		}
-	}
-	return out
-}
-
-// dataDirOf is the host's --dir, which the slots sit beside, or the CLI's default
-// (host/cli.ts DEFAULT_DIR).
-func dataDirOf(args []string) string {
-	for i, a := range args {
-		if a == "--dir" && i+1 < len(args) {
-			return args[i+1]
-		}
-		if v, ok := strings.CutPrefix(a, "--dir="); ok {
-			return v
-		}
-	}
-	return "./data"
 }
 
 // fatal reports a failure and exits non-zero.

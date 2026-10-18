@@ -18,11 +18,13 @@ import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
+  SILENT_SOCKET_MS,
   TCP_LINGER_MS,
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE } from "./wasm-limits.js";
-import { enc } from "../services/util.js";
+import { enc, errMessage } from "../services/util.js";
+import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
   PLATFORM_ABI,
@@ -53,6 +55,8 @@ export interface PlatformHost extends PlatformDispatchers {
   channels(): ChannelFactory;
   /** The UDP path's platform over the platform's datagrams. */
   datagrams: DatagramPlatform;
+  /** A node's private modules (§4). */
+  modules: PureModuleLoader;
 }
 
 /** Bytes as a Uint8Array, without a copy when they already are one. */
@@ -63,8 +67,9 @@ const abiMs = (ms: number | undefined): number =>
   ms === undefined ? DEFAULT_GUEST_DEADLINE_MS : ms === Infinity ? -1 : ms;
 
 /** The driver's ChannelFactory over a platform's TCP sockets, and the dispatchers the
- *  platform delivers them through. Once per platform, since it installs the socket limits. */
-export function tcpChannels(net: PlatformNet): ChannelFactory & NetDispatchers {
+ *  platform delivers them through. Once per platform, since it installs the socket limits.
+ *  `silentMs` is shortened only by tests. */
+export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory & NetDispatchers {
   // Limits are passed once; the platform enforces the ones that apply before JS sees a
   // socket.
   net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
@@ -75,10 +80,22 @@ export function tcpChannels(net: PlatformNet): ChannelFactory & NetDispatchers {
   function makeLink(id: number, remoteAddr?: string): RawLink {
     let onData: (bytes: Uint8Array) => void = () => {};
     let onClose: () => void = () => {};
-    chans.set(id, {
-      deliver: (bytes) => onData(bytes),
-      closed: () => { chans.delete(id); onClose(); },
-    });
+    // A socket that never sends a byte is failed before any transport deadline can arm,
+    // dialled or accepted. The first read clears it; after that idleness is the
+    // transport's, and a second clock here would cut established links behind its back.
+    const silent = setTimeout(() => {
+      net.close(id, false);
+      chans.get(id)?.closed();
+    }, silentMs);
+    const entry = {
+      deliver: (bytes: Uint8Array) => {
+        clearTimeout(silent);
+        entry.deliver = (b) => onData(b);
+        onData(bytes);
+      },
+      closed: () => { clearTimeout(silent); chans.delete(id); onClose(); },
+    };
+    chans.set(id, entry);
     return {
       stream: true,
       remoteAddr,
@@ -89,7 +106,7 @@ export function tcpChannels(net: PlatformNet): ChannelFactory & NetDispatchers {
       onData: (cb) => { onData = cb; },
       onClose: (cb) => { onClose = cb; },
       // A local close never fires __netClosed, so drop the entry here.
-      close: (graceful) => { net.close(id, graceful); chans.delete(id); },
+      close: (graceful) => { clearTimeout(silent); net.close(id, graceful); chans.delete(id); },
     };
   }
 
@@ -166,27 +183,98 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   };
 
   // ── The node's parts ───────────────────────────────────────────────────────────
-  /** Private module values over opaque slot names. */
-  let moduleSlotSeq = 0;
-  const modules: PureModuleLoader = {
+  /** Zeros for wiping a scratch window, grown to the largest wipe. */
+  let zeros = new Uint8Array(0);
+  /** One private module on bounded engine instances, under the shared ABI: bound at
+   *  install, and again on the call after a deadline closed its instance (§4.3). */
+  function engineModule(wasm: Uint8Array) {
+    let id = 0, deadline = -1, killed = false;
+    let module!: ReturnType<typeof scratchModule>;
+    const bind = () => {
+      id = bridge.engineInstantiate(wasm, moduleShims(), DEFAULT_GUEST_DEADLINE_MS);
+      try {
+        let fn = -1;
+        try { fn = bridge.engineExport(id, "handle"); } catch { /* scratchModule names it */ }
+        module = scratchModule({
+          handle: fn < 0 ? undefined : (len) => {
+            const r = bridge.engineCallBounded!(id, fn, deadline, len);
+            if (r === null) killed = true;
+            return r;
+          },
+          global: (name) => bridge.engineGlobal(id, name),
+          memoryBytes: () => bridge.engineGrow(id, 0) * 65536,
+          read: (ptr, len) => u8(bridge.engineRead(id, ptr, len)),
+          write: (ptr, bytes) => { bridge.engineWrite(id, ptr, bytes); },
+          wipe: (ptr, len) => {
+            if (zeros.length < len) zeros = new Uint8Array(len);
+            bridge.engineWrite(id, ptr, zeros.subarray(0, len));
+          },
+        }, DEFAULT_SCRATCH_SIZE);
+      } catch (err) {
+        bridge.engineDispose(id);
+        throw err;
+      }
+      killed = false;
+    };
+    bind();
+    return {
+      /** A trap or an overrun answers null; the next call after an overrun binds afresh. */
+      call(payload: Uint8Array, deadlineMs: number): Uint8Array | null {
+        if (killed) {
+          bridge.engineDispose(id);
+          try { bind(); } catch { return null; }
+        }
+        deadline = deadlineMs;
+        try { return module.call(payload); } catch { return null; }
+      },
+      dispose() { bridge.engineDispose(id); },
+    };
+  }
+  /** Private modules where the loader bounds engine calls: in the calling guest's segment,
+   *  timed on its clock. */
+  const engineModules: PureModuleLoader = {
     async build(mods) {
-      const slot = `slot:${++moduleSlotSeq}`;
-      await bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE, DEFAULT_GUEST_DEADLINE_MS);
+      const built = new Map<string, ReturnType<typeof engineModule>>();
+      try {
+        for (const m of mods) {
+          if (built.has(m.name)) throw new Error(`table: duplicate module name ${m.name}`);
+          try { built.set(m.name, engineModule(m.wasm)); } catch (err) { throw new Error(`${m.name}: ${errMessage(err)}`); }
+        }
+      } catch (err) {
+        for (const w of built.values()) w.dispose();
+        throw err;
+      }
       return {
-        async call(module, payload, deadlineMs) {
+        async call(name, payload, deadlineMs) {
+          const w = built.get(name);
+          if (!w) return { bytes: null, ms: 0 };
           const t0 = monotonicMs();
-          const r = bridge.callModule(slot, module, payload, abiMs(deadlineMs));
-          if (r instanceof Promise) {
-            const { bytes, ms } = await r;
-            return { bytes: bytes === null ? null : u8(bytes), ms };
-          }
-          // Answered in this frame, so the wall clock around it is the module's own compute.
-          return { bytes: r === null ? null : u8(r), ms: monotonicMs() - t0 };
+          const bytes = w.call(payload, abiMs(deadlineMs));
+          return { bytes, ms: monotonicMs() - t0 };
         },
-        dispose() { bridge.disposeModules(slot); },
+        dispose() {
+          for (const w of built.values()) w.dispose();
+          built.clear();
+        },
       };
     },
   };
+  /** Private modules in the loader's own isolates, over opaque slot names. */
+  let moduleSlotSeq = 0;
+  const isolatedModules: PureModuleLoader = {
+    async build(mods) {
+      const slot = `slot:${++moduleSlotSeq}`;
+      await bridge.buildModules!(slot, mods);
+      return {
+        async call(module, payload, deadlineMs) {
+          const { bytes, ms } = await bridge.callModule!(slot, module, payload, abiMs(deadlineMs));
+          return { bytes: bytes === null ? null : u8(bytes), ms };
+        },
+        dispose() { bridge.disposeModules!(slot); },
+      };
+    },
+  };
+  const modules = bridge.engineCallBounded ? engineModules : isolatedModules;
   /** `CliFiles` over the platform's operator files. A read throws for anything but a
    *  missing file; a write throws when it fails, which `FreshnessMarks` relies on to roll
    *  back. */
@@ -200,7 +288,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   const tcp = tcpChannels(net);
   const channels = () => combineChannels(tcp, new UdpNetwork({ datagrams }));
   const createRealm: RealmFactory = (opts) =>
-    engineRealms(engine, hostParts.qjs, { billModules: !bridge.modulesInSegment })(opts);
+    engineRealms(engine, hostParts.qjs, { billModules: modules === isolatedModules })(opts);
 
   async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
     const admit = policyFromJson(cfg.policyJson);
@@ -237,7 +325,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   });
 
   return {
-    sodium, createRealm, standUp, channels, datagrams,
+    sodium, createRealm, standUp, channels, datagrams, modules,
     __netDeliver: tcp.__netDeliver,
     __netClosed: tcp.__netClosed,
     __netAccept: tcp.__netAccept,

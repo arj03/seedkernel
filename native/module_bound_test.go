@@ -14,16 +14,15 @@ package main
 // exports like any installed module. WAT:
 //
 //	(module
-//	  (memory (export "memory") 2)
+//	  (memory (export "memory") 3)
 //	  (global (export "scratch") i32 (i32.const 16))
-//	  (global (export "scratchSize") i32 (i32.const 4096))
+//	  (global (export "scratchSize") i32 (i32.const 131072))
 //	  (func (export "handle") (param i32) (result i32)
 //	    (if (i32.load8_u (i32.const 16)) (then (loop (br 0))))
 //	    local.get 0))
 
 import (
 	"bytes"
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -41,9 +40,9 @@ func wedgeWasmBytes() []byte {
 	// type (i32)->i32
 	typ := sec(1, 1, 0x60, 0x01, 0x7f, 0x01, 0x7f)
 	fn := sec(3, 1, 0x00)                          // func 0 has type 0
-	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
+	mem := sec(5, 1, 0x00, 0x03)                   // memory: one, min 3 pages
 	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
-		0x7f, 0x00, 0x41, 0x80, 0x20, 0x0b) //          scratchSize = 4096
+		0x7f, 0x00, 0x41, 0x80, 0x80, 0x08, 0x0b) // scratchSize = 131072, the host default
 	exp := sec(7,
 		4,                                              // exports:
 		0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, //   memory
@@ -78,9 +77,9 @@ func wedgeWasmBytes() []byte {
 // `handle` returns immediately, and instantiation never finishes. WAT:
 //
 //	(module
-//	  (memory (export "memory") 2)
+//	  (memory (export "memory") 3)
 //	  (global (export "scratch") i32 (i32.const 16))
-//	  (global (export "scratchSize") i32 (i32.const 4096))
+//	  (global (export "scratchSize") i32 (i32.const 131072))
 //	  (func (export "handle") (param i32) (result i32) i32.const 0)
 //	  (func $init (loop (br 0)))   ;; never returns
 //	  (start $init))
@@ -92,9 +91,9 @@ func wedgeStartWasmBytes() []byte {
 		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   (handle)
 		0x60, 0x00, 0x00) //             type 1: () -> ()       (the start function)
 	fn := sec(3, 2, 0x00, 0x01)                    // func 0: type 0, func 1: type 1
-	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
+	mem := sec(5, 1, 0x00, 0x03)                   // memory: one, min 3 pages
 	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
-		0x7f, 0x00, 0x41, 0x80, 0x20, 0x0b) //          scratchSize = 4096
+		0x7f, 0x00, 0x41, 0x80, 0x80, 0x08, 0x0b) // scratchSize = 131072, the host default
 	exp := sec(7,
 		4,                                              // exports:
 		0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, //   memory
@@ -136,9 +135,9 @@ func wedgeStartWasmBytes() []byte {
 // `depth`. WAT:
 //
 //	(module
-//	  (memory (export "memory") 2)
+//	  (memory (export "memory") 3)
 //	  (global (export "scratch") i32 (i32.const 16))
-//	  (global (export "scratchSize") i32 (i32.const 4096))
+//	  (global (export "scratchSize") i32 (i32.const 131072))
 //	  (func (export "handle") (param i32) (result i32)
 //	    (call $tree (i32.const 30))
 //	    i32.const 0)
@@ -155,9 +154,9 @@ func wedgeTreeWasmBytes() []byte {
 		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   (handle)
 		0x60, 0x01, 0x7f, 0x00) //       type 1: (i32) -> ()    (tree)
 	fn := sec(3, 2, 0x00, 0x01)                    // func 0: type 0, func 1: type 1
-	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
+	mem := sec(5, 1, 0x00, 0x03)                   // memory: one, min 3 pages
 	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
-		0x7f, 0x00, 0x41, 0x80, 0x20, 0x0b) //          scratchSize = 4096
+		0x7f, 0x00, 0x41, 0x80, 0x80, 0x08, 0x0b) // scratchSize = 131072, the host default
 	exp := sec(7,
 		4,                                              // exports:
 		0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, //   memory
@@ -203,54 +202,28 @@ func wedgeTreeWasmBytes() []byte {
 func TestModuleCallBound(t *testing.T) {
 	bootRealm(t)
 	key := "wedgeapp"
-	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
-		t.Fatalf("buildModuleSlot refused: %v", err)
-	}
-	if _, err := qc.Eval("module-deadline-bridge.js", `
-		globalThis.__callBoundModule = (slot, name, deadlineMs) => {
-		  const out = bridge.callModule(slot, name, new Uint8Array([1]), deadlineMs);
-		  return out === null ? new Uint8Array(0) : new Uint8Array(out);
-		};
-	`); err != nil {
-		t.Fatal("bridge harness:", err)
+	if err := buildModules(t, key, []string{"wedge", "fwd"}, wedgeWasmBytes(), forwarderWasm); err != nil {
+		t.Fatalf("the wedge was refused: %v", err)
 	}
 	// The healthy module on the same app works before and after the kill: the bound
 	// takes the wedged module, not the app.
 	msg := []byte("still alive")
 	echo := func() {
 		t.Helper()
-		if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
+		if r := callMod(t, key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
 			t.Fatalf("healthy module echo = %q, want %q", r, msg)
 		}
 	}
 	echo()
 
-	// The wedge must be interrupted at the deadline, not return early and not wedge
-	// the test. Drive the real JS→Go bridge so dropping its deadline argument would hang
-	// the process forever.
-	start := time.Now()
-	if r, err := callRealm("__callBoundModule", time.Second,
-		qc.NewString(key), qc.NewString("wedge"), qc.NewInt64(50)); err != nil || len(r) != 0 {
-		t.Fatalf("wedged module returned %d B, err=%v; want an empty bounded failure", len(r), err)
-	}
-	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
-		t.Fatalf("wedge returned after %s, want ~50 ms: the bound did not fire", elapsed)
-	}
-
-	// The kill closed the instance, and the next call runs on a fresh one, as the JS
-	// target's next call loads a fresh worker (§4.3): one overrun must not cost the app its
-	// module until someone reinstalls it.
-	if r := callModule(key, "wedge", []byte{0, 9}, time.Second); !bytes.Equal(r, []byte{0, 9}) {
-		t.Fatalf("the killed module answered %v on its next call, want [0 9] from a fresh instance", r)
-	}
-	echo()
-
-	// The bound fires on the fresh instance too.
+	// The wedge must be interrupted at the deadline, not return early and not wedge the
+	// test. This is the host's own path, so dropping the deadline anywhere along it would
+	// hang the process.
 	wedged := func() {
 		t.Helper()
 		start := time.Now()
-		if r := callModule(key, "wedge", []byte{1}, 50*time.Millisecond); r != nil {
-			t.Fatalf("wedge returned %d B, want nil", len(r))
+		if r := callMod(t, key, "wedge", []byte{1}, 50*time.Millisecond); r != nil {
+			t.Fatalf("wedge returned %d B, want a bounded failure", len(r))
 		}
 		if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 			t.Fatalf("wedge returned after %s, want ~50 ms: the bound did not fire", elapsed)
@@ -258,8 +231,18 @@ func TestModuleCallBound(t *testing.T) {
 	}
 	wedged()
 
+	// The kill closed the instance, and the next call runs on a fresh one, as the JS
+	// target's next call loads a fresh worker (§4.3): one overrun must not cost the app its
+	// module until someone reinstalls it.
+	if r := callMod(t, key, "wedge", []byte{0, 9}, time.Second); !bytes.Equal(r, []byte{0, 9}) {
+		t.Fatalf("the killed module answered %v on its next call, want [0 9] from a fresh instance", r)
+	}
+	echo()
+	// The bound fires on the fresh instance too.
+	wedged()
+
 	// A reinstall over a killed instance replaces it like any other.
-	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
+	if err := buildModules(t, key, []string{"wedge", "fwd"}, wedgeWasmBytes(), forwarderWasm); err != nil {
 		t.Fatalf("reinstall refused: %v", err)
 	}
 	echo()
@@ -271,12 +254,11 @@ func TestModuleCallBound(t *testing.T) {
 // entry as well as on back-edges.
 func TestModuleCallBoundLoopFree(t *testing.T) {
 	bootRealm(t)
-	key := "treewedge"
-	if err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeTreeWasmBytes()}, 0x1000, time.Second); err != nil {
-		t.Fatalf("buildModuleSlot refused: %v", err)
+	if err := buildModules(t, "treewedge", []string{"wedge"}, wedgeTreeWasmBytes()); err != nil {
+		t.Fatalf("the tree wedge was refused: %v", err)
 	}
 	start := time.Now()
-	if r := callModule(key, "wedge", nil, 50*time.Millisecond); r != nil {
+	if r := callMod(t, "treewedge", "wedge", nil, 50*time.Millisecond); r != nil {
 		t.Fatalf("call tree returned %d B, want nil", len(r))
 	}
 	// Unbounded, the tree takes seconds to run out, so anything near the deadline is the
@@ -286,66 +268,47 @@ func TestModuleCallBoundLoopFree(t *testing.T) {
 	}
 }
 
-// TestModuleRuntimeArmed checks the app-module runtime honors the per-call context it is
-// given. Every call supplies its calling guest's remainder, and the runtime is armed so
-// that context is enforced.
-func TestModuleRuntimeArmed(t *testing.T) {
-	probe := func(t *testing.T) (called bool, closed bool) {
-		t.Helper()
-		key := "probeapp"
-		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
-			t.Fatalf("buildModuleSlot refused: %v", err)
-		}
-		w := moduleSlots[key]["fwd"]
-		done, cancel := context.WithCancel(ctx)
-		cancel() // done before the call: armed runtimes refuse at entry
-		defer cancel()
-		_, err := w.fn.Call(done, 0)
-		return err == nil, w.mod.IsClosed()
-	}
-
-	bootRealm(t)
-	if called, closed := probe(t); called || !closed {
-		t.Fatalf("armed runtime: call ok=%v closed=%v, want ok=false closed=true (the done ctx must end the call)", called, closed)
-	}
-}
-
 // TestModuleBindBound: instantiation is bounded too. A module whose start section never
 // returns is wedged before it is callable, so the call-time deadline has nothing to fire
-// on; instantiation itself must run under the bound (module.go bind), or
-// install would bypass it. The JS table bounds its worker load for the same reason
-// (module-table.ts).
+// on; a bounded instance's instantiation must run under the bind deadline, or install would
+// bypass it. The JS table bounds its worker load for the same reason (module-table.ts).
 func TestModuleBindBound(t *testing.T) {
 	bootRealm(t)
-	key := "startwedge"
-
+	qc.Global().SetPropertyStr("__startWedge", qc.NewArrayBuffer(wedgeStartWasmBytes()))
 	start := time.Now()
-	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000, 50*time.Millisecond)
+	got := evalString(t, `(() => {
+		try { bridge.engineInstantiate(new Uint8Array(__startWedge), moduleShims(), 50); return "accepted"; }
+		catch (e) { return String(e.message); }
+	})()`)
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("buildModuleSlot accepted a module whose start section never returns")
-	}
-	// It must be the deadline that refused it, not validation: a compile-time refusal
-	// would pass this test while leaving the wedge open. The error comes from
-	// instantiation, and it took about as long as the bound.
-	if !strings.Contains(err.Error(), "instantiate") {
-		t.Fatalf("bind refused with %v, want an instantiate failure (the bound, not a validation error)", err)
+	// It must be the deadline that refused it, not validation: a compile-time refusal would
+	// pass this test while leaving the wedge open. The error comes from instantiation, and
+	// it took about as long as the bound.
+	if !strings.Contains(got, "instantiate") {
+		t.Fatalf("bind refused with %q, want an instantiate failure (the bound, not a validation error)", got)
 	}
 	if elapsed < 40*time.Millisecond || elapsed > 5*time.Second {
 		t.Fatalf("the bind was refused after %s, want ~50 ms: that is not the bound firing", elapsed)
 	}
-	// All-or-none (§3.1): a refused bind leaves the table exactly as it was.
-	if moduleSlots[key] != nil {
-		t.Fatal("a refused bind left the app on the table")
+	// The host is unharmed: it still loads and runs an ordinary module.
+	if err := buildModules(t, "startwedge", []string{"fwd"}, forwarderWasm); err != nil {
+		t.Fatalf("a healthy module was refused after the wedge: %v", err)
 	}
+	if r := callMod(t, "startwedge", "fwd", []byte("still alive"), time.Second); !bytes.Equal(r, []byte("still alive")) {
+		t.Fatalf("healthy module echo = %q", r)
+	}
+}
 
-	// The host is unharmed: the runtime that killed the wedge still loads and runs an
-	// ordinary module.
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
-		t.Fatalf("buildModuleSlot refused a healthy module after the wedge: %v", err)
+// TestModuleBuildAllOrNone (§3.1): a set with one module the ABI refuses is refused whole,
+// and leaves what the key held before.
+func TestModuleBuildAllOrNone(t *testing.T) {
+	bootRealm(t)
+	if err := buildModules(t, "halfapp", []string{"fwd", "bad"}, forwarderWasm, abortingWasm); err == nil {
+		t.Fatal("a set with a module missing its exports was built")
+	} else if !strings.Contains(err.Error(), "bad:") {
+		t.Fatalf("the refusal does not name the module: %v", err)
 	}
-	msg := []byte("still alive")
-	if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
-		t.Fatalf("healthy module echo = %q, want %q", r, msg)
+	if hasModules(t, "halfapp") {
+		t.Fatal("a refused set was kept")
 	}
 }

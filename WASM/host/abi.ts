@@ -25,9 +25,6 @@ export interface PlatformBridge {
   readonly abi: number;
   /** The first word of the console banner, which names the loader. */
   readonly banner: string;
-  /** Whether a module call runs inside the calling guest's execution segment, which then
-   *  already counts it; otherwise the host bills it to the caller. */
-  readonly modulesInSegment: boolean;
 
   /** Process arguments after the program name, as a JSON array. */
   argv(): string;
@@ -44,23 +41,33 @@ export interface PlatformBridge {
   /** `n` bytes from the platform CSPRNG. */
   random(n: number): Bytes;
 
+  // Private modules (§4) run one of two ways, and a loader offers exactly one. One that can
+  // end a synchronous wasm call at a deadline offers bounded engine instances
+  // (`engineCallBounded`), and the host runs the module ABI over them in the calling
+  // guest's segment (host/pure-module.ts). One that cannot runs each module in an isolate
+  // of its own and offers the three calls below, which answer asynchronously with the
+  // module's own time, billed to the caller.
+
   /** Build a bundle's private modules under an opaque slot name, all or none. */
-  buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number,
-    bindDeadlineMs: number): Maybe<void>;
-  /** One module call under a deadline (-1 for none): its answer, or `null` when it failed.
-   *  A loader that runs it elsewhere answers asynchronously, with the module's own time. */
-  callModule(slot: string, module: string, payload: Uint8Array, deadlineMs: number):
-    Bytes | null | Promise<{ bytes: Bytes | null; ms: number }>;
-  disposeModules(slot: string): unknown;
+  buildModules?(slot: string, mods: { name: string; wasm: Uint8Array }[]): Promise<void>;
+  /** One module call under a deadline (-1 for none): its answer, or `null` when it failed. */
+  callModule?(slot: string, module: string, payload: Uint8Array, deadlineMs: number):
+    Promise<{ bytes: Bytes | null; ms: number }>;
+  disposeModules?(slot: string): void;
 
   /** The engine table: a wasm instance from bytes, its import handlers by module and name
-   *  as WebAssembly's importObject. Numbers cross as numbers; i64 does not cross. */
-  engineInstantiate(wasm: Uint8Array, imports: EngineImports): number;
+   *  as WebAssembly's importObject. Numbers cross as numbers; i64 does not cross. A
+   *  `bindDeadlineMs` (-1 for none) asks for a bounded instance, on a loader that offers
+   *  `engineCallBounded`; its instantiation runs under that deadline. */
+  engineInstantiate(wasm: Uint8Array, imports: EngineImports, bindDeadlineMs?: number): number;
   /** An export's handle, for engineCall. */
   engineExport(id: number, name: string): number;
   /** Call an export with up to twelve numbers; any past its parameters are ignored. A trap
    *  throws. */
   engineCall(id: number, fn: number, ...args: number[]): number;
+  /** `engineCall` on a bounded instance under a deadline in ms (-1 for none). Past it the
+   *  instance is closed and the call answers `null`; a trap still throws. */
+  engineCallBounded?(id: number, fn: number, deadlineMs: number, ...args: number[]): number | null;
   /** Grow an instance's memory by `pages` of 64 KiB: its size in pages before, or -1 when
    *  it cannot grow. 0 pages reads the size. */
   engineGrow(id: number, pages: number): number;

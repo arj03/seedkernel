@@ -56,42 +56,75 @@ func hostEnvelope(t testing.TB, a authorKeys, version, abi int, script string) [
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)
 }
 
-// The binary boots the blob it was built with, and reads the layout the realm writes.
+// The binary boots the blob it was built with, and finds the parts of a blob framed here
+// as the realm frames them.
 func TestGenesisHostReads(t *testing.T) {
 	bootRealm(t)
-	h, err := readHostBlob(genesisHost)
-	if err != nil {
-		t.Fatal("genesis:", err)
-	}
-	if h.version < 1 || h.script == "" || len(h.qjs) == 0 {
-		t.Fatalf("genesis: version %d, script %d B, qjs %d B", h.version, len(h.script), len(h.qjs))
+	script, engine, err := hostParts(genesisHost)
+	if err != nil || script == "" || len(engine) == 0 {
+		t.Fatalf("genesis: script %d B, qjs %d B, %v", len(script), len(engine), err)
 	}
 	if &host.env[0] != &genesisHost[0] {
 		t.Fatal("the running host is not the genesis blob")
 	}
-	again, err := readHostBlob(hostEnvelope(t, testAuthor(t), 7, platformABI, h.script))
-	if err != nil || again.version != 7 || again.script != h.script || !reflect.DeepEqual(again.qjs, h.qjs) {
-		t.Fatalf("a blob framed here reads back as %+v, %v", again, err)
+	s, q, err := hostParts(hostEnvelope(t, testAuthor(t), 7, platformABI, script))
+	if err != nil || s != script || !reflect.DeepEqual(q, engine) {
+		t.Fatalf("a blob framed here reads back differently: %v", err)
+	}
+	for _, short := range [][]byte{genesisHost[:offBody-1], genesisHost[:offBody+10]} {
+		if _, _, err := hostParts(short); err == nil {
+			t.Fatalf("a %d-byte blob was read", len(short))
+		}
 	}
 }
 
-// What is not a host blob is refused before any of it runs, and a host blob is not an
-// app: the two are signed under different prefixes, so the host refuses one as the other.
-func TestHostBlobRefusesWhatIsNotAHost(t *testing.T) {
+// testLoader is the loader script's realm with its slots open in a fresh directory.
+func testLoader(t *testing.T) (*loader, string) {
+	t.Helper()
 	bootRealm(t)
-	for _, tc := range []struct {
-		what string
-		env  []byte
-		want string
-	}{
-		{"another suite", append([]byte{0x01}, genesisHost[1:]...), "not a suite 0x02 envelope"},
-		{"a truncated body", genesisHost[:len(genesisHost)-1], "truncated body"},
-		{"trailing bytes", append(append([]byte(nil), genesisHost...), 0), "trailing bytes"},
+	l, err := newLoader(host.qjs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.rt.Close)
+	data := filepath.Join(t.TempDir(), "data")
+	if err := l.open([]string{"--dir", data}, "next", genesisHost); err != nil {
+		t.Fatal(err)
+	}
+	return l, data + ".host"
+}
+
+// A slot whose blob is not one for this loader is passed over for the host below it: not
+// a suite 0x02 envelope, a body that does not frame, or a manifest for another ABI.
+func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
+	l, dir := testLoader(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := testAuthor(t)
+	for what, env := range map[string][]byte{
+		"another suite":   append([]byte{0x01}, hostEnvelope(t, a, 5, platformABI, host.script)[1:]...),
+		"trailing bytes":  append(hostEnvelope(t, a, 5, platformABI, host.script), 0),
+		"another ABI":     hostEnvelope(t, a, 5, platformABI+1, host.script),
+		"a truncated one": genesisHost[:offBody+10],
 	} {
-		if _, err := readHostBlob(tc.env); err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Fatalf("%s: %v", tc.what, err)
+		if err := os.WriteFile(filepath.Join(dir, "pending.skb"), env, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := l.choose(genesisHost)
+		if err != nil || &got[0] != &genesisHost[0] {
+			t.Fatalf("%s: the slots did not fall back on the genesis blob (%v)", what, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "pending.skb")); err == nil {
+			t.Fatalf("%s: the pending blob was kept", what)
 		}
 	}
+}
+
+// A host blob is not an app: the two are signed under different prefixes, so the host
+// refuses one as the other.
+func TestHostBlobIsNotAnApp(t *testing.T) {
+	bootRealm(t)
 	if _, err := startNode(nodeConfig{KeyHex: testKeyHex(t)}); err != nil {
 		t.Fatal("startNode:", err)
 	}
@@ -105,24 +138,10 @@ func TestHostBlobRefusesWhatIsNotAHost(t *testing.T) {
 	}
 }
 
-// A blob for another platform ABI is refused before any of it runs.
-func TestBootRefusesAnotherABI(t *testing.T) {
-	bootRealm(t)
-	other := hostEnvelope(t, testAuthor(t), 2, platformABI+1, host.script)
-	defer func() {
-		bootBlob = genesisHost
-		bootRealm(t)
-	}()
-	bootBlob = other
-	err := boot()
-	if err == nil || !strings.Contains(err.Error(), "platform ABI") {
-		t.Fatalf("boot of an ABI %d blob: %v", platformABI+1, err)
-	}
-}
-
 // --host and --host-updates are the loader's: they come out of what the host sees, in
-// either spelling.
+// either spelling. The rules are the shared script's; this checks this binary runs it.
 func TestLoaderFlags(t *testing.T) {
+	l, _ := testLoader(t)
 	for _, tc := range []struct {
 		argv     []string
 		rest     []string
@@ -133,17 +152,17 @@ func TestLoaderFlags(t *testing.T) {
 		{[]string{"--host", "h.skb", "--dir", "d"}, []string{"--dir", "d"}, "h.skb", "off"},
 		{[]string{"--dir=d", "--host=h.skb", "--host-updates", "now"}, []string{"--dir=d"}, "h.skb", "now"},
 		{[]string{"--host-updates=next", "--hostile", "x"}, []string{"--hostile", "x"}, "", "next"},
-		{nil, []string{}, "", "off"},
+		{[]string{}, []string{}, "", "off"},
 	} {
-		o, err := loaderFlags(tc.argv)
-		if err != nil || !reflect.DeepEqual(o.rest, tc.rest) || o.hostFile != tc.hostFile || o.updates != tc.updates {
+		o, err := l.flags(tc.argv)
+		if err != nil || !reflect.DeepEqual(o.Rest, tc.rest) || o.HostFile != tc.hostFile || o.Updates != tc.updates {
 			t.Fatalf("loaderFlags(%q) = %+v, %v", tc.argv, o, err)
 		}
 	}
-	if _, err := loaderFlags([]string{"--host"}); err == nil {
+	if _, err := l.flags([]string{"--host"}); err == nil {
 		t.Fatal("--host with no value was accepted")
 	}
-	if dataDirOf([]string{"--policy", "p", "--dir=x/"}) != "x/" || dataDirOf(nil) != "./data" {
-		t.Fatal("dataDirOf")
+	if rest, err := l.withoutOp([]string{"--op", "x", "--dir", "d", "--op=y"}); err != nil || !reflect.DeepEqual(rest, []string{"--dir", "d"}) {
+		t.Fatalf("withoutOp: %q, %v", rest, err)
 	}
 }

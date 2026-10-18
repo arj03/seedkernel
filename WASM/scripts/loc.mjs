@@ -40,8 +40,9 @@ const fmt = (n) => n.toLocaleString("en-US");
 // ── the shared set, from the build script that defines it ────────────────────
 const pkg = JSON.parse(readFileSync(resolve(wasmDir, "package.json"), "utf8"));
 const sharedSet = new Set(
-  // Sources sit under build/<dir>/; the script's first path is its output, build/host.js.
-  (pkg.scripts["build:host-script"].match(/build\/[^\s/]+\/\S+\.js/g) ?? [])
+  // Sources sit under build/<dir>/; each script's first path is its output, build/host.js
+  // or build/loader.js. The loader script is shared too: both loaders run it.
+  ([pkg.scripts["build:host-script"], pkg.scripts["build:loader-script"]].join(" ").match(/build\/[^\s/]+\/\S+\.js/g) ?? [])
     .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
 // ── the rows, exactly as the README groups them ──────────────────────────────
@@ -51,7 +52,8 @@ const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
   { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
-    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts"] },
+    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts",
+      "WASM/host/slots.ts", "WASM/host/pure-module.ts"] },
   { find: /`host\/transport-host\.ts`/,
     files: ["WASM/host/transport-host.ts"] },
   { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,

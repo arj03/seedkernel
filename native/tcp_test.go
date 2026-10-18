@@ -298,50 +298,6 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	}
 }
 
-// TestSockChannelSilentPeerTimesOut checks the pre-auth bound (silentReadTimeout): a
-// connection that opens and never sends a byte is failed and reclaimed on its own, without
-// the transport guest noticing it. This is the slowloris case, which costs the attacker a
-// SYN and this side two goroutines and a 64 KiB buffer.
-func TestSockChannelSilentPeerTimesOut(t *testing.T) {
-	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
-	silentReadTimeout = 50 * time.Millisecond
-
-	c1, c2 := net.Pipe()
-	defer c2.Close()
-	onClosed := make(chan struct{}, 1)
-	c := newTestInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
-	go c.readLoop()
-	waitOn(t, onClosed, "a connection that never spoke must be reclaimed")
-}
-
-// TestSockChannelSpokenForSurvives is the other half of the same rule: the first byte
-// clears the deadline, so a link that has spoken is never killed for going quiet later.
-// How long an established link may idle is the transport's policy (its own idle clock),
-// and a second clock here would cut established links behind its back.
-func TestSockChannelSpokenForSurvives(t *testing.T) {
-	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
-	silentReadTimeout = 50 * time.Millisecond
-
-	c1, c2 := net.Pipe()
-	defer c2.Close()
-	in := make(chan struct{}, 1)
-	onClosed := make(chan struct{}, 1)
-	c := newTestInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} })
-	go c.readLoop()
-
-	if _, err := c2.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	waitOn(t, in, "the first frame must be delivered")
-	time.Sleep(5 * silentReadTimeout) // long past the deadline the first read cleared
-	select {
-	case <-onClosed:
-		t.Fatal("a link that had spoken was killed for idling")
-	default:
-	}
-	c.close(false)
-}
-
 // TestNetHostAcceptCeiling checks the accept bound (maxLiveChannels): past the ceiling an
 // inbound socket is closed at once, without an id, a channel or a goroutine, and the
 // listener keeps serving, so the node recovers as live channels close instead of going
