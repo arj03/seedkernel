@@ -332,12 +332,14 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // A candidate's top level runs before commit, so every seam call is refused until the
     // slot is active, and disposing a failed candidate has nothing to undo. Top level can
     // still initialize from `HOST`, `APP` and `LOCAL`.
-    return (name, payload, budget) => {
+    const seam: HostCall = (name, payload, budget) => {
       if (!slot.active) {
         throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
       }
       return fullSeam(name, payload, budget);
     };
+    seam.borrows = fullSeam.borrows;
+    return seam;
   };
   const doUninstall = (app: string) => {
     const slot = table.remove(app);

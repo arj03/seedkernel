@@ -52,6 +52,7 @@ function link(mod: WebAssembly.Module, imports: EngineImports) {
         return g instanceof WebAssembly.Global ? Number(g.value) : null;
       },
       read: (ptr, len) => new Uint8Array(memory.buffer, ptr, len).slice(),
+      view: (ptr, len) => new Uint8Array(memory.buffer, ptr, len),
       write: (ptr, bytes) => { new Uint8Array(memory.buffer).set(bytes, ptr); },
       // Nothing to release: the instance goes with its last reference.
       dispose: () => {},

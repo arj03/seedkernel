@@ -34,6 +34,9 @@ export interface EngineInstance {
   /** An exported global's value, or `null` when there is none by that name. */
   global(name: string): number | null;
   read(ptr: number, len: number): Uint8Array;
+  /** Where the platform can lend one: a view of memory without a copy, valid until the
+   *  instance next runs. */
+  view?(ptr: number, len: number): Uint8Array;
   write(ptr: number, bytes: Uint8Array): void;
   dispose(): void;
 }
@@ -170,10 +173,14 @@ export function engineRealms(engine: Engine, qjs: Uint8Array, opt: EngineRealmOp
               bufLen = -1;
             }
             const nameBytes = nameLen < 0 ? -nameLen : nameLen;
-            const bytes = inst.read(buf, nameBytes + payloadLen);
+            const lent = inst.view?.(buf, nameBytes + payloadLen);
+            let bytes = lent ?? inst.read(buf, nameBytes + payloadLen);
             const name = nameLen >= 0
               ? String.fromCharCode.apply(null, bytes.subarray(0, nameLen) as unknown as number[])
               : dec.decode(bytes.subarray(0, nameBytes));
+            // A fresh buffer per call is most of what a large argument costs on V8, so a
+            // handler that is done with its payload when it returns borrows the realm's.
+            if (lent && !opts.hostCall.borrows?.(name)) bytes = lent.slice();
             // The shared record, not a snapshot: concurrent calls charge the same spend.
             const made = active;
             // With no time left in the segment, this refuses.

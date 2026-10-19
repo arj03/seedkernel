@@ -145,7 +145,11 @@ export class CallBudget {
  *  and the realm hands them to the guest in the frame that asked: no host promise, no
  *  deadline and no later turn, which is most of what a call costs. One that has to wait
  *  returns a Promise. The guest sees a Promise either way. */
-export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
+export type HostCall = ((name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>) & {
+  /** Whether `name`'s handler is done with its payload when it returns, so the realm may
+   *  lend it a view of its memory instead of a copy (engine-realm.ts). Absent: never. */
+  borrows?(name: string): boolean;
+};
 
 export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
 
@@ -525,9 +529,12 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
       return bytes;
     }));
   }
-  return (name, payload, budget) => {
+  const seam: HostCall = (name, payload, budget) => {
     const route = routes.get(name);
     if (!route) throw new Error("guest-seam: no such name " + name + " (not crypto, a module, or declared in guest.requires)");
     return route(payload, budget);
   };
+  // The crypto transforms and `node` answer inline and keep nothing of their payload.
+  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("node/");
+  return seam;
 }
