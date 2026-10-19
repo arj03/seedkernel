@@ -241,11 +241,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const b = slot.verifiedBundle;
     const appConfig = b.manifest.guest.config ?? {};
     // The host's facts (§12.3): the key `node/sign` signs with, and the budgets the realm
-    // is held to, so a guest can pace its fan-out.
+    // is held to, so a guest can pace its fan-out and settle a wait before its deadline.
     const hostFacts: JsonObject = {
       identity: toHex(opts.identity.publicKey),
       maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
       maxOutstandingHostCallBytes: DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+      deadlineMs: bounds.deadlineMs === Infinity ? null : bounds.deadlineMs,
     };
     slot.realm = await createRealm({
       source: jsonPreamble("HOST", hostFacts) + jsonPreamble("APP", appConfig)

@@ -966,6 +966,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   "the realm's host-call budget is advertised to the guest, not only enforced against it");
+  ok(advertised.deadlineMs === 5000, "so is its invocation deadline, so a guest can settle a wait before it");
   // So is the node's public key, as hex: the key `node/sign` signs with, so what a guest
   // publishes as its node and what its signatures verify under cannot disagree.
   ok(advertised.identity === toHex(kp.ed.publicKey),

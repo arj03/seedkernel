@@ -78,6 +78,11 @@ const maxOutboundQueueSlices = 4096;
 const callWeight = HOST.maxOutstandingHostCallBytes / HOST.maxOutstandingHostCalls;
 const maxRequestWeight = maxFrameBytes + PK_LEN + callWeight;
 const deliveryWindow = HOST.maxOutstandingHostCallBytes - 2 * maxRequestWeight;
+// An invocation's deadline runs from its admission and covers a deferred answer (§12.3),
+// so a `ready` that waited the realm's whole ceiling would lose to it. It settles this far
+// short of it instead; null is an unbounded realm.
+const READY_MARGIN_MS = 250;
+const readyCapMs = HOST.deadlineMs === null ? Infinity : Math.max(0, HOST.deadlineMs - READY_MARGIN_MS);
 const maxPreAuthQueueSlices = Math.max(1, policy("maxPreAuthQueueSlices"));
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");
@@ -399,7 +404,7 @@ class Core {
     for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
-    this.readyWaiters.push({ check: allUp, d, due: dueIn(timeoutMs) });
+    this.readyWaiters.push({ check: allUp, d, due: dueIn(Math.min(timeoutMs, readyCapMs)) });
   }
 
   /** Settle each waiter whose cohort is up or whose deadline has passed (a caller that

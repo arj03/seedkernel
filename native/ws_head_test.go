@@ -29,6 +29,7 @@ const wsHeadJS = `
     identity: "00".repeat(32),
     maxOutstandingHostCalls: 256,
     maxOutstandingHostCallBytes: 16 * 1024 * 1024,
+    deadlineMs: 5000,
   };
   const APP = bundle.manifest.guest.config;
   const LOCAL = { networkKey: "00".repeat(32), peers: [], admitPeers: [] };
