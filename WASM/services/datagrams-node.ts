@@ -1,11 +1,11 @@
-// Node's datagram sockets (net-udp.ts `RawDatagrams`): a `node:dgram` socket per path,
+// Node's datagram sockets (datagrams.ts `RawDatagrams`): a `node:dgram` socket per bind,
 // dual-stack where the machine has IPv6. The Node platform hands them to the host
-// (host/platform-node.ts), and `nodeDatagrams` is the seam's default over them.
+// (host/platform-node.ts), which lends them to the UDP bundle (§12.7).
 import { createSocket, type Socket } from "node:dgram";
 import { lookup } from "node:dns";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
-import { datagramsOver, ipv6Bytes, type DatagramPlatform, type RawDatagrams } from "./net-udp.js";
+import { ipv6Bytes, type RawDatagrams } from "./datagrams.js";
 
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";
@@ -98,6 +98,3 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
     },
   };
 }
-
-/** The seam's default platform: Node's datagrams. */
-export const nodeDatagrams: DatagramPlatform = datagramsOver(nodeRawDatagrams());

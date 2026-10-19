@@ -220,21 +220,29 @@ func TestUdpPathNative(t *testing.T) {
 	awaitOK(t, "udpCheck", `udpCheck()`, 20*time.Second)
 }
 
-// A native socket is dual-stack: it hears IPv4 and IPv6 alike, and names each sender as
-// the seam writes it, IPv4 dotted though the socket hears it IPv4-mapped, IPv6 as RFC 5952
-// writes it.
+// A native socket is dual-stack: it hears IPv4 and IPv6 alike, and names each sender in the
+// batch as the platform ABI writes it, IPv4 as its 4 bytes though the socket hears it
+// IPv4-mapped, IPv6 as its 16.
 func TestUdpDualStackNative(t *testing.T) {
 	bootRealm(t)
 	got := awaitOK(t, "dual-stack", `(async () => {
-	  const a = await platformDatagrams.bind(), b = await platformDatagrams.bind();
 	  const heard = [];
-	  b.socket.onMessage((bytes, host, port) => heard.push(host + " " + (port === a.port) + " " + bytes[0]));
-	  a.socket.send(Uint8Array.of(4), b.port, "127.0.0.1");
-	  a.socket.send(Uint8Array.of(6), b.port, "::1");
+	  const read = (batch) => {
+	    const b = new Uint8Array(batch);
+	    for (let at = 0; at < b.length;) {
+	      const n = b[at], ip = b.subarray(at + 1, at + 1 + n);
+	      const port = (b[at + 1 + n] << 8) | b[at + 2 + n], len = (b[at + 3 + n] << 8) | b[at + 4 + n];
+	      heard.push((n === 4 ? ip.join(".") : ip.join("") === "0".repeat(15) + "1" ? "::1" : "?") + " " + (port === a.port) + " " + b[at + 5 + n]);
+	      at += 5 + n + len;
+	    }
+	  };
+	  const a = __udp.bind(() => {}, 1 << 16), b = __udp.bind(read, 1 << 16);
+	  __udp.send(a.id, "127.0.0.1", b.port, Uint8Array.of(4));
+	  __udp.send(a.id, "::1", b.port, Uint8Array.of(6));
 	  const until = Date.now() + 5000;
 	  while (heard.length < 2 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
-	  a.socket.close();
-	  b.socket.close();
+	  __udp.close(a.id);
+	  __udp.close(b.id);
 	  return new TextEncoder().encode(heard.sort().join(","));
 	})()`, 10*time.Second)
 	if want := "127.0.0.1 true 4,::1 true 6"; string(got) != want {

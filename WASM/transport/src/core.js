@@ -147,6 +147,7 @@ function onWake() {
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
     wakeBy(relays.onWake(t));
+    wakeBy(udp.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
     walking = false;
@@ -418,6 +419,7 @@ const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
 const rtc = new Rtc();
+const udp = new Udp();
 const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
@@ -488,14 +490,29 @@ entry("linkBytes", async (r) => {
 /** The socket closed. Answers `[severity u8][reason utf8]` (`closeReason`, ake.js), once
  *  per link. */
 entry("linkClosed", (r) => {
-  const linkId = r.u32();
-  const link = linksById.get(linkId);
+  const link = channelClosed(r.u32());
   if (!link) return EMPTY;
-  link.onChannelClosed();
-  linksById.delete(linkId);
   const why = link.closeReason;
   return concatBytes([Uint8Array.of(ROUTINE_REASONS.has(why) ? 0 : 1), utf8Encode(why)]);
 });
+
+/** A link's channel went away: tell the link, and forget it. */
+function channelClosed(linkId) {
+  const link = linksById.get(linkId);
+  if (!link) return null;
+  link.onChannelClosed();
+  linksById.delete(linkId);
+  return link;
+}
+
+/** A link this realm runs itself (udp.js) went away, which no `linkClosed` will say: on a
+ *  later turn, as the host would. Its reason goes unprinted, having no host to print it. */
+function localClosed(linkId) {
+  void Promise.resolve().then(() => channelClosed(linkId));
+}
+
+/** What the host's datagram sockets read since the last of these (udp.js). */
+entry("datagrams", (r) => { udp.onDatagrams(r); });
 
 /** App-facing send, deferred: the response is another invocation of this realm. */
 entry("send", (r, caller) => {

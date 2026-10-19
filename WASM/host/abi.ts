@@ -12,7 +12,7 @@
 
 import type { EngineImports } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
-import type { RawDatagrams } from "../services/udp/net-udp.js";
+import type { RawDatagrams } from "../services/datagrams.js";
 
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;

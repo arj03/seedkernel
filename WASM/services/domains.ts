@@ -46,9 +46,10 @@ export const HOST_SERVICES = {
   node: { calls: ["sign", "verify"] },
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
   timer: { calls: ["arm", "clear"] },
+  // Raw links, and the raw datagram sockets the occupant runs its UDP paths over (§12.7).
   link: {
-    calls: ["open", "send", "close", "deliver", "status"],
-    events: ["linkOpen", "linkBytes", "linkClosed"],
+    calls: ["open", "send", "close", "deliver", "status", "udpBind", "udpSend", "udpClose"],
+    events: ["linkOpen", "linkBytes", "linkClosed", "datagrams"],
   },
   // Hand the loader a host blob to run next (§12.9). The blob authenticates itself, so the
   // caller needs no trust; the loader's rules and the operator's --host-updates decide.

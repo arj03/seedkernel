@@ -12,8 +12,7 @@ import { bootShell } from "./shell-core.js";
 import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.js";
 import { monotonicMs, type RealmFactory } from "./realm-queue.js";
 import { engineRealms } from "./engine-realm.js";
-import { combineChannels, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
-import { UdpNetwork, datagramsOver, type DatagramPlatform } from "../services/udp/net-udp.js";
+import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import {
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
@@ -49,11 +48,9 @@ export interface PlatformHost extends PlatformDispatchers {
   /** Boot a node through `bootShell` (§12.9). The policy is parsed before anything is
    *  opened. */
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
-  /** A node's sockets: TCP, and the UDP path over the platform's datagrams. A factory per
-   *  node, since a UDP factory keeps the one node's accept sink. */
+  /** A node's TCP sockets. The platform's datagrams the transport runs its UDP paths over
+   *  are lent through `standUp` (§12.7). */
   channels(): ChannelFactory;
-  /** The UDP path's platform over the platform's datagrams. */
-  datagrams: DatagramPlatform;
   /** A node's private modules (§4). */
   modules: PureModuleLoader;
 }
@@ -164,8 +161,6 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   const hostParts = readHostBlob(hostEnv);
   const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)));
 
-  const datagrams = datagramsOver(udp);
-
   // ── The node's parts ───────────────────────────────────────────────────────────
   /** Zeros for wiping a scratch window, grown to the largest wipe. */
   let zeros = new Uint8Array(0);
@@ -270,7 +265,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
   };
   const tcp = tcpChannels(net);
-  const channels = () => combineChannels(tcp, new UdpNetwork({ datagrams }));
+  const channels = () => tcp;
   const createRealm: RealmFactory = (opts) =>
     engineRealms(engine, hostParts.qjs, { billModules: modules === isolatedModules })(opts);
 
@@ -282,7 +277,11 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
       freshnessStore: freshnessStoreFor(cliFiles, cfg.dir),
       // The network as configured, over the platform's sockets unless the caller brings
       // its own.
-      transport: cfg.transport && { ...cfg.transport, channels: cfg.transport.channels ?? channels() },
+      transport: cfg.transport && {
+        ...cfg.transport,
+        channels: cfg.transport.channels ?? channels(),
+        datagrams: cfg.transport.datagrams ?? udp,
+      },
       guestDeadlineMs: cfg.guestDeadlineMs,
       realmMemoryBytes: cfg.realmMemoryBytes,
       // The successor is this host's to vet, as an app bundle is; the loader only keeps it.
@@ -309,7 +308,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   });
 
   return {
-    sodium, createRealm, standUp, channels, datagrams, modules,
+    sodium, createRealm, standUp, channels, modules,
     /** Run the operator flow. The loader reads back, as JSON bytes, whether to keep running. */
     async runMain() {
       const { serving, close } = await runCli(cliHost());

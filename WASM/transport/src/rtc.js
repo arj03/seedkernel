@@ -1,9 +1,9 @@
 // Direct upgrades (§12.7): once a peer is linked through a relay, the smaller key offers a
 // direct path, signaled over that authenticated link, and the path's data link becomes a
-// direct link. A path is one of two kinds, each a host socket factory that holds the path
-// and decides nothing: `udp:`, the host's own UDP sockets (services/udp), tried first, and
-// `rtc:`, a WebRTC peer connection. A node offers the first its host routes, and the next
-// when the peer declines.
+// direct link. A path is one of two kinds: `udp`, this transport's own over the host's
+// datagram sockets (udp.js), tried first, and `rtc:`, a WebRTC peer connection the host
+// holds and decides nothing about. A node offers the first it has, and the next when the
+// peer declines.
 
 // The negotiation link's message tags (services/net-rtc.ts `RTC_TAG`), the same for both
 // kinds: each message is `[tag u8][UTF-8 text]`. Up: a local description, a local
@@ -76,14 +76,13 @@ class Rtc {
     this.signals = Promise.resolve();
   }
 
-  /** The RTCConfiguration suffix for a negotiation with `peer`: STUN at the relay it is
-   *  linked through, on both its ports, which already sees this node's address, so asking
-   *  it tells no one new, then the configured servers. */
-  configFor(peer) {
+  /** The ICE servers for a negotiation with `peer`: STUN at the relay it is linked
+   *  through, on both its ports, which already sees this node's address, so asking it tells
+   *  no one new, then the configured servers. */
+  iceServersFor(peer) {
     const relay = router.relayOf(peer);
     const atRelay = relay ? RELAY_STUN_PORTS.map((port) => ({ urls: `stun:${relayHost(relay)}:${port}` })) : [];
-    const iceServers = [...atRelay, ...this.iceServers];
-    return iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
+    return [...atRelay, ...this.iceServers];
   }
 
   /** Negotiations that have not produced an authenticated link; the cap counts these. */
@@ -142,26 +141,39 @@ class Rtc {
     }
   }
 
-  /** Open a negotiation link of `scheme` for one peer. Null when the cap is reached or no
-   *  route (a host without that kind of path). */
+  /** Open a negotiation link of `scheme` for one peer: a host's `rtc:` link, or a UDP
+   *  negotiation this realm runs (`e.local`). Null when the cap is reached or no route (a
+   *  host without that kind of path). */
   async open(peer, offer, sid, scheme) {
     if (this.pending() >= this.maxNegotiating) return null;
-    const e = { peer, offer, sid, scheme, ctl: 0, data: null, gone: false, due: Infinity };
+    const e = { peer, offer, sid, scheme, ctl: 0, local: null, data: null, gone: false, due: Infinity };
     this.byPeer.set(peer, e);
-    const opened = await netLinkOpen(`${scheme}:${offer ? "offer" : "answer"}${this.configFor(peer)}`);
+    const local = scheme === "udp" ? await udp.open(offer, this.iceServersFor(peer)) : null;
+    const opened = scheme === "udp"
+      ? { linkId: local ? local.linkId : 0 }
+      : await netLinkOpen(`${scheme}:${offer ? "offer" : "answer"}${configSuffix(this.iceServersFor(peer))}`);
     const early = this.early.get(opened.linkId);
     this.early.delete(opened.linkId);
     if (e.gone || this.byPeer.get(peer) !== e || opened.linkId === 0) {
-      if (opened.linkId !== 0) netLinkClose(opened.linkId, false);
+      if (local) local.close();
+      else if (opened.linkId !== 0) netLinkClose(opened.linkId, false);
       if (early) netLinkClose(early.linkId, false);
       if (this.byPeer.get(peer) === e) this.byPeer.delete(peer);
       return null;
     }
     e.ctl = opened.linkId;
+    e.local = local;
     this.byCtl.set(e.ctl, e);
     if (this.connectTimeoutMs > 0) e.due = dueIn(this.connectTimeoutMs);
     linksById.set(e.ctl, new RtcCtlLink(e.ctl, e, this));
     if (early) this.bindData(e.ctl, early.linkId, early.stream);
+    if (local) {
+      local.start({
+        up: (tag, text) => this.up(e, tag, text),
+        open: (linkId, stream) => this.bindData(e.ctl, linkId, true, stream),
+        closed: localClosed,
+      });
+    }
     return e;
   }
 
@@ -173,6 +185,7 @@ class Rtc {
 
   down(e, tag, text) {
     if (e.ctl === 0) return;
+    if (e.local) { e.local.down(tag, text); return; }
     const body = utf8Encode(text);
     const msg = new Uint8Array(1 + body.length);
     msg[0] = tag;
@@ -184,26 +197,33 @@ class Rtc {
    *  the peer it signaled, and the answering side accepts that peer and no other. Both run
    *  open, with no contact secret: the channel exists only through signaling over the
    *  authenticated link, so only that peer can reach it, and a key it brought along would
-   *  otherwise pass a gate it never opened. */
-  bindData(via, linkId, stream) {
+   *  otherwise pass a gate it never opened. A UDP negotiation's data link is its stream
+   *  (`channel`), which the link reads. */
+  bindData(via, linkId, stream, channel) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
-    if (!e || e.data) { netLinkClose(linkId, false); return; }
-    e.data = core.openLink({
-      linkId, stream, dest: "", listener: "", source: undefined,
+    if (!e || e.data) {
+      if (channel) channel.close(false);
+      else netLinkClose(linkId, false);
+      return;
+    }
+    const link = e.data = core.openLink({
+      linkId, stream, channel, dest: "", listener: "", source: undefined,
       linkSecret: ZERO32,
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,
       acceptPeerId: e.offer ? null : e.peer,
     });
+    if (channel) channel.reader((bytes) => link.onWire(bytes));
   }
 
   /** End a negotiation this end gave up on. It leaves `byCtl` at once, so a data link it
    *  announced meanwhile is closed (`bindData`) rather than run on a closing channel. */
   drop(e) {
     this.gone(e);
-    if (e.ctl !== 0) netLinkClose(e.ctl, false);
+    if (e.local) e.local.close();
+    else if (e.ctl !== 0) netLinkClose(e.ctl, false);
   }
 
   /** A negotiation link closed, and its data link with it. The peer is still reachable
@@ -217,3 +237,8 @@ class Rtc {
 
 /** Whether this negotiation's data link ever authenticated. */
 function authedData(e) { return e.data !== null && e.data.peerId !== ""; }
+
+/** The RTCConfiguration suffix of an `rtc:` destination. */
+function configSuffix(iceServers) {
+  return iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
+}

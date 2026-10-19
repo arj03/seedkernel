@@ -15,5 +15,4 @@ export const standUp = host.standUp;
 export const createRealm = host.createRealm;
 export const sodium = host.sodium;
 export const platformChannels = host.channels;
-export const platformDatagrams = host.datagrams;
 export const platformModules = host.modules;

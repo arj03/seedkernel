@@ -38,7 +38,19 @@ export interface RawNet {
   send(linkId: number, bytes: Uint8Array): void;
   /** Tear a link down; `graceful` flushes already-written bytes first. */
   close(linkId: number, graceful: boolean): void;
+  /** A datagram socket for the occupant's UDP paths (§12.7); its reads arrive as
+   *  `datagrams` events. */
+  udpBind(): Promise<DatagramSocket>;
+  /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
+   *  one that fails is lost. */
+  udpSend(batch: Uint8Array): void;
+  udpClose(id: number): void;
 }
+
+/** A bound socket: socket 0 when refused or failed. `addresses` are every address this
+ *  machine's sockets are reached at, `\n`-separated; which are candidates is the
+ *  occupant's. */
+export interface DatagramSocket { id: number; port: number; addresses: string }
 
 /** The `link` backend: the driver's raw links plus the shell's claim routing. */
 export interface LinkBackend extends RawNet {
@@ -463,6 +475,24 @@ const SERVICES: {
     // occupant when either changes.
     "link/status": (payload) => {
       net.status(payload.slice());
+      return NONE;
+    },
+    // -> [socket u32][port u16][addresses utf8], socket 0 for none.
+    "link/udpBind": () => net.udpBind().then((s) => {
+      const addresses = enc.encode(s.addresses);
+      const out = new Uint8Array(6 + addresses.length);
+      writeU32BE(out, 0, s.id);
+      out[4] = s.port >> 8;
+      out[5] = s.port & 255;
+      out.set(addresses, 6);
+      return out;
+    }),
+    "link/udpSend": (payload) => {
+      net.udpSend(payload);
+      return NONE;
+    },
+    "link/udpClose": (payload) => {
+      net.udpClose(readU32BE(payload, 0));
       return NONE;
     },
   }),

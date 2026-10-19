@@ -6,7 +6,7 @@ import { randomFillSync } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
 import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
-import { nodeRawDatagrams } from "../services/udp/node.js";
+import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { errMessage } from "../services/util.js";
 import { ModuleTable } from "./module-table.js";
 import { syncWebEngine } from "./engine-web.js";

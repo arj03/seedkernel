@@ -236,6 +236,8 @@ export async function makeTransportHost(opts = {}) {
   const transport = {
     channels: opts.channels,
     listen: opts.listen,
+    // The datagram sockets the transport's UDP paths run over, when a test wants them (§12.7).
+    datagrams: opts.datagrams,
     // The driver's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
     // The occupant's reason per link teardown (transport/src/ake.js `REASON_*`), the only

@@ -10,8 +10,8 @@ declare const bridge: { log(line: string): void; random(n: number): ArrayBuffer 
 
 const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown; crypto?: unknown };
 
-// crypto.getRandomValues, Web Crypto's entropy call, which the UDP path draws its tokens
-// from (services/udp); the loader's CSPRNG serves it.
+// crypto.getRandomValues, Web Crypto's entropy call, which ML-DSA's hedged signing draws
+// from (pq.ts); the loader's CSPRNG serves it.
 if (web.crypto === undefined) {
   web.crypto = {
     getRandomValues<T extends ArrayBufferView>(a: T): T {

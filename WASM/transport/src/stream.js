@@ -1,7 +1,7 @@
 // A reliable, ordered byte stream over a datagram path (§12.7), the data link of a UDP
-// path. The transport above it authenticates and encrypts, frames its records, bounds what
-// it sends by `buffered()` and times idle links out, so all this does is get bytes across,
-// in order, at a rate the path takes.
+// path (udp.js). The link above it authenticates and encrypts, frames its records and
+// times idle links out, so all this does is get bytes across, in order, at a rate the path
+// takes.
 //
 // The recovery design is QUIC's (RFC 9002), cut down:
 // - Every packet gets a new number, a resent chunk's too, so an ack names one send and a
@@ -18,10 +18,10 @@
 //   by 1/(2 FLOWS) once per loss episode, then grown by `FLOWS` packets a round trip, and
 //   only while it is what holds the sender back. Losses through `PERSISTENT_PTOS` probe
 //   timeouts, with nothing acked between, start the window over at two packets.
-// - Every ack says how far the receiver will take the stream, so a reader the driver holds
-//   back (`setReadable`) stops the sender, and a credit read in under two round trips
-//   doubles it, up to `MAX_CREDIT`. Nothing acks an ack, so the one that lets a sender
-//   that has used all it was given go on is sent three times.
+// - Every ack says how far the receiver will take the stream, so a reader still decoding
+//   the last read stops the sender, and a credit read in under two round trips doubles it,
+//   up to `MAX_CREDIT`. Nothing acks an ack, so the one that lets a sender that has used
+//   all it was given go on is sent three times.
 // - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
 //   from not at all for `DEAD_MS`, ends the path: the peer is gone.
 // - A path starts at QUIC's 1200-byte packets and probes for `MAX_PACKET` (RFC 8899): a
@@ -34,13 +34,12 @@
 //   ACK    [credit 6][delay u16 ms][count u8]([largest 6][smallest 6])*   newest range first
 //   PROBE  [pn 6], padded to `MAX_PACKET`
 //   CLOSE  nothing
-// The stream writes the type and leaves the token to the path (net-udp.ts).
-import { type RawLink } from "../socket-seam.js";
-import { Fifo } from "../util.js";
+// The stream writes the type and leaves the token to the path. Its timers are due times
+// the realm's wake walks (core.js `onWake`).
 
-const TYPE_DATA = 0x64, TYPE_ACK = 0x61, TYPE_PROBE = 0x6d, TYPE_CLOSE = 0x78;
+const S_DATA = 0x64, S_ACK = 0x61, S_PROBE = 0x6d, S_CLOSE = 0x78;
 /** The path's header in front of every packet. */
-export const PATH_HEADER = 9;
+const PATH_HEADER = 9;
 /** A DATA packet's bytes ahead of its chunk. */
 const DATA_HEADER = PATH_HEADER + 18;
 /** The size a path starts at: QUIC's floor, which every path is taken to carry. */
@@ -67,15 +66,13 @@ const MAX_SUSPECTS = 32;
  *  at most: a sender has one credit a round trip, so this is 84 MB/s at 100 ms. */
 const CREDIT = 1 << 20, MAX_CREDIT = 8 * CREDIT;
 /** What each buffered datagram is charged against the credit as a count, so the slices held
- *  for the reader are bounded whatever their size: a datagram costs this much host heap or so. */
+ *  for the reader are bounded whatever their size. */
 const MIN_CHUNK = 256;
-/** The receive and send buffers a platform asks for on a path's socket, one stream's. A
- *  sender may put a whole credit on the wire in a burst, and a kernel charges a datagram
- *  well past its payload, so a smaller buffer drops the burst's tail and every drop halves
- *  the sender's window. Windows' default is far below one credit. */
-export const SOCKET_BUFFER_BYTES = 4 * CREDIT;
-/** The most one read hands the driver, well under its `MAX_LINK_READ_BYTES`. */
+/** The most one read hands the link. */
 const MAX_READ = 256 * 1024;
+/** Written and not yet acked, past which a write fails the link, as the host fails a socket
+ *  whose backlog passes its cap (net-limits.ts `MAX_OUTBOUND_QUEUE_BYTES`). */
+const MAX_BUFFERED = 16 * 1024 * 1024;
 /** Received packet numbers are acked as at most this many ranges, the newest. */
 const MAX_RANGES = 32;
 /** What the probe timeout allows for a receiver holding its ack, which it does for a turn. */
@@ -93,172 +90,177 @@ const DEAD_MS = 10_000;
 /** How long a graceful close waits for what was written to be acked. */
 const LINGER_MS = 10_000;
 
-/** After the I/O the platform is in the middle of: Node's `setImmediate`, which runs once
- *  the socket's pending datagrams are read, and elsewhere a timer, which the native loop
- *  runs after the turn's socket deliveries. */
-const nextTurn: (f: () => void) => void = (globalThis as { setImmediate?: (f: () => void) => void }).setImmediate
-  ?? ((f) => setTimeout(f, 0));
+const SENT = Promise.resolve();
 
-/** A 48-bit big-endian field, written and read on the packet's own bytes, with no view
- *  allocated per packet. */
-function put48(p: Uint8Array, at: number, n: number): void {
+/** A 48-bit big-endian field, written and read on the packet's own bytes. */
+function put48(p, at, n) {
   const hi = Math.floor(n / 2 ** 32), lo = n >>> 0;
   p[at] = hi >>> 8; p[at + 1] = hi; p[at + 2] = lo >>> 24; p[at + 3] = lo >>> 16; p[at + 4] = lo >>> 8; p[at + 5] = lo;
 }
-const get48 = (p: Uint8Array, at: number) =>
-  ((p[at] << 8) | p[at + 1]) * 2 ** 32 + p[at + 2] * 2 ** 24 + ((p[at + 3] << 16) | (p[at + 4] << 8) | p[at + 5]);
+function get48(p, at) {
+  return ((p[at] << 8) | p[at + 1]) * 2 ** 32 + p[at + 2] * 2 ** 24 + ((p[at + 3] << 16) | (p[at + 4] << 8) | p[at + 5]);
+}
 /** Where a packet's body starts. */
 const B = PATH_HEADER;
 
 /** Whether an ACK's `count` ranges name packet `pn`. */
-function names(p: Uint8Array, count: number, pn: number): boolean {
+function names(p, count, pn) {
   for (let i = 0; i < count; i++) {
     if (pn <= get48(p, B + 9 + 12 * i) && pn >= get48(p, B + 15 + 12 * i)) return true;
   }
   return false;
 }
 
-/** Bytes in pieces, taken from the front: what was written and is not yet sent, and what
- *  arrived in order and is not yet read. */
-class Pieces {
-  /** A `Fifo`, not an array: draining a credit of tiny datagrams with `shift` would be
-   *  quadratic. */
-  private readonly list = new Fifo<Uint8Array>();
-  /** Where in the front piece the next byte is. */
-  private at = 0;
-  bytes = 0;
-  /** The datagrams held, each a slice the platform will not reuse. */
-  get slices(): number { return this.list.size; }
-
-  push(piece: Uint8Array): void {
-    this.list.push(piece);
-    this.bytes += piece.length;
-  }
-
-  /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
-   *  copy across pieces. */
-  take(n: number): Uint8Array {
-    this.bytes -= n;
-    if (this.at === 0 && this.list.peek()!.length === n) return this.list.shift()!;
-    let out: Uint8Array | undefined;
-    for (let got = 0; got < n;) {
-      const piece = this.list.peek()!, k = Math.min(piece.length - this.at, n - got);
-      if (k === n) out = piece.subarray(this.at, this.at + k);
-      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
-      got += k;
-      this.at += k;
-      if (this.at === piece.length) { this.list.shift(); this.at = 0; }
-    }
-    return out!;
-  }
-}
-
 /** A packet with `body` bytes behind the header, its type written. */
-function packet(type: number, body: number): Uint8Array {
+function packet(type, body) {
   const p = new Uint8Array(B + body);
   p[0] = type;
   return p;
 }
 
-/** A packet sent and not yet acked or lost. Every one carries a chunk. */
-interface Sent { offset: number; size: number; time: number }
+/** Bytes in pieces, taken from the front: what was written and is not yet sent, and what
+ *  arrived in order and is not yet read. A head index, not `shift`, which would go
+ *  quadratic over a credit of tiny datagrams; a consumed slot is cleared, so it frees. */
+class Pieces {
+  constructor() {
+    this.list = [];
+    this.head = 0;
+    this.at = 0; // where in the front piece the next byte is
+    this.bytes = 0;
+  }
 
-type Timer = ReturnType<typeof setTimeout>;
+  get slices() { return this.list.length - this.head; }
 
-export class UdpStream implements RawLink {
-  readonly stream = true;
-  private onMsg: ((bytes: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
-  /** The path, once it is chosen; until then nothing is sent. */
-  private out: ((packet: Uint8Array) => void) | null = null;
+  push(piece) {
+    this.list.push(piece);
+    this.bytes += piece.length;
+  }
 
-  // ── sending ──
-  private readonly unsent = new Pieces();
-  /** The stream offset past the last byte written, and past the last ever sent. */
-  private written = 0;
-  private nextOffset = 0;
-  /** Chunks sent and not acked, by offset. */
-  private readonly chunks = new Map<number, Uint8Array>();
-  /** Chunk offsets in the order first sent, all acked before `sentHead`: the oldest chunk
-   *  not acked, found without iterating the map, which QuickJS charges for per entry. */
-  private readonly sentOffsets: number[] = [];
-  private sentHead = 0;
-  /** Offsets of chunks to send again. */
-  private readonly lost = new Set<number>();
-  /** Packets in flight, by number, none of them below `oldestPn`. They are walked by
-   *  number, not iterated, for the same reason. */
-  private readonly inFlight = new Map<number, Sent>();
-  private oldestPn = 0;
-  private nextPn = 0;
-  private largestAcked = -1;
-  private bytesInFlight = 0;
-  private window = INITIAL_WINDOW;
-  private threshold = Infinity;
-  private recoveryStart = -Infinity;
-  /** The packets the current loss episode declared lost, up to `MAX_SUSPECTS`, and the window
-   *  it cut. Should every one of them be acked after all, they were late, not lost, and the
-   *  cut is undone. */
-  private readonly suspects: number[] = [];
-  private undo: { window: number; threshold: number } | null = null;
-  private windowLimited = false;
-  private peerCredit = CREDIT;
-  private srtt = INITIAL_RTT_MS;
-  private rttvar = INITIAL_RTT_MS / 2;
-  /** Infinity until the first round-trip sample. */
-  private minRtt = Infinity;
-  private latestRtt = 0;
-  private ptoCount = 0;
-  private lastSentData = 0;
-  private lossTime = Infinity;
-  private recoveryTimer: Timer | undefined;
-  private armedAt = Infinity;
-  /** The size a packet is on this path, and the probes for `MAX_PACKET` not yet answered. */
-  private packetBytes = BASE_PACKET;
-  private probes: number[] = [];
-  private probeTimer: Timer | undefined;
-  /** Dropped back to `BASE_PACKET`: probe again once the peer acks. */
-  private reprobe = false;
+  shift() {
+    this.list[this.head++] = null;
+    this.at = 0;
+    if (this.head >= 1024 && this.head * 2 >= this.list.length) {
+      this.list = this.list.slice(this.head);
+      this.head = 0;
+    }
+  }
 
-  // ── receiving ──
-  /** The offset the reader has been handed up to, and what follows it in order. */
-  private taken = 0;
-  private readonly held = new Pieces();
-  /** Chunks past a gap, by offset, and the packet bytes they came in. */
-  private readonly ahead = new Map<number, Uint8Array>();
-  private aheadBytes = 0;
-  /** The offset past the furthest byte received. */
-  private furthest = 0;
-  private readable = true;
-  private turnDue = false;
-  /** Packet numbers received, as `[largest, smallest]`, newest first. */
-  private ranges: [number, number][] = [];
-  private largestAt = 0;
-  private unacked = 0;
-  /** How far past `taken` this end takes the stream, and when its reader began this credit. */
-  private credit = CREDIT;
-  private creditAt = -Infinity;
-  private creditEnd = 0;
-  private advertised = CREDIT;
+  /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
+   *  copy across pieces. */
+  take(n) {
+    this.bytes -= n;
+    let out;
+    for (let got = 0; got < n;) {
+      const piece = this.list[this.head], k = Math.min(piece.length - this.at, n - got);
+      if (k === n) out = piece.subarray(this.at, this.at + k);
+      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
+      got += k;
+      this.at += k;
+      if (this.at === piece.length) this.shift();
+    }
+    return out;
+  }
+}
 
-  // ── life ──
-  private lastSent = 0;
-  private lastHeard = 0;
-  private liveTimer: Timer | undefined;
-  private lingerTimer: Timer | undefined;
-  private closing = false;
-  private gone = false;
-
+/** The stream, and the channel its link writes to (ake.js `Link`): `send` keeps the bytes
+ *  it is given. */
+class UdpStream {
   /** `onGone` runs once when the stream stops, however it does. */
-  constructor(private readonly onGone: () => void) {}
+  constructor(onGone) {
+    this.onGone = onGone;
+    /** The path, once it is chosen; until then nothing is sent. */
+    this.out = null;
+    /** The link reading the stream, and whether it is still decoding the last read. */
+    this.read = null;
+    this.reading = false;
+    this.readDone = () => { this.reading = false; this.deliver(); };
+
+    // ── sending ──
+    this.unsent = new Pieces();
+    /** The stream offset past the last byte written, and past the last ever sent. */
+    this.written = 0;
+    this.nextOffset = 0;
+    /** Chunks sent and not acked, by offset. */
+    this.chunks = new Map();
+    /** Chunk offsets in the order first sent, all acked before `sentHead`: the oldest chunk
+     *  not acked, found without iterating the map, which QuickJS charges for per entry. */
+    this.sentOffsets = [];
+    this.sentHead = 0;
+    /** Offsets of chunks to send again. */
+    this.lost = new Set();
+    /** Packets in flight, `{offset, size, time}` by number, none below `oldestPn`. They are
+     *  walked by number, not iterated, for the same reason. */
+    this.inFlight = new Map();
+    this.oldestPn = 0;
+    this.nextPn = 0;
+    this.largestAcked = -1;
+    this.bytesInFlight = 0;
+    this.window = INITIAL_WINDOW;
+    this.threshold = Infinity;
+    this.recoveryStart = -Infinity;
+    /** The packets the current loss episode declared lost, up to `MAX_SUSPECTS`, and the
+     *  window it cut. Should every one of them be acked after all, they were late, not
+     *  lost, and the cut is undone. */
+    this.suspects = [];
+    this.undo = null;
+    this.windowLimited = false;
+    this.peerCredit = CREDIT;
+    this.srtt = INITIAL_RTT_MS;
+    this.rttvar = INITIAL_RTT_MS / 2;
+    /** Infinity until the first round-trip sample. */
+    this.minRtt = Infinity;
+    this.latestRtt = 0;
+    this.ptoCount = 0;
+    this.lastSentData = 0;
+    this.lossTime = Infinity;
+    /** The size a packet is on this path, and the probes for `MAX_PACKET` not yet
+     *  answered. */
+    this.packetBytes = BASE_PACKET;
+    this.probes = [];
+    /** Dropped back to `BASE_PACKET`: probe again once the peer acks. */
+    this.reprobe = false;
+
+    // ── receiving ──
+    /** The offset the reader has been handed up to, and what follows it in order. */
+    this.taken = 0;
+    this.held = new Pieces();
+    /** Chunks past a gap, by offset, and the packet bytes they came in. */
+    this.ahead = new Map();
+    this.aheadBytes = 0;
+    /** The offset past the furthest byte received. */
+    this.furthest = 0;
+    this.turnDue = false;
+    /** Packet numbers received, as `[largest, smallest]`, newest first. */
+    this.ranges = [];
+    this.largestAt = 0;
+    this.unacked = 0;
+    /** How far past `taken` this end takes the stream, and when its reader began this
+     *  credit. */
+    this.credit = CREDIT;
+    this.creditAt = -Infinity;
+    this.creditEnd = 0;
+    this.advertised = CREDIT;
+
+    // ── life ──
+    this.lastSent = 0;
+    this.lastHeard = 0;
+    // When each timer is due, `Infinity` for none.
+    this.recoveryAt = Infinity;
+    this.probeAt = Infinity;
+    this.liveAt = Infinity;
+    this.lingerAt = Infinity;
+    this.closing = false;
+    this.gone = false;
+  }
 
   /** The path is chosen: start sending through `out`, with `rttMs` as the first
    *  round-trip sample if the path measured one. */
-  start(out: (packet: Uint8Array) => void, rttMs?: number): void {
+  start(out, rttMs) {
     if (this.gone || this.out) return;
     this.out = out;
     if (rttMs !== undefined) this.sample(rttMs, 0);
-    this.lastHeard = this.lastSent = performance.now();
-    this.liveTimer = setTimeout(() => this.tick(), KEEPALIVE_MS);
+    this.lastHeard = this.lastSent = now();
+    this.liveAt = dueIn(KEEPALIVE_MS);
     if (this.ranges.length > 0) this.sendAck();
     this.flush();
     this.startProbe();
@@ -267,11 +269,11 @@ export class UdpStream implements RawLink {
   /** The path moved to another address, `rttMs` away: what was learned of the old one no
    *  longer holds, so the window and the packet size start over, and a loss among what was
    *  sent before the move does not cut the new window. */
-  repath(rttMs: number): void {
+  repath(rttMs) {
     if (this.gone) return;
     this.window = INITIAL_WINDOW;
     this.threshold = Infinity;
-    this.recoveryStart = performance.now();
+    this.recoveryStart = now();
     this.undo = null;
     this.suspects.length = 0;
     this.minRtt = Infinity;
@@ -285,56 +287,74 @@ export class UdpStream implements RawLink {
   }
 
   /** One packet from the peer, header included. */
-  receive(p: Uint8Array): void {
+  receive(p) {
     if (this.gone) return;
-    this.lastHeard = performance.now();
+    this.lastHeard = now();
     const body = p.length - B;
-    if (p[0] === TYPE_DATA && body > 18) this.onChunk(get48(p, B), get48(p, B + 6), get48(p, B + 12), p.subarray(B + 18));
-    else if (p[0] === TYPE_ACK && body >= 9 && body >= 9 + 12 * p[B + 8]) this.onAck(p);
-    else if (p[0] === TYPE_PROBE && body >= 6) this.received(get48(p, B));
-    else if (p[0] === TYPE_CLOSE) this.fail();
+    if (p[0] === S_DATA && body > 18) this.onChunk(get48(p, B), get48(p, B + 6), get48(p, B + 12), p.subarray(B + 18));
+    else if (p[0] === S_ACK && body >= 9 && body >= 9 + 12 * p[B + 8]) this.onAck(p);
+    else if (p[0] === S_PROBE && body >= 6) this.received(get48(p, B));
+    else if (p[0] === S_CLOSE) this.fail();
   }
 
-  // ── RawLink ──
+  // ── the channel ──
 
-  send(bytes: Uint8Array): void {
+  send(bytes) {
     if (this.gone || this.closing) throw new Error("udp: link is closed");
-    if (bytes.length === 0) return;
-    this.unsent.push(bytes.slice());
+    if (this.buffered() + bytes.length > MAX_BUFFERED) throw new Error("udp: outbound limit exceeded");
+    if (bytes.length === 0) return SENT;
+    this.unsent.push(bytes);
     this.written += bytes.length;
     this.flush();
+    return SENT;
   }
-  onData(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; this.deliver(); }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  setReadable(enabled: boolean): void {
-    this.readable = enabled;
-    if (enabled) this.deliver();
+
+  /** The link that reads the stream: `read(bytes)` answers a promise of having decoded
+   *  them, and nothing more is handed over until it settles. */
+  reader(read) {
+    this.read = read;
+    this.deliver();
   }
+
   /** Written and not yet acked, which drains in send order. */
-  buffered(): number {
+  buffered() {
     const oldest = this.oldestChunk();
     return this.written - (oldest < 0 ? this.nextOffset : oldest);
   }
-  close(graceful = false): void {
-    if (this.gone || this.closing) return;
+
+  /** A graceful close waits for what was written to be acked, up to `LINGER_MS`. */
+  close(graceful) {
+    if (this.gone || this.closing) return true;
     if (graceful && this.out && this.buffered() > 0) {
       this.closing = true;
-      this.lingerTimer = setTimeout(() => this.finish(), LINGER_MS);
-      return;
+      this.lingerAt = dueIn(LINGER_MS);
+      return true;
     }
     this.finish();
+    return true;
   }
-  /** The negotiation link closed, or the peer stopped answering: tell it, in case it can
-   *  still hear, then stop and tell the driver. */
-  end(): void {
+
+  /** The negotiation ended, or the peer stopped answering: tell it, in case it can still
+   *  hear, then stop. */
+  end() {
     if (this.gone) return;
     this.sendClose();
     this.fail();
   }
 
+  /** One wake (core.js `onWake`): what is due, and when the next is. */
+  onWake(t) {
+    if (this.gone) return Infinity;
+    if (t >= this.lingerAt) { this.finish(); return Infinity; }
+    if (t >= this.liveAt) this.tick(t);
+    if (!this.gone && t >= this.recoveryAt) this.onRecovery(t);
+    if (!this.gone && t >= this.probeAt) this.sendProbe();
+    return this.gone ? Infinity : Math.min(this.recoveryAt, this.probeAt, this.liveAt, this.lingerAt);
+  }
+
   // ── receiving ──
 
-  private onChunk(pn: number, offset: number, floor: number, bytes: Uint8Array): void {
+  onChunk(pn, offset, floor, bytes) {
     // Past the credit this end gave: not taken and not acked, so it comes again.
     if (offset + bytes.length > this.taken + this.credit) return;
     this.received(pn);
@@ -344,7 +364,7 @@ export class UdpStream implements RawLink {
     this.furthest = Math.max(this.furthest, offset + bytes.length);
     let end = this.taken + this.held.bytes;
     if (offset === end) {
-      // Held as it came: a platform hands over datagrams it does not reuse (net-udp.ts).
+      // Held as it came: an event's datagrams are this realm's to keep.
       this.held.push(bytes);
       for (let next; (next = this.ahead.get(end = this.taken + this.held.bytes));) {
         this.ahead.delete(end);
@@ -362,51 +382,53 @@ export class UdpStream implements RawLink {
       this.aheadBytes += DATA_HEADER + bytes.length;
     }
     // Bound the datagrams held by their count as well as their bytes: a credit of one-byte
-    // chunks is a credit of slices, each costing far more than its byte in host heap.
+    // chunks is a credit of slices, each costing far more than its byte.
     if (this.aheadBytes > 2 * this.credit || this.held.slices + this.ahead.size > 2 * this.credit / MIN_CHUNK) this.fail();
   }
 
   /** Note `pn` as received, and see it acked. */
-  private received(pn: number): void {
+  received(pn) {
     const largest = this.ranges.length > 0 ? this.ranges[0][0] : -1;
     this.record(pn);
-    if (pn > largest) this.largestAt = performance.now();
+    if (pn > largest) this.largestAt = now();
     // Out of order, a gap or a repeat is acked at once, so the sender learns of it.
     if (pn !== largest + 1) this.sendAck();
     else this.unacked++;
-    // Everything else once a turn, not once a packet: every read is a call into the
-    // transport's realm, and every ack a datagram, and what arrives in one turn needs one
-    // of each.
+    // Everything else once a datagrams event, not once a packet (udp.js `turn`).
     if (!this.turnDue) {
       this.turnDue = true;
-      nextTurn(() => {
-        this.turnDue = false;
-        this.deliver();
-        if (this.unacked > 0) this.sendAck();
-      });
+      udp.turns.push(this);
     }
   }
 
-  /** Hand the reader what is in order, while it reads, and tell the sender once that has
-   *  freed half the credit. */
-  private deliver(): void {
-    while (this.readable && this.onMsg && this.held.bytes > 0 && !this.gone) {
+  /** The end of the datagrams event that brought packets: one read and one ack for all. */
+  turn() {
+    this.turnDue = false;
+    this.deliver();
+    if (this.unacked > 0) this.sendAck();
+  }
+
+  /** Hand the reader what is in order, once it has decoded the last, and tell the sender
+   *  once that has freed half the credit. */
+  deliver() {
+    while (!this.reading && this.read && this.held.bytes > 0 && !this.gone) {
       const bytes = this.held.take(Math.min(this.held.bytes, MAX_READ));
       this.taken += bytes.length;
-      this.onMsg(bytes);
+      this.reading = true;
+      this.read(bytes).then(this.readDone, this.readDone);
     }
     // A credit read in under two round trips held the sender back (quiche's autotune).
     if (this.taken >= this.creditEnd) {
-      const now = performance.now();
-      if (now - this.creditAt < 2 * this.srtt) this.credit = Math.min(2 * this.credit, MAX_CREDIT);
-      this.creditAt = now;
+      const t = now();
+      if (t - this.creditAt < 2 * this.srtt) this.credit = Math.min(2 * this.credit, MAX_CREDIT);
+      this.creditAt = t;
       this.creditEnd = this.taken + this.credit;
     }
     if (this.taken + this.credit - this.advertised >= this.credit / 2) this.sendAck();
   }
 
   /** Note a packet number as received, merging it into the ranges. */
-  private record(pn: number): void {
+  record(pn) {
     const r = this.ranges;
     let i = 0;
     while (i < r.length && r[i][1] > pn + 1) i++;
@@ -419,11 +441,11 @@ export class UdpStream implements RawLink {
     if (r.length > MAX_RANGES) r.length = MAX_RANGES;
   }
 
-  private sendAck(): void {
+  sendAck() {
     if (!this.out || this.gone) return;
     this.unacked = 0;
     const r = this.ranges;
-    const p = packet(TYPE_ACK, 9 + 12 * r.length);
+    const p = packet(S_ACK, 9 + 12 * r.length);
     const credit = this.taken + this.credit;
     // More credit for a sender that has used all it had, which may have nothing in flight to
     // draw another ack: one lost would leave it waiting for the keepalive, so it goes three
@@ -431,15 +453,15 @@ export class UdpStream implements RawLink {
     const copies = credit > this.advertised && this.furthest >= this.advertised ? 3 : 1;
     this.advertised = credit;
     put48(p, B, credit);
-    const delay = Math.min(0xffff, Math.round(performance.now() - this.largestAt));
+    const delay = Math.min(0xffff, Math.round(now() - this.largestAt));
     p[B + 6] = delay >>> 8; p[B + 7] = delay; p[B + 8] = r.length;
-    r.forEach(([hi, lo], i) => { put48(p, B + 9 + 12 * i, hi); put48(p, B + 15 + 12 * i, lo); });
+    for (let i = 0; i < r.length; i++) { put48(p, B + 9 + 12 * i, r[i][0]); put48(p, B + 15 + 12 * i, r[i][1]); }
     for (let i = 0; i < copies; i++) this.emit(p);
   }
 
   // ── sending ──
 
-  private onAck(p: Uint8Array): void {
+  onAck(p) {
     this.peerCredit = Math.max(this.peerCredit, get48(p, B));
     const count = p[B + 8];
     if (count > 0) {
@@ -448,7 +470,7 @@ export class UdpStream implements RawLink {
       // is bounded by the packets sent, not by the range count.
       const sent = this.nextPn - 1;
       const largest = Math.min(get48(p, B + 9), sent);
-      let newest: Sent | undefined;
+      let newest;
       let below = Infinity;
       for (let i = 0; i < count; i++) {
         const hi = Math.min(get48(p, B + 9 + 12 * i), sent, below);
@@ -481,9 +503,9 @@ export class UdpStream implements RawLink {
       }
       this.largestAcked = Math.max(this.largestAcked, largest);
       this.advanceOldest();
-      const now = performance.now();
-      if (newest) this.sample(now - newest.time, (p[B + 6] << 8) | p[B + 7]);
-      this.detectLoss(now);
+      const t = now();
+      if (newest) this.sample(t - newest.time, (p[B + 6] << 8) | p[B + 7]);
+      this.detectLoss(t);
       // The peer acks again after a drop back: see whether the path still carries more.
       if (this.reprobe && this.ptoCount === 0) { this.reprobe = false; this.startProbe(); }
     }
@@ -491,7 +513,7 @@ export class UdpStream implements RawLink {
     this.flush();
   }
 
-  private sample(latest: number, delay: number): void {
+  sample(latest, delay) {
     this.latestRtt = latest;
     if (this.minRtt === Infinity) {
       this.minRtt = this.srtt = latest;
@@ -505,18 +527,18 @@ export class UdpStream implements RawLink {
   }
 
   /** Declare lost what an ack has passed, and arm the loss timer for what it nearly has. */
-  private detectLoss(now: number): void {
+  detectLoss(t) {
     this.lossTime = Infinity;
     const delay = Math.max(9 / 8 * Math.max(this.latestRtt, this.srtt), 1);
     const persistence = PERSISTENT_PTOS * this.pto();
     let lostSentAt = -Infinity, runFrom = Infinity, persistent = false;
-    const lost: number[] = [];
+    const lost = [];
     this.advanceOldest();
     for (let pn = this.oldestPn; pn < this.largestAcked; pn++) {
       const s = this.inFlight.get(pn);
       // A run of losses goes unbroken by number: a packet acked, or not in flight, ends it.
       if (!s) { runFrom = Infinity; continue; }
-      if (this.largestAcked - pn >= 3 || s.time <= now - delay) {
+      if (this.largestAcked - pn >= 3 || s.time <= t - delay) {
         this.inFlight.delete(pn);
         this.bytesInFlight -= s.size;
         if (this.chunks.has(s.offset)) this.lost.add(s.offset);
@@ -533,7 +555,7 @@ export class UdpStream implements RawLink {
     }
     // One cut per episode: losses among packets sent before it began are the same one.
     if (lostSentAt > this.recoveryStart) {
-      this.recoveryStart = now;
+      this.recoveryStart = t;
       this.undo = { window: this.window, threshold: this.threshold };
       this.suspects.length = 0;
       this.window = this.threshold = Math.max(this.window * (1 - 1 / (2 * FLOWS)), MIN_WINDOW);
@@ -552,12 +574,12 @@ export class UdpStream implements RawLink {
     this.advanceOldest();
   }
 
-  private advanceOldest(): void {
+  advanceOldest() {
     while (this.oldestPn < this.nextPn && !this.inFlight.has(this.oldestPn)) this.oldestPn++;
   }
 
   /** The offset of the oldest chunk not acked, or -1. */
-  private oldestChunk(): number {
+  oldestChunk() {
     const o = this.sentOffsets;
     while (this.sentHead < o.length && !this.chunks.has(o[this.sentHead])) this.sentHead++;
     if (this.sentHead > 1024 && this.sentHead * 2 > o.length) { o.splice(0, this.sentHead); this.sentHead = 0; }
@@ -565,106 +587,104 @@ export class UdpStream implements RawLink {
   }
 
   /** Send what the window allows, and `probes` packets past it. */
-  private flush(probes = 0): void {
+  flush(probes = 0) {
     if (!this.out || this.gone) return;
     for (;;) {
       if (probes === 0 && this.bytesInFlight + this.packetBytes > this.window) {
         this.windowLimited = this.lost.size > 0 || (this.unsent.bytes > 0 && this.nextOffset < this.peerCredit);
         break;
       }
-      const next = this.nextChunk(probes > 0);
-      if (!next) { this.windowLimited = false; break; }
+      const offset = this.nextChunk(probes > 0);
+      if (offset < 0) { this.windowLimited = false; break; }
       if (probes > 0) probes--;
-      this.sendChunk(next[0], next[1]);
+      this.sendChunk(offset, this.chunks.get(offset));
     }
     this.arm();
   }
 
-  /** A lost chunk first, then new bytes the peer has room for; for a probe with neither,
-   *  the oldest chunk not acked. */
-  private nextChunk(probe: boolean): [number, Uint8Array] | null {
+  /** The offset of what to send next, a lost chunk first, then new bytes the peer has room
+   *  for, and for a probe with neither, the oldest chunk not acked; -1 for nothing. */
+  nextChunk(probe) {
     if (this.lost.size > 0) {
       for (const offset of this.lost) {
         this.lost.delete(offset);
         const chunk = this.chunks.get(offset);
-        if (chunk) return [offset, this.fit(offset, chunk)];
+        if (chunk) { this.fit(offset, chunk); return offset; }
       }
     }
     const n = Math.min(this.unsent.bytes, this.packetBytes - DATA_HEADER, this.peerCredit - this.nextOffset);
     if (n > 0) {
-      const chunk = this.unsent.take(n);
       const offset = this.nextOffset;
+      this.chunks.set(offset, this.unsent.take(n));
       this.nextOffset += n;
-      this.chunks.set(offset, chunk);
       this.sentOffsets.push(offset);
-      return [offset, chunk];
+      return offset;
     }
     const oldest = probe ? this.oldestChunk() : -1;
-    return oldest < 0 ? null : [oldest, this.fit(oldest, this.chunks.get(oldest)!)];
+    if (oldest >= 0) this.fit(oldest, this.chunks.get(oldest));
+    return oldest;
   }
 
-  /** The chunk at `offset`, cut to what a packet now carries. One cut when packets were
+  /** Cut the chunk at `offset` to what a packet now carries. One cut when packets were
    *  larger is split, and the rest becomes a chunk of its own, sent again behind what is
    *  already lost. The receiver may then have the bytes twice, whole and in pieces, which it
    *  takes either way. */
-  private fit(offset: number, chunk: Uint8Array): Uint8Array {
+  fit(offset, chunk) {
     const max = this.packetBytes - DATA_HEADER;
-    if (chunk.length <= max) return chunk;
-    const head = chunk.subarray(0, max), rest = offset + max;
-    this.chunks.set(offset, head);
+    if (chunk.length <= max) return;
+    const rest = offset + max;
+    this.chunks.set(offset, chunk.subarray(0, max));
     this.chunks.set(rest, chunk.subarray(max));
     this.sentOffsets.splice(this.sentOffsets.indexOf(offset, this.sentHead) + 1, 0, rest);
     this.lost.add(rest);
-    return head;
   }
 
-  private sendChunk(offset: number, chunk: Uint8Array): void {
+  sendChunk(offset, chunk) {
     const pn = this.nextPn++;
-    const p = packet(TYPE_DATA, 18 + chunk.length);
+    const p = packet(S_DATA, 18 + chunk.length);
     put48(p, B, pn);
     put48(p, B + 6, offset);
     // What the peer's acks must still name: a packet in flight, and a probe not answered. A
     // suspect arriving late is out of order, so it is acked at once, below the floor or not.
     put48(p, B + 12, Math.min(this.oldestPn, this.probes[0] ?? Infinity));
     p.set(chunk, B + 18);
-    const now = performance.now();
-    this.inFlight.set(pn, { offset, size: p.length, time: now });
+    const t = now();
+    this.inFlight.set(pn, { offset, size: p.length, time: t });
     this.bytesInFlight += p.length;
-    this.lastSentData = now;
+    this.lastSentData = t;
     this.emit(p);
   }
 
-  private pto(): number {
+  pto() {
     return this.srtt + Math.max(4 * this.rttvar, 1) + ACK_DELAY_MS;
   }
 
   /** When recovery is next due: the loss timer if one is set, else the probe timeout,
    *  doubled for each in a row. */
-  private recoveryDue(): number {
+  recoveryDue() {
     return this.lossTime < Infinity ? this.lossTime : this.lastSentData + this.pto() * 2 ** this.ptoCount;
   }
 
-  /** Arm for `recoveryDue`. A timer armed for no later is kept, and re-arms when it fires
-   *  early, so the timer moves when recovery comes sooner, not with every send. */
-  private arm(): void {
+  /** Be woken by `recoveryDue`. A wake due no later is kept, and looks again when it comes
+   *  early, so the wake moves when recovery comes sooner, not with every send. */
+  arm() {
     if (this.gone || this.inFlight.size === 0) return;
     const at = this.recoveryDue();
-    if (this.recoveryTimer !== undefined && this.armedAt <= at) return;
-    clearTimeout(this.recoveryTimer);
-    this.armedAt = at;
-    this.recoveryTimer = setTimeout(this.onRecoveryTimer, Math.max(0, at - performance.now()));
+    if (at >= this.recoveryAt) return;
+    this.recoveryAt = at;
+    wakeBy(at);
   }
 
-  private readonly onRecoveryTimer = (): void => {
-    this.recoveryTimer = undefined;
-    if (this.gone || this.inFlight.size === 0) return;
-    if (performance.now() < this.recoveryDue()) { this.arm(); return; }
+  onRecovery(t) {
+    this.recoveryAt = Infinity;
+    if (this.inFlight.size === 0) return;
+    if (t < this.recoveryDue()) { this.arm(); return; }
     if (this.lossTime < Infinity) {
-      this.detectLoss(performance.now());
+      this.detectLoss(t);
       this.flush();
       return;
     }
-    if (this.ptoCount >= MAX_PTOS && performance.now() - this.lastHeard > DEAD_MS) { this.end(); return; }
+    if (this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS) { this.end(); return; }
     // A second timeout in a row: the path may have stopped carrying the larger packets.
     if (this.ptoCount >= 1 && this.packetBytes > BASE_PACKET) {
       this.packetBytes = BASE_PACKET;
@@ -672,85 +692,71 @@ export class UdpStream implements RawLink {
     }
     this.ptoCount++;
     this.flush(2);
-  };
+  }
 
   // ── the packet size ──
 
   /** Probe the path for `MAX_PACKET`, up to `MAX_PROBES` times. */
-  private startProbe(): void {
-    clearTimeout(this.probeTimer);
+  startProbe() {
     this.probes = [];
     this.sendProbe();
   }
 
-  private readonly sendProbe = (): void => {
-    this.probeTimer = undefined;
+  sendProbe() {
+    this.probeAt = Infinity;
     if (this.gone || !this.out) return;
     if (this.probes.length >= MAX_PROBES) { this.probes = []; return; }
     const pn = this.nextPn++;
-    const p = packet(TYPE_PROBE, MAX_PACKET - B);
+    const p = packet(S_PROBE, MAX_PACKET - B);
     put48(p, B, pn);
     this.probes.push(pn);
     this.emit(p);
-    this.probeTimer = setTimeout(this.sendProbe, this.pto());
-  };
+    this.probeAt = dueIn(this.pto());
+  }
 
   /** Whether an ack names a probe: then the path carries `MAX_PACKET`. */
-  private probeAcked(p: Uint8Array, count: number): void {
+  probeAcked(p, count) {
     if (!this.probes.some((pn) => names(p, count, pn))) return;
-    clearTimeout(this.probeTimer);
-    this.probeTimer = undefined;
+    this.probeAt = Infinity;
     this.probes = [];
     this.packetBytes = MAX_PACKET;
   }
 
-  private emit(p: Uint8Array): void {
-    this.lastSent = performance.now();
-    this.out!(p);
+  emit(p) {
+    this.lastSent = now();
+    this.out(p);
   }
 
   // ── life ──
 
-  /** Every `KEEPALIVE_MS`, re-armed rather than an interval, since a platform need only
-   *  have `setTimeout`. */
-  private tick(): void {
-    const now = performance.now();
-    if (now - this.lastHeard > SILENT_MS) { this.fail(); return; }
-    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && now - this.lastHeard > DEAD_MS) { this.end(); return; }
-    if (now - this.lastSent >= KEEPALIVE_MS) this.sendAck();
-    this.liveTimer = setTimeout(() => this.tick(), KEEPALIVE_MS);
+  /** Every `KEEPALIVE_MS`. */
+  tick(t) {
+    if (t - this.lastHeard > SILENT_MS) { this.fail(); return; }
+    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS) { this.end(); return; }
+    if (t - this.lastSent >= KEEPALIVE_MS) this.sendAck();
+    this.liveAt = dueIn(KEEPALIVE_MS);
   }
 
   /** Tell the peer, then stop. */
-  private finish(): void {
+  finish() {
     if (this.gone) return;
     this.sendClose();
-    this.stop();
+    this.fail();
   }
 
   /** Nothing acks a CLOSE, and one lost would leave the peer waiting out `SILENT_MS`, so it
    *  goes three times. */
-  private sendClose(): void {
+  sendClose() {
     if (!this.out) return;
     for (let i = 0; i < 3; i++) {
-      this.emit(packet(TYPE_CLOSE, 0));
+      this.emit(packet(S_CLOSE, 0));
     }
   }
 
-  /** The peer closed or went silent: stop, and tell the driver. */
-  private fail(): void {
+  /** What the stream holds goes with it. */
+  fail() {
     if (this.gone) return;
-    this.stop();
-    this.onCls?.();
-  }
-
-  /** What the stream holds goes with it, once the driver and the negotiation let go. */
-  private stop(): void {
     this.gone = true;
-    clearTimeout(this.recoveryTimer);
-    clearTimeout(this.lingerTimer);
-    clearTimeout(this.liveTimer);
-    clearTimeout(this.probeTimer);
     this.onGone();
   }
 }

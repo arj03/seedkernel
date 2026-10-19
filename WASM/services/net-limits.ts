@@ -32,6 +32,19 @@ export const DEFAULT_MAX_RAW_LINKS = 4096;
  *  FIN. */
 export const TCP_KEEPALIVE_MS = 30_000;
 
+/** Datagram sockets the link occupant holds at once (transport-host.ts). A hard NAT's
+ *  birthday punch opens hundreds (§12.7); the transport bounds its own below this. */
+export const MAX_UDP_SOCKETS = 2048;
+
+/** Datagram bytes held for the link occupant while it reads earlier ones, for every socket
+ *  together. Past it a datagram is dropped, as a full socket buffer drops one. */
+export const MAX_UDP_HELD_BYTES = 8 * MAX_LINK_READ_BYTES;
+
+/** The kernel receive and send buffers asked for on each datagram socket: a peer may put a
+ *  whole stream credit on the wire in a burst, and a kernel charges a datagram well past
+ *  its payload, so a smaller buffer drops the burst's tail. Windows' default is far below. */
+export const UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
+
 /** How long a TCP socket may stay silent before its first byte (host/platform.ts
  *  `tcpChannels`): the slowloris bound, which costs an attacker a SYN and this side a
  *  socket and its reader until it fires. */

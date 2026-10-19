@@ -1,10 +1,10 @@
-// The UDP socket primitive exposed to QuickJS as `__udp`, the raw datagrams of the UDP
-// path (services/udp/net-udp.ts `RawDatagrams`, which `datagramsOver` shapes). A socket is
+// The UDP socket primitive exposed to QuickJS as `__udp`: the platform's raw datagrams
+// (services/datagrams.ts `RawDatagrams`), which the host lends the transport. A socket is
 // on a port the OS picks, dual-stack where the machine has IPv6. Its reader goroutine holds
 // what it reads until the loop takes it, and the loop hands each batch to the callback the
 // socket was bound with in one call, as `[n u8][ip n][port u16][len u16][bytes]` per
-// datagram, n 4 for IPv4 and 16 for IPv6: the stream (stream.ts) reads and acks once a
-// turn, so a crossing per turn is all it needs.
+// datagram, n 4 for IPv4 and 16 for IPv6: the transport's stream (stream.js) reads and
+// acks once a turn, so a crossing per turn is all it needs.
 package main
 
 import (
@@ -102,7 +102,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		}
 		return nil, nil
 	}))
-	// Every address; which are candidates is the shared seam's (datagramsOver).
+	// Every address; which are candidates is the transport's (udp.js).
 	o.SetPropertyStr("addresses", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		addrs, _ := net.InterfaceAddrs()
 		ips := make([]string, 0, len(addrs))
