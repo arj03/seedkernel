@@ -1,8 +1,9 @@
-// The loader's host slots (§12.9): which host blob a node boots, and the trial that commits
-// a staged one or drops it. One implementation for both loaders: the Node loader imports
-// it, and the native binary runs it as build/loader.js in a QuickJS realm of its own. It
-// never runs in the host's realm, so a broken host cannot break its own rollback, and it
-// only ever comes from what the loader was built with, never from a staged blob.
+// The loader's decisions (§12.9): the host's arguments, which host blob each boot runs, and
+// the trial that commits a staged one or drops it. One implementation for both loaders: the
+// Node loader imports it, and the native binary runs it as build/loader.js in a QuickJS
+// realm of its own. Each loader keeps only the booting and the clock. It never runs in the
+// host's realm, so a broken host cannot break its own rollback, and it only ever comes from
+// what the loader was built with, never from a staged blob.
 //
 //   - a floor, the committed host's version: nothing at or below it is booted;
 //   - a staged blob is tried once: marked tried before it boots, so a crash is not retried;
@@ -68,7 +69,7 @@ export function withoutOp(args: string[]): string[] {
 }
 
 /** The host's --dir, which the slots sit beside, or the CLI's default (cli.ts DEFAULT_DIR). */
-export function dataDirOf(args: string[]): string {
+function dataDirOf(args: string[]): string {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dir" && i + 1 < args.length) return args[i + 1];
     if (args[i].startsWith("--dir=")) return args[i].slice("--dir=".length);
@@ -79,24 +80,43 @@ export function dataDirOf(args: string[]): string {
 /** No host blob is larger than this. */
 const MAX_BLOB_BYTES = 64 << 20;
 
+const u8 = (b: ArrayBuffer | Uint8Array): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
+
 interface Slot { env: Uint8Array; version: number }
 
-export class HostSlots {
-  private readonly dir: string;
-  private readonly genesis: number;
+export class Loader {
+  /** What the host sees: the command line less the loader's flags, and less `--op` once a
+   *  host has run (`ended`). */
+  hostArgs: string[];
   /** How long a pending host serves before it is committed. */
   readonly windowMs: number;
+  /** `--host`'s blob, which every boot runs instead of the slots' choice. */
+  private readonly fixed: Uint8Array | null = null;
+  private readonly mode: string;
+  private readonly dir: string;
+  private readonly genesis: number;
   private trying = false;
   /** Counts boots, so a health timer from an earlier boot commits nothing. */
   private gen = 0;
 
-  /** `healthMs` is SEEDKERNEL_HOST_HEALTH_MS, which shortens the window for tests. */
-  constructor(private readonly files: SlotFiles, dataDir: string, private readonly mode: string,
-    genesis: Uint8Array, healthMs: string | undefined, private readonly log: (line: string) => void) {
-    if (!["off", "next", "now"].includes(mode)) throw new Error(`--host-updates must be off, next or now (got "${mode}")`);
+  /** `healthMs` is SEEDKERNEL_HOST_HEALTH_MS, which shortens the window for tests; `after`
+   *  is the loader's clock, which runs the window. */
+  constructor(private readonly files: SlotFiles, argv: string[], genesis: Uint8Array, healthMs: string | undefined,
+    private readonly log: (line: string) => void, private readonly after: (ms: number, fn: () => void) => void) {
+    const flags = loaderFlags(argv);
+    this.hostArgs = flags.rest;
+    this.mode = flags.updates;
+    if (!["off", "next", "now"].includes(this.mode)) throw new Error(`--host-updates must be off, next or now (got "${this.mode}")`);
     this.windowMs = healthMs ? Number(healthMs) : 30_000;
     if (!(this.windowMs >= 0)) throw new Error(`SEEDKERNEL_HOST_HEALTH_MS: not a number of ms (got "${healthMs}")`);
-    this.dir = dataDir.replace(/[/\\]+$/, "") + ".host";
+    if (flags.hostFile !== undefined) {
+      const raw = files.read(flags.hostFile, MAX_BLOB_BYTES);
+      if (raw === null) throw new Error(`--host: cannot read ${flags.hostFile}`);
+      this.fixed = u8(raw);
+      // Its slots are never consulted, so there is nowhere to stage a successor.
+      this.mode = "off";
+    }
+    this.dir = dataDirOf(this.hostArgs).replace(/[/\\]+$/, "") + ".host";
     this.genesis = readHostBlob(genesis).manifest.version;
   }
 
@@ -106,7 +126,7 @@ export class HostSlots {
   private load(name: string): Slot | null {
     const raw = this.files.read(this.path(name), MAX_BLOB_BYTES);
     if (raw === null) return null;
-    const env = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    const env = u8(raw);
     try {
       const { manifest } = readHostBlob(env);
       if (manifest.abi === PLATFORM_ABI) return { env, version: manifest.version };
@@ -135,6 +155,7 @@ export class HostSlots {
    *  once: the mark is written before it boots, so finding the mark means it never got as
    *  far as committing. */
   choose(): Uint8Array | null {
+    if (this.fixed) return this.fixed;
     this.gen++;
     this.trying = false;
     const base = this.base();
@@ -167,28 +188,30 @@ export class HostSlots {
     return true;
   }
 
-  /** How the booted host's operator flow ended. A pending host that serves is committed
-   *  once it has served for the window: the answer is the boot to pass to `commit` then.
-   *  One that only ran an op and exited proved nothing either way, so it is left pending,
-   *  untried, for the next start. */
-  started(serving: boolean): number | null {
-    if (!this.trying) return null;
+  /** How the booted host's operator flow ended. A host booted after it, in the same
+   *  process, does not repeat its one-shot `--op`. A pending host that serves is committed
+   *  once it has served for the window. One that only ran an op and exited proved nothing
+   *  either way, so it is left pending, untried, for the next start. */
+  ended(serving: boolean): void {
+    this.hostArgs = withoutOp(this.hostArgs);
+    if (!this.trying) return;
     if (!serving) {
       this.files.remove(this.path("tried"));
       this.trying = false;
-      return null;
+      return;
     }
-    return this.gen;
+    const gen = this.gen;
+    this.after(this.windowMs, () => this.commit(gen));
   }
 
   /** Make the pending host the committed one, which raises the floor to it. A crash between
    *  the write and the removal leaves pending at the floor, which the next start drops. */
-  commit(gen: number): void {
+  private commit(gen: number): void {
     if (!this.trying || this.gen !== gen) return;
     const p = this.files.read(this.path("pending.skb"), MAX_BLOB_BYTES);
     if (p === null) return;
     try {
-      this.files.write(this.path("committed.skb"), p instanceof Uint8Array ? p : new Uint8Array(p));
+      this.files.write(this.path("committed.skb"), u8(p));
     } catch (err) {
       this.log(`cannot commit the pending host: ${err instanceof Error ? err.message : String(err)}`);
       return;

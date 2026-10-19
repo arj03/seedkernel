@@ -82,15 +82,12 @@ func TestGenesisHostReads(t *testing.T) {
 func testLoader(t *testing.T) (*loader, string) {
 	t.Helper()
 	bootRealm(t)
-	l, err := newLoader(host.qjs)
+	data := filepath.Join(t.TempDir(), "data")
+	l, err := newLoader(host.qjs, []string{"--dir", data, "--host-updates", "next"}, genesisHost)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(l.rt.Close)
-	data := filepath.Join(t.TempDir(), "data")
-	if err := l.open([]string{"--dir", data}, "next", genesisHost); err != nil {
-		t.Fatal(err)
-	}
 	return l, data + ".host"
 }
 
@@ -142,6 +139,19 @@ func TestHostBlobIsNotAnApp(t *testing.T) {
 // either spelling. The rules are the shared script's; this checks this binary runs it.
 func TestLoaderFlags(t *testing.T) {
 	l, _ := testLoader(t)
+	// call runs fn over argv as JSON, and reads its answer back into out.
+	call := func(fn string, argv []string, out any) error {
+		j, _ := json.Marshal(argv)
+		s, _, err := l.call(`JSON.stringify(`+fn+`(JSON.parse(__a0)))`, string(j))
+		if err == nil {
+			err = json.Unmarshal([]byte(s), out)
+		}
+		return err
+	}
+	type loaderOptions struct {
+		Rest              []string
+		HostFile, Updates string
+	}
 	for _, tc := range []struct {
 		argv     []string
 		rest     []string
@@ -154,15 +164,16 @@ func TestLoaderFlags(t *testing.T) {
 		{[]string{"--host-updates=next", "--hostile", "x"}, []string{"--hostile", "x"}, "", "next"},
 		{[]string{}, []string{}, "", "off"},
 	} {
-		o, err := l.flags(tc.argv)
-		if err != nil || !reflect.DeepEqual(o.Rest, tc.rest) || o.HostFile != tc.hostFile || o.Updates != tc.updates {
+		var o loaderOptions
+		if err := call("loaderFlags", tc.argv, &o); err != nil || !reflect.DeepEqual(o.Rest, tc.rest) || o.HostFile != tc.hostFile || o.Updates != tc.updates {
 			t.Fatalf("loaderFlags(%q) = %+v, %v", tc.argv, o, err)
 		}
 	}
-	if _, err := l.flags([]string{"--host"}); err == nil {
+	if err := call("loaderFlags", []string{"--host"}, &loaderOptions{}); err == nil {
 		t.Fatal("--host with no value was accepted")
 	}
-	if rest, err := l.withoutOp([]string{"--op", "x", "--dir", "d", "--op=y"}); err != nil || !reflect.DeepEqual(rest, []string{"--dir", "d"}) {
+	var rest []string
+	if err := call("withoutOp", []string{"--op", "x", "--dir", "d", "--op=y"}, &rest); err != nil || !reflect.DeepEqual(rest, []string{"--dir", "d"}) {
 		t.Fatalf("withoutOp: %q, %v", rest, err)
 	}
 }

@@ -51,24 +51,13 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		maxLive := int(args[0].Int64())
-		grace := time.Duration(args[1].Int64()) * time.Millisecond
-		maxInboundBytes := int(args[2].Int64())
-		maxInboundSlices := int(args[3].Int64())
-		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
-			return nil, errors.New("net: invalid socket limits")
-		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.maxLiveChannels != 0 || n.closeGrace != 0 ||
-			n.maxInboundReadBytes != 0 || n.maxInboundReadSlices != 0 {
-			return nil, errors.New("net: socket limits already installed")
-		}
-		n.maxLiveChannels = maxLive
-		n.closeGrace = grace
-		n.maxInboundReadBytes = maxInboundBytes
-		n.maxInboundReadSlices = maxInboundSlices
-		return qc.NewUndefined(), nil
+		n.maxLiveChannels = int(args[0].Int64())
+		n.closeGrace = time.Duration(args[1].Int64()) * time.Millisecond
+		n.maxInboundReadBytes = int(args[2].Int64())
+		n.maxInboundReadSlices = int(args[3].Int64())
+		return nil, nil
 	}))
 
 	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {

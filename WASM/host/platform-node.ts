@@ -147,11 +147,7 @@ export function nodePlatform(o: NodePlatformOptions): Platform & { teardown(): v
   }
 
   const net: PlatformNet = {
-    install(maxLive, graceMs, maxInboundBytes, maxInboundSlices) {
-      if (limits) throw new Error("net: socket limits already installed");
-      if (!(maxLive > 0 && graceMs > 0 && maxInboundBytes > 0 && maxInboundSlices > 0)) {
-        throw new Error("net: invalid socket limits");
-      }
+    install(maxLive, graceMs) {
       // Reads arrive on this thread one at a time, so nothing is ever staged and the
       // inbound limits hold by construction.
       limits = { maxLive, graceMs };
