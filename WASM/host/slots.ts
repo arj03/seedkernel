@@ -1,9 +1,9 @@
 // The loader's decisions (§12.9): the host's arguments, which host blob each boot runs, and
 // the trial that commits a staged one or drops it. One implementation for both loaders: the
-// Node loader imports it, and the native binary runs it as build/loader.js in a QuickJS
-// realm of its own. Each loader keeps only the booting and the clock. It never runs in the
-// host's realm, so a broken host cannot break its own rollback, and it only ever comes from
-// what the loader was built with, never from a staged blob.
+// Node loader imports it, into the realm it runs the host in, and the native binary runs it
+// as build/loader.js in a QuickJS realm of its own, never the host's, so there a broken host
+// cannot break its own rollback. Each loader keeps only the booting and the clock. It only
+// ever comes from what the loader was built with, never from a staged blob.
 //
 //   - a floor, the committed host's version: nothing at or below it is booted;
 //   - a staged blob is tried once: marked tried before it boots, so a crash is not retried;
@@ -95,7 +95,8 @@ export class Loader {
   private readonly mode: string;
   private readonly dir: string;
   private readonly genesis: number;
-  private trying = false;
+  /** The pending host on trial, which its health window commits. */
+  private trial: Slot | null = null;
   /** Set once the booted host's operator flow has ended with the node serving. */
   private serving = false;
   /** A host staged under "now" while the operator flow ran, booted once it ends. */
@@ -151,7 +152,7 @@ export class Loader {
   private discard(reason: string) {
     this.files.remove(this.path("pending.skb"));
     this.files.remove(this.path("tried"));
-    this.trying = false;
+    this.trial = null;
     this.log(`discarded the pending host: ${reason}`);
   }
 
@@ -162,7 +163,7 @@ export class Loader {
     this.serving = false;
     if (this.fixed) return this.fixed;
     this.gen++;
-    this.trying = false;
+    this.trial = null;
     const base = this.base();
     if (this.files.size(this.path("pending.skb")) < 0) return base.env;
     if (this.files.size(this.path("tried")) >= 0) {
@@ -180,7 +181,7 @@ export class Loader {
       this.log(`cannot mark v${p.version} tried, so it is not run: ${err instanceof Error ? err.message : String(err)}`);
       return base.env;
     }
-    this.trying = true;
+    this.trial = p;
     this.log(`trying v${p.version} (committed is v${base.version})`);
     return p.env;
   }
@@ -188,7 +189,7 @@ export class Loader {
   /** Whether a failure is a pending host's, which is then dropped: the caller boots the
    *  committed host instead of giving up. */
   failed(reason: string): boolean {
-    if (!this.trying) return false;
+    if (!this.trial) return false;
     this.discard(reason);
     return true;
   }
@@ -203,31 +204,33 @@ export class Loader {
     const again = serving && this.bootAfterFlow;
     this.bootAfterFlow = false;
     this.serving = serving && !again;
-    if (this.trying && !serving) {
+    if (this.trial && !serving) {
       this.files.remove(this.path("tried"));
-      this.trying = false;
-    } else if (this.trying && !again) {
+      this.trial = null;
+    } else if (this.trial && !again) {
       const gen = this.gen;
       this.after(this.windowMs, () => this.commit(gen));
     }
     return again;
   }
 
-  /** Make the pending host the committed one, which raises the floor to it. A crash between
-   *  the write and the removal leaves pending at the floor, which the next start drops. */
+  /** Make the host on trial the committed one, which raises the floor to it. One it staged
+   *  meanwhile stays pending, for a trial of its own. A crash between the write and the
+   *  removal leaves pending at the floor, which the next start drops. */
   private commit(gen: number): void {
-    if (!this.trying || this.gen !== gen) return;
-    const p = this.files.read(this.path("pending.skb"), MAX_BLOB_BYTES);
-    if (p === null) return;
+    const trial = this.trial;
+    if (!trial || this.gen !== gen) return;
     try {
-      this.files.write(this.path("committed.skb"), u8(p));
+      this.files.write(this.path("committed.skb"), trial.env);
     } catch (err) {
       this.log(`cannot commit the pending host: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    this.files.remove(this.path("pending.skb"));
-    this.files.remove(this.path("tried"));
-    this.trying = false;
+    if (this.load("pending.skb")?.version === trial.version) {
+      this.files.remove(this.path("pending.skb"));
+      this.files.remove(this.path("tried"));
+    }
+    this.trial = null;
     this.log(`committed after ${this.windowMs}ms`);
   }
 

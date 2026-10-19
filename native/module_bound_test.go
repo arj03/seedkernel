@@ -85,7 +85,7 @@ func wedgeWasmBytes() []byte {
 //	  (start $init))
 //
 // A call-time deadline cannot reach this wedge, since the module never becomes callable,
-// so it checks that the bound also covers instantiation (module.go bind).
+// so it checks that the bound also covers instantiation (engine.go newEngineInstance).
 func wedgeStartWasmBytes() []byte {
 	typ := sec(1, 2,
 		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   (handle)

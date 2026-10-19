@@ -7,8 +7,8 @@
 // can check them against the module at load.
 //
 // One implementation on all three targets: the wasm is built from pinned mldsa-native
-// (scripts/build-mldsa.mjs) and the same bytes run in the browser, in Node and in wazero
-// (native/mldsa.go). Where a verifier accepts or rejects is consensus, and two independent
+// (scripts/build-mldsa.mjs) and the same bytes run in the browser, in Node and in wazero,
+// on each target's engine table. Where a verifier accepts or rejects is consensus, and two independent
 // lattice implementations can disagree at the edges while both pass their own tests.
 //
 // This file imports nothing (the caller hands it the module), so it loads as plain ESM in

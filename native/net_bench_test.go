@@ -163,8 +163,7 @@ func setupNetBench(b *testing.B) {
 	}
 	if v.String() != "function" {
 		// The app is signed here, by the Go-side writer, like the tests' probe app: the
-		// realm holds no signing key and the native binary cannot sign (mldsa.go binds
-		// verify only, §12.4).
+		// realm holds no author key (§12.4).
 		author := testAuthor(b)
 		blob := signedBundleBytes(b, author, benchProto, 1, netBenchGuestSource, []string{"_net"})
 		src := fmt.Sprintf(netBenchHarness,

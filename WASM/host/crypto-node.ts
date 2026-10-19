@@ -1,7 +1,7 @@
 // The Node.js crypto seam: where this target readies the whole crypto surface, and the
 // package's `.` entry point. The libsodium core and `mldsa65.wasm` are the host trust
 // root; application and transport transforms ship in their own bundles. `-node` means
-// Node.js here, as in `fs-node.ts` and `net-node.ts`, not a network node. A browser page
+// Node.js here, as in `fs-node.ts` and `platform-node.ts`, not a network node. A browser page
 // readies its own crypto (docs/CLIENT.md).
 
 import { readFileSync } from "node:fs";

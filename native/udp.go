@@ -126,7 +126,7 @@ func (u *udpHost) get(id int64) *udpSock {
 // read is a socket's reader goroutine: one queued delivery takes whatever has arrived by
 // the time the loop runs it.
 func (u *udpHost) read(id int64, s *udpSock) {
-	// Past the largest datagram the path sends (stream.ts `MAX_PACKET`), and small, since a
+	// Past the largest datagram the path sends (transport/src/stream.js `MAX_PACKET`), and small, since a
 	// hard NAT's end opens hundreds of sockets at once.
 	buf := make([]byte, 2048)
 	for {

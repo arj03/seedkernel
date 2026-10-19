@@ -122,15 +122,14 @@ try {
   // The loader's own answers, which both loaders act on: the process test above stages
   // during the operator flow only.
   console.log("Test: under now, the loader boots a staged host at once while the node serves, else once the flow ends");
-  const mem = new Map();
-  const memFiles = {
+  const memFiles = (mem) => ({
     mkdir() {},
     read: (p) => mem.get(p) ?? null,
     write: (p, b) => { mem.set(p, b); },
     remove: (p) => mem.delete(p),
     size: (p) => (mem.has(p) ? mem.get(p).length : -1),
-  };
-  const l = new Loader(memFiles, ["--host-updates", "now", "--dir", "mem"], readFileSync(join(root, "build/host.skb")), "0",
+  });
+  const l = new Loader(memFiles(new Map()), ["--host-updates", "now", "--dir", "mem"], readFileSync(join(root, "build/host.skb")), "0",
     () => {}, () => {});
   l.choose();
   ok(!l.stage(hostBlob(8)) && l.ended(true), "staged during the operator flow, it boots once a serving flow has ended");
@@ -139,6 +138,23 @@ try {
   ok(l.stage(hostBlob(9)), "staged while the node serves, it boots at once");
   l.choose();
   ok(!l.stage(hostBlob(10)) && !l.ended(false), "staged during a flow that does not serve, it waits for the next start");
+
+  console.log("Test: the health window commits the host it tried, not one that host staged meanwhile");
+  const mem = new Map();
+  let window = () => {};
+  const n = new Loader(memFiles(mem), ["--host-updates", "next", "--dir", "mem"], readFileSync(join(root, "build/host.skb")), "0",
+    () => {}, (ms, fn) => { window = fn; });
+  n.choose();
+  n.ended(true);
+  n.stage(hostBlob(2));
+  n.choose();
+  n.ended(true);
+  n.stage(hostBlob(3));
+  window();
+  const version = (env) => env && verifyHostBlob(sodium, env).manifest.version;
+  ok(version(mem.get("mem.host/committed.skb")) === 2 && version(mem.get("mem.host/pending.skb")) === 3,
+    "the tried host is committed, and the one it staged stays pending");
+  ok(version(n.choose()) === 3 && mem.has("mem.host/tried"), "…for a trial of its own at the next start");
 
   console.log("Test: --host runs a blob by the operator's choice, from any author");
   writeFileSync(join(work, "stranger.skb"), hostBlob(1, stranger));
