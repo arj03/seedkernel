@@ -1,19 +1,16 @@
-// The Node platform (§12.9): the platform ABI (abi.ts) over Node's own modules. The Node
-// loader runs a host blob's script on it (loader-node.ts), and the Node library runs the
-// same host in-process (shell-node.ts).
+// The Node platform (§12.9): the platform ABI (abi.ts) over Node's own modules, and the
+// Web APIs it shares with the browser's (platform-web.ts). The Node loader runs a host
+// blob's script on it (loader-node.ts), and the Node library runs the same host in-process
+// (shell-node.ts).
 
-import { randomFillSync } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
 import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { errMessage } from "../services/util.js";
-import { ModuleTable } from "./module-table.js";
-import { syncWebEngine } from "./engine-web.js";
-import type { PureModules } from "./bundle.js";
+import { webBridge } from "./platform-web.js";
 import type { CliFiles } from "./cli.js";
 import type { SlotFiles } from "./slots.js";
-import type { EngineExport, EngineInstance } from "./engine-realm.js";
 import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type NetDispatchers, type PlatformBridge, type PlatformNet } from "./abi.js";
 
@@ -72,18 +69,9 @@ const packageHostBlob = () => (packageHost ??= new Uint8Array(readFileSync(new U
 
 /** A Node platform, and the release of everything a host holds through it: sockets,
  *  listeners, datagram sockets, modules and engines. */
-export function nodePlatform(o: NodePlatformOptions = {}): Platform & { teardown(): void } {
+export function nodePlatform(o: NodePlatformOptions = {}): Required<Platform> & { teardown(): void } {
   // ── process, modules, engine ───────────────────────────────────────────────
-  const moduleTable = new ModuleTable();
-  const slots = new Map<string, PureModules>();
-  const engines = new Map<number, { instance: EngineInstance; fns: EngineExport[] }>();
-  let engineSeq = 0;
-  const engineOf = (id: number) => {
-    const e = engines.get(id);
-    if (!e) throw new Error("engine: no such instance");
-    return e;
-  };
-
+  const web = webBridge();
   const bridge: PlatformBridge = {
     abi: PLATFORM_ABI,
     banner: "seedkernel-shell",
@@ -97,33 +85,7 @@ export function nodePlatform(o: NodePlatformOptions = {}): Platform & { teardown
     stdin: () => {
       try { return new Uint8Array(readFileSync(0)); } catch { return new Uint8Array(0); }
     },
-    random: (n) => randomFillSync(new Uint8Array(n)),
-    async buildModules(slot, mods) {
-      slots.set(slot, await moduleTable.build(mods));
-    },
-    // Each module in a worker of its own (module-table.ts), the only way V8 stops a call.
-    async callModule(slot, module, payload, deadlineMs) {
-      const mods = slots.get(slot);
-      return mods ? mods.call(module, payload, deadlineMs < 0 ? Infinity : deadlineMs) : { bytes: null, ms: 0 };
-    },
-    disposeModules(slot) {
-      slots.get(slot)?.dispose();
-      slots.delete(slot);
-    },
-    engineInstantiate(wasm, imports) {
-      engines.set(++engineSeq, { instance: syncWebEngine(wasm, imports), fns: [] });
-      return engineSeq;
-    },
-    engineExport(id, name) {
-      const e = engineOf(id);
-      return e.fns.push(e.instance.exported(name)) - 1;
-    },
-    engineCall: (id, fn, ...args) => engineOf(id).fns[fn](...args),
-    engineGlobal: (id, name) => engineOf(id).instance.global(name),
-    engineGrow: (id, pages) => engineOf(id).instance.grow(pages),
-    engineRead: (id, ptr, len) => engineOf(id).instance.read(ptr, len),
-    engineWrite: (id, ptr, bytes) => { engineOf(id).instance.write(ptr, bytes); },
-    engineDispose: (id) => { engines.delete(id); },
+    ...web.bridge,
     hostBlob: o.hostBlob ?? packageHostBlob,
     stageHost: o.stageHost ?? (() => { throw new Error("host: a library node runs its package's host and takes no updates"); }),
   };
@@ -209,9 +171,7 @@ export function nodePlatform(o: NodePlatformOptions = {}): Platform & { teardown
       sockets.clear();
       for (const server of servers.splice(0)) server.close();
       udp.closeAll();
-      for (const mods of slots.values()) mods.dispose();
-      slots.clear();
-      engines.clear();
+      web.teardown();
       limits = null;
     },
   };

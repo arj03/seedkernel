@@ -340,28 +340,10 @@ async function testHybridManifestSuite() {
   console.log("  OK\n");
 }
 
-// ─── Test: the browser seam names a wasm file it could not fetch ───────────────
-//
-// A page that serves no mldsa65.wasm answers the fetch with a 404 page, and compiling that
-// reports a bad magic number, which says nothing about the missing file.
-async function testBrowserCryptoFetch() {
-  console.log("Test: the browser crypto seam reports a wasm file that was not served");
-  const { loadCrypto } = await imp("build/host/crypto-browser.js");
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("<html>not found</html>", { status: 404 });
-  let msg = "";
-  try { await loadCrypto({ ready: Promise.resolve() }, "https://node.example/"); }
-  catch (e) { msg = String(e?.message ?? e); }
-  finally { globalThis.fetch = realFetch; }
-  assert(msg.includes("https://node.example/mldsa65.wasm") && msg.includes("404"),
-    `the error names the file and the status, got "${msg}"`);
-  console.log("  OK\n");
-}
-
 // ─── Test: host entropy is drawn from the platform a block at a time ───────────
 //
 // libsodium's wasm build fills `randombytes_buf` with one platform draw per byte, which
-// made a megabyte of `crypto/random` seconds of host thread. Both JS seams put the
+// made a megabyte of `crypto/random` seconds of host thread. The Node seam puts the
 // platform CSPRNG under that name instead, filling up to 64 KiB per draw.
 async function testRandomBytesInBlocks() {
   console.log("Test: randombytes_buf draws from the platform CSPRNG a block at a time");
@@ -376,19 +358,6 @@ async function testRandomBytesInBlocks() {
   assertEqual(draws, 2, "100,000 bytes take two draws, not one per byte");
   assert(bytes.subarray(65_536).some((b) => b !== 0), "the bytes past the first draw are filled too");
   assertEqual(sodium.randombytes_buf(0).length, 0, "and none is none");
-
-  // The browser seam does the same to the libsodium it is handed.
-  const { loadCrypto } = await imp("build/host/crypto-browser.js");
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(readFileSync(join(root, "browser/mldsa65.wasm")));
-  let page;
-  try {
-    page = await loadCrypto({
-      ready: Promise.resolve(),
-      randombytes_buf: () => { throw new Error("libsodium's own randombytes_buf"); },
-    }, "https://node.example/");
-  } finally { globalThis.fetch = realFetch; }
-  assertEqual(page.randombytes_buf(8).length, 8, "the browser seam replaces it as well");
   console.log("  OK\n");
 }
 
@@ -401,8 +370,9 @@ async function testRandomBytesInBlocks() {
 async function testHostSodium() {
   console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
   const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
-  const { syncWebEngine } = await imp("build/host/engine-web.js");
-  const glue = readFileSync(join(root, "browser/libsodium-core.mjs"), "utf8");
+  const { syncWebEngine } = await imp("build/host/platform-web.js");
+  // The glue libsodium.wasm is extracted from (scripts/build-libsodium.mjs).
+  const glue = readFileSync(join(root, "node_modules/libsodium/dist/modules-esm/libsodium.mjs"), "utf8");
   for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
     assert(glue.includes(`._${name}=A.${min},`) || glue.includes(`._${name}=A.${min};`),
       `${name} is export ${min} in the glue`);
@@ -440,7 +410,6 @@ await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();
 await testHybridManifestSuite();
-await testBrowserCryptoFetch();
 await testRandomBytesInBlocks();
 await testHostSodium();
 

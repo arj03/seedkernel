@@ -3,7 +3,10 @@
 # and realm.c against it as a WASI reactor and exports exactly the calls their embedders
 # make: the Go bridge (QJS_*) and the shared realm driver (R_*).
 
-set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+# Optimized for size (-Os): every page downloads this engine in the host blob. Against -O3
+# it is half the code (623 against 960 KB stripped) for about 3% on a native round trip
+# and 6% on a guest dispatch; -Oz saved another 80 KB for 12% and 18%.
+set(CMAKE_BUILD_TYPE "MinSizeRel" CACHE STRING "" FORCE)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON) # -flto for clang/wasm-ld
 
 # Named against this file's own directory: the engine is a throwaway checkout under

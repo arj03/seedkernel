@@ -22,8 +22,8 @@ export interface HostSodium extends ShellSodium {
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
 
-// libsodium.wasm's minified export names, for the pinned build (browser/libsodium-core.mjs
-// maps them; tests/crypto.test.mjs checks this table against it). Re-derive them, and the
+// libsodium.wasm's minified export names, for the pinned build (the libsodium npm dist's
+// glue maps them; tests/crypto.test.mjs checks this table against it). Re-derive them, and the
 // two EM_JS entropy addresses, if libsodium.wasm is rebuilt.
 const EXPORTS = {
   malloc: "Ee", free: "Fe", sodium_init: "xe",

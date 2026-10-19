@@ -197,7 +197,7 @@
 
 **The browser has no loader.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
 
-**Size.** The binary is one artifact (~8 MB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install plus the lazily loaded `qjs.wasm`. The protocol's own footprint is tens of KB. `qjs.wasm` is lazy on the JS targets because a host with no installed slot should not pay for a realm.
+**Size.** The binary is one artifact (~7 MB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install plus the lazily loaded `qjs.wasm`. The protocol's own footprint is tens of KB. `qjs.wasm` is lazy on the JS targets because a host with no installed slot should not pay for a realm.
 
 **Minification is a second `tsc` pass**, not a bundler: no new dependency, and the compiler is the one tool on hand that can tell a regex literal from a division, so nothing hand-written lexes the host.
 

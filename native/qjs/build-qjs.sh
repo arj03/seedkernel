@@ -56,7 +56,8 @@ cmake -S "$work/quickjs" -B "$work/build" \
 
 make -C "$work/build" qjswasm -j"$(nproc)"
 
-# A post-link pass over what LTO already optimized, for size.
-wasm-opt -O3 "$work/build/qjswasm" -o "$here/qjs.wasm"
+# A post-link pass over what LTO already optimized, for size, dropping the DWARF the build
+# leaves in (a fifth of the file, which nothing reads).
+wasm-opt -Os --strip-debug --strip-producers "$work/build/qjswasm" -o "$here/qjs.wasm"
 echo "wrote $(stat -c%s "$here/qjs.wasm") bytes -> $here/qjs.wasm"
 echo "now run: cd .. && go test ./..."

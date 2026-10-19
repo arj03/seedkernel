@@ -31,12 +31,13 @@ import {
   type PlatformUdp,
 } from "./abi.js";
 
-/** A loader's primitives, as the globals of abi.ts. */
+/** A loader's primitives, as the globals of abi.ts. A page has no sockets of its own
+ *  (platform-web.ts): its channels are the ones it passes to `standUp`. */
 export interface Platform {
   bridge: PlatformBridge;
   fs: PlatformFs;
-  net: PlatformNet;
-  udp: PlatformUdp;
+  net?: PlatformNet;
+  udp?: PlatformUdp;
 }
 
 /** A host over one platform: the entry its loader calls, and what a node is built from. */
@@ -48,8 +49,8 @@ export interface PlatformHost extends PlatformDispatchers {
   /** Boot a node through `bootShell` (§12.9). The policy is parsed before anything is
    *  opened. */
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
-  /** A node's TCP sockets. The platform's datagrams the transport runs its UDP paths over
-   *  are lent through `standUp` (§12.7). */
+  /** A node's TCP sockets, on a platform that has them. The platform's datagrams the
+   *  transport runs its UDP paths over are lent through `standUp` (§12.7). */
   channels(): ChannelFactory;
   /** A node's private modules (§4). */
   modules: PureModuleLoader;
@@ -150,6 +151,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
         return (a, b, c, d, e, f, g, h, i, j, k, l) => bridge.engineCall(id, fn, a, b, c, d, e, f, g, h, i, j, k, l);
       },
       read: (ptr, len) => u8(bridge.engineRead(id, ptr, len)),
+      view: bridge.engineView && ((ptr, len) => bridge.engineView!(id, ptr, len)),
       grow: (pages) => bridge.engineGrow(id, pages),
       global: (name) => bridge.engineGlobal(id, name),
       write: (ptr, bytes) => { bridge.engineWrite(id, ptr, bytes); },
@@ -264,13 +266,16 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     },
     writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
   };
-  const tcp = tcpChannels(net);
-  const channels = () => tcp;
+  const tcp = net && tcpChannels(net);
+  const channels = () => {
+    if (!tcp) throw new Error("host: this platform has no sockets; pass transport.channels");
+    return tcp;
+  };
   const createRealm: RealmFactory = (opts) =>
     engineRealms(engine, hostParts.qjs, { billModules: modules === isolatedModules })(opts);
 
   async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
-    const admit = policyFromJson(cfg.policyJson);
+    const admit = cfg.admit ?? policyFromJson(cfg.policyJson);
     return bootShell({
       sodium, identity: cfg.identity, modules, fs: new FilesFs(files, cfg.dir), admit,
       createRealm,

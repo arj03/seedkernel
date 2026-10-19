@@ -28,24 +28,23 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page can reach, minified (`build-min`, excluding the embedded transport) | ~114 KB |
-| the embedded transport bundle (`host/transport-bundle.js`: the signed `.skb` as base64, including `ws.wasm` and `mlkem768.wasm`) | ~155 KB |
-| libsodium.wasm (core build: the host's crypto, and each loader's own blob check) | 217 KB |
-| libsodium-wrappers.mjs + libsodium-core.mjs | 135 KB |
-| mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
-| **Total browser deployment** | **~637 KB** |
+| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): its loader (`host/platform-web.js`), the socket seams and bundle verification | ~66 KB |
+| **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium and ML-DSA-65, signed (§12.9). A page's loader runs it on the browser platform | 1.4 MB |
+| of which the host script (`build/host.js`), with the transport bundle embedded as base64 (including `ws.wasm` and `mlkem768.wasm`) | 495 KB |
+| of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 623 KB |
+| of which libsodium.wasm (core build: the host's crypto) | 217 KB |
+| of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
+| **Total browser deployment** | **~1.4 MB (~570 KB gzipped)** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, counted inside the transport bundle |
-| `qjs.wasm`, the realm engine (`browser/qjs.wasm`, loaded only when a guest runs) | 1.2 MB |
-| **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium and ML-DSA-65, signed (§12.9) | 1.9 MB |
-| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~7.7 MB |
+| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~7.1 MB |
 
-`npm run build` emits the readable `build/` (~392 KB of JS) and the comment-stripped `build-min/` (~268 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach. It prints the gzipped size before and after minifying on every run.
+`npm run build` emits the readable `build/` (~563 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~437 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach, a page's loader and the host modules a page that assembles with `bootShell` itself imports. It prints the gzipped size before and after minifying on every run.
 
 ---
 
 ## 11. Example app layer: chat ([seedshell](https://github.com/arj03/seedshell))
 
-Chat is the smallest complete app, and lives in [seedshell](https://github.com/arj03/seedshell), the browser page that hosts it and a consumer of this runtime's published entry points (`shell-core`, `bundle`, `net-rtc`, `net-ws`, `libsodium`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
+Chat is the smallest complete app, and lives in [seedshell](https://github.com/arj03/seedshell), the browser page that hosts it and a consumer of this runtime's published entry points (`platform`, `platform-web`, `host.skb`, `bundle`, `net-rtc`, `net-ws`). Nothing here knows chat exists; §13 walks the same pipeline byte by byte.
 
 - **The bundle** is a guest of a few dozen lines and one restartable module, with an HTML view carried in its signed manifest. A peer's frame is drawn only if it is for this node, written to a room its sender is in or addressed to this node, and the module's render bytes are the answer; a frame from the app's own view goes out through the transport's `_net` service to the peers it is for. The module reads `senderPk ‖ chatType ‖ body` and writes render bytes; it does no I/O and no crypto. The page names a consent by one hash over the whole verified bundle: author, manifest, guest and modules.
 - **The page** generates an Ed25519 channel identity, boots a host (§12.8) and loads two small bundles of its own beside the transport, pinned to the author it was built with. Every other bundle is admitted only if the user consented to it (§12.5). A later build of chat is another bundle under the same `(author, app)`: installing it names that slot and re-states the `chat` protocol claim (§12.10).
@@ -511,7 +510,7 @@ The transport runs UDP paths itself (`transport/src/udp.js`, `stream.js`), over 
 
 ### 12.8 The shell: node assembly and the CLI
 
-`bootShell(opts)` (`host/shell-core.ts`) assembles the host and returns its `Shell` plus the channel adapter. `bootNodeShell(opts)` (`host/shell-node.ts`) stands a node up in-process through the host's own `standUp` (`host/platform.ts`) on the Node platform the Node loader runs (§12.9), with the package's host blob for its engine and crypto, and adds file-path bundle loading. The CLI is `host/cli.ts`:
+`bootShell(opts)` (`host/shell-core.ts`) assembles the host and returns its `Shell` plus the channel adapter. `bootNodeShell(opts)` (`host/shell-node.ts`) stands a node up in-process through the host's own `standUp` (`host/platform.ts`) on the Node platform the Node loader runs (§12.9), with the package's host blob for its engine and crypto, and adds file-path bundle loading. A page stands up the same way on the browser platform, `browserHost({ hostBlob }).standUp(cfg)` (`host/platform-web.ts`, §12.9), passing its own channels and, in place of a policy file, its own `admit`. The CLI is `host/cli.ts`:
 
 ```sh
 node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
@@ -543,8 +542,8 @@ A node is a **loader** running a **host blob**. The loader is the only code fixe
 
 - **The host blob** (`host/host-blob.ts`, `build/host.skb`) is a suite `0x02` envelope (§12.4) under `DOMAIN_host`, so it never passes as an app bundle or an app bundle as a host. Its body is the manifest `{version, abi}`, the host script (`build/host.js`, the shared TypeScript bundled by `scripts/bundle-host.mjs`), `qjs.wasm`, `libsodium.wasm` and `mldsa65.wasm`. `npm run build` signs it with `host-author.key`, which the first build writes, at `package.json`'s `hostVersion`.
 - **The platform ABI** (`host/abi.ts`) is what a loader gives the host script: process I/O and entropy, private modules (§4), the engine table, files, TCP and UDP sockets, timers, and `stageHost`. Every member is a raw primitive. A call a platform can only answer asynchronously is awaited by the host on every loader. The script refuses a loader that implements another ABI version, and a loader passes over a slot whose blob needs one.
-- **The engine table** instantiates wasm from bytes, calls its exports with numbers and reads and writes its memory. Guest realms (§12.3) and the host's crypto (`host/sodium-engine.ts`) run on it, so the engine and the crypto ship in the blob.
-- **Two loaders.** The native binary (`native/`) is Go over [wazero](https://wazero.io): the host script runs in a `qjs.wasm` instance from the blob, and Go owns the event loop (timers, the JS job queue, socket delivery). The Node loader (`host/loader-node.ts`, `npm run shell`) runs the host script in V8 on the Node platform (`host/platform-node.ts`), the ABI over `node:net`, `node:dgram`, `node:fs` and `WebAssembly`. The Node library (`bootNodeShell`, §12.8) runs the same host in-process on the same platform. A browser page has no loader: it embeds the host as a library (§12.8), and the origin that serves it is its trust root.
+- **The engine table** instantiates wasm from bytes, calls its exports with numbers and reads and writes its memory. The Node loader also lends a view of that memory, so a host call whose handler is done with its payload when it returns (`crypto/*`, `node/*`) reads it without a copy; the native host realm is another instance, so it always copies. Guest realms (§12.3) and the host's crypto (`host/sodium-engine.ts`) run on it, so the engine and the crypto ship in the blob.
+- **Three loaders.** The native binary (`native/`) is Go over [wazero](https://wazero.io): the host script runs in a `qjs.wasm` instance from the blob, and Go owns the event loop (timers, the JS job queue, socket delivery). The Node loader (`host/loader-node.ts`, `npm run shell`) runs the host script in V8 on the Node platform (`host/platform-node.ts`), the ABI over `node:net`, `node:dgram`, `node:fs` and `WebAssembly`. The Node library (`bootNodeShell`, §12.8) runs the same host in-process on the same platform. A page's loader is `browserHost` (`host/platform-web.ts`): it evaluates the blob's host script, as the Node loader does, on the browser platform (`browserPlatform`: the engine table over `WebAssembly`, private modules in workers, an in-memory store by default, and no sockets), which takes `'unsafe-eval'` in the page's `script-src`. The page stands its node up through the same `standUp` with its own channels and admission gate. It has no slots: the origin that serves it is its trust root. A page that assembles with `bootShell` itself imports the host instead and takes only the blob's engine and crypto (`platformHost(browserPlatform(...))`).
 - **Checked by the host it replaces.** A loader holds no crypto and decides nothing about authorship. The running host checks a blob before handing it over (`checkStagedHost`, `host/host-blob.ts`), with its own libsodium and ML-DSA-65, as it checks an app bundle: both signatures, then the parts. The chain is rooted in the genesis blob built into the loader. A loader reads the layout of what is in its slots, which only a host put there, and trusts those files as it trusts the data directory beside them.
 - **Updates** follow one implementation of a loader's decisions, `host/slots.ts`: its flags, which blob each boot runs, and the trial. The Node loader imports it into the realm it runs the host in. The native binary runs it as `build/loader.js` in a QuickJS realm of its own (`native/hostslots.go`), never the host's, so there a broken host cannot break its own rollback. On both, the script comes only from what the loader was built with. Each loader keeps only the booting and the clock the health window runs on. The slots sit beside the data directory: `<dir>.host/committed.skb`, `pending.skb` and the `tried` mark.
   - **Who and what.** A host stages only a blob from its own author, for its loader's ABI, at a version above its own. The running host is never older than the committed one, so that version is the floor.

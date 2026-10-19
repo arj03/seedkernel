@@ -76,6 +76,9 @@ export interface PlatformBridge {
   /** An exported global's value, or `null` when the instance exports none by that name. */
   engineGlobal(id: number, name: string): number | null;
   engineRead(id: number, ptr: number, len: number): Bytes;
+  /** `engineRead` without the copy, valid until the instance next runs, on a loader whose
+   *  engine memory the host script can reach. */
+  engineView?(id: number, ptr: number, len: number): Uint8Array;
   engineWrite(id: number, ptr: number, bytes: Uint8Array): void;
   engineDispose(id: number): void;
   /** The running host blob (host-blob.ts), which carries the realm engine and the host's

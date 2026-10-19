@@ -123,8 +123,8 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 ## What runs today
 
-- **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. The native binary and the Node CLI run the same signed host blob; only their loaders differ. Every target runs guests on the same QuickJS build, and nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
-- **The native node is one 8 MB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
+- **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. Every target runs the same signed host blob's engine and crypto through the same assembly: the native binary and the Node CLI behind their loaders, a page on the browser platform. Every target runs guests on the same QuickJS build, and nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
+- **The native node is one 7 MB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
 - **The host updates itself, when the operator allows it.** An app can hand the host a newer host blob from the host author, fetched over the node's own network. The running host checks it as it checks an app bundle and hands it to the loader, which tries it once and commits it after a health window; one that fails first is dropped for the host it replaced (§12.9).
 - **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~25 µs; ~110 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
 - **The engine is fast enough for real storage.** Seedstore's write pipeline encrypts, hashes and RS-encodes at ~186 MiB/s on one thread and decodes at ~2.6 GiB/s when every block is present, measured on the same WASM outside the guest. In its tested network configurations, transfer rate and latency dominated ([the overhead, measured](#the-overhead-measured)).
@@ -136,17 +136,17 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,836 LOC)**
+**Shared: one implementation for all three targets (3,842 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 777 |
+| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 778 |
 | Transport driver: channels by link id and listeners, behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7). No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 417 |
 | Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 692 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 408 |
 | Node startup, the operator flow on Node and native (§12.8): the flag set and its defaults, the order a node boots in, what it prints | `host/cli.ts` | 233 |
 | Guest realms and the host's crypto (§12.3, §12.9): the realm driver over the platform's engine table, and libsodium and ML-DSA-65 on the same table | `host/engine-realm.ts`, `host/sodium-engine.ts`, `host/pq.ts` | 460 |
-| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 396 |
+| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 401 |
 | Host services: the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts and the one directory-backed store, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (9 shared files) | 453 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
@@ -155,12 +155,12 @@ Sharing this code keeps admission and confinement rules consistent across target
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the WebAssembly engine table, sockets (TCP/WS/WebRTC), the `fs` backend, worker-backed private modules, crypto seams, entry points | 1,085 TS |
+| **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform and the page's loader, the WebAssembly engine table, sockets (TCP/WS/WebRTC), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,124 TS |
 | **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,456 Go |
 
 The transport bundle sits outside these host totals: 3,015 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
 
-All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table; the loaders hold none. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
+All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
 
 ## The overhead, measured
 

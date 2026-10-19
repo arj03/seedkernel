@@ -53,13 +53,18 @@
       "types": "./build/host/shell-core.d.ts",
       "default": "./build/host/shell-core.js"
     },
+    "./platform": {
+      "types": "./build/host/platform.d.ts",
+      "default": "./build/host/platform.js"
+    },
+    "./platform-web": {
+      "types": "./build/host/platform-web.d.ts",
+      "default": "./build/host/platform-web.js"
+    },
+    "./host.skb": "./build/host.skb",
     "./transport-bundle": {
       "types": "./build/host/transport-bundle.d.ts",
       "default": "./build/host/transport-bundle.js"
-    },
-    "./crypto-browser": {
-      "types": "./build/host/crypto-browser.d.ts",
-      "default": "./build/host/crypto-browser.js"
     },
     "./bundle": {
       "types": "./build/host/bundle.d.ts",
@@ -68,8 +73,7 @@
     "./bundle-author": {
       "types": "./build/scripts/bundle-author.d.ts",
       "default": "./build/scripts/bundle-author.js"
-    },
-    "./libsodium": "./browser/libsodium-wrappers.mjs"
+    }
   },
   "scripts": {
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
