@@ -5,7 +5,7 @@
 // pass the policy.
 import { readFileSync } from "node:fs";
 import { nodePlatform } from "./platform-node.js";
-import { platformHost, tcpChannels, type PlatformHost } from "./platform.js";
+import { platformHost, tcpChannels } from "./platform.js";
 import { type ChannelFactory } from "../services/socket-seam.js";
 import { type AppHandle, type InstallOptions, type Shell } from "./shell-core.js";
 import { type Fs } from "../services/fs.js";
@@ -29,9 +29,7 @@ export interface NodeShellRuntime extends CliNodeRuntime {
 /** Assemble a node in this process through the host's own `standUp`, then add the
  *  file-backed `installFile`. */
 export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> {
-  let host!: PlatformHost;
-  host = platformHost(nodePlatform({ host: () => host }));
-  const { shell: base, transport } = await host.standUp(opts);
+  const { shell: base, transport } = await platformHost(nodePlatform()).standUp(opts);
   const shell: NodeShell = {
     ...base,
     // This platform always supplies an fs.
@@ -46,7 +44,5 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
 /** TCP over node:net and nothing else, the platform's own sockets: a `ChannelFactory` for
  *  a caller that assembles a node with `bootShell` itself. */
 export function nodeChannels(): ChannelFactory {
-  // The platform delivers to the factory's own dispatchers; it binds no datagrams.
-  const tcp = { __udpDeliver() {} } as ReturnType<typeof tcpChannels> & { __udpDeliver(): void };
-  return Object.assign(tcp, tcpChannels(nodePlatform({ host: () => tcp }).net));
+  return tcpChannels(nodePlatform().net);
 }

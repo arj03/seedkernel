@@ -52,7 +52,8 @@
 // and both following at once only swaps them, round after round. So the offering end
 // follows at once, and the answering end only once nothing has come from its path for
 // `FOLLOW_MS`, by when an offering end that followed has settled it. A node with no
-// `datagrams` of its own gets Node's (node.ts).
+// `datagrams` of its own gets Node's (node.ts). A platform's raw sockets become the seam's
+// `DatagramPlatform` through `datagramsOver`.
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../socket-seam.js";
 import { dec, enc, fromHex, toHex } from "../util.js";
 import { bindingRequest, isStun, mappedAddress } from "./stun.js";
@@ -77,6 +78,68 @@ export interface DatagramPlatform {
   /** This machine's addresses its sockets are reached at, its host candidates: IPv4, and
    *  IPv6 but for link-local, which needs a zone no candidate carries. */
   addresses(): string[];
+}
+
+/** A platform's datagram sockets as raw primitives (host/abi.ts `PlatformUdp`), which
+ *  `datagramsOver` makes a `DatagramPlatform` of. */
+export interface RawDatagrams {
+  /** A socket on a port the OS picks, dual-stack where the machine has IPv6. What it reads
+   *  arrives at `deliver` in batches of `[n u8][ip n][port u16][len u16][bytes]`, n 4 for
+   *  IPv4 and 16 for IPv6. */
+  bind(deliver: (batch: Uint8Array | ArrayBuffer) => void): { id: number; port: number } | Promise<{ id: number; port: number }>;
+  /** One datagram; a failure is a lost one. A name rather than an address resolves. */
+  send(id: number, host: string, port: number, bytes: Uint8Array): void;
+  close(id: number): void;
+  /** Every address this machine's sockets are reached at, `\n`-separated. */
+  addresses(): string;
+}
+
+/** The seam's platform over raw datagrams, the same on every target: each batch read out,
+ *  and of the machine's addresses the outward IPv4 ones, or loopback on a machine with
+ *  none, then IPv6 but for loopback and link-local. */
+export function datagramsOver(raw: RawDatagrams): DatagramPlatform {
+  return {
+    async bind() {
+      let onMessage: (bytes: Uint8Array, host: string, port: number) => void = () => {};
+      const { id, port } = await raw.bind((batch) => {
+        const b = batch instanceof Uint8Array ? batch : new Uint8Array(batch);
+        // A batch is mostly one peer's, so its address is spelled once, not once a
+        // datagram: an IPv4 one is told from the last by its four bytes as a number, an
+        // IPv6 one by its text.
+        let host = "", ip = -1;
+        for (let at = 0; at < b.length;) {
+          const n = b[at++];
+          if (n === 4) {
+            const from = ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
+            if (from !== ip) { ip = from; host = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
+          } else {
+            ip = -1;
+            host = ipv6Text(b, at);
+          }
+          at += n;
+          const len = (b[at + 2] << 8) | b[at + 3];
+          onMessage(b.subarray(at + 4, at + 4 + len), host, (b[at] << 8) | b[at + 1]);
+          at += 4 + len;
+        }
+      });
+      return {
+        port,
+        socket: {
+          send: (bytes, to, host) => { raw.send(id, host, to, bytes); },
+          onMessage: (cb) => { onMessage = cb; },
+          // What is read after the close goes nowhere.
+          close: () => { onMessage = () => {}; raw.close(id); },
+        },
+      };
+    },
+    addresses() {
+      const all = raw.addresses().toLowerCase().split("\n").filter((a) => a !== "");
+      const v4 = all.filter((a) => !a.includes(":"));
+      const outward = v4.filter((a) => !a.startsWith("127."));
+      const v6 = all.filter((a) => a.includes(":") && a !== "::1" && !/^fe[89ab]/.test(a));
+      return [...(outward.length > 0 ? outward : v4), ...v6];
+    },
+  };
 }
 
 export interface UdpNetworkOptions {

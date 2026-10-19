@@ -14,7 +14,7 @@ import { readHostBlob } from "./host-blob.js";
 import { Loader, type SlotFiles } from "./slots.js";
 import type { PlatformDispatchers } from "./abi.js";
 
-/** The host script's dispatchers, once it has evaluated. */
+/** The host script's entry, once it has evaluated. */
 const host = globalThis as unknown as PlatformDispatchers;
 
 /** The slots' files, answered in the call as the shared rules expect. */
@@ -47,7 +47,6 @@ let serving = false;
 let rebootWaiting = false;
 
 const platform = nodePlatform({
-  host: () => host,
   argv: () => JSON.stringify(loader.hostArgs),
   hostBlob: () => blob,
   stageHost: (env) => {

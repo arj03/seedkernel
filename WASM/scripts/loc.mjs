@@ -71,21 +71,21 @@ const sharedRows = [
     files: [...sharedSet].filter((f) => f.startsWith("WASM/services/") && !f.startsWith("WASM/services/udp/")) },
 ];
 
-/** The UDP path, counted on its own line: a directory under services/ that the JS row,
- *  which reads only the top level, leaves out, and that the shared bundle carries for the
- *  native target. */
+/** The UDP path, counted on its own line: what the shared bundle carries of services/udp/.
+ *  A platform's own socket there (node.ts) is per-target, and counted with the JS row. */
 const udpFiles = readdirSync(resolve(wasmDir, "services/udp"))
   .filter((f) => f.endsWith(".ts"))
-  .map((f) => `WASM/services/udp/${f}`);
+  .map((f) => `WASM/services/udp/${f}`)
+  .filter((f) => sharedSet.has(f));
 
 // In the shared bundle but counted elsewhere: the UDP path, and transport-bundle.ts, which
 // is one line of signed bundle base64, not host code. Listed so reconciliation can tell them
 // from files counted nowhere.
-const countedElsewhere = [...udpFiles.filter((f) => sharedSet.has(f)), "WASM/host/transport-bundle.ts"];
+const countedElsewhere = [...udpFiles, "WASM/host/transport-bundle.ts"];
 
-/** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
- *  not include. Derived, so a new backend is counted automatically. */
-const jsFiles = ["services", "host"].flatMap((d) =>
+/** Per-target JS: every non-test TS under services/ (and services/udp/) and host/ that the
+ *  shared bundle does not include. Derived, so a new backend is counted automatically. */
+const jsFiles = ["services", "services/udp", "host"].flatMap((d) =>
   readdirSync(resolve(wasmDir, d))
     .filter((f) => f.endsWith(".ts"))
     .map((f) => `WASM/${d}/${f}`))

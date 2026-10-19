@@ -188,8 +188,7 @@ console.log("\nTest: a socket that never speaks is failed; one that has spoken m
 {
   const { tcpChannels } = await imp("build/host/platform.js");
   const { nodePlatform } = await imp("build/host/platform-node.js");
-  const tcp = { __udpDeliver() {} };
-  Object.assign(tcp, tcpChannels(nodePlatform({ host: () => tcp }).net, 100));
+  const tcp = tcpChannels(nodePlatform().net, 100);
   const peers = [];
   const server = createServer((s) => { s.on("error", () => {}); peers.push(s); });
   await new Promise((resolve) => server.listen(0, HOST, resolve));

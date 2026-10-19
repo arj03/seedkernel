@@ -1,16 +1,15 @@
-// The UDP socket primitive exposed to QuickJS as `__udp`, the datagram platform of the UDP
-// path (services/udp/net-udp.ts `DatagramPlatform`, shaped by host/platform.ts). A
-// socket is on a port the OS picks, dual-stack where the machine has IPv6. Its reader
-// goroutine holds what it reads until the loop takes it, and the loop hands each batch to
-// __udpDeliver in one call, as `[n u8][ip n][port u16][len u16][bytes]` per datagram, n 4
-// for IPv4 and 16 for IPv6: the stream (stream.ts) reads and acks once a turn, so a
-// crossing per turn is all it needs.
+// The UDP socket primitive exposed to QuickJS as `__udp`, the raw datagrams of the UDP
+// path (services/udp/net-udp.ts `RawDatagrams`, which `datagramsOver` shapes). A socket is
+// on a port the OS picks, dual-stack where the machine has IPv6. Its reader goroutine holds
+// what it reads until the loop takes it, and the loop hands each batch to the callback the
+// socket was bound with in one call, as `[n u8][ip n][port u16][len u16][bytes]` per
+// datagram, n 4 for IPv4 and 16 for IPv6: the stream (stream.ts) reads and acks once a
+// turn, so a crossing per turn is all it needs.
 package main
 
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
@@ -36,12 +35,11 @@ type udpHost struct {
 	mu     sync.Mutex
 	socks  map[int64]*udpSock
 	nextID int64
-
-	fnDeliver *qjs.Value
 }
 
 type udpSock struct {
-	conn *net.UDPConn
+	conn    *net.UDPConn
+	deliver *qjs.Value // the callback it was bound with, freed on close
 
 	mu     sync.Mutex
 	held   []byte // datagrams read and not yet delivered, packed
@@ -61,7 +59,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		// A kernel that caps the size grants what it allows; that is no reason to fail.
 		conn.SetReadBuffer(udpSocketBuffer)
 		conn.SetWriteBuffer(udpSocketBuffer)
-		s := &udpSock{conn: conn}
+		s := &udpSock{conn: conn, deliver: args[0].Dup()}
 		u.mu.Lock()
 		u.nextID++
 		id := u.nextID
@@ -103,23 +101,24 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		u.mu.Unlock()
 		if s != nil {
 			s.conn.Close()
+			// A delivery still queued finds the socket gone and never reaches it.
+			s.deliver.Free()
 		}
 		return nil, nil
 	}))
+	// Every address; which are candidates is the shared seam's (datagramsOver).
 	o.SetPropertyStr("addresses", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewString(strings.Join(localAddresses(), "\n")), nil
+		addrs, _ := net.InterfaceAddrs()
+		ips := make([]string, 0, len(addrs))
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok {
+				ips = append(ips, n.IP.String())
+			}
+		}
+		return qc.NewString(strings.Join(ips, "\n")), nil
 	}))
 	qc.Global().SetPropertyStr("__udp", o)
 	return u
-}
-
-// retain picks up the dispatcher host/platform.ts defines when the bundle evaluates.
-func (u *udpHost) retain() error {
-	u.fnDeliver = u.qc.Global().GetPropertyStr("__udpDeliver")
-	if u.fnDeliver.IsUndefined() {
-		return fmt.Errorf("udp: __udpDeliver not defined (host/platform.ts)")
-	}
-	return nil
 }
 
 func (u *udpHost) get(id int64) *udpSock {
@@ -172,7 +171,7 @@ func (u *udpHost) deliver(id int64, s *udpSock) {
 	if u.get(id) == nil {
 		return
 	}
-	dispatch(u.qc, "udpHost: dispatcher error", u.fnDeliver, u.qc.NewInt64(id), u.qc.NewArrayBuffer(batch))
+	dispatch(u.qc, "udpHost: dispatcher error", s.deliver, u.qc.NewArrayBuffer(batch))
 }
 
 // close tears the sockets down with their realm.
@@ -184,31 +183,4 @@ func (u *udpHost) close() {
 	for _, s := range socks {
 		s.conn.Close()
 	}
-}
-
-// localAddresses is this machine's outward IPv4 addresses, or loopback on one with none,
-// then its IPv6 ones but loopback and link-local, as services/udp/node.ts answers.
-func localAddresses() []string {
-	addrs, _ := net.InterfaceAddrs()
-	var outward, all, v6 []string
-	for _, a := range addrs {
-		n, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		if n.IP.To4() == nil {
-			if !n.IP.IsLoopback() && !n.IP.IsLinkLocalUnicast() {
-				v6 = append(v6, n.IP.String())
-			}
-			continue
-		}
-		all = append(all, n.IP.String())
-		if !n.IP.IsLoopback() {
-			outward = append(outward, n.IP.String())
-		}
-	}
-	if len(outward) > 0 {
-		all = outward
-	}
-	return append(all, v6...)
 }

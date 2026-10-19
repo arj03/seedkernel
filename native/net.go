@@ -1,12 +1,11 @@
 // The socket primitive exposed to QuickJS as `__net`. Reader goroutines hand each read to
-// el.post, and the loop delivers it through the __netDeliver/__netClosed/__netAccept
-// dispatchers defined in host/platform.ts.
+// el.post, and the loop delivers it through the deliver/closed/accept dispatchers
+// host/platform.ts hands over at install.
 package main
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -34,15 +33,14 @@ type netHost struct {
 	closeGrace           time.Duration
 	maxInboundReadBytes  int
 	maxInboundReadSlices int
+	fnDeliver            *qjs.Value
+	fnClosed             *qjs.Value
+	fnAccept             *qjs.Value
 
 	// Staging custody: reads posted to the loop but not yet handed to TransportHost.
 	inboundReadBytes  int
 	inboundReadSlices int
 	readSpace         *sync.Cond // signalled as staging custody is released
-
-	fnDeliver *qjs.Value
-	fnClosed  *qjs.Value
-	fnAccept  *qjs.Value
 }
 
 // exposeNet installs `__net`, shaped into RawLinks by host/platform.ts.
@@ -57,6 +55,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		n.closeGrace = time.Duration(args[1].Int64()) * time.Millisecond
 		n.maxInboundReadBytes = int(args[2].Int64())
 		n.maxInboundReadSlices = int(args[3].Int64())
+		n.fnDeliver = args[4].GetPropertyStr("deliver")
+		n.fnClosed = args[4].GetPropertyStr("closed")
+		n.fnAccept = args[4].GetPropertyStr("accept")
 		return nil, nil
 	}))
 
@@ -111,18 +112,6 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	}))
 	qc.Global().SetPropertyStr("__net", o)
 	return n
-}
-
-// retain picks up the dispatchers host/platform.ts defines when the bundle evaluates.
-func (n *netHost) retain() error {
-	g := n.qc.Global()
-	n.fnDeliver = g.GetPropertyStr("__netDeliver")
-	n.fnClosed = g.GetPropertyStr("__netClosed")
-	n.fnAccept = g.GetPropertyStr("__netAccept")
-	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
-		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/platform.ts)")
-	}
-	return nil
 }
 
 func (n *netHost) get(id int64) *sockChannel {
@@ -189,7 +178,7 @@ func (n *netHost) dial(addr string) int64 {
 	return id
 }
 
-// listen accepts inbound byte duplexes. Each reader starts only after __netAccept has
+// listen accepts inbound byte duplexes. Each reader starts only after `accept` has
 // made the JS channel it delivers to.
 func (n *netHost) listen(host string, port int) (int, error) {
 	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
@@ -270,7 +259,7 @@ func (n *netHost) onMsg(id int64) func([]byte) bool {
 		// b is the reader's buffer, borrowed: the spent read token keeps the next read
 		// from overwriting it before the task copies it.
 		n.el.post(func() {
-			// Staging custody ends once __netDeliver has handed off, however it returns.
+			// Staging custody ends once `deliver` has handed off, however it returns.
 			defer n.releaseInboundRead(len(b))
 			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
 		})

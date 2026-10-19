@@ -13,7 +13,7 @@ import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.
 import { monotonicMs, type RealmFactory } from "./realm-queue.js";
 import { engineRealms } from "./engine-realm.js";
 import { combineChannels, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
-import { UdpNetwork, ipv6Text, type DatagramPlatform } from "../services/udp/net-udp.js";
+import { UdpNetwork, datagramsOver, type DatagramPlatform } from "../services/udp/net-udp.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
@@ -28,7 +28,7 @@ import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
   PLATFORM_ABI,
-  type Bytes, type NetDispatchers, type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
+  type Bytes, type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
   type PlatformUdp,
 } from "./abi.js";
 
@@ -40,8 +40,7 @@ export interface Platform {
   udp: PlatformUdp;
 }
 
-/** A host over one platform: the dispatchers its loader calls, and what a node is built
- *  from. */
+/** A host over one platform: the entry its loader calls, and what a node is built from. */
 export interface PlatformHost extends PlatformDispatchers {
   /** This node's crypto, run on the engine table (sodium-engine.ts). */
   sodium: HostSodium;
@@ -66,16 +65,20 @@ const u8 = (b: Bytes): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Arr
 const abiMs = (ms: number | undefined): number =>
   ms === undefined ? DEFAULT_GUEST_DEADLINE_MS : ms === Infinity ? -1 : ms;
 
-/** The driver's ChannelFactory over a platform's TCP sockets, and the dispatchers the
- *  platform delivers them through. Once per platform, since it installs the socket limits.
- *  `silentMs` is shortened only by tests. */
-export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory & NetDispatchers {
-  // Limits are passed once; the platform enforces the ones that apply before JS sees a
-  // socket.
-  net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES);
+/** The driver's ChannelFactory over a platform's TCP sockets. Once per platform, since it
+ *  installs the socket limits and the dispatchers events arrive through. `silentMs` is
+ *  shortened only by tests. */
+export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory {
   /** Open channels by socket id, and accept callbacks by bound port. */
   const chans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
   const accepts = new Map<number, (id: number, remoteAddr: string) => void>();
+  // Limits are passed once; the platform enforces the ones that apply before JS sees a
+  // socket.
+  net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES, {
+    deliver: (id, bytes) => { chans.get(id)?.deliver(u8(bytes)); },
+    closed: (id) => { chans.get(id)?.closed(); },
+    accept: (port, id, remoteAddr) => { accepts.get(port)?.(id, remoteAddr); },
+  });
 
   function makeLink(id: number, remoteAddr?: string): RawLink {
     let onData: (bytes: Uint8Array) => void = () => {};
@@ -105,7 +108,7 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
       setReadable: (enabled) => { if (enabled) net.resume(id); },
       onData: (cb) => { onData = cb; },
       onClose: (cb) => { onClose = cb; },
-      // A local close never fires __netClosed, so drop the entry here.
+      // A local close never fires `closed`, so drop the entry here.
       close: (graceful) => { clearTimeout(silent); net.close(id, graceful); chans.delete(id); },
     };
   }
@@ -132,9 +135,6 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
       net.closeListeners();
       accepts.clear();
     },
-    __netDeliver: (id, bytes) => { chans.get(id)?.deliver(u8(bytes)); },
-    __netClosed: (id) => { chans.get(id)?.closed(); },
-    __netAccept: (port, id, remoteAddr) => { accepts.get(port)?.(id, remoteAddr); },
   };
 }
 
@@ -164,23 +164,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   const hostParts = readHostBlob(hostEnv);
   const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)));
 
-  const udpSockets = new Map<number, (bytes: Uint8Array, host: string, port: number) => void>();
-  const datagrams: DatagramPlatform = {
-    async bind() {
-      const { id, port } = await udp.bind();
-      let onMessage: (bytes: Uint8Array, host: string, port: number) => void = () => {};
-      udpSockets.set(id, (bytes, host, from) => onMessage(bytes, host, from));
-      return {
-        port,
-        socket: {
-          send: (bytes, to, host) => { udp.send(id, host, to, bytes); },
-          onMessage: (cb) => { onMessage = cb; },
-          close: () => { udpSockets.delete(id); udp.close(id); },
-        },
-      };
-    },
-    addresses: () => { const s = udp.addresses(); return s === "" ? [] : s.split("\n"); },
-  };
+  const datagrams = datagramsOver(udp);
 
   // ── The node's parts ───────────────────────────────────────────────────────────
   /** Zeros for wiping a scratch window, grown to the largest wipe. */
@@ -326,31 +310,6 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
 
   return {
     sodium, createRealm, standUp, channels, datagrams, modules,
-    __netDeliver: tcp.__netDeliver,
-    __netClosed: tcp.__netClosed,
-    __netAccept: tcp.__netAccept,
-    __udpDeliver: (id, batch) => {
-      const deliver = udpSockets.get(id);
-      const b = u8(batch);
-      // A batch is mostly one peer's, so its address is spelled once, not once a datagram:
-      // an IPv4 one is told from the last by its four bytes as a number, an IPv6 one by its
-      // text.
-      let host = "", ip = -1;
-      for (let at = 0; deliver && at < b.length;) {
-        const n = b[at++];
-        if (n === 4) {
-          const from = ((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0;
-          if (from !== ip) { ip = from; host = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
-        } else {
-          ip = -1;
-          host = ipv6Text(b, at);
-        }
-        at += n;
-        const len = (b[at + 2] << 8) | b[at + 3];
-        deliver(b.subarray(at + 4, at + 4 + len), host, (b[at] << 8) | b[at + 1]);
-        at += 4 + len;
-      }
-    },
     /** Run the operator flow. The loader reads back, as JSON bytes, whether to keep running. */
     async runMain() {
       const { serving, close } = await runCli(cliHost());

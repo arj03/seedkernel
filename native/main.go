@@ -81,13 +81,6 @@ func boot() error {
 		return fmt.Errorf("host script: %w", err)
 	}
 	done.Free()
-	// The shim defined the __net and __udp dispatchers; retain them.
-	if err := nh.retain(); err != nil {
-		return fmt.Errorf("net retain: %w", err)
-	}
-	if err := uh.retain(); err != nil {
-		return fmt.Errorf("udp retain: %w", err)
-	}
 	return nil
 }
 

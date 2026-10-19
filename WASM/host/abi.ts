@@ -1,6 +1,7 @@
 // The platform ABI (§12.9): the globals a loader installs before it evaluates the host
-// script, and the dispatchers the host script defines for the loader to call back. Every
-// member is a raw primitive; what a node makes of them is above the ABI, in the host
+// script, and the entry the host script defines for the loader to call. Socket events
+// arrive at the callbacks the host hands over (`install`, `bind`). Every member is a raw
+// primitive; what a node makes of them is above the ABI, in the host
 // script (platform.ts), which is the same on every target and carries its own crypto and
 // realm engine. The native binary implements it in Go (native/), the Node loader with
 // node:net, node:dgram and node:fs (loader-node.ts).
@@ -11,6 +12,7 @@
 
 import type { EngineImports } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
+import type { RawDatagrams } from "../services/udp/net-udp.js";
 
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;
@@ -88,53 +90,42 @@ export interface PlatformBridge {
 /** Whole files by path, which the node's store (services/fs-files.ts) is kept in. */
 export type PlatformFs = RawFiles;
 
-/** Byte streams (§12.1). Reads arrive through `__netDeliver`, one per `resume`. */
+/** Byte streams (§12.1). Reads arrive through `events.deliver`, one per `resume`. */
 export interface PlatformNet {
-  /** Host-owned socket limits, installed once before any channel opens. */
+  /** Host-owned socket limits, and the dispatchers socket events arrive through, installed
+   *  once before any channel opens. */
   install(maxLiveChannels: number, closeGraceMs: number,
-    maxInboundReadBytes: number, maxInboundReadSlices: number): void;
+    maxInboundReadBytes: number, maxInboundReadSlices: number, events: NetDispatchers): void;
   /** An outbound duplex (id never 0) that buffers sends until it connects. */
   connect(host: string, port: number): number;
   /** Bind a listener and answer its port; a failure throws the OS's reason. Accepts arrive
-   *  through `__netAccept`. */
+   *  through `events.accept`. */
   listen(host: string, port: number): Maybe<number>;
   send(id: number, bytes: Uint8Array): void;
   /** Bytes sent but not yet handed to the socket. */
   buffered(id: number): number;
   /** Allow the next read. */
   resume(id: number): void;
-  /** A local close; never fires `__netClosed`. */
+  /** A local close; never fires `events.closed`. */
   close(id: number, graceful?: boolean): void;
   closeListeners(): void;
-}
-
-/** Datagrams (§12.7). Reads arrive through `__udpDeliver`. */
-export interface PlatformUdp {
-  /** A socket on a port the OS picks, dual-stack where the machine has IPv6. */
-  bind(): Maybe<{ id: number; port: number }>;
-  /** One datagram; a failure is a lost one. A name rather than an address resolves. */
-  send(id: number, host: string, port: number, bytes: Uint8Array): void;
-  close(id: number): void;
-  /** This machine's addresses, `\n`-separated: the outward IPv4 ones, or loopback, then
-   *  IPv6 but for loopback and link-local. */
-  addresses(): string;
 }
 
 /** How a platform delivers socket events. */
 export interface NetDispatchers {
   /** A socket read. */
-  __netDeliver(id: number, bytes: Bytes): void;
+  deliver(id: number, bytes: Bytes): void;
   /** A channel failed or closed remotely. */
-  __netClosed(id: number): void;
+  closed(id: number): void;
   /** A socket was accepted on listener `port`. */
-  __netAccept(port: number, id: number, remoteAddr: string): void;
+  accept(port: number, id: number, remoteAddr: string): void;
 }
 
+/** Datagrams (§12.7), each socket's reads arriving at the `deliver` it was bound with. */
+export type PlatformUdp = RawDatagrams;
+
 /** What the host script defines for the loader to call. */
-export interface PlatformDispatchers extends NetDispatchers {
-  /** Datagrams as `[n u8][ip n][port u16][len u16][bytes]` each, n 4 for IPv4 and 16 for
-   *  IPv6. */
-  __udpDeliver(id: number, batch: Bytes): void;
+export interface PlatformDispatchers {
   /** Run the operator flow; answers `{"serving": bool}` as JSON bytes, and the loader keeps
    *  running while serving. */
   runMain(): Promise<Uint8Array>;
