@@ -6,31 +6,16 @@
 //   node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64] [--host <blob>]
 
-import { mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { runInThisContext } from "node:vm";
 import { errMessage } from "../services/util.js";
 import { nodeFiles, nodePlatform } from "./platform-node.js";
 import { readHostBlob } from "./host-blob.js";
-import { Loader, type SlotFiles } from "./slots.js";
+import { Loader } from "./slots.js";
 import type { PlatformDispatchers } from "./abi.js";
 
 /** The host script's entry, once it has evaluated. */
 const host = globalThis as unknown as PlatformDispatchers;
-
-/** The slots' files, answered in the call as the shared rules expect. */
-const slotFiles: SlotFiles = {
-  mkdir: (dir) => { mkdirSync(dir, { recursive: true, mode: 0o700 }); },
-  read(path, maxBytes) {
-    try { return statSync(path).size > maxBytes ? null : new Uint8Array(readFileSync(path)); } catch { return null; }
-  },
-  write: (path, bytes) => { nodeFiles.writeFile(path, bytes, 0o600); },
-  remove(path) {
-    try { unlinkSync(path); return true; } catch { return false; }
-  },
-  size(path) {
-    try { return statSync(path).size; } catch { return -1; }
-  },
-};
 
 /** The host's timers, so a host that is replaced leaves none behind. The loader keeps the
  *  originals for its own. */
@@ -41,27 +26,17 @@ const genesis = new Uint8Array(readFileSync(new URL("../host.skb", import.meta.u
 let loader!: Loader;
 /** The running host blob. */
 let blob!: Uint8Array;
-/** Set once the running host's operator flow has ended with the node serving. */
-let serving = false;
-/** A host staged under "now" during the operator flow, to boot once it ends. */
-let rebootWaiting = false;
 
 const platform = nodePlatform({
   argv: () => JSON.stringify(loader.hostArgs),
   hostBlob: () => blob,
-  stageHost: (env) => {
-    if (!loader.stage(env)) return;
-    // Under "now", boot it once this turn has run; while the operator flow runs, once it
-    // has ended (bootHost).
-    if (serving) setImmediate(() => { void restart(); });
-    else rebootWaiting = true;
-  },
+  // When the loader boots it now, once this turn has run.
+  stageHost: (env) => { if (loader.stage(env)) setImmediate(() => { void restart(); }); },
 });
 
 /** Release everything the running host holds, so the next one starts clean: what it holds
  *  through the platform, and its timers. */
 function teardown(): void {
-  serving = false;
   platform.teardown();
   for (const t of hostTimers) loaderClearTimeout(t);
   hostTimers.clear();
@@ -87,14 +62,9 @@ async function bootHost(): Promise<void> {
       if (loader.failed(errMessage(err))) continue;
       throw err;
     }
-    loader.ended(up);
-    if (up && rebootWaiting) {
-      rebootWaiting = false;
-      teardown();
-      continue;
-    }
-    serving = up;
-    return;
+    // A host staged under "now" while the operator flow ran boots once it has ended.
+    if (!loader.ended(up)) return;
+    teardown();
   }
 }
 
@@ -105,7 +75,7 @@ async function restart(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  loader = new Loader(slotFiles, process.argv.slice(2), genesis, process.env.SEEDKERNEL_HOST_HEALTH_MS,
+  loader = new Loader(nodeFiles, process.argv.slice(2), genesis, process.env.SEEDKERNEL_HOST_HEALTH_MS,
     (line) => { console.error("  host   " + line); },
     (ms, fn) => { loaderSetTimeout(fn, ms).unref(); });
   Object.assign(globalThis, {

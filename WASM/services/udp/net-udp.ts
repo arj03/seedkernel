@@ -57,7 +57,7 @@
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../socket-seam.js";
 import { dec, enc, fromHex, toHex } from "../util.js";
 import { bindingRequest, isStun, mappedAddress } from "./stun.js";
-import { PATH_HEADER, UdpStream } from "./stream.js";
+import { PATH_HEADER, SOCKET_BUFFER_BYTES, UdpStream } from "./stream.js";
 
 /** One UDP socket. A host is an IPv4 address dotted, an IPv6 one as `ipv6Text` writes it,
  *  or a name, which resolves to IPv4. A send that fails (an unresolved name, a full buffer,
@@ -83,10 +83,12 @@ export interface DatagramPlatform {
 /** A platform's datagram sockets as raw primitives (host/abi.ts `PlatformUdp`), which
  *  `datagramsOver` makes a `DatagramPlatform` of. */
 export interface RawDatagrams {
-  /** A socket on a port the OS picks, dual-stack where the machine has IPv6. What it reads
-   *  arrives at `deliver` in batches of `[n u8][ip n][port u16][len u16][bytes]`, n 4 for
-   *  IPv4 and 16 for IPv6. */
-  bind(deliver: (batch: Uint8Array | ArrayBuffer) => void): { id: number; port: number } | Promise<{ id: number; port: number }>;
+  /** A socket on a port the OS picks, dual-stack where the machine has IPv6, asking for
+   *  kernel receive and send buffers of `bufferBytes`; a kernel that grants less is no
+   *  failure. What it reads arrives at `deliver` in batches of
+   *  `[n u8][ip n][port u16][len u16][bytes]`, n 4 for IPv4 and 16 for IPv6. */
+  bind(deliver: (batch: Uint8Array | ArrayBuffer) => void, bufferBytes: number):
+    { id: number; port: number } | Promise<{ id: number; port: number }>;
   /** One datagram; a failure is a lost one. A name rather than an address resolves. */
   send(id: number, host: string, port: number, bytes: Uint8Array): void;
   close(id: number): void;
@@ -121,7 +123,7 @@ export function datagramsOver(raw: RawDatagrams): DatagramPlatform {
           onMessage(b.subarray(at + 4, at + 4 + len), host, (b[at] << 8) | b[at + 1]);
           at += 4 + len;
         }
-      });
+      }, SOCKET_BUFFER_BYTES);
       return {
         port,
         socket: {

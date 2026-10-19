@@ -8,6 +8,11 @@ import { basename, dirname, join } from "node:path";
 
 import { FilesFs, type RawFiles } from "./fs-files.js";
 
+/** The temp file an atomic write goes through before it is renamed over `path`: beside it,
+ *  under the `~` that marks a platform's temp files. */
+export const tempBeside = (path: string): string =>
+  join(dirname(path), `~${basename(path)}.${randomBytes(6).toString("hex")}`);
+
 export const nodeRawFiles: RawFiles = {
   async mkdir(dir) { await mkdir(dir, { recursive: true }); },
   async read(path, maxBytes) {
@@ -24,7 +29,7 @@ export const nodeRawFiles: RawFiles = {
     }
   },
   async write(path, bytes) {
-    const tmp = join(dirname(path), `~${basename(path)}.${randomBytes(6).toString("hex")}`);
+    const tmp = tempBeside(path);
     try {
       await writeFile(tmp, bytes);
       await rename(tmp, path);

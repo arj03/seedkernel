@@ -92,9 +92,9 @@ export type PlatformFs = RawFiles;
 
 /** Byte streams (§12.1). Reads arrive through `events.deliver`, one per `resume`. */
 export interface PlatformNet {
-  /** Host-owned socket limits, and the dispatchers socket events arrive through, installed
-   *  once before any channel opens. */
-  install(maxLiveChannels: number, closeGraceMs: number,
+  /** Host-owned socket settings and limits, and the dispatchers socket events arrive
+   *  through, installed once before any channel opens. */
+  install(keepAliveMs: number, closeGraceMs: number,
     maxInboundReadBytes: number, maxInboundReadSlices: number, events: NetDispatchers): void;
   /** An outbound duplex (id never 0) that buffers sends until it connects. */
   connect(host: string, port: number): number;

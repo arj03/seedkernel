@@ -25,8 +25,12 @@ export const MAX_OUTBOUND_QUEUE_SLICES = 4096;
 export const MAX_NODE_OUTBOUND_QUEUE_BYTES = 4 * MAX_OUTBOUND_QUEUE_BYTES;
 export const MAX_NODE_OUTBOUND_QUEUE_SLICES = 4 * MAX_OUTBOUND_QUEUE_SLICES;
 
-/** Live raw sockets one host holds; native also refuses at accept with it. */
+/** Live raw sockets one host holds. */
 export const DEFAULT_MAX_RAW_LINKS = 4096;
+
+/** Keepalive probes on every TCP socket, which reclaim one whose peer vanished without a
+ *  FIN. */
+export const TCP_KEEPALIVE_MS = 30_000;
 
 /** How long a TCP socket may stay silent before its first byte (host/platform.ts
  *  `tcpChannels`): the slowloris bound, which costs an attacker a SYN and this side a

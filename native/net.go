@@ -29,7 +29,7 @@ type netHost struct {
 	closed bool
 
 	// Installed by host/platform.ts before any socket opens.
-	maxLiveChannels      int
+	keepAlive            time.Duration
 	closeGrace           time.Duration
 	maxInboundReadBytes  int
 	maxInboundReadSlices int
@@ -51,7 +51,7 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		n.maxLiveChannels = int(args[0].Int64())
+		n.keepAlive = time.Duration(args[0].Int64()) * time.Millisecond
 		n.closeGrace = time.Duration(args[1].Int64()) * time.Millisecond
 		n.maxInboundReadBytes = int(args[2].Int64())
 		n.maxInboundReadSlices = int(args[3].Int64())
@@ -157,31 +157,20 @@ func (n *netHost) releaseInboundRead(length int) {
 	n.mu.Unlock()
 }
 
-// allocInbound mints an id for an accepted socket, refusing at maxLiveChannels.
-func (n *netHost) allocInbound() (int64, bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if len(n.chans) >= n.maxLiveChannels {
-		return 0, false
-	}
-	n.nextID++
-	return n.nextID, true
-}
-
 // dial opens an outbound byte duplex that JS can send on before it connects.
 func (n *netHost) dial(addr string) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.nextID++
 	id := n.nextID
-	n.chans[id] = newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
+	n.chans[id] = newDialChannel(addr, n.keepAlive, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return id
 }
 
 // listen accepts inbound byte duplexes. Each reader starts only after `accept` has
 // made the JS channel it delivers to.
 func (n *netHost) listen(host string, port int) (int, error) {
-	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
+	lc := net.ListenConfig{KeepAlive: n.keepAlive}
 	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
@@ -201,15 +190,12 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				time.Sleep(acceptErrBackoff)
 				continue
 			}
-			id, ok := n.allocInbound()
-			if !ok {
-				conn.Close()
-				continue
-			}
-			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 			// The IP alone: the transport's half-open budget groups by source IP.
 			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 			n.mu.Lock()
+			n.nextID++
+			id := n.nextID
+			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 			n.chans[id] = ch
 			n.mu.Unlock()
 			n.el.post(func() {

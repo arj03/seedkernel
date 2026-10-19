@@ -12,6 +12,7 @@ import { authorBundle, guestOpFraming, imp, root, sodium, testAuthor, toHex } fr
 
 const { ok, summary } = testkit();
 const { verifyHostBlob } = await imp("build/host/host-blob.js");
+const { Loader } = await imp("build/host/slots.js");
 const { signHostBlob, hybridAuthorKeysFromSeed } = await imp("build/scripts/bundle-author.js");
 const loader = join(root, "build/host/loader-node.js");
 const work = mkdtempSync(join(tmpdir(), "seedkernel-updates-"));
@@ -117,6 +118,27 @@ try {
   await node.exit;
   ok(/staged v6/.test(node.log()) && /trying v6/.test(node.log()), "the node reboots into it in the same process");
   ok(verifyHostBlob(sodium, readFileSync(slot("committed.skb"))).manifest.version === 6, "…and commits it");
+
+  // The loader's own answers, which both loaders act on: the process test above stages
+  // during the operator flow only.
+  console.log("Test: under now, the loader boots a staged host at once while the node serves, else once the flow ends");
+  const mem = new Map();
+  const memFiles = {
+    mkdir() {},
+    read: (p) => mem.get(p) ?? null,
+    write: (p, b) => { mem.set(p, b); },
+    remove: (p) => mem.delete(p),
+    size: (p) => (mem.has(p) ? mem.get(p).length : -1),
+  };
+  const l = new Loader(memFiles, ["--host-updates", "now", "--dir", "mem"], readFileSync(join(root, "build/host.skb")), "0",
+    () => {}, () => {});
+  l.choose();
+  ok(!l.stage(hostBlob(8)) && l.ended(true), "staged during the operator flow, it boots once a serving flow has ended");
+  l.choose();
+  ok(!l.ended(true), "…and the host it boots serves");
+  ok(l.stage(hostBlob(9)), "staged while the node serves, it boots at once");
+  l.choose();
+  ok(!l.stage(hostBlob(10)) && !l.ended(false), "staged during a flow that does not serve, it waits for the next start");
 
   console.log("Test: --host runs a blob by the operator's choice, from any author");
   writeFileSync(join(work, "stranger.skb"), hostBlob(1, stranger));

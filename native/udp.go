@@ -23,11 +23,6 @@ import (
 // full socket buffer drops one, and the stream sends it again.
 const udpHeldMax = 4 << 20
 
-// udpSocketBuffer is the kernel receive and send buffer a socket asks for, as
-// services/udp/stream.ts `SOCKET_BUFFER_BYTES`: room for a sender's whole burst, which a
-// default buffer (Windows' especially) drops the tail of.
-const udpSocketBuffer = 4 << 20
-
 type udpHost struct {
 	el *eventLoop
 	qc *qjs.Context
@@ -56,9 +51,10 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		if err != nil {
 			return nil, err
 		}
-		// A kernel that caps the size grants what it allows; that is no reason to fail.
-		conn.SetReadBuffer(udpSocketBuffer)
-		conn.SetWriteBuffer(udpSocketBuffer)
+		// The buffers the host asks for; a kernel that caps the size grants what it allows,
+		// which is no reason to fail.
+		conn.SetReadBuffer(int(args[1].Int64()))
+		conn.SetWriteBuffer(int(args[1].Int64()))
 		s := &udpSock{conn: conn, deliver: args[0].Dup()}
 		u.mu.Lock()
 		u.nextID++

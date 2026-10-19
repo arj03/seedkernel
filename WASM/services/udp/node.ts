@@ -6,16 +6,15 @@ import { lookup } from "node:dns";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
 import { datagramsOver, ipv6Bytes, type DatagramPlatform, type RawDatagrams } from "./net-udp.js";
-import { SOCKET_BUFFER_BYTES } from "./stream.js";
 
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";
 
 /** A socket on a port the OS picks: `udp6` taking IPv4 too, or `udp4` on a machine
  *  without IPv6. */
-function bound(type: "udp4" | "udp6"): Promise<Socket> {
+function bound(type: "udp4" | "udp6", bufferBytes: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const s = createSocket({ type, ipv6Only: false, recvBufferSize: SOCKET_BUFFER_BYTES, sendBufferSize: SOCKET_BUFFER_BYTES });
+    const s = createSocket({ type, ipv6Only: false, recvBufferSize: bufferBytes, sendBufferSize: bufferBytes });
     s.once("error", reject);
     s.bind(0, () => { s.off("error", reject); resolve(s); });
   });
@@ -28,14 +27,14 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
   const sockets = new Map<number, { send(bytes: Uint8Array, port: number, host: string): void; close(): void }>();
   let seq = 0;
   return {
-    async bind(deliver) {
+    async bind(deliver, bufferBytes) {
       let s: Socket;
       try {
-        s = await bound(dualStack ? "udp6" : "udp4");
+        s = await bound(dualStack ? "udp6" : "udp4", bufferBytes);
       } catch (err) {
         if (!dualStack) throw err;
         dualStack = false;
-        s = await bound("udp4");
+        s = await bound("udp4", bufferBytes);
       }
       const six = dualStack;
       // A send that fails is a lost datagram, which the stream already expects.

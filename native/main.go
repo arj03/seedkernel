@@ -47,10 +47,6 @@ var (
 	}
 	// ldr is the loader script's realm (hostslots.go); nil in tests that boot directly.
 	ldr *loader
-	// serving is set while the loop runs for a serving node, after its operator flow.
-	serving bool
-	// rebootWaiting is set when a host staged under "now" waits for the operator flow to end.
-	rebootWaiting bool
 )
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
@@ -147,19 +143,15 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewArrayBuffer(host.env), nil
 	}))
 	// Keep a host blob, which the running host checked, as the pending host (hostslots.go).
-	// Under --host-updates now, the loop stops after this turn and the loader boots it.
+	// When the loader boots it now, the loop stops after this turn.
 	b.SetPropertyStr("stageHost", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		env, err := args[0].Bytes()
 		if err != nil {
 			return nil, err
 		}
 		now, err := ldr.stage(env)
-		// While the operator flow runs, the loop is driving its await, so runHost checks once
-		// that ends instead.
-		if now && serving {
+		if now {
 			el.stopped = true
-		} else if now {
-			rebootWaiting = true
 		}
 		return nil, err
 	}))
@@ -255,15 +247,11 @@ func runHost() (again bool, err error) {
 	if err := json.Unmarshal(out, &st); err != nil {
 		return false, err
 	}
-	if _, _, err := ldr.call(`__loader.ended(__a0)`, st.Serving); err != nil {
-		return false, err
+	// The loader answers whether a host staged meanwhile boots now.
+	s, _, err := ldr.call(`__loader.ended(__a0)`, st.Serving)
+	if err != nil || s == "true" || !st.Serving {
+		return s == "true", err
 	}
-	if !st.Serving || rebootWaiting {
-		rebootWaiting = false
-		return st.Serving, nil
-	}
-	serving = true
-	defer func() { serving = false }()
 	el.stopped = false
 	el.run()
 	// The loop stops for a failure, or for a host staged under "now".

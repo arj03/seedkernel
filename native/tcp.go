@@ -10,13 +10,11 @@ import (
 	"time"
 )
 
-// tcpKeepAlive reclaims a socket whose peer vanished without a FIN.
-const tcpKeepAlive = 30 * time.Second
-
 // dialTCP dials with kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables
-// autotuning.
-func dialTCP(addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: tcpKeepAlive}
+// autotuning. No timeout of its own: a dial that never connects never reads, and the host's
+// silent-socket deadline (host/platform.ts `tcpChannels`) closes it.
+func dialTCP(addr string, keepAlive time.Duration) (net.Conn, error) {
+	d := net.Dialer{KeepAlive: keepAlive}
 	return d.DialContext(context.Background(), "tcp", addr)
 }
 
@@ -48,11 +46,11 @@ func newReadGate() chan struct{} {
 }
 
 // newDialChannel returns a channel that connects in the background; sends queue until then.
-func newDialChannel(addr string, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
-		conn, err := dialTCP(addr)
+		conn, err := dialTCP(addr, keepAlive)
 		if err != nil {
 			c.fail()
 			return

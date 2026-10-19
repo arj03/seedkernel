@@ -96,6 +96,10 @@ export class Loader {
   private readonly dir: string;
   private readonly genesis: number;
   private trying = false;
+  /** Set once the booted host's operator flow has ended with the node serving. */
+  private serving = false;
+  /** A host staged under "now" while the operator flow ran, booted once it ends. */
+  private bootAfterFlow = false;
   /** Counts boots, so a health timer from an earlier boot commits nothing. */
   private gen = 0;
 
@@ -155,6 +159,7 @@ export class Loader {
    *  once: the mark is written before it boots, so finding the mark means it never got as
    *  far as committing. */
   choose(): Uint8Array | null {
+    this.serving = false;
     if (this.fixed) return this.fixed;
     this.gen++;
     this.trying = false;
@@ -191,17 +196,21 @@ export class Loader {
   /** How the booted host's operator flow ended. A host booted after it, in the same
    *  process, does not repeat its one-shot `--op`. A pending host that serves is committed
    *  once it has served for the window. One that only ran an op and exited proved nothing
-   *  either way, so it is left pending, untried, for the next start. */
-  ended(serving: boolean): void {
+   *  either way, so it is left pending, untried, for the next start. Answers whether to boot
+   *  again at once, for a host staged under "now" while the flow ran. */
+  ended(serving: boolean): boolean {
     this.hostArgs = withoutOp(this.hostArgs);
-    if (!this.trying) return;
-    if (!serving) {
+    const again = serving && this.bootAfterFlow;
+    this.bootAfterFlow = false;
+    this.serving = serving && !again;
+    if (this.trying && !serving) {
       this.files.remove(this.path("tried"));
       this.trying = false;
-      return;
+    } else if (this.trying && !again) {
+      const gen = this.gen;
+      this.after(this.windowMs, () => this.commit(gen));
     }
-    const gen = this.gen;
-    this.after(this.windowMs, () => this.commit(gen));
+    return again;
   }
 
   /** Make the pending host the committed one, which raises the floor to it. A crash between
@@ -222,7 +231,9 @@ export class Loader {
     this.log(`committed after ${this.windowMs}ms`);
   }
 
-  /** Keep a blob the running host checked as pending; answers whether to boot it now. */
+  /** Keep a blob the running host checked as pending. Answers whether to boot it now, which
+   *  is under "now" while the node serves; one staged while the operator flow runs boots
+   *  once the flow ends (`ended`). */
   stage(env: Uint8Array): boolean {
     if (this.mode === "off") throw new Error("host: updates are off on this node (--host-updates next|now)");
     const { manifest } = readHostBlob(env);
@@ -230,6 +241,8 @@ export class Loader {
     this.files.write(this.path("pending.skb"), env);
     this.files.remove(this.path("tried"));
     this.log(`staged v${manifest.version}`);
-    return this.mode === "now";
+    if (this.mode !== "now") return false;
+    if (!this.serving) this.bootAfterFlow = true;
+    return this.serving;
   }
 }

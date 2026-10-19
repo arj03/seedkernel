@@ -28,7 +28,7 @@ func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *s
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, func(b []byte) bool {
+	return newDialChannel(addr, 0, func(b []byte) bool {
 		onMsg(append([]byte(nil), b...))
 		return true
 	}, onClose, testCloseGrace)
@@ -295,32 +295,6 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	c.fail() // idempotent
 	if len(onClosed) != 0 {
 		t.Fatal("fail() fired onClose twice")
-	}
-}
-
-// TestNetHostAcceptCeiling checks the accept bound (maxLiveChannels): past the ceiling an
-// inbound socket is closed at once, without an id, a channel or a goroutine, and the
-// listener keeps serving, so the node recovers as live channels close instead of going
-// deaf.
-func TestNetHostAcceptCeiling(t *testing.T) {
-	n := &netHost{chans: map[int64]*sockChannel{}, maxLiveChannels: 2}
-	for i := 0; i < n.maxLiveChannels; i++ {
-		id, ok := n.allocInbound()
-		if !ok {
-			t.Fatalf("connection %d refused under the ceiling", i)
-		}
-		n.chans[id] = nil // a live channel, as the accept loop registers it
-	}
-	if _, ok := n.allocInbound(); ok {
-		t.Fatal("a connection over the ceiling was admitted")
-	}
-	// One drains (a peer hung up, a link closed): the next connection is admitted again.
-	for id := range n.chans {
-		delete(n.chans, id)
-		break
-	}
-	if _, ok := n.allocInbound(); !ok {
-		t.Fatal("the ceiling did not release as channels drained")
 	}
 }
 

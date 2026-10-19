@@ -3,38 +3,40 @@
 // same host in-process (shell-node.ts).
 
 import { randomFillSync } from "node:crypto";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
-import { nodeRawFiles } from "../services/fs-node.js";
+import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/udp/node.js";
 import { errMessage } from "../services/util.js";
 import { ModuleTable } from "./module-table.js";
 import { syncWebEngine } from "./engine-web.js";
 import type { PureModules } from "./bundle.js";
 import type { CliFiles } from "./cli.js";
+import type { SlotFiles } from "./slots.js";
 import type { EngineExport, EngineInstance } from "./engine-realm.js";
 import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type NetDispatchers, type PlatformBridge, type PlatformNet } from "./abi.js";
 
-/** Keepalive probes on every socket, as native/tcp.go sets them. */
-const TCP_KEEPALIVE_MS = 30_000;
-
 /** The process's own timer, which a loader's teardown of host timers never reaches. */
 const platformSetTimeout = globalThis.setTimeout;
 
-/** Write a whole file or none: write a temp file beside the target, then rename it over.
- *  Synchronous, because it writes state a node cannot boot without: the key file and the
- *  freshness marks. */
+/** Write a whole file or none, as `nodeRawFiles` does. Synchronous, because it writes state
+ *  a node cannot boot without: the key file, the freshness marks and the host slots. */
 function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
-  renameSync(tmp, path);
+  const tmp = tempBeside(path);
+  try {
+    writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* never written */ }
+    throw err;
+  }
 }
 
-/** The operator's files (cli.ts `CliFiles`) on Node. Only a missing file reads as `null`,
- *  as on the native target; an unreadable one throws, or the `--key` first-boot path would
- *  overwrite it. */
-export const nodeFiles: CliFiles = {
+/** Node's synchronous files: the operator's (cli.ts `CliFiles`) and the loader's slots
+ *  (slots.ts `SlotFiles`). Only a missing operator file reads as `null`, as on the native
+ *  target; an unreadable one throws, or the `--key` first-boot path would overwrite it. */
+export const nodeFiles: CliFiles & SlotFiles = {
   readFile(path) {
     try { return new Uint8Array(readFileSync(path)); }
     catch (e) {
@@ -43,6 +45,17 @@ export const nodeFiles: CliFiles = {
     }
   },
   writeFile: writeFileAtomic,
+  mkdir: (dir) => { mkdirSync(dir, { recursive: true }); },
+  read(path, maxBytes) {
+    try { return statSync(path).size > maxBytes ? null : new Uint8Array(readFileSync(path)); } catch { return null; }
+  },
+  write: (path, bytes) => { writeFileAtomic(path, bytes); },
+  remove(path) {
+    try { unlinkSync(path); return true; } catch { return false; }
+  },
+  size(path) {
+    try { return statSync(path).size; } catch { return -1; }
+  },
 };
 
 /** What a Node platform's owner supplies: the loader's part of the bridge. Left out, it is
@@ -119,15 +132,14 @@ export function nodePlatform(o: NodePlatformOptions = {}): Platform & { teardown
   const sockets = new Map<number, Socket>();
   const servers: Server[] = [];
   let socketSeq = 0;
-  let limits: { maxLive: number; graceMs: number; events: NetDispatchers } | null = null;
+  let limits: { keepAliveMs: number; graceMs: number; events: NetDispatchers } | null = null;
 
   /** One socket under the ABI's rules: the first read may start at once and each later one
    *  waits for `resume`, and only a close the host did not make is reported. */
   function adopt(socket: Socket): number {
     const id = ++socketSeq;
     sockets.set(id, socket);
-    // Reclaims a socket whose peer vanished without a FIN, as native's does.
-    socket.setKeepAlive(true, TCP_KEEPALIVE_MS);
+    socket.setKeepAlive(true, limits!.keepAliveMs);
     socket.on("data", (chunk: Buffer) => {
       socket.pause();
       limits!.events.deliver(id, new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
@@ -144,18 +156,14 @@ export function nodePlatform(o: NodePlatformOptions = {}): Platform & { teardown
   }
 
   const net: PlatformNet = {
-    install(maxLive, graceMs, _maxInboundBytes, _maxInboundSlices, events) {
+    install(keepAliveMs, graceMs, _maxInboundBytes, _maxInboundSlices, events) {
       // Reads arrive on this thread one at a time, so nothing is ever staged and the
       // inbound limits hold by construction.
-      limits = { maxLive, graceMs, events };
+      limits = { keepAliveMs, graceMs, events };
     },
     connect: (host, port) => adopt(tcpConnect(port, host)),
     listen: (hostname, port) => new Promise<number>((resolve, reject) => {
       const server = createServer((socket) => {
-        if (sockets.size >= limits!.maxLive) {
-          socket.destroy();
-          return;
-        }
         // The IP alone: the transport's half-open budget groups by source IP.
         const remoteAddr = socket.remoteAddress ?? "";
         const id = adopt(socket);

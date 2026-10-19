@@ -15,10 +15,10 @@ import { engineRealms } from "./engine-realm.js";
 import { combineChannels, type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import { UdpNetwork, datagramsOver, type DatagramPlatform } from "../services/udp/net-udp.js";
 import {
-  DEFAULT_MAX_RAW_LINKS,
   MAX_INBOUND_HOLD_BYTES,
   MAX_INBOUND_HOLD_SLICES,
   SILENT_SOCKET_MS,
+  TCP_KEEPALIVE_MS,
   TCP_LINGER_MS,
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
@@ -72,9 +72,9 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
   /** Open channels by socket id, and accept callbacks by bound port. */
   const chans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
   const accepts = new Map<number, (id: number, remoteAddr: string) => void>();
-  // Limits are passed once; the platform enforces the ones that apply before JS sees a
-  // socket.
-  net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES, {
+  // Passed once; the platform applies the inbound limits to reads not yet delivered. The
+  // live-socket bound is the transport's (TransportHost `maxRawLinks`).
+  net.install(TCP_KEEPALIVE_MS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES, {
     deliver: (id, bytes) => { chans.get(id)?.deliver(u8(bytes)); },
     closed: (id) => { chans.get(id)?.closed(); },
     accept: (port, id, remoteAddr) => { accepts.get(port)?.(id, remoteAddr); },
