@@ -35,9 +35,9 @@ const SID_LEN = 8;
 // empty), the text as the path's host gives it. It comes from the authenticated peer, so
 // nothing in it needs checking beyond its shape.
 
-/** A negotiation link: the host's peer connection for one peer, and the deadline its data
- *  channel has to open by. */
-class RtcCtlLink {
+/** A negotiation's place among the links: what a host's `rtc:` link says up, and for either
+ *  kind the deadline its data link has to open by, and its close. */
+class NegotiationLink {
   constructor(linkId, e, owner) {
     this.linkId = linkId;
     this.e = e;
@@ -55,10 +55,10 @@ class RtcCtlLink {
   }
 }
 
-class Rtc {
+class Direct {
   constructor() {
     // ICE servers (STUN/TURN) as the platform takes them, beside the relay's own STUN
-    // (`configFor`).
+    // (`iceServersFor`).
     const iceServers = LOCAL.iceServers ?? APP.iceServers ?? [];
     if (!Array.isArray(iceServers) || iceServers.some((s) => typeof s !== "object" || s === null)) {
       throw new Error("transport: config iceServers must be an array of objects");
@@ -141,39 +141,33 @@ class Rtc {
     }
   }
 
-  /** Open a negotiation link of `scheme` for one peer: a host's `rtc:` link, or a UDP
-   *  negotiation this realm runs (`e.local`). Null when the cap is reached or no route (a
-   *  host without that kind of path). */
+  /** Open a negotiation of `scheme` for one peer: a UDP one this realm runs (udp.js), or
+   *  a host's `rtc:` link (`HostNegotiation`), both `e.neg`. Null when the cap is reached
+   *  or no route (a host without that kind of path). */
   async open(peer, offer, sid, scheme) {
     if (this.pending() >= this.maxNegotiating) return null;
-    const e = { peer, offer, sid, scheme, ctl: 0, local: null, data: null, gone: false, due: Infinity };
+    const e = { peer, offer, sid, scheme, ctl: 0, neg: null, data: null, gone: false, due: Infinity };
     this.byPeer.set(peer, e);
-    const local = scheme === "udp" ? await udp.open(offer, this.iceServersFor(peer)) : null;
-    const opened = scheme === "udp"
-      ? { linkId: local ? local.linkId : 0 }
-      : await netLinkOpen(`${scheme}:${offer ? "offer" : "answer"}${configSuffix(this.iceServersFor(peer))}`);
-    const early = this.early.get(opened.linkId);
-    this.early.delete(opened.linkId);
-    if (e.gone || this.byPeer.get(peer) !== e || opened.linkId === 0) {
-      if (local) local.close();
-      else if (opened.linkId !== 0) netLinkClose(opened.linkId, false);
+    const neg = await (scheme === "udp" ? udp : HostNegotiation).open(offer, this.iceServersFor(peer));
+    const early = neg ? this.early.get(neg.linkId) : undefined;
+    if (neg) this.early.delete(neg.linkId);
+    if (e.gone || this.byPeer.get(peer) !== e || !neg) {
+      if (neg) neg.close();
       if (early) netLinkClose(early.linkId, false);
       if (this.byPeer.get(peer) === e) this.byPeer.delete(peer);
       return null;
     }
-    e.ctl = opened.linkId;
-    e.local = local;
+    e.ctl = neg.linkId;
+    e.neg = neg;
     this.byCtl.set(e.ctl, e);
     if (this.connectTimeoutMs > 0) e.due = dueIn(this.connectTimeoutMs);
-    linksById.set(e.ctl, new RtcCtlLink(e.ctl, e, this));
+    linksById.set(e.ctl, new NegotiationLink(e.ctl, e, this));
     if (early) this.bindData(e.ctl, early.linkId, early.stream);
-    if (local) {
-      local.start({
-        up: (tag, text) => this.up(e, tag, text),
-        open: (linkId, stream) => this.bindData(e.ctl, linkId, true, stream),
-        closed: localClosed,
-      });
-    }
+    neg.start({
+      up: (tag, text) => this.up(e, tag, text),
+      open: (linkId, stream) => this.bindData(e.ctl, linkId, true, stream),
+      closed: localClosed,
+    });
     return e;
   }
 
@@ -183,15 +177,7 @@ class Rtc {
     if (!this.signal(e.peer, tag === RTC_OFFER && e.scheme === "udp" ? UDP_OFFER : tag, e.sid, text)) this.drop(e);
   }
 
-  down(e, tag, text) {
-    if (e.ctl === 0) return;
-    if (e.local) { e.local.down(tag, text); return; }
-    const body = utf8Encode(text);
-    const msg = new Uint8Array(1 + body.length);
-    msg[0] = tag;
-    msg.set(body, 1);
-    try { void netLinkSend(e.ctl, msg).catch(() => {}); } catch { /* budget: the negotiation times out */ }
-  }
+  down(e, tag, text) { if (e.neg) e.neg.down(tag, text); }
 
   /** The data channel of negotiation `via` arrived as `linkId`: the offering side dials
    *  the peer it signaled, and the answering side accepts that peer and no other. Both run
@@ -202,11 +188,7 @@ class Rtc {
   bindData(via, linkId, stream, channel) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
-    if (!e || e.data) {
-      if (channel) channel.close(false);
-      else netLinkClose(linkId, false);
-      return;
-    }
+    if (!e || e.data) { (channel ?? hostChannel(linkId)).close(false); return; }
     const link = e.data = core.openLink({
       linkId, stream, channel, dest: "", listener: "", source: undefined,
       linkSecret: ZERO32,
@@ -222,8 +204,7 @@ class Rtc {
    *  announced meanwhile is closed (`bindData`) rather than run on a closing channel. */
   drop(e) {
     this.gone(e);
-    if (e.local) e.local.close();
-    else if (e.ctl !== 0) netLinkClose(e.ctl, false);
+    if (e.neg) e.neg.close();
   }
 
   /** A negotiation link closed, and its data link with it. The peer is still reachable
@@ -238,7 +219,29 @@ class Rtc {
 /** Whether this negotiation's data link ever authenticated. */
 function authedData(e) { return e.data !== null && e.data.peerId !== ""; }
 
-/** The RTCConfiguration suffix of an `rtc:` destination. */
-function configSuffix(iceServers) {
-  return iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
+/** An `rtc:` negotiation link the host holds, in a UDP negotiation's shape (udp.js): what
+ *  it says up comes as `linkBytes` (`NegotiationLink`), and its data link as a `linkOpen`
+ *  naming it as `via`. */
+class HostNegotiation {
+  /** One for `offer`ing or answering, with `iceServers` as the destination's
+   *  RTCConfiguration; null for no route. */
+  static async open(offer, iceServers) {
+    const config = iceServers.length > 0 ? "?" + JSON.stringify({ iceServers }) : "";
+    const { linkId } = await netLinkOpen(`rtc:${offer ? "offer" : "answer"}${config}`);
+    return linkId === 0 ? null : new HostNegotiation(linkId);
+  }
+
+  constructor(linkId) { this.linkId = linkId; }
+
+  start() {}
+
+  down(tag, text) {
+    const body = utf8Encode(text);
+    const msg = new Uint8Array(1 + body.length);
+    msg[0] = tag;
+    msg.set(body, 1);
+    try { void netLinkSend(this.linkId, msg).catch(() => {}); } catch { /* budget: the negotiation times out */ }
+  }
+
+  close() { netLinkClose(this.linkId, false); }
 }

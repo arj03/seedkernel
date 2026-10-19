@@ -278,8 +278,8 @@ class Core {
       for (const link of [...pool.links, ...pool.held]) link.close();
     }
     // A peer connection still being negotiated has no data link to close it.
-    const e = rtc.byPeer.get(peerId);
-    if (e && e.data === null) rtc.drop(e);
+    const e = direct.byPeer.get(peerId);
+    if (e && e.data === null) direct.drop(e);
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -343,7 +343,7 @@ class Core {
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     if (!router.promote(peerId, link)) return;
-    if (link.relayed) { void rtc.upgrade(peerId).catch(() => {}); return; }
+    if (link.relayed) { void direct.upgrade(peerId).catch(() => {}); return; }
     // The requests held back from the relay go out on the direct link.
     reqres.pumpRelayed(peerId);
     if (!link.weDialed) router.retireRelayed(peerId);
@@ -353,7 +353,7 @@ class Core {
    *  relayed link once a direct one routes, and otherwise leaves it to the idle clock. */
   onControl(peerId, frame, link) {
     const tag = frame[1];
-    if (tag !== CTL_RETIRE) rtc.receive(peerId, tag, frame.subarray(2));
+    if (tag !== CTL_RETIRE) direct.receive(peerId, tag, frame.subarray(2));
     else if (link.relayed && router.hasDirect(peerId)) link.close();
   }
 
@@ -418,7 +418,7 @@ class Core {
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
-const rtc = new Rtc();
+const direct = new Direct();
 const udp = new Udp();
 const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
@@ -467,7 +467,7 @@ entry("linkOpen", (r) => {
   const listener = r.blob();
   const via = r.u32();
   const source = r.blob();
-  if (via !== 0) { rtc.bindData(via, linkId, stream); return; }
+  if (via !== 0) { direct.bindData(via, linkId, stream); return; }
   core.openLink({
     linkId, weDialed: false, stream,
     listener: listener.length > 0 ? utf8Decode(listener) : "",

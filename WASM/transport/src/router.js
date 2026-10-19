@@ -6,7 +6,7 @@ const KIND_REQ = 0x00, KIND_RES = 0x01, KIND_CTL = 0x02;
 /** OR'd into a request's kind when it wants no response. */
 const FLAG_NO_REPLY = 0x80;
 /** The control tag asking the peer to close the relayed link it arrived on, since a
- *  direct one has replaced it. rtc.js's signals are the other tags, all letters, so this
+ *  direct one has replaced it. direct.js's signals are the other tags, all letters, so this
  *  one is none. */
 const CTL_RETIRE = 0x00;
 

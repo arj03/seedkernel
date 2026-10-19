@@ -92,21 +92,13 @@ const LINGER_MS = 10_000;
 
 const SENT = Promise.resolve();
 
-/** A 48-bit big-endian field, written and read on the packet's own bytes. */
-function put48(p, at, n) {
-  const hi = Math.floor(n / 2 ** 32), lo = n >>> 0;
-  p[at] = hi >>> 8; p[at + 1] = hi; p[at + 2] = lo >>> 24; p[at + 3] = lo >>> 16; p[at + 4] = lo >>> 8; p[at + 5] = lo;
-}
-function get48(p, at) {
-  return ((p[at] << 8) | p[at + 1]) * 2 ** 32 + p[at + 2] * 2 ** 24 + ((p[at + 3] << 16) | (p[at + 4] << 8) | p[at + 5]);
-}
 /** Where a packet's body starts. */
 const B = PATH_HEADER;
 
 /** Whether an ACK's `count` ranges name packet `pn`. */
 function names(p, count, pn) {
   for (let i = 0; i < count; i++) {
-    if (pn <= get48(p, B + 9 + 12 * i) && pn >= get48(p, B + 15 + 12 * i)) return true;
+    if (pn <= readU48BE(p, B + 9 + 12 * i) && pn >= readU48BE(p, B + 15 + 12 * i)) return true;
   }
   return false;
 }
@@ -291,9 +283,9 @@ class UdpStream {
     if (this.gone) return;
     this.lastHeard = now();
     const body = p.length - B;
-    if (p[0] === S_DATA && body > 18) this.onChunk(get48(p, B), get48(p, B + 6), get48(p, B + 12), p.subarray(B + 18));
+    if (p[0] === S_DATA && body > 18) this.onChunk(readU48BE(p, B), readU48BE(p, B + 6), readU48BE(p, B + 12), p.subarray(B + 18));
     else if (p[0] === S_ACK && body >= 9 && body >= 9 + 12 * p[B + 8]) this.onAck(p);
-    else if (p[0] === S_PROBE && body >= 6) this.received(get48(p, B));
+    else if (p[0] === S_PROBE && body >= 6) this.received(readU48BE(p, B));
     else if (p[0] === S_CLOSE) this.fail();
   }
 
@@ -452,29 +444,30 @@ class UdpStream {
     // times, as a close does.
     const copies = credit > this.advertised && this.furthest >= this.advertised ? 3 : 1;
     this.advertised = credit;
-    put48(p, B, credit);
+    writeU48BE(p, B, credit);
     const delay = Math.min(0xffff, Math.round(now() - this.largestAt));
-    p[B + 6] = delay >>> 8; p[B + 7] = delay; p[B + 8] = r.length;
-    for (let i = 0; i < r.length; i++) { put48(p, B + 9 + 12 * i, r[i][0]); put48(p, B + 15 + 12 * i, r[i][1]); }
+    writeU16BE(p, B + 6, delay);
+    p[B + 8] = r.length;
+    for (let i = 0; i < r.length; i++) { writeU48BE(p, B + 9 + 12 * i, r[i][0]); writeU48BE(p, B + 15 + 12 * i, r[i][1]); }
     for (let i = 0; i < copies; i++) this.emit(p);
   }
 
   // ── sending ──
 
   onAck(p) {
-    this.peerCredit = Math.max(this.peerCredit, get48(p, B));
+    this.peerCredit = Math.max(this.peerCredit, readU48BE(p, B));
     const count = p[B + 8];
     if (count > 0) {
       // Ranges are newest first. Each is clamped below the previous range's floor, so a
       // peer cannot make overlapping ranges walk the same packet numbers again: the work
       // is bounded by the packets sent, not by the range count.
       const sent = this.nextPn - 1;
-      const largest = Math.min(get48(p, B + 9), sent);
+      const largest = Math.min(readU48BE(p, B + 9), sent);
       let newest;
       let below = Infinity;
       for (let i = 0; i < count; i++) {
-        const hi = Math.min(get48(p, B + 9 + 12 * i), sent, below);
-        const lo = Math.max(get48(p, B + 15 + 12 * i), this.oldestPn);
+        const hi = Math.min(readU48BE(p, B + 9 + 12 * i), sent, below);
+        const lo = Math.max(readU48BE(p, B + 15 + 12 * i), this.oldestPn);
         if (lo > hi) continue;
         for (let pn = lo; pn <= hi; pn++) {
           const s = this.inFlight.get(pn);
@@ -504,7 +497,7 @@ class UdpStream {
       this.largestAcked = Math.max(this.largestAcked, largest);
       this.advanceOldest();
       const t = now();
-      if (newest) this.sample(t - newest.time, (p[B + 6] << 8) | p[B + 7]);
+      if (newest) this.sample(t - newest.time, readU16BE(p, B + 6));
       this.detectLoss(t);
       // The peer acks again after a drop back: see whether the path still carries more.
       if (this.reprobe && this.ptoCount === 0) { this.reprobe = false; this.startProbe(); }
@@ -642,11 +635,11 @@ class UdpStream {
   sendChunk(offset, chunk) {
     const pn = this.nextPn++;
     const p = packet(S_DATA, 18 + chunk.length);
-    put48(p, B, pn);
-    put48(p, B + 6, offset);
+    writeU48BE(p, B, pn);
+    writeU48BE(p, B + 6, offset);
     // What the peer's acks must still name: a packet in flight, and a probe not answered. A
     // suspect arriving late is out of order, so it is acked at once, below the floor or not.
-    put48(p, B + 12, Math.min(this.oldestPn, this.probes[0] ?? Infinity));
+    writeU48BE(p, B + 12, Math.min(this.oldestPn, this.probes[0] ?? Infinity));
     p.set(chunk, B + 18);
     const t = now();
     this.inFlight.set(pn, { offset, size: p.length, time: t });
@@ -708,7 +701,7 @@ class UdpStream {
     if (this.probes.length >= MAX_PROBES) { this.probes = []; return; }
     const pn = this.nextPn++;
     const p = packet(S_PROBE, MAX_PACKET - B);
-    put48(p, B, pn);
+    writeU48BE(p, B, pn);
     this.probes.push(pn);
     this.emit(p);
     this.probeAt = dueIn(this.pto());

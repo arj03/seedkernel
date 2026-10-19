@@ -36,7 +36,7 @@ const CREDIT = 1 << 20, MAX_READ = 256 * 1024;
 
 /** The parts as the bundle assembles them (scripts/guest-source.mjs), and what the rest of
  *  the transport gives them: the wake (core.js), entropy (ake.js), the negotiation tags
- *  (rtc.js) and the `datagrams` event. */
+ *  (direct.js) and the `datagrams` event. */
 const UDP_SOURCE = ["util.js", "stream.js", "udp.js"]
   .map((f) => readFileSync(join(root, "transport", "src", f), "utf8")).join("\n")
   .replace("/* @seedkernel-op-frame */", guestOpFraming()) + `

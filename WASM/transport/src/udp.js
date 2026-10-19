@@ -1,6 +1,6 @@
 // UDP paths (§12.7): a direct path between two nodes whose hosts lend this transport raw
 // datagram sockets (`link/udpBind`), with no WebRTC. A negotiation here speaks the same
-// messages as the host's `rtc:` negotiation links (rtc.js), so signaling is the same for
+// messages as the host's `rtc:` negotiation links (direct.js), so signaling is the same for
 // both kinds. What differs is what the messages hold:
 //
 //   description  this end's token, 8 random bytes in hex, which every packet to it carries
@@ -102,12 +102,12 @@ const CANDIDATE = /^(?:((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\
 // read from the answer, which is all a server must send, and all seedrelay's `--stun` does.
 
 const STUN_COOKIE = 0x2112a442;
-const STUN_BINDING_SUCCESS = 0x0101, STUN_XOR_MAPPED_ADDRESS = 0x0020;
+const STUN_BINDING_REQUEST = 0x0001, STUN_BINDING_SUCCESS = 0x0101, STUN_XOR_MAPPED_ADDRESS = 0x0020;
 
 /** A Binding request under transaction id `txn` (12 bytes). */
 function bindingRequest(txn) {
   const out = new Uint8Array(20);
-  out[1] = 0x01;
+  writeU16BE(out, 0, STUN_BINDING_REQUEST);
   writeU32BE(out, 4, STUN_COOKIE);
   out.set(txn, 8);
   return out;
@@ -121,17 +121,16 @@ function isStun(msg) {
 
 /** The `host:port` a Binding success for `txn` names, or null for anything else. */
 function mappedAddress(msg, txn) {
-  const u16 = (at) => (msg[at] << 8) | msg[at + 1];
-  if (u16(0) !== STUN_BINDING_SUCCESS || u16(2) !== msg.length - 20) return null;
+  if (readU16BE(msg, 0) !== STUN_BINDING_SUCCESS || readU16BE(msg, 2) !== msg.length - 20) return null;
   for (let i = 0; i < 12; i++) {
     if (msg[8 + i] !== txn[i]) return null;
   }
-  for (let at = 20; at + 4 <= msg.length; at += 4 + ((u16(at + 2) + 3) & ~3)) {
-    const len = u16(at + 2);
+  for (let at = 20; at + 4 <= msg.length; at += 4 + ((readU16BE(msg, at + 2) + 3) & ~3)) {
+    const len = readU16BE(msg, at + 2);
     if (at + 4 + len > msg.length) return null;
-    if (u16(at) !== STUN_XOR_MAPPED_ADDRESS || len !== 8 || msg[at + 5] !== 1) continue;
+    if (readU16BE(msg, at) !== STUN_XOR_MAPPED_ADDRESS || len !== 8 || msg[at + 5] !== 1) continue;
     // The port XORed with the cookie's top half, the address with the cookie.
-    const port = u16(at + 6) ^ (STUN_COOKIE >>> 16);
+    const port = readU16BE(msg, at + 6) ^ (STUN_COOKIE >>> 16);
     return `${msg[at + 8] ^ msg[4]}.${msg[at + 9] ^ msg[5]}.${msg[at + 10] ^ msg[6]}.${msg[at + 11] ^ msg[7]}:${port}`;
   }
   return null;
@@ -158,7 +157,7 @@ function ipv6Text(b, at = 0) {
   const g = [];
   let run = -1, runLen = 1;
   for (let i = 0, zeros = 0; i < 8; i++) {
-    const v = (b[at + 2 * i] << 8) | b[at + 2 * i + 1];
+    const v = readU16BE(b, at + 2 * i);
     g.push(v.toString(16));
     zeros = v === 0 ? zeros + 1 : 0;
     if (zeros > runLen) { run = i - zeros + 1; runLen = zeros; }
@@ -254,7 +253,7 @@ class Udp {
     let r;
     try { r = await host.call(N_UDP_BIND, EMPTY); } catch { return null; }
     const id = readU32BE(r, 0);
-    return id === 0 ? null : { id, port: (r[4] << 8) | r[5], addresses: utf8Decode(r.subarray(6)) };
+    return id === 0 ? null : { id, port: readU16BE(r, 4), addresses: utf8Decode(r.subarray(6)) };
   }
 
   /** Send `p` from socket `id` to `to`, at `port` if given, with the turn's others. */
@@ -267,8 +266,8 @@ class Udp {
     o[at + 4] = to.b.length;
     o.set(to.b, at + 5);
     at += 5 + to.b.length;
-    o[at] = port >> 8; o[at + 1] = port & 255;
-    o[at + 2] = p.length >> 8; o[at + 3] = p.length & 255;
+    writeU16BE(o, at, port);
+    writeU16BE(o, at + 2, p.length);
     o.set(p, at + 4);
     this.outLen = at + 4 + p.length;
     if (!this.flushDue) {
@@ -316,8 +315,8 @@ class Udp {
           from = ipv6Text(b, at);
         }
         at += n;
-        const len = (b[at + 2] << 8) | b[at + 3];
-        to.onPacket(id, b.subarray(at + 4, at + 4 + len), from, (b[at] << 8) | b[at + 1]);
+        const len = readU16BE(b, at + 2);
+        to.onPacket(id, b.subarray(at + 4, at + 4 + len), from, readU16BE(b, at));
         at += 4 + len;
       }
     }
@@ -338,7 +337,7 @@ class Udp {
 // ── one negotiation ───────────────────────────────────────────────────────────
 
 /** A negotiation: its sockets, its candidates and the punch, and the stream that becomes
- *  the data link once a path is found. A local link to rtc.js, under its own id. */
+ *  the data link once a path is found. A local link to direct.js, under its own id. */
 class UdpNegotiation {
   constructor(offer, stun, socket, entropy) {
     this.offer = offer;
@@ -352,7 +351,7 @@ class UdpNegotiation {
     this.spare = entropy.subarray(2 * TOKEN + 12 * stun.length);
     this.spareAt = 0;
     this.refilling = false;
-    /** rtc.js's side: `up(tag, text)`, `open(linkId, stream)` and `closed(linkId)`. */
+    /** direct.js's side: `up(tag, text)`, `open(linkId, stream)` and `closed(linkId)`. */
     this.sink = null;
     this.peerToken = null;
     this.peerCandidates = [];
@@ -649,7 +648,7 @@ class UdpNegotiation {
     this.sink.open(this.dataId, this.data);
   }
 
-  /** A description or candidate from the peer, which rtc.js has from the authenticated
+  /** A description or candidate from the peer, which direct.js has from the authenticated
    *  link; one malformed ends the negotiation. */
   down(tag, text) {
     if (this.dead) return;
