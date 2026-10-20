@@ -1,8 +1,8 @@
 // The post-quantum half of the hybrid manifest suite (§12.4, §14.1): ML-DSA-65 (FIPS 204)
-// from browser/mldsa65.wasm, under libsodium-wrappers-style method names so it can be
-// added to the `sodium` object the install path already uses.
+// from browser/mldsa65.wasm, under libsodium-wrappers-style method names so it sits on the
+// same `sodium` object as Ed25519 (sodium-engine.ts).
 //
-// The driver is a bump arena over the module's linear memory. The field widths below are
+// The driver runs the module on the platform's engine table. The field widths below are
 // format constants of the suite (bundle.ts has its own copy); they are here so the driver
 // can check them against the module at load.
 //
@@ -11,8 +11,10 @@
 // on each target's engine table. Where a verifier accepts or rejects is consensus, and two independent
 // lattice implementations can disagree at the edges while both pass their own tests.
 //
-// This file imports nothing (the caller hands it the module), so it loads as plain ESM in
-// the browser and evaluates in QuickJS on the native target.
+// This file imports only a type (the caller hands it the instance), so it loads as plain
+// ESM in the browser and evaluates in QuickJS on the native target.
+
+import type { EngineInstance } from "./engine-realm.js";
 
 /** FIPS 204 ML-DSA-65 field widths. The manifest envelope is fixed-width per suite
  *  (§12.4), so these are format constants. `createMlDsa65` checks them against the
@@ -22,6 +24,8 @@ export const ML_DSA65_SK_LEN = 4032;
 export const ML_DSA65_SIG_LEN = 3309;
 export const ML_DSA65_SEED_LEN = 32;
 export const ML_DSA65_RND_LEN = 32;
+
+const PAGE = 65536;
 
 /** The verify half, which is all install needs (§12.4). Named and ordered like
  *  `crypto_sign_verify_detached`, which sits on the same object. */
@@ -35,124 +39,74 @@ export interface MlDsa65Signer extends MlDsa65Verifier {
   ml_dsa65_keypair_from_seed(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
 
-/** The wasm module's exports (pq/shim.c). Every buffer is a pointer into the
- *  module's own linear memory; nothing is allocated inside. */
-interface MlDsaExports {
-  memory: WebAssembly.Memory;
-  __heap_base: WebAssembly.Global;
-  mldsa65_verify(sig: number, m: number, mlen: number, ctx: number, ctxlen: number, pk: number): number;
-  mldsa65_sign(sig: number, m: number, mlen: number, ctx: number, ctxlen: number, rnd: number, sk: number): number;
-  mldsa65_keypair(pk: number, sk: number, seed: number): number;
-  mldsa65_publickeybytes(): number;
-  mldsa65_secretkeybytes(): number;
-  mldsa65_signaturebytes(): number;
-}
-
-/** Instantiate mldsa65.wasm. Async because browsers refuse synchronous compilation over
- *  4 KB on the main thread. Every operation afterwards is synchronous, so `verifyBundle`
- *  stays synchronous (§12.4). */
-export async function loadMlDsa65(wasm: BufferSource): Promise<MlDsa65Signer> {
-  const { instance } = await WebAssembly.instantiate(wasm, {});
-  return createMlDsa65(instance);
-}
-
-/** Wrap an already-instantiated module, for a target that gets its instance elsewhere
- *  (a cached compile, a worker). */
-export function createMlDsa65(instance: WebAssembly.Instance): MlDsa65Signer {
-  const e = instance.exports as unknown as MlDsaExports;
+/** ML-DSA-65 over an instance of mldsa65.wasm (pq/shim.c). `random` is the platform
+ *  CSPRNG, for the hedging randomness FIPS 204 mixes into a signature, so the module needs
+ *  no imports; unlike verification, that need not match across nodes. */
+export function createMlDsa65(pq: EngineInstance, random: (n: number) => Uint8Array): MlDsa65Signer {
   // Fail at load, not at first verify: a module built for another parameter set would
   // otherwise look fine until it rejected a real bundle as a bad signature.
   const widths: [string, number, number][] = [
-    ["public key", e.mldsa65_publickeybytes(), ML_DSA65_PK_LEN],
-    ["secret key", e.mldsa65_secretkeybytes(), ML_DSA65_SK_LEN],
-    ["signature", e.mldsa65_signaturebytes(), ML_DSA65_SIG_LEN],
+    ["public key", pq.exported("mldsa65_publickeybytes")(), ML_DSA65_PK_LEN],
+    ["secret key", pq.exported("mldsa65_secretkeybytes")(), ML_DSA65_SK_LEN],
+    ["signature", pq.exported("mldsa65_signaturebytes")(), ML_DSA65_SIG_LEN],
   ];
   for (const [what, got, want] of widths) {
     if (got !== want) throw new Error(`pq: mldsa65.wasm reports ${what} width ${got}, expected ${want}`);
   }
-
-  const heapBase = e.__heap_base.value as number;
-  let top = heapBase;
-  // A bump allocator over the module's heap, rewound before every call. The module never
-  // allocates and keeps nothing between calls, so no free list is needed.
-  const rewind = () => { top = heapBase; };
-  const alloc = (n: number): number => {
-    const p = (top + 15) & ~15;
-    top = p + n;
-    const short = top - e.memory.buffer.byteLength;
-    if (short > 0) e.memory.grow(Math.ceil(short / 65536) + 1);
-    return p;
-  };
-  // Re-read the buffer after every alloc: growing detaches the old ArrayBuffer, so a
-  // view held across an alloc would be stale.
-  const bytes = () => new Uint8Array(e.memory.buffer);
-  const put = (b: Uint8Array): number => {
-    const p = alloc(b.length);
-    bytes().set(b, p);
-    return p;
+  const verify = pq.exported("mldsa65_verify");
+  const sign = pq.exported("mldsa65_sign");
+  const keypair = pq.exported("mldsa65_keypair");
+  // The module never allocates and keeps nothing between calls, so each call lays its
+  // buffers out on its heap, from the base each time.
+  const base = pq.global("__heap_base");
+  if (base === null) throw new Error("pq: mldsa65.wasm exports no __heap_base");
+  /** Grow linear memory to `end` bytes, answering whether it could. */
+  const fits = (end: number): boolean => {
+    const short = end - pq.grow(0) * PAGE;
+    return short <= 0 || pq.grow(Math.ceil(short / PAGE)) >= 0;
   };
 
   return {
-    ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean {
+    // [sig][pk][message]
+    ml_dsa65_verify_detached(sig, message, pk) {
       // Never throws: a wrong-width key or signature is just invalid, as with
       // `crypto_sign_verify_detached`, so both halves of the suite fail the same way.
       if (sig.length !== ML_DSA65_SIG_LEN || pk.length !== ML_DSA65_PK_LEN) return false;
-      rewind();
-      const sigP = put(sig), msgP = put(message), pkP = put(pk);
+      const k = base + ML_DSA65_SIG_LEN, m = k + ML_DSA65_PK_LEN;
+      if (!fits(m + message.length)) return false;
+      pq.write(base, sig);
+      pq.write(k, pk);
+      if (message.length > 0) pq.write(m, message);
       // ctx = (0, 0): the runtime always signs with an empty FIPS 204 context, because its
       // domain separation is DOMAIN_manifest inside the preimage (§16.1).
-      return e.mldsa65_verify(sigP, msgP, message.length, 0, 0, pkP) === 1;
+      return verify(base, m, message.length, 0, 0, k) === 1;
     },
 
-    ml_dsa65_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array {
+    // [sig][sk][rnd][message]
+    ml_dsa65_sign_detached(message, sk) {
       if (sk.length !== ML_DSA65_SK_LEN) {
         throw new Error(`pq: ml-dsa-65 secret key must be ${ML_DSA65_SK_LEN} bytes, got ${sk.length}`);
       }
-      rewind();
-      const sigP = alloc(ML_DSA65_SIG_LEN);
-      const msgP = put(message);
-      const rndP = put(randomBytes(ML_DSA65_RND_LEN));
-      const skP = put(sk);
-      if (e.mldsa65_sign(sigP, msgP, message.length, 0, 0, rndP, skP) !== 1) {
-        throw new Error("pq: ml-dsa-65 signing failed");
-      }
-      return bytes().slice(sigP, sigP + ML_DSA65_SIG_LEN);
+      const k = base + ML_DSA65_SIG_LEN, r = k + ML_DSA65_SK_LEN, m = r + ML_DSA65_RND_LEN;
+      if (!fits(m + message.length)) throw new Error("pq: ml-dsa-65 out of memory");
+      pq.write(k, sk);
+      pq.write(r, random(ML_DSA65_RND_LEN));
+      if (message.length > 0) pq.write(m, message);
+      if (sign(base, m, message.length, 0, 0, r, k) !== 1) throw new Error("pq: ml-dsa-65 signing failed");
+      return pq.read(base, ML_DSA65_SIG_LEN);
     },
 
-    ml_dsa65_keypair_from_seed(seed: Uint8Array) {
+    // [pk][sk][seed]
+    ml_dsa65_keypair_from_seed(seed) {
       if (seed.length !== ML_DSA65_SEED_LEN) {
         throw new Error(`pq: ml-dsa-65 seed must be ${ML_DSA65_SEED_LEN} bytes, got ${seed.length}`);
       }
-      rewind();
-      const pkP = alloc(ML_DSA65_PK_LEN), skP = alloc(ML_DSA65_SK_LEN), seedP = put(seed);
-      if (e.mldsa65_keypair(pkP, skP, seedP) !== 1) throw new Error("pq: ml-dsa-65 keygen failed");
-      const m = bytes();
-      return {
-        publicKey: m.slice(pkP, pkP + ML_DSA65_PK_LEN),
-        privateKey: m.slice(skP, skP + ML_DSA65_SK_LEN),
-      };
+      const k = base + ML_DSA65_PK_LEN, s = k + ML_DSA65_SK_LEN;
+      if (!fits(s + ML_DSA65_SEED_LEN)) throw new Error("pq: ml-dsa-65 out of memory");
+      pq.write(s, seed);
+      if (keypair(base, k, s) !== 1) throw new Error("pq: ml-dsa-65 keygen failed");
+      const both = pq.read(base, ML_DSA65_PK_LEN + ML_DSA65_SK_LEN);
+      return { publicKey: both.slice(0, ML_DSA65_PK_LEN), privateKey: both.slice(ML_DSA65_PK_LEN) };
     },
   };
-}
-
-/** WebCrypto fills at most this much per `getRandomValues` call. */
-const RANDOM_DRAW_BYTES = 65536;
-
-/** `n` bytes from the platform CSPRNG (WebCrypto, on Node and in browsers). It is the
- *  hedging randomness FIPS 204 mixes into a signature, so mldsa65.wasm needs no imports;
- *  unlike verification, that need not match across nodes. The JS crypto seams also put it
- *  under libsodium's `randombytes_buf`, whose wasm build draws from this same source one
- *  byte per call. */
-export function randomBytes(n: number): Uint8Array {
-  const out = new Uint8Array(n);
-  const c = (globalThis as { crypto?: Crypto }).crypto;
-  if (!c?.getRandomValues) throw new Error("pq: no CSPRNG (globalThis.crypto.getRandomValues) available");
-  for (let at = 0; at < n; at += RANDOM_DRAW_BYTES) c.getRandomValues(out.subarray(at, at + RANDOM_DRAW_BYTES));
-  return out;
-}
-
-/** Add ML-DSA-65 to a libsodium instance, once at boot. `verifyBundle` checks for the
- *  method to decide whether this host accepts the hybrid suite. */
-export function withMlDsa65<T extends object>(sodium: T, mldsa: MlDsa65Signer): T & MlDsa65Signer {
-  return Object.assign(sodium, mldsa);
 }

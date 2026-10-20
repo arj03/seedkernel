@@ -32,8 +32,8 @@ function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
 }
 
 /** Node's synchronous files: the operator's (cli.ts `CliFiles`) and the loader's slots
- *  (slots.ts `SlotFiles`). Only a missing operator file reads as `null`, as on the native
- *  target; an unreadable one throws, or the `--key` first-boot path would overwrite it. */
+ *  (slots.ts `SlotFiles`). Only a missing file reads as `null`, as on the native target; an
+ *  unreadable one throws, or the `--key` first-boot path would overwrite it. */
 export const nodeFiles: CliFiles & SlotFiles = {
   readFile(path) {
     try { return new Uint8Array(readFileSync(path)); }
@@ -45,7 +45,13 @@ export const nodeFiles: CliFiles & SlotFiles = {
   writeFile: writeFileAtomic,
   mkdir: (dir) => { mkdirSync(dir, { recursive: true }); },
   read(path, maxBytes) {
-    try { return statSync(path).size > maxBytes ? null : new Uint8Array(readFileSync(path)); } catch { return null; }
+    let size: number;
+    try { size = statSync(path).size; } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw e;
+    }
+    if (size > maxBytes) throw new Error(`fs: ${path} is larger than ${maxBytes} bytes`);
+    return new Uint8Array(readFileSync(path));
   },
   write: (path, bytes) => { writeFileAtomic(path, bytes); },
   remove(path) {

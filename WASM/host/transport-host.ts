@@ -2,7 +2,7 @@
 // guest (§12.1). Destinations are opaque, and events go to the current link occupant
 // (§12.10).
 
-import { concatBytes, dec, errMessage, Fifo, readU32BE } from "../services/util.js";
+import { concatBytes, dec, errMessage, Fifo, readU32BE, u8 } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -358,7 +358,7 @@ export class TransportHost {
     try {
       let id = 0;
       const b = await raw.bind((batch) => {
-        if (id !== 0) this.heard(id, batch instanceof Uint8Array ? batch : new Uint8Array(batch));
+        if (id !== 0) this.heard(id, u8(batch));
       }, UDP_SOCKET_BUFFER_BYTES);
       if (gen !== this.socketGen) { raw.close(b.id); return NO_SOCKET; }
       id = b.id;

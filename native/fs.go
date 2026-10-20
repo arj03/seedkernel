@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -43,20 +44,27 @@ func exposeFs(qc *qjs.Context) {
 		return nil, os.MkdirAll(args[0].String(), 0o755)
 	}))
 	o.SetPropertyStr("read", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		f, err := os.Open(args[0].String())
-		if err != nil {
+		// Only absence maps to null; every other failure throws.
+		path, limit := args[0].String(), args[1].Int64()
+		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
 			return qc.NewNull(), nil
+		} else if err != nil {
+			return nil, err
 		}
 		defer f.Close()
 		// Refused before it is read, so a file planted in the store cannot become a host
 		// allocation.
 		fi, err := f.Stat()
-		if err != nil || !fi.Mode().IsRegular() || fi.Size() > args[1].Int64() {
-			return qc.NewNull(), nil
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() || fi.Size() > limit {
+			return nil, fmt.Errorf("%s: not a regular file of at most %d bytes", path, limit)
 		}
 		b := make([]byte, fi.Size())
 		if _, err := io.ReadFull(f, b); err != nil {
-			return qc.NewNull(), nil
+			return nil, err
 		}
 		return qc.NewArrayBuffer(b), nil
 	}))

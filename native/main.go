@@ -208,7 +208,7 @@ func main() {
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; os.Exit(0) }()
 	for {
-		if bootBlob, err = ldr.choose(genesisHost); err != nil {
+		if _, bootBlob, err = ldr.call(`__loader.choose()`); err != nil {
 			fatal("host slots", err)
 		}
 		again, err := runHost()

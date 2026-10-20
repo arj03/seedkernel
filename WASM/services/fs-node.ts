@@ -17,10 +17,13 @@ export const nodeRawFiles: RawFiles = {
   async mkdir(dir) { await mkdir(dir, { recursive: true }); },
   async read(path, maxBytes) {
     let f;
-    try { f = await open(path, "r"); } catch { return null; }
+    try { f = await open(path, "r"); } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw e;
+    }
     try {
       const { size } = await f.stat();
-      if (size > maxBytes) return null;
+      if (size > maxBytes) throw new Error(`fs: ${path} is larger than ${maxBytes} bytes`);
       const b = await f.readFile();
       // A plain Uint8Array view, so slice() copies (unlike Buffer's) without copying here.
       return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);

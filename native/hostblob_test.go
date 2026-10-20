@@ -108,8 +108,8 @@ func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "pending.skb"), env, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		got, err := l.choose(genesisHost)
-		if err != nil || &got[0] != &genesisHost[0] {
+		_, got, err := l.call(`__loader.choose()`)
+		if err != nil || string(got) != string(genesisHost) {
 			t.Fatalf("%s: the slots did not fall back on the genesis blob (%v)", what, err)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "pending.skb")); err == nil {

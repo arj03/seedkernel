@@ -11,15 +11,13 @@
 // loader. Timers are the standard setTimeout and clearTimeout.
 
 import type { EngineImports } from "./engine-realm.js";
+import type { PureModuleLoader } from "./bundle.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { RawDatagrams } from "../services/datagrams.js";
+import type { Bytes, Maybe } from "../services/util.js";
 
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;
-
-export type Maybe<T> = T | Promise<T>;
-/** Bytes a loader hands over; either form is the host's to keep. */
-export type Bytes = ArrayBuffer | Uint8Array;
 
 /** The process, private modules (§4) and the engine table. */
 export interface PlatformBridge {
@@ -47,15 +45,9 @@ export interface PlatformBridge {
   // end a synchronous wasm call at a deadline offers bounded engine instances
   // (`engineCallBounded`), and the host runs the module ABI over them in the calling
   // guest's segment (host/pure-module.ts). One that cannot runs each module in an isolate
-  // of its own and offers the three calls below, which answer asynchronously with the
+  // of its own and offers them as `modules`, whose calls answer asynchronously with the
   // module's own time, billed to the caller.
-
-  /** Build a bundle's private modules under an opaque slot name, all or none. */
-  buildModules?(slot: string, mods: { name: string; wasm: Uint8Array }[]): Promise<void>;
-  /** One module call under a deadline (-1 for none): its answer, or `null` when it failed. */
-  callModule?(slot: string, module: string, payload: Uint8Array, deadlineMs: number):
-    Promise<{ bytes: Bytes | null; ms: number }>;
-  disposeModules?(slot: string): void;
+  modules?: PureModuleLoader;
 
   /** The engine table: a wasm instance from bytes, its import handlers by module and name
    *  as WebAssembly's importObject. Numbers cross as numbers, and only integral ones (an

@@ -3,18 +3,16 @@
 // commits it after a health window, and drops it for the committed host when it fails
 // first. The native loader keeps
 // the same rules (native/hostslots.go); its tests check them in Go.
-import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
-import { authorBundle, guestOpFraming, imp, root, sodium, testAuthor, toHex } from "./fixtures.mjs";
+import { authorBundle, guestOpFraming, imp, root, sodium, spawnLoader, testAuthor, toHex } from "./fixtures.mjs";
 
 const { ok, summary } = testkit();
 const { verifyHostBlob } = await imp("build/host/host-blob.js");
 const { Loader } = await imp("build/host/slots.js");
 const { signHostBlob, hybridAuthorKeysFromSeed } = await imp("build/scripts/bundle-author.js");
-const loader = join(root, "build/host/loader-node.js");
 const work = mkdtempSync(join(tmpdir(), "seedkernel-updates-"));
 const HEALTH_MS = 400;
 
@@ -39,22 +37,9 @@ const dir = join(work, "data");
 const slot = (name) => join(work, "data.host", name);
 
 /** Run the loader on this node's data directory. */
-function start(args, stdin) {
-  const child = spawn(process.execPath, [loader, "--policy", join(work, "policy.json"), "--dir", dir,
-    "--key", join(work, "node.key"), "--bundle", join(work, "updater.skb"), ...args],
-  { cwd: work, env: { ...process.env, SEEDKERNEL_HOST_HEALTH_MS: String(HEALTH_MS) } });
-  let err = "";
-  child.stderr.on("data", (b) => { err += b; });
-  child.stdin.end(stdin ?? Buffer.alloc(0));
-  const until = (re) => new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`no ${re} in:\n${err}`)), 20000);
-    const look = () => { if (re.test(err)) { clearTimeout(t); resolve(); } };
-    child.stderr.on("data", look);
-    look();
-  });
-  const exit = new Promise((resolve) => child.on("exit", (code) => resolve({ code, err })));
-  return { child, until, exit, log: () => err };
-}
+const start = (args, stdin) => spawnLoader(["--policy", join(work, "policy.json"), "--dir", dir,
+  "--key", join(work, "node.key"), "--bundle", join(work, "updater.skb"), ...args],
+{ cwd: work, env: { ...process.env, SEEDKERNEL_HOST_HEALTH_MS: String(HEALTH_MS) }, stdin });
 /** Stage a blob through the updater app, as a one-op run. */
 const stage = (blob, mode = "next") => start(["--host-updates", mode, "--op", "stage"], blob).exit;
 /** Serve until `re` shows, then stop. */
@@ -163,9 +148,9 @@ try {
   const b = new Loader(memFiles(broken), ["--dir", "mem"], genesisEnv, "0", () => {}, () => {});
   ok(/^committed\.skb: host: .*; restore it, or remove it to boot v\d+$/.test(throwsOn(() => b.choose())),
     "a truncated committed.skb is refused, not passed over for the genesis blob");
-  // There, by its size, but every read fails, as one the process may not open does.
-  const u = new Loader({ ...memFiles(broken), read: () => null }, ["--dir", "mem"], genesisEnv, "0", () => {}, () => {});
-  ok(/^committed\.skb: cannot be read;/.test(throwsOn(() => u.choose())), "…and so is one that is there but unreadable");
+  // There, but every read fails, as one the process may not open does.
+  const u = new Loader({ ...memFiles(broken), read: () => { throw new Error("permission denied"); } }, ["--dir", "mem"], genesisEnv, "0", () => {}, () => {});
+  ok(/^committed\.skb: permission denied;/.test(throwsOn(() => u.choose())), "…and so is one that is there but unreadable");
 
   console.log("Test: --host refuses a file that is no host blob, whichever loader reads it");
   const files = memFiles(new Map([["junk.skb", new Uint8Array(100)], ["old.skb", hostBlob(1, hostKeys, genesis.script, genesis.manifest.abi + 1)]]));

@@ -246,12 +246,10 @@ class UdpStream {
     this.gone = false;
   }
 
-  /** The path is chosen: start sending through `out`, with `rttMs` as the first
-   *  round-trip sample if the path measured one. */
-  start(out, rttMs) {
+  /** The path is chosen: start sending through `out`. */
+  start(out) {
     if (this.gone || this.out) return;
     this.out = out;
-    if (rttMs !== undefined) this.sample(rttMs, 0);
     this.lastHeard = this.lastSent = now();
     this.liveAt = dueIn(KEEPALIVE_MS);
     if (this.ranges.length > 0) this.sendAck();
@@ -325,12 +323,11 @@ class UdpStream {
       this.lingerAt = dueIn(LINGER_MS);
       return true;
     }
-    this.finish();
+    this.end();
     return true;
   }
 
-  /** The negotiation ended, or the peer stopped answering: tell it, in case it can still
-   *  hear, then stop. */
+  /** Tell the peer, in case it can still hear, then stop. */
   end() {
     if (this.gone) return;
     this.sendClose();
@@ -340,7 +337,7 @@ class UdpStream {
   /** One wake (core.js `onWake`): what is due, and when the next is. */
   onWake(t) {
     if (this.gone) return Infinity;
-    if (t >= this.lingerAt) { this.finish(); return Infinity; }
+    if (t >= this.lingerAt) { this.end(); return Infinity; }
     if (t >= this.liveAt) this.tick(t);
     if (!this.gone && t >= this.recoveryAt) this.onRecovery(t);
     if (!this.gone && t >= this.probeAt) this.sendProbe();
@@ -506,7 +503,7 @@ class UdpStream {
       // The peer acks again after a drop back: see whether the path still carries more.
       if (this.reprobe && this.ptoCount === 0) { this.reprobe = false; this.startProbe(); }
     }
-    if (this.closing && this.buffered() === 0) { this.finish(); return; }
+    if (this.closing && this.buffered() === 0) { this.end(); return; }
     this.flush();
   }
 
@@ -732,13 +729,6 @@ class UdpStream {
     if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS) { this.end(); return; }
     if (t - this.lastSent >= KEEPALIVE_MS) this.sendAck();
     this.liveAt = dueIn(KEEPALIVE_MS);
-  }
-
-  /** Tell the peer, then stop. */
-  finish() {
-    if (this.gone) return;
-    this.sendClose();
-    this.fail();
   }
 
   /** Nothing acks a CLOSE, and one lost would leave the peer waiting out `SILENT_MS`, so it

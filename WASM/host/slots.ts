@@ -16,11 +16,12 @@
 
 import { readHostBlob } from "./host-blob.js";
 import { PLATFORM_ABI } from "./abi.js";
+import { u8 } from "../services/util.js";
 
 /** Whole files, answered in the call: a loader's own. */
 export interface SlotFiles {
   mkdir(dir: string): void;
-  /** `null` when absent or larger than `maxBytes`. */
+  /** `null` only when absent; one larger than `maxBytes`, or unreadable, throws. */
   read(path: string, maxBytes: number): ArrayBuffer | Uint8Array | null;
   /** Atomic. */
   write(path: string, bytes: Uint8Array): void;
@@ -80,8 +81,6 @@ function dataDirOf(args: string[]): string {
 /** No host blob is larger than this. */
 const MAX_BLOB_BYTES = 64 << 20;
 
-const u8 = (b: ArrayBuffer | Uint8Array): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
-
 interface Slot { env: Uint8Array; version: number }
 
 export class Loader {
@@ -94,7 +93,7 @@ export class Loader {
   private readonly fixed: Uint8Array | null = null;
   private readonly mode: string;
   private readonly dir: string;
-  private readonly genesis: number;
+  private readonly genesis: Slot;
   /** The pending host on trial, which its health window commits. */
   private trial: Slot | null = null;
   /** Set once the booted host's operator flow has ended with the node serving. */
@@ -124,7 +123,7 @@ export class Loader {
       this.mode = "off";
     }
     this.dir = dataDirOf(this.hostArgs).replace(/[/\\]+$/, "") + ".host";
-    this.genesis = readHostBlob(genesis).manifest.version;
+    this.genesis = { env: genesis, version: readHostBlob(genesis).manifest.version };
   }
 
   private path(name: string) { return `${this.dir}/${name}`; }
@@ -132,27 +131,25 @@ export class Loader {
   /** A slot's blob, or null when it is absent or not for this loader's ABI. A committed
    *  host that is there but broken throws: it is the floor, which genesis may be below. */
   private load(name: string): Slot | null {
-    const raw = this.files.read(this.path(name), MAX_BLOB_BYTES);
-    if (raw === null && this.files.size(this.path(name)) < 0) return null;
     try {
-      if (raw === null) throw new Error("cannot be read");
+      const raw = this.files.read(this.path(name), MAX_BLOB_BYTES);
+      if (raw === null) return null;
       const env = u8(raw);
       const { manifest } = readHostBlob(env);
       if (manifest.abi === PLATFORM_ABI) return { env, version: manifest.version };
       this.log(`ignored ${name}: it needs platform ABI ${manifest.abi}, this loader implements ${PLATFORM_ABI}`);
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err);
-      if (name === "committed.skb") throw new Error(`${name}: ${why}; restore it, or remove it to boot v${this.genesis}`);
+      if (name === "committed.skb") throw new Error(`${name}: ${why}; restore it, or remove it to boot v${this.genesis.version}`);
       this.log(`ignored ${name}: ${why}`);
     }
     return null;
   }
 
-  /** The committed host when it is newer than the genesis blob, which a newer loader can be;
-   *  `env` null is the genesis blob. */
-  private base(): { env: Uint8Array | null; version: number } {
+  /** The committed host when it is newer than the genesis blob, which a newer loader can be. */
+  private base(): Slot {
     const c = this.load("committed.skb");
-    return c && c.version > this.genesis ? c : { env: null, version: this.genesis };
+    return c && c.version > this.genesis.version ? c : this.genesis;
   }
 
   private discard(reason: string) {
@@ -162,10 +159,9 @@ export class Loader {
     this.log(`discarded the pending host: ${reason}`);
   }
 
-  /** The blob the next boot runs, or null for the genesis blob. A pending blob is tried
-   *  once: the mark is written before it boots, so finding the mark means it never got as
-   *  far as committing. */
-  choose(): Uint8Array | null {
+  /** The blob the next boot runs. A pending blob is tried once: the mark is written before
+   *  it boots, so finding the mark means it never got as far as committing. */
+  choose(): Uint8Array {
     this.serving = false;
     if (this.fixed) return this.fixed;
     this.gen++;

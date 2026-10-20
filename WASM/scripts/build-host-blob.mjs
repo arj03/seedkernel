@@ -6,39 +6,16 @@
 // clone has its own host author. A loader that runs this blob accepts updates only from
 // the same author. The version is package.json's `hostVersion`: raise it for a release a
 // running node should take, since loaders refuse a version at or below their floor.
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import sodiumDefault from "libsodium-wrappers";
-import { hybridAuthorKeysFromSeed, signHostBlob } from "../build/scripts/bundle-author.js";
-import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
+import { buildAuthor, signHostBlob } from "../build/scripts/bundle-author.js";
 import { PLATFORM_ABI } from "../build/host/abi.js";
 import { hybridAuthorId } from "../build/host/bundle.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const args = process.argv.slice(2);
-const keyFlag = (() => {
-  const i = args.indexOf("--key");
-  return i >= 0 && args[i + 1] ? args[i + 1] : undefined;
-})();
 const toHex = (b) => Buffer.from(b).toString("hex");
-
-await sodiumDefault.ready;
-let seed;
-const keyPath = join(root, "host-author.key");
-if (keyFlag) {
-  seed = Uint8Array.from(Buffer.from(keyFlag, "hex"));
-} else if (existsSync(keyPath)) {
-  seed = Uint8Array.from(Buffer.from(readFileSync(keyPath, "utf8").trim(), "hex"));
-} else {
-  seed = sodiumDefault.randombytes_buf(32);
-  writeFileSync(keyPath, toHex(seed) + "\n", { mode: 0o600 });
-  console.log("  wrote host-author.key (keep it; this clone's hosts are signed by it)");
-}
-if (seed.length !== 32) throw new Error("--key must be 32 bytes of hex");
-const sodium = withMlDsa65(sodiumDefault, createMlDsa65(new WebAssembly.Instance(
-  new WebAssembly.Module(readFileSync(join(root, "browser", "mldsa65.wasm"))), {})));
-const keys = hybridAuthorKeysFromSeed(sodium, seed);
+const { sodium, keys } = buildAuthor(root, "host-author.key", process.argv.slice(2));
 
 const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).hostVersion;
 if (!Number.isSafeInteger(version) || version < 1) throw new Error("package.json hostVersion must be a positive integer");

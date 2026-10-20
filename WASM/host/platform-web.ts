@@ -8,12 +8,11 @@
 // up through the host's `standUp` (platform.ts) with its own channels (WebSocket, WebRTC).
 
 import { ModuleTable } from "./module-table.js";
-import { randomBytes } from "./pq.js";
 import { readHostBlob } from "./host-blob.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
 import { dec } from "../services/util.js";
 import type { PureModules } from "./bundle.js";
-import type { Engine, EngineExport, EngineImports, EngineInstance } from "./engine-realm.js";
+import type { EngineExport, EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { Platform, PlatformHost } from "./platform.js";
 import { PLATFORM_ABI, type PlatformBridge } from "./abi.js";
@@ -78,38 +77,38 @@ function link(mod: WebAssembly.Module, imports: EngineImports) {
 }
 
 /** Compiled modules by their bytes, so a realm per app compiles the engine once. */
-const compiled = new WeakMap<Uint8Array, Promise<WebAssembly.Module>>();
-/** The engine table over WebAssembly, asynchronous: `bootShell`'s default realms
- *  (engine-web.ts). */
-export const webEngine: Engine = async (wasm, imports) => {
-  let module = compiled.get(wasm);
-  if (!module) {
-    module = WebAssembly.compile(wasm as BufferSource);
-    compiled.set(wasm, module);
-  }
-  const mod = await module;
-  const { all, view } = link(mod, imports);
-  return view(await WebAssembly.instantiate(mod, all));
-};
-
-const compiledSync = new WeakMap<Uint8Array, WebAssembly.Module>();
-/** The same table, synchronous, as the platform ABI's is. Chromium compiles a module the
- *  size of qjs.wasm synchronously on a page's main thread. */
+const compiled = new WeakMap<Uint8Array, WebAssembly.Module>();
+/** The engine table over WebAssembly, synchronous as the platform ABI's is. Chromium
+ *  compiles a module the size of qjs.wasm synchronously on a page's main thread. */
 export const syncWebEngine = (wasm: Uint8Array, imports: EngineImports): EngineInstance => {
-  let mod = compiledSync.get(wasm);
+  let mod = compiled.get(wasm);
   if (!mod) {
     mod = new WebAssembly.Module(wasm as BufferSource);
-    compiledSync.set(wasm, mod);
+    compiled.set(wasm, mod);
   }
   const { all, view } = link(mod, imports);
   return view(new WebAssembly.Instance(mod, all));
 };
 
+/** WebCrypto fills at most this much per `getRandomValues` call. */
+const RANDOM_DRAW_BYTES = 65536;
+
+/** `n` bytes from the platform CSPRNG (WebCrypto, on Node and in browsers): the entropy
+ *  the host's crypto draws for libsodium's `randombytes_buf`, whose wasm build would
+ *  otherwise draw one byte per call, and for ML-DSA-65's signing hedge. */
+export function randomBytes(n: number): Uint8Array {
+  const out = new Uint8Array(n);
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (!c?.getRandomValues) throw new Error("platform: no CSPRNG (globalThis.crypto.getRandomValues) available");
+  for (let at = 0; at < n; at += RANDOM_DRAW_BYTES) c.getRandomValues(out.subarray(at, at + RANDOM_DRAW_BYTES));
+  return out;
+}
+
 // ── the platform ─────────────────────────────────────────────────────────────
 
 /** The bridge members the Node and browser platforms share. */
 export type WebBridge = Pick<PlatformBridge,
-  | "random" | "buildModules" | "callModule" | "disposeModules"
+  | "random" | "modules"
   | "engineInstantiate" | "engineExport" | "engineCall" | "engineGlobal" | "engineGrow"
   | "engineRead" | "engineView" | "engineWrite" | "engineDispose">;
 
@@ -117,7 +116,7 @@ export type WebBridge = Pick<PlatformBridge,
  *  release of every module and instance they hold. */
 export function webBridge(): { bridge: WebBridge; teardown(): void } {
   const moduleTable = new ModuleTable();
-  const slots = new Map<string, PureModules>();
+  const built = new Set<PureModules>();
   const engines = new Map<number, { instance: EngineInstance; fns: EngineExport[] }>();
   let engineSeq = 0;
   const engineOf = (id: number) => {
@@ -128,17 +127,13 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
   return {
     bridge: {
       random: randomBytes,
-      async buildModules(slot, mods) {
-        slots.set(slot, await moduleTable.build(mods));
-      },
       // Each module in a worker of its own (module-table.ts), the only way V8 stops a call.
-      async callModule(slot, module, payload, deadlineMs) {
-        const mods = slots.get(slot);
-        return mods ? mods.call(module, payload, deadlineMs < 0 ? Infinity : deadlineMs) : { bytes: null, ms: 0 };
-      },
-      disposeModules(slot) {
-        slots.get(slot)?.dispose();
-        slots.delete(slot);
+      modules: {
+        async build(mods) {
+          const m = await moduleTable.build(mods);
+          built.add(m);
+          return { call: m.call, dispose() { built.delete(m); m.dispose(); } };
+        },
       },
       engineInstantiate(wasm, imports) {
         engines.set(++engineSeq, { instance: syncWebEngine(wasm, imports), fns: [] });
@@ -148,7 +143,9 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
         const e = engineOf(id);
         return e.fns.push(e.instance.exported(name)) - 1;
       },
-      engineCall: (id, fn, ...args) => engineOf(id).fns[fn](...args),
+      // A fixed arity, as platform.ts calls it, rather than a rest array per call.
+      engineCall: (id, fn, a, b, c, d, e, f, g, h, i, j, k, l) =>
+        engineOf(id).fns[fn](a, b, c, d, e, f, g, h, i, j, k, l),
       engineGlobal: (id, name) => engineOf(id).instance.global(name),
       engineGrow: (id, pages) => engineOf(id).instance.grow(pages),
       engineRead: (id, ptr, len) => engineOf(id).instance.read(ptr, len),
@@ -157,8 +154,8 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
       engineDispose: (id) => { engines.delete(id); },
     },
     teardown() {
-      for (const mods of slots.values()) mods.dispose();
-      slots.clear();
+      for (const m of built) m.dispose();
+      built.clear();
       engines.clear();
     },
   };

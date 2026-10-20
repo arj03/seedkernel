@@ -7,8 +7,6 @@ import { readFileSync } from "node:fs";
 import { nodePlatform } from "./platform-node.js";
 import { platformHost, tcpChannels } from "./platform.js";
 import { type ChannelFactory } from "../services/socket-seam.js";
-import { type RawDatagrams } from "../services/datagrams.js";
-import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { type AppHandle, type InstallOptions, type Shell } from "./shell-core.js";
 import { type Fs } from "../services/fs.js";
 import { type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
@@ -51,6 +49,4 @@ export function nodeChannels(): ChannelFactory {
 
 /** Node's datagram sockets, the `transport.datagrams` option for a caller that assembles a
  *  node with `bootShell` itself: the transport runs its UDP paths over them (§12.7). */
-export function nodeDatagrams(): RawDatagrams {
-  return nodeRawDatagrams();
-}
+export { nodeRawDatagrams as nodeDatagrams } from "../services/datagrams-node.js";

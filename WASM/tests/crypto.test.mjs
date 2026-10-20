@@ -14,7 +14,7 @@ import {
   sodium, root, toHex, concatBytes, hybridAuthorId, verifyTestBundle, verifyBundle,
   signTestBundle, authorBundle, testAuthor, testHost, installBundle,
   GUEST_TEXT, GUEST_BYTES, forwarderBytes,
-  JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, imp,
+  JsModuleLoader, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, imp,
 } from "./fixtures.mjs";
 
 const { ok, assertEqual, summary } = testkit({ verbose: false });
@@ -102,7 +102,6 @@ async function testMlDsaAcvpVectors() {
   console.log("Test: ML-DSA-65 ACVP known-answer vectors (FIPS 204, external/pure)");
   const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mldsa65-acvp.json"), "utf8"));
   const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
-  const mldsa = await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm")));
 
   // The vectors use FIPS 204 context strings; the runtime always signs with an empty one
   // (§12.4), so the raw module is called through the low-level entry the adapter wraps.
@@ -142,18 +141,18 @@ async function testMlDsaAcvpVectors() {
   // module: a wrapper passing a stray context byte would still pass every vector above.
   {
     const seed = new Uint8Array(32).fill(9);
-    const kp = mldsa.ml_dsa65_keypair_from_seed(seed);
+    const kp = sodium.ml_dsa65_keypair_from_seed(seed);
     assertEqual(kp.publicKey.length, ML_DSA65_PK_LEN, "keygen returns a full-width public key");
     const msg = new TextEncoder().encode("adapter path");
-    const sig = mldsa.ml_dsa65_sign_detached(msg, kp.privateKey);
-    assert(mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
+    const sig = sodium.ml_dsa65_sign_detached(msg, kp.privateKey);
+    assert(sodium.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
     top = base;
     const sp = put(sig), mp = put(msg), pp = put(kp.publicKey);
     assertEqual(e.mldsa65_verify(sp, mp, msg.length, 0, 0, pp), 1,
       "the raw module verifies what the adapter signed, with an empty context");
     sig[0] ^= 1;
-    assert(!mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
-    assert(!mldsa.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
+    assert(!sodium.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
+    assert(!sodium.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
       "a wrong-width signature is false, not a throw");
   }
 

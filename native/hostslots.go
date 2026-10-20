@@ -114,15 +114,6 @@ func (l *loader) call(expr string, args ...any) (string, []byte, error) {
 	return v.String(), nil, nil
 }
 
-// choose picks the blob the next boot runs: genesis unless the loader names another.
-func (l *loader) choose(genesis []byte) ([]byte, error) {
-	_, blob, err := l.call(`__loader.choose()`)
-	if blob == nil && err == nil {
-		return genesis, nil
-	}
-	return blob, err
-}
-
 // failed reports whether a failure belongs to a pending host, which is then dropped: the
 // caller boots the committed host instead of giving up.
 func (l *loader) failed(err error) bool {

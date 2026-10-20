@@ -4,16 +4,14 @@
 
 import type { Fs, FsStat } from "./fs.js";
 import { FS_AVAILABLE_UNKNOWN } from "./fs.js";
-
-/** Bytes a platform hands over; either form is the caller's to keep. */
-type Bytes = ArrayBuffer | Uint8Array;
-type Maybe<T> = T | Promise<T>;
+import { u8, type Bytes, type Maybe } from "./util.js";
 
 /** Whole files by path, as a platform offers them (host/abi.ts `PlatformFs`). */
 export interface RawFiles {
   /** Create a directory and its parents. */
   mkdir(dir: string): Maybe<void>;
-  /** A whole file, or `null` when it is absent or larger than `maxBytes`. */
+  /** A whole file, or `null` when it is absent. One larger than `maxBytes`, or one that
+   *  cannot be read, throws. */
   read(path: string, maxBytes: number): Maybe<Bytes | null>;
   /** Write a whole file atomically, through a sibling temp file whose name starts with
    *  `~`; a crash can leave that file behind. */
@@ -35,8 +33,6 @@ const TMP_PREFIX = "~";
  *  DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES), so a bigger file planted in the store is never
  *  read into memory. */
 const MAX_VALUE_BYTES = 16 << 20;
-
-const u8 = (b: Bytes): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
 
 export class FilesFs implements Fs {
   private used = 0;

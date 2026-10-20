@@ -1,7 +1,11 @@
 // Offline app-bundle authoring (§12.4). A running host imports only bundle.ts, which cannot
 // sign or pack; this module reuses the verifier's manifest validation so an author cannot
 // sign what install would refuse.
-import { concatBytes, enc } from "../services/util.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { concatBytes, enc, fromHex, toHex } from "../services/util.js";
+import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
+import { randomBytes, syncWebEngine } from "../host/platform-web.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
 import { callerOf, readOp, writeOp } from "../services/op-frame.js";
 import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
@@ -60,6 +64,27 @@ export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Ar
     mlDsa: sodium.ml_dsa65_keypair_from_seed(
       sodium.crypto_generichash(32, concatBytes([seed, AUTHOR_MLDSA_SEED_LABEL]), null)),
   };
+}
+
+/** A build script's author: the host's crypto over the package's wasm, and the key set from
+ *  `--key <hex seed>` in `argv`, else from `keyFile` under `root`, which the first build
+ *  writes, so each clone has its own author (§12.5). Both halves derive from the seed. */
+export function buildAuthor(root: string, keyFile: string, argv: string[]): { sodium: HostSodium; keys: HybridAuthorKeys } {
+  const sodium = engineSodium(syncWebEngine, readFileSync(join(root, "browser", "libsodium.wasm")),
+    readFileSync(join(root, "browser", "mldsa65.wasm")), randomBytes);
+  const flag = argv.indexOf("--key");
+  const keyPath = join(root, keyFile);
+  let seed: Uint8Array;
+  if (flag >= 0 && argv[flag + 1]) {
+    seed = fromHex(argv[flag + 1]);
+  } else if (existsSync(keyPath)) {
+    seed = fromHex(readFileSync(keyPath, "utf8").trim());
+  } else {
+    seed = randomBytes(32);
+    writeFileSync(keyPath, toHex(seed) + "\n", { mode: 0o600 });
+    console.log(`  wrote ${keyFile} (keep it; this clone's builds are signed by it)`);
+  }
+  return { sodium, keys: hybridAuthorKeysFromSeed(sodium, seed) };
 }
 
 /** Frame parts as a signed body: each a u32 big-endian byte count, then the bytes, all

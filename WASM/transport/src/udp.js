@@ -122,9 +122,7 @@ function isStun(msg) {
 /** The `host:port` a Binding success for `txn` names, or null for anything else. */
 function mappedAddress(msg, txn) {
   if (readU16BE(msg, 0) !== STUN_BINDING_SUCCESS || readU16BE(msg, 2) !== msg.length - 20) return null;
-  for (let i = 0; i < 12; i++) {
-    if (msg[8 + i] !== txn[i]) return null;
-  }
+  if (bytesCompare(msg.subarray(8, 20), txn) !== 0) return null;
   for (let at = 20; at + 4 <= msg.length; at += 4 + ((readU16BE(msg, at + 2) + 3) & ~3)) {
     const len = readU16BE(msg, at + 2);
     if (at + 4 + len > msg.length) return null;
@@ -470,15 +468,6 @@ class UdpNegotiation {
     return p;
   }
 
-  /** Whether `echoed` is `challenge`, by default this end's own, so an ack answers a probe
-   *  this end sent. */
-  echoes(echoed, challenge = this.challenge) {
-    for (let i = 0; i < 8; i++) {
-      if (echoed[i] !== challenge[i]) return false;
-    }
-    return true;
-  }
-
   /** Start the probe rounds, once there is someone to probe. */
   probe() {
     if (this.dead || this.path || this.roundAt < Infinity || !this.peerToken || this.peerCandidates.length === 0) return;
@@ -569,7 +558,7 @@ class UdpNegotiation {
       if (p.length !== PROBE_ACK_BYTES) return;
       const echoed = p.subarray(1 + TOKEN);
       if (this.path) this.moved(host, port, echoed);
-      else if (this.echoes(echoed)) this.choose(id, host, port);
+      else if (bytesCompare(echoed, this.challenge) === 0) this.choose(id, host, port);
     } else if (this.path) {
       // The data link, once there is one: the way back, the peer having moved, or the path.
       if (host === this.path.host && port === this.path.port) this.pathHeard = now();
@@ -621,7 +610,7 @@ class UdpNegotiation {
   moved(host, port, echoed) {
     const m = this.moving;
     if (!m || m.addr.host !== host || m.addr.port !== port || m.heard < this.pathHeard) return;
-    if (!this.echoes(echoed, m.challenge)) return;
+    if (bytesCompare(echoed, m.challenge) !== 0) return;
     this.moving = null;
     this.path = m.addr;
     this.pathHeard = m.heard;
@@ -638,8 +627,8 @@ class UdpNegotiation {
     this.keepOnly(id);
     this.stopPunching();
     const token = this.peerToken;
-    // No round-trip time is passed: the peer's own clock is not trusted for it, and the
-    // stream's first data acks measure the path.
+    // The stream starts with no round-trip time: the peer's clock is not trusted for one,
+    // and its first data acks measure the path.
     this.data.start((p) => {
       p.set(token, 1);
       udp.sendto(this.socket, this.path, p);

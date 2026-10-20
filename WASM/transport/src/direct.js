@@ -236,10 +236,7 @@ class HostNegotiation {
   start() {}
 
   down(tag, text) {
-    const body = utf8Encode(text);
-    const msg = new Uint8Array(1 + body.length);
-    msg[0] = tag;
-    msg.set(body, 1);
+    const msg = concatBytes([Uint8Array.of(tag), utf8Encode(text)]);
     try { void netLinkSend(this.linkId, msg).catch(() => {}); } catch { /* budget: the negotiation times out */ }
   }
 

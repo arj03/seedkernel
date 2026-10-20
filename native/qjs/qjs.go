@@ -125,7 +125,7 @@ func New(wasm []byte, opts ...Option) (rt *Runtime, err error) {
 		}
 	}()
 	// Each runtime compiles its own module; the shared cache keeps that cheap.
-	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
+	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(SharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
 	// A GoModuleFunc: WithFunc's reflection cost ~1µs per JS→Go call.
@@ -186,12 +186,9 @@ var (
 	cache     wazero.CompilationCache
 )
 
-// sharedCache returns the process-wide compilation cache.
 // SharedCache is the process-wide compilation cache, for an embedder that instantiates
 // qjs.wasm itself and should share the compiled engine.
-func SharedCache() wazero.CompilationCache { return sharedCache() }
-
-func sharedCache() wazero.CompilationCache {
+func SharedCache() wazero.CompilationCache {
 	cacheOnce.Do(func() { cache = wazero.NewCompilationCache() })
 	return cache
 }

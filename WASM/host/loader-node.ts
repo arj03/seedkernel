@@ -56,7 +56,7 @@ async function bootHost(): Promise<void> {
   for (;;) {
     let up: boolean;
     try {
-      up = await runHost(loader.choose() ?? genesis);
+      up = await runHost(loader.choose());
     } catch (err) {
       teardown();
       if (loader.failed(errMessage(err))) continue;

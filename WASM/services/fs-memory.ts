@@ -23,7 +23,8 @@ export function memoryRawFiles(maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES, maxEntrie
     mkdir() {},
     read(path, max) {
       const f = files.get(path);
-      return f && f.length <= max ? f.slice() : null;
+      if (f && f.length > max) throw new Error(`memory-fs: ${path} is larger than ${max} bytes`);
+      return f ? f.slice() : null;
     },
     write(path, bytes) {
       const previous = files.get(path);

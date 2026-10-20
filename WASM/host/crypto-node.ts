@@ -6,14 +6,14 @@
 // node. A page takes its host's crypto from the blob it is served (docs/CLIENT.md).
 
 import { readFileSync } from "node:fs";
-import { createMlDsa65, randomBytes, ML_DSA65_SEED_LEN, type MlDsa65Signer } from "./pq.js";
+import { ML_DSA65_SEED_LEN } from "./pq.js";
 import { engineSodium, type HostSodium } from "./sodium-engine.js";
-import { syncWebEngine } from "./platform-web.js";
+import { randomBytes, syncWebEngine } from "./platform-web.js";
 import { readHostBlob } from "./host-blob.js";
 import type { Keypair } from "../services/subkeys.js";
 
-/** The host's crypto, and the ML-DSA-65 signing half a bundle author needs (§12.4). */
-export type HostCrypto = HostSodium & MlDsa65Signer;
+/** The host's crypto, the ML-DSA-65 signing half a bundle author needs (§12.4) included. */
+export type HostCrypto = HostSodium;
 
 let packageHost: Uint8Array | undefined;
 /** The host blob this package was built with (scripts/build-host-blob.mjs). */
@@ -24,14 +24,7 @@ let crypto: HostCrypto | undefined;
 function hostCrypto(): HostCrypto {
   if (crypto) return crypto;
   const parts = readHostBlob(packageHostBlob());
-  // The host verifies with its own instance; signing, which no host does, gets another
-  // instance of the same module.
-  const signer = createMlDsa65(new WebAssembly.Instance(new WebAssembly.Module(parts.mldsa as BufferSource), {}));
-  crypto = {
-    ...engineSodium(syncWebEngine, parts.sodium, parts.mldsa, randomBytes),
-    ml_dsa65_sign_detached: signer.ml_dsa65_sign_detached,
-    ml_dsa65_keypair_from_seed: signer.ml_dsa65_keypair_from_seed,
-  };
+  crypto = engineSodium(syncWebEngine, parts.sodium, parts.mldsa, randomBytes);
   return crypto;
 }
 

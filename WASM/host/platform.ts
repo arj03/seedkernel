@@ -22,12 +22,12 @@ import {
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE } from "./wasm-limits.js";
-import { enc, errMessage } from "../services/util.js";
+import { enc, errMessage, u8 } from "../services/util.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
   PLATFORM_ABI,
-  type Bytes, type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
+  type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
   type PlatformUdp,
 } from "./abi.js";
 
@@ -55,9 +55,6 @@ export interface PlatformHost extends PlatformDispatchers {
   /** A node's private modules (§4). */
   modules: PureModuleLoader;
 }
-
-/** Bytes as a Uint8Array, without a copy when they already are one. */
-const u8 = (b: Bytes): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
 
 /** A deadline as the ABI carries it: `Infinity` as -1, omitted as the shared default. */
 const abiMs = (ms: number | undefined): number =>
@@ -240,22 +237,8 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
       };
     },
   };
-  /** Private modules in the loader's own isolates, over opaque slot names. */
-  let moduleSlotSeq = 0;
-  const isolatedModules: PureModuleLoader = {
-    async build(mods) {
-      const slot = `slot:${++moduleSlotSeq}`;
-      await bridge.buildModules!(slot, mods);
-      return {
-        async call(module, payload, deadlineMs) {
-          const { bytes, ms } = await bridge.callModule!(slot, module, payload, abiMs(deadlineMs));
-          return { bytes: bytes === null ? null : u8(bytes), ms };
-        },
-        dispose() { bridge.disposeModules!(slot); },
-      };
-    },
-  };
-  const modules = bridge.engineCallBounded ? engineModules : isolatedModules;
+  // Otherwise private modules in the loader's own isolates.
+  const modules = bridge.engineCallBounded ? engineModules : bridge.modules!;
   /** `CliFiles` over the platform's operator files. A read throws for anything but a
    *  missing file; a write throws when it fails, which `FreshnessMarks` relies on to roll
    *  back. */
@@ -272,7 +255,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     return tcp;
   };
   const createRealm: RealmFactory = (opts) =>
-    engineRealms(engine, hostParts.qjs, { billModules: modules === isolatedModules })(opts);
+    engineRealms(engine, hostParts.qjs, { billModules: !bridge.engineCallBounded })(opts);
 
   async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
     const admit = cfg.admit ?? policyFromJson(cfg.policyJson);

@@ -11,13 +11,14 @@
 import type { EngineExport, EngineInstance, EngineImports } from "./engine-realm.js";
 import type { Keypair } from "../services/subkeys.js";
 import type { ShellSodium } from "./shell-core.js";
-import { ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, ML_DSA65_SK_LEN } from "./pq.js";
+import { createMlDsa65, type MlDsa65Signer } from "./pq.js";
 
 /** An engine table that instantiates synchronously, as every loader's does. */
 export type SyncEngine = (wasm: Uint8Array, imports: EngineImports) => EngineInstance;
 
-/** `ShellSodium` plus the keypair producers a node's identity comes from. */
-export interface HostSodium extends ShellSodium {
+/** `ShellSodium` plus the keypair producers a node's identity comes from, and the ML-DSA-65
+ *  signing half a bundle author needs (§12.4). */
+export interface HostSodium extends ShellSodium, MlDsa65Signer {
   crypto_sign_keypair(): Keypair;
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
@@ -40,7 +41,7 @@ const RAND_U32 = 40216, RAND_INIT = 40252;
 const AEAD_TAG = 16;
 const PAGE = 65536;
 
-/** libsodium plus the ML-DSA-65 verifier over `engine`. `random` is the platform CSPRNG. */
+/** libsodium plus ML-DSA-65 over `engine`. `random` is the platform CSPRNG. */
 export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWasm: Uint8Array,
   random: (n: number) => Uint8Array): HostSodium {
   // ── libsodium ──
@@ -94,23 +95,8 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
     return { publicKey: both.slice(0, 32), privateKey: both.slice(32) };
   };
 
-  // ── ML-DSA-65 ──
-  const pq = engine(mldsaWasm, {});
-  const mldsaVerify = pq.exported("mldsa65_verify");
-  const widths: [string, number, number][] = [
-    ["public key", pq.exported("mldsa65_publickeybytes")(), ML_DSA65_PK_LEN],
-    ["secret key", pq.exported("mldsa65_secretkeybytes")(), ML_DSA65_SK_LEN],
-    ["signature", pq.exported("mldsa65_signaturebytes")(), ML_DSA65_SIG_LEN],
-  ];
-  for (const [what, got, want] of widths) {
-    if (got !== want) throw new Error(`pq: mldsa65.wasm reports ${what} width ${got}, expected ${want}`);
-  }
-  // The module never allocates and keeps nothing between calls, so its inputs go on its
-  // heap, from the base each time.
-  const pqBase = pq.global("__heap_base");
-  if (pqBase === null) throw new Error("pq: mldsa65.wasm exports no __heap_base");
-
   return {
+    ...createMlDsa65(engine(mldsaWasm, {}), random),
     // [out len][key][message]
     crypto_generichash(len, message, key) {
       const keyLen = key ? key.length : 0;
@@ -189,19 +175,5 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
       return lib.read(out, n);
     },
     randombytes_buf: random,
-    // [sig][pk][message], from the heap base each time.
-    ml_dsa65_verify_detached(sig, message, pk) {
-      // Never throws: a wrong-width key or signature is just invalid, as for Ed25519.
-      if (sig.length !== ML_DSA65_SIG_LEN || pk.length !== ML_DSA65_PK_LEN) return false;
-      const k = pqBase + ML_DSA65_SIG_LEN, m = k + ML_DSA65_PK_LEN;
-      const short = m + message.length - pq.grow(0) * PAGE;
-      if (short > 0 && pq.grow(Math.ceil(short / PAGE)) < 0) return false;
-      pq.write(pqBase, sig);
-      pq.write(k, pk);
-      if (message.length > 0) pq.write(m, message);
-      // ctx = (0, 0): the runtime signs with an empty FIPS 204 context; its domain separation
-      // is inside the preimage (§16.1).
-      return mldsaVerify(pqBase, m, message.length, 0, 0, k) === 1;
-    },
   };
 }

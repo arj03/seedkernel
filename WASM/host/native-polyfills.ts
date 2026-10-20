@@ -6,20 +6,9 @@
 // time (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
 
 /** The `bridge` members this file uses (abi.ts declares the whole of it). */
-declare const bridge: { log(line: string): void; random(n: number): ArrayBuffer | Uint8Array };
+declare const bridge: { log(line: string): void };
 
-const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown; crypto?: unknown };
-
-// crypto.getRandomValues, Web Crypto's entropy call, which ML-DSA's hedged signing draws
-// from (pq.ts); the loader's CSPRNG serves it.
-if (web.crypto === undefined) {
-  web.crypto = {
-    getRandomValues<T extends ArrayBufferView>(a: T): T {
-      new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(new Uint8Array(bridge.random(a.byteLength)));
-      return a;
-    },
-  };
-}
+const web = globalThis as { TextEncoder?: unknown; TextDecoder?: unknown; console?: unknown };
 
 if (web.TextEncoder === undefined) {
   web.TextEncoder = class TextEncoder {
