@@ -143,9 +143,11 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  *  convention (`_net`), not a reservation. */
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 
-/** Both keys sign `DOMAIN_manifest ‖ suite ‖ keys ‖ BLAKE2b-256(body)`. */
-export function bundleSigningInput(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array, body: Uint8Array): Uint8Array {
-  return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, genesisHash(sodium, body)]);
+/** Both keys sign `domain ‖ suite ‖ keys ‖ BLAKE2b-256(body)`: `DOMAIN_manifest` for an
+ *  app bundle, `DOMAIN_host` for a host blob. */
+export function envelopeSigningInput(sodium: ManifestVerifier, domain: Uint8Array, edPk: Uint8Array,
+  mlDsaPk: Uint8Array, body: Uint8Array): Uint8Array {
+  return concatBytes([domain, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, genesisHash(sodium, body)]);
 }
 
 /** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. */
@@ -252,46 +254,72 @@ export function validateManifest(manifest: unknown): asserts manifest is BundleM
   }
 }
 
-/** Authenticate the whole bundle, then parse its body: u32 BE length-prefixed manifest
- *  JSON, guest UTF-8, then one WASM per manifest module. Returned bytes own their storage. */
-export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): VerifiedBundle {
-  if (env.length < SUITE_LEN) throw new Error("bundle: signature invalid");
-  // Suite first, since other suites have other widths. An unknown suite is reported as
-  // such, not as a bad signature; the byte is public (§14.1).
-  const suite = env[0];
-  if (suite !== SUITE_MANIFEST_HYBRID_PQ) {
-    throw new Error(`bundle: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
-  }
+/** What an authenticated envelope carries: its author and the signed body. */
+export interface VerifiedEnvelope {
+  author: Uint8Array;
+  authorKeys: ManifestAuthorKeys;
+  body: Uint8Array;
+}
+
+/** Authenticate a suite 0x02 envelope signed under `domain`; errors name `what` it is. */
+export function verifyEnvelope(sodium: ManifestVerifier, env: Uint8Array, domain: Uint8Array,
+  what: string): VerifiedEnvelope {
   // Never fall back to Ed25519 alone: that is the downgrade the suite exists to prevent.
-  if (!sodium.ml_dsa65_verify_detached) {
-    throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
+  if (env[0] === SUITE_MANIFEST_HYBRID_PQ && !sodium.ml_dsa65_verify_detached) {
+    throw new Error(`${what}: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier`);
   }
-  if (env.length < OFF_BODY) throw new Error("bundle: signature invalid");
+  const body = envelopeBody(env, what);
   // Only the keys outlive this call (`authorKeys`), so only they are copied. A Node
   // Buffer's slice() aliases.
   const edPk = new Uint8Array(env.subarray(OFF_ED_PK, OFF_ML_PK));
   const mlPk = new Uint8Array(env.subarray(OFF_ML_PK, OFF_ED_SIG));
   const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
   const mlSig = env.slice(OFF_ML_SIG, OFF_BODY);
-  const body = env.subarray(OFF_BODY);
-  const pre = bundleSigningInput(sodium, edPk, mlPk, body);
-  // Always check both, so a broken half rejects valid bundles instead of admitting forged ones.
-  if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk)) throw new Error("bundle: signature invalid");
-  if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk)) throw new Error("bundle: signature invalid");
-  const author = hybridAuthorId(sodium, edPk, mlPk);
-  const authorKeys = { ed: edPk, mlDsa: mlPk };
-  // Lengths and JSON are interpreted only after both signatures authenticate the body.
+  const pre = envelopeSigningInput(sodium, domain, edPk, mlPk, body);
+  // Always check both, so a broken half rejects valid ones instead of admitting forged ones.
+  if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk)) throw new Error(`${what}: signature invalid`);
+  if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk)) throw new Error(`${what}: signature invalid`);
+  return { author: hybridAuthorId(sodium, edPk, mlPk), authorKeys: { ed: edPk, mlDsa: mlPk }, body };
+}
+
+/** A suite 0x02 envelope's body, unauthenticated: what a loader reads of a host blob, whose
+ *  signatures the host that staged it checked (§12.9). */
+export function envelopeBody(env: Uint8Array, what: string): Uint8Array {
+  if (env.length < SUITE_LEN) throw new Error(`${what}: signature invalid`);
+  // Suite first, since other suites have other widths. An unknown suite is reported as
+  // such, not as a bad signature; the byte is public (§14.1).
+  if (env[0] !== SUITE_MANIFEST_HYBRID_PQ) {
+    throw new Error(`${what}: unsupported manifest suite 0x${env[0].toString(16).padStart(2, "0")}`);
+  }
+  if (env.length < OFF_BODY) throw new Error(`${what}: signature invalid`);
+  return env.subarray(OFF_BODY);
+}
+
+/** A body's u32 big-endian length-prefixed parts, read in order. A bundle's lengths are
+ *  interpreted only after the signatures over them authenticate. */
+export function bodyReader(body: Uint8Array, what: string): { next(): Uint8Array; done(): boolean } {
   const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
   let off = 0;
-  const read = () => {
-    if (off + 4 > body.length) throw new Error("bundle: truncated body");
-    const length = dv.getUint32(off, false);
-    off += 4;
-    if (length > body.length - off) throw new Error("bundle: truncated body");
-    const bytes = body.subarray(off, off + length);
-    off += length;
-    return bytes;
+  return {
+    next() {
+      if (off + 4 > body.length) throw new Error(`${what}: truncated body`);
+      const length = dv.getUint32(off, false);
+      off += 4;
+      if (length > body.length - off) throw new Error(`${what}: truncated body`);
+      const bytes = body.subarray(off, off + length);
+      off += length;
+      return bytes;
+    },
+    done: () => off === body.length,
   };
+}
+
+/** Authenticate the whole bundle, then parse its body: u32 BE length-prefixed manifest
+ *  JSON, guest UTF-8, then one WASM per manifest module. Returned bytes own their storage. */
+export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): VerifiedBundle {
+  const { author, authorKeys, body } = verifyEnvelope(sodium, env, DOMAIN_MANIFEST, "bundle");
+  const parts = bodyReader(body, "bundle");
+  const read = () => parts.next();
   const json = read();
   let parsed;
   try {
@@ -307,7 +335,7 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
   validateManifest(parsed);
   const guestSource = dec.decode(read());
   const modules = parsed.modules.map((mod) => ({ mod, wasm: new Uint8Array(read()) }));
-  if (off !== body.length) throw new Error("bundle: trailing bytes in body");
+  if (!parts.done()) throw new Error("bundle: trailing bytes in body");
   return { author, authorKeys, manifest: parsed, guestSource, modules };
 }
 

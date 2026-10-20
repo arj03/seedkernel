@@ -1,6 +1,7 @@
 // The bundle, shell and host scaffolding the test suites share: sodium init, the author
 // and guest fixtures, and the test-only module host.
 
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -15,9 +16,8 @@ export const { bootShell } = await imp("build/host/shell-core.js");
 export const { bootNodeShell } = await imp("build/host/shell-node.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 
-// The host's already-readied instance, not a separate copy: libsodium-wrappers has
-// separate "import" and "require" builds, so a require() here would return a second
-// instance with its own wasm heap that nothing awaits .ready on.
+// The host's crypto from the package's host blob, ML-DSA-65 signing included, which the
+// hybrid manifest suite needs (§12.4).
 export const sodium = await loadCrypto();
 
 // One contact secret for the whole harness. In production each node has its own and
@@ -45,8 +45,9 @@ export const testBackends = () => ({
   link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
 });
 export const enc = new TextEncoder();
-export const { NodeFs } = await imp("build/services/fs-node.js");
-export const { createSafeRealm } = await imp("build/host/safe-js.js");
+export const { NodeFs, nodeRawFiles } = await imp("build/services/fs-node.js");
+export const { FilesFs } = await imp("build/services/fs-files.js");
+export const { createWebRealm } = await imp("build/host/engine-web.js");
 export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
 export { bytesEqual } from "./bytes.mjs";
 
@@ -55,7 +56,7 @@ export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
 export const { guestOpFraming, authorBundle } = await imp("build/scripts/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
-export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
+export const { ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 
 // Every app is a guest (§12.4), so every test bundle declares one. Tests that do not
 // exercise the guest use this minimal program.
@@ -151,9 +152,27 @@ export async function makeHost() {
 
 export const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
-// Add ML-DSA-65 to the test instance as a target does at its crypto seam; the hybrid
-// manifest suite needs a sodium with this method (§12.4).
-withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
+/** Run the Node loader (host/loader-node.ts) as a process on `stdin`. `until` resolves with
+ *  the first match of a pattern in its stderr, and `log` reads the stderr so far. */
+export function spawnLoader(args, { cwd, env, stdin } = {}) {
+  const child = spawn(process.execPath, [join(root, "build/host/loader-node.js"), ...args], { cwd, env });
+  let err = "";
+  const out = [];
+  child.stderr.on("data", (b) => { err += b; });
+  child.stdout.on("data", (b) => { out.push(b); });
+  child.stdin.end(stdin ?? Buffer.alloc(0));
+  const until = (re) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`no ${re} in:\n${err}`)), 20000);
+    const look = () => {
+      const m = err.match(re);
+      if (m) { clearTimeout(t); resolve(m); }
+    };
+    child.stderr.on("data", look);
+    look();
+  });
+  const exit = new Promise((resolve) => child.on("exit", (code) => resolve({ code, out: Buffer.concat(out), err })));
+  return { child, until, exit, log: () => err };
+}
 
 // Install one verified module as `app`'s whole module set. Async, since each module
 // starts in its own worker and this returns once it has loaded.

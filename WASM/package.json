@@ -1,16 +1,13 @@
 {
   "name": "seedkernel-wasm",
   "version": "0.2.0",
+  "hostVersion": 1,
   "private": true,
   "type": "module",
   "exports": {
     ".": {
       "types": "./build/host/crypto-node.d.ts",
       "default": "./build/host/crypto-node.js"
-    },
-    "./net-node": {
-      "types": "./build/services/net-node.d.ts",
-      "default": "./build/services/net-node.js"
     },
     "./peer-addr": {
       "types": "./build/services/peer-addr.d.ts",
@@ -23,10 +20,6 @@
     "./net-rtc": {
       "types": "./build/services/net-rtc.d.ts",
       "default": "./build/services/net-rtc.js"
-    },
-    "./net-udp": {
-      "types": "./build/services/udp/net-udp.d.ts",
-      "default": "./build/services/udp/net-udp.js"
     },
     "./net-ws": {
       "types": "./build/services/net-ws.d.ts",
@@ -60,13 +53,18 @@
       "types": "./build/host/shell-core.d.ts",
       "default": "./build/host/shell-core.js"
     },
+    "./platform": {
+      "types": "./build/host/platform.d.ts",
+      "default": "./build/host/platform.js"
+    },
+    "./platform-web": {
+      "types": "./build/host/platform-web.d.ts",
+      "default": "./build/host/platform-web.js"
+    },
+    "./host.skb": "./build/host.skb",
     "./transport-bundle": {
       "types": "./build/host/transport-bundle.d.ts",
       "default": "./build/host/transport-bundle.js"
-    },
-    "./crypto-browser": {
-      "types": "./build/host/crypto-browser.d.ts",
-      "default": "./build/host/crypto-browser.js"
     },
     "./bundle": {
       "types": "./build/host/bundle.d.ts",
@@ -75,36 +73,30 @@
     "./bundle-author": {
       "types": "./build/scripts/bundle-author.d.ts",
       "default": "./build/scripts/bundle-author.js"
-    },
-    "./quickjs": {
-      "types": "./quickjs/dist/variant.d.mts",
-      "default": "./quickjs/dist/variant.mjs"
-    },
-    "./libsodium": "./browser/libsodium-wrappers.mjs"
+    }
   },
   "scripts": {
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
     "build:host": "node scripts/prune-build.mjs && tsc -p .",
     "build:host:min": "node scripts/minify.mjs",
-    "build:native-host": "node scripts/bundle-native-host.mjs ../native/host-shell.gen.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,isService,toHex,fromHex,freshnessPathFor,fs,sodium,deriveNodeKey,verifyBundle,validateManifest,transportBundleBytes,linkSignScope,HOST_SERVICES,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,SUITE_MANIFEST_HYBRID_PQ,nativeChannels,nativeDatagrams,combineChannels\" build/host/native-polyfills.js build/services/util.js build/services/op-frame.js build/services/domains.js build/host/wasm-limits.js build/services/net-limits.js build/services/fs.js build/services/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/host/realm-timers.js build/host/fs-view.js build/host/slot-table.js build/services/socket-seam.js build/services/udp/stun.js build/services/udp/stream.js build/services/udp/net-udp.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/services/peer-addr.js build/host/cli.js build/host/native-shim.js",
-    "build:native-wasm": "npm run build:ws && npm run build:browser-sodium && npm run build:pq && node scripts/copy-native-wasm.mjs",
-    "build:native": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:native-host && npm run build:native-wasm",
+    "build:native": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:native-host",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build:pq": "node scripts/build-mldsa.mjs && node scripts/build-mlkem.mjs",
-    "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host:min",
+    "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host-script && npm run build:loader-script && npm run build:host-blob && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium && npm run build:pq",
-    "shell": "node build/host/main-node.js",
+    "shell": "node build/host/loader-node.js",
     "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release && asc tests/fixtures/scratch-probe.ts --config asconfig.scratch-probe.json --target release",
-    "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/cli.test.mjs && node tests/transport-link.test.mjs && node tests/transport-load.test.mjs && node tests/transport.test.mjs && node tests/transport-tcp.test.mjs && node tests/ws-framing.test.mjs && node tests/transport-bundle.test.mjs && node tests/net-rtc.test.mjs && node tests/net-udp.test.mjs && node tests/transport-relay.test.mjs && node tests/bundle-install.test.mjs && node tests/bundle-replacement.test.mjs && node tests/realm-guest.test.mjs && node tests/crypto.test.mjs",
+    "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/cli.test.mjs && node tests/loader-node.test.mjs && node tests/host-updates.test.mjs && node tests/transport-link.test.mjs && node tests/transport-load.test.mjs && node tests/transport.test.mjs && node tests/transport-tcp.test.mjs && node tests/ws-framing.test.mjs && node tests/transport-bundle.test.mjs && node tests/net-rtc.test.mjs && node tests/net-udp.test.mjs && node tests/transport-relay.test.mjs && node tests/bundle-install.test.mjs && node tests/bundle-replacement.test.mjs && node tests/realm-guest.test.mjs && node tests/crypto.test.mjs",
     "test:load": "npm run build && node tests/transport-load.test.mjs",
     "loc": "node scripts/loc.mjs",
-    "build:transport-bundle": "tsc -p tsconfig.transport-prebuild.json && node scripts/build-transport-bundle.mjs"
-  },
-  "dependencies": {
-    "libsodium-wrappers": "0.8.4",
-    "quickjs-emscripten-core": "^0.32.0"
+    "build:transport-bundle": "tsc -p tsconfig.transport-prebuild.json && node scripts/build-transport-bundle.mjs",
+    "build:host-script": "node scripts/bundle-host.mjs build/host.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,isService,toHex,fromHex,freshnessPathFor,FilesFs,sodium,deriveNodeKey,verifyBundle,validateManifest,transportBundleBytes,linkSignScope,HOST_SERVICES,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,DOMAIN_HOST,SUITE_MANIFEST_HYBRID_PQ,platformChannels,platformModules,moduleShims,combineChannels\" build/host/native-polyfills.js build/services/util.js build/services/op-frame.js build/services/domains.js build/host/wasm-limits.js build/services/net-limits.js build/services/fs.js build/services/fs-files.js build/services/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/host/realm-timers.js build/host/fs-view.js build/host/slot-table.js build/services/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/services/peer-addr.js build/host/cli.js build/host/engine-realm.js build/host/pq.js build/host/sodium-engine.js build/host/abi.js build/host/host-blob.js build/host/pure-module.js build/host/platform.js build/host/host-main.js",
+    "build:loader-script": "node scripts/bundle-host.mjs build/loader.js \"Loader,loaderFlags,withoutOp,PLATFORM_ABI\" build/host/native-polyfills.js build/services/util.js build/services/domains.js build/host/wasm-limits.js build/host/bundle.js build/host/host-blob.js build/host/abi.js build/host/slots.js",
+    "build:native-host": "npm run build:host-script && npm run build:loader-script && npm run build:host-blob && node -e \"const f=require('fs'); f.copyFileSync('build/host.skb', '../native/host.skb'); f.copyFileSync('build/loader.js', '../native/loader.js')\"",
+    "build:host-blob": "node scripts/build-host-blob.mjs"
   },
   "devDependencies": {
+    "libsodium-wrappers": "0.8.4",
     "@types/node": "^20.11.0",
     "assemblyscript": "0.28.14",
     "typescript": "^5.4.0"

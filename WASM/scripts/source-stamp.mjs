@@ -1,7 +1,7 @@
-// What the generated native host bundle was built from: the in-repo sources behind it and
-// their hashes at build time. bundle-native-host.mjs writes this stamp into
-// native/host-shell.gen.js; the Go tests re-hash the same files and refuse an artifact
-// whose sources have changed (native/shell_stamp_test.go).
+// What the host script was built from: the in-repo sources behind it and their hashes at
+// build time. bundle-host.mjs writes this stamp into the script, which the host blob
+// carries; the Go tests re-hash the same files and refuse a genesis blob whose sources have
+// changed (native/shell_stamp_test.go).
 //
 // The artifact is generated, gitignored and never pruned, so nothing else says whether it
 // matches the checkout, and everything the native target runs goes through it, including
@@ -25,7 +25,7 @@ const wasmDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const posix = (p) => p.split(sep).join("/");
 
-/** Sources for one bundle-native-host input list, as WASM-relative posix paths, sorted.
+/** Sources for one bundle-host input list, as WASM-relative posix paths, sorted.
  *  `build/x/y.js` is tsc's output for `x/y.ts`; host/transport-bundle.ts is itself
  *  generated, so the guest parts and the ws module stand in for it. */
 export function stampedSources(buildFiles) {

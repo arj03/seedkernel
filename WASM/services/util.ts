@@ -14,6 +14,13 @@ const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
+/** A platform answer that may come now or later. */
+export type Maybe<T> = T | Promise<T>;
+/** Bytes a platform hands over; either form is the receiver's to keep. */
+export type Bytes = ArrayBuffer | Uint8Array;
+/** Bytes as a Uint8Array, without a copy when they already are one. */
+export const u8 = (b: Bytes): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
+
 /** A byte-to-digit-pair table, appended four bytes at a time. This formats every peer id,
  *  block id and key the runtime prints, and on native it runs in QuickJS, where the cost
  *  per append dominates; this shape measured fastest on both engines. The tail loop

@@ -8,15 +8,16 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import _sodium from "libsodium-wrappers";
 import { testkit, makeAuthor, importBuilt } from "./testkit.mjs";
 import { readGuestSource } from "../scripts/guest-source.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = importBuilt(root);
 
-await _sodium.ready;
-const sodium = _sodium;
+// The host's crypto, ML-DSA-65 signing included: a manifest is signed and verified with
+// both halves of the author's key set (§12.4).
+const { loadCrypto } = await imp("build/host/crypto-node.js");
+const sodium = await loadCrypto();
 
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readModuleLimits, checkModuleLimits, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
@@ -33,11 +34,6 @@ const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
-// Add ML-DSA-65 to this instance, as a target does at its crypto seam: a manifest is
-// signed and verified with both halves of the author's key set (§12.4), so plain
-// libsodium cannot sign one.
-const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
-withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 /** A manifest author: both halves of the key set, plus the 32-byte id derived from them,
  *  which policies and freshness marks use. `ed` also serves as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
@@ -52,7 +48,7 @@ const TEST_CALL_LOCAL = () => null;
 const TEST_LINK = { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) };
 const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
 const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
-const { createSafeRealm, createActiveHostCallRegistry } = await imp("build/host/safe-js.js");
+const { createWebRealm } = await imp("build/host/engine-web.js");
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
 const { ok, throws, summary, sleep } = testkit();
@@ -268,7 +264,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     `a guest that swaps the preamble's entry points for getters never runs them (${getterProbe.error?.message ?? getterProbe.stderr.trim()})`);
 
   // A guest that loops forever is interrupted instead of wedging the host thread.
-  const spinner = await createSafeRealm({
+  const spinner = await createWebRealm({
     source: 'function handle() { for(;;){} }',
     hostCall: noop, deadlineMs: 300,
   });
@@ -285,7 +281,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const slowSeam = (name) => name === "slow"
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
-  const waiter = await createSafeRealm({
+  const waiter = await createWebRealm({
     source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); }',
     hostCall: slowSeam, deadlineMs: 200,
   });
@@ -297,7 +293,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // waiting waits for it instead of interleaving, and then runs on its own budget, not on
   // what the first left (§12.3).
   const order = [];
-  const both = await createSafeRealm({
+  const both = await createWebRealm({
     source: 'async function handle(a) { if (a[0] === 1) { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); } return new Uint8Array([2]); }',
     hostCall: slowSeam, deadlineMs: 1000,
   });
@@ -311,7 +307,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // The queue does not strand callers on dispose: one still queued fails instead of
   // entering a torn-down realm, which would abort the whole wasm module.
-  const closing = await createSafeRealm({
+  const closing = await createWebRealm({
     source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); }',
     hostCall: slowSeam, deadlineMs: 5000,
   });
@@ -323,7 +319,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // The default is a real number, so omitting the field bounds the guest instead of
   // leaving it unbounded, like the seam gates above.
-  const defaulted = await createSafeRealm({ source: 'function handle() { for(;;){} }', hostCall: noop });
+  const defaulted = await createWebRealm({ source: 'function handle() { for(;;){} }', hostCall: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
   try { await defaulted.call(new Uint8Array()); } catch { defaultInterrupted = true; }
@@ -333,7 +329,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // A guest can call the preamble's reports itself: a made-up id settles nothing, and a
   // non-buffer answer fails its own invocation instead of stranding it.
-  const fake = await createSafeRealm({ source: 'function handle() { __callDone(1e9, 0); return Uint8Array.of(7); }', hostCall: noop });
+  const fake = await createWebRealm({ source: 'function handle() { __callDone(1e9, 0); return Uint8Array.of(7); }', hostCall: noop });
   ok((await fake.call(new Uint8Array()))[0] === 7, "a fake __callDone id is ignored");
   fake.dispose();
 
@@ -342,7 +338,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // the retained calls returns the allowance to the realm.
   const held = [];
   let hold = true;
-  const boundedCalls = await createSafeRealm({
+  const boundedCalls = await createWebRealm({
     source: `function handle(a) {
       if (a[0]) {
         for (let i = 0; i <= ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS}; i++)
@@ -367,7 +363,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // An answer the host already has comes back in the frame that asked for it and holds
   // nothing meanwhile: more unawaited calls than the cap all answer.
   const asked = DEFAULT_MAX_OUTSTANDING_HOST_CALLS + 44;
-  const answeredAtOnce = await createSafeRealm({
+  const answeredAtOnce = await createWebRealm({
     source: `async function handle() {
       const calls = [];
       for (let i = 0; i < ${asked}; i++) calls.push(host.call("now", new Uint8Array([i & 255])));
@@ -384,7 +380,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // Such an answer still has to fit the byte allowance beside what the realm already
   // holds. One that does not is a failed round trip: a rejection, as for a late answer.
-  const overAllowance = await createSafeRealm({
+  const overAllowance = await createWebRealm({
     source: `async function handle() {
       host.call("hold", new Uint8Array(${DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES} - 8));
       let thrown = 0, rejected = 0;
@@ -400,7 +396,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   overAllowance.dispose();
 
   const duplicateHeld = [];
-  const duplicateIds = await createSafeRealm({
+  const duplicateIds = await createWebRealm({
     source: `function handle(a) {
       __host_call("first", 77, new ArrayBuffer(1));
       if (a[0]) __host_call("second", 77, new ArrayBuffer(1));
@@ -425,7 +421,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const callsAtByteCap = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES / hostCallChunk;
   const byteHeld = [];
   let holdBytes = true;
-  const byteBoundedCalls = await createSafeRealm({
+  const byteBoundedCalls = await createWebRealm({
     source: `function handle(a) {
       if (a[0]) {
         const payload = new Uint8Array(${hostCallChunk});
@@ -450,7 +446,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // Changing only the operation name does not escape the accounting.
   const ordinaryHeld = [];
-  const ordinaryCalls = await createSafeRealm({
+  const ordinaryCalls = await createWebRealm({
     source: `function handle() {
       const payload = new Uint8Array(${hostCallChunk});
       for (let i = 0; i < ${callsAtByteCap + 1}; i++) host.call("send", payload);
@@ -504,17 +500,6 @@ console.log("\n§12.3 — guest-created invocation roots have a bounded clock sh
 
 console.log("\n§12.3 — active-call and realm-entry owners have complete lifecycle rules");
 {
-  const active = createActiveHostCallRegistry(2, 8);
-  active.admit(1, 5);
-  throws(() => active.admit(1, 0), "a registry refuses a duplicate live id");
-  active.reserve(1, 3);
-  throws(() => active.admit(2, 1), "responses awaiting delivery remain charged");
-  active.release(1);
-  throws(() => active.reserve(1, 1), "a settled call cannot reserve more against its realm");
-  active.admit(2, 8);
-  active.release(2);
-  ok(true, "terminal settlement releases request, response, id, and count together");
-
   // A realm that dies with calls still pending releases them: nothing is left to consume
   // those answers or release them later, so keeping the charge would pin the allowance on
   // a backend that never answers. Both ways a realm can die (construction failure,
@@ -523,13 +508,13 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const timersBeforeFailedConstruction = liveTimers();
   let settleOrphan;
-  await rejects(createSafeRealm({
+  await rejects(createWebRealm({
     source: 'host.call("hold", Uint8Array.of(1)); throw new Error("init failed");',
     hostCall: () => new Promise((resolve) => { settleOrphan = resolve; }),
   }), "failed realm construction reports its source error");
   ok(liveTimers() === timersBeforeFailedConstruction,
     "failed realm construction disarms host-call deadlines it can no longer own");
-  const afterFailure = await createSafeRealm({
+  const afterFailure = await createWebRealm({
     source: 'async function handle() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
     hostCall: () => new Uint8Array(),
   });
@@ -541,7 +526,7 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
     "an orphaned backend settling later is a no-op, not a second release");
 
   let settleAtDispose;
-  const disposedWithParked = await createSafeRealm({
+  const disposedWithParked = await createWebRealm({
     source: 'async function handle() { await host.call("park", Uint8Array.of(1)); return Uint8Array.of(1); }',
     hostCall: () => new Promise((resolve) => { settleAtDispose = resolve; }),
   });
@@ -636,11 +621,11 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
 
   // A deferred result keeps no fresh clock of its own: it retains the handoff deadline
   // admitted with the call, including across another realm's host.call.
-  const deferring = await createSafeRealm({
+  const deferring = await createWebRealm({
     source: 'function handle() { globalThis.__deferred = true; return new Promise(() => {}); }',
     hostCall: () => new Uint8Array(),
   });
-  const waiting = await createSafeRealm({
+  const waiting = await createWebRealm({
     source: 'function handle() { return host.call("ask", new Uint8Array()); }',
     hostCall: () => deferring.call(new Uint8Array(1), 75),
     deadlineMs: 500,
@@ -796,7 +781,7 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   // callee start module-like work without awaiting that either. The late charge must still
   // reach the wake's clock after both entrypoints have answered.
   let moduleCharged;
-  const callee = await createSafeRealm({
+  const callee = await createWebRealm({
     source: 'function handle() { void host.call("work", new Uint8Array()); return new Uint8Array(); }',
     hostCall: (_name, _payload, budget) => new Promise((resolve) => {
       setTimeout(() => {
@@ -806,7 +791,7 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       }, 10);
     }),
   });
-  const caller = await createSafeRealm({
+  const caller = await createWebRealm({
     source: `async function handle() {
       await host.call("pause", new Uint8Array());
       void host.call("callee", new Uint8Array());
@@ -977,6 +962,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(advertised.maxOutstandingHostCallBytes === DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   "the realm's host-call budget is advertised to the guest, not only enforced against it");
+  ok(advertised.deadlineMs === 5000, "so is its invocation deadline, so a guest can settle a wait before it");
   // So is the node's public key, as hex: the key `node/sign` signs with, so what a guest
   // publishes as its node and what its signatures verify under cannot disagree.
   ok(advertised.identity === toHex(kp.ed.publicKey),
@@ -987,7 +973,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 console.log("\n§12.6 — host socket send queues are bounded");
 {
   const { MessageChannel } = await imp("build/services/net-channel.js");
-  const { NodeChannelFactory } = await imp("build/services/net-node.js");
+  const { nodeChannels } = await imp("build/host/shell-node.js");
   const { TransportHost } = await imp("build/host/transport-host.js");
   const ownedChannel = (channel, limits = {}) => {
     let ownerClosed = false;
@@ -1125,7 +1111,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
   // while this synchronous loop runs, so both exact boundaries are deterministic without
   // depending on a peer or on kernel socket-buffer sizes.
   const nodeLink = () => {
-    const link = new NodeChannelFactory().connect("tcp://127.0.0.1:1");
+    const link = nodeChannels().connect("tcp://127.0.0.1:1");
     if (!link) throw new Error("node test link was not created");
     link.onClose(() => {}); // consume the expected destroy/connect-error events
     return ownedChannel(link);
@@ -1217,7 +1203,7 @@ ${guestOpFraming()}
   // would give this node a backend it does not need.
   const newShell = async () => (await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(),
-    freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
+    freshnessStore: new FreshnessMarks(), createRealm: createWebRealm,
     fs: false,
     admit: admitAll,
   })).shell;

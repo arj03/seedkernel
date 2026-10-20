@@ -397,8 +397,8 @@ function headerValue(head, name) {
  *  framing. */
 const LISTENER_WS = "ws";
 
-function makeFramer(stream, linkId, dest, listener) {
-  const put = (bytes) => netLinkSend(linkId, bytes);
+/** The codec for a link that writes through `put` (ake.js `hostChannel`). */
+function makeFramer(stream, put, dest, listener) {
   if (!stream) return null;
   if (dest) {
     const ws = /^wss?:\/\/([^/]+)(\/\S*)?$/i.exec(dest);

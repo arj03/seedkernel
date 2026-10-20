@@ -17,7 +17,7 @@ const NONCE_LEN = 32, TICKET_LEN = 16;
  *  another refuses the socket instead of misreading it. */
 const RELAY_WIRE = "/v1/";
 /** The UDP ports a relay answers STUN on, beside its WebSocket port. Two, so a UDP path
- *  can tell a NAT that gives each destination its own port (services/udp). */
+ *  can tell a NAT that gives each destination its own port (udp.js). */
 const RELAY_STUN_PORTS = [3478, 3479];
 
 // ── the relay wire ────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ class RelayConn {
       return false;
     }
     this.linkId = opened.linkId;
-    this.framer = makeFramer(opened.stream, opened.linkId, url, "");
+    this.framer = makeFramer(opened.stream, (bytes) => netLinkSend(opened.linkId, bytes), url, "");
     if (this.framer) this.framer.cap = MAX_SIGNAL_BYTES;
     linksById.set(this.linkId, this);
     if (handshakeTimeoutMs > 0) this.due = dueIn(handshakeTimeoutMs);

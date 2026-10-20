@@ -7,7 +7,6 @@ import (
 	"container/heap"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	"seedkernel/qjs"
@@ -21,15 +20,8 @@ type eventLoop struct {
 	tasks   chan func()
 	stopped bool
 
-	// extra are the guest realms pumped alongside el.c, each through its budgeted pump.
-	extra []pumpEntry
-
 	// onSettle is the in-flight await's result sink, which __settle routes into.
 	onSettle func(kind int, bytes []byte, msg string)
-
-	// awaitGen tags each await, so a stale safety timer or a timed-out await's late
-	// promise cannot settle the one now in flight.
-	awaitGen int64
 
 	// stepTimer is step()'s reusable wait timer.
 	stepTimer *time.Timer
@@ -70,39 +62,12 @@ func newEventLoop(c *qjs.Context) *eventLoop {
 	return el
 }
 
-// pumpEntry pairs a registered context with the func that drains it.
-type pumpEntry struct {
-	c    *qjs.Context
-	pump func()
-}
-
-// addContext registers another context to be drained by `pump` alongside el.c.
-func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
-	el.extra = append(el.extra, pumpEntry{c: c, pump: pump})
-}
-
-// removeContext drops a context registered with addContext; a no-op otherwise.
-func (el *eventLoop) removeContext(c *qjs.Context) {
-	for i, x := range el.extra {
-		if x.c == c {
-			copy(el.extra[i:], el.extra[i+1:])
-			el.extra[len(el.extra)-1] = pumpEntry{}
-			el.extra = el.extra[:len(el.extra)-1]
-			return
-		}
-	}
-}
-
-// pumpAll drains el.c, then every extra context, so a host job that schedules guest work
-// runs it in the same round; guest-to-host work needs a wake. A failed host drain stops
-// the loop (eventLoop.err).
+// pumpAll drains the host realm. A guest realm drains its own jobs inside each entry
+// (host/engine-realm.ts). A failed host drain stops the loop (eventLoop.err).
 func (el *eventLoop) pumpAll() {
 	if err := el.c.Pump(); err != nil && el.err == nil {
 		el.err = err
 		el.stopped = true
-	}
-	for _, x := range el.extra {
-		x.pump()
 	}
 }
 
@@ -131,19 +96,19 @@ func (el *eventLoop) install() {
 		}
 		return nil, nil
 	}))
-	// __settle(gen, kind, value) settles the await tagged `gen`, and is ignored otherwise.
+	// __settle(kind, value) settles the await in flight.
 	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		if el.onSettle == nil || args[0].Int64() != el.awaitGen {
+		if el.onSettle == nil {
 			return nil, nil
 		}
 		var bytes []byte
 		var msg string
-		if b, e := args[2].Bytes(); e == nil {
+		if b, e := args[1].Bytes(); e == nil {
 			bytes = b
 		} else {
-			msg = args[2].String()
+			msg = args[1].String()
 		}
-		el.onSettle(int(args[1].Int64()), bytes, msg)
+		el.onSettle(int(args[0].Int64()), bytes, msg)
 		return nil, nil
 	}))
 	// queueMicrotask and performance.now are the engine's own.
@@ -238,27 +203,11 @@ func (el *eventLoop) run() {
 	}
 }
 
-// armSafety arms a timeout for the await in flight; onFire runs on the loop goroutine
-// only while that await is still the current one.
-func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func() bool) {
-	gen := el.awaitGen
-	safety := time.AfterFunc(timeout, func() {
-		el.post(func() {
-			if el.awaitGen == gen && !el.stopped {
-				onFire()
-			}
-		})
-	})
-	return safety.Stop
-}
-
 // await evaluates an async JS expression in the host realm and drives the loop until it
-// settles: kind 0 (fulfilled, bytes), 1 (rejected, message) or 2 (timed out). Awaits
-// must not nest: el.onSettle is a single slot.
-func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
+// settles: kind 0 (fulfilled, bytes) or 1 (rejected, message). Awaits must not nest:
+// el.onSettle is a single slot.
+func (el *eventLoop) await(callExpr string) (kind int, value []byte, msg string, err error) {
 	kind = -1
-	el.awaitGen++
-	gen := strconv.FormatInt(el.awaitGen, 10)
 	el.onSettle = func(k int, bytes []byte, m string) {
 		kind, value, msg = k, bytes, m
 		el.stopped = true
@@ -266,16 +215,11 @@ func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, va
 	defer func() { el.onSettle = nil }()
 
 	wrap := `(function(){ Promise.resolve(` + callExpr + `).then(` +
-		`(v) => __settle(` + gen + `, 0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
-		`(e) => __settle(` + gen + `, 1, String(e && e.message || e))); })();`
+		`(v) => __settle(0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
+		`(e) => __settle(1, String(e && e.message || e))); })();`
 	el.stopped = false
 	if _, err = el.c.Eval("<await>", wrap); err != nil {
 		return
-	}
-	if timeout > 0 {
-		defer el.armSafety(timeout, func() {
-			kind, msg, el.stopped = 2, "await: timed out", true
-		})()
 	}
 	el.run()
 	if el.err != nil {

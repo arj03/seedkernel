@@ -6,7 +6,7 @@
 
 import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, until, PROTO,
-  authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
+  authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createWebRealm,
   transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
   LoopbackChannels, generatorRequest,
 } from "./transport-harness.mjs";
@@ -897,6 +897,20 @@ await test("READY: a second ready() does not strand the first", async (keep) => 
     ready(st.A, 50).then(() => "ok", () => "failed"),
   ]);
   assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle (got ${r1}/${r2})`);
+});
+
+await test("READY: a wait past the transport's deadline settles short of it, not as a failure", async (keep) => {
+  // A deferred answer counts against the invocation's deadline, which starts at admission,
+  // so a `ready` that held its whole timeout would lose to it and fail the caller. The
+  // transport caps the wait by the ceiling `HOST` advertises.
+  const fabric = new LoopbackChannels();
+  const A = keep(await makeTransportHost({ channels: fabric.view(), guestDeadlineMs: 1000 }));
+  await A.addr(hexOf(generateKeyPair().publicKey), "tcp://127.0.0.1:1"); // nothing listens there
+  const t0 = Date.now();
+  const r = await ready(A, 10000).then(() => "settled", (e) => e.message);
+  const ms = Date.now() - t0;
+  assert(r === "settled", `ready() must settle with a peer missing (got ${r})`);
+  assert(ms < 1000, `and inside the transport's 1 s deadline (${ms}ms)`);
 });
 
 await test("TIE-BREAK: a dial that loses hands what it queued to the link that won", async (keep) => {

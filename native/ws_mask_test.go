@@ -9,9 +9,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"testing"
 	"time"
+
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
 )
 
 const (
@@ -27,10 +31,17 @@ const wsModuleJS = `
 globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).modules.find(({ mod }) => mod.name === "ws").wasm;
 `
 
-// wsModule loads the codec on the module table's runtime. The scratch floor matches
-// host/wasm-limits.ts DEFAULT_SCRATCH_SIZE; ws.wasm exports its own larger `scratchSize`,
-// so this only needs to be a floor it exceeds.
-func wsModule(t *testing.T) *boundModule {
+// wsInstance is ws.wasm on a runtime of the test's own, read and written directly: what
+// is under test is the codec, not the host's module path.
+type wsInstance struct {
+	fn      api.Function
+	mem     api.Memory
+	scratch uint32
+	size    uint32
+}
+
+// wsModule instantiates the codec with AssemblyScript's three shims, inert.
+func wsModule(t *testing.T) *wsInstance {
 	t.Helper()
 	bootRealm(t)
 	if _, err := qc.Eval("ws-module.js", wsModuleJS); err != nil {
@@ -40,25 +51,33 @@ func wsModule(t *testing.T) *boundModule {
 	if err != nil {
 		t.Fatal("ws.wasm out of the transport bundle:", err)
 	}
-	w, err := instantiateWasm(wasm, 128*1024, -1)
+	rt := wazero.NewRuntime(ctx)
+	t.Cleanup(func() { rt.Close(ctx) })
+	env := rt.NewHostModuleBuilder("env")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
+	if _, err := env.Instantiate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, err := rt.Instantiate(ctx, wasm)
 	if err != nil {
 		t.Fatal("instantiate ws.wasm:", err)
 	}
-	t.Cleanup(func() { closeModule(w) })
-	return w
+	return &wsInstance{fn: m.ExportedFunction("handle"), mem: m.Memory(),
+		scratch: uint32(m.ExportedGlobal("scratch").Get()), size: uint32(m.ExportedGlobal("scratchSize").Get())}
 }
 
 // wsCall writes one request and returns handle()'s answer, unclamped: a length past the
-// scratch is a bug to find here, not something to trim as the host's callModule does.
-func wsCall(t *testing.T, w *boundModule, req []byte) []byte {
+// scratch is a bug to find here, not something to trim as the host's module ABI does.
+func wsCall(t *testing.T, w *wsInstance, req []byte) []byte {
 	t.Helper()
-	mem := w.mod.Memory()
-	if uint32(len(req)) > w.size || !mem.Write(w.scratch, req) {
+	if uint32(len(req)) > w.size || !w.mem.Write(w.scratch, req) {
 		t.Fatalf("could not stage a %d-byte request in a %d-byte scratch", len(req), w.size)
 	}
 	// Zero what lies past the request, so an answer the module never wrote cannot be read
 	// back as the previous length's.
-	if tail, ok := mem.Read(w.scratch+uint32(len(req)), 64); ok {
+	if tail, ok := w.mem.Read(w.scratch+uint32(len(req)), 64); ok {
 		clear(tail)
 	}
 	r, err := w.fn.Call(ctx, uint64(len(req)))
@@ -69,7 +88,7 @@ func wsCall(t *testing.T, w *boundModule, req []byte) []byte {
 	if n < 0 || uint32(n) > w.size {
 		t.Fatalf("ws.wasm answered %d bytes from a %d-byte scratch", n, w.size)
 	}
-	out, _ := mem.Read(w.scratch, uint32(n))
+	out, _ := w.mem.Read(w.scratch, uint32(n))
 	return bytes.Clone(out)
 }
 

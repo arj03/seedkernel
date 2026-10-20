@@ -14,7 +14,7 @@ import {
   sodium, root, toHex, concatBytes, hybridAuthorId, verifyTestBundle, verifyBundle,
   signTestBundle, authorBundle, testAuthor, testHost, installBundle,
   GUEST_TEXT, GUEST_BYTES, forwarderBytes,
-  JsModuleLoader, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, imp,
+  JsModuleLoader, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN, imp,
 } from "./fixtures.mjs";
 
 const { ok, assertEqual, summary } = testkit({ verbose: false });
@@ -102,7 +102,6 @@ async function testMlDsaAcvpVectors() {
   console.log("Test: ML-DSA-65 ACVP known-answer vectors (FIPS 204, external/pure)");
   const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mldsa65-acvp.json"), "utf8"));
   const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
-  const mldsa = await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm")));
 
   // The vectors use FIPS 204 context strings; the runtime always signs with an empty one
   // (§12.4), so the raw module is called through the low-level entry the adapter wraps.
@@ -142,18 +141,18 @@ async function testMlDsaAcvpVectors() {
   // module: a wrapper passing a stray context byte would still pass every vector above.
   {
     const seed = new Uint8Array(32).fill(9);
-    const kp = mldsa.ml_dsa65_keypair_from_seed(seed);
+    const kp = sodium.ml_dsa65_keypair_from_seed(seed);
     assertEqual(kp.publicKey.length, ML_DSA65_PK_LEN, "keygen returns a full-width public key");
     const msg = new TextEncoder().encode("adapter path");
-    const sig = mldsa.ml_dsa65_sign_detached(msg, kp.privateKey);
-    assert(mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
+    const sig = sodium.ml_dsa65_sign_detached(msg, kp.privateKey);
+    assert(sodium.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
     top = base;
     const sp = put(sig), mp = put(msg), pp = put(kp.publicKey);
     assertEqual(e.mldsa65_verify(sp, mp, msg.length, 0, 0, pp), 1,
       "the raw module verifies what the adapter signed, with an empty context");
     sig[0] ^= 1;
-    assert(!mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
-    assert(!mldsa.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
+    assert(!sodium.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
+    assert(!sodium.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
       "a wrong-width signature is false, not a throw");
   }
 
@@ -340,28 +339,10 @@ async function testHybridManifestSuite() {
   console.log("  OK\n");
 }
 
-// ─── Test: the browser seam names a wasm file it could not fetch ───────────────
-//
-// A page that serves no mldsa65.wasm answers the fetch with a 404 page, and compiling that
-// reports a bad magic number, which says nothing about the missing file.
-async function testBrowserCryptoFetch() {
-  console.log("Test: the browser crypto seam reports a wasm file that was not served");
-  const { loadCrypto } = await imp("build/host/crypto-browser.js");
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("<html>not found</html>", { status: 404 });
-  let msg = "";
-  try { await loadCrypto({ ready: Promise.resolve() }, "https://node.example/"); }
-  catch (e) { msg = String(e?.message ?? e); }
-  finally { globalThis.fetch = realFetch; }
-  assert(msg.includes("https://node.example/mldsa65.wasm") && msg.includes("404"),
-    `the error names the file and the status, got "${msg}"`);
-  console.log("  OK\n");
-}
-
 // ─── Test: host entropy is drawn from the platform a block at a time ───────────
 //
 // libsodium's wasm build fills `randombytes_buf` with one platform draw per byte, which
-// made a megabyte of `crypto/random` seconds of host thread. Both JS seams put the
+// made a megabyte of `crypto/random` seconds of host thread. The host's crypto puts the
 // platform CSPRNG under that name instead, filling up to 64 KiB per draw.
 async function testRandomBytesInBlocks() {
   console.log("Test: randombytes_buf draws from the platform CSPRNG a block at a time");
@@ -376,19 +357,52 @@ async function testRandomBytesInBlocks() {
   assertEqual(draws, 2, "100,000 bytes take two draws, not one per byte");
   assert(bytes.subarray(65_536).some((b) => b !== 0), "the bytes past the first draw are filled too");
   assertEqual(sodium.randombytes_buf(0).length, 0, "and none is none");
+  console.log("  OK\n");
+}
 
-  // The browser seam does the same to the libsodium it is handed.
-  const { loadCrypto } = await imp("build/host/crypto-browser.js");
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(readFileSync(join(root, "browser/mldsa65.wasm")));
-  let page;
-  try {
-    page = await loadCrypto({
-      ready: Promise.resolve(),
-      randombytes_buf: () => { throw new Error("libsodium's own randombytes_buf"); },
-    }, "https://node.example/");
-  } finally { globalThis.fetch = realFetch; }
-  assertEqual(page.randombytes_buf(8).length, 8, "the browser seam replaces it as well");
+// ─── Test: the host's crypto on the engine table ──────────────────────────
+//
+// The host runs libsodium.wasm and mldsa65.wasm on the platform's engine table
+// (host/sodium-engine.ts), by the build's minified export names. The table must name what
+// the emscripten glue names, and every operation must agree with libsodium-wrappers, the
+// same wasm driven by its own glue.
+async function testHostSodium() {
+  console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
+  const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
+  const { syncWebEngine } = await imp("build/host/platform-web.js");
+  // The oracle is the upstream glue, not the package's root entry, which is the engine.
+  const { default: oracle } = await import("libsodium-wrappers");
+  await oracle.ready;
+  // The glue libsodium.wasm is extracted from (scripts/build-libsodium.mjs).
+  const glue = readFileSync(join(root, "node_modules/libsodium/dist/modules-esm/libsodium.mjs"), "utf8");
+  for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
+    assert(glue.includes(`._${name}=A.${min},`) || glue.includes(`._${name}=A.${min};`),
+      `${name} is export ${min} in the glue`);
+  }
+  const host = engineSodium(syncWebEngine, readFileSync(join(root, "browser/libsodium.wasm")),
+    readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n));
+  const msg = new Uint8Array(70000).map((_, i) => i * 7);
+  const key = new Uint8Array(32).fill(5), npub = new Uint8Array(12).fill(6), ad = Uint8Array.of(1, 2, 3);
+  assertEqual(toHex(host.crypto_generichash(32, msg, null)), toHex(oracle.crypto_generichash(32, msg, null)), "BLAKE2b-256");
+  assertEqual(toHex(host.crypto_generichash(64, msg, key)), toHex(oracle.crypto_generichash(64, msg, key)), "keyed BLAKE2b-512");
+  const seed = new Uint8Array(32).fill(9);
+  const kp = host.crypto_sign_seed_keypair(seed);
+  assertEqual(toHex(kp.privateKey), toHex(oracle.crypto_sign_seed_keypair(seed).privateKey), "Ed25519 keypair from a seed");
+  const sig = host.crypto_sign_detached(msg, kp.privateKey);
+  assertEqual(toHex(sig), toHex(oracle.crypto_sign_detached(msg, kp.privateKey)), "Ed25519 signature");
+  assert(host.crypto_sign_verify_detached(sig, msg, kp.publicKey), "Ed25519 verify accepts");
+  assert(!host.crypto_sign_verify_detached(sig, msg.subarray(1), kp.publicKey), "Ed25519 verify refuses another message");
+  assertEqual(toHex(host.crypto_scalarmult(key, kp.publicKey)), toHex(oracle.crypto_scalarmult(key, kp.publicKey)), "X25519");
+  const ct = host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key);
+  assertEqual(toHex(ct), toHex(oracle.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key)), "ChaCha20-Poly1305 seal");
+  assertEqual(toHex(host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key)), toHex(msg), "ChaCha20-Poly1305 open");
+  ct[5] ^= 1;
+  let refused = false;
+  try { host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key); } catch { refused = true; }
+  assert(refused, "a tampered record does not open");
+  const author = testAuthor();
+  const signed = signTestBundle(sodium, author, { app: "host-crypto", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } });
+  assert(verifyBundle(host, signed).manifest.app === "host-crypto", "a hybrid bundle verifies on the host's crypto");
   console.log("  OK\n");
 }
 
@@ -398,7 +412,7 @@ await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();
 await testHybridManifestSuite();
-await testBrowserCryptoFetch();
 await testRandomBytesInBlocks();
+await testHostSodium();
 
 summary("Results");

@@ -1,44 +1,15 @@
-// The Node platform shell (§12).
-//
-// `bootNodeShell()` gathers this platform's parts (`NodeFs` on a data directory, a
-// `node:net` channel factory, a file-backed freshness store) and hands them to the shared
-// `bootShell`, which does the assembly (§12.8). It knows nothing about any app: every app
-// arrives as a signed bundle (§12.4) whose author must pass the policy.
-//
-// The operator side (flags, defaults, boot sequence, console output) is `cli.ts`, shared by
-// every target; `main-node.ts` binds it to this platform.
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import { loadCrypto } from "./crypto-node.js";
-import { policyFromJson } from "./policy.js";
-import { NodeChannelFactory } from "../services/net-node.js";
-import { NodeFs } from "../services/fs-node.js";
-import { bootShell, type AppHandle, type InstallOptions, type Shell, type ShellSodium } from "./shell-core.js";
+// The Node library shell (§12): a node in this process, on the same platform the Node
+// loader runs a host blob on (platform-node.ts) and assembled by the same host code
+// (platform.ts), with the package's own host blob for its engine and crypto. It knows
+// nothing about any app: every app arrives as a signed bundle (§12.4) whose author must
+// pass the policy.
+import { readFileSync } from "node:fs";
+import { nodePlatform } from "./platform-node.js";
+import { platformHost, tcpChannels } from "./platform.js";
+import { type ChannelFactory } from "../services/socket-seam.js";
+import { type AppHandle, type InstallOptions, type Shell } from "./shell-core.js";
 import { type Fs } from "../services/fs.js";
-import { freshnessStoreFor, type CliFiles, type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
-
-/** Write a whole file or none: write a temp file beside the target, then rename it over.
- *  A plain `writeFileSync` truncates in place, so a crash mid-write leaves a partial file
- *  for the next boot to misread. Synchronous, because it writes state a node cannot boot
- *  without: the key file and the freshness marks. */
-function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
-  renameSync(tmp, path);
-}
-
-/** This platform's `CliFiles` (cli.ts), for the operator flow (main-node.ts) and the
- *  freshness store below. Only a missing file reads as `null`, as on the native target;
- *  an unreadable one throws, or the `--key` first-boot path would overwrite it. */
-export const nodeFiles: CliFiles = {
-  readFile(path) {
-    try { return new Uint8Array(readFileSync(path)); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
-      throw e;
-    }
-  },
-  writeFile: writeFileAtomic,
-};
+import { type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
 
 /** The Node shell: the platform-neutral `Shell` plus `installFile` and a non-optional
  *  `fs`. */
@@ -55,32 +26,10 @@ export interface NodeShellRuntime extends CliNodeRuntime {
   shell: NodeShell;
 }
 
-// No realm factory (§12.3) is passed: bootShell's default, a lazy safe-js import that
-// loads the engine on the first realm, is what this platform wants.
-/** Assemble the runtime on Node: build the platform seam, hand it to the shared
- *  `bootShell` (which installs the selected transport bundle, §12.6), then add the
+/** Assemble a node in this process through the host's own `standUp`, then add the
  *  file-backed `installFile`. */
 export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> {
-  const sodium = await loadCrypto();
-  // ── Node platform seam ─────────────────────────────────────────────────────
-  const fs = new NodeFs(opts.dir);
-  const freshness = freshnessStoreFor(nodeFiles, opts.dir);
-  // Everything that can fail happens inside bootShell, which tears down what it built
-  // when it throws, so there is no partial state to clean up here.
-  const { shell: base, transport } = await bootShell({
-    sodium: sodium as unknown as ShellSodium,
-    identity: opts.identity,
-    fs,
-    freshnessStore: freshness,
-    // The network as configured, over node:net unless the caller brings its own sockets.
-    transport: opts.transport && {
-      ...opts.transport, channels: opts.transport.channels ?? new NodeChannelFactory(),
-    },
-    admit: policyFromJson(opts.policyJson),
-    guestDeadlineMs: opts.guestDeadlineMs,
-    realmMemoryBytes: opts.realmMemoryBytes,
-  });
-  // ── Node wrapper: add file-backed installFile ───────────────────────────────────
+  const { shell: base, transport } = await platformHost(nodePlatform()).standUp(opts);
   const shell: NodeShell = {
     ...base,
     // This platform always supplies an fs.
@@ -91,3 +40,13 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
   };
   return { shell, transport };
 }
+
+/** TCP over node:net and nothing else, the platform's own sockets: a `ChannelFactory` for
+ *  a caller that assembles a node with `bootShell` itself. */
+export function nodeChannels(): ChannelFactory {
+  return tcpChannels(nodePlatform().net);
+}
+
+/** Node's datagram sockets, the `transport.datagrams` option for a caller that assembles a
+ *  node with `bootShell` itself: the transport runs its UDP paths over them (§12.7). */
+export { nodeRawDatagrams as nodeDatagrams } from "../services/datagrams-node.js";

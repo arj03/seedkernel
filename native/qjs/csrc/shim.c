@@ -63,6 +63,15 @@ void QJS_SetDeadline(int64_t ns_from_now)
     tick = 0;
 }
 
+/* What is left of the armed deadline in ns: 0 once it has passed, -1 when none is armed. */
+int64_t QJS_DeadlineLeft(void)
+{
+    if (deadline_ns <= 0)
+        return -1;
+    int64_t left = deadline_ns - (int64_t)js__hrtime_ns();
+    return left > 0 ? left : 0;
+}
+
 /* Whether the deadline has fired since this was last asked, and clears the flag. The
    embedder cannot learn it any other way: the throw lands in whatever job was running,
    and a job's exception is consumed by the job loop rather than returned to whoever

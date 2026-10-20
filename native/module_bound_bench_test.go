@@ -2,8 +2,9 @@ package main
 
 // What the §4.3 module-call bound costs, which decided it should be on by default (§14.1).
 // Arming a runtime compiles a termination check into every loop of every module on it,
-// and this measures that check on real wasm: libsodium's Ed25519 and, opt-in, seedstore's
-// Reed-Solomon codec, an installed app module and so the kind of code the bound exists for.
+// and this measures that check on real wasm: the host's ML-DSA-65 verifier and, opt-in,
+// seedstore's Reed-Solomon codec, an installed app module and so the kind of code the bound
+// exists for.
 //
 //	go test -run x -bench BenchmarkBound -benchtime 2s -count 5 ./...
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench BenchmarkBound ./...
@@ -17,9 +18,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -38,15 +39,16 @@ func boundRuntime(b *testing.B, armed bool) wazero.Runtime {
 	return rt
 }
 
-func BenchmarkBoundEd25519Verify(b *testing.B) {
+func BenchmarkBoundMlDsaVerify(b *testing.B) {
+	msg := bytes.Repeat([]byte{0x5a}, 4096)
 	for _, c := range boundConfigs {
 		b.Run(c.name, func(b *testing.B) {
-			s := bootSodium(boundRuntime(b, c.armed))
-			pk, sk := s.signSeedKeypair(bytes.Repeat([]byte{7}, 32))
-			sig := s.signDetached(benchMsg, sk)
+			s := newMlDsaSigner(b, boundRuntime(b, c.armed))
+			pk, sk := s.keypair(b, bytes.Repeat([]byte{7}, 32))
+			sig := s.signDetached(b, msg, sk)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if !s.verifyDetached(sig, benchMsg, pk) {
+				if !s.verifyCtx(b, sig, msg, nil, pk) {
 					b.Fatal("verify failed")
 				}
 			}
@@ -154,40 +156,32 @@ func benchBoundRS(b *testing.B, decode bool) {
 func BenchmarkBoundRSEncode(b *testing.B) { benchBoundRS(b, false) }
 func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 
-// BenchmarkBoundCallOverhead measures the other half of the bound: the shared deadline
-// (module.go moduleDeadline) that a finite guest deadline makes callModule arm and disarm
-// per call, where an unbounded guest takes a no-op branch. The benchmarks above measure
-// the compiled checks, which cost per back-edge and so vanish on a call that barely loops;
-// this one measures what every call pays however little it does, on the smallest real
-// module (the forwarder, which copies its input back) and a 32-byte payload, the size of a
-// control frame, where a fixed cost is most visible.
-//
-// Both variants run against one boot, so the runtime is armed in both and only the
-// context differs, which isolates the part the native host controls. wazero starts a
-// watchdog goroutine and channel per call whenever the runtime is armed, whatever context
-// it gets (internal/wasm module_instance.go CloseModuleOnCanceledOrTimeout), so that cost
-// is in both and is not measured here. Measured ~400 ns to ~480 ns, 6 allocs both: a fixed
-// ~80 ns per call for a bounded deployment, against ~30 µs for the worker hop the JS
-// targets pay per call for the same bound, and ~400 µs for the RS calls it guards.
+// BenchmarkBoundCallOverhead measures the other half of the bound: what one module call
+// costs on the host's own path, the shared §4 ABI (host/pure-module.ts) over the bounded
+// engine table, with the shared deadline (engine.go moduleDeadline) a finite guest
+// deadline makes engineCallBounded arm and disarm, and without one. The benchmarks above
+// measure the compiled checks, which cost per back-edge and so vanish on a call that barely
+// loops; this one measures what every call pays however little it does, on the smallest
+// real module (the forwarder, which copies its input back) and a 32-byte payload, the size
+// of a control frame, where a fixed cost is most visible.
 func BenchmarkBoundCallOverhead(b *testing.B) {
 	ensureBooted(b)
-	key := "callcost"
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, 5*time.Second); err != nil {
-		b.Fatalf("buildModuleSlot refused: %v", err)
+	if err := buildModules(b, "callcost", []string{"fwd"}, forwarderWasm); err != nil {
+		b.Fatalf("the forwarder was refused: %v", err)
 	}
-	payload := bytes.Repeat([]byte{0x7e}, 32)
-	for _, c := range []struct {
-		name     string
-		deadline time.Duration
-	}{{"noCallDeadline", -1}, {"callDeadline", 5 * time.Second}} {
+	evalString(b, `globalThis.__callCost = async (n, deadlineMs) => {
+		const set = __modSets.get("callcost"), payload = new Uint8Array(32).fill(0x7e);
+		for (let i = 0; i < n; i++) {
+			const r = await set.call("fwd", payload, deadlineMs);
+			if (r.bytes === null || r.bytes.length !== 32) throw new Error("forwarder answered wrong");
+		}
+		return new Uint8Array(0);
+	}, ""`)
+	for _, c := range []struct{ name, deadline string }{{"noCallDeadline", "Infinity"}, {"callDeadline", "5000"}} {
 		b.Run(c.name, func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if r := callModule(key, "fwd", payload, c.deadline); len(r) != len(payload) {
-					b.Fatalf("forwarder returned %d B, want %d", len(r), len(payload))
-				}
-			}
+			benchAwait(b, fmt.Sprintf("__callCost(%d, %s)", b.N, c.deadline))
 		})
 	}
 }

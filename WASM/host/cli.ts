@@ -33,8 +33,9 @@ export interface CliFiles {
 }
 
 /** What a node needs once the flags are read: the store, the policy, and `bootShell`'s
- *  own options. Each target builds the rest from its own parts (`standUp`). */
-export interface NodeSetup extends Pick<BootShellOptions, "identity" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
+ *  own options. Each target builds the rest from its own parts (`standUp`). An embedder
+ *  whose gate is not a policy file passes `admit` in place of `policyJson`. */
+export interface NodeSetup extends Pick<BootShellOptions, "identity" | "admit" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
   /** Directory backing the `fs` service. */
   dir: string;
   /** Policy file contents (policy.ts). Omit ⇒ deny-all for ordinary apps. */

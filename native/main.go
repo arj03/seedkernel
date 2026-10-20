@@ -1,10 +1,13 @@
-// seedkernel native shell (§12.9). The shell is the shared host TS, embedded as
-// host-shell.gen.js and run in QuickJS; Go is only the bridge: module table (§3), crypto,
-// fs, sockets, and the confined guest realms (guest.go). Pure Go, one static binary.
+// seedkernel native loader (§12.9). It runs the host script in a host blob (hostblob.go)
+// on QuickJS, over the platform ABI (WASM/host/abi.ts): the module table (§3), files,
+// sockets, entropy, and the engine table realms and the host's crypto run on (engine.go).
+// Everything a node does is in the blob, the checks on its successor included; the loader
+// keeps the slots it is staged in (hostslots.go). Pure Go, one static binary.
 package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -13,70 +16,64 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
-	"time"
 
 	"seedkernel/qjs"
-
-	"github.com/tetratelabs/wazero"
 )
 
-// hostShellJS is the shared shell plus host/native-shim.ts, bundled by
-// scripts/bundle-native-host.mjs.
+// genesisHost is the host blob this binary was built with (scripts/build-host-blob.mjs),
+// the one it runs unless told otherwise.
 //
-//go:embed host-shell.gen.js
-var hostShellJS string
+//go:embed host.skb
+var genesisHost []byte
 
 var (
 	ctx = context.Background()
-	// rtCore is the TCB's own runtime (libsodium, ML-DSA), not budget-armed.
-	rtCore wazero.Runtime
-	qc     *qjs.Context
-	qrt    *qjs.Runtime
-	el     *eventLoop
-	nh     *netHost
-	uh     *udpHost
+	qc  *qjs.Context
+	qrt *qjs.Runtime
+	el  *eventLoop
+	nh  *netHost
+	uh  *udpHost
+
+	// bootBlob is the host blob boot runs: genesisHost, or the loader's choice.
+	bootBlob = genesisHost
+	// host is the running host blob and the parts boot runs of it.
+	host struct {
+		env    []byte
+		script string
+		qjs    []byte
+	}
+	// ldr is the loader script's realm (hostslots.go), stood up before any boot.
+	ldr *loader
 )
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
-// boot stands up the engines, the host realm and its primitives, then the shared bundle.
-// Each boot releases the previous one's engines.
+// boot reads bootBlob, then stands up the engines, the host realm and its primitives, and
+// runs the host script. Each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
 	var err error
-	if err = bootModuleTable(); err != nil {
+	host.env = bootBlob
+	if host.script, host.qjs, err = hostParts(bootBlob); err != nil {
 		return err
 	}
-	rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd = bootSodium(rtCore)
-	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
 
 	// An unhandled rejection ends the process, as on Node.
-	if qrt, err = qjs.New(qjs.TrackRejections()); err != nil {
+	if qrt, err = qjs.New(host.qjs, qjs.TrackRejections()); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
 	}
 	qc = qrt.Context()
 	el = newEventLoop(qc)
 	// The bundle's module scope reaches for these primitives, so it evaluates last.
-	exposeSodium(qc, sd)
 	exposeFs(qc)
 	nh = exposeNet(qc, el)
 	uh = exposeUdp(qc, el)
 	exposeBridge(qc)
-	done, err := qc.Eval("host-shell.gen.js", hostShellJS)
+	done, err := qc.Eval("host.js", host.script)
 	if err != nil {
-		return fmt.Errorf("shell bundle: %w", err)
+		return fmt.Errorf("host script: %w", err)
 	}
 	done.Free()
-	// The shim defined the __net and __udp dispatchers; retain them.
-	if err := nh.retain(); err != nil {
-		return fmt.Errorf("net retain: %w", err)
-	}
-	if err := uh.retain(); err != nil {
-		return fmt.Errorf("udp retain: %w", err)
-	}
 	return nil
 }
 
@@ -91,36 +88,28 @@ func shutdown() {
 		uh.close()
 		uh = nil
 	}
-	for _, g := range realms {
-		g.discard()
+	for _, e := range engines {
+		e.close()
 	}
-	realms = map[int64]*guestRealm{}
-	realmSeq = 0
+	engines = map[int64]*engineInstance{}
 	if qrt != nil {
 		qrt.Close()
 		qrt, qc, el = nil, nil, nil
 	}
-	closeModuleTable()
-	if rtCore != nil {
-		_ = rtCore.Close(ctx)
-		rtCore = nil
-	}
 }
 
-// exposeBridge installs `bridge`, typed in host/native-shim.ts.
+// exposeBridge installs `bridge`, typed in host/platform.ts.
 func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
-	installModuleBridge(qc, b) // module.go
-
+	// The platform ABI this loader implements, which the host script checks first.
+	b.SetPropertyStr("abi", qc.NewInt32(int32(ldr.abi)))
+	b.SetPropertyStr("banner", qc.NewString("seedkernel-native"))
 	// The operator's world (host/cli.ts): arguments, files, stdio.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// JSON, since an argument may contain any separator.
-		j, err := json.Marshal(os.Args[1:])
-		if err != nil {
-			return nil, err
-		}
-		return qc.NewString(string(j)), nil
+		j, _, err := ldr.call(`JSON.stringify(__loader.hostArgs)`)
+		return qc.NewString(j), err
 	}))
 	b.SetPropertyStr("readFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		fb, err := os.ReadFile(args[0].String())
@@ -141,10 +130,32 @@ func exposeBridge(qc *qjs.Context) {
 			return nil, err
 		}
 		// Atomic, so a torn write never replaces the freshness state.
-		if err := writeFileAtomic(path, bytes, ".seedkernel-", mode); err != nil {
+		if err := writeFileAtomic(path, bytes, mode); err != nil {
 			return nil, err
 		}
 		return qc.NewUndefined(), nil
+	}))
+	// The running host blob, which carries the realm engine and the host's crypto.
+	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		return qc.NewArrayBuffer(host.env), nil
+	}))
+	// Keep a host blob, which the running host checked, as the pending host (hostslots.go).
+	// When the loader boots it now, the loop stops after this turn.
+	b.SetPropertyStr("stageHost", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		env, err := args[0].Bytes()
+		if err != nil {
+			return nil, err
+		}
+		now, err := ldr.stage(env)
+		if now {
+			el.stopped = true
+		}
+		return nil, err
+	}))
+	b.SetPropertyStr("random", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		out := make([]byte, args[0].Int32())
+		crand.Read(out)
+		return qc.NewArrayBuffer(out), nil
 	}))
 	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// The realm's console; stderr, since stdout is `--op`'s data channel.
@@ -170,75 +181,78 @@ func exposeBridge(qc *qjs.Context) {
 		return qc.NewArrayBuffer(bytes), nil
 	}))
 
-	installRealmBridge(qc, b) // guest.go
+	installEngineBridge(qc, b) // engine.go
 	qc.Global().SetPropertyStr("bridge", b)
-}
-
-// ───────────────────────── driving the shell ─────────────────────────
-
-// callRealm calls one of the shim's entry points with args staged as __a0…__aN, and pumps
-// the loop until its promise settles.
-func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, error) {
-	if qc == nil {
-		return nil, errors.New("seedkernel: boot has not run")
-	}
-	slots := make([]string, len(args))
-	for i, a := range args {
-		slots[i] = "__a" + strconv.Itoa(i)
-		qc.Global().SetPropertyStr(slots[i], a) // takes the reference
-	}
-	defer func() {
-		undef := qc.NewUndefined()
-		for _, slot := range slots {
-			qc.Global().SetPropertyStr(slot, undef)
-		}
-	}()
-	kind, value, msg, err := el.await(name+"("+strings.Join(slots, ",")+")", timeout)
-	if err != nil {
-		return nil, err
-	}
-	if kind != 0 {
-		return nil, errors.New(msg)
-	}
-	return value, nil
 }
 
 // ───────────────────────── entry ─────────────────────────
 
-// main boots and runs the operator flow (host/cli.ts); Go only decides whether to keep
-// the loop running.
+// main boots the loader's choice and runs its operator flow (host/cli.ts); Go only decides
+// whether to keep the loop running.
 func main() {
 	// One P by default: all engine work is on the loop goroutine, and extra Ps only add
 	// wakeups per message. GOMAXPROCS overrides.
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(1)
 	}
-	if err := boot(); err != nil {
-		fatal("boot", err)
-		return
+	// The loader script runs on the genesis blob's engine, which the host's realm then
+	// shares from the compile cache.
+	_, engine, err := hostParts(genesisHost)
+	if err == nil {
+		ldr, err = newLoader(engine, os.Args[1:], genesisHost)
 	}
-	// No watchdog: the steps that can hang carry their own deadlines.
-	out, err := callRealm("runMain", 0)
 	if err != nil {
 		fatal("seedkernel", err)
-		return
-	}
-	var st struct{ Serving bool }
-	if err := json.Unmarshal(out, &st); err != nil {
-		fatal("seedkernel", err)
-		return
-	}
-	if !st.Serving {
-		return
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; os.Exit(0) }()
+	for {
+		if _, bootBlob, err = ldr.call(`__loader.choose()`); err != nil {
+			fatal("host slots", err)
+		}
+		again, err := runHost()
+		if err != nil {
+			// A pending host that fails is dropped, and the committed one boots instead.
+			if ldr.failed(err) {
+				continue
+			}
+			fatal("seedkernel", err)
+		}
+		if !again {
+			return
+		}
+	}
+}
+
+// runHost boots bootBlob and runs its operator flow, and while it serves, its loop. It
+// returns when the flow ends without serving, when a staged host asks to boot now (again),
+// or on a failure.
+func runHost() (again bool, err error) {
+	if err := boot(); err != nil {
+		return false, fmt.Errorf("boot: %w", err)
+	}
+	// No watchdog: the steps that can hang carry their own deadlines.
+	kind, out, msg, err := el.await("runMain()")
+	if err != nil {
+		return false, err
+	}
+	if kind != 0 {
+		return false, errors.New(msg)
+	}
+	var st struct{ Serving bool }
+	if err := json.Unmarshal(out, &st); err != nil {
+		return false, err
+	}
+	// The loader answers whether a host staged meanwhile boots now.
+	s, _, err := ldr.call(`__loader.ended(__a0)`, st.Serving)
+	if err != nil || s == "true" || !st.Serving {
+		return s == "true", err
+	}
 	el.stopped = false
 	el.run()
-	if el.err != nil {
-		fatal("seedkernel", el.err)
-	}
+	// The loop stops for a failure, or for a host staged under "now".
+	return el.err == nil, el.err
 }
 
 // fatal reports a failure and exits non-zero.

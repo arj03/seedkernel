@@ -1,7 +1,7 @@
 // Computes the README's LOC figures ("one implementation, three targets"): `npm run loc`
 // exits 1 on drift, and `--write` updates the README. Counted by the README's own rule
 // (non-test sources, no blank or comment lines). The shared set is derived from
-// build:native-host and checked against the rows, so a shared file missing from every row
+// build:host-script and checked against the rows, so a shared file missing from every row
 // also fails.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,9 @@ const fmt = (n) => n.toLocaleString("en-US");
 // ── the shared set, from the build script that defines it ────────────────────
 const pkg = JSON.parse(readFileSync(resolve(wasmDir, "package.json"), "utf8"));
 const sharedSet = new Set(
-  (pkg.scripts["build:native-host"].match(/build\/\S+\.js/g) ?? [])
+  // Sources sit under build/<dir>/; each script's first path is its output, build/host.js
+  // or build/loader.js. The loader script is shared too: both loaders run it.
+  ([pkg.scripts["build:host-script"], pkg.scripts["build:loader-script"]].join(" ").match(/build\/[^\s/]+\/\S+\.js/g) ?? [])
     .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
 // ── the rows, exactly as the README groups them ──────────────────────────────
@@ -50,7 +52,8 @@ const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
   { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
-    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts"] },
+    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts",
+      "WASM/host/slots.ts", "WASM/host/pure-module.ts"] },
   { find: /`host\/transport-host\.ts`/,
     files: ["WASM/host/transport-host.ts"] },
   { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,
@@ -60,22 +63,17 @@ const sharedRows = [
     files: ["WASM/host/shell-core.ts", "WASM/host/slot-table.ts"] },
   { find: /`host\/cli\.ts`/,
     files: ["WASM/host/cli.ts"] },
+  { find: /`host\/engine-realm\.ts`, `host\/sodium-engine\.ts`/,
+    files: ["WASM/host/engine-realm.ts", "WASM/host/sodium-engine.ts", "WASM/host/pq.ts"] },
+  { find: /`host\/platform\.ts`, `host\/abi\.ts`/,
+    files: ["WASM/host/platform.ts", "WASM/host/abi.ts", "WASM/host/host-main.ts", "WASM/host/native-polyfills.ts"] },
   { find: /`services\/\*\.ts` \(\d+ shared files\)/,
-    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/") && !f.startsWith("WASM/services/udp/")) },
+    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/")) },
 ];
 
-/** The UDP path, counted on its own line: a directory under services/ that the JS row,
- *  which reads only the top level, leaves out, and that the shared bundle carries for the
- *  native target. */
-const udpFiles = readdirSync(resolve(wasmDir, "services/udp"))
-  .filter((f) => f.endsWith(".ts"))
-  .map((f) => `WASM/services/udp/${f}`);
-
-// In the shared bundle but counted elsewhere: the native target's own files, the UDP path,
-// and transport-bundle.ts, which is one line of signed bundle base64, not host code.
-// Listed so reconciliation can tell them from files counted nowhere.
-const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
-const countedElsewhere = [...nativeTs, ...udpFiles.filter((f) => sharedSet.has(f)), "WASM/host/transport-bundle.ts"];
+// In the shared bundle but counted elsewhere: transport-bundle.ts, one line of signed bundle
+// base64, not host code. Listed so reconciliation can tell it from files counted nowhere.
+const countedElsewhere = ["WASM/host/transport-bundle.ts"];
 
 /** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
  *  not include. Derived, so a new backend is counted automatically. */
@@ -89,14 +87,12 @@ const goFiles = readdirSync(resolve(repoDir, "native"))
   .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
   .map((f) => `native/${f}`);
 
-// The Native row's TS count comes from `nativeTs` above, so adding a file there updates
-// the row.
 const rows = [
   ...sharedRows.map((r) => ({ ...r, n: sum(r.files), render: cell })),
   { find: /\*\*JS\*\* \(browser \+ Node\)/, n: sum(jsFiles),
     render: (n) => `| ${fmt(n)} TS |` },
   { find: /\*\*Native\*\* \(Go\)/, n: sum(goFiles),
-    render: (n) => `| ${fmt(n)} Go + ${fmt(sum(nativeTs))} TS |` },
+    render: (n) => `| ${fmt(n)} Go |` },
 ];
 const sharedTotal = sharedRows.reduce((n, r) => n + sum(r.files), 0);
 
@@ -131,30 +127,6 @@ for (const row of rows) {
 }
 readme = lines.join("\n");
 
-// The Native row's prose gives each of its TS files its own figure (`native-shim.ts`
-// (N)), checked like the cells above.
-const inlineChecks = [
-  { file: "WASM/host/native-shim.ts", re: /native-shim\.ts` \((\d+)\)/ },
-  { file: "WASM/host/native-polyfills.ts", re: /native-polyfills\.ts` \((\d+)\)/ },
-];
-for (const { file, re } of inlineChecks) {
-  const base = file.split("/").pop();
-  const m = readme.match(re);
-  if (!m) {
-    console.error(`  MISSING  no README count matches ${base}`);
-    drift++;
-    continue;
-  }
-  const want = loc(file);
-  if (Number(m[1]) === want) {
-    console.log(`  ok       ${String(want).padStart(5)}  ${base}`);
-  } else {
-    drift++;
-    console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(want).padStart(5)}  ${base}   README says (${m[1]})`);
-    readme = readme.replace(re, `${base}\` (${want})`);
-  }
-}
-
 // Prose figures (not cells): match only the number, using the heading or source path
 // to identify it. The transport count does not depend on the surrounding sentence.
 // The shared total lives in the heading; the guest figure is summed from guest-source.mjs.
@@ -162,7 +134,6 @@ const proseFigures = [
   ["shared total (heading)", /(?<=all three targets \()[\d,]+(?= LOC\))/, sharedTotal],
   ["transport/src/*.js", /[\d,]+(?= lines of `transport\/src\/\*\.js`)/,
     sum(guestSourcePaths())],
-  ["services/udp/*.ts", /[\d,]+(?= lines of `services\/udp\/\*\.ts`)/, sum(udpFiles)],
 ];
 for (const [label, re, n] of proseFigures) {
   const m = readme.match(re);

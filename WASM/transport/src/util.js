@@ -21,6 +21,18 @@ function writeU32BE(out, off, v) {
   out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 0xff; out[off + 2] = (v >>> 8) & 0xff; out[off + 3] = v & 0xff;
 }
 function readU32BE(b, off) { return ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0; }
+function writeU16BE(out, off, v) { out[off] = v >>> 8; out[off + 1] = v & 0xff; }
+function readU16BE(b, off) { return (b[off] << 8) | b[off + 1]; }
+/** A 48-bit field, as a safe integer. Spelled out, as the stream's every packet carries
+ *  three: QuickJS pays for each call and for `2 ** 32`, which it does not fold. */
+function writeU48BE(out, off, v) {
+  const hi = (v / 4294967296) >>> 0;
+  out[off] = hi >>> 8; out[off + 1] = hi & 0xff;
+  out[off + 2] = v >>> 24; out[off + 3] = (v >>> 16) & 0xff; out[off + 4] = (v >>> 8) & 0xff; out[off + 5] = v & 0xff;
+}
+function readU48BE(b, off) {
+  return ((b[off] << 8) | b[off + 1]) * 4294967296 + (((b[off + 2] << 24) | (b[off + 3] << 16) | (b[off + 4] << 8) | b[off + 5]) >>> 0);
+}
 
 const HEX = "0123456789abcdef";
 const HEX_BYTE = Array.from({ length: 256 }, (_, i) => HEX[i >> 4] + HEX[i & 15]);

@@ -3,7 +3,7 @@
 // way to fill a slot (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall, type HostStaging } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { type Fs } from "../services/fs.js";
@@ -134,7 +134,8 @@ export interface BootShellOptions {
   freshnessStore?: FreshnessStore;
   /** Builder for a bundle's private modules (§4). Default: the worker-backed `ModuleTable`. */
   modules?: PureModuleLoader;
-  /** Confined realm factory (§12.3). Default: the lazily imported safe-js engine. */
+  /** Confined realm factory (§12.3). Default: realms on WebAssembly (engine-web.ts), imported
+   *  lazily. */
   createRealm?: RealmFactory;
   /** Default guest budget per invocation, in ms (`DEFAULT_GUEST_DEADLINE_MS`); `Infinity`
    *  disables the local ceiling. The operator's number, not the author's. */
@@ -145,6 +146,9 @@ export interface BootShellOptions {
   /** The sockets and signed transport (§12.6). Omitted or `false` means no network. The
    *  object is kept, so live accessors keep working. */
   transport?: TransportOptions | false;
+  /** The loader's host slots, behind the `host` service (§12.9). Without them an app that
+   *  requires `host` does not install. */
+  hostStaging?: HostStaging;
 }
 
 export interface BootResult {
@@ -180,7 +184,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const fs = backend ? validatedFs(backend) : undefined;
   const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
   const createRealm = opts.createRealm
-    ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
+    ?? (async (o) => (await import("./engine-web.js")).createWebRealm(o));
   const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
   const net = opts.transport === false ? undefined : opts.transport;
   const netHost = net ? new TransportHost(net) : null;
@@ -237,11 +241,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const b = slot.verifiedBundle;
     const appConfig = b.manifest.guest.config ?? {};
     // The host's facts (§12.3): the key `node/sign` signs with, and the budgets the realm
-    // is held to, so a guest can pace its fan-out.
+    // is held to, so a guest can pace its fan-out and settle a wait before its deadline.
     const hostFacts: JsonObject = {
       identity: toHex(opts.identity.publicKey),
       maxOutstandingHostCalls: DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
       maxOutstandingHostCallBytes: DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES,
+      deadlineMs: bounds.deadlineMs === Infinity ? null : bounds.deadlineMs,
     };
     slot.realm = await createRealm({
       source: jsonPreamble("HOST", hostFacts) + jsonPreamble("APP", appConfig)
@@ -315,6 +320,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         fs: slot.fsScope,
         timer: slot.timers,
         link,
+        host: opts.hostStaging,
       },
       // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
       // zeros is the host.
@@ -327,12 +333,14 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // A candidate's top level runs before commit, so every seam call is refused until the
     // slot is active, and disposing a failed candidate has nothing to undo. Top level can
     // still initialize from `HOST`, `APP` and `LOCAL`.
-    return (name, payload, budget) => {
+    const seam: HostCall = (name, payload, budget) => {
       if (!slot.active) {
         throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
       }
       return fullSeam(name, payload, budget);
     };
+    seam.borrows = fullSeam.borrows;
+    return seam;
   };
   const doUninstall = (app: string) => {
     const slot = table.remove(app);

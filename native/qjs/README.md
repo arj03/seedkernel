@@ -1,8 +1,9 @@
 # qjs: in-repo QuickJS bridge
 
-A thin Go↔wazero bridge to the **quickjs-ng** engine: objects, strings,
-ArrayBuffers, function callbacks, eval, invoke and the job queue — the synchronous
-slice of the API the native host uses, and nothing more.
+The **quickjs-ng** engine every realm runs on, on every target, and a thin Go↔wazero
+bridge to it: objects, strings, ArrayBuffers, function callbacks, eval, invoke and the
+job queue, the synchronous slice of the API the native loader uses to run the host
+script, and nothing more.
 
 ## Files
 
@@ -13,8 +14,14 @@ slice of the API the native host uses, and nothing more.
   `0001-wasi-stack-limit.patch` keeps QuickJS's stack limit, which quickjs-ng
   switches off for WASI; without it, deep recursion runs off the wasm stack into a
   trap that leaves the engine unusable, instead of throwing a `RangeError`.
-- **`qjs.wasm`** — the shim linked against the engine, checked in (~1.25 MiB) and
-  embedded via `//go:embed`, so a clone builds the binary with nothing but Go.
+- **`csrc/realm.c`** — the realm ABI (`R_*`) a guest realm is driven through from
+  JS over the engine table (`WASM/host/engine-realm.ts`): numbers and one exchange
+  buffer only, with the per-call work (arming the deadline, draining jobs, the
+  host-call ledger) compiled in rather than interpreted.
+- **`qjs.wasm`** — the shim and the realm ABI linked against the engine, checked in
+  (~1.25 MiB). The host blob carries it (`WASM/scripts/build-host-blob.mjs`), and
+  `npm run build` copies it to `WASM/browser/` for the JS targets, so a clone builds
+  with nothing but Go and Node.
 
 `./build-qjs.sh` rebuilds it: fetches quickjs-ng at the commit pinned in the script,
 applies the patches, compiles `csrc/` against it with wasi-sdk, and installs the
@@ -23,9 +30,7 @@ C, and a pinned SHA plus the patches say as much as a copy. Rebuilding is not pa
 the Go build, and a change to `csrc/` is not live until you run it; `go test ./...`
 from `native/` drives every export the bridge uses and is the check that it worked.
 
-The JS platform's engine — `WASM/quickjs/` — is the emscripten build of the **same**
-quickjs-ng commit, so both targets run one engine version; move the pin in both build
-scripts together.
+Every target runs this one build, so there is one engine version to move.
 
 Upstream: https://github.com/quickjs-ng/quickjs (MIT)
 
@@ -57,9 +62,10 @@ Upstream: https://github.com/quickjs-ng/quickjs (MIT)
 
 Synchronous only — every `QJS_*` call is a plain synchronous Go→wasm call, and the
 native host builds everything async on top of it: a Go-owned event loop, timers and socket
-delivery, in `../loop.go`. A separate `Runtime` is created per realm: the trusted host
-realm (the platform primitives plus the shared shell JS) and each zero-authority guest
-realm, whose only seam is `host.call`.
+delivery, in `../loop.go`. The bridge runs one `Runtime`, the trusted host realm (the
+platform primitives plus the host script). Each zero-authority guest realm is another
+instance of the same module on the engine table, driven through `R_*` from the host
+script, and its only seam is `host.call`.
 
 No realm reaches the host through the engine itself. The build links no quickjs-libc —
 no std/os/bjson modules and none of their globals — and sets no module loader, so there

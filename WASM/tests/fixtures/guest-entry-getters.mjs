@@ -2,11 +2,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const wasmRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const { createSafeRealm } = await import(pathToFileURL(join(wasmRoot, "build/host/safe-js.js")).href);
+const { createWebRealm } = await import(pathToFileURL(join(wasmRoot, "build/host/engine-web.js")).href);
 
 // The guest swaps every preamble entry point for a getter that never returns. Read after
 // the guest ran, one would spin outside the budget and hold this process forever.
-const realm = await createSafeRealm({
+const realm = await createWebRealm({
   source: `
     for (const name of ["__start", "__resolveHostCall", "__rejectHostCall"])
       Object.defineProperty(globalThis, name, { get() { for (;;) {} } });

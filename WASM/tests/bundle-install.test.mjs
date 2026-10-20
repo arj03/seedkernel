@@ -21,7 +21,7 @@ import {
   checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
   forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp, isWake,
-  MemoryFs, NodeFs, enc, withTestBudget,
+  MemoryFs, NodeFs, FilesFs, nodeRawFiles, enc, withTestBudget,
 } from "./fixtures.mjs";
 
 const { ok, assertEqual, summary } = testkit({ verbose: false });
@@ -454,11 +454,8 @@ async function testFs() {
   try {
     await write(pjoin(cachedDir, "existing"), new Uint8Array(17));
     await write(pjoin(cachedDir, "other"), new Uint8Array(2));
-    class CountedFs extends NodeFs {
-      sizeCalls = 0;
-      async size(key) { this.sizeCalls++; return super.size(key); }
-    }
-    const fs = new CountedFs(cachedDir);
+    const counted = { ...nodeRawFiles, sizeCalls: 0, size(path) { counted.sizeCalls++; return nodeRawFiles.size(path); } };
+    const fs = new FilesFs(counted, cachedDir);
     await Promise.all([
       fs.put("existing", new Uint8Array(5)),
       fs.put("shared", new Uint8Array(3)),
@@ -470,9 +467,9 @@ async function testFs() {
     ]);
     assertEqual((await fs.stat()).used, 5 + 2 + 7 + 528, "NodeFs: cold scan and concurrent size deltas agree");
     assert(bytesEqual(await fs.get("shared"), new Uint8Array(7).fill(42)), "NodeFs: overlapping same-file mutations preserve call order");
-    const probes = fs.sizeCalls;
+    const probes = counted.sizeCalls;
     await Promise.all(Array.from({ length: 10 }, () => fs.stat()));
-    assertEqual(fs.sizeCalls, probes, "NodeFs: repeated statistics never probe individual files");
+    assertEqual(counted.sizeCalls, probes, "NodeFs: repeated statistics never probe individual files");
     await fs.put("shared", new Uint8Array(0));
     assert(await fs.delete("shared"), "NodeFs: deleting an empty value succeeds");
     assert(!(await fs.delete("shared")), "NodeFs: deleting a missing value leaves accounting alone");
@@ -480,7 +477,7 @@ async function testFs() {
 
     // A write torn partway through: it lands in the temp file, never on the key's own.
     disk.writeFile = async (path, data, ...args) => {
-      if (path === pjoin(cachedDir, "~put-existing")) {
+      if (path.startsWith(pjoin(cachedDir, "~existing."))) {
         await write(path, data.subarray(0, 3), ...args);
         throw new Error("injected failure after partial write");
       }
@@ -513,7 +510,7 @@ async function testFs() {
 
 // ─── Test: the fs key space is one rule, shared by every target ──────────
 // Which keys a node accepts decides which blocks it stores and advertises, so it is
-// consensus: a Go node and a Bun node that disagree about it disagree about their
+// consensus: a Go node and a Node node that disagree about it disagree about their
 // contents. The rule lives in shared code (services/fs.ts `isSafeFsKey`), applied over
 // whatever backend a target supplies (`validatedFs`, host/fs-view.ts).
 
@@ -1051,7 +1048,7 @@ async function testWrongTypedStoreIsRefused() {
   // malformed or unreadable state. A directory at the file path is a portable read failure
   // that cannot be mistaken for ENOENT.
   const { freshnessStoreFor } = await imp("build/host/cli.js");
-  const { nodeFiles } = await imp("build/host/shell-node.js");
+  const { nodeFiles } = await imp("build/host/platform-node.js");
   const { freshnessPathFor } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

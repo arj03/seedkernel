@@ -8,9 +8,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"seedkernel/qjs"
 )
 
 // A test-only adapter that invokes installed bundles by label, for Go assertions that pick
@@ -114,6 +120,17 @@ var ownedRealmDir string
 // bootRealm starts a fresh realm on a temp data dir: the engines, the platform
 // primitives, and the shared bundle, but no node. For tests of a primitive (fs, the byte
 // seam) or the shared JS directly.
+// testEngine is qjs.wasm for a test that builds a bare runtime: the checked-in engine, which
+// the genesis blob carries too (shell_stamp_test.go).
+func testEngine(tb testing.TB) []byte {
+	tb.Helper()
+	wasm, err := os.ReadFile(filepath.Join("qjs", "qjs.wasm"))
+	if err != nil {
+		tb.Fatal("qjs.wasm:", err)
+	}
+	return wasm
+}
+
 func bootRealm(tb testing.TB) {
 	tb.Helper()
 	dir, err := os.MkdirTemp("", "seedkernel-realm-")
@@ -147,11 +164,12 @@ func bootRealmIn(tb testing.TB, dir string) {
 	if _, err := qc.Eval("native-handle-harness.js", nativeHandleHarness); err != nil {
 		tb.Fatal("native handle harness:", err)
 	}
-	// This realm's data directory, which Go's boot knows nothing about. Opened through the
-	// platform's own `fs.open` for tests that use `fs` with no node running, and kept as
-	// `__dir` for every `standUp` a test calls: the Go primitive serves one directory, so
-	// all nodes in a realm share it (host/native-shim.ts).
-	evalString(tb, "__fs.open("+jsonString(dir)+"), globalThis.__dir = "+jsonString(dir))
+	// The realm engine, for tests that drive the engine table by hand.
+	qc.Global().SetPropertyStr("__qjsWasm", qc.NewArrayBuffer(host.qjs))
+	// This realm's data directory, which Go's boot knows nothing about: `__dir` for every
+	// `standUp` a test calls, and `fs`, the store a node keeps there, for tests that use
+	// one with no node running.
+	evalString(tb, "globalThis.__dir = "+jsonString(dir)+", globalThis.fs = new FilesFs(__fs, __dir), ''")
 }
 
 // jsonString quotes a Go string as a JS string literal, for the few test helpers that
@@ -236,13 +254,49 @@ func evalString(tb testing.TB, expr string) string {
 	return v.String()
 }
 
+// awaitWithin is el.await under a deadline: past it the await rejects with "await: timed
+// out". The deadline is a JS race, so the call's own late settle goes to the race, never to
+// a later await.
+func awaitWithin(expr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
+	ms := strconv.FormatInt(timeout.Milliseconds(), 10)
+	return el.await(`((p) => { let t; return Promise.race([p, new Promise((_, no) => {
+		t = setTimeout(() => no(new Error("await: timed out")), ` + ms + `); })]).finally(() => clearTimeout(t)); })(` + expr + `)`)
+}
+
+// callRealm calls one of the host script's entry points with args staged as __a0…__aN, and
+// pumps the loop until its promise settles or timeout passes.
+func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, error) {
+	if qc == nil {
+		return nil, errors.New("seedkernel: boot has not run")
+	}
+	slots := make([]string, len(args))
+	for i, a := range args {
+		slots[i] = "__a" + strconv.Itoa(i)
+		qc.Global().SetPropertyStr(slots[i], a) // takes the reference
+	}
+	defer func() {
+		undef := qc.NewUndefined()
+		for _, slot := range slots {
+			qc.Global().SetPropertyStr(slot, undef)
+		}
+	}()
+	kind, value, msg, err := awaitWithin(name+"("+strings.Join(slots, ",")+")", timeout)
+	if err != nil {
+		return nil, err
+	}
+	if kind != 0 {
+		return nil, errors.New(msg)
+	}
+	return value, nil
+}
+
 // awaitOK drives the loop until expr settles and fails the test unless it fulfilled. Prefer
-// it to el.await, which reports a rejection as kind 1 with a nil error, so an `err != nil`
+// it to awaitWithin, which reports a rejection as kind 1 with a nil error, so an `err != nil`
 // check silently passes on the failure it was meant to catch. A test about a rejection or
 // timeout reads the kind instead (loop_probe_test.go).
 func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	tb.Helper()
-	kind, value, msg, err := el.await(expr, timeout)
+	kind, value, msg, err := awaitWithin(expr, timeout)
 	if err != nil {
 		tb.Fatalf("%s: %v", what, err)
 	}
@@ -348,7 +402,7 @@ func guestSeamRealm(tb testing.TB) {
 }
 
 // newTestRealm creates a confined realm through the same factory production uses
-// (createRealm, host/native-shim.ts) over a seam the caller has already installed at
+// (createRealm, host/platform.ts) over a seam the caller has already installed at
 // `__guestSeam`, and stores it at `__realm`. `source` is prefixed with the given APP
 // fixture and an empty LOCAL value, as the shell does for a real bundle's guest (no HOST).
 func newTestRealm(tb testing.TB, appJSON, source string) {

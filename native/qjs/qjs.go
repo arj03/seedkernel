@@ -8,7 +8,6 @@ package qjs
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"sync"
@@ -18,8 +17,6 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-//go:embed qjs.wasm
-var wasmBytes []byte
 
 // goFunc is a Go function exposed to JS via (*Context).Function. A call short of an
 // argument it indexes panics, which callGo turns into a JS exception.
@@ -39,6 +36,8 @@ type Runtime struct {
 	// JS_UNDEFINED and JS_NULL as this engine encodes them: immediates, so handling one
 	// needs no engine call.
 	undefined, null uint64
+	// Whether ints box as tag 0 over their 32 bits, so Go reads and makes them itself.
+	fastInt bool
 }
 
 // fnPool is one export's free list of resolved instances, held by pointer so an engine
@@ -103,9 +102,9 @@ func (r *Runtime) TookInterrupt() bool {
 // Alive reports whether the runtime has not been closed.
 func (r *Runtime) Alive() bool { return r.mod != nil && !r.mod.IsClosed() }
 
-// New instantiates a QuickJS runtime and context holding only ECMAScript intrinsics; WASI
-// answers only the clock (instantiateWASI).
-func New(opts ...Option) (rt *Runtime, err error) {
+// New instantiates a QuickJS runtime and context on `wasm`, a qjs.wasm build, holding only
+// ECMAScript intrinsics; WASI answers only the clock (instantiateWASI).
+func New(wasm []byte, opts ...Option) (rt *Runtime, err error) {
 	var cfg config
 	for _, o := range opts {
 		o(&cfg)
@@ -126,7 +125,7 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		}
 	}()
 	// Each runtime compiles its own module; the shared cache keeps that cheap.
-	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
+	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(SharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
 	// A GoModuleFunc: WithFunc's reflection cost ~1µs per JS→Go call.
@@ -140,12 +139,17 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		return rt, fmt.Errorf("host module: %w", err)
 	}
 
-	code, err := rt.wrt.CompileModule(ctx, wasmBytes)
+	code, err := rt.wrt.CompileModule(ctx, wasm)
 	if err != nil {
 		return rt, fmt.Errorf("compile qjs.wasm: %w", err)
 	}
 	if err := instantiateWASI(ctx, rt.wrt, cfg.wasiProbe, code.ImportedFunctions()); err != nil {
 		return rt, fmt.Errorf("instantiate WASI: %w", err)
+	}
+	// The realm driver's imports (csrc/realm.c) serve an embedder that drives the module
+	// through R_*; this bridge never calls R_*, so they trap.
+	if err := trapImports(ctx, rt.wrt, "realm", code.ImportedFunctions()); err != nil {
+		return rt, fmt.Errorf("instantiate realm imports: %w", err)
 	}
 
 	// A reactor: _initialize sets wasi-libc up once, before any other export runs.
@@ -167,6 +171,9 @@ func New(opts ...Option) (rt *Runtime, err error) {
 		return rt, errors.New("qjs.New: the engine could not create a runtime")
 	}
 	rt.ctxt = &Context{rt: rt, handle: handle}
+	// The int encoding Go assumes (value.go isInt), confirmed against the engine.
+	rt.fastInt = rt.call("QJS_NewInt32", handle, uint64(uint32(0xfffffff9))) == 0xfffffff9 &&
+		rt.call("QJS_ToInt32", handle, 0xfffffff9) == 0xfffffff9 && rt.undefined>>32 != 0
 	// Re-read the stack top at the depth every top-level call enters at, so deep recursion
 	// throws a RangeError before it overruns the shadow stack. Once, not per call, so
 	// re-entrant calls count against it.
@@ -179,8 +186,9 @@ var (
 	cache     wazero.CompilationCache
 )
 
-// sharedCache returns the process-wide compilation cache.
-func sharedCache() wazero.CompilationCache {
+// SharedCache is the process-wide compilation cache, for an embedder that instantiates
+// qjs.wasm itself and should share the compiled engine.
+func SharedCache() wazero.CompilationCache {
 	cacheOnce.Do(func() { cache = wazero.NewCompilationCache() })
 	return cache
 }
@@ -211,6 +219,30 @@ func instantiateWASI(ctx context.Context, r wazero.Runtime, probe func(string), 
 		}
 		b.NewFunctionBuilder().
 			WithGoModuleFunction(wasiFunc(name, len(fn.ResultTypes()) > 0, probe), fn.ParamTypes(), fn.ResultTypes()).
+			Export(name)
+	}
+	_, err := b.Instantiate(ctx)
+	return err
+}
+
+// InstantiateWASI answers a module's WASI imports in r as a realm's are answered: the clock,
+// and nothing else. For an embedder instantiating qjs.wasm itself (the engine table).
+func InstantiateWASI(ctx context.Context, r wazero.Runtime, imports []api.FunctionDefinition) error {
+	return instantiateWASI(ctx, r, nil, imports)
+}
+
+// trapImports satisfies every import from `module` with a function that traps.
+func trapImports(ctx context.Context, r wazero.Runtime, module string, imports []api.FunctionDefinition) error {
+	b := r.NewHostModuleBuilder(module)
+	for _, fn := range imports {
+		mod, name, ok := fn.Import()
+		if !ok || mod != module {
+			continue
+		}
+		b.NewFunctionBuilder().
+			WithGoModuleFunction(api.GoModuleFunc(func(context.Context, api.Module, []uint64) {
+				panic("qjs: import " + module + "." + name + " is not served here")
+			}), fn.ParamTypes(), fn.ResultTypes()).
 			Export(name)
 	}
 	_, err := b.Instantiate(ctx)

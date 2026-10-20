@@ -1,71 +1,53 @@
-// The in-memory `Fs` backend: portable, for tests and ephemeral nodes. The other backends
-// are `fs-node.ts` and Go's `native/fs.go`; the seam is `fs.ts`. The per-app key rule is
-// applied in host/fs-view.ts, so what an app can reach does not depend on the backend.
+// The in-memory `Fs` backend: portable, for tests and ephemeral nodes. It is the shared
+// store (fs-files.ts) over whole files held in a map, so it keeps the rules every other
+// target's store keeps; the seam is `fs.ts`. The per-app key rule is applied in
+// host/fs-view.ts, so what an app can reach does not depend on the backend.
 
-import { type Fs, type FsStat } from "./fs.js";
+import { FilesFs, type RawFiles } from "./fs-files.js";
 
 /** The in-memory backend's total quota, so puts cannot grow process memory without
- *  bound. */
+ *  bound, and its entry quota, since an empty value holds memory too. */
 export const DEFAULT_MEMORY_FS_MAX_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_MEMORY_FS_MAX_ENTRIES = 1 << 16;
 
-/** In-memory Fs. Stores copies so callers can reuse their buffers.
- *
- *  Every method is `async` even though the map is not, so code that accidentally relies
- *  on synchronous results fails here too and not only on a real backend. */
-export class MemoryFs implements Fs {
-  private readonly map = new Map<string, Uint8Array>();
-  private used = 0;
+/** Whole files in a map. A write past either quota is refused as a full disk refuses one,
+ *  before anything changes. Files are stored and read as copies, so callers can reuse
+ *  their buffers. */
+export function memoryRawFiles(maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES, maxEntries = DEFAULT_MEMORY_FS_MAX_ENTRIES): RawFiles {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || !Number.isSafeInteger(maxEntries) || maxEntries < 0) {
+    throw new Error("memory-fs: invalid quota");
+  }
+  const files = new Map<string, Uint8Array>();
+  let used = 0;
+  return {
+    mkdir() {},
+    read(path, max) {
+      const f = files.get(path);
+      if (f && f.length > max) throw new Error(`memory-fs: ${path} is larger than ${max} bytes`);
+      return f ? f.slice() : null;
+    },
+    write(path, bytes) {
+      const previous = files.get(path);
+      if (!previous && files.size >= maxEntries) throw new Error(`memory-fs: entry quota exceeded (cap ${maxEntries})`);
+      const next = used - (previous?.length ?? 0) + bytes.length;
+      if (next > maxBytes) throw new Error(`memory-fs: byte quota exceeded (cap ${maxBytes})`);
+      // `new Uint8Array`, because a Node Buffer's slice() aliases the caller's storage.
+      files.set(path, new Uint8Array(bytes));
+      used = next;
+    },
+    remove(path) {
+      used -= files.get(path)?.length ?? 0;
+      return files.delete(path);
+    },
+    size: (path) => files.get(path)?.length ?? -1,
+    list: (dir) => [...files.keys()].filter((p) => p.startsWith(dir + "/")).map((p) => p.slice(dir.length + 1)).join("\n"),
+    available: () => maxBytes - used,
+  };
+}
 
-  constructor(
-    private readonly maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES,
-    private readonly maxEntries = DEFAULT_MEMORY_FS_MAX_ENTRIES,
-  ) {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0
-      || !Number.isSafeInteger(maxEntries) || maxEntries < 0) {
-      throw new Error("memory-fs: invalid quota");
-    }
-  }
-
-  async get(key: string): Promise<Uint8Array | null> {
-    const v = this.map.get(key);
-    return v ? v.slice() : null;
-  }
-  async put(key: string, bytes: Uint8Array): Promise<void> {
-    const previous = this.map.get(key);
-    if (!previous && this.map.size >= this.maxEntries) {
-      throw new Error(`memory-fs: entry quota exceeded (cap ${this.maxEntries})`);
-    }
-    const nextUsed = this.used - (previous?.length ?? 0) + bytes.length;
-    if (nextUsed > this.maxBytes) {
-      throw new Error(`memory-fs: byte quota exceeded (cap ${this.maxBytes})`);
-    }
-    // Checked before the copy, committed after it, so a failed allocation leaves the old
-    // value and the accounting intact. `new Uint8Array` because a Node Buffer's slice()
-    // aliases the caller's storage.
-    const stored = new Uint8Array(bytes);
-    this.map.set(key, stored);
-    this.used = nextUsed;
-  }
-  async size(key: string): Promise<number> {
-    const v = this.map.get(key);
-    return v ? v.length : -1;
-  }
-  async list(prefix?: string): Promise<string[]> {
-    const out: string[] = [];
-    for (const k of this.map.keys()) {
-      if (!prefix || k.startsWith(prefix)) out.push(k);
-    }
-    return out;
-  }
-  async delete(key: string): Promise<boolean> {
-    const previous = this.map.get(key);
-    if (!previous) return false;
-    this.map.delete(key);
-    this.used -= previous.length;
-    return true;
-  }
-  async stat(): Promise<FsStat> {
-    return { used: this.used, available: this.maxBytes - this.used };
+/** The `fs` store in memory. */
+export class MemoryFs extends FilesFs {
+  constructor(maxBytes?: number, maxEntries?: number) {
+    super(memoryRawFiles(maxBytes, maxEntries), "memory");
   }
 }

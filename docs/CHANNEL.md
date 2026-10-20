@@ -380,7 +380,8 @@ and the migration path of §14.1. First message indistinguishable from random is
 goal and belongs in its own suite.
 
 **Impersonation after key compromise.** Seizing a node's master seed lets an attacker be
-that node. Only §3's deferral limits the *retroactive* damage.
+that node, for good: nothing revokes it ([SECURITY](SECURITY.md) §14). Only §3's deferral
+limits the *retroactive* damage.
 
 ---
 

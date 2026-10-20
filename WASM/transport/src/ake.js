@@ -187,6 +187,12 @@ async function netLinkOpen(dest) {
 }
 /** Resolves once the host has accepted the bytes. */
 function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)); }
+/** A host link as the channel a `Link` writes to: `send(bytes)` resolves once the bytes are
+ *  taken, and `close(graceful)` answers false when it must be asked again. A link this
+ *  realm runs itself (stream.js) is a channel of its own. */
+function hostChannel(linkId) {
+  return { send: (bytes) => netLinkSend(linkId, bytes), close: (graceful) => netLinkClose(linkId, graceful) };
+}
 /** Returns false when the seam refused the call (the host-call budget), so the close is
  *  retried later instead of throwing out of a teardown (`Link.closeChannel`). */
 function netLinkClose(linkId, graceful) {
@@ -217,7 +223,8 @@ function admits(peerBytes) {
 class Link {
   constructor(spec) {
     this.linkId = spec.linkId;
-    this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
+    this.channel = spec.channel ?? hostChannel(spec.linkId);
+    this.framer = makeFramer(spec.stream, (bytes) => this.channel.send(bytes), spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
     // A splice through a relay (relay.js), rather than a path of its own to the peer.
     this.relayed = spec.relayed === true;
@@ -310,7 +317,7 @@ class Link {
   /** Close the socket through the host. A refused close is retried (`onWake`) until the
    *  host accepts it. */
   closeChannel(graceful) {
-    this.closeOwed = netLinkClose(this.linkId, graceful) ? null : graceful;
+    this.closeOwed = this.channel.close(graceful) ? null : graceful;
     if (this.closeOwed !== null) this.due = dueIn(CLOSE_RETRY_MS);
   }
 
@@ -478,7 +485,7 @@ class Link {
 
   /** Put one link message on the wire, framed if the platform does not frame it. */
   wire(msg) {
-    return this.framer ? this.framer.send(msg) : netLinkSend(this.linkId, msg);
+    return this.framer ? this.framer.send(msg) : this.channel.send(msg);
   }
 
   /** Seal one record and put it on the wire, failing the link if that fails (§12.6). */

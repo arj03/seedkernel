@@ -1,5 +1,5 @@
 // The guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy parsing, node/sign
-// scoping, safe-js confinement, realm serialization, seam gating, and module-call
+// scoping, realm confinement, realm serialization, seam gating, and module-call
 // budgeting. bundle-install.test.mjs covers the verify, admit and install lifecycle;
 // crypto.test.mjs the manifest suite and ACVP vectors.
 //
@@ -16,7 +16,7 @@ import {
   signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
   testAuthor, bootTestShell, imp, MemoryFs,
   createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_CALL_LOCAL, testBackends,
-  createSafeRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
+  createWebRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
 } from "./fixtures.mjs";
 import { bytesEqual } from "./bytes.mjs";
 
@@ -397,18 +397,18 @@ async function testGuestAbi() {
   console.log("  OK\n");
 }
 
-// ─── Test: safe-js zero-authority JS confinement (§12.3) ─────────────────
+// ─── Test: zero-authority JS confinement (§12.3) ─────────────────────────
 // Zero-authority guest JS over a single host-call seam, with stand-in seams: nothing
 // reachable by construction, the async seam and byte boundary, control flow, and realm
 // isolation.
 
 async function testSafeJs() {
-  console.log("Test: safe-js — zero-authority JS confinement (§12.3)");
+  console.log("Test: zero-authority JS confinement (§12.3)");
 
-  // 1. Nothing reachable: the guest cannot name fs/net/Bun/process/fetch/require, and
+  // 1. Nothing reachable: the guest cannot name fs/net/process/fetch/require, and
   //    dynamic import() is unavailable (no module loader).
   {
-    const DANGER = ["Bun", "process", "require", "fetch", "Buffer", "WebAssembly", "globalThis"];
+    const DANGER = ["process", "require", "fetch", "Buffer", "WebAssembly", "globalThis"];
     const probeSrc = `
       function handle() {
         const names = ${JSON.stringify(DANGER)};
@@ -420,7 +420,7 @@ async function testSafeJs() {
         return out;
       }
     `;
-    const realm = await createSafeRealm({ source: probeSrc, hostCall: async () => new Uint8Array() });
+    const realm = await createWebRealm({ source: probeSrc, hostCall: async () => new Uint8Array() });
     const res = await realm.call(new Uint8Array());
     for (let i = 0; i < DANGER.length - 1; i++) {
       assertEqual(res[i], 0, `${DANGER[i]} is unreachable in the realm`);
@@ -435,7 +435,7 @@ async function testSafeJs() {
         catch { return new Uint8Array([0]); }
       }
     `;
-    const realm = await createSafeRealm({ source: src, hostCall: async () => new Uint8Array() });
+    const realm = await createWebRealm({ source: src, hostCall: async () => new Uint8Array() });
     const res = await realm.call(new Uint8Array());
     assertEqual(res[0], 0, "import('node:fs') rejects — no path out of the realm");
     realm.dispose();
@@ -459,7 +459,7 @@ async function testSafeJs() {
         throw new Error("no such sel " + sel);
       }
     `;
-    const realm = await createSafeRealm({ source: src, hostCall });
+    const realm = await createWebRealm({ source: src, hostCall });
     const input = new Uint8Array([0, 1, 2, 254, 255]);
     const U = (...xs) => new Uint8Array(xs);
     const sync = await realm.call(U(1, ...input));
@@ -499,7 +499,7 @@ async function testSafeJs() {
         return new Uint8Array([placed.length, holders, ...placed]);
       }
     `;
-    const realm = await createSafeRealm({ source: src, hostCall });
+    const realm = await createWebRealm({ source: src, hostCall });
     const res = await realm.call(new Uint8Array([3, 10]));
     assertEqual(res[0], 3, "loop placed exactly `count` blocks on distinct peers");
     assertEqual([...res.slice(2)], [0, 2, 4], "placement followed peer order and the accept rule");
@@ -509,11 +509,11 @@ async function testSafeJs() {
 
   // 4. Realm isolation: a poisoned guest cannot reach a sibling's global.
   {
-    const a = await createSafeRealm({
+    const a = await createWebRealm({
       source: `globalThis.SECRET = 42; function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
-    const b = await createSafeRealm({
+    const b = await createWebRealm({
       source: `function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
@@ -540,7 +540,7 @@ async function testRealmSerialization() {
   {
     let calls = 0;
     const hostCall = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
-    const realm = await createSafeRealm({
+    const realm = await createWebRealm({
       source: `function handle(arg) { return host.call("inc", arg); }`,
       hostCall,
     });
@@ -562,7 +562,7 @@ async function testRealmSerialization() {
       if (name === "inc") return payload.map((b) => (b + 1) & 0xff);       // answers at once (holder path)
       return new Uint8Array();
     };
-    const realm = await createSafeRealm({
+    const realm = await createWebRealm({
       source: `function handle(a) {
                  if (a[0] === 1) return (async () => await host.call("park", new Uint8Array()))();
                  if (a[0] === 2) return host.call("inc", a.subarray(1)); // holder path
@@ -587,7 +587,7 @@ async function testRealmSerialization() {
 
   // 3. Still nothing reachable: the one seam is the same zero-authority sandbox.
   {
-    const realm = await createSafeRealm({
+    const realm = await createWebRealm({
       source: `function handle() { return new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]); }`,
       hostCall: async () => new Uint8Array(),
     });
@@ -601,7 +601,7 @@ async function testRealmSerialization() {
   //    taking the wasm module with it: the engine asserts an empty gc object list when a
   //    runtime is freed, so a handle the waiting call still held would abort the module.
   {
-    const realm = await createSafeRealm({
+    const realm = await createWebRealm({
       source: `async function handle() { await host.call("park", new Uint8Array()); }`,
       hostCall: (name) => (name === "park" ? new Promise(() => {}) : new Uint8Array()),  // never settles
     });
@@ -617,7 +617,7 @@ async function testRealmSerialization() {
     assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
 
     // A realm built after the teardown shows the module survived it.
-    const next = await createSafeRealm({
+    const next = await createWebRealm({
       source: `function handle(arg) { return arg; }`,
       hostCall: async () => new Uint8Array(),
     });
@@ -869,7 +869,7 @@ async function testModuleCallChargedToGuestBudget() {
   const { ModuleTable } = await imp("build/host/module-table.js");
   const { SPIN_WASM } = await import("./fixtures/spin-wasm.mjs");
   const { createGuestSeam } = await imp("build/host/guest-seam.js");
-  const { createSafeRealm } = await imp("build/host/safe-js.js");
+  const { createWebRealm } = await imp("build/host/engine-web.js");
   const { testHost } = await import("./fixtures.mjs");
 
   const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
@@ -887,7 +887,7 @@ async function testModuleCallChargedToGuestBudget() {
   });
   // The realm's budget is 5 s, but the guest burns most of it before calling the module:
   // the call must then be killed near what remains, not at the table's 60 s.
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source: `async function handle() {
       const t0 = Date.now();
       while (Date.now() - t0 < 4900) { /* burn the segment */ }
@@ -915,7 +915,7 @@ async function testModuleCallChargedToGuestBudget() {
   // needed: the guest waits while the module runs, so its own spend advances by
   // microseconds per turn, and QuickJS's interrupt is checked per bytecode, of which this
   // guest runs almost none between calls.
-  const looper = await createSafeRealm({
+  const looper = await createWebRealm({
     source: `async function handle() {
       for (;;) await host.call("spin", new Uint8Array());
     }`,
@@ -960,7 +960,7 @@ async function testPreviousAbiRefused() {
       }
       return out;
     }`;
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source,
     hostCall: createGuestSeam({
       sodium,
@@ -981,11 +981,11 @@ async function testPreviousAbiRefused() {
 }
 
 async function testSafeRealmConcurrency() {
-  console.log("Test: concurrent call()s on one safe-js realm retain their own arguments");
+  console.log("Test: concurrent call()s on one realm retain their own arguments");
 
   // Concurrent callers queue at the realm boundary. Each entry passes its own argument
   // handle synchronously, before the first await, and retains those bytes while parked.
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source: `async function handle(a) { return await host.call("echo", a); }`,
     hostCall: (_name, p) => sleep(10).then(() => p),
   });
@@ -1019,7 +1019,7 @@ async function testDeferredKeepsItsDeadline() {
   const parkingRealm = async (source, deadlineMs) => {
     const parked = new Map();
     const remaining = new Map();
-    const realm = await createSafeRealm({
+    const realm = await createWebRealm({
       source,
       deadlineMs,
       hostCall: (name, tag, budget) => {
@@ -1089,7 +1089,7 @@ async function testDetachedAnswerIsANewTurn() {
   // `deliver` detaches and never answers, so its own handoff deadline (the invocation's
   // 100 ms) settles it; `remaining` records the remainder its continuation was given.
   const remaining = [];
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source: `function handle(tag) {
       host.call("deliver", tag).then(() => {}, () => {})
         .then(() => host.call("remaining", tag)).catch(() => {});
@@ -1121,7 +1121,7 @@ async function testOwnTurns() {
   // records the remainder the turn still had then.
   let release;
   const remaining = [];
-  const realm = await createSafeRealm({
+  const realm = await createWebRealm({
     source: `async function handle(tag) {
       try { await host.call("wait", tag); await host.call("remaining", tag); } catch {}
       return tag;

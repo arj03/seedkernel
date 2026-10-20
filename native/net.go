@@ -1,12 +1,11 @@
 // The socket primitive exposed to QuickJS as `__net`. Reader goroutines hand each read to
-// el.post, and the loop delivers it through the __netDeliver/__netClosed/__netAccept
-// dispatchers defined in host/native-shim.ts.
+// el.post, and the loop delivers it through the deliver/closed/accept dispatchers
+// host/platform.ts hands over at install.
 package main
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -29,46 +28,37 @@ type netHost struct {
 	// Set by close, releasing readers parked on the staging allowance.
 	closed bool
 
-	// Installed by host/native-shim.ts before any socket opens.
-	maxLiveChannels      int
+	// Installed by host/platform.ts before any socket opens.
+	keepAlive            time.Duration
 	closeGrace           time.Duration
 	maxInboundReadBytes  int
 	maxInboundReadSlices int
+	fnDeliver            *qjs.Value
+	fnClosed             *qjs.Value
+	fnAccept             *qjs.Value
 
 	// Staging custody: reads posted to the loop but not yet handed to TransportHost.
 	inboundReadBytes  int
 	inboundReadSlices int
 	readSpace         *sync.Cond // signalled as staging custody is released
-
-	fnDeliver *qjs.Value
-	fnClosed  *qjs.Value
-	fnAccept  *qjs.Value
 }
 
-// exposeNet installs `__net`, shaped into RawLinks by host/native-shim.ts.
+// exposeNet installs `__net`, shaped into RawLinks by host/platform.ts.
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		maxLive := int(args[0].Int64())
-		grace := time.Duration(args[1].Int64()) * time.Millisecond
-		maxInboundBytes := int(args[2].Int64())
-		maxInboundSlices := int(args[3].Int64())
-		if maxLive <= 0 || grace <= 0 || maxInboundBytes <= 0 || maxInboundSlices <= 0 {
-			return nil, errors.New("net: invalid socket limits")
-		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.maxLiveChannels != 0 || n.closeGrace != 0 ||
-			n.maxInboundReadBytes != 0 || n.maxInboundReadSlices != 0 {
-			return nil, errors.New("net: socket limits already installed")
-		}
-		n.maxLiveChannels = maxLive
-		n.closeGrace = grace
-		n.maxInboundReadBytes = maxInboundBytes
-		n.maxInboundReadSlices = maxInboundSlices
-		return qc.NewUndefined(), nil
+		n.keepAlive = time.Duration(args[0].Int64()) * time.Millisecond
+		n.closeGrace = time.Duration(args[1].Int64()) * time.Millisecond
+		n.maxInboundReadBytes = int(args[2].Int64())
+		n.maxInboundReadSlices = int(args[3].Int64())
+		n.fnDeliver = args[4].GetPropertyStr("deliver")
+		n.fnClosed = args[4].GetPropertyStr("closed")
+		n.fnAccept = args[4].GetPropertyStr("accept")
+		return nil, nil
 	}))
 
 	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
@@ -124,18 +114,6 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	return n
 }
 
-// retain picks up the dispatchers host/native-shim.ts defines when the bundle evaluates.
-func (n *netHost) retain() error {
-	g := n.qc.Global()
-	n.fnDeliver = g.GetPropertyStr("__netDeliver")
-	n.fnClosed = g.GetPropertyStr("__netClosed")
-	n.fnAccept = g.GetPropertyStr("__netAccept")
-	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
-		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
-	}
-	return nil
-}
-
 func (n *netHost) get(id int64) *sockChannel {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -179,31 +157,20 @@ func (n *netHost) releaseInboundRead(length int) {
 	n.mu.Unlock()
 }
 
-// allocInbound mints an id for an accepted socket, refusing at maxLiveChannels.
-func (n *netHost) allocInbound() (int64, bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if len(n.chans) >= n.maxLiveChannels {
-		return 0, false
-	}
-	n.nextID++
-	return n.nextID, true
-}
-
 // dial opens an outbound byte duplex that JS can send on before it connects.
 func (n *netHost) dial(addr string) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.nextID++
 	id := n.nextID
-	n.chans[id] = newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
+	n.chans[id] = newDialChannel(addr, n.keepAlive, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return id
 }
 
-// listen accepts inbound byte duplexes. Each reader starts only after __netAccept has
+// listen accepts inbound byte duplexes. Each reader starts only after `accept` has
 // made the JS channel it delivers to.
 func (n *netHost) listen(host string, port int) (int, error) {
-	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
+	lc := net.ListenConfig{KeepAlive: n.keepAlive}
 	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
@@ -223,15 +190,12 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				time.Sleep(acceptErrBackoff)
 				continue
 			}
-			id, ok := n.allocInbound()
-			if !ok {
-				conn.Close()
-				continue
-			}
-			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 			// The IP alone: the transport's half-open budget groups by source IP.
 			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 			n.mu.Lock()
+			n.nextID++
+			id := n.nextID
+			ch := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 			n.chans[id] = ch
 			n.mu.Unlock()
 			n.el.post(func() {
@@ -281,7 +245,7 @@ func (n *netHost) onMsg(id int64) func([]byte) bool {
 		// b is the reader's buffer, borrowed: the spent read token keeps the next read
 		// from overwriting it before the task copies it.
 		n.el.post(func() {
-			// Staging custody ends once __netDeliver has handed off, however it returns.
+			// Staging custody ends once `deliver` has handed off, however it returns.
 			defer n.releaseInboundRead(len(b))
 			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
 		})

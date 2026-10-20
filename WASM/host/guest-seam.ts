@@ -38,7 +38,19 @@ export interface RawNet {
   send(linkId: number, bytes: Uint8Array): void;
   /** Tear a link down; `graceful` flushes already-written bytes first. */
   close(linkId: number, graceful: boolean): void;
+  /** A datagram socket for the occupant's UDP paths (§12.7); its reads arrive as
+   *  `datagrams` events. */
+  udpBind(): Promise<DatagramSocket>;
+  /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
+   *  one that fails is lost. */
+  udpSend(batch: Uint8Array): void;
+  udpClose(id: number): void;
 }
+
+/** A bound socket: socket 0 when refused or failed. `addresses` are every address this
+ *  machine's sockets are reached at, `\n`-separated; which are candidates is the
+ *  occupant's. */
+export interface DatagramSocket { id: number; port: number; addresses: string }
 
 /** The `link` backend: the driver's raw links plus the shell's claim routing. */
 export interface LinkBackend extends RawNet {
@@ -60,6 +72,12 @@ export interface HostTimers {
   clear(): void;
 }
 
+/** The loader's host slots (§12.9): keep a host blob as the one to run next, or refuse it
+ *  with the reason. */
+export interface HostStaging {
+  stage(blob: Uint8Array): void | Promise<void>;
+}
+
 /** What stands behind each host service. */
 export interface SeamBackends {
   /** This slot's signing scope (`slotSignScope`): signing is never raw. */
@@ -68,6 +86,7 @@ export interface SeamBackends {
   fs: Fs;
   timer: HostTimers;
   link: LinkBackend;
+  host: HostStaging;
 }
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
@@ -138,7 +157,11 @@ export class CallBudget {
  *  and the realm hands them to the guest in the frame that asked: no host promise, no
  *  deadline and no later turn, which is most of what a call costs. One that has to wait
  *  returns a Promise. The guest sees a Promise either way. */
-export type HostCall = (name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
+export type HostCall = ((name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>) & {
+  /** Whether `name`'s handler is done with its payload when it returns, so the realm may
+   *  lend it a view of its memory instead of a copy (engine-realm.ts). Absent: never. */
+  borrows?(name: string): boolean;
+};
 
 export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
 
@@ -218,7 +241,7 @@ globalThis.__rejectHostCall = (callId, msg) => {
 };
 globalThis.host = {
   // Every name answers a Promise. A refused name throws here, at the call site. The
-  // payload crosses as a plain ArrayBuffer: quickjs-emscripten rejects a view.
+  // payload crosses as a plain ArrayBuffer, which is what the realm reads (realm.c).
   call(name, bytes) {
     const callId = ++__callSeq;
     const ab = bytes instanceof ArrayBuffer
@@ -407,6 +430,9 @@ const SERVICES: {
     }),
     "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
   }),
+  host: (staging) => ({
+    "host/stage": async (payload) => { await staging.stage(payload); return NONE; },
+  }),
   timer: (timers) => ({
     "timer/arm": (payload) => {
       if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
@@ -449,6 +475,24 @@ const SERVICES: {
     // occupant when either changes.
     "link/status": (payload) => {
       net.status(payload.slice());
+      return NONE;
+    },
+    // -> [socket u32][port u16][addresses utf8], socket 0 for none.
+    "link/udpBind": () => net.udpBind().then((s) => {
+      const addresses = enc.encode(s.addresses);
+      const out = new Uint8Array(6 + addresses.length);
+      writeU32BE(out, 0, s.id);
+      out[4] = s.port >> 8;
+      out[5] = s.port & 255;
+      out.set(addresses, 6);
+      return out;
+    }),
+    "link/udpSend": (payload) => {
+      net.udpSend(payload);
+      return NONE;
+    },
+    "link/udpClose": (payload) => {
+      net.udpClose(readU32BE(payload, 0));
       return NONE;
     },
   }),
@@ -515,9 +559,12 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
       return bytes;
     }));
   }
-  return (name, payload, budget) => {
+  const seam: HostCall = (name, payload, budget) => {
     const route = routes.get(name);
     if (!route) throw new Error("guest-seam: no such name " + name + " (not crypto, a module, or declared in guest.requires)");
     return route(payload, budget);
   };
+  // The crypto transforms and `node` answer inline and keep nothing of their payload.
+  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("node/");
+  return seam;
 }

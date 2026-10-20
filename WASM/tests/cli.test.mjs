@@ -141,6 +141,37 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1
   }
 }
 
+// A page's node: the host blob's own script, run by the page's loader on the browser
+// platform (platform-web.ts), through the same standUp, with the page's own admission gate
+// in place of a policy file.
+{
+  const { authorBundle, testAuthor } = await import("./fixtures.mjs");
+  const { browserHost } = await imp("build/host/platform-web.js");
+  const host = browserHost({ hostBlob: new Uint8Array(readFileSync(join(root, "build/host.skb"))) });
+  const asked = [];
+  const node = await host.standUp({
+    dir: "page", identity: host.sodium.crypto_sign_keypair(), transport: false,
+    admit: (b) => { asked.push(b.manifest.app); return true; },
+  });
+  try {
+    const app = await node.shell.install(authorBundle(sodium, testAuthor(), {
+      app: "page-probe", version: 1, modules: [], guestRequires: [],
+      guestSource: "function handle() { return host.call('crypto/blake2b', new Uint8Array([32, 0, 1, 2, 3])); }",
+    }).blob);
+    ok(asked.includes("page-probe"), "a page's node admits through the page's own gate");
+    ok(toHex(await app.invoke(new Uint8Array())) === toHex(host.sodium.crypto_generichash(32, new Uint8Array([1, 2, 3]))),
+      "…and its guest's crypto runs on the host blob's libsodium");
+    let msg = "";
+    try {
+      await host.standUp({ dir: "page2", identity: host.sodium.crypto_sign_keypair(), transport: {} });
+    } catch (e) { msg = e.message; }
+    ok(/no sockets/.test(msg), "a page's node is networked only through the page's own channels");
+  } finally {
+    node.shell.close();
+    host.teardown();
+  }
+}
+
 // The §12.3 guest bounds reach the shell; otherwise no operator could set them.
 {
   const host = fakeHost(["--key", join(work, "g.key"), "--guest-timeout", "250", "--guest-memory", "8"]);
@@ -179,10 +210,10 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
   ok(msg.startsWith(`--key: cannot read ${keyPath}`) && host.written.size === 0 && host.stood === null,
     "an unreadable --key fails the boot and mints nothing over it");
 }
-// The Node binding keeps that contract, as native does (shell-node.ts `nodeFiles`). A
+// The Node binding keeps that contract, as native does (platform-node.ts `nodeFiles`). A
 // directory at the path is a portable read failure that cannot be mistaken for ENOENT.
 {
-  const { nodeFiles } = await imp("build/host/shell-node.js");
+  const { nodeFiles } = await imp("build/host/platform-node.js");
   ok(nodeFiles.readFile(join(work, "never-written")) === null, "Node: only a missing file reads as absent");
   const keyDir = mkdtempSync(join(work, "keydir-"));
   throws(() => nodeFiles.readFile(keyDir), "Node: a path that exists and cannot be read throws");

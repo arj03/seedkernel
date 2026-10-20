@@ -29,7 +29,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 	}
 
 	// Capped like a guest realm, so the out-of-memory probe below fails fast.
-	rt, err := New(WithMemoryLimit(64<<20), func(c *config) { c.wasiProbe = probe })
+	rt, err := New(engine(t), WithMemoryLimit(64<<20), func(c *config) { c.wasiProbe = probe })
 	if err != nil {
 		t.Fatal("New:", err)
 	}
@@ -88,7 +88,7 @@ func TestStackOverflowThrows(t *testing.T) {
 		{"JSON.parse", `JSON.parse("[".repeat(1000000) + "]".repeat(1000000))`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt, err := New()
+			rt, err := New(engine(t))
 			if err != nil {
 				t.Fatal("New:", err)
 			}

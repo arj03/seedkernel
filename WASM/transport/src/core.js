@@ -78,6 +78,11 @@ const maxOutboundQueueSlices = 4096;
 const callWeight = HOST.maxOutstandingHostCallBytes / HOST.maxOutstandingHostCalls;
 const maxRequestWeight = maxFrameBytes + PK_LEN + callWeight;
 const deliveryWindow = HOST.maxOutstandingHostCallBytes - 2 * maxRequestWeight;
+// An invocation's deadline runs from its admission and covers a deferred answer (§12.3),
+// so a `ready` that waited the realm's whole ceiling would lose to it. It settles this far
+// short of it instead; null is an unbounded realm.
+const READY_MARGIN_MS = 250;
+const readyCapMs = HOST.deadlineMs === null ? Infinity : Math.max(0, HOST.deadlineMs - READY_MARGIN_MS);
 const maxPreAuthQueueSlices = Math.max(1, policy("maxPreAuthQueueSlices"));
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");
@@ -147,6 +152,7 @@ function onWake() {
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));
     wakeBy(relays.onWake(t));
+    wakeBy(udp.onWake(t));
     for (const link of linksById.values()) wakeBy(link.onWake(t));
   } finally {
     walking = false;
@@ -277,8 +283,8 @@ class Core {
       for (const link of [...pool.links, ...pool.held]) link.close();
     }
     // A peer connection still being negotiated has no data link to close it.
-    const e = rtc.byPeer.get(peerId);
-    if (e && e.data === null) rtc.drop(e);
+    const e = direct.byPeer.get(peerId);
+    if (e && e.data === null) direct.drop(e);
   }
 
   /** Top a peer up to connsPerPeer outbound links, one dial per peer at a time. */
@@ -342,7 +348,7 @@ class Core {
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
     if (!router.promote(peerId, link)) return;
-    if (link.relayed) { void rtc.upgrade(peerId).catch(() => {}); return; }
+    if (link.relayed) { void direct.upgrade(peerId).catch(() => {}); return; }
     // The requests held back from the relay go out on the direct link.
     reqres.pumpRelayed(peerId);
     if (!link.weDialed) router.retireRelayed(peerId);
@@ -352,7 +358,7 @@ class Core {
    *  relayed link once a direct one routes, and otherwise leaves it to the idle clock. */
   onControl(peerId, frame, link) {
     const tag = frame[1];
-    if (tag !== CTL_RETIRE) rtc.receive(peerId, tag, frame.subarray(2));
+    if (tag !== CTL_RETIRE) direct.receive(peerId, tag, frame.subarray(2));
     else if (link.relayed && router.hasDirect(peerId)) link.close();
   }
 
@@ -398,7 +404,7 @@ class Core {
     for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
-    this.readyWaiters.push({ check: allUp, d, due: dueIn(timeoutMs) });
+    this.readyWaiters.push({ check: allUp, d, due: dueIn(Math.min(timeoutMs, readyCapMs)) });
   }
 
   /** Settle each waiter whose cohort is up or whose deadline has passed (a caller that
@@ -417,7 +423,8 @@ class Core {
 const router = new Router(ownPk);
 const reqres = new ReqRes();
 const core = new Core();
-const rtc = new Rtc();
+const direct = new Direct();
+const udp = new Udp();
 const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
@@ -465,7 +472,7 @@ entry("linkOpen", (r) => {
   const listener = r.blob();
   const via = r.u32();
   const source = r.blob();
-  if (via !== 0) { rtc.bindData(via, linkId, stream); return; }
+  if (via !== 0) { direct.bindData(via, linkId, stream); return; }
   core.openLink({
     linkId, weDialed: false, stream,
     listener: listener.length > 0 ? utf8Decode(listener) : "",
@@ -488,14 +495,29 @@ entry("linkBytes", async (r) => {
 /** The socket closed. Answers `[severity u8][reason utf8]` (`closeReason`, ake.js), once
  *  per link. */
 entry("linkClosed", (r) => {
-  const linkId = r.u32();
-  const link = linksById.get(linkId);
+  const link = channelClosed(r.u32());
   if (!link) return EMPTY;
-  link.onChannelClosed();
-  linksById.delete(linkId);
   const why = link.closeReason;
   return concatBytes([Uint8Array.of(ROUTINE_REASONS.has(why) ? 0 : 1), utf8Encode(why)]);
 });
+
+/** A link's channel went away: tell the link, and forget it. */
+function channelClosed(linkId) {
+  const link = linksById.get(linkId);
+  if (!link) return null;
+  link.onChannelClosed();
+  linksById.delete(linkId);
+  return link;
+}
+
+/** A link this realm runs itself (udp.js) went away, which no `linkClosed` will say: on a
+ *  later turn, as the host would. Its reason goes unprinted, having no host to print it. */
+function localClosed(linkId) {
+  void Promise.resolve().then(() => channelClosed(linkId));
+}
+
+/** What the host's datagram sockets read since the last of these (udp.js). */
+entry("datagrams", (r) => { udp.onDatagrams(r); });
 
 /** App-facing send, deferred: the response is another invocation of this realm. */
 entry("send", (r, caller) => {

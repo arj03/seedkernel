@@ -15,8 +15,8 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { bootShell } = await imp("build/host/shell-core.js");
-const { NodeChannelFactory } = await imp("build/services/net-node.js");
-const { createSafeRealm } = await imp("build/host/safe-js.js");
+const { nodeChannels } = await imp("build/host/shell-node.js");
+const { createWebRealm } = await imp("build/host/engine-web.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
@@ -38,7 +38,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     authors: [appAuthorHex],
   }));
   const transportOptions = {
-    channels: new NodeChannelFactory(),
+    channels: nodeChannels(),
     listen: [
       { label: "tcp", host: HOST, port: 0 },
       ...(ws ? [{ label: "ws", host: HOST, port: 0 }] : []),
@@ -54,7 +54,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: { ...transportOptions, config: transportConfig },
-    createRealm: async (o) => createSafeRealm(o),
+    createRealm: async (o) => createWebRealm(o),
     admit: policy,
   });
   const app = await shell.install(harnessAppBlob(appAuthor));
@@ -180,5 +180,36 @@ assert(stalledClosed, "the handshake deadline closed a link parked on an upgrade
 
 await e.transport.close();
 await new Promise((resolve) => stalling.close(resolve));
+
+// The slowloris bound, in the shared sockets every platform's TCP goes through: a socket
+// that never speaks is failed on its own, and the first byte clears the clock, so a link
+// that has spoken may go quiet for as long as its transport allows.
+console.log("\nTest: a socket that never speaks is failed; one that has spoken may idle");
+{
+  const { tcpChannels } = await imp("build/host/platform.js");
+  const { nodePlatform } = await imp("build/host/platform-node.js");
+  const tcp = tcpChannels(nodePlatform().net, 100);
+  const peers = [];
+  const server = createServer((s) => { s.on("error", () => {}); peers.push(s); });
+  await new Promise((resolve) => server.listen(0, HOST, resolve));
+  const dial = async () => {
+    const link = tcp.connect(`tcp://${HOST}:${server.address().port}`);
+    const state = { closed: false, read: false };
+    link.onClose(() => { state.closed = true; });
+    link.onData(() => { state.read = true; });
+    const n = peers.length;
+    while (peers.length === n) await new Promise((r) => setTimeout(r, 5));
+    return { link, state, peer: peers[n] };
+  };
+  const silent = await dial();
+  const spoken = await dial();
+  spoken.peer.write("hi");
+  await new Promise((r) => setTimeout(r, 500));
+  assert(silent.state.closed, "a socket whose peer never spoke was failed");
+  assert(spoken.state.read && !spoken.state.closed, "a socket that has spoken outlives the silent bound");
+  spoken.link.close(false);
+  for (const p of peers) p.destroy();
+  await new Promise((resolve) => server.close(resolve));
+}
 
 summary("transport TCP smoke");

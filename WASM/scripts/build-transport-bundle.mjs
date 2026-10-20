@@ -5,50 +5,20 @@
 // The author key is `--key <seed>` or transport/author.key, generated on first build, so
 // each clone has its own author (§12.5). Both halves of the hybrid key derive from it.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
 import { TRANSPORT_APP_CONFIG, TRANSPORT_SERVICE } from "./transport-config.mjs";
-import { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } from "../build/scripts/bundle-author.js";
-import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
+import { authorBundle, buildAuthor, guestOpFraming } from "../build/scripts/bundle-author.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 
-const args = process.argv.slice(2);
-const keyFlag = (() => {
-  const i = args.indexOf("--key");
-  return i >= 0 && args[i + 1] ? args[i + 1] : undefined;
-})();
-
 const toHex = (b) => Buffer.from(b).toString("hex");
 
 async function main() {
-  await sodiumDefault.ready;
-  let sodium = sodiumDefault;
-
-  let seed;
-  const keyPath = join(root, "transport", "author.key");
-  if (keyFlag) {
-    seed = Uint8Array.from(Buffer.from(keyFlag, "hex"));
-  } else if (existsSync(keyPath)) {
-    seed = Uint8Array.from(Buffer.from(readFileSync(keyPath, "utf8").trim(), "hex"));
-  } else {
-    seed = sodium.randombytes_buf(32);
-    writeFileSync(keyPath, toHex(seed) + "\n", { mode: 0o600 });
-    console.log("  wrote transport/author.key (keep it; this clone's bundle is signed by it)");
-  }
-  if (seed.length !== 32) throw new Error("--key must be 32 bytes of hex");
-
-  // ML-DSA-65 added to `sodium`, so one object signs and verifies both halves.
-  const mldsaInstance = new WebAssembly.Instance(
-    new WebAssembly.Module(readFileSync(join(root, "browser", "mldsa65.wasm"))), {});
-  sodium = withMlDsa65(sodium, createMlDsa65(mldsaInstance));
-
-  // Both keys from the one seed, so the same seed is the same author (§12.4).
-  const keys = hybridAuthorKeysFromSeed(sodium, seed);
+  const { sodium, keys } = buildAuthor(root, "transport/author.key", process.argv.slice(2));
 
   const guest = readGuestSource(guestOpFraming());
   // RFC 6455 framing and the handshake KEM are bundle content.

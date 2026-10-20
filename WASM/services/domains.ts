@@ -9,6 +9,9 @@ export const DOMAIN_MANIFEST = domain("seedkernel-manifest-sig-v1\0");
 /** Bundle manifest author id (§12.4). The only prefix here that goes into a hash instead
  *  of a signature, so it must stay disjoint from every signing prefix. */
 export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
+/** Host blob (§12.9): the same envelope as a bundle under its own prefix, so a host blob
+ *  can never pass as an app bundle, nor an app bundle as a host. */
+export const DOMAIN_HOST = domain("seedkernel-host-sig-v1\0");
 /** Guest-seam signing (§12.2), so a guest's signatures stay in its app's namespace and
  *  the node key cannot be used as a general signing oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
@@ -43,10 +46,14 @@ export const HOST_SERVICES = {
   node: { calls: ["sign", "verify"] },
   fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
   timer: { calls: ["arm", "clear"] },
+  // Raw links, and the raw datagram sockets the occupant runs its UDP paths over (§12.7).
   link: {
-    calls: ["open", "send", "close", "deliver", "status"],
-    events: ["linkOpen", "linkBytes", "linkClosed"],
+    calls: ["open", "send", "close", "deliver", "status", "udpBind", "udpSend", "udpClose"],
+    events: ["linkOpen", "linkBytes", "linkClosed", "datagrams"],
   },
+  // Hand the loader a host blob to run next (§12.9). The blob authenticates itself, so the
+  // caller needs no trust; the loader's rules and the operator's --host-updates decide.
+  host: { calls: ["stage"] },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
 /** Services with `events` have one occupant per node (slot-table.ts). */

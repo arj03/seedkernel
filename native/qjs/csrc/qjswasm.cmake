@@ -1,13 +1,17 @@
 # Included into quickjs-ng's own CMakeLists (build-qjs.sh passes this file as
 # CMAKE_PROJECT_INCLUDE), so the engine's `qjs` library target is in scope. Builds shim.c
-# against it as a WASI reactor and exports exactly the calls the Go bridge makes.
+# and realm.c against it as a WASI reactor and exports exactly the calls their embedders
+# make: the Go bridge (QJS_*) and the shared realm driver (R_*).
 
-set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+# Optimized for size (-Os): every page downloads this engine in the host blob. Against -O3
+# it is half the code (623 against 960 KB stripped) for about 3% on a native round trip
+# and 6% on a guest dispatch; -Oz saved another 80 KB for 12% and 18%.
+set(CMAKE_BUILD_TYPE "MinSizeRel" CACHE STRING "" FORCE)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON) # -flto for clang/wasm-ld
 
 # Named against this file's own directory: the engine is a throwaway checkout under
 # .build/, so a path relative to it would point outside the repo.
-add_executable(qjswasm ${CMAKE_CURRENT_LIST_DIR}/shim.c)
+add_executable(qjswasm ${CMAKE_CURRENT_LIST_DIR}/shim.c ${CMAKE_CURRENT_LIST_DIR}/realm.c)
 set_target_properties(qjswasm PROPERTIES OUTPUT_NAME "qjswasm")
 target_include_directories(qjswasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(qjswasm PRIVATE "-fvisibility=default")
@@ -68,4 +72,10 @@ target_link_options(qjswasm PRIVATE
     "LINKER:--export=JS_SetPropertyStr"
     "LINKER:--export=JS_HasException"
     "LINKER:--export=JS_GetException"
+
+    "LINKER:--export=R_Buf"
+    "LINKER:--export=R_Init"
+    "LINKER:--export=R_Eval"
+    "LINKER:--export=R_Invoke"
+    "LINKER:--export=R_Settle"
 )

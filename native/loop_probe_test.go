@@ -16,7 +16,7 @@ import (
 //  2. Pump does run it, draining that pending microtask, and returns promptly: the engine
 //     has no timers or I/O of its own, so the drain has nothing to wait on.
 func TestQjsPumpModel(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,21 +106,21 @@ func TestHostClockIsSubMillisecond(t *testing.T) {
 // TestAwaitIgnoresStaleSettle covers the one way a finished await can affect the next one.
 // __settle is installed once and outlives the await that wrote it, and the loop's timer
 // heap is shared across awaits, so the promise of a timed-out call can resolve during a
-// later await; without awaitGen it would settle that await with the previous call's
-// result. The first await here abandons a 300ms promise after 60ms; the second runs long
-// enough (500ms) for that promise to resolve inside it.
+// later await; it must not settle that await with the previous call's result. The first
+// await here abandons a 300ms promise after 60ms; the second runs long enough (500ms) for
+// that promise to resolve inside it.
 func TestAwaitIgnoresStaleSettle(t *testing.T) {
 	ensureBooted(t)
 
-	kind, _, _, err := el.await(`(new Promise(r => setTimeout(() => r(new Uint8Array([7])), 300)))`, 60*time.Millisecond)
+	kind, _, msg, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([7])), 300)))`, 60*time.Millisecond)
 	if err != nil {
 		t.Fatal("abandoned await:", err)
 	}
-	if kind != 2 {
-		t.Fatalf("first await: kind=%d, want 2 (timed out)", kind)
+	if kind != 1 || msg != "await: timed out" {
+		t.Fatalf("first await: kind=%d msg=%q, want a time-out", kind, msg)
 	}
 
-	kind, value, msg, err := el.await(`(new Promise(r => setTimeout(() => r(new Uint8Array([1])), 500)))`, 5*time.Second)
+	kind, value, msg, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([1])), 500)))`, 5*time.Second)
 	if err != nil || kind != 0 {
 		t.Fatalf("second await: kind=%d msg=%q err=%v", kind, msg, err)
 	}
@@ -134,7 +134,7 @@ func TestAwaitIgnoresStaleSettle(t *testing.T) {
 // take only the tasks queued when its drain began, or the timers wait until the producers
 // pause.
 func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
 // zero delay (as a guest can re-arm a 0 ms wake from inside its own wake) must not keep the
 // timer phase running, just as Node never runs a timer armed during that phase.
 func TestLoopTaskRunsDuringZeroDelayTimers(t *testing.T) {
-	rt, err := qjs.New()
+	rt, err := qjs.New(testEngine(t))
 	if err != nil {
 		t.Fatal(err)
 	}

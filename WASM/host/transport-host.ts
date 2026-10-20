@@ -2,7 +2,7 @@
 // guest (§12.1). Destinations are opaque, and events go to the current link occupant
 // (§12.10).
 
-import { dec, errMessage, Fifo } from "../services/util.js";
+import { concatBytes, dec, errMessage, Fifo, readU32BE, u8 } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -12,10 +12,14 @@ import {
   MAX_NODE_OUTBOUND_QUEUE_SLICES,
   MAX_OUTBOUND_QUEUE_BYTES,
   MAX_OUTBOUND_QUEUE_SLICES,
+  MAX_UDP_HELD_BYTES,
+  MAX_UDP_SOCKETS,
+  UDP_SOCKET_BUFFER_BYTES,
 } from "../services/net-limits.js";
 import { type LinkEvent } from "../services/domains.js";
+import { type RawDatagrams } from "../services/datagrams.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../services/socket-seam.js";
-import { HOST_CALLER_ID, type RawNet } from "./guest-seam.js";
+import { HOST_CALLER_ID, type DatagramSocket, type RawNet } from "./guest-seam.js";
 import { REALM_DISPOSED } from "./realm-queue.js";
 import { OpArgs } from "../services/op-frame.js";
 
@@ -24,7 +28,16 @@ const EMPTY = new Uint8Array(0);
 /** Link id 0 means no route; its `stream` bit is ignored. */
 const NO_ROUTE = { linkId: 0, stream: false } as const;
 
+const NO_SOCKET: DatagramSocket = { id: 0, port: 0, addresses: "" };
+
 const ev = (name: LinkEvent) => new OpArgs(name);
+
+/** After the I/O the platform is in the middle of, so one `datagrams` event takes every
+ *  datagram a turn read: Node's `setImmediate`, which runs once the poll phase has read
+ *  what its sockets hold, where a microtask would run after each datagram's own callback.
+ *  Elsewhere a microtask: the native loop hands a socket's datagrams over in one call. */
+const nextTurn: (f: () => void) => void =
+  (globalThis as { setImmediate?: (f: () => void) => void }).setImmediate ?? queueMicrotask;
 
 /** Ceiling on the sockets the driver holds, independent of any guest limit. */
 export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
@@ -45,6 +58,9 @@ export interface TransportHostOptions {
   channels?: ChannelFactory;
   /** The listeners to bind, each labelled for the occupant. */
   listen?: readonly ListenAddress[];
+  /** The platform's datagram sockets, lent to the occupant for its UDP paths (§12.7).
+   *  Omitted means none: `link/udpBind` answers socket 0. */
+  datagrams?: RawDatagrams;
   /** One link went down, with the occupant's reason (for the shipped transport, a word
    *  from ake.js `REASON_*`; empty when it gave none). Observation only. No shell uses it;
    *  tests/transport-link.test.mjs checks reasons through it, and an embedder can use it
@@ -149,6 +165,16 @@ export class TransportHost {
   private inboundReadBytes = 0;
   private outboundSlices = 0;
   private outboundBytes = 0;
+  // The occupant's datagram sockets. A socket's reads wait here, at most MAX_UDP_HELD_BYTES
+  // together, for the one `datagrams` event in the realm at a time.
+  private readonly sockets = new Set<number>();
+  private binding = 0;
+  /** Counts occupants, so what finishes for one that has gone touches nothing. */
+  private socketGen = 0;
+  private readonly reads = new Fifo<{ args: OpArgs; bytes: number }>();
+  private heldDatagramBytes = 0;
+  private readsBusy = false;
+  private readsDue = false;
 
   constructor(opts: TransportHostOptions) {
     this.opts = opts;
@@ -212,6 +238,13 @@ export class TransportHost {
     // Through the normal close path, over a copy since it deletes as it goes. Clearing the
     // table first would make `channelClosed` skip notifying the occupant.
     for (const [linkId, link] of [...this.links]) this.dropLink(linkId, link);
+    // Sockets are the occupant's paths, session state as its links are.
+    this.socketGen++;
+    for (const id of this.sockets) this.opts.datagrams?.close(id);
+    this.sockets.clear();
+    this.reads.clear();
+    this.heldDatagramBytes = 0;
+    this.readsBusy = false;
   }
 
   /** Close one socket. A throw means the backend already closed it. */
@@ -289,7 +322,87 @@ export class TransportHost {
         // no-op.
         queueMicrotask(() => this.channelClosed(linkId, link));
       },
+      udpBind: () => (bound() ? this.bind() : Promise.resolve(NO_SOCKET)),
+      udpSend: (batch) => {
+        const raw = this.opts.datagrams;
+        if (!bound() || !raw) return;
+        // The platform takes the batch whole, so it is checked here: every datagram inside
+        // it, and from a socket this occupant holds. One that is not is left out.
+        let kept: Uint8Array[] | null = null;
+        for (let at = 0; at < batch.length;) {
+          const port = at + 5 + (batch[at + 4] ?? 0), end = port + 4 + ((batch[port + 2] << 8) | batch[port + 3]);
+          if (port + 4 > batch.length || end > batch.length) throw new Error("link/udpSend: a datagram runs past the batch");
+          if (this.sockets.has(readU32BE(batch, at))) kept?.push(batch.subarray(at, end));
+          else kept ??= [batch.subarray(0, at)];
+          at = end;
+        }
+        raw.send(kept ? concatBytes(kept) : batch);
+      },
+      udpClose: (id) => {
+        if (this.sockets.delete(id)) this.opts.datagrams?.close(id);
+      },
     };
+  }
+
+  // ── datagrams ───────────────────────────────────────────────────────────────
+  // The host reads no datagram and keeps no path (§12.7): it bounds what the occupant holds,
+  // its sockets and what they read while it is busy.
+
+  /** A socket, or socket 0 when the platform has none, the cap is reached or the bind
+   *  failed. */
+  private async bind(): Promise<DatagramSocket> {
+    const raw = this.opts.datagrams;
+    if (!raw || this.sockets.size + this.binding >= MAX_UDP_SOCKETS) return NO_SOCKET;
+    const gen = this.socketGen;
+    this.binding++;
+    try {
+      let id = 0;
+      const b = await raw.bind((batch) => {
+        if (id !== 0) this.heard(id, u8(batch));
+      }, UDP_SOCKET_BUFFER_BYTES);
+      if (gen !== this.socketGen) { raw.close(b.id); return NO_SOCKET; }
+      id = b.id;
+      this.sockets.add(id);
+      return { id, port: b.port, addresses: raw.addresses() };
+    } catch {
+      return NO_SOCKET;
+    } finally {
+      this.binding--;
+    }
+  }
+
+  /** A socket's read, for the next event. Past what the host holds it is dropped, as a full
+   *  socket buffer drops one. */
+  private heard(id: number, batch: Uint8Array): void {
+    if (!this.sockets.has(id) || batch.length > MAX_UDP_HELD_BYTES - this.heldDatagramBytes) return;
+    this.heldDatagramBytes += batch.length;
+    let last = this.reads.size > 0 ? this.reads.at(this.reads.size - 1) : undefined;
+    if (!last || last.bytes + batch.length > MAX_LINK_READ_BYTES) this.reads.push(last = { args: ev("datagrams"), bytes: 0 });
+    last.args.u32(id).blob(batch);
+    last.bytes += batch.length;
+    this.pumpReads();
+  }
+
+  /** The next event, once the last has been read, on a later turn. */
+  private pumpReads(): void {
+    if (this.readsBusy || this.readsDue || this.reads.size === 0) return;
+    this.readsDue = true;
+    nextTurn(() => {
+      this.readsDue = false;
+      const next = this.reads.shift();
+      if (!next || this.readsBusy) return;
+      const gen = this.socketGen;
+      const done = () => {
+        if (gen !== this.socketGen) return;
+        this.readsBusy = false;
+        this.heldDatagramBytes -= next.bytes;
+        this.pumpReads();
+      };
+      const r = this.toTransport(next.args);
+      if (!r) { done(); return; }
+      this.readsBusy = true;
+      void r.then(done, (err: unknown) => { this.reportOpError("datagrams", err); done(); });
+    });
   }
 
   // ── channels ────────────────────────────────────────────────────────────────
