@@ -8,15 +8,16 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import _sodium from "libsodium-wrappers";
 import { testkit, makeAuthor, importBuilt } from "./testkit.mjs";
 import { readGuestSource } from "../scripts/guest-source.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = importBuilt(root);
 
-await _sodium.ready;
-const sodium = _sodium;
+// The host's crypto, ML-DSA-65 signing included: a manifest is signed and verified with
+// both halves of the author's key set (§12.4).
+const { loadCrypto } = await imp("build/host/crypto-node.js");
+const sodium = await loadCrypto();
 
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readModuleLimits, checkModuleLimits, DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
@@ -33,11 +34,6 @@ const { MemoryFs } = await imp("build/services/fs-memory.js");
 const { appScopeFor, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
-// Add ML-DSA-65 to this instance, as a target does at its crypto seam: a manifest is
-// signed and verified with both halves of the author's key set (§12.4), so plain
-// libsodium cannot sign one.
-const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
-withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 /** A manifest author: both halves of the key set, plus the 32-byte id derived from them,
  *  which policies and freshness marks use. `ed` also serves as a node identity. */
 const testAuthor = () => makeAuthor(sodium);

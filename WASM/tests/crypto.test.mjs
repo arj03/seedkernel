@@ -343,7 +343,7 @@ async function testHybridManifestSuite() {
 // ─── Test: host entropy is drawn from the platform a block at a time ───────────
 //
 // libsodium's wasm build fills `randombytes_buf` with one platform draw per byte, which
-// made a megabyte of `crypto/random` seconds of host thread. The Node seam puts the
+// made a megabyte of `crypto/random` seconds of host thread. The host's crypto puts the
 // platform CSPRNG under that name instead, filling up to 64 KiB per draw.
 async function testRandomBytesInBlocks() {
   console.log("Test: randombytes_buf draws from the platform CSPRNG a block at a time");
@@ -371,6 +371,9 @@ async function testHostSodium() {
   console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
   const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
   const { syncWebEngine } = await imp("build/host/platform-web.js");
+  // The oracle is the upstream glue, not the package's root entry, which is the engine.
+  const { default: oracle } = await import("libsodium-wrappers");
+  await oracle.ready;
   // The glue libsodium.wasm is extracted from (scripts/build-libsodium.mjs).
   const glue = readFileSync(join(root, "node_modules/libsodium/dist/modules-esm/libsodium.mjs"), "utf8");
   for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
@@ -381,18 +384,18 @@ async function testHostSodium() {
     readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n));
   const msg = new Uint8Array(70000).map((_, i) => i * 7);
   const key = new Uint8Array(32).fill(5), npub = new Uint8Array(12).fill(6), ad = Uint8Array.of(1, 2, 3);
-  assertEqual(toHex(host.crypto_generichash(32, msg, null)), toHex(sodium.crypto_generichash(32, msg, null)), "BLAKE2b-256");
-  assertEqual(toHex(host.crypto_generichash(64, msg, key)), toHex(sodium.crypto_generichash(64, msg, key)), "keyed BLAKE2b-512");
+  assertEqual(toHex(host.crypto_generichash(32, msg, null)), toHex(oracle.crypto_generichash(32, msg, null)), "BLAKE2b-256");
+  assertEqual(toHex(host.crypto_generichash(64, msg, key)), toHex(oracle.crypto_generichash(64, msg, key)), "keyed BLAKE2b-512");
   const seed = new Uint8Array(32).fill(9);
   const kp = host.crypto_sign_seed_keypair(seed);
-  assertEqual(toHex(kp.privateKey), toHex(sodium.crypto_sign_seed_keypair(seed).privateKey), "Ed25519 keypair from a seed");
+  assertEqual(toHex(kp.privateKey), toHex(oracle.crypto_sign_seed_keypair(seed).privateKey), "Ed25519 keypair from a seed");
   const sig = host.crypto_sign_detached(msg, kp.privateKey);
-  assertEqual(toHex(sig), toHex(sodium.crypto_sign_detached(msg, kp.privateKey)), "Ed25519 signature");
+  assertEqual(toHex(sig), toHex(oracle.crypto_sign_detached(msg, kp.privateKey)), "Ed25519 signature");
   assert(host.crypto_sign_verify_detached(sig, msg, kp.publicKey), "Ed25519 verify accepts");
   assert(!host.crypto_sign_verify_detached(sig, msg.subarray(1), kp.publicKey), "Ed25519 verify refuses another message");
-  assertEqual(toHex(host.crypto_scalarmult(key, kp.publicKey)), toHex(sodium.crypto_scalarmult(key, kp.publicKey)), "X25519");
+  assertEqual(toHex(host.crypto_scalarmult(key, kp.publicKey)), toHex(oracle.crypto_scalarmult(key, kp.publicKey)), "X25519");
   const ct = host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key);
-  assertEqual(toHex(ct), toHex(sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key)), "ChaCha20-Poly1305 seal");
+  assertEqual(toHex(ct), toHex(oracle.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key)), "ChaCha20-Poly1305 seal");
   assertEqual(toHex(host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key)), toHex(msg), "ChaCha20-Poly1305 open");
   ct[5] ^= 1;
   let refused = false;

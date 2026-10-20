@@ -26,6 +26,15 @@ func TestMain(m *testing.M) {
 		main()
 		os.Exit(0)
 	}
+	// Every boot reads the loader's realm (the platform ABI, the host's arguments), so the
+	// tests stand one up as main does.
+	_, engine, err := hostParts(genesisHost)
+	if err == nil {
+		ldr, err = newLoader(engine, []string{}, genesisHost)
+	}
+	if err != nil {
+		panic(err)
+	}
 	os.Exit(m.Run())
 }
 
@@ -144,23 +153,23 @@ func TestHostUpdatesNative(t *testing.T) {
 	}
 	serve := append(base, "--listen", "127.0.0.1:0")
 
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "off"); err == nil || !strings.Contains(log, "updates are off") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, ldr.abi, host.script), "off"); err == nil || !strings.Contains(log, "updates are off") {
 		t.Fatalf("staging with updates off: %v\n%s", err, log)
 	}
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "next"); err != nil || !strings.Contains(log, "staged v2") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, ldr.abi, host.script), "next"); err != nil || !strings.Contains(log, "staged v2") {
 		t.Fatalf("staging v2: %v\n%s", err, log)
 	}
 	log := startLoader(t, work, nil, serve...).until(t, "committed after")
 	if !strings.Contains(log, "trying v2 (committed is v1)") || committed() != 2 {
 		t.Fatalf("v2 was not tried and committed (committed v%d):\n%s", committed(), log)
 	}
-	if err, log := stage(hostEnvelope(t, hostKeys, 2, platformABI, host.script), "next"); err == nil || !strings.Contains(log, "v2 is not above v2") {
+	if err, log := stage(hostEnvelope(t, hostKeys, 2, ldr.abi, host.script), "next"); err == nil || !strings.Contains(log, "v2 is not above v2") {
 		t.Fatalf("staging at the floor: %v\n%s", err, log)
 	}
-	if err, log := stage(hostEnvelope(t, testAuthor(t), 5, platformABI, host.script), "next"); err == nil || !strings.Contains(log, "not the running host's author") {
+	if err, log := stage(hostEnvelope(t, testAuthor(t), 5, ldr.abi, host.script), "next"); err == nil || !strings.Contains(log, "not the running host's author") {
 		t.Fatalf("staging another author's host: %v\n%s", err, log)
 	}
-	tampered := hostEnvelope(t, hostKeys, 5, platformABI, host.script)
+	tampered := hostEnvelope(t, hostKeys, 5, ldr.abi, host.script)
 	tampered[len(tampered)-1] ^= 1
 	appBundle, err := os.ReadFile(updater)
 	if err != nil {
@@ -175,7 +184,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		t.Fatal("a refused host was kept")
 	}
 
-	if err, log := stage(hostEnvelope(t, hostKeys, 3, platformABI, `throw new Error("broken host");`), "next"); err != nil {
+	if err, log := stage(hostEnvelope(t, hostKeys, 3, ldr.abi, `throw new Error("broken host");`), "next"); err != nil {
 		t.Fatalf("staging v3: %v\n%s", err, log)
 	}
 	log = startLoader(t, work, nil, serve...).until(t, "listening on")
@@ -186,7 +195,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		t.Fatal("the broken host is still pending")
 	}
 
-	if err := os.WriteFile(slot("pending.skb"), hostEnvelope(t, hostKeys, 4, platformABI, host.script), 0o600); err != nil {
+	if err := os.WriteFile(slot("pending.skb"), hostEnvelope(t, hostKeys, 4, ldr.abi, host.script), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(slot("tried"), nil, 0o600); err != nil {
@@ -197,7 +206,7 @@ func TestHostUpdatesNative(t *testing.T) {
 		t.Fatalf("a host marked tried was run again:\n%s", log)
 	}
 
-	log = startLoader(t, work, hostEnvelope(t, hostKeys, 6, platformABI, host.script),
+	log = startLoader(t, work, hostEnvelope(t, hostKeys, 6, ldr.abi, host.script),
 		append(serve, "--host-updates", "now", "--op", "stage")...).until(t, "committed after")
 	if !strings.Contains(log, "staged v6") || !strings.Contains(log, "trying v6") || committed() != 6 {
 		t.Fatalf("under now, v6 did not boot in place and commit (committed v%d):\n%s", committed(), log)

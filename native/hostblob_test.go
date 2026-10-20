@@ -67,7 +67,7 @@ func TestGenesisHostReads(t *testing.T) {
 	if &host.env[0] != &genesisHost[0] {
 		t.Fatal("the running host is not the genesis blob")
 	}
-	s, q, err := hostParts(hostEnvelope(t, testAuthor(t), 7, platformABI, script))
+	s, q, err := hostParts(hostEnvelope(t, testAuthor(t), 7, ldr.abi, script))
 	if err != nil || s != script || !reflect.DeepEqual(q, engine) {
 		t.Fatalf("a blob framed here reads back differently: %v", err)
 	}
@@ -100,9 +100,9 @@ func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
 	}
 	a := testAuthor(t)
 	for what, env := range map[string][]byte{
-		"another suite":   append([]byte{0x01}, hostEnvelope(t, a, 5, platformABI, host.script)[1:]...),
-		"trailing bytes":  append(hostEnvelope(t, a, 5, platformABI, host.script), 0),
-		"another ABI":     hostEnvelope(t, a, 5, platformABI+1, host.script),
+		"another suite":   append([]byte{0x01}, hostEnvelope(t, a, 5, ldr.abi, host.script)[1:]...),
+		"trailing bytes":  append(hostEnvelope(t, a, 5, ldr.abi, host.script), 0),
+		"another ABI":     hostEnvelope(t, a, 5, ldr.abi+1, host.script),
 		"a truncated one": genesisHost[:offBody+10],
 	} {
 		if err := os.WriteFile(filepath.Join(dir, "pending.skb"), env, 0o600); err != nil {

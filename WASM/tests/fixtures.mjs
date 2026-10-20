@@ -15,9 +15,8 @@ export const { bootShell } = await imp("build/host/shell-core.js");
 export const { bootNodeShell } = await imp("build/host/shell-node.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 
-// The host's already-readied instance, not a separate copy: libsodium-wrappers has
-// separate "import" and "require" builds, so a require() here would return a second
-// instance with its own wasm heap that nothing awaits .ready on.
+// The host's crypto from the package's host blob, ML-DSA-65 signing included, which the
+// hybrid manifest suite needs (§12.4).
 export const sodium = await loadCrypto();
 
 // One contact secret for the whole harness. In production each node has its own and
@@ -56,7 +55,7 @@ export const { hybridAuthorId, FreshnessMarks, verifyBundle, loadBundleModules }
   = await imp("build/host/bundle.js");
 export const { guestOpFraming, authorBundle } = await imp("build/scripts/bundle-author.js");
 export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("build/host/policy.js");
-export const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
+export const { loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 
 // Every app is a guest (§12.4), so every test bundle declares one. Tests that do not
 // exercise the guest use this minimal program.
@@ -151,10 +150,6 @@ export async function makeHost() {
 }
 
 export const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
-
-// Add ML-DSA-65 to the test instance as a target does at its crypto seam; the hybrid
-// manifest suite needs a sodium with this method (§12.4).
-withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 
 // Install one verified module as `app`'s whole module set. Async, since each module
 // starts in its own worker and this returns once it has loaded.

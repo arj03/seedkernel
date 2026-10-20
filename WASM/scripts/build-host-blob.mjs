@@ -44,7 +44,9 @@ const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).hos
 if (!Number.isSafeInteger(version) || version < 1) throw new Error("package.json hostVersion must be a positive integer");
 const blob = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, {
   script: readFileSync(join(root, "build", "host.js")),
-  qjs: readFileSync(join(root, "browser", "qjs.wasm")),
+  // Where the native build keeps it (native/qjs/build-qjs.sh), checked in there since
+  // go:embed cannot reach outside native/.
+  qjs: readFileSync(join(root, "..", "native", "qjs", "qjs.wasm")),
   sodium: readFileSync(join(root, "browser", "libsodium.wasm")),
   mldsa: readFileSync(join(root, "browser", "mldsa65.wasm")),
 });

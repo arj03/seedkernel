@@ -28,6 +28,9 @@ type loader struct {
 	mu sync.Mutex
 	rt *qjs.Runtime
 	qc *qjs.Context
+	// abi is the platform ABI this binary implements: the loader script's PLATFORM_ABI
+	// (host/abi.ts), built with it, so the number is written down once.
+	abi int
 }
 
 // newLoader stands the realm up on engine, the genesis blob's, with the script's `Loader`
@@ -63,6 +66,12 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 	if err == nil {
 		_, _, err = l.call(`globalThis.__loader = new Loader(__fs, JSON.parse(__a0), new Uint8Array(__a1), __a2 || undefined,
 			bridge.log, bridge.after), 0`, string(j), genesis, os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
+	}
+	if err == nil {
+		var abi string
+		if abi, _, err = l.call(`PLATFORM_ABI`); err == nil {
+			l.abi, err = strconv.Atoi(abi)
+		}
 	}
 	if err != nil {
 		rt.Close()

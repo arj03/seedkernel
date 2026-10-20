@@ -9,6 +9,7 @@ import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { errMessage } from "../services/util.js";
 import { webBridge } from "./platform-web.js";
+import { packageHostBlob } from "./crypto-node.js";
 import type { CliFiles } from "./cli.js";
 import type { SlotFiles } from "./slots.js";
 import type { Platform } from "./platform.js";
@@ -62,10 +63,6 @@ export interface NodePlatformOptions {
   hostBlob?(): Uint8Array;
   stageHost?(blob: Uint8Array): void;
 }
-
-/** The host blob this package was built with (scripts/build-host-blob.mjs). */
-let packageHost: Uint8Array | undefined;
-const packageHostBlob = () => (packageHost ??= new Uint8Array(readFileSync(new URL("../host.skb", import.meta.url))));
 
 /** A Node platform, and the release of everything a host holds through it: sockets,
  *  listeners, datagram sockets, modules and engines. */

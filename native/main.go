@@ -20,9 +20,6 @@ import (
 	"seedkernel/qjs"
 )
 
-// platformABI is the version of the platform ABI (host/abi.ts) this binary implements.
-const platformABI = 1
-
 // genesisHost is the host blob this binary was built with (scripts/build-host-blob.mjs),
 // the one it runs unless told otherwise.
 //
@@ -45,7 +42,7 @@ var (
 		script string
 		qjs    []byte
 	}
-	// ldr is the loader script's realm (hostslots.go); nil in tests that boot directly.
+	// ldr is the loader script's realm (hostslots.go), stood up before any boot.
 	ldr *loader
 )
 
@@ -106,7 +103,7 @@ func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
 	// The platform ABI this loader implements, which the host script checks first.
-	b.SetPropertyStr("abi", qc.NewInt32(platformABI))
+	b.SetPropertyStr("abi", qc.NewInt32(int32(ldr.abi)))
 	b.SetPropertyStr("banner", qc.NewString("seedkernel-native"))
 	// The operator's world (host/cli.ts): arguments, files, stdio.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
