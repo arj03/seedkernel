@@ -24,10 +24,11 @@
 //   all it was given go on is sent three times.
 // - Data in flight that draws no ack through `MAX_PTOS` probe timeouts, from a peer heard
 //   from not at all for `DEAD_MS`, ends the path: the peer is gone.
-// - A path starts at QUIC's 1200-byte packets and probes for `MAX_PACKET` (RFC 8899): a
-//   probe the peer acks raises the size, and a second probe timeout in a row drops it back
-//   and probes again. Every cost of the stream is per packet, so larger ones are that much
-//   cheaper. A chunk cut larger than the path now carries is split when it is resent.
+// - A path starts at QUIC's 1200-byte packets and, once the peer first acks, probes for
+//   `MAX_PACKET` (RFC 8899): a probe the peer acks raises the size, and a second probe
+//   timeout in a row drops it back and probes again. Every cost of the stream is per
+//   packet, so larger ones are that much cheaper. A chunk cut larger than the path now
+//   carries is split when it is resent.
 //
 // A packet is the path's header, `[type u8][receiver's token 8]`, then:
 //   DATA   [pn 6][offset 6][floor 6][bytes]   no packet below floor is waited on
@@ -209,7 +210,7 @@ class UdpStream {
      *  answered. */
     this.packetBytes = BASE_PACKET;
     this.probes = [];
-    /** Dropped back to `BASE_PACKET`: probe again once the peer acks. */
+    /** Started, or dropped back to `BASE_PACKET`: probe once the peer acks. */
     this.reprobe = false;
 
     // ── receiving ──
@@ -255,7 +256,9 @@ class UdpStream {
     this.liveAt = dueIn(KEEPALIVE_MS);
     if (this.ranges.length > 0) this.sendAck();
     this.flush();
-    this.startProbe();
+    // Not yet: the peer's end may not be running, and a probe it never hears holds the
+    // floor of every chunk until the probe times out.
+    this.reprobe = true;
   }
 
   /** The path moved to another address, `rttMs` away: what was learned of the old one no
