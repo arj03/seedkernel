@@ -38,6 +38,7 @@ type udpSock struct {
 
 	mu     sync.Mutex
 	held   []byte // datagrams read and not yet delivered, packed
+	spare  []byte // the batch delivered last, which the reader fills next: the loop's alone
 	posted bool   // a delivery is queued on the loop
 }
 
@@ -67,23 +68,43 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		r.SetPropertyStr("port", qc.NewInt32(int32(conn.LocalAddr().(*net.UDPAddr).Port)))
 		return r, nil
 	}))
-	// A send that fails is a lost datagram, IPv6 from an IPv4 socket among them. An address
-	// is sent to at once, from a view of the bytes; a name is resolved to IPv4 off the loop
-	// goroutine, from a copy.
+	// A turn's datagrams, `([socket u32][hostLen u8][host][port u16][len u16][bytes])*`, which
+	// the host has checked. A send that fails is a lost datagram, IPv6 from an IPv4 socket
+	// among them. An address is sent to at once, from a view of the batch; a name is
+	// resolved to IPv4 off the loop goroutine, from a copy. A batch is mostly one path's, so
+	// a socket is looked up and a host parsed once a run.
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		s := u.get(args[0].Int64())
-		if s == nil {
-			return nil, nil
+		b, err := args[0].View()
+		if err != nil {
+			return nil, err
 		}
-		host, port := args[1].String(), int(args[2].Int32())
-		if ip, err := netip.ParseAddr(host); err == nil {
-			if b, err := args[3].View(); err == nil {
-				s.conn.WriteToUDPAddrPort(b, netip.AddrPortFrom(ip, uint16(port)))
+		var s *udpSock
+		sid, host := int64(-1), ""
+		var ip netip.Addr
+		var ipErr error
+		for at := 0; at < len(b); {
+			p := at + 5 + int(b[at+4])
+			port, end := binary.BigEndian.Uint16(b[p:]), p+4+int(binary.BigEndian.Uint16(b[p+2:]))
+			if id := int64(binary.BigEndian.Uint32(b[at:])); id != sid {
+				s, sid = u.get(id), id
 			}
-		} else if b, err := args[3].Bytes(); err == nil {
+			if h := b[at+5 : p]; string(h) != host {
+				host = string(h)
+				ip, ipErr = netip.ParseAddr(host)
+			}
+			bytes := b[p+4 : end]
+			at = end
+			if s == nil {
+				continue
+			}
+			if ipErr == nil {
+				s.conn.WriteToUDPAddrPort(bytes, netip.AddrPortFrom(ip, port))
+				continue
+			}
+			conn, name, copied := s.conn, host, append([]byte(nil), bytes...)
 			go func() {
-				if to, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(host, strconv.Itoa(port))); err == nil {
-					s.conn.WriteToUDP(b, to)
+				if to, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(name, strconv.Itoa(int(port)))); err == nil {
+					conn.WriteToUDP(copied, to)
 				}
 			}()
 		}
@@ -162,12 +183,15 @@ func (u *udpHost) read(id int64, s *udpSock) {
 func (u *udpHost) deliver(id int64, s *udpSock) {
 	s.mu.Lock()
 	batch := s.held
-	s.held, s.posted = nil, false
+	s.held, s.posted = s.spare, false
 	s.mu.Unlock()
 	if u.get(id) == nil {
 		return
 	}
-	dispatch(u.qc, "udpHost: dispatcher error", s.deliver, u.qc.NewArrayBuffer(batch))
+	ab := u.qc.NewArrayBuffer(batch)
+	// The realm has its own copy, so the reader fills this one again, without growing it.
+	s.spare = batch[:0]
+	dispatch(u.qc, "udpHost: dispatcher error", s.deliver, ab)
 }
 
 // close tears the sockets down with their realm.

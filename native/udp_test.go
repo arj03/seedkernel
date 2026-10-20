@@ -237,8 +237,9 @@ func TestUdpDualStackNative(t *testing.T) {
 	    }
 	  };
 	  const a = __udp.bind(() => {}, 1 << 16), b = __udp.bind(read, 1 << 16);
-	  __udp.send(a.id, "127.0.0.1", b.port, Uint8Array.of(4));
-	  __udp.send(a.id, "::1", b.port, Uint8Array.of(6));
+	  // [socket u32][hostLen u8][host][port u16][len u16][bytes], as link/udpSend carries it.
+	  const one = (host, x) => Uint8Array.of(0, 0, 0, a.id, host.length, ...new TextEncoder().encode(host), b.port >> 8, b.port & 255, 0, 1, x);
+	  __udp.send(new Uint8Array([...one("127.0.0.1", 4), ...one("::1", 6)]));
 	  const until = Date.now() + 5000;
 	  while (heard.length < 2 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
 	  __udp.close(a.id);

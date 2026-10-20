@@ -22,7 +22,7 @@ import {
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = importBuilt(root);
 const { nodeRawDatagrams } = await imp("build/services/datagrams-node.js");
-const { ipv6Bytes } = await imp("build/services/datagrams.js");
+const { forEachDatagram, ipv6Bytes } = await imp("build/services/datagrams.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
 const { RTC_TAG } = await imp("build/services/net-rtc.js");
 const { combineChannels } = await imp("build/services/socket-seam.js");
@@ -182,6 +182,19 @@ function batchOf(host, port, bytes) {
   return out;
 }
 
+/** One datagram as a send batch carries it: `[socket u32][hostLen u8][host][port u16][len u16][bytes]`. */
+function sendOf(id, host, port, bytes) {
+  const h = enc.encode(host), out = new Uint8Array(9 + h.length + bytes.length);
+  out[0] = id >>> 24; out[1] = (id >>> 16) & 255; out[2] = (id >>> 8) & 255; out[3] = id & 255;
+  out[4] = h.length;
+  out.set(h, 5);
+  const at = 5 + h.length;
+  out[at] = port >> 8; out[at + 1] = port & 255;
+  out[at + 2] = bytes.length >> 8; out[at + 3] = bytes.length & 255;
+  out.set(bytes, at + 4);
+  return out;
+}
+
 /** Raw datagrams over a platform of `{ addresses() -> string[], bind() -> { port, socket } }`,
  *  each socket `{ send(bytes, port, host), onMessage(cb), close() }`: the shape this file's
  *  fake networks are written in. */
@@ -196,7 +209,7 @@ function rawOver(platform) {
       socket.onMessage((bytes, host, from) => deliver(batchOf(host, from, bytes)));
       return { id, port };
     },
-    send: (id, host, port, bytes) => { sockets.get(id)?.send(bytes, port, host); },
+    send: (batch) => forEachDatagram(batch, (id, host, port, bytes) => sockets.get(id)?.send(bytes, port, host)),
     close: (id) => { sockets.get(id)?.close(); sockets.delete(id); },
     addresses: () => platform.addresses().join("\n"),
   };
@@ -218,7 +231,7 @@ function nodePlatform(addresses) {
           at += 5 + n + len;
         }
       }, 1 << 20);
-      return { port, socket: { send: (bytes, p, h) => raw.send(id, h, p, bytes), onMessage: (cb) => { handler = cb; }, close: () => raw.close(id) } };
+      return { port, socket: { send: (bytes, p, h) => raw.send(sendOf(id, h, p, bytes)), onMessage: (cb) => { handler = cb; }, close: () => raw.close(id) } };
     },
   };
 }
@@ -910,8 +923,8 @@ await test("a Node socket is dual-stack: it hears IPv4 and IPv6, and names each 
       at += 5 + n + len;
     }
   }, 1 << 16);
-  raw.send(a.id, "127.0.0.1", b.port, Uint8Array.of(4));
-  raw.send(a.id, "::1", b.port, Uint8Array.of(6));
+  raw.send(sendOf(a.id, "127.0.0.1", b.port, Uint8Array.of(4)));
+  raw.send(sendOf(a.id, "::1", b.port, Uint8Array.of(6)));
   await until(() => heard.length === 2, 2000, "both datagrams");
   raw.closeAll();
   assert(heard.sort().join(",") === "127.0.0.1 true 4,::1 true 6", `heard ${heard}`);

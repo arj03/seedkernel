@@ -343,6 +343,9 @@ class UdpNegotiation {
     this.offer = offer;
     this.linkId = udp.nextId();
     this.token = entropy.subarray(0, TOKEN);
+    /** The token as two words, which every packet is checked against. */
+    this.tokenHi = readU32BE(this.token, 0);
+    this.tokenLo = readU32BE(this.token, 4);
     /** The challenge every probe carries, which an ack must echo for the path to be taken. */
     this.challenge = entropy.subarray(TOKEN, 2 * TOKEN);
     /** The STUN servers not yet answered, and each one's answer, the address it saw. */
@@ -548,10 +551,7 @@ class UdpNegotiation {
       }
       return;
     }
-    if (p.length < PATH_HEADER) return;
-    for (let i = 0; i < TOKEN; i++) {
-      if (p[1 + i] !== this.token[i]) return;
-    }
+    if (p.length < PATH_HEADER || readU32BE(p, 1) !== this.tokenHi || readU32BE(p, 5) !== this.tokenLo) return;
     if (p[0] === TYPE_PROBE) {
       if (p.length !== PROBE_BYTES) return;
       this.peerToken ??= p.slice(1 + TOKEN, 1 + 2 * TOKEN);

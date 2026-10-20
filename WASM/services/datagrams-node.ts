@@ -5,7 +5,7 @@ import { createSocket, type Socket } from "node:dgram";
 import { lookup } from "node:dns";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
-import { ipv6Bytes, type RawDatagrams } from "./datagrams.js";
+import { forEachDatagram, ipv6Bytes, type RawDatagrams } from "./datagrams.js";
 
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";
@@ -87,7 +87,7 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
       });
       return { id, port: s.address().port };
     },
-    send: (id, host, port, bytes) => { sockets.get(id)?.send(bytes, port, host); },
+    send: (batch) => forEachDatagram(batch, (id, host, port, bytes) => sockets.get(id)?.send(bytes, port, host)),
     close: (id) => { sockets.get(id)?.close(); sockets.delete(id); },
     // IPv6 only while sockets are dual-stack.
     addresses: () => Object.values(networkInterfaces()).flat()

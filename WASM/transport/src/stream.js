@@ -382,7 +382,8 @@ class UdpStream {
   received(pn) {
     const largest = this.ranges.length > 0 ? this.ranges[0][0] : -1;
     this.record(pn);
-    if (pn > largest) this.largestAt = now();
+    // Only ever inside `receive`, which has just read the clock.
+    if (pn > largest) this.largestAt = this.lastHeard;
     // Out of order, a gap or a repeat is acked at once, so the sender learns of it.
     if (pn !== largest + 1) this.sendAck();
     else this.unacked++;
@@ -645,7 +646,7 @@ class UdpStream {
     this.inFlight.set(pn, { offset, size: p.length, time: t });
     this.bytesInFlight += p.length;
     this.lastSentData = t;
-    this.emit(p);
+    this.emit(p, t);
   }
 
   pto() {
@@ -715,8 +716,8 @@ class UdpStream {
     this.packetBytes = MAX_PACKET;
   }
 
-  emit(p) {
-    this.lastSent = now();
+  emit(p, t = now()) {
+    this.lastSent = t;
     this.out(p);
   }
 

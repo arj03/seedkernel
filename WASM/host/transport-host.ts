@@ -2,7 +2,7 @@
 // guest (§12.1). Destinations are opaque, and events go to the current link occupant
 // (§12.10).
 
-import { dec, errMessage, Fifo, readU32BE } from "../services/util.js";
+import { concatBytes, dec, errMessage, Fifo, readU32BE } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -175,9 +175,6 @@ export class TransportHost {
   private heldDatagramBytes = 0;
   private readsBusy = false;
   private readsDue = false;
-  /** The host a datagram last went to, as sent and as text: a path sends to one. */
-  private lastHost = new Uint8Array(0);
-  private lastHostText = "";
 
   constructor(opts: TransportHostOptions) {
     this.opts = opts;
@@ -329,15 +326,17 @@ export class TransportHost {
       udpSend: (batch) => {
         const raw = this.opts.datagrams;
         if (!bound() || !raw) return;
+        // The platform takes the batch whole, so it is checked here: every datagram inside
+        // it, and from a socket this occupant holds. One that is not is left out.
+        let kept: Uint8Array[] | null = null;
         for (let at = 0; at < batch.length;) {
           const port = at + 5 + (batch[at + 4] ?? 0), end = port + 4 + ((batch[port + 2] << 8) | batch[port + 3]);
           if (port + 4 > batch.length || end > batch.length) throw new Error("link/udpSend: a datagram runs past the batch");
-          const id = readU32BE(batch, at);
-          if (this.sockets.has(id)) {
-            raw.send(id, this.hostText(batch.subarray(at + 5, port)), (batch[port] << 8) | batch[port + 1], batch.subarray(port + 4, end));
-          }
+          if (this.sockets.has(readU32BE(batch, at))) kept?.push(batch.subarray(at, end));
+          else kept ??= [batch.subarray(0, at)];
           at = end;
         }
+        raw.send(kept ? concatBytes(kept) : batch);
       },
       udpClose: (id) => {
         if (this.sockets.delete(id)) this.opts.datagrams?.close(id);
@@ -404,17 +403,6 @@ export class TransportHost {
       this.readsBusy = true;
       void r.then(done, (err: unknown) => { this.reportOpError("datagrams", err); done(); });
     });
-  }
-
-  private hostText(b: Uint8Array): string {
-    const last = this.lastHost;
-    let same = b.length === last.length;
-    for (let i = 0; same && i < b.length; i++) same = b[i] === last[i];
-    if (!same) {
-      this.lastHost = b.slice();
-      this.lastHostText = dec.decode(b);
-    }
-    return this.lastHostText;
   }
 
   // ── channels ────────────────────────────────────────────────────────────────
