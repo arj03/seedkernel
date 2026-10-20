@@ -132,7 +132,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the peer claim map (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
 | `link/status` | `[relay u8][key 32][direct u8]*`: the state of the relay the node is registered on, then the linked peers and how each is reached, as the shipped transport's `relayState` and `routes` ops answer them (§12.6.3) | (empty). The occupant says it each time either changes, and the host hands it, decoded as `{ relay, linked: [{ key, direct }] }`, to the embedder's `onStatus` (`bootShell`'s transport options), so a host follows its relay and its links without polling them. |
 | `link/udpBind` | (empty) | `[socket u32][port u16][addresses utf8 ..]`: a datagram socket on a port the OS picks, dual-stack where the machine has IPv6, and every address the machine's sockets are reached at, `\n`-separated. Socket 0 when the host has no datagram sockets, has lent `MAX_UDP_SOCKETS`, or the bind failed. Its reads arrive as `datagrams` events. |
-| `link/udpSend` | `([socket u32][hostLen u8][host utf8][port u16][len u16][bytes])*`: a turn's datagrams, each to an IPv4 or IPv6 address, or to a name, which resolves to IPv4 | (empty). A datagram that cannot be sent is lost; one running past the payload rejects the call. |
+| `link/udpSend` | `([socket u32][hostLen u8][host utf8][port u16][len u16][bytes])*`: a turn's datagrams, each to an IPv4 or IPv6 address, or to a name, which resolves to IPv4 | (empty). A datagram that cannot be sent is lost, as is one from a socket this occupant does not hold; one running past the payload rejects the call. |
 | `link/udpClose` | `[socket u32]` | (empty), behind what the socket was given to send |
 | `timer/arm` | `[ms u32]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as the `wake` host event (§12.2). A realm that has spent its clock share has it slipped, not failed. |
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a notification already handed to the realm is not retracted. |
@@ -561,7 +561,7 @@ seedkernel --policy ./allowed-keys.json --dir ./data --key ./node.key \
      [--op name  < argument > response] [--host ./host.skb] [--host-updates off|next|now]
 ```
 
-Benchmarks: `wsl bash gorun.sh test -run x -bench . -benchmem ./...` from `native/`; `node tests/bench-module-call.mjs` from `WASM/` for the JS module-call hop.
+Benchmarks: `go test -run x -bench . -benchmem ./...` from `native/`; `node tests/bench-module-call.mjs` from `WASM/` for the JS module-call hop.
 
 ### 12.10 Protocol routing: which app handles a message
 
