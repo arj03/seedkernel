@@ -21,7 +21,7 @@ const HEALTH_MS = 400;
 // Hosts from this clone's host author, as the genesis blob is, at chosen versions.
 const genesis = verifyHostBlob(sodium, readFileSync(join(root, "build/host.skb")));
 const hostKeys = hybridAuthorKeysFromSeed(sodium, Buffer.from(readFileSync(join(root, "host-author.key"), "utf8").trim(), "hex"));
-const hostBlob = (version, keys = hostKeys, script = genesis.script) => signHostBlob(sodium, keys, { version, abi: genesis.manifest.abi },
+const hostBlob = (version, keys = hostKeys, script = genesis.script, abi = genesis.manifest.abi) => signHostBlob(sodium, keys, { version, abi },
   { script, qjs: genesis.qjs, sodium: genesis.sodium, mldsa: genesis.mldsa });
 
 const author = testAuthor();
@@ -155,6 +155,24 @@ try {
   ok(version(mem.get("mem.host/committed.skb")) === 2 && version(mem.get("mem.host/pending.skb")) === 3,
     "the tried host is committed, and the one it staged stays pending");
   ok(version(n.choose()) === 3 && mem.has("mem.host/tried"), "…for a trial of its own at the next start");
+
+  console.log("Test: a committed host that cannot be read stops the boot, since the floor is lost with it");
+  const throwsOn = (fn) => { try { fn(); return ""; } catch (err) { return err.message; } };
+  const genesisEnv = readFileSync(join(root, "build/host.skb"));
+  const broken = new Map([["mem.host/committed.skb", hostBlob(4).subarray(0, 4000)]]);
+  const b = new Loader(memFiles(broken), ["--dir", "mem"], genesisEnv, "0", () => {}, () => {});
+  ok(/^committed\.skb: host: .*; restore it, or remove it to boot v\d+$/.test(throwsOn(() => b.choose())),
+    "a truncated committed.skb is refused, not passed over for the genesis blob");
+  // There, by its size, but every read fails, as one the process may not open does.
+  const u = new Loader({ ...memFiles(broken), read: () => null }, ["--dir", "mem"], genesisEnv, "0", () => {}, () => {});
+  ok(/^committed\.skb: cannot be read;/.test(throwsOn(() => u.choose())), "…and so is one that is there but unreadable");
+
+  console.log("Test: --host refuses a file that is no host blob, whichever loader reads it");
+  const files = memFiles(new Map([["junk.skb", new Uint8Array(100)], ["old.skb", hostBlob(1, hostKeys, genesis.script, genesis.manifest.abi + 1)]]));
+  ok(/^host: /.test(throwsOn(() => new Loader(files, ["--host", "junk.skb"], genesisEnv, "0", () => {}, () => {}))),
+    "a file that does not frame as one");
+  ok(/^--host: old\.skb is not for platform ABI/.test(throwsOn(() => new Loader(files, ["--host", "old.skb"], genesisEnv, "0", () => {}, () => {}))),
+    "a blob for another platform ABI");
 
   console.log("Test: --host runs a blob by the operator's choice, from any author");
   writeFileSync(join(work, "stranger.skb"), hostBlob(1, stranger));

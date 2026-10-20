@@ -118,6 +118,8 @@ export class Loader {
       const raw = files.read(flags.hostFile, MAX_BLOB_BYTES);
       if (raw === null) throw new Error(`--host: cannot read ${flags.hostFile}`);
       this.fixed = u8(raw);
+      // Read here, so a file that is no host blob fails alike on every loader.
+      if (readHostBlob(this.fixed).manifest.abi !== PLATFORM_ABI) throw new Error(`--host: ${flags.hostFile} is not for platform ABI ${PLATFORM_ABI}`);
       // Its slots are never consulted, so there is nowhere to stage a successor.
       this.mode = "off";
     }
@@ -127,17 +129,21 @@ export class Loader {
 
   private path(name: string) { return `${this.dir}/${name}`; }
 
-  /** A slot's blob, or null when it is absent or not for this loader's ABI. */
+  /** A slot's blob, or null when it is absent or not for this loader's ABI. A committed
+   *  host that is there but broken throws: it is the floor, which genesis may be below. */
   private load(name: string): Slot | null {
     const raw = this.files.read(this.path(name), MAX_BLOB_BYTES);
-    if (raw === null) return null;
-    const env = u8(raw);
+    if (raw === null && this.files.size(this.path(name)) < 0) return null;
     try {
+      if (raw === null) throw new Error("cannot be read");
+      const env = u8(raw);
       const { manifest } = readHostBlob(env);
       if (manifest.abi === PLATFORM_ABI) return { env, version: manifest.version };
       this.log(`ignored ${name}: it needs platform ABI ${manifest.abi}, this loader implements ${PLATFORM_ABI}`);
     } catch (err) {
-      this.log(`ignored ${name}: ${err instanceof Error ? err.message : String(err)}`);
+      const why = err instanceof Error ? err.message : String(err);
+      if (name === "committed.skb") throw new Error(`${name}: ${why}; restore it, or remove it to boot v${this.genesis}`);
+      this.log(`ignored ${name}: ${why}`);
     }
     return null;
   }

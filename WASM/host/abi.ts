@@ -58,7 +58,9 @@ export interface PlatformBridge {
   disposeModules?(slot: string): void;
 
   /** The engine table: a wasm instance from bytes, its import handlers by module and name
-   *  as WebAssembly's importObject. Numbers cross as numbers; i64 does not cross. A
+   *  as WebAssembly's importObject. Numbers cross as numbers, and only integral ones (an
+   *  f64 is an id or a duration in ns), which is all a loader need carry; i64 does not
+   *  cross. A
    *  `bindDeadlineMs` (-1 for none) asks for a bounded instance, on a loader that offers
    *  `engineCallBounded`; its instantiation runs under that deadline. */
   engineInstantiate(wasm: Uint8Array, imports: EngineImports, bindDeadlineMs?: number): number;

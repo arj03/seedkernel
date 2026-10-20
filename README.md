@@ -136,11 +136,11 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,831 LOC)**
+**Shared: one implementation for all three targets (3,835 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 778 |
+| Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 782 |
 | Transport driver: channels by link id and listeners, behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7). No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 405 |
 | Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 692 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 409 |
