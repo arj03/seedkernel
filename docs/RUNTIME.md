@@ -431,7 +431,7 @@ The host driver keeps its own coarse bounds beneath the transport's, on structur
 
 #### 12.6.2b One master seed, one identity
 
-A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity: the peer id, `senderPk` and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2).
+A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity: the peer id, `senderPk` and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2). Nothing revokes it: a leaked seed is a lost identity, and recovery is a new seed and peer id (§14).
 
 #### 12.6.3 The contact secret, the network key, and the peer list
 
