@@ -82,7 +82,7 @@ const deliveryWindow = HOST.maxOutstandingHostCallBytes - 2 * maxRequestWeight;
 // so a `ready` that waited the realm's whole ceiling would lose to it. It settles this far
 // short of it instead; null is an unbounded realm.
 const READY_MARGIN_MS = 250;
-const readyCapMs = HOST.deadlineMs === null ? Infinity : Math.max(0, HOST.deadlineMs - READY_MARGIN_MS);
+const readyCapMs = HOST.deadlineMs == null ? Infinity : Math.max(0, HOST.deadlineMs - READY_MARGIN_MS);
 const maxPreAuthQueueSlices = Math.max(1, policy("maxPreAuthQueueSlices"));
 const maxUnverified = policy("maxHalfOpenUnverified");
 const maxPerSource = policy("maxHalfOpenPerSource");

@@ -38,7 +38,7 @@ export const SODIUM_EXPORTS: Readonly<Record<keyof typeof EXPORTS, string>> = EX
 /** The EM_JS snippets randombytes reaches through import `a.b`: one random word, and the
  *  RNG's lazy init. */
 const RAND_U32 = 40216, RAND_INIT = 40252;
-const AEAD_TAG = 16;
+const AEAD_TAG = 16, AEAD_NPUB = 12, AEAD_KEY = 32;
 const PAGE = 65536;
 
 /** libsodium plus ML-DSA-65 over `engine`. `random` is the platform CSPRNG. */
@@ -84,6 +84,12 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
   /** Write `bytes` at `ptr` unless there are none, which saves the crossing. */
   const put = (ptr: number, bytes: Uint8Array): void => {
     if (bytes.length > 0) lib.write(ptr, bytes);
+  };
+  /** The AEAD's nonce and key cross without lengths, so check them before writing. */
+  const aeadWidths = (op: string, npub: Uint8Array, key: Uint8Array): void => {
+    if (npub.length !== AEAD_NPUB || key.length !== AEAD_KEY) {
+      throw new Error(`${op}: nonce must be ${AEAD_NPUB} bytes and key ${AEAD_KEY}`);
+    }
   };
   // [pk 32][sk 64][seed 32]
   const keypair = (seed: Uint8Array | null): Keypair => {
@@ -147,6 +153,7 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
     },
     // [key 32][npub 16][ad][message][out]
     crypto_aead_chacha20poly1305_ietf_encrypt(message, ad, _nsec, npub, key) {
+      aeadWidths("crypto_aead_chacha20poly1305_ietf_encrypt", npub, key);
       const adLen = ad ? ad.length : 0, n = message.length;
       const at = scratch(48 + adLen + 2 * n + AEAD_TAG), m = at + 48 + adLen, out = m + n;
       lib.write(at, key);
@@ -161,6 +168,7 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
     },
     // [key 32][npub 16][ad][ciphertext][out]
     crypto_aead_chacha20poly1305_ietf_decrypt(_nsec, ciphertext, ad, npub, key) {
+      aeadWidths("crypto_aead_chacha20poly1305_ietf_decrypt", npub, key);
       if (ciphertext.length < AEAD_TAG) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
       const adLen = ad ? ad.length : 0, n = ciphertext.length - AEAD_TAG;
       const at = scratch(48 + adLen + ciphertext.length + n), c = at + 48 + adLen, out = c + ciphertext.length;

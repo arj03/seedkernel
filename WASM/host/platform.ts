@@ -72,7 +72,12 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
   net.install(TCP_KEEPALIVE_MS, TCP_LINGER_MS, MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES, {
     deliver: (id, bytes) => { chans.get(id)?.deliver(u8(bytes)); },
     closed: (id) => { chans.get(id)?.closed(); },
-    accept: (port, id, remoteAddr) => { accepts.get(port)?.(id, remoteAddr); },
+    accept: (port, id, remoteAddr) => {
+      const onAccept = accepts.get(port);
+      // A port no longer listened on has nothing to hand the socket to.
+      if (onAccept) onAccept(id, remoteAddr);
+      else net.close(id, false);
+    },
   });
 
   function makeLink(id: number, remoteAddr?: string): RawLink {

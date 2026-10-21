@@ -19,7 +19,11 @@ function loadQjs(): Promise<Uint8Array> {
       // otherwise reach the blob reader and fail there as a bad blob.
       if (!r.ok) throw new Error(`engine: ${url.href} was not served (HTTP ${r.status})`);
       return r.arrayBuffer();
-    }).then((b) => new Uint8Array(b))).then((blob) => readHostBlob(blob).qjs);
+    }).then((b) => new Uint8Array(b))).then((blob) => readHostBlob(blob).qjs, (err) => {
+      // A failed read is not cached, so the next realm tries again.
+      qjsBytes = undefined;
+      throw err;
+    });
 }
 
 /** This target's realm factory (§12.3). A module call is asynchronous here (a worker), so

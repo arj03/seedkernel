@@ -191,9 +191,21 @@ export class Loader {
   /** Whether a failure is a pending host's, which is then dropped: the caller boots the
    *  committed host instead of giving up. */
   failed(reason: string): boolean {
-    if (!this.trial) return false;
-    this.discard(reason);
+    const trial = this.trial;
+    if (!trial) return false;
+    if (this.holdsPending(trial)) {
+      this.discard(reason);
+    } else {
+      // The trial staged a successor, which was checked on its own and gets its own trial.
+      this.trial = null;
+      this.log(`v${trial.version} failed (${reason}); the host it staged stays pending`);
+    }
     return true;
+  }
+
+  /** Whether pending.skb still holds `slot`, rather than a successor staged since. */
+  private holdsPending(slot: Slot): boolean {
+    return this.load("pending.skb")?.version === slot.version;
   }
 
   /** How the booted host's operator flow ended. A host booted after it, in the same
@@ -228,7 +240,7 @@ export class Loader {
       this.log(`cannot commit the pending host: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    if (this.load("pending.skb")?.version === trial.version) {
+    if (this.holdsPending(trial)) {
       this.files.remove(this.path("pending.skb"));
       this.files.remove(this.path("tried"));
     }

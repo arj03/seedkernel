@@ -12,10 +12,10 @@ import (
 
 // dialTCP dials with kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables
 // autotuning. No timeout of its own: a dial that never connects never reads, and the host's
-// silent-socket deadline (host/platform.ts `tcpChannels`) closes it.
-func dialTCP(addr string, keepAlive time.Duration) (net.Conn, error) {
+// silent-socket deadline (host/platform.ts `tcpChannels`) closes the channel, which cancels ctx.
+func dialTCP(ctx context.Context, addr string, keepAlive time.Duration) (net.Conn, error) {
 	d := net.Dialer{KeepAlive: keepAlive}
-	return d.DialContext(context.Background(), "tcp", addr)
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 // ───────────────────────── RawLink: a byte duplex ──────────────────────────────
@@ -34,8 +34,9 @@ type sockChannel struct {
 	queued     int      // bytes held in queue, reported by buffered()
 	dead       bool
 	closeGrace time.Duration
+	cancelDial context.CancelFunc // aborts a connect in flight; nil on an accepted socket
 
-	wake     chan struct{} // cap 1: nudges the writer; coalesces bursts
+	wake    chan struct{} // cap 1: nudges the writer; coalesces bursts
 	readGate chan struct{} // one token permits one socket read
 }
 
@@ -47,10 +48,11 @@ func newReadGate() chan struct{} {
 
 // newDialChannel returns a channel that connects in the background; sends queue until then.
 func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace, cancelDial: cancel,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
-		conn, err := dialTCP(addr, keepAlive)
+		conn, err := dialTCP(ctx, addr, keepAlive)
 		if err != nil {
 			c.fail()
 			return
@@ -177,7 +179,11 @@ func (c *sockChannel) terminate(flush, notify bool) {
 	}
 	conn := c.conn
 	c.mu.Unlock()
-	// A nil conn is a dial in flight, which closes its conn on seeing dead.
+	// A nil conn is a dial in flight: cancelling ends it, and one that lands anyway closes
+	// its conn on seeing dead.
+	if c.cancelDial != nil {
+		c.cancelDial()
+	}
 	if conn != nil {
 		if flush {
 			conn.SetWriteDeadline(time.Now().Add(c.closeGrace))

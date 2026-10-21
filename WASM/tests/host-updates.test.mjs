@@ -141,6 +141,20 @@ try {
     "the tried host is committed, and the one it staged stays pending");
   ok(version(n.choose()) === 3 && mem.has("mem.host/tried"), "…for a trial of its own at the next start");
 
+  console.log("Test: a trial that fails drops itself, not the host it staged meanwhile");
+  const fmem = new Map();
+  const f = new Loader(memFiles(fmem), ["--host-updates", "next", "--dir", "mem"], readFileSync(join(root, "build/host.skb")), "0",
+    () => {}, () => {});
+  f.choose();
+  f.ended(true);
+  f.stage(hostBlob(2));
+  f.choose();
+  f.ended(true);
+  f.stage(hostBlob(3));
+  ok(f.failed("broken") && version(fmem.get("mem.host/pending.skb")) === 3 && !fmem.has("mem.host/committed.skb"),
+    "the failed v2 is not committed, and the v3 it staged stays pending");
+  ok(version(f.choose()) === 3, "…for a trial of its own at the next start");
+
   console.log("Test: a committed host that cannot be read stops the boot, since the floor is lost with it");
   const throwsOn = (fn) => { try { fn(); return ""; } catch (err) { return err.message; } };
   const genesisEnv = readFileSync(join(root, "build/host.skb"));

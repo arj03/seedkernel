@@ -400,6 +400,13 @@ async function testHostSodium() {
   let refused = false;
   try { host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key); } catch { refused = true; }
   assert(refused, "a tampered record does not open");
+  // The scratch arena holds the last operation's bytes (here the signing key), which a
+  // short key or nonce would otherwise be padded out with.
+  const throws = (fn) => { try { fn(); return false; } catch { return true; } };
+  assert(throws(() => host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key.subarray(0, 16))),
+    "a short AEAD key is refused");
+  assert(throws(() => host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub.subarray(0, 8), key)),
+    "a short AEAD nonce is refused");
   const author = testAuthor();
   const signed = signTestBundle(sodium, author, { app: "host-crypto", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } });
   assert(verifyBundle(host, signed).manifest.app === "host-crypto", "a hybrid bundle verifies on the host's crypto");

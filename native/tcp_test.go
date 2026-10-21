@@ -264,12 +264,17 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 	c.send([]byte("queued")) // buffers pre-connect; the non-graceful close drops it
 	c.close(false)
 
-	conn, err := ln.Accept() // the dial lands, sees dead, and closes the fresh conn
-	if err != nil {
+	// Cancelled in time, the dial never connects; landed first, it sees dead and closes the
+	// fresh conn.
+	ln.(*net.TCPListener).SetDeadline(time.Now().Add(500 * time.Millisecond))
+	conn, err := ln.Accept()
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		conn = nil
+	} else if err != nil {
 		t.Fatal(err)
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	for {
+	for conn != nil {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, err := conn.Read(make([]byte, 16))
 		if err == io.EOF || err == io.ErrClosedPipe {
 			break
@@ -280,6 +285,27 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 	}
 	if onClosed.Load() != 0 {
 		t.Fatal("a deliberate close() while dialing must not fire onClose")
+	}
+}
+
+// TestSockChannelCloseCancelsDial checks that closing a channel whose dial never connects
+// ends the dial, rather than leaving its goroutine and fd until the OS gives up (~2 min).
+// 192.0.2.1 is TEST-NET-1, which is never routed; on a machine with no route at all the
+// dial fails at once and the test passes trivially.
+func TestSockChannelCloseCancelsDial(t *testing.T) {
+	c := newTestDialChannel("192.0.2.1:9", func([]byte) {}, func() {})
+	time.Sleep(50 * time.Millisecond) // let the dial start
+	c.close(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		if !strings.Contains(string(buf[:runtime.Stack(buf, true)]), "newDialChannel.func1") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the dial outlived the channel's close")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
