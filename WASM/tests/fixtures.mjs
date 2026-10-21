@@ -33,7 +33,7 @@ export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 /** Local service routing under which nothing claims any id. */
 export const TEST_CALL_LOCAL = () => null;
-export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
+export const { callerOf, readOp, writeOp, utf8Encode, utf8Decode } = await imp("build/services/op-frame.js");
 /** Is this realm argument the host's wake event (§12.3)? */
 export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");

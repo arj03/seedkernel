@@ -268,10 +268,10 @@ class Core {
     return true;
   }
 
-  /** Record one peer: where to reach it and its contact secret. An empty `dest` is a peer
-   *  this node cannot dial but `ready` still waits for. */
+  /** Record one peer: where to reach it and its contact secret, empty for none. An empty
+   *  `dest` is a peer this node cannot dial but `ready` still waits for. */
   addAddr(peerBytes, secret, dest) {
-    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
+    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret.slice() : ZERO32 });
   }
 
   /** Drop one peer: its address, and every link to it, dialing or up. */
@@ -367,12 +367,13 @@ class Core {
     Core.drop(this.connecting, link.dialedPeerId, link);
     router.remove(link);
     // Its queued frames move to another link to the peer. A dial that dies as the last way
-    // to its peer fails what waits on it now, not at its timeout.
+    // to its peer fails what waits on it now, not at its timeout, a `dial` waiter too.
     const peerId = link.peerId || link.dialedPeerId;
     if (peerId) {
       for (const frame of link.takeQueued()) this.place(peerId, frame);
       if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) {
         reqres.peerDown(peerId);
+        this.checkReady();
       }
     }
     // Left in `linksById`: `linkClosed` still has to ask why it closed.
@@ -404,17 +405,32 @@ class Core {
     for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
-    this.readyWaiters.push({ check: allUp, d, due: dueIn(Math.min(timeoutMs, readyCapMs)) });
+    this.readyWaiters.push({ check: allUp, d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer: () => EMPTY });
   }
 
-  /** Settle each waiter whose cohort is up or whose deadline has passed (a caller that
-   *  needs to know which can read `peers`). Returns the soonest deadline still waiting. */
+  /** Dial one peer and settle `d` with `[1]` once it is linked, else `[0]`: as soon as no
+   *  dial to it is left, or at the deadline. */
+  dialPeer(d, peerId, timeoutMs) {
+    const linked = () => router.linkCount(peerId) >= 1;
+    const answer = () => Uint8Array.of(linked() ? 1 : 0);
+    if (linked()) { d.settle(answer()); return; }
+    // Not settled before the dial is under way: until then nothing is connecting yet.
+    const w = { check: () => linked(), d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer };
+    this.readyWaiters.push(w);
+    void this.dial(peerId).catch(() => {}).finally(() => {
+      w.check = () => linked() || !this.connecting.has(peerId);
+      this.checkReady();
+    });
+  }
+
+  /** Settle each waiter whose peers are up, or whose deadline has passed, with its answer.
+   *  Returns the soonest deadline still waiting. */
   checkReady(t = now()) {
     let next = Infinity;
     for (const w of [...this.readyWaiters]) {
       if (!w.check() && t < w.due) { next = Math.min(next, w.due); continue; }
       this.readyWaiters.splice(this.readyWaiters.indexOf(w), 1);
-      w.d.settle(EMPTY);
+      w.d.settle(w.answer());
     }
     return next;
   }
@@ -541,11 +557,33 @@ entry("send", (r, caller) => {
   return d.promise;
 });
 
-/** Add one peer: key, contact secret and destination (`addAddr`). */
+/** Add one peer: key, contact secret (empty, or 32 zero bytes, for none) and destination
+ *  (`addAddr`). */
 entry("addr", (r) => {
   const peer = r.blob();
   const secret = r.blob();
+  if (peer.length !== PK_LEN) throw new Error("transport: addr needs a 32-byte peer id");
+  if (secret.length !== 0 && secret.length !== PK_LEN) throw new Error("transport: addr needs a 32-byte contact secret, or none");
   core.addAddr(peer, secret, utf8Decode(r.blob()));
+});
+
+/** Dial one known peer, `[peer 32][timeout u32]`: answers `[1]` once it is linked, `[0]`
+ *  when it cannot be reached or the timeout passes (`dialPeer`). Deferred. */
+entry("dial", (r) => {
+  const peer = r.blob();
+  if (peer.length !== PK_LEN) throw new Error("transport: dial needs a 32-byte peer id");
+  const d = defer();
+  core.dialPeer(d, toHex(peer), r.u32());
+  return d.promise;
+});
+
+/** The ICE servers this node uses toward one peer, `[peer 32]`, as RTCConfiguration
+ *  `iceServers` JSON: so the host's own peer connections (a call's media) ask the same
+ *  STUN as the transport's (`iceServersFor`, direct.js). */
+entry("ice", (r) => {
+  const peer = r.blob();
+  if (peer.length !== PK_LEN) throw new Error("transport: ice needs a 32-byte peer id");
+  return utf8Encode(JSON.stringify(direct.iceServersFor(toHex(peer))));
 });
 
 /** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through

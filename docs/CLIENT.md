@@ -314,9 +314,10 @@ That is the door to the node's own network. Waiting for a cohort, listing linked
 import { OpArgs } from "seedkernel-wasm/op-frame";
 import { TRANSPORT_SERVICE } from "seedkernel-wasm/transport-bundle";
 
-// Teach the running transport one peer: [peer 32][secret 32][dest utf8], each blob-framed.
+// Teach the running transport one peer: [peer 32][secret][dest utf8], each blob-framed, the
+// secret empty for a peer that has none.
 const taught = shell.call(TRANSPORT_SERVICE, new OpArgs("addr")
-  .blob(peerId).blob(contactSecret ?? new Uint8Array(32)).text(dest).build());
+  .blob(peerId).blob(contactSecret ?? new Uint8Array(0)).text(dest).build());
 if (!taught) throw new Error("this node has no transport");
 await taught;
 
@@ -329,8 +330,10 @@ await shell.call(TRANSPORT_SERVICE, new OpArgs("contact").blob(newSecret).build(
 await shell.call(TRANSPORT_SERVICE, new OpArgs("welcome").blob(welcomedKeys).build());
 await shell.call(TRANSPORT_SERVICE, new OpArgs("forget").blob(peerId).build());
 
-// Wait for the cohort or the deadline; the op settles either way.
+// Wait for the cohort or the deadline; the op settles either way. Or dial one peer: [1] once
+// it is linked, [0] when it cannot be reached.
 await shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
+const [linked] = await shell.call(TRANSPORT_SERVICE, new OpArgs("dial").blob(peerId).u32(5000).build());
 ```
 
 The op names and their argument order are the transport bundle's own content, not a host ABI: a replacement transport may spell them differently, which is why its service id travels with its blob. `BootResult.transport` keeps only what is genuinely the host's: the bound ports, `start()`, `reset()` and `close()`.

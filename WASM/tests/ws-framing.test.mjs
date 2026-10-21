@@ -5,7 +5,7 @@
 // carried across calls.
 //
 // `WsFramer` is guest code without a module boundary: it shares a scope with util.js
-// (transport/src/util.js) and reads `host`, `N_WS`, `maxFrameBytes` and `randomBytes` as
+// (transport/src/util.js), with the op-frame prelude injected as the build does, and reads `host`, `N_WS`, `maxFrameBytes` and `randomBytes` as
 // free variables normally supplied by ake.js and the realm. This loads the real util.js
 // and framing.js source into a vm context and supplies just those four names, with
 // `host.call` bridged to the real ws.wasm, so a change to either file shows up here.
@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { testkit } from "./testkit.mjs";
+import { guestOpFraming } from "./fixtures.mjs";
 
 const { ok, assertEqual, note, summary } = testkit({ verbose: false });
 
@@ -50,7 +51,7 @@ function decodeFrame(frame, expectMasked) {
 const TEST_MAX_FRAME_BYTES = 1 << 20; // the post-`raiseCap` ceiling; distinct from the 8 KiB pre-auth one
 
 const guestSrc =
-  readFileSync(join(root, "transport/src/util.js"), "utf8") + "\n" +
+  readFileSync(join(root, "transport/src/util.js"), "utf8").replace("/* @seedkernel-op-frame */", guestOpFraming()) + "\n" +
   readFileSync(join(root, "transport/src/framing.js"), "utf8") + "\n" +
   `globalThis.__wsTestExports = {
     WsFramer, ByteParts, LengthFramer,

@@ -20,7 +20,7 @@ import {
   signTestBundle, guestOpFraming, authorBundle, policyFromJson, authorAllowlist,
   checkHostGates, GUEST_TEXT, GUEST_BYTES, GUEST, testAuthor, boot, bootTestShell,
   loadBundle, EMPTY, TestModuleHost, testHost, installBundle, makeHost,
-  forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp, isWake,
+  forwarderBytes, installMod, imp, root, bytesEqual, callerOf, readOp, writeOp, utf8Encode, utf8Decode, isWake,
   MemoryFs, NodeFs, FilesFs, nodeRawFiles, enc, withTestBudget,
 } from "./fixtures.mjs";
 
@@ -1386,9 +1386,9 @@ function testGeneratedOpFrame() {
   // Every caller inlines this fragment into a guest it then signs, so the bytes must not
   // depend on the machine that compiled op-frame.ts, which line endings otherwise would.
   assert(!guestOpFraming().includes("\r"), "the emitted op-frame source is LF-only, so a signed guest is the same bytes anywhere");
-  const host = { callerOf, readOp, writeOp };
+  const host = { callerOf, readOp, writeOp, utf8Encode, utf8Decode };
   const guest = new Function(`"use strict";${guestOpFraming()}
-    return { callerOf, readOp, writeOp };`)();
+    return { callerOf, readOp, writeOp, utf8Encode, utf8Decode };`)();
   // Outcome, not message: the emitted source and module execute in different contexts, so
   // what must agree is accept-vs-reject and the bytes on accept.
   const out = (impl, fn, args) => { try { return JSON.stringify(impl[fn](...args)); } catch { return "threw"; } };
@@ -1410,6 +1410,15 @@ function testGeneratedOpFrame() {
   agree("a 256-byte op name", "writeOp", "a".repeat(256), new Uint8Array(0));
   // 0x80 is the only code point that separates a `> 127` ceiling from a `> 128` one.
   agree("an op at the first non-ASCII code point", "writeOp", "a" + String.fromCharCode(0x80), new Uint8Array(0));
+  // Every UTF-8 length and a surrogate pair, and a lone surrogate, which TextEncoder writes
+  // as U+FFFD.
+  const text = "aé€😀", lone = "x\ud800y";
+  agree("text of every UTF-8 length", "utf8Encode", text);
+  agree("a lone surrogate", "utf8Encode", lone);
+  agree("UTF-8 back to text", "utf8Decode", new TextEncoder().encode(text));
+  assert(bytesEqual(utf8Encode(text), new TextEncoder().encode(text)), "utf8Encode writes what TextEncoder writes");
+  assert(bytesEqual(utf8Encode(lone), new TextEncoder().encode(lone)), "a lone surrogate is U+FFFD, as TextEncoder writes it");
+  assert(utf8Decode(utf8Encode(text)) === text, "utf8Decode reads back what utf8Encode wrote");
   console.log("  OK\n");
 }
 

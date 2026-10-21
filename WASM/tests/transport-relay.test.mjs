@@ -157,6 +157,46 @@ await test("a key the relay does not know fails the request at once", async (kee
   assert(relay.calls === 1, "the relay was asked");
 });
 
+await test("dial answers once the peer is linked, and at once for one nobody can reach", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  for (const n of [A, B]) await joinRelay(n);
+  const dial = (peer) => transportOp(A, new OpArgs("dial").blob(Buffer.from(peer, "hex")).u32(5000));
+  await addr(A, B.peerId, "relay+" + RELAY);
+  assert((await dial(B.peerId))[0] === 1, "a dial to a registered peer answers linked");
+  assert(await linked(A, B), "and the link is up at both ends");
+  assert((await dial(B.peerId))[0] === 1, "a peer already linked answers at once");
+  await addr(A, "ab".repeat(32), "relay+" + RELAY);
+  const t0 = Date.now();
+  assert((await dial("ab".repeat(32)))[0] === 0, "a key the relay does not know answers not linked");
+  assert(Date.now() - t0 < 1000, `without waiting out the timeout, took ${Date.now() - t0} ms`);
+  assert((await dial("cd".repeat(32)))[0] === 0, "and so does a key never taught");
+});
+
+await test("ice names the STUN the transport asks: the relay a peer is linked through", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  await relayed(A, B);
+  const ice = JSON.parse(new TextDecoder().decode(await transportOp(A, new OpArgs("ice").blob(Buffer.from(B.peerId, "hex")))));
+  const urls = ice.map((s) => s.urls);
+  assert(urls.includes("stun:relay:3478") && urls.includes("stun:relay:3479"), `the relay's STUN on both ports, got ${JSON.stringify(urls)}`);
+});
+
+await test("a peer taught without a secret is dialed with none, not this node's own", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const secret = new Uint8Array(32).fill(3);
+  // Both hold the same secret, so presenting A's own would open B.
+  const A = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
+  const B = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
+  for (const n of [A, B]) await joinRelay(n);
+  await addr(A, B.peerId, "relay+" + RELAY, new Uint8Array(0));
+  assert(!(await reaches(A, B)), "an empty secret presents none");
+  await addr(A, B.peerId, "relay+" + RELAY, secret);
+  assert(await reaches(A, B), "and the peer's own secret opens it");
+});
+
 await test("the callee's contact secret still gates a relayed dial", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay, { transportConfig: { handshakeTimeoutMs: 300 } }));

@@ -77,10 +77,10 @@ class Direct {
   }
 
   /** The ICE servers for a negotiation with `peer`: STUN at the relay it is linked
-   *  through, on both its ports, which already sees this node's address, so asking it tells
-   *  no one new, then the configured servers. */
+   *  through, else at this node's home relay, on both its ports, which already sees this
+   *  node's address, so asking it tells no one new, then the configured servers. */
   iceServersFor(peer) {
-    const relay = router.relayOf(peer);
+    const relay = router.relayOf(peer) || relays.home || "";
     const atRelay = relay ? RELAY_STUN_PORTS.map((port) => ({ urls: `stun:${relayHost(relay)}:${port}` })) : [];
     return [...atRelay, ...this.iceServers];
   }

@@ -7,7 +7,7 @@ import { concatBytes, enc, fromHex, toHex } from "../services/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
-import { callerOf, readOp, writeOp } from "../services/op-frame.js";
+import { callerOf, readOp, writeOp, utf8Encode, utf8Decode } from "../services/op-frame.js";
 import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
 import {
   hybridAuthorId,
@@ -188,9 +188,10 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
  *  Newlines are forced to LF because callers sign the result, and the compiled line
  *  endings depend on the machine that built this file. */
 export function guestOpFraming(): string {
-  const src = [callerOf, readOp, writeOp].map((fn) => fn.toString()).join("\n");
+  const src = [callerOf, readOp, writeOp, utf8Encode, utf8Decode].map((fn) => fn.toString()).join("\n");
   return `
-// op-frame: the host's raw-link event ABI; optional framing for application bodies.
+// op-frame: the host's raw-link event ABI; optional framing for application bodies; UTF-8,
+// which a realm has no TextEncoder for.
 ${src}
 `.replace(/\r\n/g, "\n");
 }
