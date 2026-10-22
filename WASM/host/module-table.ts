@@ -7,6 +7,7 @@ import {
 } from "./wasm-limits.js";
 import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
+import { errMessage } from "../services/util.js";
 
 // ─── module routing ─────────────────────────────────────────────────────
 
@@ -264,7 +265,7 @@ export class ModuleTable implements PureModuleLoader {
         else if (m.type === "loadError") fail(new Error(`table: failed to instantiate wasm: ${m.message}`));
       });
       worker.onError((err) =>
-        fail(new Error(`table: module worker failed during load: ${(err as Error)?.message ?? String(err)}`)));
+        fail(new Error(`table: module worker failed during load: ${errMessage(err)}`)));
       worker.post({ type: "load", wasm: ref.wasm });
     });
     // Loaded and idle, so stop holding the loop open. (Every failure path above killed the

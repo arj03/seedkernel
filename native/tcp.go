@@ -10,14 +10,6 @@ import (
 	"time"
 )
 
-// dialTCP dials with kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables
-// autotuning. No timeout of its own: a dial that never connects never reads, and the host's
-// silent-socket deadline (host/platform.ts `tcpChannels`) closes the channel, which cancels ctx.
-func dialTCP(ctx context.Context, addr string, keepAlive time.Duration) (net.Conn, error) {
-	d := net.Dialer{KeepAlive: keepAlive}
-	return d.DialContext(ctx, "tcp", addr)
-}
-
 // ───────────────────────── RawLink: a byte duplex ──────────────────────────────
 
 // sockChannel is a RawLink (services/socket-seam.ts): each delivery is an arbitrary slice
@@ -52,7 +44,11 @@ func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) boo
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace, cancelDial: cancel,
 		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
-		conn, err := dialTCP(ctx, addr, keepAlive)
+		// Kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables autotuning. No
+		// timeout of its own: a dial that never connects never reads, and the host's
+		// silent-socket deadline (host/platform.ts `tcpChannels`) closes the channel, which
+		// cancels ctx.
+		conn, err := (&net.Dialer{KeepAlive: keepAlive}).DialContext(ctx, "tcp", addr)
 		if err != nil {
 			c.fail()
 			return
@@ -104,12 +100,6 @@ func (c *sockChannel) buffered() int {
 	return c.queued
 }
 
-// resume returns the read token, once a delivery's realm turn has settled; until then
-// excess bytes stay in the socket's receive window.
-func (c *sockChannel) resume() {
-	c.wakeReader()
-}
-
 // waitReadable parks for the read token and reports whether the channel is still alive.
 func (c *sockChannel) waitReadable() bool {
 	<-c.readGate
@@ -118,7 +108,9 @@ func (c *sockChannel) waitReadable() bool {
 	return !c.dead
 }
 
-func (c *sockChannel) wakeReader() {
+// resume returns the read token, once a delivery's realm turn has settled; until then
+// excess bytes stay in the socket's receive window.
+func (c *sockChannel) resume() {
 	select {
 	case c.readGate <- struct{}{}:
 	default:
@@ -192,7 +184,7 @@ func (c *sockChannel) terminate(flush, notify bool) {
 		}
 	}
 	c.signal()
-	c.wakeReader()
+	c.resume()
 	if notify {
 		c.onClose()
 	}

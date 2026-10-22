@@ -54,7 +54,7 @@ const guestSrc =
   readFileSync(join(root, "transport/src/util.js"), "utf8").replace("/* @seedkernel-op-frame */", guestOpFraming()) + "\n" +
   readFileSync(join(root, "transport/src/framing.js"), "utf8") + "\n" +
   `globalThis.__wsTestExports = {
-    WsFramer, ByteParts, LengthFramer,
+    WsFramer, Pieces, MERGE_BELOW, LengthFramer,
     WS_OP_CONT, WS_OP_BINARY, WS_OP_CLOSE, WS_OP_PING, WS_OP_PONG,
     MAX_HANDSHAKE_FRAME_BYTES, MAX_WS_HANDSHAKE,
   };`;
@@ -153,14 +153,14 @@ async function run() {
     // Appending must never treat that capacity as the framer's accumulator.
     const backing = Uint8Array.from({ length: 100 }, (_, i) => i);
     const before = backing.slice();
-    const parts = new WS.ByteParts();
+    const parts = new WS.Pieces(WS.MERGE_BELOW);
     parts.push(backing.subarray(5, 12));
     parts.push(Uint8Array.of(200, 201));
     ok(bytesEq(backing, before), "merging small slices never overwrites borrowed backing storage");
     const first = parts.take(3);
     parts.push(backing.subarray(20, 24));
     ok(bytesEq(first, before.subarray(5, 8)), "partial consumption returns the right prefix");
-    ok(bytesEq(parts.take(parts.length), concat([before.subarray(8, 12), Uint8Array.of(200, 201), before.subarray(20, 24)])),
+    ok(bytesEq(parts.take(parts.bytes), concat([before.subarray(8, 12), Uint8Array.of(200, 201), before.subarray(20, 24)])),
       "append after partial consumption preserves the remaining bytes");
   }
   const client = frameFactory();
@@ -384,7 +384,7 @@ async function run() {
 
   {
     // Same property, but each frame arrives as several small unawaited chunks, testing
-    // `ByteParts` reassembly and the read chain together: a chunk boundary can land
+    // `Pieces` reassembly and the read chain together: a chunk boundary can land
     // mid-header or mid-payload of any frame while an earlier push is still parsing.
     const N = 6;
     const CHUNK = 7;

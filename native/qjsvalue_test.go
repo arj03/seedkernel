@@ -86,9 +86,6 @@ func TestValueBytesIgnoresAccessors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer v.Free()
-	if n, err := v.ByteLength(); err != nil || n != 2 {
-		t.Fatalf("ByteLength = %d, %v; want 2", n, err)
-	}
 	if b, err := v.Bytes(); err != nil || !bytes.Equal(b, []byte{2, 3}) {
 		t.Fatalf("Bytes = %v, %v; want [2 3]", b, err)
 	}
@@ -115,9 +112,6 @@ func TestValueBytesHostileProperties(t *testing.T) {
 			defer v.Free()
 			if b, err := v.Bytes(); err == nil {
 				t.Fatalf("Bytes accepted it, returning %v", b)
-			}
-			if n, err := v.ByteLength(); err == nil {
-				t.Fatalf("ByteLength accepted it, returning %d", n)
 			}
 			// The realm is still usable: the refusal took the exception with it.
 			r, err := qc.Eval("after-hostile-view.js", `1 + 1`)

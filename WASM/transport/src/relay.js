@@ -236,10 +236,10 @@ class Relays {
 
   /** Close a relay socket. */
   drop(c) {
+    // Off the map first, so its closing is not taken for a lost home relay.
     if (this.conns.get(c.origin) === c) this.conns.delete(c.origin);
-    c.gone = true;
     c.close();
-    for (const settle of c.waiters.splice(0)) settle(false);
+    c.onChannelClosed();
   }
 
   onGone(c) {

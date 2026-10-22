@@ -12,9 +12,9 @@ import { fileURLToPath } from "node:url";
 import { buildAuthor, signHostBlob } from "../build/scripts/bundle-author.js";
 import { PLATFORM_ABI } from "../build/host/abi.js";
 import { hybridAuthorId } from "../build/host/bundle.js";
+import { toHex } from "../build/services/util.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const toHex = (b) => Buffer.from(b).toString("hex");
 const { sodium, keys } = buildAuthor(root, "host-author.key", process.argv.slice(2));
 
 const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).hostVersion;

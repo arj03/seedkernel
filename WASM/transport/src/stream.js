@@ -111,50 +111,6 @@ function packet(type, body) {
   return p;
 }
 
-/** Bytes in pieces, taken from the front: what was written and is not yet sent, and what
- *  arrived in order and is not yet read. A head index, not `shift`, which would go
- *  quadratic over a credit of tiny datagrams; a consumed slot is cleared, so it frees. */
-class Pieces {
-  constructor() {
-    this.list = [];
-    this.head = 0;
-    this.at = 0; // where in the front piece the next byte is
-    this.bytes = 0;
-  }
-
-  get slices() { return this.list.length - this.head; }
-
-  push(piece) {
-    this.list.push(piece);
-    this.bytes += piece.length;
-  }
-
-  shift() {
-    this.list[this.head++] = null;
-    this.at = 0;
-    if (this.head >= 1024 && this.head * 2 >= this.list.length) {
-      this.list = this.list.slice(this.head);
-      this.head = 0;
-    }
-  }
-
-  /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
-   *  copy across pieces. */
-  take(n) {
-    this.bytes -= n;
-    let out;
-    for (let got = 0; got < n;) {
-      const piece = this.list[this.head], k = Math.min(piece.length - this.at, n - got);
-      if (k === n) out = piece.subarray(this.at, this.at + k);
-      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
-      got += k;
-      this.at += k;
-      if (this.at === piece.length) this.shift();
-    }
-    return out;
-  }
-}
-
 /** The stream, and the channel its link writes to (ake.js `Link`): `send` keeps the bytes
  *  it is given. */
 class UdpStream {

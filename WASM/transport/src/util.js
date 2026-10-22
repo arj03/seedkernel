@@ -107,6 +107,109 @@ Reader.prototype.blob = function () {
 /** Whether an optional trailing field follows. */
 Reader.prototype.more = function () { return this.off < this.b.length; };
 
+// ── byte queue ────────────────────────────────────────────────────────────────
+
+/** Bytes in pieces, taken from the front: what arrived and is not yet parsed or read, and
+ *  what was written and is not yet sent. A head index and an offset into the front piece,
+ *  not `shift` or `subarray`, which would go quadratic over a credit of tiny datagrams; a
+ *  consumed slot is cleared, so it frees. Pieces under `mergeBelow` gather into a doubling
+ *  accumulator: the first is borrowed and a second starts it, so a frame arriving in tiny
+ *  slices costs linear copying. */
+class Pieces {
+  constructor(mergeBelow = 0) {
+    this.list = [];
+    this.head = 0;
+    this.at = 0; // where in the front piece the next byte is
+    this.bytes = 0;
+    this.mergeBelow = mergeBelow;
+    this.tail = -1;         // index of the growable accumulator in `list`, or -1 for none
+    this.tailOwned = false; // a borrowed piece's spare capacity must not be written
+  }
+
+  get slices() { return this.list.length - this.head; }
+
+  push(piece) {
+    if (piece.length === 0) return;
+    this.bytes += piece.length;
+    // A large piece is kept as it arrived and ends the accumulator.
+    if (piece.length >= this.mergeBelow) { this.list.push(piece); this.tail = -1; return; }
+    if (this.tail < 0) {
+      this.tail = this.list.length;
+      this.tailOwned = false;
+      this.list.push(piece);
+      return;
+    }
+    const cur = this.list[this.tail];
+    if (this.tailOwned && piece.length <= cur.buffer.byteLength - cur.byteOffset - cur.length) {
+      const grown = new Uint8Array(cur.buffer, cur.byteOffset, cur.length + piece.length);
+      grown.set(piece, cur.length);
+      this.list[this.tail] = grown;
+      return;
+    }
+    const want = cur.length + piece.length;
+    const buf = new Uint8Array(Math.max(this.mergeBelow, want * 2));
+    buf.set(cur, 0);
+    buf.set(piece, cur.length);
+    this.list[this.tail] = buf.subarray(0, want);
+    this.tailOwned = true;
+  }
+
+  shift() {
+    if (this.tail === this.head) this.tail = -1;
+    this.list[this.head++] = null;
+    this.at = 0;
+    if (this.head >= 1024 && this.head * 2 >= this.list.length) {
+      this.list = this.list.slice(this.head);
+      if (this.tail >= 0) this.tail -= this.head;
+      this.head = 0;
+    }
+  }
+
+  /** Copy up to `n` bytes from the front without consuming them. */
+  peek(n) {
+    const out = new Uint8Array(Math.min(n, this.bytes));
+    for (let i = this.head, from = this.at, off = 0; off < out.length; i++, from = 0) {
+      const p = this.list[i];
+      const k = Math.min(p.length - from, out.length - off);
+      out.set(p.subarray(from, from + k), off);
+      off += k;
+    }
+    return out;
+  }
+
+  /** The i-th live byte, without copying; callers check `bytes` first. */
+  byteAt(i) {
+    i += this.at;
+    for (let k = this.head; k < this.list.length; k++) {
+      const p = this.list[k];
+      if (i < p.length) return p[i];
+      i -= p.length;
+    }
+    return 0;
+  }
+
+  /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
+   *  copy across pieces. */
+  take(n) { return this.consume(n, undefined, 0); }
+
+  /** The next `n` bytes as a buffer the caller owns, with `prefix` free bytes in front for
+   *  it to fill. A framer's frames take this, since the pieces it was handed are borrowed. */
+  takeCopy(n, prefix = 0) { return this.consume(n, new Uint8Array(prefix + n), prefix); }
+
+  consume(n, out, prefix) {
+    this.bytes -= n;
+    for (let got = 0; got < n;) {
+      const piece = this.list[this.head], k = Math.min(piece.length - this.at, n - got);
+      if (k === n && out === undefined) out = piece.subarray(this.at, this.at + k);
+      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), prefix + got);
+      got += k;
+      this.at += k;
+      if (this.at === piece.length) this.shift();
+    }
+    return out;
+  }
+}
+
 // ── the caller prefix and op envelope ───────────────────────────────────────
 // Injected from services/op-frame.ts by scripts/guest-source.mjs; assembly fails without it.
 /* @seedkernel-op-frame */

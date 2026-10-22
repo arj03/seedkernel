@@ -75,30 +75,6 @@ func TrackRejections() Option {
 	return func(c *config) { c.trackRejections = true }
 }
 
-// Budget bounds execution wall time until the returned restore func runs, through
-// QuickJS's interrupt handler. An overrun is a catchable JS exception and the runtime
-// stays usable. A non-positive d is unbounded.
-func (r *Runtime) Budget(d time.Duration) func() {
-	if d <= 0 {
-		return func() {}
-	}
-	r.call("QJS_SetDeadline", uint64(d.Nanoseconds()))
-	return func() {
-		if r.Alive() {
-			r.call("QJS_SetDeadline", 0)
-		}
-	}
-}
-
-// TookInterrupt reports and clears whether the Budget deadline fired. A pump can swallow
-// the exception inside a job, so this is the only reliable signal.
-func (r *Runtime) TookInterrupt() bool {
-	if !r.Alive() {
-		return false
-	}
-	return r.call("QJS_TakeInterrupted") != 0
-}
-
 // Alive reports whether the runtime has not been closed.
 func (r *Runtime) Alive() bool { return r.mod != nil && !r.mod.IsClosed() }
 

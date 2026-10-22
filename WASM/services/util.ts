@@ -105,7 +105,7 @@ export function errMessage(e: unknown): string {
  *
  *  `Array.prototype.shift` moves every remaining element, so draining a full queue costs
  *  O(n²), and the queues here are bounded, so that cost lands exactly when they are full.
- *  Same design and constants as the framer's `ByteParts`. */
+ *  Same design as the transport's `Pieces`. */
 export class Fifo<T> {
   private items: T[] = [];
   private head = 0;

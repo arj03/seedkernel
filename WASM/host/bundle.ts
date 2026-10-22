@@ -1,5 +1,5 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, isHex64, enc, dec, errMessage, type JsonValue, type JsonObject } from "../services/util.js";
+import { concatBytes, toHex, isHex64, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "../services/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "../services/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
 export type { JsonValue, JsonObject };
@@ -298,12 +298,11 @@ export function envelopeBody(env: Uint8Array, what: string): Uint8Array {
 /** A body's u32 big-endian length-prefixed parts, read in order. A bundle's lengths are
  *  interpreted only after the signatures over them authenticate. */
 export function bodyReader(body: Uint8Array, what: string): { next(): Uint8Array; done(): boolean } {
-  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
   let off = 0;
   return {
     next() {
       if (off + 4 > body.length) throw new Error(`${what}: truncated body`);
-      const length = dv.getUint32(off, false);
+      const length = readU32BE(body, off);
       off += 4;
       if (length > body.length - off) throw new Error(`${what}: truncated body`);
       const bytes = body.subarray(off, off + length);
@@ -319,8 +318,7 @@ export function bodyReader(body: Uint8Array, what: string): { next(): Uint8Array
 export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): VerifiedBundle {
   const { author, authorKeys, body } = verifyEnvelope(sodium, env, DOMAIN_MANIFEST, "bundle");
   const parts = bodyReader(body, "bundle");
-  const read = () => parts.next();
-  const json = read();
+  const json = parts.next();
   let parsed;
   try {
     parsed = JSON.parse(dec.decode(json));
@@ -333,8 +331,8 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
     throw new Error("bundle: this manifest declares no guest, and every app is a guest (§12.4) — the modules are the library it drives, so ship the guest that drives them");
   }
   validateManifest(parsed);
-  const guestSource = dec.decode(read());
-  const modules = parsed.modules.map((mod) => ({ mod, wasm: new Uint8Array(read()) }));
+  const guestSource = dec.decode(parts.next());
+  const modules = parsed.modules.map((mod) => ({ mod, wasm: new Uint8Array(parts.next()) }));
   if (!parts.done()) throw new Error("bundle: trailing bytes in body");
   return { author, authorKeys, manifest: parsed, guestSource, modules };
 }

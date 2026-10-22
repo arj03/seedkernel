@@ -6,7 +6,6 @@ import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({
   submodule: "mldsa-native",
-  marker: "mldsa/mldsa_native.c",
   cSource: "mldsa/mldsa_native.c",
   incDir: "mldsa",
   configDefine: "MLD_CONFIG_FILE",

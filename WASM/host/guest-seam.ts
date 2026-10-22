@@ -4,7 +4,7 @@ import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../services/util.j
 import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, isService, type HostTransformName, type ServiceMethod, type ServiceName } from "../services/domains.js";
 import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
-import { HOST_CALL_SPENT, monotonicMs, type CausalClock } from "./realm-queue.js";
+import { HOST_CALL_SPENT, type CausalClock } from "./realm-queue.js";
 import type { Keypair } from "../services/subkeys.js";
 
 /** What a scoped SIGN/VERIFY signs under (§12.2): `domain ‖ scope ‖ msg`, `msg` never
@@ -129,12 +129,11 @@ export class CallBudget {
   /** @param remainingMs what is left of the segment (`Infinity` when unbudgeted). Zero
    *    is refused here, so no handler needs to check again.
    *  @param causalClock the clock of the self-initiated work this call belongs to, if any.
-   *  @param spend the record host CPU time is billed to. None on native, where Go already
-   *    counts module time inside the guest's segment. */
+   *  @param spend the record host CPU time is billed to. */
   constructor(
     readonly remainingMs: number,
     readonly causalClock: CausalClock | undefined,
-    private readonly spend: Spend | undefined,
+    private readonly spend: Spend,
   ) {
     if (remainingMs <= 0) throw new Error(HOST_CALL_SPENT);
   }
@@ -143,7 +142,7 @@ export class CallBudget {
    *  bounds concurrent use, which the wall-clock deadline cannot: N parallel module calls
    *  use N ms per ms waited. */
   charge(ms: number): void {
-    if (ms <= 0 || this.spend === undefined) return;
+    if (ms <= 0) return;
     this.spend.consumedMs += ms;
     this.causalClock?.charge(ms);
   }
@@ -319,13 +318,13 @@ function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message:
   return concatBytes([scope.domain, scope.scope, message]);
 }
 
-/** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). */
-export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): {
+/** Sign and verify under one scope: `node/sign` and `node/verify`, and their host-side
+ *  twin `appSigner`. */
+function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
   sign(msg: Uint8Array): Uint8Array;
   /** False on a bad signature, and on a `sig` or `pk` of the wrong shape. */
   verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
-  const scope = appSignScope(key, app);
   return {
     sign(msg) {
       return sodium.crypto_sign_detached(scopedSigningInput(scope, msg), scope.key.privateKey);
@@ -338,6 +337,11 @@ export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): {
       }
     },
   };
+}
+
+/** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). */
+export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): ReturnType<typeof scopedSigner> {
+  return scopedSigner(sodium, appSignScope(key, app));
 }
 
 /** The `link` slot's signing scope: `DOMAIN_link_scope`, empty suffix. The transport tags
@@ -386,19 +390,18 @@ const SERVICES: {
   [S in ServiceName]: (backend: SeamBackends[S], sodium: SeamCrypto) => Record<ServiceMethod<S>, SeamHandler>
 } = {
   // Signed under this slot's scope; the guest never picks a namespace.
-  node: (s, sodium) => ({
-    "node/sign": (payload) => sodium.crypto_sign_detached(scopedSigningInput(s, payload), s.key.privateKey),
-    // [pk 32][sig 64][msg ...] -> [ok u8]. Too short for the prefix throws; an empty msg
-    // is valid.
-    "node/verify": (payload) => {
-      if (payload.length < 96) throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
-      try {
-        return sodium.crypto_sign_verify_detached(payload.subarray(32, 96), scopedSigningInput(s, payload.subarray(96)), payload.subarray(0, 32)) ? ONE : ZERO;
-      } catch {
-        return ZERO;
-      }
-    },
-  }),
+  node: (s, sodium) => {
+    const signer = scopedSigner(sodium, s);
+    return {
+      "node/sign": (payload) => signer.sign(payload),
+      // [pk 32][sig 64][msg ...] -> [ok u8]. Too short for the prefix throws; an empty msg
+      // is valid.
+      "node/verify": (payload) => {
+        if (payload.length < 96) throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
+        return signer.verify(payload.subarray(0, 32), payload.subarray(32, 96), payload.subarray(96)) ? ONE : ZERO;
+      },
+    };
+  },
   fs: (fs) => ({
     "fs/get": (payload) => fs.get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
     // Views, not copies: the payload already belongs to this call, and backends copy.
@@ -498,25 +501,6 @@ const SERVICES: {
   }),
 };
 
-/** A host handler as a route. Its synchronous part is host CPU spent for the caller
- *  (libsodium runs to completion; I/O returns a promise at once), so it can be billed to
- *  a wake's clock (§12.3) without listing which names compute. `finally`, because a
- *  rejected tag still did the work. Not `budget.charge`: this paces self-initiated work,
- *  it is not the realm's segment (§4.3). Only wakes carry a clock, so the frame path pays
- *  nothing. */
-function charged(fn: SeamHandler): SeamHandler {
-  return (payload, budget) => {
-    const owner = budget.causalClock;
-    if (owner === undefined) return fn(payload, budget);
-    const at = monotonicMs();
-    try {
-      return fn(payload, budget);
-    } finally {
-      owner.charge(monotonicMs() - at);
-    }
-  };
-}
-
 /** The `host.call` a realm runs against. A refusal (unreachable name, spent budget) or a
  *  synchronous handler error throws at the call site; a failed round trip rejects. The
  *  realm handles serialization. */
@@ -529,7 +513,7 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
   // (bundle.ts), so insertion order does not matter.
   const routes = new Map<string, SeamHandler>();
   const addHost = (handlers: Record<string, SeamHandler>) => {
-    for (const [name, fn] of Object.entries(handlers)) routes.set(name, charged(fn));
+    for (const [name, fn] of Object.entries(handlers)) routes.set(name, fn);
   };
   addHost(hostTransforms(sodium));
   for (const id of new Set(requires)) {

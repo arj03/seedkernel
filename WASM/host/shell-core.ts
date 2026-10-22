@@ -188,7 +188,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
   const net = opts.transport === false ? undefined : opts.transport;
   const netHost = net ? new TransportHost(net) : null;
-  const transportBlob = netHost ? (net!.bundle ?? transportBundleBytes()) : null;
   const appAdmit = opts.admit ?? denyAll;
   let closed = false;
 
@@ -456,8 +455,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
 
   // A failed boot returns no handle, so it tears down what it started.
   try {
-    if (netHost && transportBlob) {
-      await installBundle(transportBlob,
+    if (netHost) {
+      await installBundle(net!.bundle ?? transportBundleBytes(),
         net!.config === undefined ? undefined : { localConfig: net!.config }, true);
       await netHost.start();
     }

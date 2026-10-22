@@ -4,96 +4,16 @@
 /** Pre-auth frame cap, with room for the ML-KEM-768 encapsulation key (1184 B). */
 const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;
 
-// ── inbound byte assembly ─────────────────────────────────────────────────────
-//
-// Slices can be arbitrarily small. The first small one is borrowed; a second starts a
-// doubling accumulator, so a frame arriving in tiny pieces costs linear copying.
-const MERGE_BELOW = 8 * 1024;
+// ── byte assembly ─────────────────────────────────────────────────────────────
 
-class ByteParts {
-  constructor() {
-    this.parts = [];   // inbound slices, not yet parsed
-    this.head = 0;     // index of the first live slice
-    this.length = 0;   // live bytes across all slices
-    this.tail = -1;    // index of the growable accumulator in `parts`, or -1 for none
-    this.tailOwned = false; // a borrowed slice's spare capacity must not be written
-  }
-  push(chunk) {
-    if (chunk.length === 0) return;
-    this.length += chunk.length;
-    // A large slice is kept as it arrived and ends the accumulator.
-    if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
-    if (this.tail < 0) {
-      this.tail = this.parts.length;
-      this.tailOwned = false;
-      this.parts.push(chunk);
-      return;
-    }
-    const cur = this.parts[this.tail];
-    if (this.tailOwned && chunk.length <= cur.buffer.byteLength - cur.byteOffset - cur.length) {
-      const grown = new Uint8Array(cur.buffer, cur.byteOffset, cur.length + chunk.length);
-      grown.set(chunk, cur.length);
-      this.parts[this.tail] = grown;
-      return;
-    }
-    const want = cur.length + chunk.length;
-    const buf = new Uint8Array(Math.max(MERGE_BELOW, want * 2));
-    buf.set(cur, 0);
-    buf.set(chunk, cur.length);
-    this.parts[this.tail] = buf.subarray(0, want);
-    this.tailOwned = true;
-  }
-  /** Copy up to `n` bytes from the front without consuming them. */
-  peek(n) {
-    const out = new Uint8Array(Math.min(n, this.length));
-    let off = 0;
-    for (let i = this.head; i < this.parts.length && off < out.length; i++) {
-      const p = this.parts[i];
-      const take = Math.min(p.length, out.length - off);
-      out.set(p.subarray(0, take), off);
-      off += take;
-    }
-    return out;
-  }
-  /** The i-th live byte, without copying; callers check `length` first. */
-  byteAt(i) {
-    for (let k = this.head; k < this.parts.length; k++) {
-      const p = this.parts[k];
-      if (i < p.length) return p[i];
-      i -= p.length;
-    }
-    return 0;
-  }
-  /** Consume exactly `n` bytes from the front, as one buffer with `prefix` free bytes in
-   *  front for the caller to fill. */
-  take(n, prefix = 0) {
-    const out = new Uint8Array(prefix + n);
-    const end = prefix + n;
-    let off = prefix;
-    while (off < end) {
-      const p = this.parts[this.head];
-      const need = end - off;
-      if (p.length <= need) { out.set(p, off); off += p.length; this.parts[this.head] = null; this.head++; }
-      else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = end; }
-    }
-    this.length -= n;
-    // Once consumed from, the accumulator must not be appended into.
-    if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
-    // Drop the consumed slices once they outnumber the live ones.
-    if (this.head >= 8 && this.head * 2 >= this.parts.length) {
-      this.parts = this.parts.slice(this.head);
-      if (this.tail >= 0) this.tail -= this.head;
-      this.head = 0;
-    }
-    return out;
-  }
-}
+/** Below this, a framer's pieces gather into one accumulator. */
+const MERGE_BELOW = 8 * 1024;
 
 /** A length-prefixed link is writable immediately; there is no negotiation. */
 class LengthFramer {
   constructor(put) {
     this.put = put;
-    this.parts = new ByteParts();
+    this.parts = new Pieces(MERGE_BELOW);
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
   }
 
@@ -107,7 +27,7 @@ class LengthFramer {
   raiseCap() { this.cap = maxFrameBytes; }
 
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
-  discard() { this.parts = new ByteParts(); }
+  discard() { this.parts = new Pieces(MERGE_BELOW); }
 
   /** Feed inbound bytes, delivering each whole message. Returns false for an over-cap
    *  frame, true when waiting for more; before the cap is raised, a promise of either
@@ -121,12 +41,13 @@ class LengthFramer {
    *  (ake.js `becomeAuthed`) before the next frame in the same read is measured. */
   parse(deliver) {
     for (;;) {
-      if (this.parts.length < 4) return true;
+      if (this.parts.bytes < 4) return true;
       const p = this.parts;
       const len = ((p.byteAt(0) << 24) | (p.byteAt(1) << 16) | (p.byteAt(2) << 8) | p.byteAt(3)) >>> 0;
       if (len > this.cap) return false;
-      if (this.parts.length < 4 + len) return true;
-      const step = deliver(this.parts.take(4 + len).subarray(4));
+      if (this.parts.bytes < 4 + len) return true;
+      this.parts.take(4);
+      const step = deliver(this.parts.takeCopy(len));
       if (this.cap !== maxFrameBytes) return Promise.resolve(step).then(() => this.parse(deliver));
     }
   }
@@ -169,7 +90,7 @@ class WsFramer {
     this.put = put;
     this.client = weDialed;
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
-    this.parts = new ByteParts();      // inbound: handshake head, then frames
+    this.parts = new Pieces(MERGE_BELOW);      // inbound: handshake head, then frames
     this.open = false;
     // `send` waits on this until the upgrade completes, or fails with it (`abort`, §12.6).
     this.opened = new Promise((resolve, reject) => {
@@ -207,7 +128,7 @@ class WsFramer {
   raiseCap() { this.cap = maxFrameBytes; }
 
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
-  discard() { this.parts = new ByteParts(); this.frags = []; this.fragBytes = 0; }
+  discard() { this.parts = new Pieces(MERGE_BELOW); this.frags = []; this.fragBytes = 0; }
 
   async frame(opcode, payload) {
     const m = this.client ? await maskKey() : null;
@@ -268,18 +189,18 @@ class WsFramer {
   /** Extend the rolling `\r\n\r\n` scan over one pre-open chunk. Returns the terminator's
    *  offset in the stream, -1 if not found yet, or -2 past MAX_WS_HANDSHAKE. */
   scanHead(chunk) {
-    let h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, n = this.headLen;
+    let h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3, n = this.headLen, found = -1;
     for (let i = 0; i < chunk.length; i++) {
       h0 = h1; h1 = h2; h2 = h3; h3 = chunk[i];
       n++;
       const matched = h0 === 13 && h1 === 10 && h2 === 13 && h3 === 10;
       if (matched || n > MAX_WS_HANDSHAKE) {
-        this.h0 = h0; this.h1 = h1; this.h2 = h2; this.h3 = h3; this.headLen = n;
-        return matched && n <= MAX_WS_HANDSHAKE ? n - 4 : -2;
+        found = matched && n <= MAX_WS_HANDSHAKE ? n - 4 : -2;
+        break;
       }
     }
     this.h0 = h0; this.h1 = h1; this.h2 = h2; this.h3 = h3; this.headLen = n;
-    return -1;
+    return found;
   }
 
   /** Read (client) or answer (server) the opening handshake, `sep` bytes into the buffered
@@ -311,9 +232,9 @@ class WsFramer {
       const total = this.frameLength();
       if (total < 0) return true;
       if (total === Infinity) return false;
-      if (this.parts.length < total) return true;
+      if (this.parts.bytes < total) return true;
       // Taken with room for the two-byte request header in front.
-      const req = this.parts.take(total, 2);
+      const req = this.parts.takeCopy(total, 2);
       req[0] = WS_OP_DECODE_ONE;
       req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
       const r = await wsCall(req);
@@ -385,11 +306,11 @@ class WsFramer {
   }
 }
 
-/** Case-insensitively read a header value from an HTTP head. A blank value does not
- *  match; the lookahead keeps the lazy group from returning leading whitespace. */
+/** Case-insensitively read a header value from an HTTP head. `name` is a literal header
+ *  name, used in the pattern as is. A blank value does not match; the lookahead keeps the
+ *  lazy group from returning leading whitespace. */
 function headerValue(head, name) {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const m = new RegExp("^" + escaped + ":[ \\t]*(?![ \\t])(.+?)[ \\t]*$", "im").exec(head);
+  const m = new RegExp("^" + name + ":[ \\t]*(?![ \\t])(.+?)[ \\t]*$", "im").exec(head);
   return m ? m[1] : null;
 }
 

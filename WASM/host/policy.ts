@@ -3,7 +3,7 @@
 // freshness) run before it for every bundle, transport included, and again at commit,
 // since what they read may have changed by then. Ordinary apps default to deny-all.
 
-import { isHex64, toHex } from "../services/util.js";
+import { errMessage, isHex64, toHex } from "../services/util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
 /** The admission seam. Return `true` to admit, `false` to reject silently, or throw to
@@ -41,7 +41,7 @@ export function authorAllowlist(authors: string[]): Admit {
 export function parsePolicy(json: string): Admit {
   let raw: unknown;
   try { raw = JSON.parse(json); }
-  catch (e) { throw new Error(`policy: invalid JSON (${(e as Error).message})`); }
+  catch (e) { throw new Error(`policy: invalid JSON (${errMessage(e)})`); }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error("policy: expected a JSON object");
   }

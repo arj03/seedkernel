@@ -26,9 +26,9 @@ export const sodium = await loadCrypto();
 export const TEST_CONTACT = new Uint8Array(32).fill(3);
 export const { createGuestSeam, guestSignScope, appSignScope, CallBudget } = await imp("build/host/guest-seam.js");
 /** A seam called straight from a test, with the budget a realm would pass: an unbounded
- *  segment with no causal root and no spend record. */
+ *  segment with no causal root and a fresh spend record. */
 export const withTestBudget = (seam) => (name, payload) =>
-  seam(name, payload, new CallBudget(Infinity, undefined, undefined));
+  seam(name, payload, new CallBudget(Infinity, undefined, { consumedMs: 0 }));
 export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 /** Local service routing under which nothing claims any id. */

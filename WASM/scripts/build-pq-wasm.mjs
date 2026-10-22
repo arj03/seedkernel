@@ -23,13 +23,13 @@ const toWslPath = (arg) =>
   arg.replace(/([A-Za-z]):\\([^"]*)/g,
     (_, drive, rest) => `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, "/")}`);
 
-/** @param {object} cfg  build inputs: pq submodule and marker (present when checked out),
+/** @param {object} cfg  build inputs: pq submodule (its cSource present when checked out),
  *  cSource/incDir, the config define/header (memcpy/memset/zeroize redirect), shim, out. */
 export function buildPqWasm(cfg) {
   const src = resolve(pq, cfg.submodule);
   const out = resolve(root, cfg.out);
 
-  if (!existsSync(resolve(src, cfg.marker))) {
+  if (!existsSync(resolve(src, cfg.cSource))) {
     throw new Error(`pq/${cfg.submodule} is empty — run \`git submodule update --init --recursive\``);
   }
 

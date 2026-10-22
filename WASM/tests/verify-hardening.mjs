@@ -237,7 +237,7 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
     modules: { names: new Set(["codec"]), call: chatModules.call },
   });
   // The forwarder echoes its input, so a resolved module answers with the body.
-  const budget = () => new CallBudget(Infinity, undefined, undefined);
+  const budget = () => new CallBudget(Infinity, undefined, { consumedMs: 0 });
   ok((await scoped("codec", new Uint8Array([7, 7, 7]), budget())).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7]), budget()),
     "another app's module name reaches nothing through this seam");
@@ -733,12 +733,11 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   ok(waitingFires === 2, "clock credit earned during I/O admits the successor promptly after settlement");
   waiting.clearAll();
 
-  // Host compute counts as execution too, and no guest segment sees it: a body that only
-  // calls host services waits between each call. The seam times the synchronous part of
-  // each handler, so libsodium's work is billed while an I/O name (whose promise returns at
-  // once) bills nothing, with no list of which names are which. A failed verify still did
-  // the work, so the measurement is in `finally`; otherwise a re-arm loop of bad
-  // signatures would be free.
+  // Host compute counts as execution too: a body that only calls host services waits
+  // between each call. A handler runs synchronously inside the realm entry that made the
+  // call, so the entry's timing bills libsodium's work while an I/O name (whose promise
+  // returns at once) bills nothing, with no list of which names are which. A failed verify
+  // still did the work; otherwise a re-arm loop of bad signatures would be free.
   {
     const burnMs = 15;
     const burningSodium = Object.create(sodium);
@@ -758,22 +757,28 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     });
-    const meter = () => {
+    // [0] calls node/verify on the rest, [1] fs/get.
+    const realm = await createWebRealm({
+      source: `async function handle(arg) {
+        return await host.call(arg[0] === 0 ? "node/verify" : "fs/get", arg.subarray(1));
+      }`,
+      hostCall: seam,
+    });
+    const meter = async (input) => {
       let charged = 0;
-      return { budget: { remainingMs: 5_000, charge() {}, causalClock: { charge(ms) { charged += ms; } } },
-        spent: () => charged };
+      const out = await realm.call(input, undefined, { charge(ms) { charged += ms; } });
+      return { out, spent: charged };
     };
     // 96 bytes is the fixed prefix: a garbage pk and sig over an empty message, which the
     // handler runs to completion before answering [0].
-    const cpu = meter();
-    ok((await seam("node/verify", new Uint8Array(96), cpu.budget))[0] === 0,
-      "a bad signature answers [0] rather than throwing");
-    ok(cpu.spent() >= burnMs,
-      `a host-service call bills its compute to the causal root (${cpu.spent().toFixed(1)}ms >= ${burnMs}ms)`);
-    const io = meter();
-    await seam("fs/get", new TextEncoder().encode("absent"), io.budget);
-    ok(io.spent() < burnMs / 2,
-      `a host name that round-trips bills only its dispatch (${io.spent().toFixed(1)}ms)`);
+    const cpu = await meter(new Uint8Array(97));
+    ok(cpu.out[0] === 0, "a bad signature answers [0] rather than throwing");
+    ok(cpu.spent >= burnMs,
+      `a host-service call bills its compute to the causal root (${cpu.spent.toFixed(1)}ms >= ${burnMs}ms)`);
+    const io = await meter(new Uint8Array([1, ...new TextEncoder().encode("absent")]));
+    ok(io.spent < burnMs / 2,
+      `a host name that round-trips bills only its dispatch (${io.spent.toFixed(1)}ms)`);
+    realm.dispose();
   }
 
   // The opposite escape is returning before descendant work finishes: await once (so the
@@ -1263,7 +1268,7 @@ ${guestOpFraming()}
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the seam the realm was given, then uninstall the app.
   const pending = new Uint8Array([0, 0, 0, 5]);
-  await armed("timer/arm", pending, new CallBudget(Infinity, undefined, undefined));
+  await armed("timer/arm", pending, new CallBudget(Infinity, undefined, { consumedMs: 0 }));
   ok(stub.uninstall("ticker") === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);

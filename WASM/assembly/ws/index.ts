@@ -112,10 +112,7 @@ function sha1(msgPtr: i32, msgLen: i32, outPtr: i32, workPtr: i32): void {
   memory.copy(workPtr, msgPtr, msgLen);
   store<u8>(workPtr + msgLen, 0x80);
   const bits = msgLen * 8; // msgLen ≪ 2^28, so the high 32 bits are zero
-  store<u8>(workPtr + total - 4, ((bits >>> 24) & 255) as u8);
-  store<u8>(workPtr + total - 3, ((bits >>> 16) & 255) as u8);
-  store<u8>(workPtr + total - 2, ((bits >>> 8) & 255) as u8);
-  store<u8>(workPtr + total - 1, (bits & 255) as u8);
+  storeBE(workPtr + total - 4, bits);
 
   let h0: i32 = 0x67452301, h1: i32 = 0xefcdab89, h2: i32 = 0x98badcfe, h3: i32 = 0x10325476, h4: i32 = 0xc3d2e1f0;
   const wPtr = workPtr + total; // 80 × i32
@@ -187,10 +184,7 @@ function opEncode(input_len: i32): i32 {
     store<u8>(scratch + 1, 127);
     store<u8>(scratch + 2, 0); store<u8>(scratch + 3, 0);
     store<u8>(scratch + 4, 0); store<u8>(scratch + 5, 0);
-    store<u8>(scratch + 6, ((payloadLen >>> 24) & 255) as u8);
-    store<u8>(scratch + 7, ((payloadLen >>> 16) & 255) as u8);
-    store<u8>(scratch + 8, ((payloadLen >>> 8) & 255) as u8);
-    store<u8>(scratch + 9, (payloadLen & 255) as u8);
+    storeBE(scratch + 6, payloadLen);
   }
   if (maskFlag) {
     store<u8>(scratch + 1, (load<u8>(scratch + 1) | 0x80) as u8);

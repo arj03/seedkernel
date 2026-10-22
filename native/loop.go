@@ -117,16 +117,6 @@ func (el *eventLoop) install() {
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
 func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 
-// wake nudges the loop into another pump round, so a microtask queued during a pump is
-// not stranded behind a blocking select. Any Go-side settlement outside a task or timer
-// must call it. Non-blocking: a full buffer means work is already queued.
-func (el *eventLoop) wake() {
-	select {
-	case el.tasks <- func() {}:
-	default:
-	}
-}
-
 // armTimer (re)arms the loop's reusable wait timer for d; step() never re-enters.
 func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 	if el.stepTimer == nil {

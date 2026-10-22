@@ -3,7 +3,7 @@
 // sign what install would refuse.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { concatBytes, enc, fromHex, toHex } from "../services/util.js";
+import { concatBytes, enc, fromHex, toHex, writeU32BE } from "../services/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
@@ -94,7 +94,7 @@ export function encodeParts(fields: Uint8Array[]): Uint8Array {
   for (const bytes of fields) {
     if (bytes.length > 0xffffffff) throw new Error("bundle: body field exceeds u32 length");
     const length = new Uint8Array(4);
-    new DataView(length.buffer).setUint32(0, bytes.length, false);
+    writeU32BE(length, 0, bytes.length);
     parts.push(length, bytes);
   }
   return concatBytes(parts);

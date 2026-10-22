@@ -6,11 +6,11 @@
 //   node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64] [--host <blob>]
 
-import { readFileSync } from "node:fs";
 import { runInThisContext } from "node:vm";
-import { errMessage } from "../services/util.js";
+import { dec, errMessage } from "../services/util.js";
 import { nodeFiles, nodePlatform } from "./platform-node.js";
 import { readHostBlob } from "./host-blob.js";
+import { packageHostBlob } from "./crypto-node.js";
 import { Loader } from "./slots.js";
 import type { PlatformDispatchers } from "./abi.js";
 
@@ -22,7 +22,7 @@ const host = globalThis as unknown as PlatformDispatchers;
 const hostTimers = new Set<ReturnType<typeof setTimeout>>();
 const loaderSetTimeout = globalThis.setTimeout, loaderClearTimeout = globalThis.clearTimeout;
 
-const genesis = new Uint8Array(readFileSync(new URL("../host.skb", import.meta.url)));
+const genesis = packageHostBlob();
 let loader!: Loader;
 /** The running host blob. */
 let blob!: Uint8Array;
@@ -45,9 +45,9 @@ function teardown(): void {
 /** Run a blob's host script: the operator flow, which answers whether the node serves. */
 async function runHost(env: Uint8Array): Promise<boolean> {
   blob = env;
-  runInThisContext(new TextDecoder().decode(readHostBlob(env).script), { filename: "host.js" });
+  runInThisContext(dec.decode(readHostBlob(env).script), { filename: "host.js" });
   const out = await host.runMain();
-  return (JSON.parse(new TextDecoder().decode(out)) as { serving: boolean }).serving;
+  return (JSON.parse(dec.decode(out)) as { serving: boolean }).serving;
 }
 
 /** Boot the loader's choice, falling back to the committed host when a pending one fails

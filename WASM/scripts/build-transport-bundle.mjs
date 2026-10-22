@@ -11,11 +11,10 @@ import { fileURLToPath } from "node:url";
 import { readGuestSource } from "./guest-source.mjs";
 import { TRANSPORT_APP_CONFIG, TRANSPORT_SERVICE } from "./transport-config.mjs";
 import { authorBundle, buildAuthor, guestOpFraming } from "../build/scripts/bundle-author.js";
+import { toHex } from "../build/services/util.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
-
-const toHex = (b) => Buffer.from(b).toString("hex");
 
 async function main() {
   const { sodium, keys } = buildAuthor(root, "transport/author.key", process.argv.slice(2));

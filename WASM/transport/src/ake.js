@@ -439,7 +439,7 @@ class Link {
       let saidGoodbye = false;
       if (farewell && this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
         try {
-          await this.wire(await this.seal(new Uint8Array(0)));
+          await this.wire(await this.seal(EMPTY));
           // A codec with its own end-of-stream signal sends it too.
           if (this.framer && this.framer.goodbye) await this.framer.goodbye();
           saidGoodbye = true;
@@ -612,7 +612,7 @@ class Link {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
     const kemPk = this.myKem.publicKey;
     const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
-      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), new Uint8Array(0))]);
+      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), EMPTY)]);
     this.th = await hash(this.root, w1);
     await this.wire(w1);
   }

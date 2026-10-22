@@ -301,16 +301,24 @@ class Udp {
       if (!to) continue;
       // A batch is mostly one peer's, so its address is spelled once, not once a datagram:
       // an IPv4 one is told from the last by its four bytes as a number, an IPv6 one by
-      // its text.
-      let from = "", ip = -1;
+      // comparing its sixteen bytes with the last's (`v6`, their offset in the batch).
+      let from = "", ip = -1, v6 = -1;
       for (let at = 0; at + 5 <= b.length;) {
         const n = b[at++];
         if (n === 4) {
           const v = readU32BE(b, at);
           if (v !== ip) { ip = v; from = `${b[at]}.${b[at + 1]}.${b[at + 2]}.${b[at + 3]}`; }
+          v6 = -1;
         } else {
+          let same = v6 >= 0;
+          for (let i = 0; same && i < 16; i++) {
+            same = b[v6 + i] === b[at + i];
+          }
+          if (!same) {
+            from = ipv6Text(b, at);
+          }
           ip = -1;
-          from = ipv6Text(b, at);
+          v6 = at;
         }
         at += n;
         const len = readU16BE(b, at + 2);

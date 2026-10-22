@@ -10,7 +10,7 @@ import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntim
 import { parseDest } from "../services/peer-addr.js";
 import { bootShell } from "./shell-core.js";
 import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.js";
-import { monotonicMs, type RealmFactory } from "./realm-queue.js";
+import type { RealmFactory } from "./realm-queue.js";
 import { engineRealms } from "./engine-realm.js";
 import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
 import {
@@ -231,9 +231,8 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
         async call(name, payload, deadlineMs) {
           const w = built.get(name);
           if (!w) return { bytes: null, ms: 0 };
-          const t0 = monotonicMs();
-          const bytes = w.call(payload, abiMs(deadlineMs));
-          return { bytes, ms: monotonicMs() - t0 };
+          // Synchronous, so the time is already inside the calling guest's segment.
+          return { bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 };
         },
         dispose() {
           for (const w of built.values()) w.dispose();
@@ -259,8 +258,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     if (!tcp) throw new Error("host: this platform has no sockets; pass transport.channels");
     return tcp;
   };
-  const createRealm: RealmFactory = (opts) =>
-    engineRealms(engine, hostParts.qjs, { billModules: !bridge.engineCallBounded })(opts);
+  const createRealm: RealmFactory = engineRealms(engine, hostParts.qjs);
 
   async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
     const admit = cfg.admit ?? policyFromJson(cfg.policyJson);

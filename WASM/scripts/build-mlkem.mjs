@@ -5,7 +5,6 @@ import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({
   submodule: "mlkem-native",
-  marker: "mlkem/mlkem_native.c",
   cSource: "mlkem/mlkem_native.c",
   incDir: "mlkem",
   configDefine: "MLK_CONFIG_FILE",

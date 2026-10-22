@@ -64,15 +64,8 @@ interface InvocationBudget extends Spend {
   reject?: (err: Error) => void;
 }
 
-export interface EngineRealmOptions {
-  /** Whether a module call is billed to the calling invocation through its CallBudget. Off
-   *  where module calls run synchronously inside the guest's segment, which already counts
-   *  them. */
-  billModules: boolean;
-}
-
 /** A realm factory over `engine`, running each realm on `qjs` (qjs.wasm). */
-export function engineRealms(engine: Engine, qjs: Uint8Array, opt: EngineRealmOptions): RealmFactory {
+export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
   return async (opts) => {
     const configuredMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
     const causalContext = new CausalContext();
@@ -184,8 +177,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array, opt: EngineRealmOp
             // The shared record, not a snapshot: concurrent calls charge the same spend.
             const made = active;
             // With no time left in the segment, this refuses.
-            const budget = new CallBudget(remainingMs < 0 ? Infinity : remainingMs, causalContext.current,
-              opt.billModules ? made : undefined);
+            const budget = new CallBudget(remainingMs < 0 ? Infinity : remainingMs, causalContext.current, made);
             const result = opts.hostCall(name, bytes.subarray(nameBytes), budget);
             if (result instanceof Uint8Array) return (stage(result) << 2) | ANSWERED;
             settleByDeadline(deadlines.hostCall, budget.remainingMs, result, HOST_CALL_LATE,

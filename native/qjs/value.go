@@ -194,18 +194,12 @@ func (v *Value) window() (addr, size uint32, ok bool) {
 // Bytes copies out the bytes of an ArrayBuffer or TypedArray. The shape comes from the
 // engine's internal slots, so no JS runs; anything else is refused and the error cleared.
 func (v *Value) Bytes() ([]byte, error) {
-	addr, size, ok := v.window()
-	if !ok {
-		return nil, notBytes(v.c)
+	buf, err := v.View()
+	if err != nil {
+		return nil, err
 	}
-	out := make([]byte, size)
-	if size > 0 {
-		buf, ok := v.c.rt.mem.Read(addr, size)
-		if !ok {
-			return nil, errors.New("qjs: byte window outside wasm memory")
-		}
-		copy(out, buf)
-	}
+	out := make([]byte, len(buf))
+	copy(out, buf)
 	return out, nil
 }
 
@@ -226,15 +220,6 @@ func (v *Value) View() ([]byte, error) {
 		return nil, errors.New("qjs: byte window outside wasm memory")
 	}
 	return buf, nil
-}
-
-// ByteLength returns the width Bytes would copy, without copying.
-func (v *Value) ByteLength() (int64, error) {
-	_, size, ok := v.window()
-	if !ok {
-		return 0, notBytes(v.c)
-	}
-	return int64(size), nil
 }
 
 func notBytes(c *Context) error {

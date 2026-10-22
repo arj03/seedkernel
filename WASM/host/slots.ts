@@ -16,7 +16,7 @@
 
 import { readHostBlob } from "./host-blob.js";
 import { PLATFORM_ABI } from "./abi.js";
-import { u8 } from "../services/util.js";
+import { errMessage, u8 } from "../services/util.js";
 
 /** Whole files, answered in the call: a loader's own. */
 export interface SlotFiles {
@@ -139,7 +139,7 @@ export class Loader {
       if (manifest.abi === PLATFORM_ABI) return { env, version: manifest.version };
       this.log(`ignored ${name}: it needs platform ABI ${manifest.abi}, this loader implements ${PLATFORM_ABI}`);
     } catch (err) {
-      const why = err instanceof Error ? err.message : String(err);
+      const why = errMessage(err);
       if (name === "committed.skb") throw new Error(`${name}: ${why}; restore it, or remove it to boot v${this.genesis.version}`);
       this.log(`ignored ${name}: ${why}`);
     }
@@ -180,7 +180,7 @@ export class Loader {
     try {
       this.files.write(this.path("tried"), new Uint8Array(0));
     } catch (err) {
-      this.log(`cannot mark v${p.version} tried, so it is not run: ${err instanceof Error ? err.message : String(err)}`);
+      this.log(`cannot mark v${p.version} tried, so it is not run: ${errMessage(err)}`);
       return base.env;
     }
     this.trial = p;
@@ -237,7 +237,7 @@ export class Loader {
     try {
       this.files.write(this.path("committed.skb"), trial.env);
     } catch (err) {
-      this.log(`cannot commit the pending host: ${err instanceof Error ? err.message : String(err)}`);
+      this.log(`cannot commit the pending host: ${errMessage(err)}`);
       return;
     }
     if (this.holdsPending(trial)) {
