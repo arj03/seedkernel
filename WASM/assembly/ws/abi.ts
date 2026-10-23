@@ -11,10 +11,9 @@
 // type-check under tsc).
 
 // Request ABI ops (see assembly/ws/index.ts `handle()`).
-export const OP_ENCODE = 1;
-export const OP_DECODE_ONE = 2;
-export const OP_ACCEPT = 3;
-export const OP_BASE64 = 4;
+export const OP_MASK = 1;
+export const OP_ACCEPT = 2;
+export const OP_BASE64 = 3;
 
 // RFC 6455 §4.2.2 handshake GUID.
 export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -27,4 +26,3 @@ export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // is allocated at module init, so every node pays for it, and a `maxFrameBytes` above the
 // compiled-in size would hand this module a frame it has no room for.
 export const SCRATCH_SIZE = (2 << 20) + (1 << 12); // 2 MB + 4 KB overhead slack
-export const MAX_FRAME_PAYLOAD = SCRATCH_SIZE - 16;

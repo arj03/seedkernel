@@ -1,8 +1,8 @@
 // Named-op envelope for the host's raw-link event ABI, and optional application framing.
 // Event names live in services/domains.ts; their byte layouts are in §12.2.
-// bundle-author.ts's `guestOpFraming` serializes the three functions below into
-// import-free guests, and the transport build injects that source before signing, so they
-// must reference nothing outside themselves, not even this file's imports. The type system
+// bundle-author.ts's `guestOpFraming` serializes the three functions below and utf8.ts's
+// two into import-free guests, and the transport build injects that source before signing,
+// so they must reference nothing outside themselves, not even this file's imports. The type system
 // cannot check that; `testGeneratedOpFrame` (tests/bundle-install.test.mjs) runs the
 // emitted source to catch a free variable, so a new code path here needs a case there.
 import { writeU32BE, readU32BE, enc } from "./util.js";
@@ -42,41 +42,8 @@ export function writeOp(op: string, args: Uint8Array): Uint8Array {
   return out;
 }
 
-/** UTF-8 as TextEncoder writes it: a surrogate pair is one four-byte sequence, a lone
- *  surrogate U+FFFD. A realm has no TextEncoder, so guests take this one. */
-export function utf8Encode(s: string): Uint8Array {
-  const out: number[] = [];
-  for (let i = 0; i < s.length; i++) {
-    let c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdfff) {
-      const lo = s.charCodeAt(i + 1);
-      if (c < 0xdc00 && lo >= 0xdc00 && lo <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00); i++; }
-      else c = 0xfffd;
-    }
-    if (c < 0x80) out.push(c);
-    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-  }
-  return new Uint8Array(out);
-}
-
-/** UTF-8 bytes as a string, the inverse of `utf8Encode` on what it writes. */
-export function utf8Decode(b: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < b.length; i++) {
-    const c = b[i];
-    if (c < 0x80) s += String.fromCharCode(c);
-    else if ((c & 0xe0) === 0xc0) { s += String.fromCharCode(((c & 31) << 6) | (b[i + 1] & 63)); i += 1; }
-    else if ((c & 0xf0) === 0xe0) { s += String.fromCharCode(((c & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63)); i += 2; }
-    else {
-      const cp = (((c & 7) << 18) | ((b[i + 1] & 63) << 12) | ((b[i + 2] & 63) << 6) | (b[i + 3] & 63)) - 0x10000;
-      s += String.fromCharCode(0xd800 | (cp >> 10), 0xdc00 | (cp & 0x3ff));
-      i += 3;
-    }
-  }
-  return s;
-}
+/** A realm has no TextEncoder, so guests take these (utf8.ts). */
+export { utf8Encode, utf8Decode } from "./utf8.js";
 
 // ── op arguments ──────────────────────────────────────────────────────────────
 //
@@ -97,6 +64,9 @@ function opHeader(op: string): Uint8Array {
   return h;
 }
 
+/** Every one-byte field, shared for the same reason. */
+const BYTES = Array.from({ length: 256 }, (_, v) => Uint8Array.of(v));
+
 /** One op's payload. The op is named in the constructor so `build()` writes the whole
  *  envelope, attribution prefix included, in one pass instead of copying the payload
  *  again behind a header. */
@@ -108,22 +78,14 @@ export class OpArgs {
     this.op = op;
     this.raw(opHeader(op));
   }
-  u8(v: number): this {
-    const b = new Uint8Array(1);
-    b[0] = v;
-    return this.raw(b);
-  }
+  u8(v: number): this { return this.raw(BYTES[v & 255]); }
   u32(v: number): this {
     const b = new Uint8Array(4);
     writeU32BE(b, 0, v);
     return this.raw(b);
   }
   /** `[len u32 BE][bytes]`; an empty blob is length 0. */
-  blob(b: Uint8Array): this {
-    const h = new Uint8Array(4);
-    writeU32BE(h, 0, b.length);
-    return this.raw(h).raw(b);
-  }
+  blob(b: Uint8Array): this { return this.u32(b.length).raw(b); }
   /** A UTF-8 string as a blob. */
   text(s: string): this { return this.blob(enc.encode(s)); }
   private raw(b: Uint8Array): this { this.parts.push(b); this.len += b.length; return this; }

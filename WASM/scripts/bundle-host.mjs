@@ -33,9 +33,13 @@ function exportsOf(src) {
 }
 
 const declared = new Map(); // exported name -> the file that defines it
+const imported = [];        // [file, name] for every name a file imports (tsc keeps value imports only)
 let body = "";
 for (const f of files) {
   let src = readFileSync(f, "utf8");
+  for (const m of src.matchAll(/^\s*import\s*\{([^}]*)\}/gm)) {
+    for (const name of m[1].split(",").map((s) => s.trim()).filter(Boolean)) imported.push([f, name]);
+  }
   src = src.replace(/^\s*import\s[^\n]*$/gm, "");
   src = src.replace(/^\/\/#\s*sourceMappingURL=.*$/gm, "");
   const names = exportsOf(src);
@@ -57,6 +61,14 @@ for (const f of files) {
   body += `\n// ===== ${f} =====\n${open}\n${src.trim()}${handout}\n${close}\n`;
 }
 
+// An import from a file outside this bundle would be a ReferenceError only once bundled,
+// and only on the target that runs the bundle.
+for (const [f, n] of imported) {
+  if (!declared.has(n)) {
+    console.error(`bundle-host: ${f} imports "${n}", which no module in this bundle exports`);
+    process.exit(1);
+  }
+}
 for (const n of exportNames) {
   if (!declared.has(n)) {
     console.error(`bundle-host: no module in this bundle exports "${n}"`);

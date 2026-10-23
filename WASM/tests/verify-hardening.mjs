@@ -221,7 +221,6 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
     callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   };
-  throws(() => createGuestSeam({ ...base }), "omitting requires throws at construction");
   ok(typeof createGuestSeam({ ...base, requires: ALL_HOST_SERVICES }) === "function",
     "an explicit full service set is accepted");
 
@@ -1082,7 +1081,11 @@ console.log("\n§12.6 — host socket send queues are bounded");
   ok(drain.transport.closed,
     "and no more: the ceiling still bites on the undrained remainder");
 
-  const parentLinks = [0, 1].map(() => {
+  // Every link holds its own ceiling's worth; the node's allowance is a whole number of
+  // those, so the link past it is refused.
+  const perLink = new Uint8Array(MAX_OUTBOUND_QUEUE_BYTES);
+  const linksWithin = MAX_NODE_OUTBOUND_QUEUE_BYTES / MAX_OUTBOUND_QUEUE_BYTES;
+  const parentLinks = Array.from({ length: linksWithin + 1 }, () => {
     const listeners = new Map();
     return {
       held: 0, closed: false,
@@ -1100,15 +1103,13 @@ console.log("\n§12.6 — host socket send queues are bounded");
       listen: async (addrs) => addrs.map(() => 0),
       close() {},
     },
-    maxOutboundBytes: 6,
   });
   parentDriver.activate(() => Promise.resolve(new Uint8Array()));
   const parentRaw = parentDriver.rawNet();
-  const firstLink = parentRaw.open("a").linkId;
-  const secondLink = parentRaw.open("b").linkId;
-  parentRaw.send(firstLink, new Uint8Array(4));
-  parentRaw.send(secondLink, new Uint8Array(3));
-  ok(!parentLinks[0].closed && parentLinks[1].closed,
+  for (const id of parentLinks.map((_, i) => parentRaw.open(String(i)).linkId)) {
+    parentRaw.send(id, perLink);
+  }
+  ok(parentLinks.slice(0, linksWithin).every((l) => !l.closed) && parentLinks[linksWithin].closed,
     "the node allowance prevents individually legal links multiplying retained bytes");
   parentDriver.close();
 

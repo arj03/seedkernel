@@ -1,10 +1,10 @@
-// RFC 6455 framing and opening-handshake bytes as a pure module.
+// The per-byte work of RFC 6455 as a pure module: masking, and the opening handshake's
+// accept value.
 //
-// A wire codec is pure byte transformation, which suits a WASM module with no host
-// imports. It imports nothing but the AS runtime and ships as a module of the transport
-// bundle, whose guest holds the socket, the RNG and the leftover receive buffer. This
-// module only frames, deframes and computes the handshake accept, with no per-connection
-// state.
+// Byte transformation whose cost is per byte suits a WASM module with no host imports. It
+// imports nothing but the AS runtime and ships as a module of the transport bundle, whose
+// guest holds the socket, the RNG, the leftover receive buffer and the frame headers
+// (transport/src/framing.js). No per-connection state.
 //
 // ABI (§4): the host writes a request at the exported `scratch` offset, calls
 // handle(input_len), and reads the response from `scratch`.
@@ -12,19 +12,14 @@
 //   response = [bytes ...]   (length is handle()'s return value; 0 = error)
 //
 // Ops:
-//   OP_ENCODE     (1) args [opcode u8][maskFlag u8][mask 4?][payload]  -> frame
-//   OP_DECODE_ONE (2) args [expectMasked u8][buf ...]
-//        -> [status u8] then, if status==1:
-//          [fin<<7 | opcode u8][consumed u32 BE][payloadLen u32 BE][payload ...]
-//          status 0 = need more bytes; status 2 = protocol error
-//        Fragmented data frames (FIN=0, opcode 0/1/2) are reported with the fin
-//        bit clear; the host reassembles the message. A fragmented *control*
-//        frame is a protocol error (RFC 6455 §5.4/§5.5).
-//   OP_ACCEPT     (3) args [key bytes]   -> base64(sha1(key ‖ GUID)) bytes (28)
-//   OP_BASE64     (4) args [bytes]       -> base64(bytes)
+//   OP_MASK   (1) args [frame]       -> the frame with its payload XORed under the key its
+//                                       header carries: masks a client frame, or unmasks
+//                                       one a server reads. The header is the caller's.
+//   OP_ACCEPT (2) args [key bytes]   -> base64(sha1(key ‖ GUID)) bytes (28)
+//   OP_BASE64 (3) args [bytes]       -> base64(bytes)
 
 // The ABI ops, handshake GUID and scratch sizes are in assembly/ws/abi.ts.
-import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "./abi";
+import { OP_MASK, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE } from "./abi";
 
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
 
@@ -59,14 +54,13 @@ function b64char(idx: i32): u8 {
 /** XOR `len` bytes at `ptr` with the RFC 6455 masking key m0..m3, eight bytes at a time.
  *
  *  The key repeats every four octets counted from the payload's start (RFC 6455 §5.3),
- *  and both callers mask a run that starts there, so one little-endian word covers every
- *  group and the doubled word covers two. Every frame a browser sends is masked, so this
- *  is on the whole client-to-server data path.
+ *  and the run starts there, so one little-endian word covers every group and the doubled
+ *  word covers two. Every frame a browser sends is masked, so this is on the whole
+ *  client-to-server data path.
  *
- *  Alignment is declared as 1 because the data is unaligned: a decoded payload lands at
- *  `scratch + 10` and an encoded one after a 2/4/10-byte header plus the key. Wasm allows
- *  unaligned access anyway (the immediate is only a hint), so the accurate hint costs
- *  nothing. */
+ *  Alignment is declared as 1 because the data is unaligned: a payload starts after a
+ *  2/4/10-byte header plus the key. Wasm allows unaligned access anyway (the immediate is
+ *  only a hint), so the accurate hint costs nothing. */
 function maskRun(ptr: i32, len: i32, m0: i32, m1: i32, m2: i32, m3: i32): void {
   // Little-endian, so byte i of the word is the key octet for payload offset i.
   const word: u32 = (m0 as u32) | ((m1 as u32) << 8) | ((m2 as u32) << 16) | ((m3 as u32) << 24);
@@ -146,121 +140,21 @@ function sha1(msgPtr: i32, msgLen: i32, outPtr: i32, workPtr: i32): void {
   storeBE(outPtr + 12, h3); storeBE(outPtr + 16, h4);
 }
 
-/** Encode one RFC 6455 frame from [op][opcode][maskFlag][mask 4?][payload]. */
-function opEncode(input_len: i32): i32 {
-  if (input_len < 3) return 0;
-  const opcode = load<u8>(scratch + 1) as i32;
-  const maskFlag = (load<u8>(scratch + 2) as i32) != 0;
-  const inMaskLen = maskFlag ? 4 : 0;
-  if (input_len < 3 + inMaskLen) return 0;
-  // Read the mask into locals before the move overwrites it.
-  let m0: i32 = 0, m1: i32 = 0, m2: i32 = 0, m3: i32 = 0;
-  if (maskFlag) {
-    m0 = load<u8>(scratch + 3) as i32; m1 = load<u8>(scratch + 4) as i32;
-    m2 = load<u8>(scratch + 5) as i32; m3 = load<u8>(scratch + 6) as i32;
-  }
-  const payloadIn = scratch + 3 + inMaskLen;
-  const payloadLen = input_len - 3 - inMaskLen;
-
-  let outHeaderLen = 2;
-  if (payloadLen >= 65536) outHeaderLen = 10;
-  else if (payloadLen >= 126) outHeaderLen = 4;
-  const outMaskLen = maskFlag ? 4 : 0;
-  const outPayloadPos = outHeaderLen + outMaskLen;
-  const outTotal = outPayloadPos + payloadLen;
-  if (outTotal > SCRATCH_SIZE) return 0;
-
-  // Move the payload to its output position (memmove-safe), then lay the header.
-  memory.copy(scratch + outPayloadPos, payloadIn, payloadLen);
-
-  store<u8>(scratch, (0x80 | (opcode & 0x0f)) as u8); // FIN=1
-  if (payloadLen < 126) {
-    store<u8>(scratch + 1, payloadLen as u8);
-  } else if (payloadLen < 65536) {
-    store<u8>(scratch + 1, 126);
-    store<u8>(scratch + 2, ((payloadLen >>> 8) & 255) as u8);
-    store<u8>(scratch + 3, (payloadLen & 255) as u8);
-  } else {
-    store<u8>(scratch + 1, 127);
-    store<u8>(scratch + 2, 0); store<u8>(scratch + 3, 0);
-    store<u8>(scratch + 4, 0); store<u8>(scratch + 5, 0);
-    storeBE(scratch + 6, payloadLen);
-  }
-  if (maskFlag) {
-    store<u8>(scratch + 1, (load<u8>(scratch + 1) | 0x80) as u8);
-    store<u8>(scratch + outHeaderLen, m0 as u8);
-    store<u8>(scratch + outHeaderLen + 1, m1 as u8);
-    store<u8>(scratch + outHeaderLen + 2, m2 as u8);
-    store<u8>(scratch + outHeaderLen + 3, m3 as u8);
-    maskRun(scratch + outPayloadPos, payloadLen, m0, m1, m2, m3);
-  }
-  return outTotal;
-}
-
-/** Parse one frame from [op][expectMasked u8][buf ...]. */
-function opDecodeOne(input_len: i32): i32 {
-  const expectMasked = (load<u8>(scratch + 1) as i32) != 0;
-  const bufPtr = scratch + 2;
-  const bufLen = input_len - 2;
-
-  if (bufLen < 2) { store<u8>(scratch, 0); return 1; }
-  const b0 = load<u8>(bufPtr) as i32;
-  const b1 = load<u8>(bufPtr + 1) as i32;
-  const fin = (b0 & 0x80) != 0;
-  const rsv = b0 & 0x70;
-  const opcode = b0 & 0x0f;
-  if (rsv != 0) { store<u8>(scratch, 2); return 1; } // RSV1/2/3 must be 0
-  if (opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10) {
-    store<u8>(scratch, 2); return 1; // unknown opcode
-  }
-  if (!fin && opcode >= 8) { store<u8>(scratch, 2); return 1; }    // fragmented control frame
-  const masked = (b1 & 0x80) != 0;
-  if (masked != expectMasked) { store<u8>(scratch, 2); return 1; } // bad mask direction
-
-  let payloadLen = b1 & 0x7f;
-  if (opcode >= 8) {
-    if (!fin || payloadLen > 125) { store<u8>(scratch, 2); return 1; } // control frames: FIN=1, payload <= 125
-    if (opcode == 8 && payloadLen == 1) { store<u8>(scratch, 2); return 1; } // a 1-byte close payload is invalid
-  }
-  let headerLen = 2;
-  if (payloadLen == 126) {
-    if (bufLen < 4) { store<u8>(scratch, 0); return 1; }
-    payloadLen = ((load<u8>(bufPtr + 2) as i32) << 8) | (load<u8>(bufPtr + 3) as i32);
-    if (payloadLen < 126) { store<u8>(scratch, 2); return 1; } // must use the minimal length encoding
-    headerLen = 4;
-  } else if (payloadLen == 127) {
-    if (bufLen < 10) { store<u8>(scratch, 0); return 1; }
-    const high = ((load<u8>(bufPtr + 2) as i32) << 24) | ((load<u8>(bufPtr + 3) as i32) << 16) |
-                 ((load<u8>(bufPtr + 4) as i32) << 8) | (load<u8>(bufPtr + 5) as i32);
-    payloadLen = ((load<u8>(bufPtr + 6) as i32) << 24) | ((load<u8>(bufPtr + 7) as i32) << 16) |
-                 ((load<u8>(bufPtr + 8) as i32) << 8) | (load<u8>(bufPtr + 9) as i32);
-    if (high != 0 || payloadLen < 0 || payloadLen > MAX_FRAME_PAYLOAD) { store<u8>(scratch, 2); return 1; }
-    if (payloadLen < 65536) { store<u8>(scratch, 2); return 1; } // must use the minimal length encoding, top bit already excluded by payloadLen < 0 above
-    headerLen = 10;
-  }
-  if (payloadLen > MAX_FRAME_PAYLOAD) { store<u8>(scratch, 2); return 1; }
-
-  const maskLen = masked ? 4 : 0;
-  const totalFrame = headerLen + maskLen + payloadLen;
-  if (bufLen < totalFrame) { store<u8>(scratch, 0); return 1; }
-
-  // Read the mask into locals before the payload moves over the header region.
-  let m0: i32 = 0, m1: i32 = 0, m2: i32 = 0, m3: i32 = 0;
-  if (masked) {
-    m0 = load<u8>(bufPtr + headerLen) as i32; m1 = load<u8>(bufPtr + headerLen + 1) as i32;
-    m2 = load<u8>(bufPtr + headerLen + 2) as i32; m3 = load<u8>(bufPtr + headerLen + 3) as i32;
-  }
-  const payloadSrc = bufPtr + headerLen + maskLen;
-  memory.copy(scratch + 10, payloadSrc, payloadLen); // memmove-safe
-
-  store<u8>(scratch, 1);                 // status = frame
-  store<u8>(scratch + 1, ((fin ? 0x80 : 0) | opcode) as u8);
-  storeBE(scratch + 2, totalFrame);      // consumed
-  storeBE(scratch + 6, payloadLen);      // payloadLen
-  if (masked) {
-    maskRun(scratch + 10, payloadLen, m0, m1, m2, m3);
-  }
-  return 10 + payloadLen;
+/** Mask or unmask a whole frame's payload under the key its header carries, from
+ *  [op][frame], answering the frame. The caller built or checked the header; a frame too
+ *  short for the header its second byte declares is refused. */
+function opMask(input_len: i32): i32 {
+  const len = input_len - 1;
+  if (len < 2) return 0;
+  const len7 = (load<u8>(scratch + 2) as i32) & 0x7f;
+  const head = (len7 == 127 ? 10 : (len7 == 126 ? 4 : 2)) + 4;
+  if (len < head) return 0;
+  // Drop the op byte (memmove-safe), then read the key from where it now sits.
+  memory.copy(scratch, scratch + 1, len);
+  const k = scratch + head - 4;
+  maskRun(scratch + head, len - head,
+    load<u8>(k) as i32, load<u8>(k + 1) as i32, load<u8>(k + 2) as i32, load<u8>(k + 3) as i32);
+  return len;
 }
 
 /** base64(sha1(key ‖ GUID)), the RFC 6455 server accept value. */
@@ -286,8 +180,7 @@ function opBase64(input_len: i32): i32 {
 export function handle(input_len: i32): i32 {
   if (input_len < 1) return 0;
   const op = load<u8>(scratch) as i32;
-  if (op == OP_ENCODE) return opEncode(input_len);
-  if (op == OP_DECODE_ONE) return opDecodeOne(input_len);
+  if (op == OP_MASK) return opMask(input_len);
   if (op == OP_ACCEPT) return opAccept(input_len);
   if (op == OP_BASE64) return opBase64(input_len);
   return 0;

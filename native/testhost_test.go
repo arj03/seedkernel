@@ -131,6 +131,17 @@ func testEngine(tb testing.TB) []byte {
 	return wasm
 }
 
+// testScript is the genesis blob's host script, for a test that frames a host blob of its
+// own.
+func testScript(tb testing.TB) string {
+	tb.Helper()
+	script, _, err := hostParts(genesisHost)
+	if err != nil {
+		tb.Fatal("genesis host:", err)
+	}
+	return script
+}
+
 func bootRealm(tb testing.TB) {
 	tb.Helper()
 	dir, err := os.MkdirTemp("", "seedkernel-realm-")
@@ -165,7 +176,7 @@ func bootRealmIn(tb testing.TB, dir string) {
 		tb.Fatal("native handle harness:", err)
 	}
 	// The realm engine, for tests that drive the engine table by hand.
-	qc.Global().SetPropertyStr("__qjsWasm", qc.NewArrayBuffer(host.qjs))
+	qc.Global().SetPropertyStr("__qjsWasm", qc.NewArrayBuffer(testEngine(tb)))
 	// This realm's data directory, which Go's boot knows nothing about: `__dir` for every
 	// `standUp` a test calls, and `fs`, the store a node keeps there, for tests that use
 	// one with no node running.

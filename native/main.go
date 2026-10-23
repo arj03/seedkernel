@@ -34,14 +34,9 @@ var (
 	nh  *netHost
 	uh  *udpHost
 
-	// bootBlob is the host blob boot runs: genesisHost, or the loader's choice.
+	// bootBlob is the host blob boot runs, and the one running since: genesisHost, or the
+	// loader's choice.
 	bootBlob = genesisHost
-	// host is the running host blob and the parts boot runs of it.
-	host struct {
-		env    []byte
-		script string
-		qjs    []byte
-	}
 	// ldr is the loader script's realm (hostslots.go), stood up before any boot.
 	ldr *loader
 )
@@ -52,14 +47,13 @@ var (
 // runs the host script. Each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
-	var err error
-	host.env = bootBlob
-	if host.script, host.qjs, err = hostParts(bootBlob); err != nil {
+	script, engine, err := hostParts(bootBlob)
+	if err != nil {
 		return err
 	}
 
 	// An unhandled rejection ends the process, as on Node.
-	if qrt, err = qjs.New(host.qjs, qjs.TrackRejections()); err != nil {
+	if qrt, err = qjs.New(engine, qjs.TrackRejections()); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
 	}
 	qc = qrt.Context()
@@ -69,7 +63,7 @@ func boot() error {
 	nh = exposeNet(qc, el)
 	uh = exposeUdp(qc, el)
 	exposeBridge(qc)
-	done, err := qc.Eval("host.js", host.script)
+	done, err := qc.Eval("host.js", script)
 	if err != nil {
 		return fmt.Errorf("host script: %w", err)
 	}
@@ -137,7 +131,7 @@ func exposeBridge(qc *qjs.Context) {
 	}))
 	// The running host blob, which carries the realm engine and the host's crypto.
 	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return qc.NewArrayBuffer(host.env), nil
+		return qc.NewArrayBuffer(bootBlob), nil
 	}))
 	// Keep a host blob, which the running host checked, as the pending host (hostslots.go).
 	// When the loader boots it now, the loop stops after this turn.

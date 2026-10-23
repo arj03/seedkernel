@@ -29,7 +29,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 	}
 
 	// Capped like a guest realm, so the out-of-memory probe below fails fast.
-	rt, err := New(engine(t), WithMemoryLimit(64<<20), func(c *config) { c.wasiProbe = probe })
+	rt, err := New(engine(t), func(c *config) { c.memoryLimit, c.wasiProbe = 64<<20, probe })
 	if err != nil {
 		t.Fatal("New:", err)
 	}

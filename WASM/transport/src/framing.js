@@ -55,9 +55,10 @@ class LengthFramer {
 
 // ── RFC 6455, for the browser edge ────────────────────────────────────────────
 //
-// For browsers, which cannot open raw TCP. Both ends run this one class; every byte
-// transform (encode, decode, the accept value) runs in this bundle's `ws.wasm`.
-const WS_OP_ENCODE = 1, WS_OP_DECODE_ONE = 2, WS_OP_ACCEPT = 3, WS_OP_BASE64 = 4;
+// For browsers, which cannot open raw TCP. Both ends run this one class. Headers are read
+// and written here; the per-byte work (masking, the accept value) runs in this bundle's
+// `ws.wasm`, so a frame that is not masked, every one a server sends, never reaches it.
+const WS_OP_MASK = 1, WS_OP_ACCEPT = 2, WS_OP_BASE64 = 3;
 const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
 /** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
 const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
@@ -71,17 +72,68 @@ function wsCall(req) {
 
 // A client masks every frame under a fresh four-byte key (RFC 6455 §5.3). The keys come
 // out of one block of host entropy at a time: a host round trip per frame for four bytes
-// costs more than framing it.
+// costs more than framing it. A key the block has is handed over at once; only a refill
+// waits.
 const MASK_POOL_BYTES = 1024;
 let maskPool = EMPTY;
 let maskAt = 0;
-async function maskKey() {
-  if (maskAt + 4 > maskPool.length) {
-    maskPool = await randomBytes(MASK_POOL_BYTES);
-    maskAt = 0;
+function maskKey() {
+  if (maskAt + 4 <= maskPool.length) {
+    maskAt += 4;
+    return maskPool.subarray(maskAt - 4, maskAt);
   }
-  maskAt += 4;
-  return maskPool.subarray(maskAt - 4, maskAt);
+  return randomBytes(MASK_POOL_BYTES).then((pool) => {
+    maskPool = pool;
+    maskAt = 4;
+    return pool.subarray(0, 4);
+  });
+}
+
+/** One frame with FIN set (RFC 6455 §5.2), in the shortest length form. With a `key` it is
+ *  a masking request for ws.wasm, `[WS_OP_MASK][frame]` with the payload still clear. */
+function wsFrame(opcode, payload, key) {
+  const n = payload.length, ext = n < 126 ? 0 : n < 65536 ? 2 : 8;
+  const at = key ? 1 : 0, head = 2 + ext + (key ? 4 : 0);
+  const out = new Uint8Array(at + head + n);
+  out[at] = 0x80 | opcode;
+  out[at + 1] = (key ? 0x80 : 0) | (ext === 0 ? n : ext === 2 ? 126 : 127);
+  if (ext === 2) writeU16BE(out, at + 2, n);
+  else if (ext === 8) writeU32BE(out, at + 6, n);
+  out.set(payload, at + head);
+  if (!key) return out;
+  out[0] = WS_OP_MASK;
+  out.set(key, at + head - 4);
+  return out;
+}
+
+/** The next frame's header, read off the front of `p` without consuming it: `{ fin,
+ *  opcode, head, len }`, with `head` counting the key, once its bytes are there, null
+ *  before, false for a frame RFC 6455 refuses or a payload over `cap`. A server reads
+ *  masked frames and a client unmasked ones; a control frame is whole and at most 125
+ *  bytes, a close's never 1; a length takes its shortest form. */
+function wsHead(p, masked, cap) {
+  if (p.bytes < 2) return null;
+  const b0 = p.byteAt(0), b1 = p.byteAt(1);
+  const fin = (b0 & 0x80) !== 0, opcode = b0 & 0x0f;
+  let len = b1 & 0x7f, head = 2;
+  if ((b0 & 0x70) !== 0 || ((b1 & 0x80) !== 0) !== masked) return false;
+  if (opcode > WS_OP_BINARY && (opcode < WS_OP_CLOSE || opcode > WS_OP_PONG)) return false;
+  if (opcode >= WS_OP_CLOSE && (!fin || len > 125 || (opcode === WS_OP_CLOSE && len === 1))) return false;
+  if (len === 126) {
+    if (p.bytes < 4) return null;
+    len = (p.byteAt(2) << 8) | p.byteAt(3);
+    if (len < 126) return false;
+    head = 4;
+  } else if (len === 127) {
+    if (p.bytes < 10) return null;
+    // Any bit in the high half is over any cap.
+    if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return false;
+    len = ((p.byteAt(6) << 24) | (p.byteAt(7) << 16) | (p.byteAt(8) << 8) | p.byteAt(9)) >>> 0;
+    if (len < 65536) return false;
+    head = 10;
+  }
+  if (len > cap) return false;
+  return { fin, opcode, head: head + (masked ? 4 : 0), len };
 }
 
 class WsFramer {
@@ -130,15 +182,13 @@ class WsFramer {
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
   discard() { this.parts = new Pieces(MERGE_BELOW); this.frags = []; this.fragBytes = 0; }
 
-  async frame(opcode, payload) {
-    const m = this.client ? await maskKey() : null;
-    const req = new Uint8Array(3 + (m ? 4 : 0) + payload.length);
-    req[0] = WS_OP_ENCODE;
-    req[1] = opcode & 0x0f;
-    req[2] = m ? 1 : 0;
-    if (m) req.set(m, 3);
-    req.set(payload, 3 + (m ? 4 : 0));
-    return wsCall(req);
+  /** One frame, or a promise of it when ws.wasm masks it: every frame a client sends. */
+  frame(opcode, payload) {
+    if (!this.client) return wsFrame(opcode, payload, null);
+    const key = maskKey();
+    return key instanceof Uint8Array
+      ? wsCall(wsFrame(opcode, payload, key))
+      : key.then((k) => wsCall(wsFrame(opcode, payload, k)));
   }
 
   /** Frame one message and put it, in order, on the write chain. */
@@ -146,9 +196,9 @@ class WsFramer {
     return this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => this.put(f));
   }
 
-  async send(msg) {
-    await this.opened;
-    await this.enqueue(WS_OP_BINARY, msg);
+  send(msg) {
+    if (this.open) return this.enqueue(WS_OP_BINARY, msg);
+    return this.opened.then(() => this.enqueue(WS_OP_BINARY, msg));
   }
 
   /** A close frame, after the end-of-stream record on the same chain. None before the
@@ -229,21 +279,23 @@ class WsFramer {
    *  before the next frame is measured (`dispatch`). */
   async frames(deliver) {
     for (;;) {
-      const total = this.frameLength();
-      if (total < 0) return true;
-      if (total === Infinity) return false;
-      if (this.parts.bytes < total) return true;
-      // Taken with room for the two-byte request header in front.
-      const req = this.parts.takeCopy(total, 2);
-      req[0] = WS_OP_DECODE_ONE;
-      req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
-      const r = await wsCall(req);
-      // Anything but 1 is a protocol violation.
-      if (r[0] !== 1) return false;
-      const fin = (r[1] & 0x80) !== 0;
-      const opcode = r[1] & 0x0f;
-      // A view is safe: each call returns a fresh buffer.
-      const payload = r.subarray(10, 10 + readU32BE(r, 6));
+      // A server expects masked frames, a client unmasked.
+      const h = wsHead(this.parts, !this.client, this.cap);
+      if (h === null) return true;
+      if (h === false) return false;
+      if (this.parts.bytes < h.head + h.len) return true;
+      const { fin, opcode } = h;
+      let payload;
+      if (this.client) {
+        this.parts.take(h.head);
+        payload = this.parts.takeCopy(h.len);
+      } else {
+        // Taken with room for the request's op byte in front. A view of the answer is
+        // safe: each call returns a fresh buffer.
+        const req = this.parts.takeCopy(h.head + h.len, 1);
+        req[0] = WS_OP_MASK;
+        payload = (await wsCall(req)).subarray(h.head);
+      }
       if (opcode === WS_OP_CONT) {
         if (this.fragOpcode < 0) return false;
         this.fragBytes += payload.length;
@@ -256,7 +308,7 @@ class WsFramer {
           if (!(await this.dispatch(first, msg, deliver))) return false;
         }
       } else if (!fin) {
-        // The first fragment of a data message (the module refuses fragmented control).
+        // The first fragment of a data message (`wsHead` refuses fragmented control).
         if (this.fragOpcode >= 0) return false;
         this.fragOpcode = opcode;
         this.frags = [payload];
@@ -278,31 +330,6 @@ class WsFramer {
     } else if (opcode === WS_OP_PING) await this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
     return true;
-  }
-
-  /** The next frame's total length from its unvalidated header: -1 if not yet known,
-   *  Infinity if its payload is over the cap. The module does the validation. */
-  frameLength() {
-    const p = this.parts;
-    if (p.length < 2) return -1;
-    const b1 = p.byteAt(1);
-    const masked = (b1 & 0x80) !== 0;
-    const len7 = b1 & 0x7f;
-    let headerLen = 2, payloadLen = len7;
-    if (len7 === 126) {
-      if (p.length < 4) return -1;
-      headerLen = 4;
-      payloadLen = (p.byteAt(2) << 8) | p.byteAt(3);
-    } else if (len7 === 127) {
-      if (p.length < 10) return -1;
-      // Any bit in the high half is over any cap.
-      if ((p.byteAt(2) | p.byteAt(3) | p.byteAt(4) | p.byteAt(5)) !== 0) return Infinity;
-      headerLen = 10;
-      payloadLen = ((p.byteAt(6) << 24) | (p.byteAt(7) << 16)
-        | (p.byteAt(8) << 8) | p.byteAt(9)) >>> 0;
-    }
-    if (payloadLen > this.cap) return Infinity;
-    return headerLen + (masked ? 4 : 0) + payloadLen;
   }
 }
 

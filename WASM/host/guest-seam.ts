@@ -1,6 +1,6 @@
 // `host.call(name, bytes)` (§12.2). One map per realm, built at construction from what
 // the bundle declares, so an undeclared service has no handler at all (§12.1).
-import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../services/util.js";
+import { concatBytes, writeU32BE, readU32BE, enc, dec, EMPTY } from "../services/util.js";
 import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, isService, type HostTransformName, type ServiceMethod, type ServiceName } from "../services/domains.js";
 import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
@@ -59,9 +59,8 @@ export interface LinkBackend extends RawNet {
    *  handler both answer empty. It enters another realm, so the caller must not wait on it
    *  in the same turn; the answer resumes the caller as a new turn (`CallBudget.detach`). */
   deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
-  /** The occupant's word on its relay's state, and on who is linked now and how each is
-   *  reached, as its `relayState` and `routes` ops answer them: told each time either
-   *  changes. */
+  /** The occupant's word on its own standing, in its own format, told each time it
+   *  changes; the host passes it to the embedder unread. */
   status(status: Uint8Array): void;
 }
 
@@ -217,7 +216,8 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
 
 /** Guest preamble: `host.call` and the entrypoint, `handle`, which receives
  *  `[caller 32][body ...]`. Every realm factory calls `handle` through `__start`, after
- *  installing `__host_call`, `__callDone` and `__callFail`. */
+ *  installing `__host_call`, `__callDone` and `__callFail`, and settles a parked call
+ *  through `__settleHostCall`. */
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }
@@ -226,51 +226,42 @@ const GUEST_PREAMBLE = `
 "use strict";
 let __callSeq = 0;
 const __pending = Object.create(null);
-globalThis.__resolveHostCall = (callId, bytes) => {
+globalThis.__settleHostCall = (callId, ok, v) => {
   const p = __pending[callId];
   if (!p) return;
   delete __pending[callId];
-  p.resolve(new Uint8Array(bytes));
+  if (ok) p.resolve(new Uint8Array(v));
+  else p.reject(new Error(v));
 };
-globalThis.__rejectHostCall = (callId, msg) => {
-  const p = __pending[callId];
-  if (!p) return;
-  delete __pending[callId];
-  p.reject(new Error(msg));
-};
+// Bytes as the plain ArrayBuffer the realm reads (realm.c), copied only when a view covers
+// part of its buffer.
+function __ab(bytes, refusal) {
+  if (bytes instanceof ArrayBuffer) return bytes;
+  if (bytes instanceof Uint8Array) {
+    return (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer;
+  }
+  throw new Error(refusal);
+}
 globalThis.host = {
-  // Every name answers a Promise. A refused name throws here, at the call site. The
-  // payload crosses as a plain ArrayBuffer, which is what the realm reads (realm.c).
+  // Every name answers a Promise. A refused name throws here, at the call site.
   call(name, bytes) {
     const callId = ++__callSeq;
-    const ab = bytes instanceof ArrayBuffer
-      ? bytes
-      : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
-        ? bytes.buffer
-        : bytes.slice().buffer;
     // The host answers in this frame when it already has the answer: with the bytes, or
     // with why they could not be handed over, which rejects. Otherwise it parks the call
     // and settles it on a later turn. Called before the table entry exists, so an answer
     // or a synchronous refusal leaves nothing to clean up.
-    const now = __host_call(name, callId, ab);
+    const now = __host_call(name, callId, __ab(bytes, "guest: host.call takes Uint8Array | ArrayBuffer"));
     if (typeof now === "string") return Promise.reject(new Error(now));
     if (now !== null && now !== undefined) return Promise.resolve(new Uint8Array(now));
-    let resolve, reject;
-    const answer = new Promise((res, rej) => { resolve = res; reject = rej; });
-    __pending[callId] = { resolve, reject };
-    return answer;
+    const parked = Promise.withResolvers();
+    __pending[callId] = parked;
+    return parked.promise;
   },
 };
 // Set by a guest whose answer will arrive in a later invocation of this realm, so the
 // queue frees the realm at the end of the synchronous part (realm-queue.ts).
 globalThis.__deferred = false;
-function __norm(out) {
-  if (out instanceof ArrayBuffer) return out;
-  if (out instanceof Uint8Array) {
-    return (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength) ? out.buffer : out.slice().buffer;
-  }
-  throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
-}
+const __norm = (out) => __ab(out, "guest: entrypoint must return Uint8Array | ArrayBuffer");
 const __fail = (id, e) => __callFail(id, String(e && e.message || e));
 // Run handle for one invocation and report its answer as bytes, so no guest promise
 // reaches the host. Returns 1 when the invocation deferred.
@@ -375,7 +366,6 @@ function aeadArgs(a: Uint8Array, op: string): { npub: Uint8Array; key: Uint8Arra
 }
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
-const NONE = new Uint8Array(0);
 
 function u64be(value: number): Uint8Array {
   const out = new Uint8Array(8);
@@ -408,7 +398,7 @@ const SERVICES: {
     "fs/put": (payload) => {
       const klen = readU32BE(payload, 0);
       const key = dec.decode(payload.subarray(4, 4 + klen));
-      return fs.put(key, payload.subarray(4 + klen)).then(() => NONE);
+      return fs.put(key, payload.subarray(4 + klen)).then(() => EMPTY);
     },
     "fs/list": (payload) => {
       const prefix = payload.length ? dec.decode(payload) : undefined;
@@ -425,7 +415,7 @@ const SERVICES: {
         return concatBytes(parts);
       });
     },
-    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => NONE),
+    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => EMPTY),
     "fs/size": (payload) => fs.size(dec.decode(payload)).then((sz) => {
       const out = new Uint8Array(4);
       writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
@@ -434,18 +424,18 @@ const SERVICES: {
     "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
   }),
   host: (staging) => ({
-    "host/stage": async (payload) => { await staging.stage(payload); return NONE; },
+    "host/stage": async (payload) => { await staging.stage(payload); return EMPTY; },
   }),
   timer: (timers) => ({
     "timer/arm": (payload) => {
       if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
       timers.arm(readU32BE(payload, 0));
-      return NONE;
+      return EMPTY;
     },
     "timer/clear": (payload) => {
       if (payload.byteLength !== 0) throw new Error("guest: timer/clear requires an empty body");
       timers.clear();
-      return NONE;
+      return EMPTY;
     },
   }),
   // Raw bytes over an opaque link id (§12.1); inbound bytes arrive as `handle` events.
@@ -459,11 +449,11 @@ const SERVICES: {
     },
     "link/send": (payload) => {
       net.send(readU32BE(payload, 0), payload.subarray(4));
-      return NONE;
+      return EMPTY;
     },
     "link/close": (payload) => {
       net.close(readU32BE(payload, 0), payload[4] === 1);
-      return NONE;
+      return EMPTY;
     },
     // [claimLen u8][claim][attribution 32][payload ...] (§12.10). Detached: the reply is
     // new work on a shared link and must not inherit a read's spent budget, since a record
@@ -474,11 +464,10 @@ const SERVICES: {
       const attrAt = 1 + payload[0];
       return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
     },
-    // The relay's state and who is linked now, `[relay u8][key 32][direct u8]*`, said by the
-    // occupant when either changes.
+    // The occupant's standing, in its own format, for the embedder.
     "link/status": (payload) => {
       net.status(payload.slice());
-      return NONE;
+      return EMPTY;
     },
     // -> [socket u32][port u16][addresses utf8], socket 0 for none.
     "link/udpBind": () => net.udpBind().then((s) => {
@@ -492,11 +481,11 @@ const SERVICES: {
     }),
     "link/udpSend": (payload) => {
       net.udpSend(payload);
-      return NONE;
+      return EMPTY;
     },
     "link/udpClose": (payload) => {
       net.udpClose(readU32BE(payload, 0));
-      return NONE;
+      return EMPTY;
     },
   }),
 };
@@ -505,10 +494,6 @@ const SERVICES: {
  *  synchronous handler error throws at the call site; a failed round trip rejects. The
  *  realm handles serialization. */
 export function createGuestSeam({ sodium, requires, backends, callLocal, modules }: GuestSeamDeps): HostCall {
-  // Checked at runtime too, since native runs the compiled JS.
-  if (requires === undefined) {
-    throw new Error("guest-seam: requires is required — pass the manifest's declared guest.requires");
-  }
   // Every reachable name. Install keeps modules, local ids and host names disjoint
   // (bundle.ts), so insertion order does not matter.
   const routes = new Map<string, SeamHandler>();

@@ -64,7 +64,7 @@ func TestGenesisHostReads(t *testing.T) {
 	if err != nil || script == "" || len(engine) == 0 {
 		t.Fatalf("genesis: script %d B, qjs %d B, %v", len(script), len(engine), err)
 	}
-	if &host.env[0] != &genesisHost[0] {
+	if &bootBlob[0] != &genesisHost[0] {
 		t.Fatal("the running host is not the genesis blob")
 	}
 	s, q, err := hostParts(hostEnvelope(t, testAuthor(t), 7, ldr.abi, script))
@@ -83,7 +83,7 @@ func testLoader(t *testing.T) (*loader, string) {
 	t.Helper()
 	bootRealm(t)
 	data := filepath.Join(t.TempDir(), "data")
-	l, err := newLoader(host.qjs, []string{"--dir", data, "--host-updates", "next"}, genesisHost)
+	l, err := newLoader(testEngine(t), []string{"--dir", data, "--host-updates", "next"}, genesisHost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,11 +98,11 @@ func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	a := testAuthor(t)
+	a, script := testAuthor(t), testScript(t)
 	for what, env := range map[string][]byte{
-		"another suite":   append([]byte{0x01}, hostEnvelope(t, a, 5, ldr.abi, host.script)[1:]...),
-		"trailing bytes":  append(hostEnvelope(t, a, 5, ldr.abi, host.script), 0),
-		"another ABI":     hostEnvelope(t, a, 5, ldr.abi+1, host.script),
+		"another suite":   append([]byte{0x01}, hostEnvelope(t, a, 5, ldr.abi, script)[1:]...),
+		"trailing bytes":  append(hostEnvelope(t, a, 5, ldr.abi, script), 0),
+		"another ABI":     hostEnvelope(t, a, 5, ldr.abi+1, script),
 		"a truncated one": genesisHost[:offBody+10],
 	} {
 		if err := os.WriteFile(filepath.Join(dir, "pending.skb"), env, 0o600); err != nil {

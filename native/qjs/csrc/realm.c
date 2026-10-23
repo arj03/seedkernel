@@ -58,7 +58,7 @@ enum { ANSWER_PARKED, ANSWER_BYTES, ANSWER_REJECT, ANSWER_THROW };
 #define FIRST_BUF 4096
 
 static JSContext *ctx;
-static JSValue start_fn, resolve_fn, reject_fn;
+static JSValue start_fn, settle_fn;
 
 static uint8_t *xbuf;
 static size_t xcap;
@@ -335,7 +335,7 @@ int32_t R_Init(double memory_limit, int32_t outstanding_calls, double outstandin
         return -2;
     /* Every later entry starts at this depth (shim.c, QJS_UpdateStackTop). */
     JS_UpdateStackTop(JS_GetRuntime(ctx));
-    start_fn = resolve_fn = reject_fn = JS_UNDEFINED;
+    start_fn = settle_fn = JS_UNDEFINED;
     set_global_fn("__host_call", host_call, 3);
     set_global_fn("__callDone", call_done, 2);
     set_global_fn("__callFail", call_fail, 2);
@@ -358,8 +358,7 @@ int32_t R_Eval(int32_t len, int32_t preamble, double deadline_ns)
     if (preamble) {
         JSValue global = JS_GetGlobalObject(ctx);
         start_fn = JS_GetPropertyStr(ctx, global, "__start");
-        resolve_fn = JS_GetPropertyStr(ctx, global, "__resolveHostCall");
-        reject_fn = JS_GetPropertyStr(ctx, global, "__rejectHostCall");
+        settle_fn = JS_GetPropertyStr(ctx, global, "__settleHostCall");
         JS_FreeValue(ctx, global);
     }
     return leave(0);
@@ -401,9 +400,9 @@ int32_t R_Settle(double call_id, int32_t ok, int32_t len, double deadline_ns)
                  : JS_NewStringLen(ctx, (const char *)xbuf, (size_t)len);
     }
     release(i);
-    JSValue args[2] = { JS_NewFloat64(ctx, call_id), arg };
+    JSValue args[3] = { JS_NewFloat64(ctx, call_id), JS_NewBool(ctx, ok), arg };
     QJS_SetDeadline((int64_t)deadline_ns);
-    JSValue r = JS_Call(ctx, ok ? resolve_fn : reject_fn, JS_UNDEFINED, 2, args);
+    JSValue r = JS_Call(ctx, settle_fn, JS_UNDEFINED, 3, args);
     JS_FreeValue(ctx, arg);
     if (JS_IsException(r))
         return leave(fail());

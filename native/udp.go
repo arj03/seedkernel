@@ -158,8 +158,14 @@ func (u *udpHost) read(id int64, s *udpSock) {
 			}
 			continue
 		}
-		// IPv4 as itself, though a dual-stack socket hears it as IPv4-mapped IPv6.
-		ip := from.Addr().Unmap().AsSlice()
+		// IPv4 as itself, though a dual-stack socket hears it as IPv4-mapped IPv6. Read
+		// through an array, since AsSlice allocates per datagram.
+		addr := from.Addr().Unmap()
+		a16 := addr.As16()
+		ip := a16[:]
+		if addr.Is4() {
+			ip = a16[12:]
+		}
 		s.mu.Lock()
 		if len(s.held)+5+len(ip)+n > udpHeldMax {
 			s.mu.Unlock()

@@ -404,7 +404,7 @@ class Core {
     const targets = [...this.addrs.keys()].filter((p) => p !== ownId);
     for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
-    if (allUp()) { d.settle(EMPTY); return; }
+    if (allUp()) { d.resolve(EMPTY); return; }
     this.readyWaiters.push({ check: allUp, d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer: () => EMPTY });
   }
 
@@ -413,7 +413,7 @@ class Core {
   dialPeer(d, peerId, timeoutMs) {
     const linked = () => router.linkCount(peerId) >= 1;
     const answer = () => Uint8Array.of(linked() ? 1 : 0);
-    if (linked()) { d.settle(answer()); return; }
+    if (linked()) { d.resolve(answer()); return; }
     // Not settled before the dial is under way: until then nothing is connecting yet.
     const w = { check: () => linked(), d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer };
     this.readyWaiters.push(w);
@@ -430,7 +430,7 @@ class Core {
     for (const w of [...this.readyWaiters]) {
       if (!w.check() && t < w.due) { next = Math.min(next, w.due); continue; }
       this.readyWaiters.splice(this.readyWaiters.indexOf(w), 1);
-      w.d.settle(w.answer());
+      w.d.resolve(w.answer());
     }
     return next;
   }
@@ -453,10 +453,8 @@ for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
 // Answer on a later turn; `__deferred` tells the host the realm is free.
 const defer = () => {
-  let settle, fail;
-  const promise = new Promise((res, rej) => { settle = res; fail = rej; });
   globalThis.__deferred = true;
-  return { promise, settle, fail };
+  return Promise.withResolvers();
 };
 
 const ops = Object.create(null);
@@ -595,7 +593,7 @@ entry("relay", (r) => {
   const d = defer();
   const url = utf8Decode(r.blob());
   const secret = r.more() ? r.blob() : null;
-  relays.join(url, secret).then(() => d.settle(Uint8Array.of(relays.state())), d.fail);
+  relays.join(url, secret).then(() => d.resolve(Uint8Array.of(relays.state())), d.reject);
   return d.promise;
 });
 

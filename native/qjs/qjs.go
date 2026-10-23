@@ -58,15 +58,11 @@ type pooledFn struct {
 type Option func(*config)
 
 type config struct {
-	memoryLimit     uint64       // bytes; 0 = unbounded
-	trackRejections bool         // TrackRejections
-	wasiProbe       func(string) // tests only: records WASI import calls
-}
-
-// WithMemoryLimit caps the runtime's total heap; past it, allocation throws a catchable
-// "out of memory".
-func WithMemoryLimit(bytes uint64) Option {
-	return func(c *config) { c.memoryLimit = bytes }
+	trackRejections bool // TrackRejections
+	// Tests only: a heap cap in bytes (0 = unbounded; past it, allocation throws a catchable
+	// "out of memory"), and a witness of WASI import calls.
+	memoryLimit uint64
+	wasiProbe   func(string)
 }
 
 // TrackRejections makes Pump fail on a rejection still unhandled once the job queue is

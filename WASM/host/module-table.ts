@@ -179,20 +179,17 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── installing WASM modules ─────────────────────────────────────────
 
-  /** Build one slot's modules, all or none (§3.1). A re-install replaces the whole map. */
+  /** Build one slot's modules, all or none (§3.1), their workers loading side by side. A
+   *  re-install replaces the whole map. Names and bytes were checked at install (bundle.ts). */
   async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
+    const spawned = await Promise.allSettled(mods.map((m) => this.spawn(m.wasm)));
     const built = new Map<string, WasmModuleRef>();
-    try {
-      for (const m of mods) {
-        if (m.name.length === 0) throw new Error("table: empty module name");
-        if (built.has(m.name)) throw new Error(`table: duplicate module name ${m.name}`);
-        built.set(m.name, await this.spawn(m.wasm));
-      }
-    }
-    catch (e) {
+    spawned.forEach((r, i) => { if (r.status === "fulfilled") built.set(mods[i].name, r.value); });
+    const failed = spawned.find((r) => r.status === "rejected");
+    if (failed) {
       // Release what this attempt started, so a refused bundle leaves no orphaned workers.
       for (const ref of built.values()) this.teardown(ref);
-      throw e;
+      throw failed.reason;
     }
     return {
       call: (name, payload, deadlineMs) => this.callModule(built, name, payload, deadlineMs),
@@ -207,7 +204,6 @@ export class ModuleTable implements PureModuleLoader {
    *  to the bytes, before instantiation allocates anything. The §4 export checks run in
    *  the worker and report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
-    if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
     const ref: WasmModuleRef = {
       wasm: wasmBytes,
       worker: null,

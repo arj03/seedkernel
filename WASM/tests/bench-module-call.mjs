@@ -13,14 +13,20 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { ModuleTable } = await imp("build/host/module-table.js");
 
 const wasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
-const OP_ENCODE = 1, OP_DECODE_ONE = 2;
+const OP_MASK = 1;
 
-// A masked binary frame request, built once per size: [op][opcode][maskFlag][mask 4][payload].
-const frameReq = (payloadLen, mask) => {
-  const req = new Uint8Array(3 + (mask ? 4 : 0) + payloadLen);
-  req[0] = OP_ENCODE; req[1] = 0x2; req[2] = mask ? 1 : 0;
-  if (mask) req.fill(0x5a, 3, 7);
-  req.fill(0x33, 3 + (mask ? 4 : 0));
+/** A masking request for one masked binary frame, built once per size: [op][frame], the
+ *  frame's header in its shortest length form. */
+const frameReq = (payloadLen) => {
+  const ext = payloadLen < 126 ? 0 : payloadLen < 65536 ? 2 : 8;
+  const req = new Uint8Array(1 + 2 + ext + 4 + payloadLen);
+  req[0] = OP_MASK;
+  req[1] = 0x82;
+  req[2] = 0x80 | (ext === 0 ? payloadLen : ext === 2 ? 126 : 127);
+  if (ext === 2) { req[3] = payloadLen >>> 8; req[4] = payloadLen & 0xff; }
+  else if (ext === 8) new DataView(req.buffer).setUint32(7, payloadLen);
+  req.fill(0x5a, 3 + ext, 7 + ext); // the key
+  req.fill(0x33, 7 + ext);
   return req;
 };
 
@@ -55,35 +61,19 @@ const inst = new WebAssembly.Instance(mod, { env: { abort: () => {}, seed: () =>
 const table = new ModuleTable({ deadlineMs: 60_000 });
 const modules = await table.build([{ name: "ws", wasm }]);
 
-console.log("module-call cost, in-thread vs worker-per-module — ws.wasm (RFC 6455 codec)\n");
+console.log("module-call cost, in-thread vs worker-per-module — ws.wasm (RFC 6455 masking)\n");
 console.log(`${"workload".padEnd(38)}${"in-thread".padStart(12)}${"worker".padStart(12)}${"ratio".padStart(8)}`);
 console.log("-".repeat(70));
 
 for (const [name, payloadLen, iters] of [
-  ["encode 64 KiB frame (masked)", 64 * 1024, 2000],
-  ["encode 1 KiB frame (masked)", 1024, 5000],
-  ["encode 32 B control frame", 32, 20000],
+  ["mask 64 KiB frame", 64 * 1024, 2000],
+  ["mask 1 KiB frame", 1024, 5000],
+  ["mask 32 B frame", 32, 20000],
 ]) {
-  const reqs = [frameReq(payloadLen, true)];
+  const reqs = [frameReq(payloadLen)];
   const tIn = timeInThread(inst, reqs, iters);
   const tW = await timeWorker(modules, reqs, iters);
   console.log(`${name.padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
-}
-
-// Decode-one of a ~64 KiB frame, the inbound record path. A real masked frame, built by
-// hand: [FIN|opcode 0x82][mask|len7 0xfe][u16 BE length][mask 4][payload ...].
-{
-  const payloadLen = 65535;
-  const frame = new Uint8Array(8 + payloadLen);
-  frame[0] = 0x82; frame[1] = 0xfe; frame[2] = (payloadLen >>> 8) & 0xff; frame[3] = payloadLen & 0xff;
-  frame.fill(0x5a, 4, 8); // mask
-  frame.fill(0x33, 8);
-  const dec = new Uint8Array(2 + frame.length);
-  dec[0] = OP_DECODE_ONE; dec[1] = 1; dec.set(frame, 2); // expectMasked, whole frame
-  const iters = 2000;
-  const tIn = timeInThread(inst, [dec], iters);
-  const tW = await timeWorker(modules, [dec], iters);
-  console.log(`${"decode 64 KiB frame".padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
 }
 
 // The one-time cost of starting a worker (spawn, compile, instantiate), paid at install

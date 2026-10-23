@@ -1,8 +1,8 @@
 // Unit tests for the RFC 6455 state machine in transport/src/framing.js (`WsFramer`):
 // fragment reassembly, control-frame interleaving, the pre-auth frame cap, and the
-// read/write serialization `push`/`enqueue` provide over an async per-frame module call.
-// transport.test.mjs covers ws.wasm's stateless per-frame codec; this file covers state
-// carried across calls.
+// read/write serialization `push`/`enqueue` provide over async module calls.
+// transport.test.mjs covers the stateless per-frame codec; this file covers state carried
+// across calls.
 //
 // `WsFramer` is guest code without a module boundary: it shares a scope with util.js
 // (transport/src/util.js), with the op-frame prelude injected as the build does, and reads `host`, `N_WS`, `maxFrameBytes` and `randomBytes` as
@@ -35,16 +35,20 @@ function wsRawCall(req) {
   return new Uint8Array(wsInst.exports.memory.buffer, wsScratch, len).slice();
 }
 
-/** Decode one whole frame with the same module, independent of any `WsFramer` under test:
- *  the oracle for what a captured `put` sink received. */
+/** Decode one whole frame by hand, independent of the framing code under test: the oracle
+ *  for what a captured `put` sink received. Null when the mask bit is not the expected one. */
 function decodeFrame(frame, expectMasked) {
-  const req = new Uint8Array(2 + frame.length);
-  req[0] = 2; req[1] = expectMasked ? 1 : 0; // WS_OP_DECODE_ONE
-  req.set(frame, 2);
-  const r = wsRawCall(req);
-  if (r.length === 0 || r[0] !== 1) return null;
-  const payloadLen = ((r[6] << 24) | (r[7] << 16) | (r[8] << 8) | r[9]) >>> 0;
-  return { fin: (r[1] & 0x80) !== 0, opcode: r[1] & 0x0f, payload: r.slice(10, 10 + payloadLen) };
+  if (((frame[1] & 0x80) !== 0) !== expectMasked) return null;
+  let len = frame[1] & 0x7f, at = 2;
+  if (len === 126) { len = (frame[2] << 8) | frame[3]; at = 4; }
+  else if (len === 127) { len = ((frame[6] << 24) | (frame[7] << 16) | (frame[8] << 8) | frame[9]) >>> 0; at = 10; }
+  const key = expectMasked ? frame.subarray(at, at + 4) : null;
+  if (key) at += 4;
+  const payload = frame.slice(at, at + len);
+  if (key) {
+    for (let i = 0; i < payload.length; i++) payload[i] ^= key[i & 3];
+  }
+  return { fin: (frame[0] & 0x80) !== 0, opcode: frame[0] & 0x0f, payload };
 }
 
 // ── the real WsFramer, in the same lexical scope util.js gives it in production ──
@@ -93,7 +97,7 @@ function frameFactory() {
   return makeFramer(true).framer;
 }
 
-/** Force a fragment start (`opEncode` always sets FIN=1); flipping the bit after encoding
+/** Force a fragment start (`wsFrame` always sets FIN=1); flipping the bit after encoding
  *  is safe because masking only XORs the payload. */
 function withFin(frame, fin) {
   const b = frame.slice();

@@ -9,7 +9,7 @@ import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { ListenAddress } from "../services/socket-seam.js";
-import type { AppHandle, BootShellOptions, Shell, TransportStatus } from "./shell-core.js";
+import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted, on every target. */
 export const DEFAULT_DIR = "./data";
@@ -237,10 +237,14 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
   // One line each time a peer is linked, changes how it is reached, or goes, so an
   // operator, or a script driving the node, sees a relayed link move to a direct path
-  // (§12.7). The status repeats every link on each change, so only differences print.
+  // (§12.7). The shipped transport's status is `[relay u8]` and then `[key 32][direct u8]`
+  // per linked peer, repeated whole on each change, so only differences print.
   let routes = new Map<string, boolean>();
-  const onStatus = (s: TransportStatus) => {
-    const now = new Map(s.linked.map((l) => [toHex(l.key), l.direct] as const));
+  const onStatus = (status: Uint8Array) => {
+    const now = new Map<string, boolean>();
+    for (let off = 1; off + 33 <= status.length; off += 33) {
+      now.set(toHex(status.subarray(off, off + 32)), status[off + 32] === 1);
+    }
     for (const [k, direct] of now) {
       if (routes.get(k) !== direct) host.log(`  link   ${k} ${direct ? "direct" : "relayed"}`);
     }

@@ -328,7 +328,8 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 // shared across links (not one allowance per sockChannel), admitted up to the exact byte
 // and count ceilings, and fully returned after delivery.
 func TestNetHostInboundReadAllowance(t *testing.T) {
-	n := &netHost{maxInboundReadBytes: 8, maxInboundReadSlices: 2}
+	n := newNetHost(nil, nil)
+	n.maxInboundReadBytes, n.maxInboundReadSlices = 8, 2
 	if !n.reserveInboundRead(5) || !n.reserveInboundRead(3) {
 		t.Fatal("reads at the exact aggregate byte/slice ceilings must be admitted")
 	}
@@ -350,7 +351,8 @@ func TestNetHostInboundReadAllowance(t *testing.T) {
 // reader goroutine (where waiting is free and the socket's receive window passes it on to
 // the peer) instead of failing a well-behaved link.
 func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
-	n := &netHost{maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	n := newNetHost(nil, nil)
+	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
 	if !n.reserveInboundRead(4) {
 		t.Fatal("failed to occupy the test allowance")
 	}
@@ -382,7 +384,8 @@ func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
 // touching the delivery path would panic the test.
 func TestNetHostOnMsgChargesBeforePost(t *testing.T) {
 	el := &eventLoop{tasks: make(chan func(), 1)}
-	n := &netHost{el: el, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	n := newNetHost(el, nil)
+	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
 	if n.onMsg(1)([]byte("toolong")) {
 		t.Fatal("onMsg admitted a read larger than the whole staging window")
 	}
@@ -460,7 +463,8 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 // After teardown there is no loop, so close() must wake and refuse it instead of leaving
 // the goroutine blocked for the life of the process.
 func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
-	n := &netHost{chans: map[int64]*sockChannel{}, maxInboundReadBytes: 4, maxInboundReadSlices: 1}
+	n := newNetHost(nil, nil)
+	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
 	if !n.reserveInboundRead(4) {
 		t.Fatal("failed to occupy the test allowance")
 	}

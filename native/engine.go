@@ -254,11 +254,9 @@ func numberToJS(qc *qjs.Context, t api.ValueType, v uint64) *qjs.Value {
 		return qc.NewInt32(api.DecodeI32(v))
 	case api.ValueTypeF64:
 		return qc.NewFloat64(api.DecodeF64(v))
-	case api.ValueTypeF32:
-		return qc.NewFloat64(float64(api.DecodeF32(v)))
 	default:
-		// An i64 would need a BigInt on every target; the ABI has none.
-		panic("engine: i64 values do not cross the engine table")
+		// An i64 would need a BigInt on every target, and nothing crosses an f32.
+		panic("engine: only i32 and f64 values cross the engine table")
 	}
 }
 
@@ -270,10 +268,8 @@ func numberFromJS(t api.ValueType, v *qjs.Value) uint64 {
 		return api.EncodeI32(v.Int32())
 	case api.ValueTypeF64:
 		return api.EncodeF64(float64(v.Int64()))
-	case api.ValueTypeF32:
-		return api.EncodeF32(float32(v.Int64()))
 	default:
-		panic("engine: i64 values do not cross the engine table")
+		panic("engine: only i32 and f64 values cross the engine table")
 	}
 }
 

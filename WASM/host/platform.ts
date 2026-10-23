@@ -220,7 +220,6 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
       const built = new Map<string, ReturnType<typeof engineModule>>();
       try {
         for (const m of mods) {
-          if (built.has(m.name)) throw new Error(`table: duplicate module name ${m.name}`);
           try { built.set(m.name, engineModule(m.wasm)); } catch (err) { throw new Error(`${m.name}: ${errMessage(err)}`); }
         }
       } catch (err) {

@@ -95,7 +95,7 @@ func TestGuestRealmEntryGettersNeverRun(t *testing.T) {
 			t.Fatal("build seam:", err)
 		}
 		newTestRealmBudget(t, "{}", `
-			for (const name of ["__start", "__resolveHostCall", "__rejectHostCall"])
+			for (const name of ["__start", "__settleHostCall"])
 			  Object.defineProperty(globalThis, name, { get() { for (;;) {} } });
 			async function handle(arg) {
 			  try { return await host.call(arg[arg.length - 1] === 1 ? "fail" : "park", new Uint8Array()); }

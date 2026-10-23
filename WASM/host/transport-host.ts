@@ -2,7 +2,7 @@
 // guest (§12.1). Destinations are opaque, and events go to the current link occupant
 // (§12.10).
 
-import { concatBytes, dec, errMessage, Fifo, readU32BE, u8 } from "../services/util.js";
+import { concatBytes, dec, EMPTY, errMessage, Fifo, readU32BE, u8 } from "../services/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -17,13 +17,11 @@ import {
   UDP_SOCKET_BUFFER_BYTES,
 } from "../services/net-limits.js";
 import { type LinkEvent } from "../services/domains.js";
-import { type RawDatagrams } from "../services/datagrams.js";
+import { datagramEnd, type RawDatagrams } from "../services/datagrams.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../services/socket-seam.js";
 import { HOST_CALLER_ID, type DatagramSocket, type RawNet } from "./guest-seam.js";
 import { REALM_DISPOSED } from "./realm-queue.js";
 import { OpArgs } from "../services/op-frame.js";
-
-const EMPTY = new Uint8Array(0);
 
 /** Link id 0 means no route; its `stream` bit is ignored. */
 const NO_ROUTE = { linkId: 0, stream: false } as const;
@@ -31,13 +29,6 @@ const NO_ROUTE = { linkId: 0, stream: false } as const;
 const NO_SOCKET: DatagramSocket = { id: 0, port: 0, addresses: "" };
 
 const ev = (name: LinkEvent) => new OpArgs(name);
-
-/** After the I/O the platform is in the middle of, so one `datagrams` event takes every
- *  datagram a turn read: Node's `setImmediate`, which runs once the poll phase has read
- *  what its sockets hold, where a microtask would run after each datagram's own callback.
- *  Elsewhere a microtask: the native loop hands a socket's datagrams over in one call. */
-const nextTurn: (f: () => void) => void =
-  (globalThis as { setImmediate?: (f: () => void) => void }).setImmediate ?? queueMicrotask;
 
 /** Ceiling on the sockets the driver holds, independent of any guest limit. */
 export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
@@ -50,9 +41,6 @@ export interface TransportHostOptions {
   /** Live raw links this driver holds at once (default `DEFAULT_MAX_RAW_LINKS`). Bounds the
    *  host's own table; never shipped to the guest. */
   maxRawLinks?: number;
-  /** Total queued outbound bytes and writes across every link in this driver. */
-  maxOutboundBytes?: number;
-  maxOutboundSlices?: number;
   /** The socket seam, which alone decides what a destination means. A factory with no
    *  `connect` is accept-only, and `link/open` answers "no route". */
   channels?: ChannelFactory;
@@ -209,8 +197,8 @@ export class TransportHost {
   }
 
   private outboundFits(length: number): boolean {
-    return this.outboundSlices < (this.opts.maxOutboundSlices ?? MAX_NODE_OUTBOUND_QUEUE_SLICES)
-      && length <= (this.opts.maxOutboundBytes ?? MAX_NODE_OUTBOUND_QUEUE_BYTES) - this.outboundBytes;
+    return this.outboundSlices < MAX_NODE_OUTBOUND_QUEUE_SLICES
+      && length <= MAX_NODE_OUTBOUND_QUEUE_BYTES - this.outboundBytes;
   }
 
   private reserveOutbound(length: number): boolean {
@@ -257,9 +245,6 @@ export class TransportHost {
     this.shut(link.channel);
     this.channelClosed(linkId, link);
   }
-
-  /** Whether `close` has run. A driver that was only dropped still holds its listener. */
-  get isClosed(): boolean { return this.closed; }
 
   /** The port the first listener labelled `label` bound, or 0 for none. */
   portOf(label: string): number {
@@ -330,8 +315,8 @@ export class TransportHost {
         // it, and from a socket this occupant holds. One that is not is left out.
         let kept: Uint8Array[] | null = null;
         for (let at = 0; at < batch.length;) {
-          const port = at + 5 + (batch[at + 4] ?? 0), end = port + 4 + ((batch[port + 2] << 8) | batch[port + 3]);
-          if (port + 4 > batch.length || end > batch.length) throw new Error("link/udpSend: a datagram runs past the batch");
+          const end = datagramEnd(batch, at);
+          if (end > batch.length) throw new Error("link/udpSend: a datagram runs past the batch");
           if (this.sockets.has(readU32BE(batch, at))) kept?.push(batch.subarray(at, end));
           else kept ??= [batch.subarray(0, at)];
           at = end;
@@ -387,7 +372,8 @@ export class TransportHost {
   private pumpReads(): void {
     if (this.readsBusy || this.readsDue || this.reads.size === 0) return;
     this.readsDue = true;
-    nextTurn(() => {
+    // On a later microtask, so the reads that arrive in one platform callback go together.
+    queueMicrotask(() => {
       this.readsDue = false;
       const next = this.reads.shift();
       if (!next || this.readsBusy) return;
@@ -479,11 +465,7 @@ export class TransportHost {
         return;
       }
       // A custom RawLink may reuse its callback buffer, so a held read owns its bytes.
-      try { held.push(new Uint8Array(bytes)); }
-      catch {
-        this.releaseInboundRead(bytes.length);
-        failReadSide();
-      }
+      held.push(new Uint8Array(bytes));
     });
     channel.onClose(() => { dropHeld(); this.channelClosed(linkId, link); });
     return linkId;

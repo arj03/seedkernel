@@ -43,9 +43,16 @@ type netHost struct {
 	readSpace         *sync.Cond // signalled as staging custody is released
 }
 
+// newNetHost is a netHost with nothing installed yet.
+func newNetHost(el *eventLoop, qc *qjs.Context) *netHost {
+	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
+	n.readSpace = sync.NewCond(&n.mu)
+	return n
+}
+
 // exposeNet installs `__net`, shaped into RawLinks by host/platform.ts.
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
-	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
+	n := newNetHost(el, qc)
 	o := qc.NewObject()
 
 	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
@@ -120,26 +127,18 @@ func (n *netHost) get(id int64) *sockChannel {
 	return n.chans[id]
 }
 
-// waitSpace is built lazily, so a zero-value netHost works; called under mu.
-func (n *netHost) waitSpace() *sync.Cond {
-	if n.readSpace == nil {
-		n.readSpace = sync.NewCond(&n.mu)
-	}
-	return n.readSpace
-}
-
 // reserveInboundRead charges a read to the staging allowance (§16.1) before it is posted.
 // A full window parks the reader, so backpressure reaches the peer through TCP; only a
 // read that can never fit is refused.
 func (n *netHost) reserveInboundRead(length int) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if length < 0 || length > n.maxInboundReadBytes || n.maxInboundReadSlices <= 0 {
+	if length > n.maxInboundReadBytes {
 		return false
 	}
 	for !n.closed && (n.inboundReadSlices >= n.maxInboundReadSlices ||
 		length > n.maxInboundReadBytes-n.inboundReadBytes) {
-		n.waitSpace().Wait()
+		n.readSpace.Wait()
 	}
 	if n.closed {
 		return false
@@ -153,7 +152,7 @@ func (n *netHost) releaseInboundRead(length int) {
 	n.mu.Lock()
 	n.inboundReadSlices--
 	n.inboundReadBytes -= length
-	n.waitSpace().Broadcast()
+	n.readSpace.Broadcast()
 	n.mu.Unlock()
 }
 
@@ -232,7 +231,7 @@ func (n *netHost) close() {
 	}
 	n.mu.Lock()
 	n.closed = true
-	n.waitSpace().Broadcast()
+	n.readSpace.Broadcast()
 	n.mu.Unlock()
 }
 

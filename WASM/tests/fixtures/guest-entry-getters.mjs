@@ -8,7 +8,7 @@ const { createWebRealm } = await import(pathToFileURL(join(wasmRoot, "build/host
 // the guest ran, one would spin outside the budget and hold this process forever.
 const realm = await createWebRealm({
   source: `
-    for (const name of ["__start", "__resolveHostCall", "__rejectHostCall"])
+    for (const name of ["__start", "__settleHostCall"])
       Object.defineProperty(globalThis, name, { get() { for (;;) {} } });
     async function handle(arg) {
       try { return await host.call(arg[0] === 1 ? "fail" : "park", new Uint8Array()); }

@@ -14,6 +14,9 @@ const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
+/** The shared empty answer; nothing writes into a zero-length array. */
+export const EMPTY = new Uint8Array(0);
+
 /** A platform answer that may come now or later. */
 export type Maybe<T> = T | Promise<T>;
 /** Bytes a platform hands over; either form is the receiver's to keep. */

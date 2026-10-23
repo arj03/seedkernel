@@ -221,7 +221,7 @@ const upgraded = await upgrading;
 assert(Buffer.from(upgraded.author).toString("hex") === Buffer.from(replacementKeys.id).toString("hex") &&
   a.shell.resolve(TRANSPORT_SERVICE) === upgraded.manifest.app,
   "the new author took over the transport claim");
-assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
+assert(aNet.available(), "the adapter is neither closed nor left unbound by the slot replacement");
 assert(aNet.portOf("tcp") === oldPort, "the node stayed on the SAME port its peers hold");
 
 // The cost of the address book living in the guest: neither the peer A was linked to nor

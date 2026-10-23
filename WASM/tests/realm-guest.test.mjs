@@ -690,11 +690,11 @@ async function testSeamGating() {
   assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
   // Guest-controlled allocation caps. Tests that use every host service declare them all
-  // explicitly; omitting requires entirely throws (§12.2).
+  // explicitly; omitting requires entirely grants none (§12.2).
   const open = mk(ALL_HOST_SERVICES);
   let omitted = false;
-  try { mk(undefined); } catch { omitted = true; }
-  assert(omitted, "omitting requires throws rather than granting every name");
+  try { await mk(undefined)("node/sign", U(1, 2)); } catch { omitted = true; }
+  assert(omitted, "omitting requires grants no service rather than every name");
   // A declared service this node cannot provide fails the seam, so the install fails.
   let unbacked = "";
   try {

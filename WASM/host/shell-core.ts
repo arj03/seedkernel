@@ -11,15 +11,13 @@ import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, errMessage, concatBytes } from "../services/util.js";
+import { enc, fromHex, toHex, isHex64, errMessage, concatBytes, EMPTY } from "../services/util.js";
 import { sendProtocol } from "../services/op-frame.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../services/subkeys.js";
 
 /** Neutral realm contracts exposed through the shell facade clients configure. */
 export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
-
-const EMPTY = new Uint8Array(0);
 
 /** Manifest verification plus the guest crypto ops; core libsodium satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
@@ -95,27 +93,9 @@ export interface TransportOptions extends TransportHostOptions {
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
-  /** Called each time the transport's standing changes: the state of the relay it is
-   *  registered on, who is linked, or how one of them is reached. */
-  onStatus?: (status: TransportStatus) => void;
-}
-
-/** The transport's standing, as its `link/status` says it (§12.2). */
-export interface TransportStatus {
-  /** The relay it is registered on, as its `relayState` op answers it: 0 none, 1
-   *  registered, 2 redialing (§12.6.3). */
-  relay: number;
-  /** The linked peers, as its `routes` op answers them: each one's key, and whether a
-   *  direct link carries its traffic rather than a relay (§12.7). */
-  linked: { key: Uint8Array; direct: boolean }[];
-}
-
-/** `[relay u8][key 32][direct u8]*`, decoded. */
-function readStatus(status: Uint8Array): TransportStatus {
-  const linked: TransportStatus["linked"] = [];
-  for (let off = 1; off + 33 <= status.length; off += 33)
-    linked.push({ key: status.subarray(off, off + 32), direct: status[off + 32] === 1 });
-  return { relay: status[0], linked };
+  /** Called each time the transport's standing changes, with its `link/status` bytes
+   *  (§12.2), in the transport's own format. */
+  onStatus?: (status: Uint8Array) => void;
 }
 
 /** Assembly options (§12.8). Everything except `sodium` and `identity` has a default. */
@@ -209,6 +189,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const appScope = appScopeFor(sodium, loaded.manifest.app);
     slot = {
       verifiedBundle: loaded,
+      links: reachesLink(loaded.manifest),
       pureModules,
       fsScope: fs ? scopedFs(fs, appScope) : undefined,
       appScope,
@@ -254,7 +235,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       memoryLimitBytes: bounds.memoryBytes,
       deadlineMs: bounds.deadlineMs,
       // The link occupant writes state every caller shares, so its turns are its own.
-      ownTurns: reachesLink(slot.verifiedBundle.manifest),
+      ownTurns: slot.links,
     });
   };
   /** Enter a committed slot as `caller` with `body`. Host events the host frames itself
@@ -273,8 +254,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  at the far end (§12.10). */
   const sendsOwn = (app: string, protocols: readonly string[], call: LocalCall): LocalCall =>
     (id, payload, deadlineMs, causalClock) => {
-      const callee = table.localClaimant(id);
-      const protocol = callee && reachesLink(callee.verifiedBundle.manifest) ? sendProtocol(payload) : null;
+      const protocol = table.localClaimant(id)?.links ? sendProtocol(payload) : null;
       if (protocol !== null && !protocols.includes(protocol)) {
         throw new Error(`shell: ${app} does not claim ${JSON.stringify(protocol)}, so it may not send under it`);
       }
@@ -301,7 +281,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return answer.catch(() => EMPTY);
     },
     status: (status) => {
-      try { net!.onStatus?.(readStatus(status)); }
+      try { net!.onStatus?.(status); }
       catch (err) { console.error(`[shell] the embedder's onStatus threw: ${errMessage(err)}`); }
     },
   } : undefined;
@@ -315,7 +295,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // The signed list, unmodified: host services and local service ids.
       requires: b.manifest.guest.requires,
       backends: {
-        node: slotSignScope(opts, app, reachesLink(b.manifest)),
+        node: slotSignScope(opts, app, slot.links),
         fs: slot.fsScope,
         timer: slot.timers,
         link,

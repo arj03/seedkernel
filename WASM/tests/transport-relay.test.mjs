@@ -330,7 +330,7 @@ await test("the host is told its status when the relay's state changes", async (
   // A status may be told again unchanged.
   const told = [];
   const states = () => told.filter((s, i) => s !== told[i - 1]).join();
-  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status.relay) }));
+  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status[0]) }));
   await joinRelay(A);
   assert(states() === "2,1", `joining tells it is on its way, then registered, got ${told}`);
   relay.restart();
@@ -381,7 +381,14 @@ await test("the host is told its status when who is linked changes, ahead of a n
   const heard = [];
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay, {
-    onStatus: (status) => heard.push(status.linked.map(({ key, direct }) => Buffer.from(key).toString("hex") + (direct ? "d" : "r")).join()),
+    // `[relay u8]`, then `[key 32][direct u8]` per linked peer.
+    onStatus: (status) => {
+      const linked = [];
+      for (let off = 1; off + 33 <= status.length; off += 33) {
+        linked.push(Buffer.from(status.subarray(off, off + 32)).toString("hex") + (status[off + 32] === 1 ? "d" : "r"));
+      }
+      heard.push(linked.join());
+    },
     onHostCall: (name) => { if (name === "link/deliver") heard.push("frame"); },
   }));
   // A's request is what dials, so its frame comes in right behind the handshake.

@@ -158,7 +158,7 @@ class ReqRes {
       const q = this.relayed.get(p.to);
       if (q) { q.bytes -= p.relayedBytes; this.pumpRelayed(p.to); }
     }
-    p.d.settle(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
+    p.d.resolve(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
   }
 
   /** Whether `from` may put one more request of `weight` on `link/deliver` (core.js

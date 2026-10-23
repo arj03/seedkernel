@@ -234,7 +234,7 @@ func TestAppSendsOnlyUnderItsOwnClaims(t *testing.T) {
 
 	_, err := callRealm("askAsApp", 8*time.Second,
 		qc.NewArrayBuffer(probeSendArgs(st.PeerID, "echoapp", payload)))
-	if err == nil || !strings.Contains(err.Error(), `probe does not claim "echoapp"`) {
+	if err == nil || !strings.Contains(err.Error(), `does not claim "echoapp"`) {
 		t.Fatalf("a send under another app's id must be refused by name, got: %v", err)
 	}
 	got := ask(t, st.PeerID, "echoapp", payload)

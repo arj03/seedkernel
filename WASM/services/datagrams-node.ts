@@ -6,6 +6,7 @@ import { lookup } from "node:dns";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
 import { forEachDatagram, ipv6Bytes, type RawDatagrams } from "./datagrams.js";
+import { concatBytes } from "./util.js";
 
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";
@@ -39,6 +40,15 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
       const six = dualStack;
       // A send that fails is a lost datagram, which the stream already expects.
       s.on("error", () => {});
+      // Node hands over one datagram per callback. They go to `deliver` together once the
+      // poll phase has read what the socket holds (`setImmediate`), as the native loop
+      // hands a socket's datagrams over in one call.
+      let heard: Uint8Array[] = [];
+      const flush = () => {
+        const batch = heard.length === 1 ? heard[0] : concatBytes(heard);
+        heard = [];
+        deliver(batch);
+      };
       s.on("message", (msg, from) => {
         // IPv4 as itself, though a dual-stack socket hears it IPv4-mapped.
         const a = from.address.startsWith(MAPPED) ? from.address.slice(MAPPED.length) : from.address;
@@ -52,7 +62,8 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
         batch[at + 2] = msg.length >> 8;
         batch[at + 3] = msg.length & 255;
         batch.set(msg, at + 4);
-        deliver(batch);
+        if (heard.length === 0) setImmediate(flush);
+        heard.push(batch);
       });
       let sending = 0, closing = false;
       const shut = () => { try { s.close(); } catch { /* already closed */ } };

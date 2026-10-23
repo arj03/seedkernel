@@ -15,6 +15,9 @@ export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Arr
  *  slot enters the table with its realm in place. */
 export interface AppSlot {
   verifiedBundle: LoadedBundle;
+  /** Whether it requires `link` (`reachesLink`), read once: such a slot runs its own
+   *  turns, signs under the link scope, and holds apps' sends to their claims. */
+  links: boolean;
   pureModules: PureModules;
   fsScope?: Fs;
   /** The fs prefix this slot's view is scoped under (`appScopeFor`). */

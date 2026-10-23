@@ -18,12 +18,8 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-const (
-	// assembly/ws/abi.ts
-	wsOpEncode    = 1
-	wsOpDecodeOne = 2
-	wsFrame       = 1 // decodeOne's status for a whole frame
-)
+// assembly/ws/abi.ts
+const wsOpMask = 1
 
 // wsModuleJS lifts ws.wasm out of the transport bundle the host already embeds, so the
 // module under test is always the one that ships in the signed bundle.
@@ -119,8 +115,9 @@ func wsMaskPayload(n int) []byte {
 }
 
 // wsMaskedFrame builds one masked binary frame by hand, one byte at a time, in the minimal
-// length encoding RFC 6455 §5.2 requires, so neither test checks the module against itself.
-func wsMaskedFrame(payload []byte) []byte {
+// length encoding RFC 6455 §5.2 requires, so the test never checks the module against
+// itself. clear leaves the payload unmasked behind the same header.
+func wsMaskedFrame(payload []byte, clear bool) []byte {
 	var f []byte
 	n := len(payload)
 	switch {
@@ -134,47 +131,32 @@ func wsMaskedFrame(payload []byte) []byte {
 	}
 	f = append(f, wsMaskKey[:]...)
 	for i, b := range payload {
-		f = append(f, b^wsMaskKey[i&3])
+		if clear {
+			f = append(f, b)
+		} else {
+			f = append(f, b^wsMaskKey[i&3])
+		}
 	}
 	return f
 }
 
-// TestWsMaskDecodeEveryTail decodes a masked frame at each length. This is the server side:
-// every frame a browser sends is masked, so it is the whole inbound data path.
-func TestWsMaskDecodeEveryTail(t *testing.T) {
+// TestWsMaskEveryTail masks a frame at each length and unmasks it again, checking each
+// against the hand-built one byte for byte: the client's way out and the server's way in,
+// since every frame a browser sends is masked.
+func TestWsMaskEveryTail(t *testing.T) {
 	w := wsModule(t)
 	for _, n := range wsMaskLengths() {
 		payload := wsMaskPayload(n)
-		frame := wsMaskedFrame(payload)
-		// [status][fin|opcode][consumed u32][payloadLen u32][payload]
-		out := wsCall(t, w, append([]byte{wsOpDecodeOne, 1}, frame...))
-		if len(out) < 10 || out[0] != wsFrame {
-			t.Fatalf("len %d: module answered %d bytes, want a frame", n, len(out))
-		}
-		if consumed := binary.BigEndian.Uint32(out[2:6]); int(consumed) != len(frame) {
-			t.Fatalf("len %d: consumed %d of a %d-byte frame", n, consumed, len(frame))
-		}
-		if gotLen := binary.BigEndian.Uint32(out[6:10]); int(gotLen) != n {
-			t.Fatalf("len %d: module reports payloadLen %d", n, gotLen)
-		}
-		if !bytes.Equal(out[10:], payload) {
-			t.Fatalf("len %d: unmasked payload differs at byte %d", n, firstByteDiff(out[10:], payload))
-		}
-	}
-}
-
-// TestWsMaskEncodeEveryTail masks on the way out (the client side) and checks the frame
-// byte for byte against the hand-masked one. Same lengths, so both directions cross the
-// same loop boundaries.
-func TestWsMaskEncodeEveryTail(t *testing.T) {
-	w := wsModule(t)
-	for _, n := range wsMaskLengths() {
-		payload := wsMaskPayload(n)
-		req := append([]byte{wsOpEncode, 0x2, 1}, wsMaskKey[:]...)
-		got := wsCall(t, w, append(req, payload...))
-		if want := wsMaskedFrame(payload); !bytes.Equal(got, want) {
-			t.Fatalf("len %d: %d-byte frame differs from the hand-masked %d-byte one at byte %d",
-				n, len(got), len(want), firstByteDiff(got, want))
+		clear, masked := wsMaskedFrame(payload, true), wsMaskedFrame(payload, false)
+		for _, c := range []struct {
+			dir      string
+			in, want []byte
+		}{{"mask", clear, masked}, {"unmask", masked, clear}} {
+			got := wsCall(t, w, append([]byte{wsOpMask}, c.in...))
+			if !bytes.Equal(got, c.want) {
+				t.Fatalf("%s len %d: %d-byte frame differs from the hand-built %d-byte one at byte %d",
+					c.dir, n, len(got), len(c.want), firstByteDiff(got, c.want))
+			}
 		}
 	}
 }
