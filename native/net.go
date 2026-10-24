@@ -1,6 +1,11 @@
 // The socket primitive exposed to QuickJS as `__net`. Reader goroutines hand each read to
 // el.post, and the loop delivers it through the deliver/closed/accept dispatchers
 // host/platform.ts hands over at install.
+//
+// A socket has at most one read on its way to the realm (sockChannel.readGate), held in
+// the reader's own buffer until the loop copies it in, so what waits here is bounded by
+// the sockets and costs nothing they do not already hold. The driver-wide inbound budget
+// is the transport host's, as on Node.
 package main
 
 import (
@@ -25,29 +30,18 @@ type netHost struct {
 	chans     map[int64]*sockChannel
 	nextID    int64
 	listeners []net.Listener
-	// Set by close, releasing readers parked on the staging allowance.
-	closed bool
 
 	// Installed by host/platform.ts before any socket opens.
-	keepAlive            time.Duration
-	closeGrace           time.Duration
-	maxInboundReadBytes  int
-	maxInboundReadSlices int
-	fnDeliver            *qjs.Value
-	fnClosed             *qjs.Value
-	fnAccept             *qjs.Value
-
-	// Staging custody: reads posted to the loop but not yet handed to TransportHost.
-	inboundReadBytes  int
-	inboundReadSlices int
-	readSpace         *sync.Cond // signalled as staging custody is released
+	keepAlive  time.Duration
+	closeGrace time.Duration
+	fnDeliver  *qjs.Value
+	fnClosed   *qjs.Value
+	fnAccept   *qjs.Value
 }
 
 // newNetHost is a netHost with nothing installed yet.
 func newNetHost(el *eventLoop, qc *qjs.Context) *netHost {
-	n := &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
-	n.readSpace = sync.NewCond(&n.mu)
-	return n
+	return &netHost{el: el, qc: qc, chans: map[int64]*sockChannel{}}
 }
 
 // exposeNet installs `__net`, shaped into RawLinks by host/platform.ts.
@@ -60,11 +54,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		defer n.mu.Unlock()
 		n.keepAlive = time.Duration(args[0].Int64()) * time.Millisecond
 		n.closeGrace = time.Duration(args[1].Int64()) * time.Millisecond
-		n.maxInboundReadBytes = int(args[2].Int64())
-		n.maxInboundReadSlices = int(args[3].Int64())
-		n.fnDeliver = args[4].GetPropertyStr("deliver")
-		n.fnClosed = args[4].GetPropertyStr("closed")
-		n.fnAccept = args[4].GetPropertyStr("accept")
+		n.fnDeliver = args[2].GetPropertyStr("deliver")
+		n.fnClosed = args[2].GetPropertyStr("closed")
+		n.fnAccept = args[2].GetPropertyStr("accept")
 		return nil, nil
 	}))
 
@@ -129,35 +121,6 @@ func (n *netHost) take(id int64) *sockChannel {
 	ch := n.chans[id]
 	delete(n.chans, id)
 	return ch
-}
-
-// reserveInboundRead charges a read to the staging allowance (§16.1) before it is posted.
-// A full window parks the reader, so backpressure reaches the peer through TCP; only a
-// read that can never fit is refused.
-func (n *netHost) reserveInboundRead(length int) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if length > n.maxInboundReadBytes {
-		return false
-	}
-	for !n.closed && (n.inboundReadSlices >= n.maxInboundReadSlices ||
-		length > n.maxInboundReadBytes-n.inboundReadBytes) {
-		n.readSpace.Wait()
-	}
-	if n.closed {
-		return false
-	}
-	n.inboundReadSlices++
-	n.inboundReadBytes += length
-	return true
-}
-
-func (n *netHost) releaseInboundRead(length int) {
-	n.mu.Lock()
-	n.inboundReadSlices--
-	n.inboundReadBytes -= length
-	n.readSpace.Broadcast()
-	n.mu.Unlock()
 }
 
 // dial opens an outbound byte duplex that JS can send on before it connects.
@@ -229,30 +192,19 @@ func (n *netHost) close() {
 	chans := n.chans
 	n.chans = map[int64]*sockChannel{}
 	n.mu.Unlock()
-	// Kill channels before releasing parked readers, so a woken reader finds its own dead.
 	for _, ch := range chans {
 		ch.close(false)
 	}
-	n.mu.Lock()
-	n.closed = true
-	n.readSpace.Broadcast()
-	n.mu.Unlock()
 }
 
 // onMsg/onClose run on a reader goroutine and hand the work to the loop goroutine.
-func (n *netHost) onMsg(id int64) func([]byte) bool {
-	return func(b []byte) bool {
-		if !n.reserveInboundRead(len(b)) {
-			return false
-		}
+func (n *netHost) onMsg(id int64) func([]byte) {
+	return func(b []byte) {
 		// b is the reader's buffer, borrowed: the spent read token keeps the next read
 		// from overwriting it before the task copies it.
 		n.el.post(func() {
-			// Staging custody ends once `deliver` has handed off, however it returns.
-			defer n.releaseInboundRead(len(b))
 			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
 		})
-		return true
 	}
 }
 

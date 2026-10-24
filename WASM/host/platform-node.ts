@@ -73,9 +73,7 @@ export function nodePlatform(o: NodePlatformOptions = {}): Required<Platform> & 
   }
 
   const net: PlatformNet = {
-    install(keepAliveMs, graceMs, _maxInboundBytes, _maxInboundSlices, events) {
-      // Reads arrive on this thread one at a time, so nothing is ever staged and the
-      // inbound limits hold by construction.
+    install(keepAliveMs, graceMs, events) {
       limits = { keepAliveMs, graceMs, events };
     },
     connect: (host, port) => adopt(tcpConnect(port, host)),

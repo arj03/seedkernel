@@ -17,7 +17,7 @@ import (
 // writer goroutine. send only queues, so a peer that stops draining never blocks the loop
 // goroutine; the FIFO also buffers pre-connect sends.
 type sockChannel struct {
-	onMsg   func([]byte) bool // false: the read can never fit the staging allowance
+	onMsg   func([]byte)
 	onClose func()
 
 	mu         sync.Mutex
@@ -32,7 +32,7 @@ type sockChannel struct {
 	readGate chan struct{} // one token permits one socket read
 }
 
-func newSockChannel(onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+func newSockChannel(onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
 	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
 		wake: make(chan struct{}, 1), readGate: make(chan struct{}, 1)}
 	c.readGate <- struct{}{} // the first read may start immediately
@@ -40,7 +40,7 @@ func newSockChannel(onMsg func([]byte) bool, onClose func(), closeGrace time.Dur
 }
 
 // newDialChannel returns a channel that connects in the background; sends queue until then.
-func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
 	c := newSockChannel(onMsg, onClose, closeGrace)
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelDial = cancel
@@ -70,7 +70,7 @@ func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) boo
 
 // newInboundChannel wraps an accepted socket; the caller starts readLoop once the JS
 // channel is registered.
-func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
 	c := newSockChannel(onMsg, onClose, closeGrace)
 	c.conn = conn
 	go c.writeLoop()
@@ -223,12 +223,7 @@ func (c *sockChannel) readLoop() {
 		}
 		n, err := conn.Read(chunk)
 		if n > 0 {
-			// onMsg charges the §12.6 staging allowance, stalling while it is full; false
-			// means the read can never fit.
-			if !c.onMsg(chunk[:n]) {
-				c.fail()
-				return
-			}
+			c.onMsg(chunk[:n])
 		} else if err == nil {
 			// No delivery, so no realm turn returns the token.
 			c.resume()

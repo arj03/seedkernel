@@ -283,7 +283,7 @@ func BenchmarkUdpUpload1M(b *testing.B) {
 }
 
 // TestUdpHeldBudgetShared: what the sockets hold for the loop is one budget across all of
-// them (MAX_UDP_HELD_BYTES, passed at bind), not one per socket, as TCP's staging is.
+// them (MAX_UDP_HELD_BYTES, passed at bind), not one per socket.
 func TestUdpHeldBudgetShared(t *testing.T) {
 	bootRealm(t)
 	const budget = 3000

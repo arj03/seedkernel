@@ -21,16 +21,14 @@ import (
 const testCloseGrace = time.Second
 
 func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	return newInboundChannel(conn, func(b []byte) bool {
+	return newInboundChannel(conn, func(b []byte) {
 		onMsg(append([]byte(nil), b...))
-		return true
 	}, onClose, testCloseGrace)
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, 0, func(b []byte) bool {
+	return newDialChannel(addr, 0, func(b []byte) {
 		onMsg(append([]byte(nil), b...))
-		return true
 	}, onClose, testCloseGrace)
 }
 
@@ -324,109 +322,6 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	}
 }
 
-// TestNetHostInboundReadAllowance checks the native side of the driver-wide inbound limit:
-// shared across links (not one allowance per sockChannel), admitted up to the exact byte
-// and count ceilings, and fully returned after delivery.
-func TestNetHostInboundReadAllowance(t *testing.T) {
-	n := newNetHost(nil, nil)
-	n.maxInboundReadBytes, n.maxInboundReadSlices = 8, 2
-	if !n.reserveInboundRead(5) || !n.reserveInboundRead(3) {
-		t.Fatal("reads at the exact aggregate byte/slice ceilings must be admitted")
-	}
-	if n.reserveInboundRead(9) {
-		t.Fatal("a read larger than the whole window must be refused, never waited on")
-	}
-	if got := n.inboundReadBytes; got != 8 {
-		t.Fatalf("refusal changed staged bytes: got %d, want 8", got)
-	}
-	n.releaseInboundRead(5)
-	n.releaseInboundRead(3)
-	if n.inboundReadBytes != 0 || n.inboundReadSlices != 0 {
-		t.Fatalf("native staging custody leaked: %d bytes, %d slices",
-			n.inboundReadBytes, n.inboundReadSlices)
-	}
-}
-
-// TestNetHostInboundReadWaitsForSpace is the backpressure half: a full window blocks the
-// reader goroutine (where waiting is free and the socket's receive window passes it on to
-// the peer) instead of failing a well-behaved link.
-func TestNetHostInboundReadWaitsForSpace(t *testing.T) {
-	n := newNetHost(nil, nil)
-	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
-	if !n.reserveInboundRead(4) {
-		t.Fatal("failed to occupy the test allowance")
-	}
-	admitted := make(chan struct{})
-	go func() {
-		n.reserveInboundRead(2)
-		close(admitted)
-	}()
-	select {
-	case <-admitted:
-		t.Fatal("a read was admitted while the staging window was full")
-	case <-time.After(50 * time.Millisecond):
-	}
-	n.releaseInboundRead(4)
-	select {
-	case <-admitted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("released staging capacity did not wake the waiting reader")
-	}
-	n.releaseInboundRead(2)
-	if n.inboundReadBytes != 0 || n.inboundReadSlices != 0 {
-		t.Fatalf("native staging custody leaked: %d bytes, %d slices",
-			n.inboundReadBytes, n.inboundReadSlices)
-	}
-}
-
-// TestNetHostOnMsgChargesBeforePost checks the order: the copy into the event-loop queue
-// happens only after the read is charged. The QuickJS context is nil on purpose, so
-// touching the delivery path would panic the test.
-func TestNetHostOnMsgChargesBeforePost(t *testing.T) {
-	el := &eventLoop{tasks: make(chan func(), 1)}
-	n := newNetHost(el, nil)
-	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
-	if n.onMsg(1)([]byte("toolong")) {
-		t.Fatal("onMsg admitted a read larger than the whole staging window")
-	}
-	if len(el.tasks) != 0 || n.inboundReadSlices != 0 {
-		t.Fatal("a refused read was charged or posted toward QuickJS")
-	}
-	if !n.onMsg(1)([]byte("ok")) {
-		t.Fatal("onMsg refused a read the staging window had room for")
-	}
-	if n.inboundReadBytes != 2 || n.inboundReadSlices != 1 || len(el.tasks) != 1 {
-		t.Fatalf("accepted read was not charged before post: %d bytes, %d slices, %d tasks",
-			n.inboundReadBytes, n.inboundReadSlices, len(el.tasks))
-	}
-	// Do not execute the task against this test's intentionally nil QuickJS context.
-	// Discard its retained closure and mirror the defer it would run after delivery.
-	<-el.tasks
-	n.releaseInboundRead(2)
-}
-
-// TestSockChannelReadAdmissionRefusalIsTerminal checks a peer cannot keep retrying a read
-// the staging limit can never admit: it closes the socket and reports the link down once.
-func TestSockChannelReadAdmissionRefusalIsTerminal(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c2.Close()
-	closed := make(chan struct{}, 1)
-	var attempts atomic.Int32
-	c := newInboundChannel(c1, func([]byte) bool {
-		attempts.Add(1)
-		return false
-	}, func() { closed <- struct{}{} }, testCloseGrace)
-	go c.readLoop()
-
-	if _, err := c2.Write([]byte("refused")); err != nil {
-		t.Fatal(err)
-	}
-	waitOn(t, closed, "an over-budget native read must fail its link")
-	if attempts.Load() != 1 {
-		t.Fatalf("read admission attempted %d times, want exactly once", attempts.Load())
-	}
-}
-
 // TestSockChannelCloseFailRace exercises the close/fail split from many goroutines: the
 // dead flag must settle the channel once (at most one onClose, no panic, no hang) however
 // the races interleave.
@@ -456,36 +351,6 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 	c.mu.Unlock()
 	if !dead {
 		t.Fatal("the channel must be dead after close/fail")
-	}
-}
-
-// A reader blocked on a full staging window waits for the event loop to release space.
-// After teardown there is no loop, so close() must wake and refuse it instead of leaving
-// the goroutine blocked for the life of the process.
-func TestNetHostCloseReleasesParkedReaders(t *testing.T) {
-	n := newNetHost(nil, nil)
-	n.maxInboundReadBytes, n.maxInboundReadSlices = 4, 1
-	if !n.reserveInboundRead(4) {
-		t.Fatal("failed to occupy the test allowance")
-	}
-	answered := make(chan bool, 1)
-	go func() { answered <- n.reserveInboundRead(2) }()
-	select {
-	case <-answered:
-		t.Fatal("a read was admitted while the staging window was full")
-	case <-time.After(50 * time.Millisecond):
-	}
-	n.close()
-	select {
-	case admitted := <-answered:
-		if admitted {
-			t.Fatal("a read was admitted after teardown")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("close() left a reader parked on the staging window")
-	}
-	if n.reserveInboundRead(1) {
-		t.Fatal("a fresh read was admitted after teardown")
 	}
 }
 

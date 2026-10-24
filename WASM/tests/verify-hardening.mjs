@@ -492,9 +492,8 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
     + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3: one bundle's total module memory
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
     + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6: outbound socket queues, over every link
-    + 2 * MAX_INBOUND_HOLD_BYTES    // §12.6: native staging and the driver window can hold
-  // the same read at once (native/net.go). WebRTC negotiation uses the same link windows
-  // (§12.7), so it adds nothing of its own.
+    + MAX_INBOUND_HOLD_BYTES        // §12.6: the driver's inbound window. WebRTC
+  // negotiation uses the same link windows (§12.7), so it adds nothing of its own.
     + DEFAULT_MEMORY_FS_MAX_BYTES;  // the in-memory fs backend's whole quota
   // Measured against a real machine's memory, so growing any term has to be a deliberate
   // choice.

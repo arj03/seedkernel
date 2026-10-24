@@ -35,6 +35,9 @@ type udpHost struct {
 	heldMax atomic.Int64
 }
 
+// The largest delivered batch a socket keeps to fill again: a few datagrams.
+const udpSpareMax = 8 << 10
+
 type udpSock struct {
 	conn    *net.UDPConn
 	deliver *qjs.Value // the callback it was bound with, freed on close
@@ -203,7 +206,12 @@ func (u *udpHost) deliver(id int64, s *udpSock) {
 	}
 	ab := u.qc.NewArrayBuffer(batch)
 	// The realm has its own copy, so the reader fills this one again, without growing it.
-	s.spare = batch[:0]
+	// A burst's buffer is let go, or every socket would keep its largest: the held budget
+	// counts bytes in use, not what sockets keep.
+	s.spare = nil
+	if cap(batch) <= udpSpareMax {
+		s.spare = batch[:0]
+	}
 	dispatch(u.qc, "udpHost: dispatcher error", s.deliver, ab)
 }
 

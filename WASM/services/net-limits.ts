@@ -5,9 +5,8 @@
 export const MAX_LINK_READ_BYTES = 2 * 1024 * 1024; // 2 MiB
 
 /** Inbound bytes one driver admits across dispatched and held reads, for the whole driver,
- *  not per link. Native applies it again to reads staged toward QuickJS, so its bound is
- *  2x (§12.6); there a full window stalls the reader, here it fails the arriving link.
- *  Seedstore's holder ingest bench, the worst case, peaks at ~6 MiB. */
+ *  not per link; a read past it fails the arriving link (§12.6). Seedstore's holder ingest
+ *  bench, the worst case, peaks at ~6 MiB. */
 export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** Count companion to `MAX_INBOUND_HOLD_BYTES`, against floods of tiny reads. */
@@ -38,8 +37,8 @@ export const MAX_UDP_SOCKETS = 2048;
 
 /** Datagram bytes held for the link occupant while it reads earlier ones, for every socket
  *  together. Past it a datagram is dropped, as a full socket buffer drops one. Native's
- *  readers charge it again, across every socket, to what they hold for the loop (udp.go),
- *  so its bound is 2x, as `MAX_INBOUND_HOLD_BYTES` is for TCP. */
+ *  readers charge it again, across every socket, to what they hold for the loop (udp.go):
+ *  no read token gates them as TCP's are, so its bound is 2x. */
 export const MAX_UDP_HELD_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** The kernel receive and send buffers asked for on each datagram socket: a peer may put a
