@@ -9,8 +9,6 @@ import (
 	"context"
 	crand "crypto/rand"
 	_ "embed"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -102,7 +100,8 @@ func exposeBridge(qc *qjs.Context) {
 	// The operator's world (host/cli.ts): arguments and stdio; its files are `__fs`.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// JSON, since an argument may contain any separator.
-		j, _, err := ldr.call(`JSON.stringify(__loader.hostArgs)`)
+		var j string
+		err := ldr.call(`JSON.stringify(__loader.hostArgs)`, func(v *qjs.Value) { j = v.String() })
 		return qc.NewString(j), err
 	}))
 	// The running host blob, which carries the realm engine and the host's crypto.
@@ -116,10 +115,9 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		now, err := ldr.stage(env)
-		if now {
-			el.stopped = true
-		}
+		var now bool
+		err = ldr.call(`__loader.stage(new Uint8Array(__a0))`, readBool(&now), env)
+		el.stopped = el.stopped || now
 		return nil, err
 	}))
 	b.SetPropertyStr("random", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
@@ -176,13 +174,15 @@ func main() {
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; os.Exit(0) }()
 	for {
-		if _, bootBlob, err = ldr.call(`__loader.choose()`); err != nil {
+		// A blob that is not bytes fails at boot, as a truncated one does.
+		if err := ldr.call(`__loader.choose()`, func(v *qjs.Value) { bootBlob, _ = v.Bytes() }); err != nil {
 			fatal("host slots", err)
 		}
 		again, err := runHost()
 		if err != nil {
 			// A pending host that fails is dropped, and the committed one boots instead.
-			if ldr.failed(err) {
+			var pending bool
+			if ldr.call(`__loader.failed(__a0)`, readBool(&pending), err.Error()) == nil && pending {
 				continue
 			}
 			fatal("seedkernel", err)
@@ -201,21 +201,13 @@ func runHost() (again bool, err error) {
 		return false, fmt.Errorf("boot: %w", err)
 	}
 	// No watchdog: the steps that can hang carry their own deadlines.
-	kind, out, msg, err := el.await("runMain()")
-	if err != nil {
+	var serving bool
+	if err := el.await("runMain()", readBool(&serving)); err != nil {
 		return false, err
 	}
-	if kind != 0 {
-		return false, errors.New(msg)
-	}
-	var st struct{ Serving bool }
-	if err := json.Unmarshal(out, &st); err != nil {
-		return false, err
-	}
-	// The loader answers whether a host staged meanwhile boots now.
-	s, _, err := ldr.call(`__loader.ended(__a0)`, st.Serving)
-	if err != nil || s == "true" || !st.Serving {
-		return s == "true", err
+	// A host staged meanwhile boots now; otherwise the loop runs while the node serves.
+	if err := ldr.call(`__loader.ended(__a0)`, readBool(&again), serving); err != nil || again || !serving {
+		return again, err
 	}
 	el.stopped = false
 	el.run()

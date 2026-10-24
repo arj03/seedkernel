@@ -5,6 +5,7 @@ package main
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -21,7 +22,7 @@ type eventLoop struct {
 	stopped bool
 
 	// onSettle is the in-flight await's result sink, which __settle routes into.
-	onSettle func(kind int, bytes []byte, msg string)
+	onSettle func(fulfilled bool, value *qjs.Value)
 
 	// stepTimer is step()'s reusable wait timer, stopped between turns.
 	stepTimer *time.Timer
@@ -94,19 +95,11 @@ func (el *eventLoop) install() {
 		}
 		return nil, nil
 	}))
-	// __settle(kind, value) settles the await in flight.
+	// __settle(fulfilled, value) settles the await in flight.
 	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		if el.onSettle == nil {
-			return nil, nil
+		if el.onSettle != nil {
+			el.onSettle(args[0].Int32() != 0, args[1])
 		}
-		var bytes []byte
-		var msg string
-		if b, e := args[1].Bytes(); e == nil {
-			bytes = b
-		} else {
-			msg = args[1].String()
-		}
-		el.onSettle(int(args[0].Int64()), bytes, msg)
 		return nil, nil
 	}))
 	// queueMicrotask and performance.now are the engine's own.
@@ -179,26 +172,32 @@ func (el *eventLoop) run() {
 }
 
 // await evaluates an async JS expression in the host realm and drives the loop until it
-// settles: kind 0 (fulfilled, bytes) or 1 (rejected, message). Awaits must not nest:
-// el.onSettle is a single slot.
-func (el *eventLoop) await(callExpr string) (kind int, value []byte, msg string, err error) {
-	kind = -1
-	el.onSettle = func(k int, bytes []byte, m string) {
-		kind, value, msg = k, bytes, m
+// settles. read takes the fulfilled value, borrowed for the call; a rejection is the error.
+// Awaits must not nest: el.onSettle is a single slot.
+func (el *eventLoop) await(callExpr string, read func(*qjs.Value)) error {
+	var rejected error
+	el.onSettle = func(fulfilled bool, v *qjs.Value) {
+		if fulfilled {
+			read(v)
+		} else {
+			rejected = errors.New(v.String())
+		}
 		el.stopped = true
 	}
 	defer func() { el.onSettle = nil }()
 
 	wrap := `(function(){ Promise.resolve(` + callExpr + `).then(` +
-		`(v) => __settle(0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
-		`(e) => __settle(1, String(e && e.message || e))); })();`
+		`(v) => __settle(true, v), (e) => __settle(false, String(e && e.message || e))); })();`
 	el.stopped = false
-	if _, err = el.c.Eval("<await>", wrap); err != nil {
-		return
+	done, err := el.c.Eval("<await>", wrap)
+	if err != nil {
+		return err
 	}
+	done.Free()
 	el.run()
-	if el.err != nil {
-		err, el.err = el.err, nil
+	if err := el.err; err != nil {
+		el.err = nil
+		return err
 	}
-	return
+	return rejected
 }

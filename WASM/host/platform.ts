@@ -20,7 +20,7 @@ import {
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE, WASM_PAGE_BYTES } from "./wasm-limits.js";
-import { enc, u8 } from "../services/util.js";
+import { u8 } from "../services/util.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
@@ -268,11 +268,11 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
 
   return {
     sodium, createRealm, standUp, channels, modules,
-    /** Run the operator flow. The loader reads back, as JSON bytes, whether to keep running. */
+    /** Run the operator flow. The loader reads back whether to keep running. */
     async runMain() {
       const { serving, close } = await runCli(cliHost());
       if (!serving) close();
-      return enc.encode(JSON.stringify({ serving }));
+      return serving;
     },
   };
 }

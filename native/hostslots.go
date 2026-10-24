@@ -61,17 +61,14 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 	l.qc.Global().SetPropertyStr("bridge", b)
 	j, err := json.Marshal(argv)
 	if err == nil {
-		_, _, err = l.call(loaderScript)
+		err = l.call(loaderScript, nil)
 	}
 	if err == nil {
-		_, _, err = l.call(`globalThis.__loader = new Loader(__fs, JSON.parse(__a0), new Uint8Array(__a1), __a2 || undefined,
-			bridge.log, bridge.after), 0`, string(j), genesis, os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
+		err = l.call(`globalThis.__loader = new Loader(__fs, JSON.parse(__a0), new Uint8Array(__a1), __a2 || undefined,
+			bridge.log, bridge.after)`, nil, string(j), genesis, os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
 	}
 	if err == nil {
-		var abi string
-		if abi, _, err = l.call(`PLATFORM_ABI`); err == nil {
-			l.abi, err = strconv.Atoi(abi)
-		}
+		err = l.call(`PLATFORM_ABI`, func(v *qjs.Value) { l.abi = int(v.Int32()) })
 	}
 	if err != nil {
 		rt.Close()
@@ -81,8 +78,8 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 }
 
 // call evaluates expr in turn with the other callers, with args (strings, bytes, bools)
-// as __a0…__aN, and answers its value as bytes when it is bytes, else as a string.
-func (l *loader) call(expr string, args ...any) (string, []byte, error) {
+// as __a0…__aN, and hands its value to read, borrowed for the call; nil ignores it.
+func (l *loader) call(expr string, read func(*qjs.Value), args ...any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	g := l.qc.Global()
@@ -105,25 +102,16 @@ func (l *loader) call(expr string, args ...any) (string, []byte, error) {
 	}()
 	v, err := l.qc.Eval("loader.js", expr)
 	if err != nil {
-		return "", nil, err
+		return err
 	}
 	defer v.Free()
-	if b, err := v.Bytes(); err == nil {
-		return "", b, nil
+	if read != nil {
+		read(v)
 	}
-	return v.String(), nil, nil
+	return nil
 }
 
-// failed reports whether a failure belongs to a pending host, which is then dropped: the
-// caller boots the committed host instead of giving up.
-func (l *loader) failed(err error) bool {
-	s, _, cerr := l.call(`__loader.failed(__a0)`, err.Error())
-	return cerr == nil && s == "true"
-}
-
-// stage keeps a host blob the running host checked as pending. Answers whether it should
-// boot now.
-func (l *loader) stage(env []byte) (bool, error) {
-	s, _, err := l.call(`__loader.stage(new Uint8Array(__a0))`, env)
-	return s == "true", err
+// readBool reads a JS boolean into out.
+func readBool(out *bool) func(*qjs.Value) {
+	return func(v *qjs.Value) { *out = v.Int32() != 0 }
 }

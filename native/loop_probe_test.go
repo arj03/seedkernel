@@ -112,17 +112,14 @@ func TestHostClockIsSubMillisecond(t *testing.T) {
 func TestAwaitIgnoresStaleSettle(t *testing.T) {
 	ensureBooted(t)
 
-	kind, _, msg, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([7])), 300)))`, 60*time.Millisecond)
-	if err != nil {
-		t.Fatal("abandoned await:", err)
-	}
-	if kind != 1 || msg != "await: timed out" {
-		t.Fatalf("first await: kind=%d msg=%q, want a time-out", kind, msg)
+	_, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([7])), 300)))`, 60*time.Millisecond)
+	if err == nil || err.Error() != "await: timed out" {
+		t.Fatalf("first await: err=%v, want a time-out", err)
 	}
 
-	kind, value, msg, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([1])), 500)))`, 5*time.Second)
-	if err != nil || kind != 0 {
-		t.Fatalf("second await: kind=%d msg=%q err=%v", kind, msg, err)
+	value, err := awaitWithin(`(new Promise(r => setTimeout(() => r(new Uint8Array([1])), 500)))`, 5*time.Second)
+	if err != nil {
+		t.Fatalf("second await: %v", err)
 	}
 	if len(value) != 1 || value[0] != 1 {
 		t.Fatalf("second await settled with %v — the abandoned await's result leaked into it", value)

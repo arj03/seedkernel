@@ -47,8 +47,7 @@ function teardown(): void {
 async function runHost(env: Uint8Array): Promise<boolean> {
   blob = env;
   runInThisContext(dec.decode(readHostBlob(env).script), { filename: "host.js" });
-  const out = await host.runMain();
-  return (JSON.parse(dec.decode(out)) as { serving: boolean }).serving;
+  return host.runMain();
 }
 
 /** Boot the loader's choice, falling back to the committed host when a pending one fails

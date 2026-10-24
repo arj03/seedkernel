@@ -123,7 +123,7 @@ export type PlatformUdp = RawDatagrams;
 
 /** What the host script defines for the loader to call. */
 export interface PlatformDispatchers {
-  /** Run the operator flow; answers `{"serving": bool}` as JSON bytes, and the loader keeps
-   *  running while serving. */
-  runMain(): Promise<Uint8Array>;
+  /** Run the operator flow; answers whether the node is serving, and the loader keeps
+   *  running while it is. */
+  runMain(): Promise<boolean>;
 }

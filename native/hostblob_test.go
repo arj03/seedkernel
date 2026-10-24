@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"seedkernel/qjs"
 )
 
 // The parts of a host blob's body, in order (WASM/host/host-blob.ts).
@@ -108,7 +110,8 @@ func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "pending.skb"), env, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, got, err := l.call(`__loader.choose()`)
+		var got []byte
+		err := l.call(`__loader.choose()`, func(v *qjs.Value) { got, _ = v.Bytes() })
 		if err != nil || string(got) != string(genesisHost) {
 			t.Fatalf("%s: the slots did not fall back on the genesis blob (%v)", what, err)
 		}
@@ -142,7 +145,8 @@ func TestLoaderFlags(t *testing.T) {
 	// call runs fn over argv as JSON, and reads its answer back into out.
 	call := func(fn string, argv []string, out any) error {
 		j, _ := json.Marshal(argv)
-		s, _, err := l.call(`JSON.stringify(`+fn+`(JSON.parse(__a0)))`, string(j))
+		var s string
+		err := l.call(`JSON.stringify(`+fn+`(JSON.parse(__a0)))`, func(v *qjs.Value) { s = v.String() }, string(j))
 		if err == nil {
 			err = json.Unmarshal([]byte(s), out)
 		}

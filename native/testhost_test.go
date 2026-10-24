@@ -268,10 +268,13 @@ func evalString(tb testing.TB, expr string) string {
 // awaitWithin is el.await under a deadline: past it the await rejects with "await: timed
 // out". The deadline is a JS race, so the call's own late settle goes to the race, never to
 // a later await.
-func awaitWithin(expr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
+func awaitWithin(expr string, timeout time.Duration) (value []byte, err error) {
 	ms := strconv.FormatInt(timeout.Milliseconds(), 10)
-	return el.await(`((p) => { let t; return Promise.race([p, new Promise((_, no) => {
-		t = setTimeout(() => no(new Error("await: timed out")), ` + ms + `); })]).finally(() => clearTimeout(t)); })(` + expr + `)`)
+	err = el.await(`((p) => { let t; return Promise.race([p, new Promise((_, no) => {
+		t = setTimeout(() => no(new Error("await: timed out")), `+ms+`); })]).finally(() => clearTimeout(t)); })(`+expr+`)`,
+		// Bytes, or none for anything else.
+		func(v *qjs.Value) { value, _ = v.Bytes() })
+	return value, err
 }
 
 // callRealm calls one of the host script's entry points with args staged as __a0…__aN, and
@@ -291,28 +294,15 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 			qc.Global().SetPropertyStr(slot, undef)
 		}
 	}()
-	kind, value, msg, err := awaitWithin(name+"("+strings.Join(slots, ",")+")", timeout)
-	if err != nil {
-		return nil, err
-	}
-	if kind != 0 {
-		return nil, errors.New(msg)
-	}
-	return value, nil
+	return awaitWithin(name+"("+strings.Join(slots, ",")+")", timeout)
 }
 
-// awaitOK drives the loop until expr settles and fails the test unless it fulfilled. Prefer
-// it to awaitWithin, which reports a rejection as kind 1 with a nil error, so an `err != nil`
-// check silently passes on the failure it was meant to catch. A test about a rejection or
-// timeout reads the kind instead (loop_probe_test.go).
+// awaitOK drives the loop until expr settles and fails the test unless it fulfilled.
 func awaitOK(tb testing.TB, what, expr string, timeout time.Duration) []byte {
 	tb.Helper()
-	kind, value, msg, err := awaitWithin(expr, timeout)
+	value, err := awaitWithin(expr, timeout)
 	if err != nil {
 		tb.Fatalf("%s: %v", what, err)
-	}
-	if kind != 0 {
-		tb.Fatalf("%s: kind=%d msg=%q", what, kind, msg)
 	}
 	return value
 }
