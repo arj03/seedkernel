@@ -130,17 +130,15 @@ func exposeBridge(qc *qjs.Context) {
 	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// The realm's console; stderr, since stdout is `--op`'s data channel.
 		fmt.Fprintln(os.Stderr, args[0].String())
-		return qc.NewUndefined(), nil
+		return nil, nil
 	}))
 	b.SetPropertyStr("stdout", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		bytes, err := args[0].View()
 		if err != nil {
 			return nil, err
 		}
-		if _, err := os.Stdout.Write(bytes); err != nil {
-			return nil, err
-		}
-		return qc.NewUndefined(), nil
+		_, err = os.Stdout.Write(bytes)
+		return nil, err
 	}))
 	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// `--op`'s argument, read whole and only on demand.

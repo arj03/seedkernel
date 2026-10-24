@@ -28,21 +28,22 @@ type sockChannel struct {
 	closeGrace time.Duration
 	cancelDial context.CancelFunc // aborts a connect in flight; nil on an accepted socket
 
-	wake    chan struct{} // cap 1: nudges the writer; coalesces bursts
+	wake     chan struct{} // cap 1: nudges the writer; coalesces bursts
 	readGate chan struct{} // one token permits one socket read
 }
 
-func newReadGate() chan struct{} {
-	gate := make(chan struct{}, 1)
-	gate <- struct{}{} // the first read may start immediately
-	return gate
+func newSockChannel(onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
+		wake: make(chan struct{}, 1), readGate: make(chan struct{}, 1)}
+	c.readGate <- struct{}{} // the first read may start immediately
+	return c
 }
 
 // newDialChannel returns a channel that connects in the background; sends queue until then.
 func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
+	c := newSockChannel(onMsg, onClose, closeGrace)
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace, cancelDial: cancel,
-		wake: make(chan struct{}, 1), readGate: newReadGate()}
+	c.cancelDial = cancel
 	go func() {
 		// Kernel-default socket buffers: setting SO_RCVBUF/SO_SNDBUF disables autotuning. No
 		// timeout of its own: a dial that never connects never reads, and the host's
@@ -70,8 +71,8 @@ func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte) boo
 // newInboundChannel wraps an accepted socket; the caller starts readLoop once the JS
 // channel is registered.
 func newInboundChannel(conn net.Conn, onMsg func([]byte) bool, onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
-		wake: make(chan struct{}, 1), readGate: newReadGate()}
+	c := newSockChannel(onMsg, onClose, closeGrace)
+	c.conn = conn
 	go c.writeLoop()
 	return c
 }

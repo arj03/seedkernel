@@ -107,13 +107,8 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	}))
 	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// A deliberate close never fires onClose, so the entry is dropped here.
-		id := args[0].Int64()
-		if ch := n.get(id); ch != nil {
-			graceful := len(args) >= 2 && args[1].Int32() != 0
-			ch.close(graceful)
-			n.mu.Lock()
-			delete(n.chans, id)
-			n.mu.Unlock()
+		if ch := n.take(args[0].Int64()); ch != nil {
+			ch.close(len(args) >= 2 && args[1].Int32() != 0)
 		}
 		return nil, nil
 	}))
@@ -125,6 +120,15 @@ func (n *netHost) get(id int64) *sockChannel {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.chans[id]
+}
+
+// take removes a channel from the table and answers it, or nil if it is gone.
+func (n *netHost) take(id int64) *sockChannel {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	ch := n.chans[id]
+	delete(n.chans, id)
+	return ch
 }
 
 // reserveInboundRead charges a read to the staging allowance (§16.1) before it is posted.
@@ -256,9 +260,7 @@ func (n *netHost) onClose(id int64) func() {
 	return func() {
 		n.el.post(func() {
 			// Dropped first, so a close from the JS handler is a no-op.
-			n.mu.Lock()
-			delete(n.chans, id)
-			n.mu.Unlock()
+			n.take(id)
 			n.invoke(n.fnClosed, n.qc.NewInt64(id))
 		})
 	}

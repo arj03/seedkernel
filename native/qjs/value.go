@@ -34,9 +34,6 @@ func (v *Value) Raw() uint64 {
 	return v.raw
 }
 
-// Context returns the value's owning context.
-func (v *Value) Context() *Context { return v.c }
-
 // Free releases the JSValue reference.
 func (v *Value) Free() {
 	if v == nil || v.raw == 0 {

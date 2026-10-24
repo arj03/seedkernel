@@ -23,7 +23,7 @@ type eventLoop struct {
 	// onSettle is the in-flight await's result sink, which __settle routes into.
 	onSettle func(kind int, bytes []byte, msg string)
 
-	// stepTimer is step()'s reusable wait timer.
+	// stepTimer is step()'s reusable wait timer, stopped between turns.
 	stepTimer *time.Timer
 
 	// err is a failed host-realm drain: a job that threw, or an unhandled rejection
@@ -57,7 +57,8 @@ func (h *timerHeap) Pop() any {
 
 // newEventLoop binds a loop to a QuickJS context and installs setTimeout/clearTimeout.
 func newEventLoop(c *qjs.Context) *eventLoop {
-	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256)}
+	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), stepTimer: time.NewTimer(0)}
+	el.stepTimer.Stop()
 	el.install()
 	return el
 }
@@ -76,10 +77,7 @@ func (el *eventLoop) install() {
 	g.SetPropertyStr("setTimeout", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		var ms int64
 		if len(args) >= 2 {
-			ms = args[1].Int64()
-		}
-		if ms < 0 {
-			ms = 0
+			ms = max(args[1].Int64(), 0)
 		}
 		el.nextID++
 		id := el.nextID
@@ -117,16 +115,6 @@ func (el *eventLoop) install() {
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
 func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 
-// armTimer (re)arms the loop's reusable wait timer for d; step() never re-enters.
-func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
-	if el.stepTimer == nil {
-		el.stepTimer = time.NewTimer(d)
-	} else {
-		el.stepTimer.Reset(d)
-	}
-	return el.stepTimer.C
-}
-
 // dispatch calls a retained JS callback and frees its result and `args`. A throw is the
 // callback's own failure, so it is logged under `who`, not returned.
 func dispatch(c *qjs.Context, who string, cb *qjs.Value, args ...*qjs.Value) {
@@ -163,11 +151,8 @@ func (el *eventLoop) step() {
 	}
 	var wait <-chan time.Time
 	if len(el.timers) > 0 {
-		d := time.Until(el.timers[0].deadline)
-		if d < 0 {
-			d = 0
-		}
-		wait = el.armTimer(d)
+		el.stepTimer.Reset(max(time.Until(el.timers[0].deadline), 0))
+		wait = el.stepTimer.C
 	}
 	select {
 	case task := <-el.tasks:

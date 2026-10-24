@@ -17,7 +17,6 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-
 // goFunc is a Go function exposed to JS via (*Context).Function. A call short of an
 // argument it indexes panics, which callGo turns into a JS exception.
 type goFunc = func(*Context, []*Value) (*Value, error)
@@ -48,7 +47,8 @@ type fnPool struct {
 	hasResult bool
 }
 
-// pooledFn is one resolved instance and its own value stack, reused by CallWithStack.
+// pooledFn is one resolved instance and its own value stack (wide enough for its params
+// and result), reused by CallWithStack.
 type pooledFn struct {
 	fn    api.Function
 	stack []uint64
@@ -291,7 +291,12 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	if len(args) != p.params {
 		panic(fmt.Errorf("qjs: call %s: %d arguments for %d parameters", name, len(args), p.params))
 	}
-	f := p.acquire(r, name)
+	var f pooledFn
+	if n := len(p.free); n > 0 {
+		f, p.free = p.free[n-1], p.free[:n-1]
+	} else {
+		f = pooledFn{fn: r.mod.ExportedFunction(name), stack: make([]uint64, max(p.params, 1))}
+	}
 	copy(f.stack, args)
 	err := f.fn.CallWithStack(r.ctx, f.stack)
 	res := f.stack[0]
@@ -315,25 +320,9 @@ func (r *Runtime) pool(name string) *fnPool {
 		}
 		def := fn.Definition()
 		p = &fnPool{params: len(def.ParamTypes()), hasResult: len(def.ResultTypes()) > 0}
-		p.free = append(p.free, p.instance(fn))
 		r.fnPools[name] = p
 	}
 	return p
-}
-
-// instance pairs a resolved export with a stack wide enough for its params and result.
-func (p *fnPool) instance(fn api.Function) pooledFn {
-	return pooledFn{fn: fn, stack: make([]uint64, max(p.params, 1))}
-}
-
-// acquire hands out a free instance, or resolves a new one.
-func (p *fnPool) acquire(r *Runtime, name string) pooledFn {
-	if n := len(p.free); n > 0 {
-		f := p.free[n-1]
-		p.free = p.free[:n-1]
-		return f
-	}
-	return p.instance(r.mod.ExportedFunction(name))
 }
 
 func (r *Runtime) mallocN(n int) uint64 {
@@ -398,7 +387,7 @@ func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 	case err != nil:
 		stack[0] = c.throwError(err)
 	case res == nil:
-		stack[0] = c.NewUndefined().Raw()
+		stack[0] = r.undefined
 	default:
 		stack[0] = res.Raw()
 	}
