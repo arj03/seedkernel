@@ -99,35 +99,11 @@ func exposeBridge(qc *qjs.Context) {
 	// The platform ABI this loader implements, which the host script checks first.
 	b.SetPropertyStr("abi", qc.NewInt32(int32(ldr.abi)))
 	b.SetPropertyStr("banner", qc.NewString("seedkernel-native"))
-	// The operator's world (host/cli.ts): arguments, files, stdio.
+	// The operator's world (host/cli.ts): arguments and stdio; its files are `__fs`.
 	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// JSON, since an argument may contain any separator.
 		j, _, err := ldr.call(`JSON.stringify(__loader.hostArgs)`)
 		return qc.NewString(j), err
-	}))
-	b.SetPropertyStr("readFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		fb, err := os.ReadFile(args[0].String())
-		if err != nil {
-			// Only absence maps to null; every other failure surfaces.
-			if errors.Is(err, os.ErrNotExist) {
-				return qc.NewNull(), nil
-			}
-			return nil, err
-		}
-		return qc.NewArrayBuffer(fb), nil
-	}))
-	b.SetPropertyStr("writeFile", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// Bytes borrowed last (qjs.Value.View).
-		path, mode := args[0].String(), os.FileMode(args[2].Int64())
-		bytes, err := args[1].View()
-		if err != nil {
-			return nil, err
-		}
-		// Atomic, so a torn write never replaces the freshness state.
-		if err := writeFileAtomic(path, bytes, mode); err != nil {
-			return nil, err
-		}
-		return qc.NewUndefined(), nil
 	}))
 	// The running host blob, which carries the realm engine and the host's crypto.
 	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {

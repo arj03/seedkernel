@@ -58,13 +58,13 @@ function fakeHost(argv, { listening = [], shell = {}, linkAvailable = true } = {
     lines,
     written,
     stood: null,
-    readFile(path) {
+    read(path) {
       if (written.has(path)) return written.get(path);
       // Only a missing file reads as absent (the `CliFiles` contract).
       try { return new Uint8Array(readFileSync(path)); }
       catch (e) { if (e.code === "ENOENT") return null; throw e; }
     },
-    writeFile(path, bytes) { written.set(path, bytes); },
+    write(path, bytes) { written.set(path, bytes); },
     log(line) { lines.push(line); },
     stdout(bytes) { host.out = bytes; },
     /** `--op`'s argument. None of these cases pipes one in, which matches what a real
@@ -202,7 +202,7 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
 {
   const keyPath = join(work, "unreadable.key");
   const host = fakeHost(["--key", keyPath]);
-  host.readFile = (path) => {
+  host.read = (path) => {
     if (path === keyPath) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
     return null;
   };
@@ -211,16 +211,16 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
   ok(msg.startsWith(`--key: cannot read ${keyPath}`) && host.written.size === 0 && host.stood === null,
     "an unreadable --key fails the boot and mints nothing over it");
 }
-// The Node binding keeps that contract, as native does (platform-node.ts `nodeFiles`). A
+// The Node binding keeps that contract, as native does (services/fs-node.ts `nodeRawFiles`). A
 // directory at the path is a portable read failure that cannot be mistaken for ENOENT.
 {
-  const { nodeFiles } = await imp("build/host/platform-node.js");
-  ok(nodeFiles.readFile(join(work, "never-written")) === null, "Node: only a missing file reads as absent");
+  const { nodeRawFiles } = await imp("build/services/fs-node.js");
+  ok(nodeRawFiles.read(join(work, "never-written"), 1024) === null, "Node: only a missing file reads as absent");
   const keyDir = mkdtempSync(join(work, "keydir-"));
-  throws(() => nodeFiles.readFile(keyDir), "Node: a path that exists and cannot be read throws");
+  throws(() => nodeRawFiles.read(keyDir, 1024), "Node: a path that exists and cannot be read throws");
   const host = fakeHost(["--key", keyDir]);
-  host.readFile = nodeFiles.readFile;
-  host.writeFile = nodeFiles.writeFile;
+  host.read = nodeRawFiles.read;
+  host.write = nodeRawFiles.write;
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
   const temps = readdirSync(work).filter((n) => n.startsWith(basename(keyDir) + ".") && n.endsWith(".tmp"));

@@ -445,12 +445,12 @@ async function testFs() {
   }
 
   // A cold store must seed its byte total before concurrent mutations start changing it.
-  // Only same-file mutations need ordering, and a failed write must not poison the queue
+  // Mutations keep their call order, and a failed write must not poison later ones
   // or touch the value it was replacing.
-  const disk = (await import("node:fs/promises")).default;
+  const disk = (await import("node:fs")).default;
   const { syncBuiltinESMExports } = await import("node:module");
   const cachedDir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-cached-"));
-  const write = disk.writeFile;
+  const write = disk.writeFileSync;
   try {
     await write(pjoin(cachedDir, "existing"), new Uint8Array(17));
     await write(pjoin(cachedDir, "other"), new Uint8Array(2));
@@ -476,9 +476,9 @@ async function testFs() {
     assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: shrinking and deleting adjust the total");
 
     // A write torn partway through: it lands in the temp file, never on the key's own.
-    disk.writeFile = async (path, data, ...args) => {
+    disk.writeFileSync = (path, data, ...args) => {
       if (path.startsWith(pjoin(cachedDir, "~existing."))) {
-        await write(path, data.subarray(0, 3), ...args);
+        write(path, data.subarray(0, 3), ...args);
         throw new Error("injected failure after partial write");
       }
       return write(path, data, ...args);
@@ -490,7 +490,7 @@ async function testFs() {
     assertEqual((await fs.get("existing"))?.length, 5, "NodeFs: a torn write leaves the old value in place");
     assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: a torn write leaves the accounting unchanged");
     assert(!readdirSync(cachedDir).some((n) => n.startsWith("~")), "NodeFs: a torn write leaves no temp file");
-    disk.writeFile = write;
+    disk.writeFileSync = write;
     syncBuiltinESMExports();
     await fs.put("existing", new Uint8Array(8));
     assertEqual((await fs.stat()).used, 8 + 2 + 528, "NodeFs: a failed write does not poison later writes");
@@ -500,7 +500,7 @@ async function testFs() {
     assertEqual((await new NodeFs(cachedDir).stat()).used, (await fs.stat()).used, "NodeFs: reopening reconstructs the same total");
     assert(!readdirSync(cachedDir).includes("~put-block-0"), "NodeFs: reopening reclaims an orphaned temp file");
   } finally {
-    disk.writeFile = write;
+    disk.writeFileSync = write;
     syncBuiltinESMExports();
     rmSync(cachedDir, { recursive: true, force: true });
   }
@@ -1048,7 +1048,7 @@ async function testWrongTypedStoreIsRefused() {
   // malformed or unreadable state. A directory at the file path is a portable read failure
   // that cannot be mistaken for ENOENT.
   const { freshnessStoreFor } = await imp("build/host/cli.js");
-  const { nodeFiles } = await imp("build/host/platform-node.js");
+  const { nodeRawFiles } = await imp("build/services/fs-node.js");
   const { freshnessPathFor } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1057,15 +1057,15 @@ async function testWrongTypedStoreIsRefused() {
   const dataDir = pjoin(dir, "data");
   const path = freshnessPathFor(dataDir);
   try {
-    freshnessStoreFor(nodeFiles, dataDir); // genuine absence
+    freshnessStoreFor(nodeRawFiles, dataDir); // genuine absence
     writeFileSync(path, "not json");
     let malformed = false;
-    try { freshnessStoreFor(nodeFiles, dataDir); } catch { malformed = true; }
+    try { freshnessStoreFor(nodeRawFiles, dataDir); } catch { malformed = true; }
     assert(malformed, "Node refuses a malformed freshness file");
     rmSync(path);
     mkdirSync(path);
     let unreadable = false;
-    try { freshnessStoreFor(nodeFiles, dataDir); } catch { unreadable = true; }
+    try { freshnessStoreFor(nodeRawFiles, dataDir); } catch { unreadable = true; }
     assert(unreadable, "Node refuses freshness read errors other than file-not-found");
   } finally {
     rmSync(dir, { recursive: true, force: true });

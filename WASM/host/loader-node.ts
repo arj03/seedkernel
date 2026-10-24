@@ -8,7 +8,8 @@
 
 import { runInThisContext } from "node:vm";
 import { dec, errMessage } from "../services/util.js";
-import { nodeFiles, nodePlatform } from "./platform-node.js";
+import { nodePlatform } from "./platform-node.js";
+import { nodeRawFiles } from "../services/fs-node.js";
 import { readHostBlob } from "./host-blob.js";
 import { packageHostBlob } from "./crypto-node.js";
 import { Loader } from "./slots.js";
@@ -75,7 +76,7 @@ async function restart(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  loader = new Loader(nodeFiles, process.argv.slice(2), genesis, process.env.SEEDKERNEL_HOST_HEALTH_MS,
+  loader = new Loader(nodeRawFiles, process.argv.slice(2), genesis, process.env.SEEDKERNEL_HOST_HEALTH_MS,
     (line) => { console.error("  host   " + line); },
     (ms, fn) => { loaderSetTimeout(fn, ms).unref(); });
   Object.assign(globalThis, {

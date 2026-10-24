@@ -15,16 +15,13 @@ import (
 
 // writeFileAtomic writes b via a sibling temp file and rename: atomic but not fsynced, so a
 // crash leaves the old file or the new one, and perhaps the temp, whose name starts with
-// `~`. Mode 0 keeps CreateTemp's 0600.
-func writeFileAtomic(path string, b []byte, mode os.FileMode) error {
+// `~`. CreateTemp makes it 0600: readable by this user alone.
+func writeFileAtomic(path string, b []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "~"+filepath.Base(path)+".*")
 	if err != nil {
 		return err
 	}
 	_, err = tmp.Write(b)
-	if err == nil && mode != 0 {
-		err = tmp.Chmod(mode)
-	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -75,7 +72,7 @@ func exposeFs(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		return nil, writeFileAtomic(path, b, 0o644)
+		return nil, writeFileAtomic(path, b)
 	}))
 	o.SetPropertyStr("remove", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		return qc.NewBool(os.Remove(args[0].String()) == nil), nil

@@ -6,7 +6,7 @@
 // may answer asynchronously.
 import { policyFromJson } from "./policy.js";
 import { moduleSet, type PureModuleLoader } from "./bundle.js";
-import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { freshnessStoreFor, runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "../services/peer-addr.js";
 import { bootShell } from "./shell-core.js";
 import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.js";
@@ -222,16 +222,6 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   };
   // Otherwise private modules in the loader's own isolates.
   const modules = bridge.engineCallBounded ? engineModules : bridge.modules!;
-  /** `CliFiles` over the platform's operator files. A read throws for anything but a
-   *  missing file; a write throws when it fails, which `FreshnessMarks` relies on to roll
-   *  back. */
-  const cliFiles: CliFiles = {
-    readFile(path) {
-      const r = bridge.readFile(path);
-      return r === null ? null : u8(r);
-    },
-    writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
-  };
   const tcp = net && tcpChannels(net);
   const channels = () => {
     if (!tcp) throw new Error("host: this platform has no sockets; pass transport.channels");
@@ -244,7 +234,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     return bootShell({
       sodium, identity: cfg.identity, modules, fs: new FilesFs(files, cfg.dir), admit,
       createRealm,
-      freshnessStore: freshnessStoreFor(cliFiles, cfg.dir),
+      freshnessStore: freshnessStoreFor(files, cfg.dir),
       // The network as configured, over the platform's sockets unless the caller brings
       // its own.
       transport: cfg.transport && {
@@ -267,7 +257,8 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   // ── the operator flow ──────────────────────────────────────────────────────────
   /** This platform as `cli.ts` needs it; cli.ts makes every decision. */
   const cliHost = (): CliHost => ({
-    ...cliFiles,
+    read: (path, maxBytes) => files.read(path, maxBytes),
+    write: (path, bytes) => files.write(path, bytes),
     banner: bridge.banner,
     argv: JSON.parse(bridge.argv()) as string[],
     log(line) { bridge.log(line); },

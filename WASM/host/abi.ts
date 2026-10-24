@@ -32,10 +32,6 @@ export interface PlatformBridge {
 
   /** Process arguments after the program name, as a JSON array. */
   argv(): string;
-  /** Read a whole file; `null` only when absent. Other read failures throw. */
-  readFile(path: string): Bytes | null;
-  /** Write a whole file atomically; `mode` 0 keeps the platform default. */
-  writeFile(path: string, bytes: Uint8Array, mode: number): void;
   /** One diagnostic line on stderr; stdout is the data channel. */
   log(line: string): void;
   /** Raw bytes on stdout. */
@@ -88,7 +84,8 @@ export interface PlatformBridge {
   stageHost(blob: Uint8Array): Maybe<void>;
 }
 
-/** Whole files by path, which the node's store (services/fs-files.ts) is kept in. */
+/** Whole files by path: the node's store (services/fs-files.ts), and the operator's files
+ *  (the key, the freshness marks and what the flags name, cli.ts). */
 export type PlatformFs = RawFiles;
 
 /** Byte streams (§12.1). Reads arrive through `events.deliver`, one per `resume`. */

@@ -3,64 +3,18 @@
 // blob's script on it (loader-node.ts), and the Node library runs the same host in-process
 // (shell-node.ts).
 
-import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
-import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
+import { nodeRawFiles } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { EMPTY, errMessage } from "../services/util.js";
 import { webBridge } from "./platform-web.js";
 import { packageHostBlob } from "./crypto-node.js";
-import type { CliFiles } from "./cli.js";
-import type { SlotFiles } from "./slots.js";
 import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type NetDispatchers, type PlatformBridge, type PlatformNet } from "./abi.js";
 
 /** The process's own timer, which a loader's teardown of host timers never reaches. */
 const platformSetTimeout = globalThis.setTimeout;
-
-/** Write a whole file or none, as `nodeRawFiles` does. Synchronous, because it writes state
- *  a node cannot boot without: the key file, the freshness marks and the host slots. */
-function writeFileAtomic(path: string, data: Uint8Array, mode?: number): void {
-  const tmp = tempBeside(path);
-  try {
-    writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
-    renameSync(tmp, path);
-  } catch (err) {
-    try { unlinkSync(tmp); } catch { /* never written */ }
-    throw err;
-  }
-}
-
-/** Node's synchronous files: the operator's (cli.ts `CliFiles`) and the loader's slots
- *  (slots.ts `SlotFiles`). Only a missing file reads as `null`, as on the native target; an
- *  unreadable one throws, or the `--key` first-boot path would overwrite it. */
-export const nodeFiles: CliFiles & SlotFiles = {
-  readFile(path) {
-    try { return new Uint8Array(readFileSync(path)); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
-      throw e;
-    }
-  },
-  writeFile: writeFileAtomic,
-  mkdir: (dir) => { mkdirSync(dir, { recursive: true }); },
-  read(path, maxBytes) {
-    let size: number;
-    try { size = statSync(path).size; } catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
-      throw e;
-    }
-    if (size > maxBytes) throw new Error(`fs: ${path} is larger than ${maxBytes} bytes`);
-    return new Uint8Array(readFileSync(path));
-  },
-  write: (path, bytes) => { writeFileAtomic(path, bytes); },
-  remove(path) {
-    try { unlinkSync(path); return true; } catch { return false; }
-  },
-  size(path) {
-    try { return statSync(path).size; } catch { return -1; }
-  },
-};
 
 /** What a Node platform's owner supplies: the loader's part of the bridge. Left out, it is
  *  a library node's: no arguments, the package's own host blob, and no updates. */
@@ -79,8 +33,6 @@ export function nodePlatform(o: NodePlatformOptions = {}): Required<Platform> & 
     abi: PLATFORM_ABI,
     banner: "seedkernel-shell",
     argv: o.argv ?? (() => "[]"),
-    readFile: (path) => nodeFiles.readFile(path),
-    writeFile: (path, bytes, mode) => nodeFiles.writeFile(path, bytes, mode === 0 ? undefined : mode),
     log: (line) => { console.error(line); },
     stdout: (bytes) => { process.stdout.write(bytes); },
     // Whatever was piped in, or empty. Reading fd 0 throws instead of blocking when stdin

@@ -164,22 +164,18 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
 export interface BrowserPlatformOptions {
   /** The host blob the page is served (build/host.skb): its realm engine and its crypto. */
   hostBlob: Uint8Array;
-  /** Where the node's `fs` keeps its files. Default: memory, gone with the page. */
+  /** Where the node keeps its files: its `fs`, and the freshness marks beside it. Default:
+   *  memory, gone with the page. */
   files?: RawFiles;
 }
 
 /** A page's platform, and the release of every module and instance its host holds. */
 export function browserPlatform(o: BrowserPlatformOptions): Platform & { teardown(): void } {
   const web = webBridge();
-  /** What `standUp` keeps beside the store (the freshness marks), which it reads in the
-   *  call, so in memory. */
-  const operator = new Map<string, Uint8Array>();
   const bridge: PlatformBridge = {
     abi: PLATFORM_ABI,
     banner: "seedkernel-browser",
     argv: () => "[]",
-    readFile: (path) => operator.get(path) ?? null,
-    writeFile: (path, bytes) => { operator.set(path, bytes.slice()); },
     log: (line) => { console.log(line); },
     stdout: () => {},
     stdin: () => EMPTY,

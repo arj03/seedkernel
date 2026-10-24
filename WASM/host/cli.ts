@@ -1,7 +1,8 @@
 // The operator side of a node, shared by every target: flags, defaults, deny-all without
 // `--policy` (§14), remedies before the bundle (§12.5), which failures are fatal, and the
 // console output. A `CliHost` supplies only what differs per target.
-import { toHex, fromHex, isHex64, errMessage, enc, dec } from "../services/util.js";
+import { toHex, fromHex, isHex64, errMessage, enc, dec, u8 } from "../services/util.js";
+import type { RawFiles } from "../services/fs-files.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subkeys.js";
 import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
 import { OpArgs, writeOp } from "../services/op-frame.js";
@@ -22,13 +23,10 @@ const FLAGS = new Set([
   "guest-timeout", "guest-memory", "transport",
 ]);
 
-/** File access. A read returns `null` only for a missing file and throws otherwise, since
- *  an unreadable key file taken as a first boot would get a new identity written over it.
- *  Writes are atomic. */
-export interface CliFiles {
-  readFile(path: string): Uint8Array | null;
-  writeFile(path: string, bytes: Uint8Array, mode?: number): void;
-}
+/** The platform's files (abi.ts `PlatformFs`). A read returns `null` only for a missing
+ *  file and throws otherwise, since an unreadable key file taken as a first boot would get
+ *  a new identity written over it. Writes are atomic and private to this user. */
+export type CliFiles = Pick<RawFiles, "read" | "write">;
 
 /** What a node needs once the flags are read: the store, the policy, and `bootShell`'s
  *  own options. Each target builds the rest from its own parts (`standUp`). An embedder
@@ -114,8 +112,11 @@ function parseListen(v: string): ListenAddress[] {
 
 /** Read a file the operator named, naming the flag on failure; `null` when absent. */
 function readNamed(files: CliFiles, path: string, label: string): Uint8Array | null {
-  try { return files.readFile(path); }
-  catch (e) { throw new Error(`${label}: cannot read ${path}: ${errMessage(e)}`, { cause: e }); }
+  // The operator's own files, so no cap.
+  try {
+    const b = files.read(path, Number.MAX_SAFE_INTEGER);
+    return b === null ? null : u8(b);
+  } catch (e) { throw new Error(`${label}: cannot read ${path}: ${errMessage(e)}`, { cause: e }); }
 }
 
 /** `readNamed` for a file that must exist. */
@@ -154,23 +155,22 @@ export function parseHex32(hex: string, label: string): Uint8Array {
   return fromHex(trimmed);
 }
 
-/** Load the master seed from `--key`, or create one and save it 0600, then derive the
+/** Load the master seed from `--key`, or create one and save it, then derive the
  *  node's keypair from it (§12.6.2b). The master itself signs nothing. */
 function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   const existing = readNamed(host, keyPath, "--key");
   if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(dec.decode(existing), `--key ${keyPath}`));
   const master = host.sodium.randombytes_buf(32);
-  host.writeFile(keyPath, enc.encode(toHex(master)), 0o600);
+  host.write(keyPath, enc.encode(toHex(master)));
   return deriveNodeKey(host.sodium, master);
 }
 
 /** The freshness store (§12.4) beside the data directory. An unreadable file fails the
- *  boot instead of dropping every mark and revocation. Writes are atomic and 0600. */
+ *  boot instead of dropping every mark and revocation. */
 export function freshnessStoreFor(files: CliFiles, dir: string): FreshnessMarks {
   const path = freshnessPathFor(dir);
   const raw = readNamed(files, path, "freshness store");
-  return new FreshnessMarks(raw === null ? null : dec.decode(raw),
-    (json) => files.writeFile(path, enc.encode(json), 0o600));
+  return new FreshnessMarks(raw === null ? null : dec.decode(raw), (json) => files.write(path, enc.encode(json)));
 }
 
 /** The console line a load prints (§12.4, §12.10): label, version, author and claims.
