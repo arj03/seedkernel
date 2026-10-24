@@ -52,6 +52,19 @@ assert(transportVerified.guestSource === currentTransportGuest,
 // though the repo checks out LF, so the assembler normalizes; otherwise the same commit
 // could sign different bytes depending on who built it.
 assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its signed bytes are the same on every platform");
+// CHANNEL §10 invariant 15: the identity key never meets X25519. The guest holds no identity
+// secret, so what a convenient refactor could lose is a DH taking a non-ephemeral scalar or
+// an identity public key, the Ed25519-to-Curve25519 shortcut. Every DH is the `scalarmult`
+// helper over this end's own ephemeral, and nothing else reaches the host's DH.
+{
+  const dh = [...currentTransportGuest.matchAll(/(?<!function )\bscalarmult\(([^,()]*),\s*([^()]*?)\)/g)]
+    .map(([, sk, pk]) => [sk.trim(), pk.trim()]);
+  assert(dh.length > 0 && dh.every(([sk]) => sk === "sk" || sk === "this.myEph.privateKey"),
+    `every X25519 in the transport runs on an ephemeral scalar (${dh.map(([sk]) => sk).join(", ")})`);
+  assert(dh.every(([, pk]) => !/ownPk|peerPubkey|dialedPeerId|\bid[RI]\b/.test(pk)),
+    `no X25519 in the transport takes an identity key (${dh.map(([, pk]) => pk).join(", ")})`);
+  assert(currentTransportGuest.split("P_DH").length - 1 === 2, "only the scalarmult helper names crypto/x25519/dh");
+}
 assert(JSON.stringify(transportVerified.manifest.guest.config) === JSON.stringify(TRANSPORT_APP_CONFIG),
   "the shipped transport manifest signs the guest's complete default configuration");
 // The artifact is PQ-signed (§14.1): one hybrid suite, and the author id in a policy is a

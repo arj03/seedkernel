@@ -404,13 +404,15 @@ limits the *retroactive* damage.
 12. A member authenticates under a sustained flood, credentialled or not.
 13. A proved msg1 is spent: a replay draws the same silence a wrong secret draws.
 14. A full authed budget sheds the quietest link, never one carrying traffic.
-15. The channel Ed25519 key is never an argument to `crypto_scalarmult`. Worth a grep test
-    in CI: it is the invariant most likely to be lost to a convenient refactor.
+15. The channel Ed25519 key is never an argument to `crypto_scalarmult`: it is the
+    invariant most likely to be lost to a convenient refactor.
 
-All but 15 are covered by `tests/transport-link.test.mjs` and
-`tests/transport-load.test.mjs`, which pin them against the shipped transport bundle
-(through the real host stack, over an instrumented in-process channel) rather than against
-a library object a test could hold.
+1–14 are covered by `tests/transport-link.test.mjs` and `tests/transport-load.test.mjs`,
+which pin them against the shipped transport bundle (through the real host stack, over an
+instrumented in-process channel) rather than against a library object a test could hold.
+15 is a check of the signed guest source in `tests/transport-bundle.test.mjs`: every X25519
+runs on an ephemeral scalar, none takes an identity key, and only the one helper reaches the
+host's DH.
 
 **Where 5 lives, and why it is easy to lose.** The receiver's half is structural: msg2 has
 no field for its key. The caller's half is one check in `onMsg2`: the signature is verified

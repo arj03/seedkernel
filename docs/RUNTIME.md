@@ -363,6 +363,8 @@ FRAME       [AEAD record ..]                                          only after
 ```
 
 ```
+H(x)    = BLAKE2b-256(x), unkeyed; ‖ is concatenation
+KDF(ikm, ctx, label) = H(ikm ‖ ctx ‖ label)
 root    = H(DOMAIN_channel ‖ network_key)
 k_probe = KDF(contact, H(root ‖ suite ‖ eph_i ‖ kem_pk_i), LABEL_probe)
 h1      = H(root ‖ msg1)
@@ -375,13 +377,18 @@ h2      = H(h1 ‖ msg2)
 k3      = KDF(ee ‖ pq ‖ contact, h2, LABEL_msg3)
 sig_i   = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
 h3      = H(h2 ‖ msg3)
-k_i2r, k_r2i = KDF(ee ‖ pq ‖ contact, h3, "…i->r-v1\0" / "…r->i-v1\0")
+k_i2r   = KDF(ee ‖ pq ‖ contact, h3, LABEL_i2r)
+k_r2i   = KDF(ee ‖ pq ‖ contact, h3, LABEL_r2i)
 
 Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   (node/sign; the prefix is the host's)
+
+LABEL_probe = "seedkernel-c-probe-v1\0"         LABEL_i2r   = "seedkernel-session-i->r-v1\0"
+LABEL_msg2  = "seedkernel-c-msg2-v1\0"          LABEL_r2i   = "seedkernel-session-r->i-v1\0"
+LABEL_msg3  = "seedkernel-c-msg3-v1\0"          LABEL_rekey = "seedkernel-session-rekey-v1\0"
 ```
 
 - **Parsing is by state.** The initiator reads msg2, the responder msg1 then msg3, and everything after authentication is a record. Each handshake message is accepted only at its exact width.
-- **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret and network key are KDF inputs.
+- **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret and network key are KDF inputs. An all-zero X25519 result (a low-order point: `crypto/x25519/dh` answers `ok = 0`) or a KEM call the module refuses is a refusal like a seal that does not open: silence, on either side, the initiator at msg2 included.
 - **Suite `0x03`** is the only suite: Ed25519 identity, ephemeral X25519 + ML-KEM-768, contact secret, ChaCha20-Poly1305 records. An unrecognised id draws silence. There is no list, fallback or negotiation. `suite` is folded into `h1`, so both signatures cover it.
 - **A dial pins its peer, and the receiver's key never travels.** `sig_r` is checked against the key the caller dialed; `id_r` is in the signed message but not on the wire. A signature under any other key, including the caller's own, closes the link before the caller names itself.
 - **Ordering.** An accepting node sends nothing until a msg1 opens under its contact secret, or under none from a caller it welcomes (§12.6.3). The receiver proves itself at msg2; the caller names itself at msg3, only to a receiver it has verified.
@@ -392,9 +399,9 @@ Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)   (node/sign; the prefix is the host'
 
 #### 12.6.1 Records and link teardown
 
-- Every post-handshake frame is a ChaCha20-Poly1305-IETF record: the initiator seals with `k_i2r` and opens with `k_r2i`, the responder mirrors. There is one post-handshake frame type.
-- The nonce is an implicit per-direction `(epoch, counter)`, strictly enforced on receive; a bad tag or out-of-order counter tears the link down. After `REKEY_AFTER_FRAMES` a direction ratchets its key; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
-- Only `close()` emits the authenticated end-of-stream record; every failure path is silent. The record goes out behind what was handed to the link before the close, so a frame sent and a peer forgotten right after still arrives; a failure drops what was waiting.
+- Every post-handshake frame is a ChaCha20-Poly1305-IETF record with no associated data: the initiator seals with `k_i2r` and opens with `k_r2i`, the responder mirrors. There is one post-handshake frame type.
+- The nonce is an implicit per-direction `(epoch, counter)`, never sent: the 12 bytes `epoch u32 ‖ 0x00000000 ‖ counter u32`, both starting at 0. It is strictly enforced on receive, and the receiving counter advances only on a record that opens; a bad tag or out-of-order counter tears the link down. After `REKEY_AFTER_FRAMES` records a direction ratchets, `k ← H(k ‖ LABEL_rekey)`, advancing the epoch and restarting the counter at 0; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
+- Only `close()` emits the authenticated end-of-stream record, a record with an empty plaintext (its 16-byte tag alone); an application frame is never empty, so the two cannot be confused. Every failure path is silent. The record goes out behind what was handed to the link before the close, so a frame sent and a peer forgotten right after still arrives; a failure drops what was waiting.
 - A graceful `link/close` asks the socket to flush its queued bytes before closing, bounded on TCP by `TCP_LINGER_MS` (`services/net-limits.ts`).
 - Records assume an ordered whole-message pipe, which every socket seam supplies.
 
