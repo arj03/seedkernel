@@ -5,7 +5,7 @@ import {
   DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_SCRATCH_SIZE,
 } from "./wasm-limits.js";
-import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
+import { MODULE_FAILED, moduleSet, type ModuleResult, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { errMessage } from "../services/util.js";
 
@@ -179,25 +179,13 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── installing WASM modules ─────────────────────────────────────────
 
-  /** Build one slot's modules, all or none (§3.1), their workers loading side by side. A
-   *  re-install replaces the whole map. Names and bytes were checked at install (bundle.ts). */
-  async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
-    const spawned = await Promise.allSettled(mods.map((m) => this.spawn(m.wasm)));
-    const built = new Map<string, WasmModuleRef>();
-    spawned.forEach((r, i) => { if (r.status === "fulfilled") built.set(mods[i].name, r.value); });
-    const failed = spawned.find((r) => r.status === "rejected");
-    if (failed) {
-      // Release what this attempt started, so a refused bundle leaves no orphaned workers.
-      for (const ref of built.values()) this.teardown(ref);
-      throw failed.reason;
-    }
-    return {
-      call: (name, payload, deadlineMs) => this.callModule(built, name, payload, deadlineMs),
-      dispose: () => {
-        for (const ref of built.values()) this.teardown(ref);
-        built.clear();
-      },
-    };
+  /** Build one slot's modules, all or none (§3.1), their workers loading side by side, so a
+   *  refused bundle leaves no orphaned workers. Names and bytes were checked at install
+   *  (bundle.ts). */
+  build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
+    return moduleSet(mods, (wasm) => this.spawn(wasm),
+      (ref, payload, deadlineMs) => this.callModule(ref, payload, deadlineMs),
+      (ref) => this.teardown(ref));
   }
 
   /** Start a module's worker. The load path has already applied the §4.3 memory ceiling
@@ -220,9 +208,13 @@ export class ModuleTable implements PureModuleLoader {
    *  because instantiation runs the start section and could otherwise hang install. */
   private async load(ref: WasmModuleRef): Promise<ModuleWorker> {
     const worker = await spawnWorker(moduleWorkerSrc());
-    // The ref may have been released while this was spawning; attaching the worker now
-    // would leave it running with nothing able to kill it.
-    if (ref.dead) { worker.kill(); throw new Error("table: module was released while it loaded"); }
+    /** Kill what this load spawned once the ref is released, since nothing else can. */
+    const released = () => {
+      worker.kill();
+      return new Error("table: module was released while it loaded");
+    };
+    // Released while this was spawning.
+    if (ref.dead) throw released();
     ref.worker = worker;
     // Keep the loop open during the load, as during a call: an unbounded table arms no
     // load timer, and the caller is waiting on it.
@@ -267,31 +259,30 @@ export class ModuleTable implements PureModuleLoader {
     // Loaded and idle, so stop holding the loop open. (Every failure path above killed the
     // worker.)
     worker.keepAlive(false);
-    // Released while the load was in flight: `teardown` had no worker to kill, so kill it
-    // here.
-    if (ref.dead) { ref.worker = null; worker.kill(); throw new Error("table: module was released while it loaded"); }
+    // Released while the load was in flight.
+    if (ref.dead) {
+      ref.worker = null;
+      throw released();
+    }
     // After the load, an engine crash (not a wasm trap, which the worker reports as a null
     // result) fails the in-flight call with an empty answer, and the next call loads a
     // fresh worker.
     worker.onError(() => {
       if (ref.worker !== worker) return;
       ref.worker = null;
-      answer(ref, { bytes: null, ms: 0 });
+      answer(ref, MODULE_FAILED);
     });
     return worker;
   }
 
-  // ─── public API ──────────────────────────────────────────────────────
+  // ─── calls ───────────────────────────────────────────────────────────
 
-  /** Invoke one module in this private set, returning its response bytes or null (§4).
-   *  The set is already per slot, so lookup is by module name alone. `deadlineMs` is the
+  /** Invoke one module, returning its response bytes or null (§4). `deadlineMs` is the
    *  call's whole budget; past it the call answers empty and the worker is killed and
    *  respawned, so a module that never returns fails like a trap. A guest's call carries
    *  its own remaining segment (§4.3). */
-  private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult> {
-    const w = modules.get(module);
-    if (!w) return { bytes: null, ms: 0 };
-    if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
+  private async callModule(w: WasmModuleRef, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult> {
+    if (payload.length > w.scratchSize) return MODULE_FAILED;
     const bound = deadlineMs ?? this.deadlineMs;
     // Payload bytes are accounted by the realm's `ActiveHostCalls` ledger under the
     // enclosing `host.call` (§12.3). Execution is accounted here: one in-flight call per
@@ -305,12 +296,15 @@ export class ModuleTable implements PureModuleLoader {
    *  failed reload and a deadline kill all give the same empty answer a trap does. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
     // Released while this call waited its turn: loading would start a worker only to kill it.
-    if (w.dead) return { bytes: null, ms: 0 };
+    if (w.dead) return MODULE_FAILED;
     // After a kill or crash there is no worker, so load a fresh instance with clean state.
     // Calls chain on `tail`, so this is the only load in flight. A failed load has killed
     // what it spawned; this call answers empty and the next one retries.
     const worker = w.worker ?? await this.load(w).catch(() => null);
-    if (worker === null) { w.worker = null; return { bytes: null, ms: 0 }; }
+    if (worker === null) {
+      w.worker = null;
+      return MODULE_FAILED;
+    }
     // Own an exact-sized, transferable buffer even when the caller passed a Node Buffer.
     const input = new Uint8Array(payload);
     // Hold the loop open for the call, since an unbounded call arms no timer.
@@ -343,7 +337,7 @@ export class ModuleTable implements PureModuleLoader {
     // Mark first: a load may be in flight, and when it finishes it must kill what it
     // spawned instead of attaching it.
     ref.dead = true;
-    answer(ref, { bytes: null, ms: 0 });
+    answer(ref, MODULE_FAILED);
     ref.worker?.kill();
     ref.worker = null;
   }

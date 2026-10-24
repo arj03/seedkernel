@@ -22,7 +22,7 @@
 // safe; a console peer passes its own `peerConnectionFactory`.
 import { MessageChannel } from "./net-channel.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
-import { enc, dec } from "./util.js";
+import { enc, dec, isRecord } from "./util.js";
 
 export interface RtcNetworkOptions {
   /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
@@ -92,7 +92,7 @@ function parseRtcDest(dest: string): { offer: boolean; config?: RTCConfiguration
   if (q < 0) return { offer: role === "rtc:offer" };
   let config: unknown;
   try { config = JSON.parse(dest.slice(q + 1)); } catch { return null; }
-  if (typeof config !== "object" || config === null || Array.isArray(config)) return null;
+  if (!isRecord(config)) return null;
   return { offer: role === "rtc:offer", config: config as RTCConfiguration };
 }
 

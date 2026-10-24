@@ -10,7 +10,7 @@
 import { ModuleTable } from "./module-table.js";
 import { readHostBlob } from "./host-blob.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
-import { dec } from "../services/util.js";
+import { dec, EMPTY } from "../services/util.js";
 import type { PureModules } from "./bundle.js";
 import type { EngineExport, EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
@@ -182,7 +182,7 @@ export function browserPlatform(o: BrowserPlatformOptions): Platform & { teardow
     writeFile: (path, bytes) => { operator.set(path, bytes.slice()); },
     log: (line) => { console.log(line); },
     stdout: () => {},
-    stdin: () => new Uint8Array(0),
+    stdin: () => EMPTY,
     ...web.bridge,
     hostBlob: () => o.hostBlob,
     stageHost: () => { throw new Error("host: a page runs the host it is served and takes no updates"); },

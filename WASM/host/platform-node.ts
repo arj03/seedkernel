@@ -7,7 +7,7 @@ import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSyn
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
 import { nodeRawFiles, tempBeside } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
-import { errMessage } from "../services/util.js";
+import { EMPTY, errMessage } from "../services/util.js";
 import { webBridge } from "./platform-web.js";
 import { packageHostBlob } from "./crypto-node.js";
 import type { CliFiles } from "./cli.js";
@@ -86,7 +86,7 @@ export function nodePlatform(o: NodePlatformOptions = {}): Required<Platform> & 
     // Whatever was piped in, or empty. Reading fd 0 throws instead of blocking when stdin
     // is an unredirected terminal, which also means no argument.
     stdin: () => {
-      try { return new Uint8Array(readFileSync(0)); } catch { return new Uint8Array(0); }
+      try { return new Uint8Array(readFileSync(0)); } catch { return EMPTY; }
     },
     ...web.bridge,
     hostBlob: o.hostBlob ?? packageHostBlob,

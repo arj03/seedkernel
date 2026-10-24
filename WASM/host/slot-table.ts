@@ -58,10 +58,11 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
       }
     }
   };
+  const get = (app: string): AppSlot | undefined => slots.find((slot) => labelOf(slot) === app);
   return {
     /** A slot's `app` label (§12.4): its install key and fs/signing namespace. */
     labelOf,
-    get: (app: string): AppSlot | undefined => slots.find((slot) => labelOf(slot) === app),
+    get,
     /** Every installed slot, in install order. */
     all: (): readonly AppSlot[] => slots,
     /** Who serves this claim, peer-reachable name first. */
@@ -84,7 +85,7 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
       // One slot per label, whoever authored it; a standing label changes hands only
       // through an install that names it.
       const app = loaded.manifest.app;
-      const installed = slots.find((slot) => labelOf(slot) === app);
+      const installed = get(app);
       if (installed && installed !== replacement)
         throw new Error(`shell: '${app}' is already installed — install with { replaces: '${app}' } to take over its slot`);
       for (const [book, names, audience] of booksOf(loaded.manifest)) {
@@ -115,9 +116,9 @@ export function createSlotTable(maxSlots = DEFAULT_MAX_APP_SLOTS) {
     },
     /** Drop the slot holding this label and release its claims. */
     remove(app: string): AppSlot | undefined {
-      const at = slots.findIndex((slot) => labelOf(slot) === app);
-      if (at < 0) return undefined;
-      const [slot] = slots.splice(at, 1);
+      const slot = get(app);
+      if (!slot) return undefined;
+      slots.splice(slots.indexOf(slot), 1);
       release(slot);
       return slot;
     },

@@ -5,6 +5,7 @@ import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, isService, type HostTransformName, typ
 import { type Fs } from "../services/fs.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, type CausalClock } from "./realm-queue.js";
+import { OpArgs } from "../services/op-frame.js";
 import type { Keypair } from "../services/subkeys.js";
 
 /** What a scoped SIGN/VERIFY signs under (§12.2): `domain ‖ scope ‖ msg`, `msg` never
@@ -338,7 +339,7 @@ export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): Return
 /** The `link` slot's signing scope: `DOMAIN_link_scope`, empty suffix. The transport tags
  *  its own handshake format inside the message, so changing it needs no host change. */
 export function linkSignScope(key: Keypair): SignScope {
-  return { domain: DOMAIN_LINK_SCOPE, scope: new Uint8Array(0), key };
+  return { domain: DOMAIN_LINK_SCOPE, scope: EMPTY, key };
 }
 
 /** A slot's signing scope, derived at load from admitted facts only (§12.2): never
@@ -400,27 +401,16 @@ const SERVICES: {
       const key = dec.decode(payload.subarray(4, 4 + klen));
       return fs.put(key, payload.subarray(4 + klen)).then(() => EMPTY);
     },
-    "fs/list": (payload) => {
-      const prefix = payload.length ? dec.decode(payload) : undefined;
-      return fs.list(prefix).then((keys) => {
-        const head = new Uint8Array(4);
-        writeU32BE(head, 0, keys.length);
-        const parts = [head];
-        for (const k of keys) {
-          const kb = enc.encode(k);
-          const kh = new Uint8Array(4);
-          writeU32BE(kh, 0, kb.length);
-          parts.push(kh, kb);
-        }
-        return concatBytes(parts);
-      });
-    },
-    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => EMPTY),
-    "fs/size": (payload) => fs.size(dec.decode(payload)).then((sz) => {
-      const out = new Uint8Array(4);
-      writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
-      return out;
+    // -> [count u32]([len u32][key utf8])*
+    "fs/list": (payload) => fs.list(payload.length ? dec.decode(payload) : undefined).then((keys) => {
+      const out = new OpArgs().u32(keys.length);
+      for (const k of keys) out.text(k);
+      return out.build();
     }),
+    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => EMPTY),
+    // -> [size u32], all ones for absent.
+    "fs/size": (payload) => fs.size(dec.decode(payload))
+      .then((sz) => new OpArgs().u32(sz < 0 ? 0xffffffff : sz).build()),
     "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
   }),
   host: (staging) => ({
@@ -440,12 +430,10 @@ const SERVICES: {
   }),
   // Raw bytes over an opaque link id (§12.1); inbound bytes arrive as `handle` events.
   link: (net) => ({
+    // -> [link u32][stream u8], link 0 for no route.
     "link/open": (payload) => {
       const link = net.open(dec.decode(payload));
-      const out = new Uint8Array(5);
-      writeU32BE(out, 0, link.linkId);
-      out[4] = link.stream ? 1 : 0;
-      return out;
+      return new OpArgs().u32(link.linkId).u8(link.stream ? 1 : 0).build();
     },
     "link/send": (payload) => {
       net.send(readU32BE(payload, 0), payload.subarray(4));
@@ -470,15 +458,8 @@ const SERVICES: {
       return EMPTY;
     },
     // -> [socket u32][port u16][addresses utf8], socket 0 for none.
-    "link/udpBind": () => net.udpBind().then((s) => {
-      const addresses = enc.encode(s.addresses);
-      const out = new Uint8Array(6 + addresses.length);
-      writeU32BE(out, 0, s.id);
-      out[4] = s.port >> 8;
-      out[5] = s.port & 255;
-      out.set(addresses, 6);
-      return out;
-    }),
+    "link/udpBind": () => net.udpBind()
+      .then((s) => new OpArgs().u32(s.id).u16(s.port).bytes(enc.encode(s.addresses)).build()),
     "link/udpSend": (payload) => {
       net.udpSend(payload);
       return EMPTY;

@@ -66,7 +66,7 @@ function bytesCompare(a, b) {
   return a.length === b.length ? 0 : (a.length < b.length ? -1 : 1);
 }
 
-// utf8Encode and utf8Decode come with the op-frame prelude (op-frame.ts `guestOpFraming`).
+// utf8Encode and utf8Decode come with the op-frame prelude (bundle-author.ts `guestOpFraming`).
 
 // ── outbound argument encoding ────────────────────────────────────────────────
 
@@ -103,6 +103,12 @@ Reader.prototype.blob = function () {
   const s = this.b.subarray(this.off, this.off + n);
   this.off += n;
   return s;
+};
+/** A blob that must be a 32-byte peer id; `op` names the op that refuses anything else. */
+Reader.prototype.peer = function (op) {
+  const b = this.blob();
+  if (b.length !== PK_LEN) throw new Error("transport: " + op + " needs a 32-byte peer id");
+  return b;
 };
 /** Whether an optional trailing field follows. */
 Reader.prototype.more = function () { return this.off < this.b.length; };
@@ -210,6 +216,6 @@ class Pieces {
   }
 }
 
-// ── the caller prefix and op envelope ───────────────────────────────────────
-// Injected from services/op-frame.ts by scripts/guest-source.mjs; assembly fails without it.
+// ── the caller prefix and op envelope, UTF-8, and `Fifo` ────────────────────
+// Injected from the host's own sources by scripts/guest-source.mjs; assembly fails without it.
 /* @seedkernel-op-frame */

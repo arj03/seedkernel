@@ -3,11 +3,13 @@
 // sign what install would refuse.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { concatBytes, enc, fromHex, toHex, writeU32BE } from "../services/util.js";
+import { concatBytes, enc, Fifo, fromHex, toHex } from "../services/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
-import { callerOf, readOp, writeOp, utf8Encode, utf8Decode } from "../services/op-frame.js";
+import { callerOf, readOp, writeOp, OpArgs } from "../services/op-frame.js";
+import { utf8Encode, utf8Decode } from "../services/utf8.js";
+import type { Keypair } from "../services/subkeys.js";
 import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
 import {
   hybridAuthorId,
@@ -23,28 +25,22 @@ import {
 /** What signing a manifest needs. */
 export interface ManifestCrypto extends ManifestVerifier {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
-  /** The PQ half of the signature; `signBundle` throws without it. */
+  /** The PQ half of the signature. */
   ml_dsa65_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
 }
 
 /** An author's key set (§12.4). Both keys together are the identity (`hybridAuthorId`).
  *  Only names whose shape depends on the suite carry "hybrid". */
 export interface HybridAuthorKeys {
-  ed: {
-    publicKey: Uint8Array;
-    privateKey: Uint8Array;
-  };
-  mlDsa: {
-    publicKey: Uint8Array;
-    privateKey: Uint8Array;
-  };
+  ed: Keypair;
+  mlDsa: Keypair;
 }
 
 /** What deriving an author's key set needs: the two keygens and the hash between them. */
 export interface AuthorSeedCrypto {
-  crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
+  crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
   crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
-  ml_dsa65_keypair_from_seed(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
+  ml_dsa65_keypair_from_seed(seed: Uint8Array): Keypair;
 }
 
 /** Manifest bytes. The signed envelope carries these verbatim and the verifier parses the
@@ -89,15 +85,10 @@ export function buildAuthor(root: string, keyFile: string, argv: string[]): { so
 
 /** Frame parts as a signed body: each a u32 big-endian byte count, then the bytes, all
  *  covered by both signatures. */
-export function encodeParts(fields: Uint8Array[]): Uint8Array {
-  const parts: Uint8Array[] = [];
-  for (const bytes of fields) {
-    if (bytes.length > 0xffffffff) throw new Error("bundle: body field exceeds u32 length");
-    const length = new Uint8Array(4);
-    writeU32BE(length, 0, bytes.length);
-    parts.push(length, bytes);
-  }
-  return concatBytes(parts);
+function encodeParts(fields: Uint8Array[]): Uint8Array {
+  const body = new OpArgs();
+  for (const bytes of fields) body.blob(bytes);
+  return body.build();
 }
 
 /** Frame a bundle's body: manifest, guest, modules in manifest order. */
@@ -106,11 +97,8 @@ export function encodeBundleBody(m: BundleManifest, guest: Uint8Array, modules: 
 }
 
 /** Sign a body under `domain` as a suite 0x02 envelope. */
-export function signEnvelope(sodium: ManifestCrypto, keys: HybridAuthorKeys, domain: Uint8Array,
+function signEnvelope(sodium: ManifestCrypto, keys: HybridAuthorKeys, domain: Uint8Array,
   body: Uint8Array): Uint8Array {
-  if (!sodium.ml_dsa65_sign_detached) {
-    throw new Error("bundle: no ML-DSA-65 signer — cannot sign");
-  }
   const pre = envelopeSigningInput(sodium, domain, keys.ed.publicKey, keys.mlDsa.publicKey, body);
   const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
   const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
@@ -188,10 +176,10 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
  *  Newlines are forced to LF because callers sign the result, and the compiled line
  *  endings depend on the machine that built this file. */
 export function guestOpFraming(): string {
-  const src = [callerOf, readOp, writeOp, utf8Encode, utf8Decode].map((fn) => fn.toString()).join("\n");
+  const src = [callerOf, readOp, writeOp, utf8Encode, utf8Decode, Fifo].map((fn) => fn.toString()).join("\n");
   return `
 // op-frame: the host's raw-link event ABI; optional framing for application bodies; UTF-8,
-// which a realm has no TextEncoder for.
+// which a realm has no TextEncoder for; the host's queue.
 ${src}
 `.replace(/\r\n/g, "\n");
 }

@@ -360,7 +360,7 @@ class UdpNegotiation {
     this.spare = entropy.subarray(2 * TOKEN + 12 * stun.length);
     this.spareAt = 0;
     this.refilling = false;
-    /** direct.js's side: `up(tag, text)`, `open(linkId, stream)` and `closed(linkId)`. */
+    /** direct.js's side: `up(tag, text)`, `open(linkId, channel)` and `closed(linkId)`. */
     this.sink = null;
     this.peerToken = null;
     this.peerCandidates = [];
@@ -654,7 +654,11 @@ class UdpNegotiation {
       if ((tag === RTC_OFFER) === this.offer || !DESCRIPTION.test(text)) { this.close(); return; }
       this.peerToken = fromHex(text);
       // Up on a later turn, not inside the signal being applied.
-      if (tag === RTC_OFFER) void Promise.resolve().then(() => { if (!this.dead && this.held) this.describe(); });
+      if (tag === RTC_OFFER) {
+        void Promise.resolve().then(() => {
+          if (!this.dead && this.held) this.describe();
+        });
+      }
       this.probe();
     } else if (tag === RTC_CANDIDATE) {
       const c = candidateOf(text);

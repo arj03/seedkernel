@@ -3,7 +3,7 @@
 // freshness) run before it for every bundle, transport included, and again at commit,
 // since what they read may have changed by then. Ordinary apps default to deny-all.
 
-import { errMessage, isHex64, toHex } from "../services/util.js";
+import { errMessage, isHex64, isRecord, toHex } from "../services/util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
 /** The admission seam. Return `true` to admit, `false` to reject silently, or throw to
@@ -42,17 +42,14 @@ export function parsePolicy(json: string): Admit {
   let raw: unknown;
   try { raw = JSON.parse(json); }
   catch (e) { throw new Error(`policy: invalid JSON (${errMessage(e)})`); }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    throw new Error("policy: expected a JSON object");
-  }
-  const o = raw as Record<string, unknown>;
-  for (const key of Object.keys(o)) {
+  if (!isRecord(raw)) throw new Error("policy: expected a JSON object");
+  for (const key of Object.keys(raw)) {
     if (key !== "authors") throw new Error(`policy: "${key}" is not a policy key (expected "authors")`);
   }
-  if (!Array.isArray(o.authors) || o.authors.some((a) => typeof a !== "string" || !isHex64(a))) {
+  if (!Array.isArray(raw.authors) || raw.authors.some((a) => typeof a !== "string" || !isHex64(a))) {
     throw new Error('policy: "authors" must be an array of 64-character hex author ids');
   }
-  return authorAllowlist(o.authors);
+  return authorAllowlist(raw.authors);
 }
 
 /** An absent policy admits no apps. Transport selection is a separate decision. */

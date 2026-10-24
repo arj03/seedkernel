@@ -252,20 +252,23 @@ class Core {
   constructor() {
     this.connecting = new Map(); // peerId to Link[] (outbound, pre-auth)
     this.addrs = new Map();      // peerId to { dest, secret }: the address book
-    this.readyWaiters = [];      // [{check, d, due}], one per in-flight ready()
+    this.readyWaiters = [];      // [{check, d, due, answer}], one per in-flight ready() or dial
     this.dialing = new Map();    // peerId to in-flight dial, so concurrent senders share one
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
   static push(m, peerId, link) {
-    const a = m.get(peerId); if (a) a.push(link); else m.set(peerId, [link]);
+    const a = m.get(peerId);
+    if (a) a.push(link);
+    else m.set(peerId, [link]);
   }
+
   static drop(m, peerId, link) {
-    const a = m.get(peerId); if (!a) return false;
-    const i = a.indexOf(link); if (i < 0) return false;
+    const a = m.get(peerId);
+    const i = a ? a.indexOf(link) : -1;
+    if (i < 0) return;
     a.splice(i, 1);
     if (a.length === 0) m.delete(peerId);
-    return true;
   }
 
   /** Record one peer: where to reach it and its contact secret, empty for none. An empty
@@ -415,7 +418,7 @@ class Core {
     const answer = () => Uint8Array.of(linked() ? 1 : 0);
     if (linked()) { d.resolve(answer()); return; }
     // Not settled before the dial is under way: until then nothing is connecting yet.
-    const w = { check: () => linked(), d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer };
+    const w = { check: linked, d, due: dueIn(Math.min(timeoutMs, readyCapMs)), answer };
     this.readyWaiters.push(w);
     void this.dial(peerId).catch(() => {}).finally(() => {
       w.check = () => linked() || !this.connecting.has(peerId);
@@ -536,19 +539,18 @@ entry("datagrams", (r) => { udp.onDatagrams(r); });
 /** App-facing send, deferred: the response is another invocation of this realm. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
-  // Views, copied into the frame synchronously by `buildReq`.
-  const to = r.blob();
+  // Views, copied into the frame synchronously by `buildReq`. Checked before any copy, and
+  // loud: a caller error.
+  const to = r.peer("send");
   const proto = r.blob();
   const payload = r.blob();
-  // Checked before any copy, and loud: a caller error.
-  if (to.length !== PK_LEN) throw new Error("transport: send needs a 32-byte peer id");
   if (proto.length > 0xff) throw new Error("transport: protocol id too long");
   if (REQ_HEAD_LEN + proto.length + payload.length > maxFrameBytes - TAG_LEN) {
     throw new Error("transport: send over the frame cap");
   }
   if (noReply) {
     reqres.request(null, toHex(to), proto, payload, true);
-    return Uint8Array.from([1]);
+    return Uint8Array.of(1);
   }
   const d = defer();
   reqres.request(d, toHex(to), proto, payload, false);
@@ -558,9 +560,8 @@ entry("send", (r, caller) => {
 /** Add one peer: key, contact secret (empty, or 32 zero bytes, for none) and destination
  *  (`addAddr`). */
 entry("addr", (r) => {
-  const peer = r.blob();
+  const peer = r.peer("addr");
   const secret = r.blob();
-  if (peer.length !== PK_LEN) throw new Error("transport: addr needs a 32-byte peer id");
   if (secret.length !== 0 && secret.length !== PK_LEN) throw new Error("transport: addr needs a 32-byte contact secret, or none");
   core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
@@ -568,8 +569,7 @@ entry("addr", (r) => {
 /** Dial one known peer, `[peer 32][timeout u32]`: answers `[1]` once it is linked, `[0]`
  *  when it cannot be reached or the timeout passes (`dialPeer`). Deferred. */
 entry("dial", (r) => {
-  const peer = r.blob();
-  if (peer.length !== PK_LEN) throw new Error("transport: dial needs a 32-byte peer id");
+  const peer = r.peer("dial");
   const d = defer();
   core.dialPeer(d, toHex(peer), r.u32());
   return d.promise;
@@ -579,9 +579,7 @@ entry("dial", (r) => {
  *  `iceServers` JSON: so the host's own peer connections (a call's media) ask the same
  *  STUN as the transport's (`iceServersFor`, direct.js). */
 entry("ice", (r) => {
-  const peer = r.blob();
-  if (peer.length !== PK_LEN) throw new Error("transport: ice needs a 32-byte peer id");
-  return utf8Encode(JSON.stringify(direct.iceServersFor(toHex(peer))));
+  return utf8Encode(JSON.stringify(direct.iceServersFor(toHex(r.peer("ice")))));
 });
 
 /** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through
@@ -623,9 +621,7 @@ entry("welcome", (r) => {
 
 /** Forget one peer: its address, and every link to it (`forgetPeer`). */
 entry("forget", (r) => {
-  const peer = r.blob();
-  if (peer.length !== PK_LEN) throw new Error("transport: forget needs a 32-byte peer id");
-  core.forgetPeer(toHex(peer));
+  core.forgetPeer(toHex(r.peer("forget")));
 });
 
 /** Wait until every known peer is linked, or the deadline passes. */

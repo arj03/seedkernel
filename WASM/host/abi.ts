@@ -19,6 +19,10 @@ import type { Bytes, Maybe } from "../services/util.js";
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;
 
+/** Where a node's store lives when `--dir` is omitted, on every target: the host's (cli.ts)
+ *  and its loader's host slots beside it (slots.ts). */
+export const DEFAULT_DIR = "./data";
+
 /** The process, private modules (§4) and the engine table. */
 export interface PlatformBridge {
   /** The ABI version this loader implements (`PLATFORM_ABI`). */

@@ -1,11 +1,11 @@
 // Named-op envelope for the host's raw-link event ABI, and optional application framing.
 // Event names live in services/domains.ts; their byte layouts are in §12.2.
-// bundle-author.ts's `guestOpFraming` serializes the three functions below and utf8.ts's
-// two into import-free guests, and the transport build injects that source before signing,
-// so they must reference nothing outside themselves, not even this file's imports. The type system
+// bundle-author.ts's `guestOpFraming` serializes the three functions below into import-free
+// guests, and the transport build injects that source before signing, so they must
+// reference nothing outside themselves, not even this file's imports. The type system
 // cannot check that; `testGeneratedOpFrame` (tests/bundle-install.test.mjs) runs the
 // emitted source to catch a free variable, so a new code path here needs a case there.
-import { writeU32BE, readU32BE, enc } from "./util.js";
+import { writeU32BE, readU32BE, enc, EMPTY } from "./util.js";
 
 /** Split a `handle` argument: `[caller 32][body ...]`. The host id is all zeros, checked
  *  over all 32 bytes, since a caller id can be ground to match any short prefix. */
@@ -42,9 +42,6 @@ export function writeOp(op: string, args: Uint8Array): Uint8Array {
   return out;
 }
 
-/** A realm has no TextEncoder, so guests take these (utf8.ts). */
-export { utf8Encode, utf8Decode } from "./utf8.js";
-
 // ── op arguments ──────────────────────────────────────────────────────────────
 //
 // The op's fields after the envelope, in the order the op defines. The reading side is
@@ -58,7 +55,7 @@ const OP_HEADERS = new Map<string, Uint8Array>();
 function opHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
   if (h === undefined) {
-    h = writeOp(op, new Uint8Array(0));
+    h = writeOp(op, EMPTY);
     OP_HEADERS.set(op, h);
   }
   return h;
@@ -67,28 +64,33 @@ function opHeader(op: string): Uint8Array {
 /** Every one-byte field, shared for the same reason. */
 const BYTES = Array.from({ length: 256 }, (_, v) => Uint8Array.of(v));
 
-/** One op's payload. The op is named in the constructor so `build()` writes the whole
- *  envelope, attribution prefix included, in one pass instead of copying the payload
- *  again behind a header. */
+/** One op's payload, or with no op named, bare fields (a host call's answer, a signed
+ *  body). The op is named in the constructor so `build()` writes the whole envelope,
+ *  attribution prefix included, in one pass instead of copying the payload again behind a
+ *  header. */
 export class OpArgs {
-  readonly op: string;
   private readonly parts: Uint8Array[] = [];
   private len = 0;
-  constructor(op: string) {
-    this.op = op;
-    this.raw(opHeader(op));
+  constructor(readonly op = "") {
+    if (op !== "") this.bytes(opHeader(op));
   }
-  u8(v: number): this { return this.raw(BYTES[v & 255]); }
+  u8(v: number): this { return this.bytes(BYTES[v & 255]); }
+  u16(v: number): this { return this.bytes(Uint8Array.of(v >> 8, v & 255)); }
   u32(v: number): this {
     const b = new Uint8Array(4);
     writeU32BE(b, 0, v);
-    return this.raw(b);
+    return this.bytes(b);
   }
   /** `[len u32 BE][bytes]`; an empty blob is length 0. */
-  blob(b: Uint8Array): this { return this.u32(b.length).raw(b); }
+  blob(b: Uint8Array): this { return this.u32(b.length).bytes(b); }
   /** A UTF-8 string as a blob. */
   text(s: string): this { return this.blob(enc.encode(s)); }
-  private raw(b: Uint8Array): this { this.parts.push(b); this.len += b.length; return this; }
+  /** Bytes as they are, with no length: a trailing field. */
+  bytes(b: Uint8Array): this {
+    this.parts.push(b);
+    this.len += b.length;
+    return this;
+  }
   /** The whole thing as one buffer. `prefix` (the host's 32-byte caller id) is written in
    *  front of the envelope, so a socket read is copied once here instead of again when a
    *  prefix is added later. */

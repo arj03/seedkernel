@@ -5,7 +5,7 @@
 // and in-process under the Node library (shell-node.ts). It awaits each call a platform
 // may answer asynchronously.
 import { policyFromJson } from "./policy.js";
-import { type PureModuleLoader } from "./bundle.js";
+import { moduleSet, type PureModuleLoader } from "./bundle.js";
 import { freshnessStoreFor, runCli, type CliFiles, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "../services/peer-addr.js";
 import { bootShell } from "./shell-core.js";
@@ -21,8 +21,8 @@ import {
   TCP_LINGER_MS,
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE } from "./wasm-limits.js";
-import { enc, errMessage, u8 } from "../services/util.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE, WASM_PAGE_BYTES } from "./wasm-limits.js";
+import { enc, u8 } from "../services/util.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
@@ -185,7 +185,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
             return r;
           },
           global: (name) => bridge.engineGlobal(id, name),
-          memoryBytes: () => bridge.engineGrow(id, 0) * 65536,
+          memoryBytes: () => bridge.engineGrow(id, 0) * WASM_PAGE_BYTES,
           read: (ptr, len) => u8(bridge.engineRead(id, ptr, len)),
           write: (ptr, bytes) => { bridge.engineWrite(id, ptr, bytes); },
           wipe: (ptr, len) => {
@@ -214,31 +214,11 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     };
   }
   /** Private modules where the loader bounds engine calls: in the calling guest's segment,
-   *  timed on its clock. */
+   *  timed on its clock. A call is synchronous, so its time is already inside that segment. */
   const engineModules: PureModuleLoader = {
-    async build(mods) {
-      const built = new Map<string, ReturnType<typeof engineModule>>();
-      try {
-        for (const m of mods) {
-          try { built.set(m.name, engineModule(m.wasm)); } catch (err) { throw new Error(`${m.name}: ${errMessage(err)}`); }
-        }
-      } catch (err) {
-        for (const w of built.values()) w.dispose();
-        throw err;
-      }
-      return {
-        async call(name, payload, deadlineMs) {
-          const w = built.get(name);
-          if (!w) return { bytes: null, ms: 0 };
-          // Synchronous, so the time is already inside the calling guest's segment.
-          return { bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 };
-        },
-        dispose() {
-          for (const w of built.values()) w.dispose();
-          built.clear();
-        },
-      };
-    },
+    build: (mods) => moduleSet(mods, engineModule,
+      async (w, payload, deadlineMs) => ({ bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 }),
+      (w) => w.dispose()),
   };
   // Otherwise private modules in the loader's own isolates.
   const modules = bridge.engineCallBounded ? engineModules : bridge.modules!;

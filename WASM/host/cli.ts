@@ -9,10 +9,8 @@ import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { ListenAddress } from "../services/socket-seam.js";
+import { DEFAULT_DIR } from "./abi.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
-
-/** Where a node's store lives when `--dir` is omitted, on every target. */
-export const DEFAULT_DIR = "./data";
 /** Where the node's 32-byte master seed lives when `--key` is omitted (§12.6.2b). */
 export const DEFAULT_KEY = "./seedkernel.key";
 
@@ -100,11 +98,11 @@ function list(v: string | undefined): string[] {
 
 /** The label for a `--listen` entry that names none. The shipped transport treats every
  *  label except `ws` as length framing. */
-export const DEFAULT_LISTEN_LABEL = "tcp";
+const DEFAULT_LISTEN_LABEL = "tcp";
 
 /** `--listen [label=]host:port,...`: one listener per entry. The transport decides what a
  *  label means; only its shape is checked here. */
-export function parseListen(v: string): ListenAddress[] {
+function parseListen(v: string): ListenAddress[] {
   return list(v).map((entry) => {
     const eq = entry.indexOf("=");
     const label = eq < 0 ? DEFAULT_LISTEN_LABEL : entry.slice(0, eq);
@@ -125,6 +123,18 @@ function mustRead(files: CliFiles, path: string, label: string): Uint8Array {
   const b = readNamed(files, path, label);
   if (b === null) throw new Error(`${label}: cannot read ${path}`);
   return b;
+}
+
+/** A secret from the file a flag names, kept out of `ps` that way: its text, trimmed. */
+function readSecret(files: CliFiles, path: string, flag: string): string {
+  return dec.decode(mustRead(files, path, flag)).trim();
+}
+
+/** One op through the transport's service id, refused when there is no transport. */
+function transportCall(shell: Shell, op: OpArgs, flag: string): Promise<Uint8Array> {
+  const answer = shell.call(TRANSPORT_SERVICE, op.build());
+  if (!answer) throw new Error(`shell: ${flag} given, but this node has no transport to carry it`);
+  return answer;
 }
 
 /** A whole-number flag, validated instead of coerced (`Number("")` is 0, which would lift
@@ -203,14 +213,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       throw new Error(`--${flag}: this node's sockets have no TLS, so it cannot reach wss://; use the ws:// address`);
     }
   }
-  // A private relay's secret (seedrelay's `--secret`), from a file to keep it out of `ps`.
+  // A private relay's secret (seedrelay's `--secret`).
   const relaySecretPath = args.get("relay-secret");
   if (relaySecretPath !== undefined && relay === undefined) {
     throw new Error("--relay-secret requires --relay, the relay it is the secret of");
   }
-  const relaySecret = relaySecretPath === undefined
-    ? undefined
-    : dec.decode(mustRead(host, relaySecretPath, "--relay-secret")).trim();
+  const relaySecret = relaySecretPath === undefined ? undefined : readSecret(host, relaySecretPath, "--relay-secret");
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
   for (const flag of ["transport", "contact-secret"]) {
     if (args.has(flag) && !network) {
@@ -227,12 +235,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   // Transport config (§12.6.3), passed through unread: the transport checks it at load.
-  // The contact secret comes from a file to keep it out of `ps`.
   const peers = list(args.get("peers"));
   const transportConfig: JsonObject = {};
   if (peers.length > 0) transportConfig.peers = peers;
   if (contactSecretPath !== undefined) {
-    transportConfig.contactSecret = dec.decode(mustRead(host, contactSecretPath, "--contact-secret")).trim();
+    transportConfig.contactSecret = readSecret(host, contactSecretPath, "--contact-secret");
   }
 
   // One line each time a peer is linked, changes how it is reached, or goes, so an
@@ -274,17 +281,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   if (relay !== undefined) {
     const op = new OpArgs("relay").text(relay);
     if (relaySecret !== undefined) op.text(relaySecret);
-    const joined = shell.call(TRANSPORT_SERVICE, op.build());
-    if (!joined) throw new Error("shell: --relay given, but there is nothing to join it with; enable transport first");
-    registered = (await joined)[0] === 1;
+    registered = (await transportCall(shell, op, "--relay"))[0] === 1;
   }
   // Wait for the cohort through the transport's service id. Best effort: `ready` settles
   // at its deadline instead of rejecting, so a missing peer delays boot but never fails it.
-  if (peers.length > 0) {
-    const ready = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
-    if (!ready) throw new Error("shell: --peers given, but there is nothing to dial from — enable transport first");
-    await ready;
-  }
+  if (peers.length > 0) await transportCall(shell, new OpArgs("ready").u32(5000), "--peers");
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);

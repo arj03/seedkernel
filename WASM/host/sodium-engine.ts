@@ -12,6 +12,7 @@ import type { EngineExport, EngineInstance, EngineImports } from "./engine-realm
 import type { Keypair } from "../services/subkeys.js";
 import type { ShellSodium } from "./shell-core.js";
 import { createMlDsa65, type MlDsa65Signer } from "./pq.js";
+import { WASM_PAGE_BYTES } from "./wasm-limits.js";
 
 /** An engine table that instantiates synchronously, as every loader's does. */
 export type SyncEngine = (wasm: Uint8Array, imports: EngineImports) => EngineInstance;
@@ -39,7 +40,6 @@ export const SODIUM_EXPORTS: Readonly<Record<keyof typeof EXPORTS, string>> = EX
  *  RNG's lazy init. */
 const RAND_U32 = 40216, RAND_INIT = 40252;
 const AEAD_TAG = 16, AEAD_NPUB = 12, AEAD_KEY = 32;
-const PAGE = 65536;
 
 /** libsodium plus ML-DSA-65 over `engine`. `random` is the platform CSPRNG. */
 export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWasm: Uint8Array,
@@ -58,8 +58,8 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
       c: () => { throw new Error("libsodium: abort"); },
       // emscripten_resize_heap(requestedBytes): grow linear memory to fit.
       d: (requested) => {
-        const want = requested >>> 0, have = lib.grow(0) * PAGE;
-        return want <= have || lib.grow(Math.ceil((want - have) / PAGE)) >= 0 ? 1 : 0;
+        const want = requested >>> 0, have = lib.grow(0) * WASM_PAGE_BYTES;
+        return want <= have || lib.grow(Math.ceil((want - have) / WASM_PAGE_BYTES)) >= 0 ? 1 : 0;
       },
     },
   });

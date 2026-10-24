@@ -44,7 +44,9 @@ class NegotiationLink {
     this.owner = owner;
     this.closeReason = REASON_NONE;
   }
-  async onWire(bytes) { if (bytes.length > 0) this.owner.up(this.e, bytes[0], utf8Decode(bytes.subarray(1))); }
+  async onWire(bytes) {
+    if (bytes.length > 0) this.owner.up(this.e, bytes[0], utf8Decode(bytes.subarray(1)));
+  }
   onChannelClosed() { this.owner.gone(this.e); }
   onWake(t) {
     const e = this.e;
@@ -80,7 +82,7 @@ class Direct {
    *  through, else at this node's home relay, on both its ports, which already sees this
    *  node's address, so asking it tells no one new, then the configured servers. */
   iceServersFor(peer) {
-    const relay = router.relayOf(peer) || relays.home || "";
+    const relay = router.relayOf(peer) || relays.home;
     const atRelay = relay ? RELAY_STUN_PORTS.map((port) => ({ urls: `stun:${relayHost(relay)}:${port}` })) : [];
     return [...atRelay, ...this.iceServers];
   }
@@ -165,7 +167,7 @@ class Direct {
     if (early) this.bindData(e.ctl, early.linkId, early.stream);
     neg.start({
       up: (tag, text) => this.up(e, tag, text),
-      open: (linkId, stream) => this.bindData(e.ctl, linkId, true, stream),
+      open: (linkId, channel) => this.bindData(e.ctl, linkId, true, channel),
       closed: localClosed,
     });
     return e;

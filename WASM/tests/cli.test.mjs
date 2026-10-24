@@ -14,7 +14,8 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 const { loadCrypto } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
-const { runCli, parseArgs, parseHex32, loadedLine, DEFAULT_DIR, DEFAULT_KEY } = await imp("build/host/cli.js");
+const { runCli, parseArgs, parseHex32, loadedLine, DEFAULT_KEY } = await imp("build/host/cli.js");
+const { DEFAULT_DIR } = await imp("build/host/abi.js");
 const { deriveNodeKey } = await imp("build/services/subkeys.js");
 const { toHex } = await imp("build/services/util.js");
 
@@ -360,7 +361,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
     { linkAvailable: false });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("there is nothing to dial from"), "--peers with no transport claimant explains itself");
+  ok(msg.includes("--peers given, but this node has no transport"), "--peers with no transport claimant explains itself");
 }
 // --relay reaches the transport's `relay` op as typed, and a node on a relay serves through
 // it without a listener.
@@ -414,7 +415,7 @@ for (const flag of ["--transport", "--contact-secret"]) {
   const host = fakeHost(["--key", join(work, "r2.key"), "--relay", "ws://127.0.0.1:1/"], { linkAvailable: false });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("nothing to join it with"), "--relay with no transport claimant explains itself");
+  ok(msg.includes("--relay given, but this node has no transport"), "--relay with no transport claimant explains itself");
 }
 
 console.log("\n— the load line —");

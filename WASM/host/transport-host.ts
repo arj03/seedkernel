@@ -362,7 +362,10 @@ export class TransportHost {
     if (!this.sockets.has(id) || batch.length > MAX_UDP_HELD_BYTES - this.heldDatagramBytes) return;
     this.heldDatagramBytes += batch.length;
     let last = this.reads.size > 0 ? this.reads.at(this.reads.size - 1) : undefined;
-    if (!last || last.bytes + batch.length > MAX_LINK_READ_BYTES) this.reads.push(last = { args: ev("datagrams"), bytes: 0 });
+    if (!last || last.bytes + batch.length > MAX_LINK_READ_BYTES) {
+      last = { args: ev("datagrams"), bytes: 0 };
+      this.reads.push(last);
+    }
     last.args.u32(id).blob(batch);
     last.bytes += batch.length;
     this.pumpReads();

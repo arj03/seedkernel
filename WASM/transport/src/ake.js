@@ -167,15 +167,6 @@ function rootKey() {
 function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
-/** Sign with the node's key under `DOMAIN_link_scope`. A refusal returns `{ok:false}` so
- *  the caller can abort the link. */
-async function channelSign(root, th, id) {
-  try {
-    return { ok: true, sig: await host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
-  } catch {
-    return { ok: false, sig: null };
-  }
-}
 
 // ── calling out: the link ops ─────────────────────────────────────────────────
 
@@ -252,8 +243,7 @@ class Link {
     this.myEph = null;
     this.myKem = null;
     this.kemSecret = null;
-    this.queue = [];
-    this.queueHead = 0;
+    this.queue = new Fifo();
     this.queuedBytes = 0;
     this.outboundQueuedBytes = 0;
     this.outboundQueuedSlices = 0;
@@ -396,26 +386,17 @@ class Link {
     }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
-    // Drop-oldest through a head index: `shift()` would go quadratic under a flood.
-    let live = this.queue.length - this.queueHead;
-    while ((this.queuedBytes > MAX_QUEUE_BYTES || live > maxPreAuthQueueSlices) && live > 1) {
-      this.queuedBytes -= this.queue[this.queueHead].length;
-      this.queue[this.queueHead++] = null;
-      live--;
-    }
-    // Compact once the consumed prefix outnumbers what is queued.
-    if (this.queueHead >= 8 && this.queueHead * 2 >= this.queue.length) {
-      this.queue = this.queue.slice(this.queueHead);
-      this.queueHead = 0;
+    // Drop-oldest past either bound, keeping the newest.
+    while ((this.queuedBytes > MAX_QUEUE_BYTES || this.queue.size > maxPreAuthQueueSlices) && this.queue.size > 1) {
+      this.queuedBytes -= this.queue.shift().length;
     }
   }
 
   /** Hand over the frames still waiting for authentication, oldest first. */
   takeQueued() {
-    const frames = this.queue.slice(this.queueHead);
-    this.queue = [];
-    this.queueHead = 0;
     this.queuedBytes = 0;
+    const frames = [];
+    while (this.queue.size > 0) frames.push(this.queue.shift());
     return frames;
   }
 
@@ -437,7 +418,9 @@ class Link {
     this.severWire();
     void this.enqueue(async () => {
       let saidGoodbye = false;
-      if (farewell && this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
+      // Read again behind the records before it: a failure meanwhile ends the parting, and
+      // those records may have used the last epoch.
+      if (this.parting && this.authed && this.sendKey && this.sendEpoch < REJECT_AFTER_EPOCHS) {
         try {
           await this.wire(await this.seal(EMPTY));
           // A codec with its own end-of-stream signal sends it too.
@@ -590,11 +573,15 @@ class Link {
     return this.kdf([], await hash(this.root, suiteByte, ephI, kemPkI), LABEL_PROBE);
   }
 
-  async signIdentity(th) {
-    const r = await channelSign(this.root, th, ownPk);
-    // A local misconfiguration, so abort instead of stalling.
-    if (!r.ok) { this.abort(); return null; }
-    return { id: ownPk, sig: r.sig };
+  /** Sign the transcript with the node's key under `DOMAIN_link_scope`. A refusal is a local
+   *  misconfiguration, so the link aborts instead of stalling, and this answers null. */
+  async signTranscript(th) {
+    try {
+      return await host.call(N_SIGN, channelIdentityMessage(this.root, th, ownPk));
+    } catch {
+      this.abort();
+      return null;
+    }
   }
 
   async openIdentity(key, ct, th) {
@@ -650,10 +637,10 @@ class Link {
     const h1 = await hash(this.root, w1);
     const head = concatBytes([this.myEph.publicKey.subarray(0, EPH_LEN), kem.ciphertext]);
     const hs = await hash(h1, head);
-    const si = await this.signIdentity(hs);
-    if (!si) return;
+    const sig = await this.signTranscript(hs);
+    if (!sig) return;
     const w2 = concatBytes([head,
-      await this.sealZero(await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), si.sig)]);
+      await this.sealZero(await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), sig)]);
     this.th = await hash(h1, w2);
     await this.wire(w2);
   }
@@ -682,9 +669,9 @@ class Link {
     this.peerPubkey = idR; this.peerId = this.dialedPeerId;
 
     const h2 = await hash(this.th, w2);
-    const si = await this.signIdentity(h2);
-    if (!si) return;
-    const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([si.id, si.sig]));
+    const sig = await this.signTranscript(h2);
+    if (!sig) return;
+    const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([ownPk, sig]));
     this.th = await hash(h2, w3);
     try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
     await this.wire(w3);

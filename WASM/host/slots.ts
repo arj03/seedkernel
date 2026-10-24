@@ -15,8 +15,8 @@
 // directory, as the freshness store does: <dir>.host/committed.skb, pending.skb, tried.
 
 import { readHostBlob } from "./host-blob.js";
-import { PLATFORM_ABI } from "./abi.js";
-import { errMessage, u8 } from "../services/util.js";
+import { DEFAULT_DIR, PLATFORM_ABI } from "./abi.js";
+import { EMPTY, errMessage, u8 } from "../services/util.js";
 
 /** Whole files, answered in the call: a loader's own. */
 export interface SlotFiles {
@@ -69,13 +69,13 @@ export function withoutOp(args: string[]): string[] {
   return args.filter((a, i) => a !== "--op" && !a.startsWith("--op=") && args[i - 1] !== "--op");
 }
 
-/** The host's --dir, which the slots sit beside, or the CLI's default (cli.ts DEFAULT_DIR). */
+/** The host's --dir, which the slots sit beside, or the default. */
 function dataDirOf(args: string[]): string {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dir" && i + 1 < args.length) return args[i + 1];
     if (args[i].startsWith("--dir=")) return args[i].slice("--dir=".length);
   }
-  return "./data";
+  return DEFAULT_DIR;
 }
 
 /** No host blob is larger than this. */
@@ -152,9 +152,14 @@ export class Loader {
     return c && c.version > this.genesis.version ? c : this.genesis;
   }
 
-  private discard(reason: string) {
+  /** Remove the pending host and its tried mark. */
+  private clearPending(): void {
     this.files.remove(this.path("pending.skb"));
     this.files.remove(this.path("tried"));
+  }
+
+  private discard(reason: string) {
+    this.clearPending();
     this.trial = null;
     this.log(`discarded the pending host: ${reason}`);
   }
@@ -178,7 +183,7 @@ export class Loader {
       return base.env;
     }
     try {
-      this.files.write(this.path("tried"), new Uint8Array(0));
+      this.files.write(this.path("tried"), EMPTY);
     } catch (err) {
       this.log(`cannot mark v${p.version} tried, so it is not run: ${errMessage(err)}`);
       return base.env;
@@ -240,10 +245,7 @@ export class Loader {
       this.log(`cannot commit the pending host: ${errMessage(err)}`);
       return;
     }
-    if (this.holdsPending(trial)) {
-      this.files.remove(this.path("pending.skb"));
-      this.files.remove(this.path("tried"));
-    }
+    if (this.holdsPending(trial)) this.clearPending();
     this.trial = null;
     this.log(`committed after ${this.windowMs}ms`);
   }

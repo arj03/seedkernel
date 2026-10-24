@@ -141,7 +141,7 @@ class RelayConn {
     const body = m.subarray(1);
     const type = m[0];
     if (type === R_CHALLENGE && body.length === NONCE_LEN && !this.registered) {
-      let sig, mac = new Uint8Array(0);
+      let sig, mac = EMPTY;
       try {
         sig = await host.call(N_SIGN, concatBytes([DOMAIN_RELAY, utf8Encode(relayAuthority(this.origin)), body]));
         const secret = this.origin === relays.home ? relays.secret : null;

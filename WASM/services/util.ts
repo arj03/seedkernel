@@ -98,6 +98,12 @@ export function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
+/** Whether a parsed value is an object with keys, not an array or null: the shape every
+ *  JSON document the host reads has at its root. */
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
 export function errMessage(e: unknown): string {
   const m = (e as Error | null)?.message;
   return m == null ? String(e) : String(m);
@@ -108,7 +114,8 @@ export function errMessage(e: unknown): string {
  *
  *  `Array.prototype.shift` moves every remaining element, so draining a full queue costs
  *  O(n²), and the queues here are bounded, so that cost lands exactly when they are full.
- *  Same design as the transport's `Pieces`. */
+ *  The transport guest takes it by source (bundle-author.ts `guestOpFraming`), so it must
+ *  reference nothing outside itself. */
 export class Fifo<T> {
   private items: T[] = [];
   private head = 0;

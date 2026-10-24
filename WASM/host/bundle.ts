@@ -1,5 +1,5 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, isHex64, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "../services/util.js";
+import { concatBytes, toHex, isHex64, isRecord, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "../services/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "../services/domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
 export type { JsonValue, JsonObject };
@@ -184,7 +184,7 @@ export function isJsonValue(value: unknown): value is JsonValue {
 
 /** True for a JSON object, the shape both config channels carry. */
 export function isJsonObject(value: unknown): value is JsonObject {
-  return isJsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value);
+  return isRecord(value) && isJsonValue(value);
 }
 
 /** Control, line-separator, bidi and zero-width characters. */
@@ -192,15 +192,14 @@ const UNSAFE_LABEL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u206
 
 /** Shape check on a verified manifest, so an author's mistake is rejected up front
  *  instead of surfacing as a TypeError deep in install. */
-function isValidManifest(m: unknown): m is BundleManifest {
-  if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
-  const o = m as Record<string, unknown>;
+function isValidManifest(o: unknown): o is BundleManifest {
+  if (!isRecord(o)) return false;
   // appSignScope encodes the name in one length byte. A lone surrogate would encode as
   // U+FFFD and share another label's scope; a control or bidi character could forge the
   // operator's console line.
   if (typeof o.app !== "string" || o.app.length === 0) return false;
-  if (dec.decode(enc.encode(o.app)) !== o.app || UNSAFE_LABEL.test(o.app)) return false;
-  if (enc.encode(o.app).length > 255) return false;
+  const appBytes = enc.encode(o.app);
+  if (appBytes.length > 255 || dec.decode(appBytes) !== o.app || UNSAFE_LABEL.test(o.app)) return false;
   if (typeof o.version !== "number" || !Number.isSafeInteger(o.version) || o.version < 0) return false;
   // Uniqueness is per list (§12.10); the same name in both is reachable either way.
   for (const list of [o.protocols, o.services]) {
@@ -222,8 +221,8 @@ function isValidManifest(m: unknown): m is BundleManifest {
     seen.add(mod.name);
   }
   // An omitted `guest` is refused by name in verifyBundle.
-  const g = o.guest as Record<string, unknown>;
-  if (typeof g !== "object" || g === null || Array.isArray(g)) return false;
+  const g = o.guest;
+  if (!isRecord(g)) return false;
   if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string")) return false;
   if (g.config !== undefined && !isJsonObject(g.config)) return false;
   return true;
@@ -326,8 +325,7 @@ export function verifyBundle(sodium: ManifestVerifier, env: Uint8Array): Verifie
     throw new Error("bundle: malformed manifest (not JSON)");
   }
   // A manifest with no guest gets its own error.
-  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-    && (parsed as Record<string, unknown>).guest === undefined) {
+  if (isRecord(parsed) && parsed.guest === undefined) {
     throw new Error("bundle: this manifest declares no guest, and every app is a guest (§12.4) — the modules are the library it drives, so ship the guest that drives them");
   }
   validateManifest(parsed);
@@ -360,16 +358,15 @@ export class FreshnessMarks {
         throw new Error(`freshness store: corrupt file — malformed JSON: ${errMessage(e)}. ` +
           "Delete it to start from no marks.", { cause: e });
       }
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      if (!isRecord(parsed)) {
         throw new Error("freshness store: corrupt file — root must be an object with marks and revoked fields");
       }
-      const raw = parsed as Record<string, unknown>;
-      if (raw.marks === undefined || raw.revoked === undefined) {
+      if (parsed.marks === undefined || parsed.revoked === undefined) {
         throw new Error('freshness store: corrupt file — expected both "marks" and "revoked" fields. ' +
           "Delete it to start from no marks.");
       }
-      const marks = raw.marks;
-      if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
+      const marks = parsed.marks;
+      if (!isRecord(marks)) {
         throw new Error('freshness store: corrupt file — "marks" must be an object of {"<author hex>:<app>": version} pairs');
       }
       for (const [k, v] of Object.entries(marks)) {
@@ -383,7 +380,7 @@ export class FreshnessMarks {
         // Lowercased, or a hand-edited uppercase mark would guard nothing.
         this.marks.set(k.slice(0, 64).toLowerCase() + k.slice(64), v);
       }
-      const revoked = raw.revoked;
+      const revoked = parsed.revoked;
       if (!Array.isArray(revoked)) {
         throw new Error('freshness store: corrupt file — "revoked" must be an array of hex author ids');
       }
@@ -441,6 +438,42 @@ export class FreshnessMarks {
         "Fix the store and revoke again.", { cause: e });
     }
   }
+}
+
+/** A module call with no answer: a trap, an overrun, an unknown name or a module gone. */
+export const MODULE_FAILED: ModuleResult = Object.freeze({ bytes: null, ms: 0 });
+
+/** One slot's modules, all or none (§3.1), as each target's loader builds them: each made
+ *  by `make`, side by side, and a set one of them fails releases the rest. A call by a name
+ *  the set does not hold fails. */
+export async function moduleSet<M>(mods: { name: string; wasm: Uint8Array }[],
+  make: (wasm: Uint8Array) => M | Promise<M>,
+  call: (m: M, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult>,
+  release: (m: M) => void): Promise<PureModules> {
+  const made = await Promise.allSettled(mods.map(async ({ wasm }) => make(wasm)));
+  const built = new Map<string, M>();
+  let failure: Error | undefined;
+  for (const [i, r] of made.entries()) {
+    if (r.status === "fulfilled") {
+      built.set(mods[i].name, r.value);
+    } else {
+      failure ??= new Error(`${mods[i].name}: ${errMessage(r.reason)}`, { cause: r.reason });
+    }
+  }
+  if (failure) {
+    for (const m of built.values()) release(m);
+    throw failure;
+  }
+  return {
+    call: (name, payload, deadlineMs) => {
+      const m = built.get(name);
+      return m === undefined ? Promise.resolve(MODULE_FAILED) : call(m, payload, deadlineMs);
+    },
+    dispose: () => {
+      for (const m of built.values()) release(m);
+      built.clear();
+    },
+  };
 }
 
 /** Build a verified bundle's private modules, all or none (§3.1). Admission already ran. */

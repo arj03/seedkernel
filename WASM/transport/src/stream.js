@@ -405,7 +405,10 @@ class UdpStream {
     const delay = Math.min(0xffff, Math.round(now() - this.largestAt));
     writeU16BE(p, B + 6, delay);
     p[B + 8] = r.length;
-    for (let i = 0; i < r.length; i++) { writeU48BE(p, B + 9 + 12 * i, r[i][0]); writeU48BE(p, B + 15 + 12 * i, r[i][1]); }
+    for (let i = 0; i < r.length; i++) {
+      writeU48BE(p, B + 9 + 12 * i, r[i][0]);
+      writeU48BE(p, B + 15 + 12 * i, r[i][1]);
+    }
     for (let i = 0; i < copies; i++) this.emit(p);
   }
 
@@ -634,7 +637,7 @@ class UdpStream {
       this.flush();
       return;
     }
-    if (this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS) { this.end(); return; }
+    if (this.peerGone(t)) { this.end(); return; }
     // A second timeout in a row: the path may have stopped carrying the larger packets.
     if (this.ptoCount >= 1 && this.packetBytes > BASE_PACKET) {
       this.packetBytes = BASE_PACKET;
@@ -679,10 +682,15 @@ class UdpStream {
 
   // ── life ──
 
+  /** Data in flight through `MAX_PTOS` probe timeouts, from a peer silent for `DEAD_MS`. */
+  peerGone(t) {
+    return this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS;
+  }
+
   /** Every `KEEPALIVE_MS`. */
   tick(t) {
     if (t - this.lastHeard > SILENT_MS) { this.fail(); return; }
-    if (this.inFlight.size > 0 && this.ptoCount >= MAX_PTOS && t - this.lastHeard > DEAD_MS) { this.end(); return; }
+    if (this.peerGone(t)) { this.end(); return; }
     if (t - this.lastSent >= KEEPALIVE_MS) this.sendAck();
     this.liveAt = dueIn(KEEPALIVE_MS);
   }

@@ -145,11 +145,8 @@ class WsFramer {
     this.parts = new Pieces(MERGE_BELOW);      // inbound: handshake head, then frames
     this.open = false;
     // `send` waits on this until the upgrade completes, or fails with it (`abort`, §12.6).
-    this.opened = new Promise((resolve, reject) => {
-      this.resolveOpen = resolve;
-      this.rejectOpen = reject;
-    });
-    this.opened.catch(() => {}); // no unhandled rejection when nothing was waiting
+    this.opened = Promise.withResolvers();
+    this.opened.promise.catch(() => {}); // no unhandled rejection when nothing was waiting
     // Rolling scan state for the HTTP head terminator (`scanHead`).
     this.headLen = 0;
     this.h0 = -1; this.h1 = -1; this.h2 = -1; this.h3 = -1;
@@ -198,7 +195,7 @@ class WsFramer {
 
   send(msg) {
     if (this.open) return this.enqueue(WS_OP_BINARY, msg);
-    return this.opened.then(() => this.enqueue(WS_OP_BINARY, msg));
+    return this.opened.promise.then(() => this.enqueue(WS_OP_BINARY, msg));
   }
 
   /** A close frame, after the end-of-stream record on the same chain. None before the
@@ -209,7 +206,7 @@ class WsFramer {
 
   /** Terminal: no upgrade will complete, so fail whatever is waiting on it. */
   abort() {
-    this.rejectOpen(new Error("ws: link closed before the upgrade completed"));
+    this.opened.reject(new Error("ws: link closed before the upgrade completed"));
   }
 
   /** One chunk in, parsed on the read chain so two parses never overlap. */
@@ -229,7 +226,7 @@ class WsFramer {
       try { consumed = await this.upgrade(sep); } catch { return false; }
       this.parts.take(consumed);
       this.open = true;
-      this.resolveOpen();
+      this.opened.resolve();
     } else {
       this.parts.push(chunk);
     }
@@ -348,11 +345,8 @@ const LISTENER_WS = "ws";
 /** The codec for a link that writes through `put` (ake.js `hostChannel`). */
 function makeFramer(stream, put, dest, listener) {
   if (!stream) return null;
-  if (dest) {
-    const ws = /^wss?:\/\/([^/]+)(\/\S*)?$/i.exec(dest);
-    if (ws) return new WsFramer(put, true, ws[1], ws[2] ?? "/");
-    return new LengthFramer(put);
-  }
-  if (listener === LISTENER_WS) return new WsFramer(put, false, "");
+  const ws = dest ? /^wss?:\/\/([^/]+)(\/\S*)?$/i.exec(dest) : null;
+  if (ws) return new WsFramer(put, true, ws[1], ws[2] ?? "/");
+  if (!dest && listener === LISTENER_WS) return new WsFramer(put, false, "");
   return new LengthFramer(put);
 }

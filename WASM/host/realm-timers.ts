@@ -56,13 +56,15 @@ export function createRealmTimers(
       if (!Number.isInteger(ms) || ms < 0 || ms > 0x7fffffff)
         throw new Error("guest: wake requires a delay in 0..2147483647");
       clear();
-      const entry = { timer: undefined as ReturnType<typeof setTimeout> | undefined, attempt: () => {
+      /** Fire the wake, unless a newer arm replaced it, one is in flight, or the pace
+       *  holds it back. */
+      const attempt = (): void => {
         if (live !== entry) return;
         entry.timer = undefined;
         if (firing) return;
         accrue();
         if (paced && credit <= 0) {
-          entry.timer = setTimeout(entry.attempt, Math.min(0x7fffffff, Math.ceil((1 - credit) * clockDivisor)));
+          entry.timer = setTimeout(attempt, Math.min(0x7fffffff, Math.ceil((1 - credit) * clockDivisor)));
           return;
         }
         live = undefined;
@@ -71,9 +73,9 @@ export function createRealmTimers(
         try { handed = fire(wakeBody(), newCausalClock()); } catch { handed = undefined; }
         if (handed) void handed.then(release, release);
         else release();
-      } };
+      };
+      const entry: NonNullable<typeof live> = { timer: setTimeout(attempt, ms), attempt };
       live = entry;
-      entry.timer = setTimeout(entry.attempt, ms);
     },
     clear,
     clearAll() { disposed = true; clear(); },

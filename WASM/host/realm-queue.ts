@@ -1,7 +1,7 @@
 // The realm contract and the per-realm pieces the realm driver (engine-realm.ts) builds
 // on: serialized entry into one confined realm, and the deadlines that bound it.
 
-import { Fifo } from "../services/util.js";
+import { EMPTY, Fifo } from "../services/util.js";
 import type { HostCall } from "./guest-seam.js";
 
 /** What a disposed realm fails every in-flight and queued caller with, on every target.
@@ -77,9 +77,6 @@ export class CausalContext {
 /** Monotonic milliseconds, since a wall-clock step would expire or extend every live
  *  deadline at once. The native host realm gets it from native/loop.go. */
 export const monotonicMs = (): number => performance.now();
-
-/** A settled queue entry's payload, so dropping borrowed bytes allocates nothing. */
-const NO_PAYLOAD = new Uint8Array(0);
 
 /** Convert a remaining duration into an absolute deadline. */
 const deadlineAt = (remainingMs: number): number => {
@@ -226,7 +223,7 @@ export function serializeCalls(
   const finish = (entry: Entry, ok: boolean, value: unknown): void => {
     if (entry.settled) return;
     entry.settled = true;
-    entry.payload = NO_PAYLOAD;
+    entry.payload = EMPTY;
     deadlines.drop(entry);
     if (ok) entry.resolve(value as Uint8Array);
     else entry.reject(value);
