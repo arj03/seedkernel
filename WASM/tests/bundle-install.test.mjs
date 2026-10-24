@@ -394,34 +394,32 @@ async function testFs() {
   for (const { name, make } of backends) {
     const { fs, cleanup } = make();
     try {
-      // The seam is async on every backend (services/fs.ts), so a browser backend can
-      // implement it.
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-      assert(await fs.size("a.blk") < 0, `${name}: absent before put`);
-      assertEqual(await fs.size("a.blk"), -1, `${name}: size -1 when absent`);
-      assertEqual(await fs.get("a.blk"), null, `${name}: get null when absent`);
+      assert(fs.size("a.blk") < 0, `${name}: absent before put`);
+      assertEqual(fs.size("a.blk"), -1, `${name}: size -1 when absent`);
+      assertEqual(fs.get("a.blk"), null, `${name}: get null when absent`);
 
-      await fs.put("a.blk", bytes);
-      assert(await fs.size("a.blk") >= 0, `${name}: present after put`);
-      assertEqual(await fs.size("a.blk"), 5, `${name}: size reflects bytes`);
-      assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: get round-trips`);
-      const read = await fs.get("a.blk");
+      fs.put("a.blk", bytes);
+      assert(fs.size("a.blk") >= 0, `${name}: present after put`);
+      assertEqual(fs.size("a.blk"), 5, `${name}: size reflects bytes`);
+      assert(bytesEqual(fs.get("a.blk"), bytes), `${name}: get round-trips`);
+      const read = fs.get("a.blk");
       const copy = read.slice();
       copy.fill(0);
       assert(bytesEqual(read, bytes), `${name}: returned bytes keep copying slice semantics`);
       read.fill(0);
-      assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: a read owns its bytes independently of the store`);
+      assert(bytesEqual(fs.get("a.blk"), bytes), `${name}: a read owns its bytes independently of the store`);
 
-      await fs.put("a.dsc", new Uint8Array([9]));
-      await fs.put("b.blk", new Uint8Array([7, 7]));
-      assertEqual((await fs.list()).sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
-      assertEqual((await fs.list("a.")).sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
-      assertEqual((await fs.stat()).used, 5 + 1 + 2, `${name}: stat.used sums all values`);
-      assert((await fs.stat()).available > 0, `${name}: stat.available is positive`);
+      fs.put("a.dsc", new Uint8Array([9]));
+      fs.put("b.blk", new Uint8Array([7, 7]));
+      assertEqual(fs.list().sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
+      assertEqual(fs.list("a.").sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
+      assertEqual(fs.stat().used, 5 + 1 + 2, `${name}: stat.used sums all values`);
+      assert(fs.stat().available > 0, `${name}: stat.available is positive`);
 
-      assert(await fs.delete("a.blk"), `${name}: delete reports removal`);
-      assert(await fs.size("a.blk") < 0, `${name}: absent after delete`);
-      assert(!(await fs.delete("a.blk")), `${name}: second delete is false`);
+      assert(fs.delete("a.blk"), `${name}: delete reports removal`);
+      assert(fs.size("a.blk") < 0, `${name}: absent after delete`);
+      assert(!fs.delete("a.blk"), `${name}: second delete is false`);
     } finally {
       cleanup();
     }
@@ -431,49 +429,44 @@ async function testFs() {
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-"));
   try {
     const fs = new NodeFs(dir);
-    // The key check throws inside an async method, so it surfaces as a rejection, still
-    // before any syscall.
+    // The key check throws before any syscall.
     let threw = false;
-    try { await fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
+    try { fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects a path-traversal key on put");
-    assertEqual(await fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
+    assertEqual(fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
     threw = false;
-    try { await fs.put("..", new Uint8Array([0])); } catch { threw = true; }
+    try { fs.put("..", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects the bare '..' key");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 
-  // A cold store must seed its byte total before concurrent mutations start changing it.
-  // Mutations keep their call order, and a failed write must not poison later ones
-  // or touch the value it was replacing.
+  // A cold store must seed its byte total before the first mutation changes it, and a
+  // failed write must not poison later ones or touch the value it was replacing.
   const disk = (await import("node:fs")).default;
   const { syncBuiltinESMExports } = await import("node:module");
   const cachedDir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-cached-"));
   const write = disk.writeFileSync;
   try {
-    await write(pjoin(cachedDir, "existing"), new Uint8Array(17));
-    await write(pjoin(cachedDir, "other"), new Uint8Array(2));
+    write(pjoin(cachedDir, "existing"), new Uint8Array(17));
+    write(pjoin(cachedDir, "other"), new Uint8Array(2));
     const counted = { ...nodeRawFiles, sizeCalls: 0, size(path) { counted.sizeCalls++; return nodeRawFiles.size(path); } };
     const fs = new FilesFs(counted, cachedDir);
-    await Promise.all([
-      fs.put("existing", new Uint8Array(5)),
-      fs.put("shared", new Uint8Array(3)),
-      fs.put("shared", new Uint8Array(11)),
-      fs.delete("shared"),
-      fs.put("shared", new Uint8Array(7).fill(42)),
-      ...Array.from({ length: 32 }, (_, i) => fs.put(`block-${i}`, new Uint8Array(i + 1))),
-      fs.stat(),
-    ]);
-    assertEqual((await fs.stat()).used, 5 + 2 + 7 + 528, "NodeFs: cold scan and concurrent size deltas agree");
-    assert(bytesEqual(await fs.get("shared"), new Uint8Array(7).fill(42)), "NodeFs: overlapping same-file mutations preserve call order");
+    fs.put("existing", new Uint8Array(5));
+    fs.put("shared", new Uint8Array(3));
+    fs.put("shared", new Uint8Array(11));
+    fs.delete("shared");
+    fs.put("shared", new Uint8Array(7).fill(42));
+    for (let i = 0; i < 32; i++) fs.put(`block-${i}`, new Uint8Array(i + 1));
+    assertEqual(fs.stat().used, 5 + 2 + 7 + 528, "NodeFs: cold scan and size deltas agree");
+    assert(bytesEqual(fs.get("shared"), new Uint8Array(7).fill(42)), "NodeFs: same-file mutations land in call order");
     const probes = counted.sizeCalls;
-    await Promise.all(Array.from({ length: 10 }, () => fs.stat()));
+    for (let i = 0; i < 10; i++) fs.stat();
     assertEqual(counted.sizeCalls, probes, "NodeFs: repeated statistics never probe individual files");
-    await fs.put("shared", new Uint8Array(0));
-    assert(await fs.delete("shared"), "NodeFs: deleting an empty value succeeds");
-    assert(!(await fs.delete("shared")), "NodeFs: deleting a missing value leaves accounting alone");
-    assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: shrinking and deleting adjust the total");
+    fs.put("shared", new Uint8Array(0));
+    assert(fs.delete("shared"), "NodeFs: deleting an empty value succeeds");
+    assert(!fs.delete("shared"), "NodeFs: deleting a missing value leaves accounting alone");
+    assertEqual(fs.stat().used, 5 + 2 + 528, "NodeFs: shrinking and deleting adjust the total");
 
     // A write torn partway through: it lands in the temp file, never on the key's own.
     disk.writeFileSync = (path, data, ...args) => {
@@ -485,19 +478,19 @@ async function testFs() {
     };
     syncBuiltinESMExports();
     let failed = false;
-    try { await fs.put("existing", new Uint8Array(20)); } catch { failed = true; }
-    assert(failed, "NodeFs: a partial write still rejects");
-    assertEqual((await fs.get("existing"))?.length, 5, "NodeFs: a torn write leaves the old value in place");
-    assertEqual((await fs.stat()).used, 5 + 2 + 528, "NodeFs: a torn write leaves the accounting unchanged");
+    try { fs.put("existing", new Uint8Array(20)); } catch { failed = true; }
+    assert(failed, "NodeFs: a partial write still throws");
+    assertEqual(fs.get("existing")?.length, 5, "NodeFs: a torn write leaves the old value in place");
+    assertEqual(fs.stat().used, 5 + 2 + 528, "NodeFs: a torn write leaves the accounting unchanged");
     assert(!readdirSync(cachedDir).some((n) => n.startsWith("~")), "NodeFs: a torn write leaves no temp file");
     disk.writeFileSync = write;
     syncBuiltinESMExports();
-    await fs.put("existing", new Uint8Array(8));
-    assertEqual((await fs.stat()).used, 8 + 2 + 528, "NodeFs: a failed write does not poison later writes");
+    fs.put("existing", new Uint8Array(8));
+    assertEqual(fs.stat().used, 8 + 2 + 528, "NodeFs: a failed write does not poison later writes");
     // A temp file a crash left behind is neither listed nor counted, and a reopen reclaims it.
-    await write(pjoin(cachedDir, "~put-block-0"), new Uint8Array(99));
-    assert(!(await fs.list()).some((n) => n.startsWith("~")), "NodeFs: list skips temp files");
-    assertEqual((await new NodeFs(cachedDir).stat()).used, (await fs.stat()).used, "NodeFs: reopening reconstructs the same total");
+    write(pjoin(cachedDir, "~put-block-0"), new Uint8Array(99));
+    assert(!fs.list().some((n) => n.startsWith("~")), "NodeFs: list skips temp files");
+    assertEqual(new NodeFs(cachedDir).stat().used, fs.stat().used, "NodeFs: reopening reconstructs the same total");
     assert(!readdirSync(cachedDir).includes("~put-block-0"), "NodeFs: reopening reclaims an orphaned temp file");
   } finally {
     disk.writeFileSync = write;
@@ -531,35 +524,35 @@ async function testFsKeyRule() {
   ];                                     // case- and extension-insensitively
   for (const k of illegal) assert(!isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should not hold`);
 
-  // validatedFs applies it to every op that names a key, as a rejection, not a silent
-  // miss: an invalid key is a caller bug on read as much as on write.
+  // validatedFs applies it to every op that names a key, as a throw, not a silent miss:
+  // an invalid key is a caller bug on read as much as on write.
   const fs = validatedFs(new MemoryFs());
-  await fs.put("ok.blk", new Uint8Array([1]));
+  fs.put("ok.blk", new Uint8Array([1]));
   for (const [what, call] of [
     ["put", () => fs.put("a/b", new Uint8Array([1]))],
     ["get", () => fs.get("a/b")],
     ["size", () => fs.size("CON")],
     ["delete", () => fs.delete("")],
   ]) {
-    let rejected = false;
-    try { await call(); } catch { rejected = true; }
-    assert(rejected, `validatedFs rejects an unsafe key on ${what}`);
+    let refused = false;
+    try { call(); } catch { refused = true; }
+    assert(refused, `validatedFs refuses an unsafe key on ${what}`);
   }
 
   // It does not apply to ops that take no key. `list()` takes a prefix, and the empty
   // prefix (every key) is exactly what a key rule here would wrongly refuse.
-  assertEqual((await fs.list()).join(","), "ok.blk", "validatedFs leaves list(undefined) alone");
-  assertEqual((await fs.list("ok")).join(","), "ok.blk", "validatedFs leaves a list prefix alone");
-  assert((await fs.stat()).used === 1, "validatedFs leaves stat alone");
+  assertEqual(fs.list().join(","), "ok.blk", "validatedFs leaves list(undefined) alone");
+  assertEqual(fs.list("ok").join(","), "ok.blk", "validatedFs leaves a list prefix alone");
+  assert(fs.stat().used === 1, "validatedFs leaves stat alone");
 
   // The shell puts validatedFs under scopedFs, so the rule sees the full key the backend
   // sees: a guest key that would escape its scope is refused even though the scope prefix
   // is itself valid.
   const scoped = scopedFs(fs, "abcd1234");
-  await scoped.put("mine.blk", new Uint8Array([2]));
-  assert((await fs.get("abcd1234mine.blk")) !== null, "scoped put lands under the scope");
+  scoped.put("mine.blk", new Uint8Array([2]));
+  assert(fs.get("abcd1234mine.blk") !== null, "scoped put lands under the scope");
   let escaped = false;
-  try { await scoped.put("../../etc", new Uint8Array([3])); } catch { escaped = true; }
+  try { scoped.put("../../etc", new Uint8Array([3])); } catch { escaped = true; }
   assert(escaped, "a scoped key with separators is refused on the composite");
 
   console.log("  OK\n");
@@ -642,7 +635,7 @@ async function testShellBoot() {
       identity, // no transport, so no network
     });
     // Installing an allowed author's bundle is covered end to end by testBundle (§12.4).
-    assert((await shell.fs.list()).length === 0, "fs.* backend is wired over the data dir");
+    assert(shell.fs.list().length === 0, "fs.* backend is wired over the data dir");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1250,7 +1243,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       ["_svc", "crypto/blake2b", "crypto/random", "fs/put", "fwd", "link/open"],
       "a candidate reaches nothing at all — not a write, another realm, a link, or a read");
     assertEqual(reached, 0, "…so the realm it called was never entered");
-    assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
+    assertEqual(fs.stat().used, 0, "…and it left nothing on disk");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
     flaky.fail = false;
@@ -1258,7 +1251,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
     await withTestBudget(candidates[1].hostCall)("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
     await withTestBudget(candidates[1].hostCall)("_svc", new Uint8Array());
-    assertEqual((await fs.stat()).used, 1, "the committed realm writes");
+    assertEqual(fs.stat().used, 1, "the committed realm writes");
     assertEqual(reached, 1, "…and reaches its neighbour");
   } finally {
     shell.close();

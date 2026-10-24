@@ -11,17 +11,18 @@ export interface FsStat {
 /** Sentinel when the backend cannot ask the OS for free space. */
 export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
 
-/** Storage seam. Every method is async because browser storage (IndexedDB, OPFS) cannot
- *  be synchronous. */
+/** Storage seam. Synchronous, as the `RawFiles` under every backend is (fs-files.ts), so a
+ *  guest's `fs/*` call is answered in the frame that asked (guest-seam.ts). A failure
+ *  throws. */
 export interface Fs {
-  get(key: string): Promise<Uint8Array | null>;
-  put(key: string, bytes: Uint8Array): Promise<void>;
+  get(key: string): Uint8Array | null;
+  put(key: string, bytes: Uint8Array): void;
   /** Byte length, or -1 if absent. Use `size >= 0` to test existence. */
-  size(key: string): Promise<number>;
-  list(prefix?: string): Promise<string[]>;
+  size(key: string): number;
+  list(prefix?: string): string[];
   /** true if a value was removed, false if the key was already absent. */
-  delete(key: string): Promise<boolean>;
-  stat(): Promise<FsStat>;
+  delete(key: string): boolean;
+  stat(): FsStat;
 }
 
 // The key charset is consensus (§16.1), applied once in shared code.

@@ -375,25 +375,24 @@ const SERVICES: {
       },
     };
   },
+  // Synchronous like the store (fs.ts), so each answers inline. Views, not copies: the
+  // payload already belongs to this call, and backends copy (or write) before returning.
   fs: (fs) => ({
-    "fs/get": (payload) => fs.get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
-    // Views, not copies: the payload already belongs to this call, and backends copy.
+    "fs/get": (payload) => { const v = fs.get(dec.decode(payload)); return v ? concatBytes([ONE, v]) : ZERO; },
     "fs/put": (payload) => {
       const klen = readU32BE(payload, 0);
-      const key = dec.decode(payload.subarray(4, 4 + klen));
-      return fs.put(key, payload.subarray(4 + klen)).then(() => EMPTY);
+      fs.put(dec.decode(payload.subarray(4, 4 + klen)), payload.subarray(4 + klen));
+      return EMPTY;
     },
     // -> [count u32]([len u32][key utf8])*
-    "fs/list": (payload) => fs.list(payload.length ? dec.decode(payload) : undefined).then((keys) => {
-      const out = new OpArgs().u32(keys.length);
-      for (const k of keys) out.text(k);
-      return out.build();
-    }),
-    "fs/delete": (payload) => fs.delete(dec.decode(payload)).then(() => EMPTY),
-    // -> [size u32], all ones for absent.
-    "fs/size": (payload) => fs.size(dec.decode(payload))
-      .then((sz) => new OpArgs().u32(sz < 0 ? 0xffffffff : sz).build()),
-    "fs/stat": () => fs.stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
+    "fs/list": (payload) => {
+      const keys = fs.list(payload.length ? dec.decode(payload) : undefined);
+      return keys.reduce((out, k) => out.text(k), new OpArgs().u32(keys.length)).build();
+    },
+    "fs/delete": (payload) => { fs.delete(dec.decode(payload)); return EMPTY; },
+    // -> [size u32], all ones (-1) for absent.
+    "fs/size": (payload) => new OpArgs().u32(fs.size(dec.decode(payload)) >>> 0).build(),
+    "fs/stat": () => { const s = fs.stat(); return concatBytes([u64be(s.used), u64be(s.available)]); },
   }),
   host: (staging) => ({
     "host/stage": async (payload) => { await staging.stage(payload); return EMPTY; },
@@ -496,7 +495,7 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
     if (!route) throw new Error("guest-seam: no such name " + name + " (not crypto, a module, or declared in guest.requires)");
     return route(payload, budget);
   };
-  // The crypto transforms and `node` answer inline and keep nothing of their payload.
-  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("node/");
+  // The crypto transforms, `node` and `fs` answer inline and keep nothing of their payload.
+  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("node/") || name.startsWith("fs/");
   return seam;
 }

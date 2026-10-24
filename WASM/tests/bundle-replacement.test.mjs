@@ -43,7 +43,7 @@ await test("another author replaces a chat owner under a new label atomically, w
     const old = await n.shell.install(bundle(alice, "chat", 50, {
       protocols: ["chat", "old-only"], services: ["chat-local"], guestRequires: ["fs", "node"],
     }));
-    await old.fs.put("private", Uint8Array.of(42));
+    old.fs.put("private", Uint8Array.of(42));
     const next = await n.shell.install(bundle(bob, "other-chat", 1, {
       protocols: ["chat"], services: ["chat-local", "new-only"], guestRequires: ["fs", "node"],
     }), { replaces: "chat" });
@@ -52,8 +52,8 @@ await test("another author replaces a chat owner under a new label atomically, w
     assert.equal(n.shell.resolve("old-only"), null);
     assert.equal(n.shell.resolve("new-only"), "other-chat");
     assert.equal(n.shell.uninstall("chat"), false);
-    assert.equal(await next.fs.get("private"), null);
-    assert.deepEqual(await old.fs.get("private"), Uint8Array.of(42));
+    assert.equal(next.fs.get("private"), null);
+    assert.deepEqual(old.fs.get("private"), Uint8Array.of(42));
     assert.notEqual(old.appScope, next.appScope);
     assert.equal(n.store.get(alice.id, "chat"), 50);
     assert.equal(n.store.get(bob.id, "other-chat"), 1);
@@ -68,14 +68,14 @@ await test("another author keeping the label takes its data and signing scope, b
   const reach = { guestRequires: ["fs", "node"] };
   try {
     const old = await n.shell.install(bundle(alice, "chat", 50, reach));
-    await old.fs.put("history", Uint8Array.of(42));
+    old.fs.put("history", Uint8Array.of(42));
     const msg = Uint8Array.of(7, 7);
     const sig = await n.records[0].seam("node/sign", msg);
     // One slot per label: a second author's `chat` installs only by replacing the current one.
     await assert.rejects(n.shell.install(bundle(bob, "chat", 1, reach)), /'chat' is already installed/);
     const next = await n.shell.install(bundle(bob, "chat", 1, reach), { replaces: "chat" });
     assert.equal(next.appScope, old.appScope);
-    assert.deepEqual(await next.fs.get("history"), Uint8Array.of(42));
+    assert.deepEqual(next.fs.get("history"), Uint8Array.of(42));
     const verdict = await n.records[1].seam("node/verify", concatBytes([n.identity.publicKey, sig, msg]));
     assert.equal(verdict[0], 1, "the new author's slot verifies what the old one signed");
     assert.equal(n.store.get(alice.id, "chat"), 50);

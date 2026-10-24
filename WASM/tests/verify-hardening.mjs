@@ -148,20 +148,20 @@ console.log("\n§12.2 — fs is scoped per app label");
   const notes = scopedFs(disk, appScopeFor(sodium, "notes"));
   // Every method is awaited: the seam is async so a browser backend can implement it
   // (services/fs.ts), and MemoryFs answers in a microtask like any other.
-  await chat.put("secret", new Uint8Array([1, 2, 3]));
-  await notes.put("secret", new Uint8Array([9]));
-  ok((await chat.get("secret")).length === 3, "chat reads its own key");
-  ok((await notes.get("secret")).length === 1, "notes' same-named key is a different value");
-  const notesKeys = await notes.list("");
+  chat.put("secret", new Uint8Array([1, 2, 3]));
+  notes.put("secret", new Uint8Array([9]));
+  ok(chat.get("secret").length === 3, "chat reads its own key");
+  ok(notes.get("secret").length === 1, "notes' same-named key is a different value");
+  const notesKeys = notes.list("");
   ok(notesKeys.length === 1 && notesKeys[0] === "secret", "list() shows only this app's keys, unprefixed");
-  ok(await notes.delete("secret") && (await chat.get("secret")) !== null, "notes' delete cannot reach chat's key");
-  ok((await disk.list("")).length === 1, "the backend holds both under distinct physical keys");
+  ok(notes.delete("secret") && chat.get("secret") !== null, "notes' delete cannot reach chat's key");
+  ok(disk.list("").length === 1, "the backend holds both under distinct physical keys");
 
   // Colons in an app name cannot make two scopes overlap, and cannot reach the backend.
   const amb1 = scopedFs(disk, appScopeFor(sodium, "x:y"));
   const amb2 = scopedFs(disk, appScopeFor(sodium, "x"));
-  await amb1.put("z", new Uint8Array([1]));
-  ok((await amb2.get("y:z")) === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
+  amb1.put("z", new Uint8Array([1]));
+  ok(amb2.get("y:z") === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
   ok(/^[A-Za-z0-9._-]+$/.test(appScopeFor(sodium, "x:y")), "the derived scope is inside the backend key charset");
   // Keys are filenames, and a case-folding filesystem would merge two labels differing
   // only in case if the label were the prefix. The hash is lowercase hex.
@@ -173,18 +173,18 @@ console.log("\n§12.2 — fs is scoped per app label");
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
 
   const bounded = new MemoryFs(4, 2);
-  await bounded.put("a", Uint8Array.of(1, 2, 3));
-  await rejects(bounded.put("b", Uint8Array.of(4, 5)),
+  bounded.put("a", Uint8Array.of(1, 2, 3));
+  throws(() => bounded.put("b", Uint8Array.of(4, 5)),
     "an in-memory backend refuses cumulative bytes beyond its quota");
-  ok((await bounded.get("a")).join() === "1,2,3",
+  ok(bounded.get("a").join() === "1,2,3",
     "a refused put leaves existing stored state intact");
-  await bounded.put("a", Uint8Array.of(9));
-  await bounded.put("b", Uint8Array.of(8, 7, 6));
-  await rejects(bounded.put("c", new Uint8Array()),
+  bounded.put("a", Uint8Array.of(9));
+  bounded.put("b", Uint8Array.of(8, 7, 6));
+  throws(() => bounded.put("c", new Uint8Array()),
     "the storage owner also bounds retained entry objects");
-  await bounded.delete("a");
-  await bounded.put("c", Uint8Array.of(5));
-  ok((await bounded.stat()).used === 4 && (await bounded.stat()).available === 0,
+  bounded.delete("a");
+  bounded.put("c", Uint8Array.of(5));
+  ok(bounded.stat().used === 4 && bounded.stat().available === 0,
     "replacement and deletion transactionally release storage custody");
 }
 

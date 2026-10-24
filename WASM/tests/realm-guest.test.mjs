@@ -161,11 +161,11 @@ async function testGuestSeam() {
     // wait for. The guest reads a Promise for every name alike, so a forgotten `await`
     // never reads bytes (testPreviousAbiRefused, through a realm).
     assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Uint8Array, "a catalog primitive has its answer at once");
-    assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise");
+    assert(seam("fs/size", fk) instanceof Uint8Array, "fs/size has its answer at once, as the store is synchronous");
     assert(prim("random", U(0, 0, 0, 1)) instanceof Uint8Array, "crypto/random has its answer at once");
 
     // The cross-realm call: a declared local service is another realm, reached on a later
-    // turn, so it is a Promise like fs. There is no `net` host service; the network is a
+    // turn, so it is a Promise. There is no `net` host service; the network is a
     // bundle that claims the service `_net`, and this seam's routing reaches it (§12.10).
     const crossed = seam("_net", U(1, 2, 3));
     assert(crossed instanceof Promise, "a local service id returns a Promise (the callee runs on a later turn)");

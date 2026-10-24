@@ -23,9 +23,8 @@ import (
 // blockBytes is the block size every fs bench moves per op (seedstore's block size).
 const blockBytes = 64 * 1024
 
-// The `fs` seam is async, so a put/get settles through the event loop like every other
-// async op; running b.N ops in one JS await loop keeps the el.await cost out of the per-op
-// number, as the net benches do.
+// The store is synchronous; running b.N ops in one JS loop keeps the el.await cost out of
+// the per-op number, as the net benches do.
 
 func BenchmarkFsPut64K(b *testing.B) {
 	setupFsJS(b)
@@ -44,16 +43,15 @@ func BenchmarkFsGet64K(b *testing.B) {
 }
 
 // setupFsJS boots the shared shell, uses the process-wide benchmark data dir and writes one
-// block, leaving __benchPut/__benchGet ready to run on the shared loop. The first put is
-// itself an awaited async call, since `fs.put` returns a Promise.
+// block, leaving __benchPut/__benchGet ready to run on the shared loop.
 func setupFsJS(b *testing.B) {
 	ensureBooted(b)
 	// Do not re-point the process-wide realm at b.TempDir(): Go removes that directory
 	// when this benchmark ends, while later benchmarks still use the same store.
 	if _, err := qc.Eval("fs-bench-setup.js", `
 		globalThis.__benchBlock = new Uint8Array(65536); __benchBlock.fill(0x5a);
-		globalThis.__benchPut = async (n) => { for (let i = 0; i < n; i++) await fs.put("benchblk", __benchBlock); return new Uint8Array(0); };
-		globalThis.__benchGet = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await fs.get("benchblk"); if (r && r.length) acc ^= r[0]; } return new Uint8Array([acc & 255]); };
+		globalThis.__benchPut = (n) => { for (let i = 0; i < n; i++) fs.put("benchblk", __benchBlock); return new Uint8Array(0); };
+		globalThis.__benchGet = (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = fs.get("benchblk"); if (r && r.length) acc ^= r[0]; } return new Uint8Array([acc & 255]); };
 	`); err != nil {
 		b.Fatal(err)
 	}
@@ -73,9 +71,9 @@ func BenchmarkFsOpenScan(b *testing.B) {
 				}
 			}
 			b.ResetTimer()
-			benchAwait(b, fmt.Sprintf(`(async () => {
+			benchAwait(b, fmt.Sprintf(`(() => {
 				for (let i = 0; i < %d; i++) {
-					const s = await new FilesFs(__fs, %s).stat();
+					const s = new FilesFs(__fs, %s).stat();
 					if (s.used !== %d) throw new Error("used " + s.used);
 				}
 				return new Uint8Array(0);

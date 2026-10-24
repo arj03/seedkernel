@@ -73,14 +73,13 @@ export class FilesFs implements Fs {
     return withTemps ? names : names.filter((n) => !n.startsWith(TMP_PREFIX));
   }
 
-  // `async`, so a failure is a rejection on this seam, as `Fs` promises.
-  async get(key: string): Promise<Uint8Array | null> {
+  get(key: string): Uint8Array | null {
     try {
       const b = this.files.read(this.path(key), MAX_VALUE_BYTES);
       return b === null ? null : u8(b);
     } catch { return null; }
   }
-  async put(key: string, bytes: Uint8Array): Promise<void> {
+  put(key: string, bytes: Uint8Array): void {
     const path = this.path(key);
     this.scan();
     const old = Math.max(0, this.files.size(path));
@@ -88,16 +87,16 @@ export class FilesFs implements Fs {
     this.files.write(path, bytes);
     this.used += bytes.byteLength - old;
   }
-  async size(key: string): Promise<number> {
+  size(key: string): number {
     try { return this.files.size(this.path(key)); } catch { return -1; }
   }
-  async list(prefix?: string): Promise<string[]> {
+  list(prefix?: string): string[] {
     try {
       const names = this.names();
       return prefix ? names.filter((n) => n.startsWith(prefix)) : names;
     } catch { return []; }
   }
-  async delete(key: string): Promise<boolean> {
+  delete(key: string): boolean {
     try {
       const path = this.path(key);
       this.scan();
@@ -107,7 +106,7 @@ export class FilesFs implements Fs {
       return true;
     } catch { return false; }
   }
-  async stat(): Promise<FsStat> {
+  stat(): FsStat {
     this.scan();
     const available = this.files.available(this.dir);
     return { used: this.used, available: available < 0 ? FS_AVAILABLE_UNKNOWN : available };

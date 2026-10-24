@@ -11,14 +11,12 @@ export function validatedFs(inner: Fs): Fs {
     if (!isSafeFsKey(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
     return key;
   };
-  // `async` so a refusal is a rejection, like every other failure on this seam, and not
-  // a synchronous throw that bypasses a caller's `.catch`.
   return {
-    async get(key) { return inner.get(check(key)); },
-    async put(key, bytes) { return inner.put(check(key), bytes); },
-    async size(key) { return inner.size(check(key)); },
+    get: (key) => inner.get(check(key)),
+    put: (key, bytes) => inner.put(check(key), bytes),
+    size: (key) => inner.size(check(key)),
     list: (prefix) => inner.list(prefix),
-    async delete(key) { return inner.delete(check(key)); },
+    delete: (key) => inner.delete(check(key)),
     stat: () => inner.stat(),
   };
 }
@@ -37,7 +35,7 @@ export function scopedFs(inner: Fs, scope: string): Fs {
     size: (key) => inner.size(outward(key)),
     // No prefix means everything in this scope. Keys come back with the scope stripped,
     // so the guest only sees names it chose.
-    list: async (prefix) => (await inner.list(outward(prefix ?? ""))).map((k) => k.slice(scope.length)),
+    list: (prefix) => inner.list(outward(prefix ?? "")).map((k) => k.slice(scope.length)),
     delete: (key) => inner.delete(outward(key)),
     stat: () => inner.stat(),
   };

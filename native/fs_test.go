@@ -13,26 +13,24 @@ import (
 // on a miss, end to end: the shared key store (services/fs-files.ts) over Go's file
 // primitive (fs.go).
 //
-// Every call is awaited, because the seam is async on every target: no browser backend
-// could implement a synchronous `get`, so the native target does not offer one either. Go
-// still answers from disk within the call.
+// Every call answers within the call, as `RawFiles` does on every target (services/fs.ts).
 func TestFsExposedToRealm(t *testing.T) {
 	bootRealm(t) // a store on a fresh temp dir, the way --dir gives one
 	if _, err := qc.Eval("fs-realm-test.js", `
 		const enc = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 		const dec = (b) => { let s = ""; for (const x of b) s += String.fromCharCode(x); return s; };
-		globalThis.__fsProbe = async () => {
-			await fs.put("blk1", enc("payload-one"));
-			await fs.put("blk2", enc("payload-two"));
-			await fs.put("blk2", enc("payload-2"));
+		globalThis.__fsProbe = () => {
+			fs.put("blk1", enc("payload-one"));
+			fs.put("blk2", enc("payload-two"));
+			fs.put("blk2", enc("payload-2"));
 			return enc([
-				dec(await fs.get("blk1")),
-				(await fs.get("nope")) === null ? "null" : "notnull",
-				String(await fs.size("blk1")), String(await fs.size("nope")),
-				(await fs.list("blk")).sort().join(","),
-				String((await fs.list("zzz")).length),
-				String(await fs.delete("blk1")), String(await fs.size("blk1")), String(await fs.delete("blk1")),
-				String((await fs.stat()).used),
+				dec(fs.get("blk1")),
+				fs.get("nope") === null ? "null" : "notnull",
+				String(fs.size("blk1")), String(fs.size("nope")),
+				fs.list("blk").sort().join(","),
+				String(fs.list("zzz").length),
+				String(fs.delete("blk1")), String(fs.size("blk1")), String(fs.delete("blk1")),
+				String(fs.stat().used),
 			].join("|"));
 		};
 	`); err != nil {
@@ -64,10 +62,10 @@ func TestFsOpenOverExistingFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "huge"), bytes.Repeat([]byte{1}, 16<<20+1), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := awaitOK(t, "open scan", `(async () => {
+	got := awaitOK(t, "open scan", `(() => {
 		const f = new FilesFs(__fs, `+jsonString(dir)+`);
-		const s = await f.stat();
-		return new TextEncoder().encode([s.used, (await f.list()).sort().join(","), String(await f.get("huge"))].join("|"));
+		const s = f.stat();
+		return new TextEncoder().encode([s.used, f.list().sort().join(","), String(f.get("huge"))].join("|"));
 	})()`, 5*time.Second)
 	if string(got) != "16777221|blk,huge|null" {
 		t.Fatalf("open over existing files: %q", got)
@@ -83,12 +81,12 @@ func TestFsOpenOverExistingFiles(t *testing.T) {
 func TestFsKeysStayInTheirDirectory(t *testing.T) {
 	bootRealm(t)
 	parent := t.TempDir()
-	got := awaitOK(t, "unsafe keys", `(async () => {
+	got := awaitOK(t, "unsafe keys", `(() => {
 		const f = new FilesFs(__fs, `+jsonString(filepath.Join(parent, "data"))+`);
 		const out = [];
 		for (const k of ["", ".", "..", "a/b", "../pwned", "a\\b"]) {
-			out.push(await f.put(k, new Uint8Array([1])).then(() => "accepted", () => "refused"));
-			out.push(String(await f.size(k)), String(await f.get(k)), String(await f.delete(k)));
+			try { f.put(k, new Uint8Array([1])); out.push("accepted"); } catch { out.push("refused"); }
+			out.push(String(f.size(k)), String(f.get(k)), String(f.delete(k)));
 		}
 		return new TextEncoder().encode(out.join(","));
 	})()`, 5*time.Second)
