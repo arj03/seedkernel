@@ -17,7 +17,7 @@ export class WsNetwork implements ChannelFactory {
 
   constructor(opts: WsNetworkOptions = {}) {
     this.mkWs = opts.webSocketFactory
-      ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => MessageTransport }).WebSocket(url));
+      ?? ((url: string) => new WebSocket(url));
   }
 
   /** Parsed instead of passed through, so a malformed destination or `tcp://` gives

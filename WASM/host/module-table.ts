@@ -8,6 +8,7 @@ import {
 import { MODULE_FAILED, moduleSet, type ModuleResult, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { errMessage } from "../services/util.js";
+import type { Worker as NodeWorker } from "node:worker_threads";
 
 // ─── module routing ─────────────────────────────────────────────────────
 
@@ -112,34 +113,26 @@ port.onmessage = (e) => {
 };
 `;
 
-let nodeWorkerCtor: Promise<{ new (code: string, opts: { eval: boolean }): ModuleWorkerPort }> | null = null;
+let nodeWorkerCtor: Promise<typeof NodeWorker> | null = null;
 
-/** The part of Node's `Worker` this file uses, typed structurally. */
-interface ModuleWorkerPort {
-  on(event: "message", cb: (msg: unknown) => void): unknown;
-  on(event: "error", cb: (err: unknown) => void): unknown;
-  postMessage(msg: unknown, transfer?: unknown[]): void;
-  terminate(): Promise<number> | void;
-  ref?(): void;
-  unref?(): void;
-}
-
-/** The part of the DOM's `Worker` this file uses, typed structurally since this tsconfig
- *  has no DOM lib and the global is checked at runtime. */
-interface BrowserWorkerLike {
-  onmessage?: ((e: { data: unknown }) => void) | null;
-  onerror?: ((e: { message?: string }) => void) | null;
-  postMessage(msg: unknown, transfer?: unknown[]): void;
-  terminate?(): void;
+/** One exchange with `worker`, a load or a call: hold the loop open until it ends, since an
+ *  unbounded one arms no timer and its caller is waiting, and run `expire` once it has
+ *  taken `ms` (`Infinity` never). Answers the release, which the answer calls. */
+function exchange(worker: ModuleWorker, ms: number, expire: () => void): () => void {
+  worker.keepAlive(true);
+  const timer = Number.isFinite(ms) ? setTimeout(expire, ms) : undefined;
+  return () => {
+    clearTimeout(timer);
+    worker.keepAlive(false);
+  };
 }
 
 /** Start one module worker. Uses the browser `Worker` global when there is one, else Node
  *  `worker_threads`, imported lazily so the browser build never resolves `node:`. */
 async function spawnWorker(src: string): Promise<ModuleWorker> {
-  const browserCtor = (globalThis as { Worker?: { new (url: string): BrowserWorkerLike } }).Worker;
-  if (typeof browserCtor === "function") {
+  if (typeof Worker === "function") {
     const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-    const w = new browserCtor(url);
+    const w = new Worker(url);
     // Nothing else revokes the blob URL, so without this it would leak one entry per
     // deadline kill for the life of the document.
     URL.revokeObjectURL(url);
@@ -148,22 +141,21 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
       onError: (cb) => { w.onerror = () => cb(new Error("module worker failed")); },
       post: (msg, transfer) => w.postMessage(msg, transfer ?? []),
       keepAlive: () => {},
-      kill: () => w.terminate?.(),
+      kill: () => w.terminate(),
     };
   }
   if (!nodeWorkerCtor) {
-    nodeWorkerCtor = import("node:worker_threads").then((wt) => wt.Worker as { new (code: string, opts: { eval: boolean }): ModuleWorkerPort });
+    nodeWorkerCtor = import("node:worker_threads").then((wt) => wt.Worker);
   }
-  const WorkerCtor = await nodeWorkerCtor;
-  const w = new WorkerCtor(src, { eval: true });
+  const w = new (await nodeWorkerCtor)(src, { eval: true });
   // An idle worker should not keep the process up; `keepAlive` re-refs it while a call is
   // in flight.
-  w.unref?.();
+  w.unref();
   return {
     onMessage: (cb) => { w.on("message", (m) => cb(m as WorkerMsg)); },
-    onError: (cb) => { w.on("error", (err) => cb(err)); },
+    onError: (cb) => { w.on("error", cb); },
     post: (msg, transfer) => w.postMessage(msg, transfer ?? []),
-    keepAlive: (on) => { if (on) w.ref?.(); else w.unref?.(); },
+    keepAlive: (on) => { if (on) w.ref(); else w.unref(); },
     kill: () => { void w.terminate(); },
   };
 }
@@ -216,24 +208,19 @@ export class ModuleTable implements PureModuleLoader {
     // Released while this was spawning.
     if (ref.dead) throw released();
     ref.worker = worker;
-    // Keep the loop open during the load, as during a call: an unbounded table arms no
-    // load timer, and the caller is waiting on it.
-    worker.keepAlive(true);
     await new Promise<void>((resolve, reject) => {
       let loading = true;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      /** Fail the load once, killing the worker. */
-      const fail = (err: Error): void => {
+      /** End the load once: loaded, or failed, which kills the worker. */
+      const settle = (err?: Error): void => {
         if (!loading) return;
         loading = false;
-        if (timer !== null) clearTimeout(timer);
+        done();
+        if (!err) return resolve();
         worker.kill();
         reject(err);
       };
-      if (Number.isFinite(this.deadlineMs)) {
-        timer = setTimeout(() => fail(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`)),
-          this.deadlineMs);
-      }
+      const done = exchange(worker, this.deadlineMs,
+        () => settle(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`)));
       // One handler for both phases, since load and calls are sequential per module (a
       // call reaches a worker only after `ready`, and a reload runs inside the queued call).
       worker.onMessage((m) => {
@@ -245,20 +232,15 @@ export class ModuleTable implements PureModuleLoader {
         }
         if (!loading) return;
         if (m.type === "ready") {
-          loading = false;
-          if (timer !== null) clearTimeout(timer);
           ref.scratchSize = m.scratchSize;
-          resolve();
+          settle();
         }
-        else if (m.type === "loadError") fail(new Error(`table: failed to instantiate wasm: ${m.message}`));
+        else if (m.type === "loadError") settle(new Error(`table: failed to instantiate wasm: ${m.message}`));
       });
       worker.onError((err) =>
-        fail(new Error(`table: module worker failed during load: ${errMessage(err)}`)));
+        settle(new Error(`table: module worker failed during load: ${errMessage(err)}`)));
       worker.post({ type: "load", wasm: ref.wasm });
     });
-    // Loaded and idle, so stop holding the loop open. (Every failure path above killed the
-    // worker.)
-    worker.keepAlive(false);
     // Released while the load was in flight.
     if (ref.dead) {
       ref.worker = null;
@@ -307,27 +289,21 @@ export class ModuleTable implements PureModuleLoader {
     }
     // Own an exact-sized, transferable buffer even when the caller passed a Node Buffer.
     const input = new Uint8Array(payload);
-    // Hold the loop open for the call, since an unbounded call arms no timer.
-    worker.keepAlive(true);
     return new Promise<ModuleResult>((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = exchange(worker, bound, () => {
+        // The module overran its bound. Kill the worker (the only interrupt that works
+        // mid-loop), answer empty, and let the next call load a fresh one. The caller is
+        // billed the full bound, so a guest looping on a wedged module exhausts its budget.
+        // Every other path that retires this worker settles the call first and clears
+        // this timer, so the worker here is still the current one.
+        answer(w, { bytes: null, ms: bound });
+        w.worker = null;
+        worker.kill();
+      });
       w.pending = (r) => {
-        if (timer !== null) clearTimeout(timer);
-        worker.keepAlive(false);
+        done();
         resolve(r);
       };
-      if (Number.isFinite(bound)) {
-        timer = setTimeout(() => {
-          // The module overran its bound. Kill the worker (the only interrupt that works
-          // mid-loop), answer empty, and let the next call load a fresh one. The caller is
-          // billed the full bound, so a guest looping on a wedged module exhausts its budget.
-          // Every other path that retires this worker settles the call first and clears
-          // this timer, so the worker here is still the current one.
-          answer(w, { bytes: null, ms: bound });
-          w.worker = null;
-          worker.kill();
-        }, bound);
-      }
       worker.post({ type: "call", payload: input.buffer }, [input.buffer]);
     });
   }

@@ -98,7 +98,7 @@ const RANDOM_DRAW_BYTES = 65536;
  *  otherwise draw one byte per call, and for ML-DSA-65's signing hedge. */
 export function randomBytes(n: number): Uint8Array {
   const out = new Uint8Array(n);
-  const c = (globalThis as { crypto?: Crypto }).crypto;
+  const c = globalThis.crypto;
   if (!c?.getRandomValues) throw new Error("platform: no CSPRNG (globalThis.crypto.getRandomValues) available");
   for (let at = 0; at < n; at += RANDOM_DRAW_BYTES) c.getRandomValues(out.subarray(at, at + RANDOM_DRAW_BYTES));
   return out;

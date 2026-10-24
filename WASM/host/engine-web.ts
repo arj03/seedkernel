@@ -11,7 +11,7 @@ let qjsBytes: Promise<Uint8Array> | undefined;
 /** qjs.wasm, out of the package's host blob (build/host.skb, beside build/host/). */
 function loadQjs(): Promise<Uint8Array> {
   const url = new URL("../host.skb", import.meta.url);
-  const node = (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node;
+  const node = globalThis.process?.versions?.node;
   return qjsBytes ??= (node
     ? import("node:fs/promises").then(({ readFile }) => readFile(url)).then((b) => new Uint8Array(b))
     : fetch(url).then((r) => {

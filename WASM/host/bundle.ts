@@ -198,8 +198,7 @@ function isValidManifest(o: unknown): o is BundleManifest {
   // U+FFFD and share another label's scope; a control or bidi character could forge the
   // operator's console line.
   if (typeof o.app !== "string" || o.app.length === 0) return false;
-  const appBytes = enc.encode(o.app);
-  if (appBytes.length > 255 || dec.decode(appBytes) !== o.app || UNSAFE_LABEL.test(o.app)) return false;
+  if (!o.app.isWellFormed() || enc.encode(o.app).length > 255 || UNSAFE_LABEL.test(o.app)) return false;
   if (typeof o.version !== "number" || !Number.isSafeInteger(o.version) || o.version < 0) return false;
   // Uniqueness is per list (§12.10); the same name in both is reachable either way.
   for (const list of [o.protocols, o.services]) {

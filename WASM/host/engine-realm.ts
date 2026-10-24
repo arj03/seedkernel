@@ -245,7 +245,8 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
       // Kept through every host-call settlement; a later entry gets its own.
       const budget = create(deadlineMs);
       const id = ++invocationSeq;
-      const result = new Promise<Uint8Array>((resolve, reject) => { invocations.set(id, { resolve, reject }); });
+      const answer = Promise.withResolvers<Uint8Array>();
+      invocations.set(id, answer);
       const fail = (err: Error): void => { takeInvocation(id)?.reject(err); };
       budget.reject = fail;
       let deferred = false;
@@ -260,7 +261,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
           fail(err instanceof Error ? err : new Error(String(err)));
         }
       });
-      return { result, deferred, cancel: fail };
+      return { result: answer.promise, deferred, cancel: fail };
     };
 
     return {

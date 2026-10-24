@@ -6,15 +6,7 @@
     // generates. build:host type-checks everything once it exists.
     "noCheck": true
   },
-  "files": [
-    "services/util.ts",
-    "services/domains.ts",
-    "services/net-limits.ts",
-    "host/wasm-limits.ts",
-    "host/bundle.ts",
-    "scripts/bundle-author.ts",
-    "services/op-frame.ts",
-    "host/pq.ts"
-  ],
+  // The authoring script and what it imports, which the transport build runs.
+  "files": ["scripts/bundle-author.ts"],
   "include": []
 }
