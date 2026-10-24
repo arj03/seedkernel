@@ -24,7 +24,9 @@ export const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 export const TEST_CONTACT = new Uint8Array(32).fill(3);
-export const { createGuestSeam, guestSignScope, appSignScope, CallBudget } = await imp("build/host/guest-seam.js");
+export const { createGuestSeam, appSignScope, CallBudget } = await imp("build/host/guest-seam.js");
+/** The bytes an app's scope adds after `DOMAIN_guest`: `app_len u8 ‖ app`. */
+export const guestSignScope = (app) => appSignScope(null, app).scope;
 /** A seam called straight from a test, with the budget a realm would pass: an unbounded
  *  segment with no causal root and a fresh spend record. */
 export const withTestBudget = (seam) => (name, payload) =>

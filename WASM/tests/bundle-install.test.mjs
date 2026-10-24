@@ -1075,7 +1075,7 @@ async function testWrongTypedStoreIsRefused() {
 
 // ─── Test: an app the runtime cannot serve is refused at load ────────────────
 //
-// `app` is the guest's signing scope, limited to 255 UTF-8 bytes (guestSignScope's
+// `app` is the guest's signing scope, limited to 255 UTF-8 bytes (appSignScope's
 // one-byte length). Refused at install, or a longer name would verify and install, then
 // fail at first use (§12.2, §12.4).
 async function testAppNameLengthRefused() {

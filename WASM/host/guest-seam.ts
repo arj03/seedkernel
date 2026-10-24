@@ -289,41 +289,37 @@ globalThis.__start = (id, argBuf) => {
  *  a peer or a co-resident app. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 
-/** The scope `node/sign` binds a guest signature to (§12.2): `app_len u8 ‖ app`. Derived
+/** An ordinary app's signing scope (§12.2): `DOMAIN_guest ‖ app_len u8 ‖ app`. Derived
  *  from the label, so every node running the app derives the same bytes. */
-export function guestSignScope(app: string): Uint8Array {
+export function appSignScope(key: Keypair, app: string): SignScope {
   const appBytes = enc.encode(app);
   if (appBytes.length > 255) throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
-  const out = new Uint8Array(1 + appBytes.length);
-  out[0] = appBytes.length;
-  out.set(appBytes, 1);
-  return out;
+  return { domain: DOMAIN_GUEST, scope: concatBytes([Uint8Array.of(appBytes.length), appBytes]), key };
 }
 
-/** An ordinary app's signing scope: `DOMAIN_guest ‖ app`. */
-export function appSignScope(key: Keypair, app: string): SignScope {
-  return { domain: DOMAIN_GUEST, scope: guestSignScope(app), key };
+/** A slot's signing scope, derived at load from admitted facts only (§12.2): never
+ *  `protocols`, which change between versions, nor the author, whose key can rotate. The
+ *  `link` slot signs under `DOMAIN_link_scope` with an empty suffix; the transport tags its
+ *  own handshake format inside the message, so changing it needs no host change. */
+export function slotSignScope(node: { identity: Keypair }, app: string, links: boolean): SignScope {
+  return links ? { domain: DOMAIN_LINK_SCOPE, scope: EMPTY, key: node.identity } : appSignScope(node.identity, app);
 }
 
-/** The one scoped-signature transcript: `domain ‖ scope ‖ message`. */
-function scopedSigningInput(scope: Pick<SignScope, "domain" | "scope">, message: Uint8Array): Uint8Array {
-  return concatBytes([scope.domain, scope.scope, message]);
-}
-
-/** Sign and verify under one scope: `node/sign` and `node/verify`, and their host-side
- *  twin `appSigner`. */
+/** Sign and verify under one scope, over `domain ‖ scope ‖ msg`: `node/sign` and
+ *  `node/verify`, and their host-side twin `appSigner`. */
 function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
   sign(msg: Uint8Array): Uint8Array;
   /** False on a bad signature, and on a `sig` or `pk` of the wrong shape. */
   verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
+  const input = (msg: Uint8Array) => concatBytes([scope.domain, scope.scope, msg]);
   return {
     sign(msg) {
-      return sodium.crypto_sign_detached(scopedSigningInput(scope, msg), scope.key.privateKey);
+      return sodium.crypto_sign_detached(input(msg), scope.key.privateKey);
     },
     verify(pk, sig, msg) {
       try {
-        return sodium.crypto_sign_verify_detached(sig, scopedSigningInput(scope, msg), pk);
+        return sodium.crypto_sign_verify_detached(sig, input(msg), pk);
       } catch {
         return false;
       }
@@ -334,20 +330,6 @@ function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). */
 export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): ReturnType<typeof scopedSigner> {
   return scopedSigner(sodium, appSignScope(key, app));
-}
-
-/** The `link` slot's signing scope: `DOMAIN_link_scope`, empty suffix. The transport tags
- *  its own handshake format inside the message, so changing it needs no host change. */
-export function linkSignScope(key: Keypair): SignScope {
-  return { domain: DOMAIN_LINK_SCOPE, scope: EMPTY, key };
-}
-
-/** A slot's signing scope, derived at load from admitted facts only (§12.2): never
- *  `protocols`, which change between versions, nor the author, whose key can rotate. */
-export function slotSignScope(node: { identity: Keypair }, app: string, links: boolean): SignScope {
-  return links
-    ? linkSignScope(node.identity)
-    : appSignScope(node.identity, app);
 }
 
 // The realm's memory limit does not cover host allocations, so the seam caps them itself.
