@@ -25,7 +25,7 @@ import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
   PLATFORM_ABI,
-  type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
+  type EngineTable, type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
   type PlatformUdp,
 } from "./abi.js";
 
@@ -136,90 +136,92 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
   };
 }
 
+/** The engine over a loader's table of handles (native). */
+function tableEngine(t: EngineTable): SyncEngine {
+  return (wasm, imports) => {
+    const id = t.engineInstantiate(wasm, imports);
+    return {
+      exported: (name) => {
+        const fn = t.engineExport(id, name);
+        // A fixed arity rather than a spread, which costs the interpreted host realm.
+        return (a, b, c, d, e, f, g, h, i, j, k, l) => t.engineCall(id, fn, a, b, c, d, e, f, g, h, i, j, k, l);
+      },
+      read: (ptr, len) => u8(t.engineRead(id, ptr, len)),
+      grow: (pages) => t.engineGrow(id, pages),
+      global: (name) => t.engineGlobal(id, name),
+      write: (ptr, bytes) => { t.engineWrite(id, ptr, bytes); },
+      dispose: () => { t.engineDispose(id); },
+    };
+  };
+}
+
+/** Zeros for wiping a scratch window, grown to the largest wipe. */
+let zeros = new Uint8Array(0);
+/** One private module on bounded engine instances, under the shared ABI: bound at
+ *  install, and again on the call after a deadline closed its instance (§4.3). */
+function engineModule(t: EngineTable, wasm: Uint8Array) {
+  let id = 0, deadline = -1, killed = false;
+  let module!: ReturnType<typeof scratchModule>;
+  const bind = () => {
+    id = t.engineInstantiate(wasm, moduleShims(), DEFAULT_GUEST_DEADLINE_MS);
+    try {
+      let fn = -1;
+      try { fn = t.engineExport(id, "handle"); } catch { /* scratchModule names it */ }
+      module = scratchModule({
+        handle: fn < 0 ? undefined : (len) => {
+          const r = t.engineCallBounded(id, fn, deadline, len);
+          if (r === null) killed = true;
+          return r;
+        },
+        global: (name) => t.engineGlobal(id, name),
+        memoryBytes: () => t.engineGrow(id, 0) * WASM_PAGE_BYTES,
+        read: (ptr, len) => u8(t.engineRead(id, ptr, len)),
+        write: (ptr, bytes) => { t.engineWrite(id, ptr, bytes); },
+        wipe: (ptr, len) => {
+          if (zeros.length < len) zeros = new Uint8Array(len);
+          t.engineWrite(id, ptr, zeros.subarray(0, len));
+        },
+      }, DEFAULT_SCRATCH_SIZE);
+    } catch (err) {
+      t.engineDispose(id);
+      throw err;
+    }
+    killed = false;
+  };
+  bind();
+  return {
+    /** A trap or an overrun answers null; the next call after an overrun binds afresh. */
+    call(payload: Uint8Array, deadlineMs: number): Uint8Array | null {
+      if (killed) {
+        t.engineDispose(id);
+        try { bind(); } catch { return null; }
+      }
+      deadline = deadlineMs;
+      try { return module.call(payload); } catch { return null; }
+    },
+    dispose() { t.engineDispose(id); },
+  };
+}
+/** Private modules where the loader bounds engine calls: in the calling guest's segment,
+ *  timed on its clock. A call is synchronous, so its time is already inside that segment. */
+const engineModules = (t: EngineTable): PureModuleLoader => ({
+  build: (mods) => moduleSet(mods, (wasm) => engineModule(t, wasm),
+    async (w, payload, deadlineMs) => ({ bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 }),
+    (w) => w.dispose()),
+});
+
 export function platformHost({ bridge, fs: files, net, udp }: Platform): PlatformHost {
   if (bridge.abi !== PLATFORM_ABI) {
     throw new Error(`host: this loader implements platform ABI ${bridge.abi}, the host needs ${PLATFORM_ABI}`);
   }
 
-  /** The engine table over the platform's. */
-  const engine: SyncEngine = (wasm, imports) => {
-    const id = bridge.engineInstantiate(wasm, imports);
-    return {
-      exported: (name) => {
-        const fn = bridge.engineExport(id, name);
-        // A fixed arity rather than a spread, which costs the interpreted host realm.
-        return (a, b, c, d, e, f, g, h, i, j, k, l) => bridge.engineCall(id, fn, a, b, c, d, e, f, g, h, i, j, k, l);
-      },
-      read: (ptr, len) => u8(bridge.engineRead(id, ptr, len)),
-      view: bridge.engineView && ((ptr, len) => bridge.engineView!(id, ptr, len)),
-      grow: (pages) => bridge.engineGrow(id, pages),
-      global: (name) => bridge.engineGlobal(id, name),
-      write: (ptr, bytes) => { bridge.engineWrite(id, ptr, bytes); },
-      dispose: () => { bridge.engineDispose(id); },
-    };
-  };
+  const { engine, modules } = "engine" in bridge ? bridge
+    : { engine: tableEngine(bridge), modules: engineModules(bridge) };
   /** The running host blob, which carries the realm engine and this host's crypto. */
   const hostEnv = u8(bridge.hostBlob());
   const hostParts = readHostBlob(hostEnv);
   const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)));
 
-  // ── The node's parts ───────────────────────────────────────────────────────────
-  /** Zeros for wiping a scratch window, grown to the largest wipe. */
-  let zeros = new Uint8Array(0);
-  /** One private module on bounded engine instances, under the shared ABI: bound at
-   *  install, and again on the call after a deadline closed its instance (§4.3). */
-  function engineModule(wasm: Uint8Array) {
-    let id = 0, deadline = -1, killed = false;
-    let module!: ReturnType<typeof scratchModule>;
-    const bind = () => {
-      id = bridge.engineInstantiate(wasm, moduleShims(), DEFAULT_GUEST_DEADLINE_MS);
-      try {
-        let fn = -1;
-        try { fn = bridge.engineExport(id, "handle"); } catch { /* scratchModule names it */ }
-        module = scratchModule({
-          handle: fn < 0 ? undefined : (len) => {
-            const r = bridge.engineCallBounded!(id, fn, deadline, len);
-            if (r === null) killed = true;
-            return r;
-          },
-          global: (name) => bridge.engineGlobal(id, name),
-          memoryBytes: () => bridge.engineGrow(id, 0) * WASM_PAGE_BYTES,
-          read: (ptr, len) => u8(bridge.engineRead(id, ptr, len)),
-          write: (ptr, bytes) => { bridge.engineWrite(id, ptr, bytes); },
-          wipe: (ptr, len) => {
-            if (zeros.length < len) zeros = new Uint8Array(len);
-            bridge.engineWrite(id, ptr, zeros.subarray(0, len));
-          },
-        }, DEFAULT_SCRATCH_SIZE);
-      } catch (err) {
-        bridge.engineDispose(id);
-        throw err;
-      }
-      killed = false;
-    };
-    bind();
-    return {
-      /** A trap or an overrun answers null; the next call after an overrun binds afresh. */
-      call(payload: Uint8Array, deadlineMs: number): Uint8Array | null {
-        if (killed) {
-          bridge.engineDispose(id);
-          try { bind(); } catch { return null; }
-        }
-        deadline = deadlineMs;
-        try { return module.call(payload); } catch { return null; }
-      },
-      dispose() { bridge.engineDispose(id); },
-    };
-  }
-  /** Private modules where the loader bounds engine calls: in the calling guest's segment,
-   *  timed on its clock. A call is synchronous, so its time is already inside that segment. */
-  const engineModules: PureModuleLoader = {
-    build: (mods) => moduleSet(mods, engineModule,
-      async (w, payload, deadlineMs) => ({ bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 }),
-      (w) => w.dispose()),
-  };
-  // Otherwise private modules in the loader's own isolates.
-  const modules = bridge.engineCallBounded ? engineModules : bridge.modules!;
   const tcp = net && tcpChannels(net);
   const channels = () => {
     if (!tcp) throw new Error("host: this platform has no sockets; pass transport.channels");

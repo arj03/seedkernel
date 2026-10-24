@@ -12,10 +12,10 @@ import { readHostBlob } from "./host-blob.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
 import { dec, EMPTY } from "../services/util.js";
 import type { PureModules } from "./bundle.js";
-import type { EngineExport, EngineImports, EngineInstance } from "./engine-realm.js";
+import type { EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { Platform, PlatformHost } from "./platform.js";
-import { PLATFORM_ABI, type PlatformBridge } from "./abi.js";
+import { PLATFORM_ABI, type PlatformBridge, type WholeEngine } from "./abi.js";
 
 /** The parts of a host blob, unchecked: a page's own code can run on the blob's wasm
  *  without fetching it again (its libsodium.wasm, under its own glue). */
@@ -107,23 +107,13 @@ export function randomBytes(n: number): Uint8Array {
 // ── the platform ─────────────────────────────────────────────────────────────
 
 /** The bridge members the Node and browser platforms share. */
-export type WebBridge = Pick<PlatformBridge,
-  | "random" | "modules"
-  | "engineInstantiate" | "engineExport" | "engineCall" | "engineGlobal" | "engineGrow"
-  | "engineRead" | "engineView" | "engineWrite" | "engineDispose">;
+export type WebBridge = Pick<PlatformBridge, "random"> & WholeEngine;
 
-/** Entropy, private modules in workers and the engine table over WebAssembly, and the
- *  release of every module and instance they hold. */
+/** Entropy, private modules in workers and the engine over WebAssembly, and the release of
+ *  every module they hold. */
 export function webBridge(): { bridge: WebBridge; teardown(): void } {
   const moduleTable = new ModuleTable();
   const built = new Set<PureModules>();
-  const engines = new Map<number, { instance: EngineInstance; fns: EngineExport[] }>();
-  let engineSeq = 0;
-  const engineOf = (id: number) => {
-    const e = engines.get(id);
-    if (!e) throw new Error("engine: no such instance");
-    return e;
-  };
   return {
     bridge: {
       random: randomBytes,
@@ -135,28 +125,11 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
           return { call: m.call, dispose() { built.delete(m); m.dispose(); } };
         },
       },
-      engineInstantiate(wasm, imports) {
-        engines.set(++engineSeq, { instance: syncWebEngine(wasm, imports), fns: [] });
-        return engineSeq;
-      },
-      engineExport(id, name) {
-        const e = engineOf(id);
-        return e.fns.push(e.instance.exported(name)) - 1;
-      },
-      // A fixed arity, as platform.ts calls it, rather than a rest array per call.
-      engineCall: (id, fn, a, b, c, d, e, f, g, h, i, j, k, l) =>
-        engineOf(id).fns[fn](a, b, c, d, e, f, g, h, i, j, k, l),
-      engineGlobal: (id, name) => engineOf(id).instance.global(name),
-      engineGrow: (id, pages) => engineOf(id).instance.grow(pages),
-      engineRead: (id, ptr, len) => engineOf(id).instance.read(ptr, len),
-      engineView: (id, ptr, len) => engineOf(id).instance.view!(ptr, len),
-      engineWrite: (id, ptr, bytes) => { engineOf(id).instance.write(ptr, bytes); },
-      engineDispose: (id) => { engines.delete(id); },
+      engine: syncWebEngine,
     },
     teardown() {
       for (const m of built) m.dispose();
       built.clear();
-      engines.clear();
     },
   };
 }

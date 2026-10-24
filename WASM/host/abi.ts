@@ -11,6 +11,7 @@
 // loader. Timers are the standard setTimeout and clearTimeout.
 
 import type { EngineImports } from "./engine-realm.js";
+import type { SyncEngine } from "./sodium-engine.js";
 import type { PureModuleLoader } from "./bundle.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { RawDatagrams } from "../services/datagrams.js";
@@ -23,8 +24,11 @@ export const PLATFORM_ABI = 1;
  *  and its loader's host slots beside it (slots.ts). */
 export const DEFAULT_DIR = "./data";
 
-/** The process, private modules (§4) and the engine table. */
-export interface PlatformBridge {
+/** The process, the engine (§12.9) and private modules (§4), which come in one of two
+ *  pairs: `WholeEngine` (Node, the browser) or `EngineTable` (native). */
+export type PlatformBridge = BridgeProcess & (WholeEngine | EngineTable);
+
+interface BridgeProcess {
   /** The ABI version this loader implements (`PLATFORM_ABI`). */
   readonly abi: number;
   /** The first word of the console banner, which names the loader. */
@@ -41,20 +45,32 @@ export interface PlatformBridge {
   /** `n` bytes from the platform CSPRNG. */
   random(n: number): Bytes;
 
-  // Private modules (§4) run one of two ways, and a loader offers exactly one. One that can
-  // end a synchronous wasm call at a deadline offers bounded engine instances
-  // (`engineCallBounded`), and the host runs the module ABI over them in the calling
-  // guest's segment (host/pure-module.ts). One that cannot runs each module in an isolate
-  // of its own and offers them as `modules`, whose calls answer asynchronously with the
-  // module's own time, billed to the caller.
-  modules?: PureModuleLoader;
+  /** The running host blob (host-blob.ts), which carries the realm engine and the host's
+   *  crypto. */
+  hostBlob(): Bytes;
+  /** Keep a host blob, which the running host has checked (host-blob.ts
+   *  `checkStagedHost`), as the one to try next, under the operator's --host-updates; a
+   *  refusal throws its reason. */
+  stageHost(blob: Uint8Array): Maybe<void>;
+}
 
-  /** The engine table: a wasm instance from bytes, its import handlers by module and name
-   *  as WebAssembly's importObject. Numbers cross as numbers, and only integral ones (an
-   *  f64 is an id or a duration in ns), which is all a loader need carry; i64 does not
-   *  cross. A
-   *  `bindDeadlineMs` (-1 for none) asks for a bounded instance, on a loader that offers
-   *  `engineCallBounded`; its instantiation runs under that deadline. */
+/** The engine whole, from a loader that can hand the host script objects. It cannot end a
+ *  synchronous wasm call at a deadline, so it runs each private module in an isolate of its
+ *  own, whose calls answer asynchronously with the module's own time, billed to the caller. */
+export interface WholeEngine {
+  engine: SyncEngine;
+  modules: PureModuleLoader;
+}
+
+/** The engine as a table of handles, from a loader that cannot hand the host script
+ *  objects: a wasm instance from bytes, its import handlers by module and name as
+ *  WebAssembly's importObject. Numbers cross as numbers, and only integral ones (an f64 is
+ *  an id or a duration in ns), which is all a loader need carry; i64 does not cross. It can
+ *  end a call at a deadline, so the host runs private modules on bounded instances, in the
+ *  calling guest's segment (host/pure-module.ts). */
+export interface EngineTable {
+  /** A `bindDeadlineMs` (-1 for none) asks for a bounded instance; its instantiation runs
+   *  under that deadline. */
   engineInstantiate(wasm: Uint8Array, imports: EngineImports, bindDeadlineMs?: number): number;
   /** An export's handle, for engineCall. */
   engineExport(id: number, name: string): number;
@@ -63,25 +79,15 @@ export interface PlatformBridge {
   engineCall(id: number, fn: number, ...args: number[]): number;
   /** `engineCall` on a bounded instance under a deadline in ms (-1 for none). Past it the
    *  instance is closed and the call answers `null`; a trap still throws. */
-  engineCallBounded?(id: number, fn: number, deadlineMs: number, ...args: number[]): number | null;
+  engineCallBounded(id: number, fn: number, deadlineMs: number, ...args: number[]): number | null;
   /** Grow an instance's memory by `pages` of 64 KiB: its size in pages before, or -1 when
    *  it cannot grow. 0 pages reads the size. */
   engineGrow(id: number, pages: number): number;
   /** An exported global's value, or `null` when the instance exports none by that name. */
   engineGlobal(id: number, name: string): number | null;
   engineRead(id: number, ptr: number, len: number): Bytes;
-  /** `engineRead` without the copy, valid until the instance next runs, on a loader whose
-   *  engine memory the host script can reach. */
-  engineView?(id: number, ptr: number, len: number): Uint8Array;
   engineWrite(id: number, ptr: number, bytes: Uint8Array): void;
   engineDispose(id: number): void;
-  /** The running host blob (host-blob.ts), which carries the realm engine and the host's
-   *  crypto. */
-  hostBlob(): Bytes;
-  /** Keep a host blob, which the running host has checked (host-blob.ts
-   *  `checkStagedHost`), as the one to try next, under the operator's --host-updates; a
-   *  refusal throws its reason. */
-  stageHost(blob: Uint8Array): Maybe<void>;
 }
 
 /** Whole files by path: the node's store (services/fs-files.ts), and the operator's files
