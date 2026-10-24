@@ -2,7 +2,7 @@
 // table and load order. Targets only swap platform members; signed bundles are the only
 // way to fill a slot (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
-import { appScopeFor, FreshnessMarks, genesisHash, isJsonObject, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
+import { appScopeFor, FreshnessMarks, genesisHash, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall, type HostStaging } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
@@ -11,7 +11,7 @@ import { validatedFs, scopedFs } from "./fs-view.js";
 import { createRealmTimers } from "./realm-timers.js";
 import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, errMessage, concatBytes, EMPTY } from "../services/util.js";
+import { enc, fromHex, toHex, isHex64, isRecord, errMessage, concatBytes, EMPTY } from "../services/util.js";
 import { sendProtocol } from "../services/op-frame.js";
 import { type CausalClock, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "../services/subkeys.js";
@@ -334,8 +334,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   // transport differ only in their target.
   const installBundle = async (blob: Uint8Array, load: InstallOptions = {},
     bootTransport = false): Promise<AppHandle> => {
-    const localConfig = load.localConfig ?? {};
-    if (!isJsonObject(localConfig)) throw new Error("shell: localConfig must be a JSON object");
+    // Round-tripped, so it is exactly what `jsonPreamble` injects; a value JSON cannot
+    // carry (a cycle, a function) fails here, before any candidate code runs.
+    let localConfig: JsonObject | undefined;
+    try { localConfig = JSON.parse(JSON.stringify(load.localConfig ?? {})); } catch { localConfig = undefined; }
+    if (!isRecord(localConfig)) throw new Error("shell: localConfig must be a JSON object");
     const bounds = boundsFor(load);
     // Resolved to the exact slot now; commit refuses if a different slot holds the label
     // by then.

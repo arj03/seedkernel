@@ -153,14 +153,15 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     requires: input.guestRequires,
     ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
   };
-  const manifest: BundleManifest = {
+  // Round-tripped, so what is validated is what a verifier parses from the signed bytes.
+  const manifest: BundleManifest = JSON.parse(JSON.stringify({
     app: input.app,
     version: input.version,
     ...(input.protocols !== undefined ? { protocols: input.protocols } : {}),
     ...(input.services !== undefined ? { services: input.services } : {}),
     modules,
     guest,
-  };
+  }));
   validateManifest(manifest);
   return {
     blob: signBundle(sodium, keys, manifest, guestBytes, input.modules.map(({ wasm }) => wasm)),

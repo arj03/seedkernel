@@ -13,8 +13,8 @@
 // reads the same layout in Go (native/hostblob.go).
 
 import { DOMAIN_HOST } from "../services/domains.js";
-import { dec, toHex } from "../services/util.js";
-import { bodyReader, envelopeBody, isJsonObject, verifyEnvelope, type ManifestVerifier } from "./bundle.js";
+import { dec, isRecord, toHex } from "../services/util.js";
+import { bodyReader, envelopeBody, verifyEnvelope, type ManifestVerifier } from "./bundle.js";
 
 /** What a host blob declares about itself. */
 export interface HostManifest {
@@ -51,7 +51,7 @@ function parseBody(body: Uint8Array): HostBlob {
   } catch {
     throw new Error("host: malformed manifest (not JSON)");
   }
-  if (!isJsonObject(manifest) || !Number.isSafeInteger(manifest.version) || (manifest.version as number) < 1
+  if (!isRecord(manifest) || !Number.isSafeInteger(manifest.version) || (manifest.version as number) < 1
     || !Number.isSafeInteger(manifest.abi) || (manifest.abi as number) < 1) {
     throw new Error("host: the manifest needs a positive integer version and abi");
   }

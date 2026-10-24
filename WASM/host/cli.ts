@@ -1,10 +1,10 @@
 // The operator side of a node, shared by every target: flags, defaults, deny-all without
 // `--policy` (§14), remedies before the bundle (§12.5), which failures are fatal, and the
 // console output. A `CliHost` supplies only what differs per target.
-import { toHex, fromHex, isHex64, errMessage, enc, dec, u8 } from "../services/util.js";
+import { toHex, fromHex, isHex64, isRecord, errMessage, enc, dec, u8 } from "../services/util.js";
 import type { RawFiles } from "../services/fs-files.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subkeys.js";
-import { FreshnessMarks, freshnessPathFor, isJsonObject, type JsonObject } from "./bundle.js";
+import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
 import { OpArgs, writeOp } from "../services/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
@@ -230,8 +230,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   let localConfig: JsonObject | undefined;
   if (args.has("local-config")) {
     const parsed: unknown = JSON.parse(dec.decode(mustRead(host, args.get("local-config")!, "--local-config")));
-    if (!isJsonObject(parsed)) throw new Error("--local-config must hold a JSON object");
-    localConfig = parsed;
+    if (!isRecord(parsed)) throw new Error("--local-config must hold a JSON object");
+    localConfig = parsed as JsonObject;
   }
 
   // Transport config (§12.6.3), passed through unread: the transport checks it at load.

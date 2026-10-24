@@ -914,7 +914,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   }
   const cyclic = {}; cyclic.self = cyclic;
   await rejects(reload({ localConfig: cyclic }),
-    "a non-JSON local value is refused instead of being silently changed during injection");
+    "a local value JSON cannot carry is refused at install, not when the realm is stood");
   // Both config values are objects. A guest reads config by name, so a scalar or array
   // would make every `LOCAL.x` read `undefined` at run time instead of failing the install.
   await rejects(reload({ localConfig: [1, 2] }),

@@ -6,7 +6,6 @@
 // node. A page takes its host's crypto from the blob it is served (docs/CLIENT.md).
 
 import { readFileSync } from "node:fs";
-import { ML_DSA65_SEED_LEN } from "./pq.js";
 import { engineSodium, type HostSodium } from "./sodium-engine.js";
 import { randomBytes, syncWebEngine } from "./platform-web.js";
 import { readHostBlob } from "./host-blob.js";
@@ -31,13 +30,6 @@ function hostCrypto(): HostCrypto {
 /** The host crypto surface: libsodium plus ML-DSA-65. */
 export async function loadCrypto(): Promise<HostCrypto> {
   return hostCrypto();
-}
-
-/** A fresh ML-DSA-65 keypair, the PQ half of a hybrid author identity (§12.4). The
- *  Ed25519 half is `generateKeyPair` below; `hybridAuthorId` (bundle.ts) turns the two
- *  public keys into the 32-byte id. */
-export function generatePqKeyPair(): Keypair {
-  return hostCrypto().ml_dsa65_keypair_from_seed(randomBytes(ML_DSA65_SEED_LEN));
 }
 
 export function generateKeyPair(): Keypair {

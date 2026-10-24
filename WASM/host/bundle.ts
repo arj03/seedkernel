@@ -155,38 +155,6 @@ export function hybridAuthorId(sodium: ManifestVerifier, edPk: Uint8Array, mlDsa
   return sodium.crypto_generichash(32, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]), null);
 }
 
-function isJsonValueAt(value: unknown, ancestors: Set<object>): value is JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value !== "object") return false;
-  const object = value as object;
-  if (ancestors.has(object)) return false;
-  const proto = Object.getPrototypeOf(object);
-  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) return false;
-  ancestors.add(object);
-  try {
-    return (Array.isArray(value) ? value : Object.values(value))
-      .every((item) => isJsonValueAt(item, ancestors));
-  } finally {
-    ancestors.delete(object);
-  }
-}
-
-/** True for exactly the values signed manifest JSON can carry: no cycles, exotic (or
- *  cross-realm) prototypes, or non-finite numbers, which `JSON.stringify` would change. */
-export function isJsonValue(value: unknown): value is JsonValue {
-  try {
-    return isJsonValueAt(value, new Set());
-  } catch {
-    return false;
-  }
-}
-
-/** True for a JSON object, the shape both config channels carry. */
-export function isJsonObject(value: unknown): value is JsonObject {
-  return isRecord(value) && isJsonValue(value);
-}
-
 /** Control, line-separator, bidi and zero-width characters. */
 const UNSAFE_LABEL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
 
@@ -223,7 +191,7 @@ function isValidManifest(o: unknown): o is BundleManifest {
   const g = o.guest;
   if (!isRecord(g)) return false;
   if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string")) return false;
-  if (g.config !== undefined && !isJsonObject(g.config)) return false;
+  if (g.config !== undefined && !isRecord(g.config)) return false;
   return true;
 }
 
