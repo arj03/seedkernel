@@ -97,3 +97,20 @@ func TestFsKeysStayInTheirDirectory(t *testing.T) {
 		t.Fatal("an unsafe key escaped the data directory")
 	}
 }
+
+// TestFsDurableWrite: a durable write lands like any other, flushed first (writeFileAtomic).
+func TestFsDurableWrite(t *testing.T) {
+	bootRealm(t)
+	dir := t.TempDir()
+	got := awaitOK(t, "durable write", `(() => {
+		const p = `+jsonString(filepath.Join(dir, "key"))+`;
+		__fs.write(p, new TextEncoder().encode("seed"), true);
+		return __fs.read(p, 64);
+	})()`, 5*time.Second)
+	if string(got) != "seed" {
+		t.Fatalf("durable write read back %q, want \"seed\"", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("the durable write left %d entries, want the file alone", len(entries))
+	}
+}

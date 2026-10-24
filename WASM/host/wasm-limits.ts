@@ -82,11 +82,18 @@ function readVarU32(c: Cursor): number {
   throw new Error("wasm: LEB128 too long for a u32");
 }
 
-function skipName(c: Cursor): void {
+function readName(c: Cursor): string {
   const len = readVarU32(c);
+  if (len > c.b.length - c.i) throw new Error("wasm: truncated name");
+  const name = String.fromCharCode(...c.b.subarray(c.i, c.i + len));
   c.i += len;
-  if (c.i > c.b.length) throw new Error("wasm: truncated name");
+  return name;
 }
+
+/** The only imports a module may make: the inert runtime shims `moduleShims` answers
+ *  (pure-module.ts), all functions. Anything else, a WASI call or a memory, table or
+ *  global included, is refused here, so a module loads on every target or on none. */
+const MODULE_IMPORTS = new Set(["env.abort", "env.seed", "env.trace"]);
 
 /** A `limits` record: flags, initial, then maximum if declared. Shared (0x02) and 64-bit
  *  (0x04+) are outside the §4 contract and refused by name. */
@@ -112,8 +119,8 @@ function readTableType(c: Cursor): { initial: number; max: number | null } {
 }
 
 /** Read what a module declares it may allocate: its own linear memory (null when it
- *  declares none) and its tables. Throws when the module imports a memory or a table,
- *  declares more than one memory, or cannot be walked. */
+ *  declares none) and its tables. Throws when the module imports anything but the runtime
+ *  shims, declares more than one memory, or cannot be walked. */
 export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
   if (wasm.length < 8) throw new Error("wasm: too short to be a module");
   if (!(wasm[0] === 0x00 && wasm[1] === 0x61 && wasm[2] === 0x73 && wasm[3] === 0x6d)) {
@@ -129,19 +136,15 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
     const end = c.i + size;
     if (end > wasm.length) throw new Error("wasm: truncated section");
     if (id === 2) {
-      // Imports: functions only (§4.2). An imported memory or table is storage the module
-      // did not declare, so it is refused.
+      // Imports: the runtime shims and nothing else (§4.2).
       const count = readVarU32(c);
       for (let k = 0; k < count; k++) {
-        skipName(c);
-        skipName(c);
+        const name = readName(c) + "." + readName(c);
         if (c.i >= c.b.length) throw new Error("wasm: truncated import");
-        const kind = wasm[c.i++];
-        if (kind === 0x00) readVarU32(c);                     // func: typeidx
-        else if (kind === 0x01) throw new Error("wasm: module imports a table — refused (§4.2: a module imports nothing from the runtime)");
-        else if (kind === 0x02) throw new Error("wasm: module imports a memory — refused (§4.2: a module imports nothing from the runtime)");
-        else if (kind === 0x03) c.i += 2;                     // global: valtype ‖ mut
-        else throw new Error(`wasm: unknown import kind 0x${kind.toString(16)}`);
+        if (wasm[c.i++] !== 0x00 || !MODULE_IMPORTS.has(name)) {
+          throw new Error(`wasm: module imports ${JSON.stringify(name)} — refused (§4.2: a module imports only ${[...MODULE_IMPORTS].join(", ")})`);
+        }
+        readVarU32(c);                                        // func: typeidx
       }
     } else if (id === 4) {
       // Tables: ordinary compiler output, so charged like pages rather than refused.

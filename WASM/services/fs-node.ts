@@ -3,10 +3,16 @@
 // target: the Node platform's files, the operator's and the loader's slots included.
 
 import { randomBytes } from "node:crypto";
-import { closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { FilesFs, type RawFiles } from "./fs-files.js";
+
+/** Flush a file (opened for writing, as Windows needs) or a directory to disk. */
+function flush(path: string, mode: "r+" | "r"): void {
+  const fd = openSync(path, mode);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
 
 /** The temp file an atomic write goes through before it is renamed over `path`: beside it,
  *  under the `~` that marks a platform's temp files. */
@@ -30,14 +36,20 @@ export const nodeRawFiles: RawFiles = {
       closeSync(fd);
     }
   },
-  write(path, bytes) {
+  write(path, bytes, durable = false) {
     const tmp = tempBeside(path);
     try {
       writeFileSync(tmp, bytes, { mode: 0o600 });
+      if (durable) flush(tmp, "r+");
       renameSync(tmp, path);
     } catch (err) {
       try { unlinkSync(tmp); } catch { /* never written */ }
       throw err;
+    }
+    // The rename is the directory's change, flushed as best it can be: the file is in place
+    // whatever this answers, and Windows cannot open a directory to flush it.
+    if (durable && process.platform !== "win32") {
+      try { flush(dirname(path), "r"); } catch { /* the file stands */ }
     }
   },
   remove(path) {

@@ -37,7 +37,9 @@ export const TCP_KEEPALIVE_MS = 30_000;
 export const MAX_UDP_SOCKETS = 2048;
 
 /** Datagram bytes held for the link occupant while it reads earlier ones, for every socket
- *  together. Past it a datagram is dropped, as a full socket buffer drops one. */
+ *  together. Past it a datagram is dropped, as a full socket buffer drops one. Native's
+ *  readers charge it again, across every socket, to what they hold for the loop (udp.go),
+ *  so its bound is 2x, as `MAX_INBOUND_HOLD_BYTES` is for TCP. */
 export const MAX_UDP_HELD_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** The kernel receive and send buffers asked for on each datagram socket: a peer may put a

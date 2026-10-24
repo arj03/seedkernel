@@ -2,8 +2,9 @@
 // call its exports with numbers, and read and write its memory. It knows nothing of what
 // runs inside; the shared realm driver (host/engine-realm.ts) builds guest realms on it
 // from qjs.wasm. An import outside WASI calls the JS function the instantiation names for
-// it, as WebAssembly's importObject does. WASI is answered as a realm's is (qjs.go): the
-// clock and nothing else.
+// it, as WebAssembly's importObject does. WASI is answered only for an unbounded instance,
+// the realm engine, as a realm's is (qjs.go): the clock and nothing else. A private module
+// imports only the runtime shims (host/wasm-limits.ts), so it is handed no WASI here either.
 //
 // A bounded instance is the one a private module runs on (§4.3): its runtime compiles in
 // the check that lets a deadline end a call mid-loop, instantiation runs under its own
@@ -168,13 +169,15 @@ func newEngineInstance(qc *qjs.Context, bytes []byte, importObject *qjs.Value, b
 		return nil, fmt.Errorf("engine: compile: %w", err)
 	}
 	imports := code.ImportedFunctions()
-	if err := qjs.InstantiateWASI(ctx, e.rt, imports); err != nil {
-		return nil, fmt.Errorf("engine: WASI: %w", err)
+	if !bounded {
+		if err := qjs.InstantiateWASI(ctx, e.rt, imports); err != nil {
+			return nil, fmt.Errorf("engine: WASI: %w", err)
+		}
 	}
 	builders := map[string]wazero.HostModuleBuilder{}
 	for _, def := range imports {
 		module, name, _ := def.Import()
-		if module == "wasi_snapshot_preview1" {
+		if module == "wasi_snapshot_preview1" && !bounded {
 			continue
 		}
 		ns := importObject.GetPropertyStr(module)

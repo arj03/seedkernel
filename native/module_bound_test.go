@@ -23,6 +23,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -310,5 +311,22 @@ func TestModuleBuildAllOrNone(t *testing.T) {
 	}
 	if hasModules(t, "halfapp") {
 		t.Fatal("a refused set was kept")
+	}
+}
+
+// wasiClockWasm is a module of the §4 shape whose handle calls WASI's clock_time_get.
+var wasiClockWasm, _ = hex.DecodeString("0061736d01000000010d0260037f7e7f017f60017f017f02290116776173695f736e617073686f745f70726576696577310e636c6f636b5f74696d655f6765740000030201010504010104040607017f004180080b071d03066d656d6f72790200077363726174636803000668616e646c6500010a0f010d0041004201410010001a41000b")
+
+// TestModuleGetsNoWasi (§4.2): the engine table answers WASI for the realm engine alone, so
+// a module importing it binds on no target. Install refuses it before that
+// (host/wasm-limits.ts, tests/verify-hardening.mjs); this is the bridge behind it.
+func TestModuleGetsNoWasi(t *testing.T) {
+	bootRealm(t)
+	err := buildModules(t, "wasiapp", []string{"clock"}, wasiClockWasm)
+	if err == nil {
+		t.Fatal("a module importing WASI's clock was built, so it can read the clock")
+	}
+	if !strings.Contains(err.Error(), "wasi_snapshot_preview1") {
+		t.Fatalf("the refusal does not name the WASI import: %v", err)
 	}
 }

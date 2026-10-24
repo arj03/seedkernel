@@ -15,13 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"seedkernel/qjs"
 )
-
-// udpHeldMax bounds what a socket holds for the loop. Past it a datagram is dropped, as a
-// full socket buffer drops one, and the stream sends it again.
-const udpHeldMax = 4 << 20
 
 type udpHost struct {
 	el *eventLoop
@@ -30,6 +27,12 @@ type udpHost struct {
 	mu     sync.Mutex
 	socks  map[int64]*udpSock
 	nextID int64
+
+	// What every socket together holds for the loop, and its ceiling, which the host
+	// passes at bind (MAX_UDP_HELD_BYTES): past it a datagram is dropped, as a full socket
+	// buffer drops one, and the stream sends it again.
+	held    atomic.Int64
+	heldMax atomic.Int64
 }
 
 type udpSock struct {
@@ -56,6 +59,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		// which is no reason to fail.
 		conn.SetReadBuffer(int(args[1].Int64()))
 		conn.SetWriteBuffer(int(args[1].Int64()))
+		u.heldMax.Store(args[2].Int64())
 		s := &udpSock{conn: conn, deliver: args[0].Dup()}
 		u.mu.Lock()
 		u.nextID++
@@ -166,11 +170,12 @@ func (u *udpHost) read(id int64, s *udpSock) {
 		if addr.Is4() {
 			ip = a16[12:]
 		}
-		s.mu.Lock()
-		if len(s.held)+5+len(ip)+n > udpHeldMax {
-			s.mu.Unlock()
+		size := int64(5 + len(ip) + n)
+		if u.held.Add(size) > u.heldMax.Load() {
+			u.held.Add(-size)
 			continue
 		}
+		s.mu.Lock()
 		s.held = append(s.held, byte(len(ip)))
 		s.held = append(s.held, ip...)
 		s.held = binary.BigEndian.AppendUint16(s.held, from.Port())
@@ -191,6 +196,8 @@ func (u *udpHost) deliver(id int64, s *udpSock) {
 	batch := s.held
 	s.held, s.posted = s.spare, false
 	s.mu.Unlock()
+	// Released here, whether or not the socket is still there to take it.
+	u.held.Add(-int64(len(batch)))
 	if u.get(id) == nil {
 		return
 	}

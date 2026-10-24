@@ -8,20 +8,27 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"seedkernel/qjs"
 )
 
-// writeFileAtomic writes b via a sibling temp file and rename: atomic but not fsynced, so a
-// crash leaves the old file or the new one, and perhaps the temp, whose name starts with
-// `~`. CreateTemp makes it 0600: readable by this user alone.
-func writeFileAtomic(path string, b []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "~"+filepath.Base(path)+".*")
+// writeFileAtomic writes b via a sibling temp file and rename, so a crash leaves the old
+// file or the new one, and perhaps the temp, whose name starts with `~`. CreateTemp makes it
+// 0600: readable by this user alone. durable flushes the file before the rename and, as
+// best it can, the directory after it, so a power loss cannot undo the write either (RawFiles.write,
+// services/fs-files.ts); without it the write is atomic but not fsynced.
+func writeFileAtomic(path string, b []byte, durable bool) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "~"+filepath.Base(path)+".*")
 	if err != nil {
 		return err
 	}
 	_, err = tmp.Write(b)
+	if err == nil && durable {
+		err = tmp.Sync()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
@@ -30,8 +37,17 @@ func writeFileAtomic(path string, b []byte) error {
 	}
 	if err != nil {
 		os.Remove(tmp.Name())
+		return err
 	}
-	return err
+	// The rename is the directory's change, flushed as best it can be: the file is in place
+	// whatever this answers, and Windows cannot open a directory to flush it.
+	if durable && runtime.GOOS != "windows" {
+		if d, err := os.Open(dir); err == nil {
+			d.Sync()
+			d.Close()
+		}
+	}
+	return nil
 }
 
 // exposeFs installs `__fs`, typed in host/abi.ts.
@@ -68,11 +84,12 @@ func exposeFs(qc *qjs.Context) {
 	o.SetPropertyStr("write", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		// Bytes borrowed last (qjs.Value.View).
 		path := args[0].String()
+		durable := len(args) > 2 && args[2].Int32() != 0
 		b, err := args[1].View()
 		if err != nil {
 			return nil, err
 		}
-		return nil, writeFileAtomic(path, b)
+		return nil, writeFileAtomic(path, b, durable)
 	}))
 	o.SetPropertyStr("remove", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		return qc.NewBool(os.Remove(args[0].String()) == nil), nil

@@ -258,7 +258,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   /** This platform as `cli.ts` needs it; cli.ts makes every decision. */
   const cliHost = (): CliHost => ({
     read: (path, maxBytes) => files.read(path, maxBytes),
-    write: (path, bytes) => files.write(path, bytes),
+    write: (path, bytes, durable) => files.write(path, bytes, durable),
     banner: bridge.banner,
     argv: JSON.parse(bridge.argv()) as string[],
     log(line) { bridge.log(line); },

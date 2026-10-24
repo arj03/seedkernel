@@ -344,7 +344,7 @@ export class TransportHost {
       let id = 0;
       const b = await raw.bind((batch) => {
         if (id !== 0) this.heard(id, u8(batch));
-      }, UDP_SOCKET_BUFFER_BYTES);
+      }, UDP_SOCKET_BUFFER_BYTES, MAX_UDP_HELD_BYTES);
       if (gen !== this.socketGen) { raw.close(b.id); return NO_SOCKET; }
       id = b.id;
       this.sockets.add(id);

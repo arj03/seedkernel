@@ -16,6 +16,8 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -236,7 +238,7 @@ func TestUdpDualStackNative(t *testing.T) {
 	      at += 5 + n + len;
 	    }
 	  };
-	  const a = __udp.bind(() => {}, 1 << 16), b = __udp.bind(read, 1 << 16);
+	  const a = __udp.bind(() => {}, 1 << 16, 1 << 22), b = __udp.bind(read, 1 << 16, 1 << 22);
 	  // [socket u32][hostLen u8][host][port u16][len u16][bytes], as link/udpSend carries it.
 	  const one = (host, x) => Uint8Array.of(0, 0, 0, a.id, host.length, ...new TextEncoder().encode(host), b.port >> 8, b.port & 255, 0, 1, x);
 	  __udp.send(new Uint8Array([...one("127.0.0.1", 4), ...one("::1", 6)]));
@@ -278,4 +280,36 @@ func BenchmarkUdpUpload1M(b *testing.B) {
 	b.ResetTimer()
 	benchAwait(b, fmt.Sprintf("udpUploadN(%d)", b.N))
 	b.StopTimer()
+}
+
+// TestUdpHeldBudgetShared: what the sockets hold for the loop is one budget across all of
+// them (MAX_UDP_HELD_BYTES, passed at bind), not one per socket, as TCP's staging is.
+func TestUdpHeldBudgetShared(t *testing.T) {
+	bootRealm(t)
+	const budget = 3000
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	payload := make([]byte, 1000)
+	for i := 0; i < 2; i++ {
+		port, err := strconv.Atoi(evalString(t, fmt.Sprintf(`__udp.bind(() => {}, 65536, %d).port`, budget)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < 4; j++ {
+			client.WriteToUDP(payload, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		}
+	}
+	// No loop turn runs here, so nothing is delivered: what is held only grows, to the budget.
+	entry := int64(5 + 4 + len(payload))
+	deadline := time.Now().Add(2 * time.Second)
+	for uh.held.Load() < 2*entry && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if held := uh.held.Load(); held != 2*entry {
+		t.Fatalf("two sockets hold %d bytes under a shared budget of %d, want the %d bytes of the two datagrams that fit", held, budget, 2*entry)
+	}
 }

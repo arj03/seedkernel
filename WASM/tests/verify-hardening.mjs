@@ -70,6 +70,11 @@ const tableSection = (initial, max) => section(4, [0x01, 0x70,
   ...(max === null ? [0x00, ...leb(initial)] : [0x01, ...leb(initial), ...leb(max)])]);
 /** A module importing a table (`e.t`) instead of declaring one. */
 const importedTableModule = () => rawModule(section(2, [0x01, 0x01, 0x65, 0x01, 0x74, 0x01, 0x70, 0x00, ...leb(1)]));
+const name = (s) => [...leb(s.length), ...Array.from(s, (c) => c.charCodeAt(0))];
+/** A module with one memory and one function import, `module.field`. */
+const funcImportModule = (module, field) => rawModule(section(2, [0x01, ...name(module), ...name(field), 0x00, 0x00]), memSection(1, 1));
+/** A module importing an i32 global, `env.g`. */
+const globalImportModule = () => rawModule(section(2, [0x01, ...name("env"), ...name("g"), 0x03, 0x7f, 0x00]), memSection(1, 1));
 const memModule = (initialPages, maxPages) => rawModule(memSection(initialPages, maxPages));
 
 console.log("\n§4.3 — declared memory and tables are bounded before instantiation");
@@ -96,6 +101,18 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
     "a module declaring no memory is still charged for its tables");
   throws(() => checkModuleLimits(importedTableModule(), 64 * 1024 * 1024),
     "an imported table is refused like an imported memory (§4.2)");
+  // A module imports the runtime shims and nothing else (§4.2), refused here rather than at
+  // instantiation, where a target that resolved more (native answered WASI) would accept
+  // what another refuses.
+  for (const shim of ["abort", "seed", "trace"]) {
+    ok(checkModuleLimits(funcImportModule("env", shim), 64 * 1024 * 1024).memory !== null, `the env.${shim} shim is a module's to import`);
+  }
+  throws(() => checkModuleLimits(funcImportModule("wasi_snapshot_preview1", "clock_time_get"), 64 * 1024 * 1024),
+    "a WASI import is refused, so no target hands a module a clock");
+  throws(() => checkModuleLimits(funcImportModule("env", "now"), 64 * 1024 * 1024),
+    "a function import outside the shims is refused");
+  throws(() => checkModuleLimits(globalImportModule(), 64 * 1024 * 1024),
+    "a global import is refused like a memory or table import");
 
   // The ceiling is applied once, on the shared load path (bundle.ts `loadBundleModules`),
   // for every target. A stub loader is enough, since this tests that path, not an isolate.

@@ -8,8 +8,11 @@ export interface RawDatagrams {
   /** A socket on a port the OS picks, dual-stack where the machine has IPv6, asking for
    *  kernel receive and send buffers of `bufferBytes`; a kernel that grants less is no
    *  failure. What it reads arrives at `deliver` in batches of
-   *  `[n u8][ip n][port u16][len u16][bytes]`, n 4 for IPv4 and 16 for IPv6. */
-  bind(deliver: (batch: Uint8Array | ArrayBuffer) => void, bufferBytes: number):
+   *  `[n u8][ip n][port u16][len u16][bytes]`, n 4 for IPv4 and 16 for IPv6. A platform that
+   *  reads off its event loop holds what it has read for `deliver` within `heldBytes`, for
+   *  all its sockets together, dropping a datagram past it; one that reads on the loop
+   *  delivers at once and holds nothing. */
+  bind(deliver: (batch: Uint8Array | ArrayBuffer) => void, bufferBytes: number, heldBytes: number):
     { id: number; port: number } | Promise<{ id: number; port: number }>;
   /** A turn's datagrams, as `link/udpSend` carries them (`forEachDatagram`), whole and from
    *  sockets the sender holds. A failure is a lost one. A name rather than an address

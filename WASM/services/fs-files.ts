@@ -15,8 +15,13 @@ export interface RawFiles {
    *  cannot be read, throws. */
   read(path: string, maxBytes: number): Bytes | null;
   /** Write a whole file atomically and readable by this user alone, through a sibling temp
-   *  file whose name starts with `~`; a crash can leave that file behind. */
-  write(path: string, bytes: Uint8Array): void;
+   *  file whose name starts with `~`; a crash can leave that file behind. `durable` also
+   *  flushes the file to disk before the rename and then, as best it can, the directory,
+   *  so a power loss cannot undo the write; a failure past the rename does not throw, since
+   *  the file is in place. For the operator's files (the key, the freshness marks, the
+   *  loader's slots), where a lost write is a lost revocation or identity. The store's
+   *  blocks skip it, since a lost block is fetched again. */
+  write(path: string, bytes: Uint8Array, durable?: boolean): void;
   /** false when there was nothing to remove. */
   remove(path: string): boolean;
   /** A regular file's size, or -1 when there is none. */

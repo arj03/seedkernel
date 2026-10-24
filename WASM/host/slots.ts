@@ -23,8 +23,8 @@ export interface SlotFiles {
   mkdir(dir: string): void;
   /** `null` only when absent; one larger than `maxBytes`, or unreadable, throws. */
   read(path: string, maxBytes: number): ArrayBuffer | Uint8Array | null;
-  /** Atomic. */
-  write(path: string, bytes: Uint8Array): void;
+  /** Atomic; `durable` as `RawFiles.write` has it (services/fs-files.ts). */
+  write(path: string, bytes: Uint8Array, durable?: boolean): void;
   remove(path: string): boolean;
   /** -1 when absent. */
   size(path: string): number;
@@ -183,7 +183,7 @@ export class Loader {
       return base.env;
     }
     try {
-      this.files.write(this.path("tried"), EMPTY);
+      this.files.write(this.path("tried"), EMPTY, true);
     } catch (err) {
       this.log(`cannot mark v${p.version} tried, so it is not run: ${errMessage(err)}`);
       return base.env;
@@ -240,7 +240,7 @@ export class Loader {
     const trial = this.trial;
     if (!trial || this.gen !== gen) return;
     try {
-      this.files.write(this.path("committed.skb"), trial.env);
+      this.files.write(this.path("committed.skb"), trial.env, true);
     } catch (err) {
       this.log(`cannot commit the pending host: ${errMessage(err)}`);
       return;
@@ -257,7 +257,7 @@ export class Loader {
     if (this.mode === "off") throw new Error("host: updates are off on this node (--host-updates next|now)");
     const { manifest } = readHostBlob(env);
     this.files.mkdir(this.dir);
-    this.files.write(this.path("pending.skb"), env);
+    this.files.write(this.path("pending.skb"), env, true);
     this.files.remove(this.path("tried"));
     this.log(`staged v${manifest.version}`);
     if (this.mode !== "now") return false;

@@ -161,7 +161,7 @@ function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   const existing = readNamed(host, keyPath, "--key");
   if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(dec.decode(existing), `--key ${keyPath}`));
   const master = host.sodium.randombytes_buf(32);
-  host.write(keyPath, enc.encode(toHex(master)));
+  host.write(keyPath, enc.encode(toHex(master)), true);
   return deriveNodeKey(host.sodium, master);
 }
 
@@ -170,7 +170,7 @@ function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
 export function freshnessStoreFor(files: CliFiles, dir: string): FreshnessMarks {
   const path = freshnessPathFor(dir);
   const raw = readNamed(files, path, "freshness store");
-  return new FreshnessMarks(raw === null ? null : dec.decode(raw), (json) => files.write(path, enc.encode(json)));
+  return new FreshnessMarks(raw === null ? null : dec.decode(raw), (json) => files.write(path, enc.encode(json), true));
 }
 
 /** The console line a load prints (§12.4, §12.10): label, version, author and claims.
