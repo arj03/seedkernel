@@ -28,17 +28,17 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): its loader (`host/platform-web.js`), the socket seams and bundle verification | ~66 KB |
+| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): its loader (`host/platform-web.js`), the socket seams and bundle verification | ~56 KB |
 | **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium and ML-DSA-65, signed (§12.9). A page's loader runs it on the browser platform | 1.4 MB |
-| of which the host script (`build/host.js`), with the transport bundle embedded as base64 (including `ws.wasm` and `mlkem768.wasm`) | 495 KB |
+| of which the host script (`build/host.js`), with the transport bundle embedded as base64 (including `ws.wasm` and `mlkem768.wasm`) | 482 KB |
 | of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 623 KB |
 | of which libsodium.wasm (core build: the host's crypto) | 217 KB |
 | of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
-| **Total browser deployment** | **~1.4 MB (~570 KB gzipped)** |
+| **Total browser deployment** | **~1.4 MB (~560 KB gzipped)** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, counted inside the transport bundle |
 | **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~7.1 MB |
 
-`npm run build` emits the readable `build/` (~563 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~437 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach, a page's loader and the host modules a page that assembles with `bootShell` itself imports. It prints the gzipped size before and after minifying on every run.
+`npm run build` emits the readable `build/` (~547 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~425 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach, a page's loader and the host modules a page that assembles with `bootShell` itself imports. It prints the gzipped size before and after minifying on every run.
 
 ---
 
@@ -347,7 +347,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 
 - Node↔node over TCP: a length prefix. Browser↔node: RFC 6455 over the same TCP socket, its headers in `framing.js` and its masking in `ws.wasm`. Platform `WebSocket` and `RTCDataChannel`: whole messages as delivered.
 - Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and `maxFrameBytes` (`MAX_FRAME_BYTES` by default) after. `raiseCap()` lands once the authenticating step (msg2 dialing, msg3 accepting) has run; until then framers take one message at a time.
-- `ByteParts` merges slices below 8 KiB (`MERGE_BELOW`) into a doubling tail buffer and keeps larger slices as they arrived. The WebSocket framer serializes `push`.
+- `Pieces` (`transport/src/util.js`) merges slices below 8 KiB (`MERGE_BELOW`) into a doubling tail buffer and keeps larger slices as they arrived. The WebSocket framer serializes `push`.
 
 #### Handshake
 
