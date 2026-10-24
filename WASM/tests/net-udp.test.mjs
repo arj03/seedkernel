@@ -35,7 +35,7 @@ const CREDIT = 1 << 20, MAX_READ = 256 * 1024;
 // ── the transport's UDP parts, in a realm of their own ───────────────────────
 
 /** The parts as the bundle assembles them (scripts/guest-source.mjs), and what the rest of
- *  the transport gives them: the wake (core.js), entropy (ake.js), the negotiation tags
+ *  the transport gives them: the wake and retried calls (core.js), entropy (ake.js), the negotiation tags
  *  (direct.js) and the `datagrams` event. */
 const UDP_SOURCE = ["util.js", "stream.js", "udp.js"]
   .map((f) => readFileSync(join(root, "transport", "src", f), "utf8")).join("\n")
@@ -51,6 +51,7 @@ function wakeBy(at) {
   wakeTimer = setTimeout(() => { wakeAt = Infinity; wakeBy(udp.onWake(now())); }, Math.max(0, at - now()));
 }
 function dueIn(ms) { const at = now() + ms; wakeBy(at); return at; }
+function callRetried(name, bytes) { void host.call(name, bytes).catch(() => {}); }
 function randomBytes(n) { return host.call("crypto/random", argU32(n)); }
 const udp = new Udp();
 globalThis.__handle = (input) => {

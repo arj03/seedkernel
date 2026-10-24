@@ -109,8 +109,9 @@ const linksById = new Map();
 // (`Infinity` for none). The host's single wake (§12.3) is armed for the soonest; each
 // wake walks them all (`onWake`) and re-arms.
 const now = () => performance.now();
-/** A refused close is retried after this long (`Link.closeChannel`). */
-const CLOSE_RETRY_MS = 100;
+/** A host call the budget refused is asked again after this long (`callRetried`). */
+const RETRY_MS = 100;
+const owed = [];        // those calls, for the next wake
 let wakeAt = Infinity;  // when the armed wake fires
 let armGen = 0;         // which arm is the latest, so a stale refusal changes nothing
 let owedAt = Infinity;  // the latest arm was refused; the next event asks again for this
@@ -128,6 +129,14 @@ function wakeBy(at) {
   if (at >= wakeAt) return;
   wakeAt = at;
   if (!walking) arm(at);
+}
+
+/** Make a host call whose answer nothing waits on. One the host-call budget refuses is
+ *  asked again `RETRY_MS` later, until the host takes it: a close, say, which would
+ *  otherwise leave its socket open. */
+function callRetried(name, bytes) {
+  try { void host.call(name, bytes).catch(() => {}); }
+  catch { owed.push(() => callRetried(name, bytes)); dueIn(RETRY_MS); }
 }
 
 function arm(at) {
@@ -148,6 +157,7 @@ function onWake() {
   wakeAt = Infinity;
   walking = true;
   try {
+    for (const call of owed.splice(0)) call();
     const t = now();
     wakeBy(reqres.onWake(t));
     wakeBy(core.checkReady(t));

@@ -212,8 +212,6 @@ class Udp {
     this.outLen = 0;
     this.flushDue = false;
     this.flushNow = () => { this.flushDue = false; this.flush(); };
-    /** Closes the host-call budget refused, asked again on the next wake. */
-    this.owedCloses = [];
     /** Birthday sockets this node may still open, shared across every negotiation. */
     this.birthdayBudget = MAX_NODE_BIRTHDAY_SOCKETS;
     /** Ids for links this realm runs itself: past any the host gives. */
@@ -289,7 +287,7 @@ class Udp {
   close(id) {
     this.listeners.delete(id);
     this.flush();
-    try { void host.call(N_UDP_CLOSE, argU32(id)).catch(() => {}); } catch { this.owedCloses.push(id); }
+    callRetried(N_UDP_CLOSE, argU32(id));
   }
 
   /** One `datagrams` event: `[socket u32][batch blob]` until the end, each batch the
@@ -333,7 +331,6 @@ class Udp {
 
   /** One wake (core.js `onWake`): every negotiation's timers, and the soonest next. */
   onWake(t) {
-    for (const id of this.owedCloses.splice(0)) this.close(id);
     let next = Infinity;
     for (const n of this.live) next = Math.min(next, n.onWake(t));
     return next;

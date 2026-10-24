@@ -179,20 +179,15 @@ async function netLinkOpen(dest) {
 /** Resolves once the host has accepted the bytes. */
 function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)); }
 /** A host link as the channel a `Link` writes to: `send(bytes)` resolves once the bytes are
- *  taken, and `close(graceful)` answers false when it must be asked again. A link this
- *  realm runs itself (stream.js) is a channel of its own. */
+ *  taken, and `close(graceful)` ends it. A link this realm runs itself (stream.js) is a
+ *  channel of its own. */
 function hostChannel(linkId) {
   return { send: (bytes) => netLinkSend(linkId, bytes), close: (graceful) => netLinkClose(linkId, graceful) };
 }
-/** Returns false when the seam refused the call (the host-call budget), so the close is
- *  retried later instead of throwing out of a teardown (`Link.closeChannel`). */
+/** Never throws out of a teardown: a close the host-call budget refuses is asked again
+ *  (`callRetried`, core.js). */
 function netLinkClose(linkId, graceful) {
-  try {
-    void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {});
-    return true;
-  } catch {
-    return false;
-  }
+  callRetried(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0]));
 }
 /** Hand one decoded request to the host's claim routing:
  *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
@@ -259,7 +254,6 @@ class Link {
     this.slot = null;
     this.due = Infinity;      // when the handshake deadline or the idle window ends
     this.lastSeen = 0;        // when anything last crossed, for the idle window
-    this.closeOwed = null;    // a refused close's `graceful`, retried shortly
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -304,13 +298,6 @@ class Link {
     return done;
   }
 
-  /** Close the socket through the host. A refused close is retried (`onWake`) until the
-   *  host accepts it. */
-  closeChannel(graceful) {
-    this.closeOwed = this.channel.close(graceful) ? null : graceful;
-    if (this.closeOwed !== null) this.due = dueIn(CLOSE_RETRY_MS);
-  }
-
   async ensureKeys() {
     if (!this.myEph) this.myEph = await boxKeypair();
     // Only the initiator publishes an encapsulation key.
@@ -329,15 +316,12 @@ class Link {
     this.due = linkIdleTimeoutMs > 0 ? dueIn(linkIdleTimeoutMs) : Infinity;
   }
 
-  /** One wake (core.js `onWake`): past `due`, a handshake times out, an idle link closes,
-   *  and a closed one retries a refused close. Returns the next deadline, or `Infinity`. */
+  /** One wake (core.js `onWake`): past `due`, a handshake times out and an idle link
+   *  closes. Returns the next deadline, or `Infinity`. */
   onWake(t) {
     if (t < this.due) return this.due;
     this.due = Infinity;
-    if (this.closed) {
-      if (this.closeOwed !== null) this.closeChannel(this.closeOwed);
-      return this.due;
-    }
+    if (this.closed) return Infinity;
     if (!this.authed) {
       this.timedOut = true;
       this.abort();
@@ -430,7 +414,7 @@ class Link {
       }
       this.teardown();
       // Graceful only after a goodbye, so the close flushes it.
-      this.closeChannel(saidGoodbye);
+      this.channel.close(saidGoodbye);
     });
     this.onClose(this);
   }

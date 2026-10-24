@@ -145,6 +145,22 @@ await test("a relay a peer was only called through is left once it idles, and th
   assert(resp[0] === 2, "the next call goes through it again");
 });
 
+await test("a relay socket whose close the host refuses is closed on a later wake, however often refused", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  let refusals = 2;
+  const A = keep(await relayNode(relay, {
+    onHostCall: (name) => {
+      if (name === "link/close" && refusals > 0) { refusals--; throw new Error("guest: budget refused the close"); }
+    },
+  }));
+  await joinRelay(A);
+  assert(relay.registered.has(A.peerId), "registered");
+  await joinRelay(A, "");
+  assert(refusals === 1 && relay.registered.has(A.peerId), "the refused close leaves the socket open");
+  await until(() => !relay.registered.has(A.peerId), 2000, "the owed close, refused once more, then taken");
+  assert(refusals === 0, "the retry was refused too, and asked again");
+});
+
 await test("a key the relay does not know fails the request at once", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay));

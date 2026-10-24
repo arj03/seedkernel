@@ -273,14 +273,13 @@ class UdpStream {
 
   /** A graceful close waits for what was written to be acked, up to `LINGER_MS`. */
   close(graceful) {
-    if (this.gone || this.closing) return true;
+    if (this.gone || this.closing) return;
     if (graceful && this.out && this.buffered() > 0) {
       this.closing = true;
       this.lingerAt = dueIn(LINGER_MS);
-      return true;
+      return;
     }
     this.end();
-    return true;
   }
 
   /** Tell the peer, in case it can still hear, then stop. */
