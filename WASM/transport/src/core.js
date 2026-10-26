@@ -346,7 +346,7 @@ class Core {
     const link = new Link({
       ...spec,
       onAuth: (pid, l) => this.onAuth(pid, l),
-      onFrame: (pid, frame, pk, l) => (frame[0] === KIND_CTL ? this.onControl(pid, frame, l) : reqres.onFrame(pid, frame, pk)),
+      onFrame: (pid, frame, pk, l) => (frame[0] === KIND_CTL ? this.onControl(pid, frame, l) : reqres.onFrame(pid, frame, pk, l)),
       onClose: (l) => this.forget(l),
     });
     linksById.set(link.linkId, link);

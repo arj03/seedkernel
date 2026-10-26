@@ -17,6 +17,7 @@ import { importBuilt, testkit } from "./testkit.mjs";
 import { FakeRelay } from "./fake-relay.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair, generatorRequest, TransportHost,
+  LoopbackChannels,
 } from "./transport-harness.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -992,6 +993,31 @@ await test("over a path that loses, repeats and reorders, the transport's record
     const big = await B.request(A.peerId, PROTO, generatorRequest(n, 11));
     assert(big.length === n && big.every((x, i) => x === ((i * 11) & 255)), `an answer of ${n} bytes, intact`);
   }
+});
+
+await test("a peer back over TCP while its dead UDP path is still held gets every answer", async (keep) => {
+  // A crashed peer sends no CLOSE, so B holds its UDP path until the stream's silence clock
+  // runs out. An answer goes back on the link its request came in on, never onto that path.
+  const relay = new FakeRelay("relay:8080");
+  const net = fabric();
+  const loop = new LoopbackChannels();
+  const [small, large] = sortedIdentities(2);
+  const A = await makeTransportHost({ identity: small, channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.1", false)) });
+  const B = keep(await makeTransportHost({
+    identity: large, channels: combineChannels(relay.factory(), loop.view()),
+    listen: [{ label: "tcp", host: "loopback", port: 0 }], datagrams: rawOver(net.machine("10.0.0.2", true)),
+  }));
+  await relayLink(A, B, "ws://relay:8080");
+  await until(async () => (await routes(B)).get(A.peerId) === true, 5000, "B to route A over the UDP path");
+  net.cut();
+  A.shell.close();
+  const A2 = keep(await makeTransportHost({ identity: small, channels: loop.view() }));
+  await A2.addr(B.peerId, `tcp://loopback:${B.driver.portOf("tcp")}`);
+  const asks = Array.from({ length: 16 }, (_, i) => A2.request(B.peerId, PROTO, Uint8Array.of(i)));
+  const answered = await Promise.race([Promise.all(asks), settle(3000).then(() => null)]);
+  assert(answered !== null, "every request is answered, none lost to the dead path");
+  assert(answered.every((r, i) => r.length === 1 && r[0] === i), "each with its own answer");
+  assert((await routes(B)).get(A.peerId) === true, "while B still holds the dead path");
 });
 
 await test("a peer with no UDP path declines it, and the offering side offers WebRTC next", async (keep) => {

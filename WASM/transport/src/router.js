@@ -39,6 +39,17 @@ class Router {
     return true;
   }
 
+  /** Send on `link` while `send` could pick it, else as `send` does. An answer goes back
+   *  the way its request came, so a path the peer left without a goodbye, still held until
+   *  it times out, takes none of the answers meant for the links the peer uses now. */
+  sendOn(to, link, frame) {
+    const pool = this.pools.get(to);
+    const i = pool ? pool.links.indexOf(link) : -1;
+    if (i < 0 || i >= (pool.direct || pool.links.length)) return this.send(to, frame);
+    link.send(frame);
+    return true;
+  }
+
   /** Send on the peer's first link, for frames that must arrive in the order they were
    *  sent: two links deliver in no order between them. */
   sendInOrder(to, frame) {
@@ -244,7 +255,7 @@ class ReqRes {
     return frame;
   }
 
-  onFrame(from, frame, fromPubkey) {
+  onFrame(from, frame, fromPubkey, link) {
     // An empty response (five bytes) is the shortest legal frame.
     if (frame.length < RES_HEAD_LEN) return;
     const kind = frame[0];
@@ -266,17 +277,18 @@ class ReqRes {
     // awaited: the answer comes in another turn, and the closure keeps corr and sender.
     // Past the window, answer empty as for an unclaimed request.
     const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
-    if (!this.admits(from, weight)) { this.respond(corr, noReply, from, EMPTY); return; }
+    if (!this.admits(from, weight)) { this.respond(corr, noReply, from, link, EMPTY); return; }
     const answer = netLinkDeliver(proto, fromPubkey, payload);
     this.hold(from, weight);
     // A seam rejection (deadline, budget) is no answer either: reply empty.
-    const done = (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, bytes); };
+    const done = (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, link, bytes); };
     answer.then(done, () => done(EMPTY));
   }
 
-  /** Answer a delivered request to `from`, unless noReply. An answer too big for one
-   *  record is sent back empty instead of leaving the caller waiting. */
-  respond(corr, noReply, from, payload) {
+  /** Answer a delivered request to `from` on the link it came in on (Router `sendOn`),
+   *  unless noReply. An answer too big for one record is sent back empty instead of leaving
+   *  the caller waiting. */
+  respond(corr, noReply, from, link, payload) {
     if (noReply) return;
     const fits = payload && RES_HEAD_LEN + payload.length <= maxFrameBytes - TAG_LEN;
     const body = fits ? payload : EMPTY;
@@ -284,7 +296,7 @@ class ReqRes {
     frame[0] = KIND_RES;
     writeU32BE(frame, 1, corr);
     frame.set(body, RES_HEAD_LEN);
-    core.sendFrame(from, frame);
+    if (!router.sendOn(from, link, frame)) core.sendFrame(from, frame);
   }
 
   peerDown(peerId) {
