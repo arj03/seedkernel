@@ -139,7 +139,10 @@ func exposeBridge(qc *qjs.Context) {
 		return nil, err
 	}))
 	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		// `--op`'s argument, read whole and only on demand.
+		// `--op`'s argument, read whole and only on demand. A terminal is nothing piped in.
+		if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+			return qc.NewArrayBuffer([]byte{}), nil
+		}
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return nil, err

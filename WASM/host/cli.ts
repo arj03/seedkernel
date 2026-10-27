@@ -213,7 +213,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       const answer = await controlInvoke(control, args.get("app") ?? "", writeOp(op, opArg!));
       if (answer !== null) {
         host.stdout(answer);
-        host.log(`${host.banner}: --op ${op} answered by the node serving ${dir}`);
         return { serving: false, close: () => {} };
       }
     } else if (await controlServes(control)) {
