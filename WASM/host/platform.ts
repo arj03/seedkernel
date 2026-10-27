@@ -12,7 +12,7 @@ import { bootShell } from "./shell-core.js";
 import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.js";
 import type { RealmFactory } from "./realm-queue.js";
 import { engineRealms } from "./engine-realm.js";
-import { type ChannelFactory, type RawLink } from "../services/socket-seam.js";
+import { type ChannelFactory, type LocalChannels, type RawLink } from "../services/socket-seam.js";
 import {
   SILENT_SOCKET_MS,
   TCP_KEEPALIVE_MS,
@@ -61,7 +61,7 @@ const abiMs = (ms: number | undefined): number =>
 /** The driver's ChannelFactory over a platform's TCP sockets. Once per platform, since it
  *  installs the socket limits and the dispatchers events arrive through. `silentMs` is
  *  shortened only by tests. */
-export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory {
+export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory & Partial<LocalChannels> {
   /** Open channels by socket id, and accept callbacks by bound port. */
   const chans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
   const accepts = new Map<number, (id: number, remoteAddr: string) => void>();
@@ -111,7 +111,17 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
     };
   }
 
+  // Local sockets, on a platform that has them; their listeners key below zero.
+  const local: Partial<LocalChannels> = net.listenLocal && net.connectLocal ? {
+    listenLocal: async (path, onAccept) => {
+      const key = await net.listenLocal!(path);
+      accepts.set(key, (id) => onAccept(makeLink(id)));
+    },
+    connectLocal: (path) => makeLink(net.connectLocal!(path)),
+  } : {};
+
   return {
+    ...local,
     // The ABI has no TLS socket, so `wss://` is unroutable (§12.1).
     connect: (dest) => {
       const d = parseDest(dest);
@@ -266,6 +276,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     stdin() { return u8(bridge.stdin()); },
     sodium,
     standUp,
+    ...(tcp?.listenLocal && tcp.connectLocal ? { local: tcp as LocalChannels } : {}),
   });
 
   return {

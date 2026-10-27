@@ -197,6 +197,16 @@ for (const [flag, value] of [["--guest-timeout", "5000ms"], ["--guest-timeout", 
     `${flag} ${JSON.stringify(value)} is refused`);
 }
 
+// `--app` names the app on the node already serving `--dir`, so it needs `--op`, and a
+// booted bundle names its own.
+for (const argv of [["--app", "probe"], ["--app", "probe", "--op", "x", "--bundle", "probe.skb"]]) {
+  const host = fakeHost(["--key", join(work, "app.key"), ...argv]);
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.startsWith("--app names the app") && host.written.size === 0 && host.stood === null,
+    `${argv.join(" ")} is refused`);
+}
+
 // A key file that exists but cannot be read fails the boot. Treated as absent, the
 // first-boot path would write a new seed over the node's identity.
 {

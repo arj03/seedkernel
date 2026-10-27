@@ -62,7 +62,7 @@ const sharedRows = [
   { find: /`host\/shell-core\.ts`/,
     files: ["WASM/host/shell-core.ts", "WASM/host/slot-table.ts"] },
   { find: /`host\/cli\.ts`/,
-    files: ["WASM/host/cli.ts"] },
+    files: ["WASM/host/cli.ts", "WASM/host/control.ts"] },
   { find: /`host\/engine-realm\.ts`, `host\/sodium-engine\.ts`/,
     files: ["WASM/host/engine-realm.ts", "WASM/host/sodium-engine.ts", "WASM/host/pq.ts"] },
   { find: /`host\/platform\.ts`, `host\/abi\.ts`/,

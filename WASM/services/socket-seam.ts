@@ -49,6 +49,13 @@ export interface ChannelFactory {
   close(): void;
 }
 
+/** Local sockets only this user can reach, by path: the control endpoint's (§12.8). */
+export interface LocalChannels {
+  /** Listen at `path`, replacing a stale socket; throws if a live one is there. */
+  listenLocal(path: string, onAccept: (link: RawLink) => void): Promise<void>;
+  connectLocal(path: string): RawLink;
+}
+
 /** Several factories as one: a destination goes to the first that routes it; every
  *  factory gets the addresses and the accept sink. */
 export function combineChannels(...factories: ChannelFactory[]): ChannelFactory {

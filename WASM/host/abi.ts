@@ -104,6 +104,12 @@ export interface PlatformNet {
   /** Bind a listener and answer its port; a failure throws the OS's reason. Accepts arrive
    *  through `events.accept`. */
   listen(host: string, port: number): Maybe<number>;
+  /** A local socket at `path` only this user can reach (§12.8, the control endpoint): a
+   *  Unix domain socket, owner-only. Answers a listener key below zero for
+   *  `events.accept`. A stale socket is replaced; a live one throws. Optional. */
+  listenLocal?(path: string): Maybe<number>;
+  /** An outbound duplex to the local socket at `path`, as `connect`. */
+  connectLocal?(path: string): number;
   send(id: number, bytes: Uint8Array): void;
   /** Bytes sent but not yet handed to the socket. */
   buffered(id: number): number;

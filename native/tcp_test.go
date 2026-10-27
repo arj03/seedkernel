@@ -27,7 +27,7 @@ func newTestInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *s
 }
 
 func newTestDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	return newDialChannel(addr, 0, func(b []byte) {
+	return newDialChannel("tcp", addr, 0, func(b []byte) {
 		onMsg(append([]byte(nil), b...))
 	}, onClose, testCloseGrace)
 }

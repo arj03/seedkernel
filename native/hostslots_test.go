@@ -61,12 +61,13 @@ func hostAuthor(t *testing.T) authorKeys {
 
 // loaderRun is one run of the loader on a test's node.
 type loaderRun struct {
-	cmd    *exec.Cmd
-	stderr *syncBuffer
-	done   chan error
+	cmd            *exec.Cmd
+	stdout, stderr *syncBuffer
+	done           chan error
 }
 
-// startLoader runs main in a child with these arguments and stdin.
+// startLoader runs main in a child with these arguments and stdin. A child still running
+// when the test ends is killed.
 func startLoader(t *testing.T, work string, stdin []byte, args ...string) *loaderRun {
 	t.Helper()
 	argv, _ := json.Marshal(args)
@@ -74,17 +75,18 @@ func startLoader(t *testing.T, work string, stdin []byte, args ...string) *loade
 	cmd.Dir = work
 	cmd.Env = append(os.Environ(), "SEEDKERNEL_TEST_LOADER_ARGS="+string(argv), "SEEDKERNEL_HOST_HEALTH_MS=300")
 	cmd.Stdin = bytes.NewReader(stdin)
-	r := &loaderRun{cmd: cmd, stderr: &syncBuffer{}, done: make(chan error, 1)}
-	cmd.Stderr = r.stderr
+	r := &loaderRun{cmd: cmd, stdout: &syncBuffer{}, stderr: &syncBuffer{}, done: make(chan error, 1)}
+	cmd.Stdout, cmd.Stderr = r.stdout, r.stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cmd.Process.Kill() })
 	go func() { r.done <- cmd.Wait() }()
 	return r
 }
 
-// until waits for a stderr line matching want, then stops the loader.
-func (r *loaderRun) until(t *testing.T, want string) string {
+// wait waits for a stderr line matching want, leaving the loader running.
+func (r *loaderRun) wait(t *testing.T, want string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for !strings.Contains(r.stderr.String(), want) {
@@ -94,6 +96,17 @@ func (r *loaderRun) until(t *testing.T, want string) string {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// until waits for a stderr line matching want, then stops the loader.
+func (r *loaderRun) until(t *testing.T, want string) string {
+	t.Helper()
+	r.wait(t, want)
+	return r.stop()
+}
+
+// stop kills the loader, which leaves whatever it had bound behind, and answers its log.
+func (r *loaderRun) stop() string {
 	r.cmd.Process.Kill()
 	<-r.done
 	return r.stderr.String()

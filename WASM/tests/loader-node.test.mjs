@@ -3,7 +3,7 @@
 // app; the other installs the same app, calls the app's private module locally, then sends
 // it a request over a real socket. Everything above the ABI is the native suite's code, so
 // this covers what is Node's own: sockets, files, modules, the engine table and crypto.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
@@ -55,8 +55,42 @@ try {
   ok(sent.code === 0, `the sender exits cleanly (stderr: ${sent.err.trim().split("\n").pop()})`);
   ok(sent.out.equals(Buffer.from([1, 1, 2, 3])),
     `a request crosses a socket, the handshake and the holder's module (got ${[...sent.out]})`);
+
+  console.log("Test: an --op on a serving node's directory reaches that node (control endpoint)");
+  const [, controlPath] = await holder.until(/control (\S+) \(/);
+  ok(controlPath === join(work, "holder.control") && existsSync(controlPath), "the holder's control socket sits beside its directory");
+  if (process.platform !== "win32") ok((statSync(controlPath).mode & 0o777) === 0o600, "owner-only");
+  const op = (dir, stdin) => spawnLoader(["--dir", join(work, dir), "--op", "fwd"], { cwd: work, stdin }).exit;
+  const viaControl = await op("holder", Buffer.from([4, 5, 6]));
+  ok(viaControl.code === 0 && viaControl.out.equals(Buffer.from([4, 5, 6])),
+    `the running holder answers, with no --bundle or --key (stderr: ${viaControl.err.trim().split("\n").pop()})`);
+  ok(!existsSync(join(work, "seedkernel.key")), "and no second node, so no key of its own");
+  const mixed = await spawnLoader(["--dir", join(work, "holder"), "--bundle", join(work, "app.skb"), "--op", "fwd"],
+    { cwd: work, stdin: Buffer.from([8]) }).exit;
+  ok(mixed.code !== 0 && /reading no --bundle/.test(mixed.err) && mixed.out.length === 0,
+    "an --op that also names a bundle is refused while the node serves, not half obeyed");
+  const second = spawnLoader(["--policy", join(work, "policy.json"), "--dir", join(work, "holder"), "--key", join(work, "second.key"),
+    "--bundle", join(work, "app.skb"), "--listen", "127.0.0.1:0"], { cwd: work });
+  const [, why] = await second.until(/control unavailable: (.*)/);
+  ok(/already listens/.test(why), "a second node on the same directory leaves the live socket alone");
+  second.child.kill();
+  await second.exit;
+  ok((await op("holder", Buffer.from([7]))).out.equals(Buffer.from([7])), "which still reaches the first");
   holder.child.kill();
   await holder.exit;
+  const stale = await op("holder", Buffer.from([1]));
+  ok(stale.code !== 0 && /no node is serving/.test(stale.err), "once it stops, its socket reaches nothing");
+  if (process.platform === "win32") {
+    writeFileSync(join(work, "other.control"), "notes");
+    const foreign = await op("other", Buffer.from([1]));
+    ok(foreign.code !== 0 && /native node's control socket/.test(foreign.err),
+      "on Windows a control file naming no pipe is refused, never read as nobody serving");
+  }
+  const again = start("holder", ["--listen", "127.0.0.1:0"]);
+  await again.until(/control (\S+) \(/);
+  ok((await op("holder", Buffer.from([9]))).out.equals(Buffer.from([9])), "and a node starting there again replaces the stale one");
+  again.child.kill();
+  await again.exit;
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

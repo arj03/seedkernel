@@ -11,7 +11,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ type netHost struct {
 	mu        sync.Mutex
 	chans     map[int64]*sockChannel
 	nextID    int64
+	nextLocal int // local listeners key below zero
 	listeners []net.Listener
 
 	// Installed by host/platform.ts before any socket opens.
@@ -70,6 +73,20 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 			return nil, err
 		}
 		return qc.NewInt32(int32(bound)), nil
+	}))
+	o.SetPropertyStr("listenLocal", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		key, err := n.listenLocal(args[0].String())
+		if err != nil {
+			return nil, err
+		}
+		return qc.NewInt32(int32(key)), nil
+	}))
+	o.SetPropertyStr("connectLocal", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+		path := args[0].String()
+		if err := checkLocalPath(path, false); err != nil {
+			return nil, err
+		}
+		return qc.NewInt64(n.dialNet("unix", path)), nil
 	}))
 	// No answer: the driver has already charged these bytes (sockChannel.send).
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
@@ -124,12 +141,14 @@ func (n *netHost) take(id int64) *sockChannel {
 }
 
 // dial opens an outbound byte duplex that JS can send on before it connects.
-func (n *netHost) dial(addr string) int64 {
+func (n *netHost) dial(addr string) int64 { return n.dialNet("tcp", addr) }
+
+func (n *netHost) dialNet(network, addr string) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.nextID++
 	id := n.nextID
-	n.chans[id] = newDialChannel(addr, n.keepAlive, n.onMsg(id), n.onClose(id), n.closeGrace)
+	n.chans[id] = newDialChannel(network, addr, n.keepAlive, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return id
 }
 
@@ -142,6 +161,36 @@ func (n *netHost) listen(host string, port int) (int, error) {
 		return 0, err
 	}
 	bound := ln.Addr().(*net.TCPAddr).Port
+	n.serve(ln, bound)
+	return bound, nil
+}
+
+// listenLocal binds an owner-only Unix domain socket at path (the control endpoint,
+// host/control.ts), replacing a stale one and refusing a live one. Its key, below zero,
+// tells its accepts apart from the TCP listeners'.
+func (n *netHost) listenLocal(path string) (int, error) {
+	if err := checkLocalPath(path, true); err != nil {
+		return 0, err
+	}
+	if c, err := net.Dial("unix", path); err == nil {
+		c.Close()
+		return 0, fmt.Errorf("%s: a node already listens there", path)
+	}
+	os.Remove(path)
+	ln, err := listenPrivate(path)
+	if err != nil {
+		return 0, err
+	}
+	n.mu.Lock()
+	n.nextLocal--
+	key := n.nextLocal
+	n.mu.Unlock()
+	n.serve(ln, key)
+	return key, nil
+}
+
+// serve accepts on ln and hands each socket to JS under key, its port or local key.
+func (n *netHost) serve(ln net.Listener, bound int) {
 	n.mu.Lock()
 	n.listeners = append(n.listeners, ln)
 	n.mu.Unlock()
@@ -157,7 +206,10 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				continue
 			}
 			// The IP alone: the transport's half-open budget groups by source IP.
-			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
+			remoteAddr := "local"
+			if a, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+				remoteAddr = a.IP.String()
+			}
 			n.mu.Lock()
 			n.nextID++
 			id := n.nextID
@@ -170,7 +222,6 @@ func (n *netHost) listen(host string, port int) (int, error) {
 			})
 		}
 	}()
-	return bound, nil
 }
 
 // closeListeners closes every bound listener, ending its accept goroutine.

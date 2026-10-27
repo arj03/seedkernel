@@ -40,7 +40,8 @@ func newSockChannel(onMsg func([]byte), onClose func(), closeGrace time.Duration
 }
 
 // newDialChannel returns a channel that connects in the background; sends queue until then.
-func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+// network is "tcp", or "unix" for a local socket.
+func newDialChannel(network, addr string, keepAlive time.Duration, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
 	c := newSockChannel(onMsg, onClose, closeGrace)
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelDial = cancel
@@ -49,7 +50,7 @@ func newDialChannel(addr string, keepAlive time.Duration, onMsg func([]byte), on
 		// timeout of its own: a dial that never connects never reads, and the host's
 		// silent-socket deadline (host/platform.ts `tcpChannels`) closes the channel, which
 		// cancels ctx.
-		conn, err := (&net.Dialer{KeepAlive: keepAlive}).DialContext(ctx, "tcp", addr)
+		conn, err := (&net.Dialer{KeepAlive: keepAlive}).DialContext(ctx, network, addr)
 		if err != nil {
 			c.fail()
 			return

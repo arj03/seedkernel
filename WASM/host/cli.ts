@@ -9,7 +9,8 @@ import { OpArgs, writeOp } from "../services/op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
-import type { ListenAddress } from "../services/socket-seam.js";
+import type { ListenAddress, LocalChannels } from "../services/socket-seam.js";
+import { controlInvoke, controlServes, serveControl } from "./control.js";
 import { DEFAULT_DIR } from "./abi.js";
 import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
 /** Where the node's 32-byte master seed lives when `--key` is omitted (§12.6.2b). */
@@ -19,9 +20,11 @@ export const DEFAULT_KEY = "./seedkernel.key";
  *  silently booting a deny-all node. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "peers", "relay", "relay-secret", "contact-secret",
-  "bundle", "op", "local-config", "revoke", "uninstall",
+  "bundle", "op", "app", "local-config", "revoke", "uninstall",
   "guest-timeout", "guest-memory", "transport",
 ]);
+/** The flags an `--op` to the node already serving `--dir` takes. */
+const CONTROL_FLAGS = new Set(["dir", "op", "app"]);
 
 /** The platform's files (abi.ts `PlatformFs`). A read returns `null` only for a missing
  *  file and throws otherwise, since an unreadable key file taken as a first boot would get
@@ -61,6 +64,8 @@ export interface CliHost extends CliFiles {
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
   /** Assemble a node on this platform through `bootShell`. */
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
+  /** The platform's local sockets, for the control endpoint; absent on a platform with none. */
+  local?: LocalChannels;
 }
 
 /** Whether the node is listening (so the caller keeps the process alive) and how to shut
@@ -192,6 +197,32 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const guestMemory = wholeNumberFlag(args, "guest-memory");
   const dir = args.get("dir") ?? DEFAULT_DIR;
   const keyPath = args.get("key") ?? DEFAULT_KEY;
+  const bundlePath = args.get("bundle");
+  const op = args.get("op");
+  if (args.has("app") && (op === undefined || bundlePath !== undefined)) {
+    throw new Error("--app names the app an --op goes to on the node serving --dir, so it takes --op and no --bundle");
+  }
+  const opArg = op === undefined ? undefined : host.stdin();
+  // `--op` goes to the node already serving `--dir` when there is one, through its control
+  // endpoint, rather than to a second node booted over the same store. That node reads no
+  // other flag, so a command line with one is refused there rather than half obeyed.
+  if (op !== undefined && host.local) {
+    const control = { dir, local: host.local };
+    const unread = [...args.keys()].filter((f) => !CONTROL_FLAGS.has(f));
+    if (unread.length === 0) {
+      const answer = await controlInvoke(control, args.get("app") ?? "", writeOp(op, opArg!));
+      if (answer !== null) {
+        host.stdout(answer);
+        host.log(`${host.banner}: --op ${op} answered by the node serving ${dir}`);
+        return { serving: false, close: () => {} };
+      }
+    } else if (await controlServes(control)) {
+      throw new Error(`--op: a node already serves ${dir} and takes the op itself, reading no --${unread.join(", --")}: drop them, or stop that node`);
+    }
+  }
+  if (op !== undefined && bundlePath === undefined) {
+    throw new Error(`--op: no node is serving ${dir}, and without --bundle there is no app to boot`);
+  }
   const policyPath = args.get("policy");
   // An absent policy denies ordinary apps; the boot transport needs no entry in it.
   const policyJson = policyPath === undefined
@@ -199,7 +230,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     : dec.decode(mustRead(host, policyPath, "--policy"));
   const key = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
-  const bundlePath = args.get("bundle");
   if (args.has("local-config") && bundlePath === undefined) {
     throw new Error("--local-config requires --bundle so the configuration has one app scope");
   }
@@ -306,8 +336,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   // A signed bundle from disk, installed by the shell (§12.4, §12.10).
+  let loaded: AppHandle | undefined;
   if (bundlePath !== undefined) {
-    let loaded: AppHandle;
     try {
       // --local-config belongs to this load only.
       loaded = await shell.install(
@@ -322,9 +352,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
     // A single op through this install's handle (§12.8): stdin is the argument, stdout the
     // response. The op name is framed by `writeOp` and not otherwise interpreted (§12.2).
-    const op = args.get("op");
     if (op !== undefined) {
-      host.stdout(await loaded.invoke(writeOp(op, host.stdin())));
+      host.stdout(await loaded.invoke(writeOp(op, opArg!)));
     }
   }
 
@@ -332,8 +361,16 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // A node on a relay serves through it, listening or not.
   if (!net?.listening.some((l) => l.port > 0) && relay === undefined) return { serving: false, close };
   // Inbound requests already route to the loaded app by protocol id (§12.8, §12.10).
-  if (bundlePath !== undefined) {
+  if (loaded !== undefined) {
     host.log("  serving the app's request side from the confined guest");
+    if (host.local) {
+      const app = loaded;
+      // Without it the node still serves; only a later --op boots its own node.
+      try {
+        const path = await serveControl({ dir, local: host.local, app: (name) => (name === "" || name === app.manifest.app ? app : undefined) });
+        host.log(`  control ${path} (--op from this user reaches this node)`);
+      } catch (err) { host.log(`  control unavailable: ${errMessage(err)}`); }
+    }
   }
   host.log("serving — Ctrl-C to stop");
   return { serving: true, close };

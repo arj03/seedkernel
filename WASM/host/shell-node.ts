@@ -6,7 +6,7 @@
 import { readFileSync } from "node:fs";
 import { nodePlatform } from "./platform-node.js";
 import { platformHost, tcpChannels } from "./platform.js";
-import { type ChannelFactory } from "../services/socket-seam.js";
+import { type ChannelFactory, type LocalChannels } from "../services/socket-seam.js";
 import { type AppHandle, type InstallOptions, type Shell } from "./shell-core.js";
 import { type Fs } from "../services/fs.js";
 import { type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
@@ -45,6 +45,13 @@ export async function bootNodeShell(opts: NodeSetup): Promise<NodeShellRuntime> 
  *  a caller that assembles a node with `bootShell` itself. */
 export function nodeChannels(): ChannelFactory {
   return tcpChannels(nodePlatform().net);
+}
+
+/** Local sockets over node:net, for reaching a node's control endpoint from a library
+ *  (seedkernel-wasm/control `controlInvoke`). */
+export function nodeLocalChannels(): LocalChannels {
+  const { listenLocal, connectLocal } = tcpChannels(nodePlatform().net);
+  return { listenLocal: listenLocal!, connectLocal: connectLocal! };
 }
 
 /** Node's datagram sockets, the `transport.datagrams` option for a caller that assembles a
