@@ -33,6 +33,10 @@
       "types": "./build/services/op-frame.d.ts",
       "default": "./build/services/op-frame.js"
     },
+    "./subkeys": {
+      "types": "./build/services/subkeys.d.ts",
+      "default": "./build/services/subkeys.js"
+    },
     "./fs-memory": {
       "types": "./build/services/fs-memory.d.ts",
       "default": "./build/services/fs-memory.js"
