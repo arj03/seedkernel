@@ -119,7 +119,9 @@ This makes the **protocol replaceable without a fork**: a deployment can change 
 
 Choosing the transport grants it access to sockets, session keys and plaintext. The initial transport is selected at boot, and live changes must explicitly replace the current transport; ordinary app installation cannot acquire `link`. The transport must therefore be trusted with the traffic it handles ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
 
-**The first transport ships inside the host artifact**, because a node needs a transport before it can fetch anything. Later versions can arrive over the transport already running, like any other bundle.
+**The first transport ships inside the host artifact**, because a networked node needs a transport before it can fetch anything. Later versions can arrive over the transport already running, like any other bundle.
+
+**A node runs without one.** `bootShell` installs no transport unless asked, and the CLI starts one only with `--listen`, `--peers` or `--relay` (§12.8). Such a node still admits and runs apps, with storage and local service calls; it has no peers, and a call to `_net` is refused because nothing claims it.
 
 ## What runs today
 
@@ -134,7 +136,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 ## One implementation, three targets
 
-All three targets share bundle admission, policy and routing, and run the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
+All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
 **Shared: one implementation for all three targets (3,857 LOC)**
 
@@ -160,7 +162,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 
 The transport bundle sits outside these host totals: 2,989 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
 
-All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. They also run the same `mlkem768.wasm`, delivered inside the signed transport bundle as a private module. Native runs these WASM artifacts through wazero.
+All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. The transport bundle carries the same `mlkem768.wasm` on every target, as a private module. Native runs these WASM artifacts through wazero.
 
 ## The overhead, measured
 
