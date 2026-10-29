@@ -35,13 +35,16 @@ export interface SeamCrypto {
 export interface RawNet {
   /** Open an opaque destination; id 0 means no route (§12.1). */
   open(dest: string): { linkId: number; stream: boolean };
-  /** Write whole bytes to a link; silently dropped if the link is gone. */
-  send(linkId: number, bytes: Uint8Array): void;
+  /** Write whole bytes to a link, silently dropped if the link is gone, and answer what it
+   *  still holds for the wire (0 for a link that is gone). Empty bytes only ask. */
+  send(linkId: number, bytes: Uint8Array): number;
+  /** Stop reading a link, or read it again. */
+  pause(linkId: number, paused: boolean): void;
   /** Tear a link down; `graceful` flushes already-written bytes first. */
   close(linkId: number, graceful: boolean): void;
-  /** A datagram socket for the occupant's UDP paths (§12.7); its reads arrive as
-   *  `datagrams` events. */
-  udpBind(): Promise<DatagramSocket>;
+  /** A datagram socket on `port`, or on one the OS picks for 0, for the occupant's UDP paths
+   *  (§12.7); its reads arrive as `datagrams` events. */
+  udpBind(port: number): Promise<DatagramSocket>;
   /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
    *  one that fails is lost. */
   udpSend(batch: Uint8Array): void;
@@ -416,8 +419,15 @@ const SERVICES: {
       const link = net.open(dec.decode(payload));
       return new OpArgs().u32(link.linkId).u8(link.stream ? 1 : 0).build();
     },
+    // -> [backlog u32], what the link still holds for the wire; empty bytes only ask.
     "link/send": (payload) => {
-      net.send(readU32BE(payload, 0), payload.subarray(4));
+      const out = new Uint8Array(4);
+      writeU32BE(out, 0, net.send(readU32BE(payload, 0), payload.subarray(4)));
+      return out;
+    },
+    // [link u32][paused u8]: while paused, none of the link's reads reach the occupant.
+    "link/pause": (payload) => {
+      net.pause(readU32BE(payload, 0), payload[4] === 1);
       return EMPTY;
     },
     "link/close": (payload) => {
@@ -438,8 +448,9 @@ const SERVICES: {
       net.status(payload.slice());
       return EMPTY;
     },
-    // -> [socket u32][port u16][addresses utf8], socket 0 for none.
-    "link/udpBind": () => net.udpBind()
+    // [port u16]? -> [socket u32][port u16][addresses utf8], socket 0 for none. No port, or
+    // 0, is one the OS picks.
+    "link/udpBind": (payload) => net.udpBind(payload.length >= 2 ? (payload[0] << 8) | payload[1] : 0)
       .then((s) => new OpArgs().u32(s.id).u16(s.port).bytes(enc.encode(s.addresses)).build()),
     "link/udpSend": (payload) => {
       net.udpSend(payload);

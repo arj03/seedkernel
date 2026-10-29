@@ -5,6 +5,7 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { testkit, makeAuthor } from "./testkit.mjs";
 // The same assembler the build signs through (scripts/guest-source.mjs), imported instead
 // of copied, so these bundles sign exactly the guest production signs.
@@ -24,7 +25,7 @@ const { policyFromJson } = await imp("build/host/policy.js");
 const bundleApi = await imp("build/host/bundle.js");
 const authorApi = await imp("build/scripts/bundle-author.js");
 const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
-const { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } = authorApi;
+const { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed, stripComments } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const TRANSPORT_SERVICE = "_net";
 // Every transport change below is one install naming the installed slot (§12.5): the
@@ -46,8 +47,29 @@ assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signBundle", "encodeBundl
 // Read from the artifact, since the bundle can be rebuilt with a different key.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
-assert(transportVerified.guestSource === currentTransportGuest,
-  "the shipped transport contains the canonical generated op-frame source");
+assert(transportVerified.guestSource === stripComments(currentTransportGuest),
+  "the shipped transport is the canonical source, op-frame included, less its comments");
+// A bundle signs its guest without comments (bundle-author.ts `stripComments`). Stripped, a
+// source must parse to the tree TypeScript makes of it with its comments removed: here the
+// transport, and the cases a scanner that guessed at `/` would get wrong.
+{
+  const tree = (src, removeComments) => ts.createPrinter({ removeComments })
+    .printFile(ts.createSourceFile("guest.js", src, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS));
+  const tricky = String.raw`
+const a = 1 / 2; /* gone */ let b = /\/\/ kept/g.test("x"); // gone
+const c = 'it\'s // kept', d = "/* kept */", f = [1] / 2 / (3) / 4;
+const e = ${"`"}// kept ${"${"}a /* gone */ + 1} /* kept */${"`"};
+function g(x) { return /[/*]+/.test(x) ? x : /'/.source; } if (a) { } /re\//.test("re/");
+let i = a
+/* spans
+lines */ ++b;`;
+  for (const [name, src] of [["the transport", currentTransportGuest], ["the tricky cases", tricky]]) {
+    assert(tree(stripComments(src), false) === tree(src, true), `stripping ${name} removes its comments and nothing else`);
+  }
+  const stripped = stripComments(tricky);
+  assert(!stripped.includes("gone") && stripped.split("kept").length === 6,
+    "a comment goes, and what only looks like one stays");
+}
 // The guest text is part of the signed body, and an editor can save a part with CRLF even
 // though the repo checks out LF, so the assembler normalizes; otherwise the same commit
 // could sign different bytes depending on who built it.

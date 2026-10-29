@@ -68,6 +68,8 @@ class LinkOutboundOwner {
   private readonly queued = new Fifo<number>();
   private charged = 0; // === sum(queued)
   private closed = false;
+  /** The occupant's `link/pause`, wired to the link's reads by `register`. */
+  pause: (paused: boolean) => void = () => {};
 
   constructor(
     readonly channel: RawLink,
@@ -102,11 +104,14 @@ class LinkOutboundOwner {
     this.releaseParent(bytes, n);
   }
 
-  send(bytes: Uint8Array): void {
+  /** Admit one write, and answer what the link still holds for the wire, this write
+   *  included. An empty write sends nothing and only asks. */
+  send(bytes: Uint8Array): number {
     if (this.closed) throw new Error("socket: link is closed");
     const now = this.report();
     if (now === null) throw new Error("socket: adapter cannot report its outbound backlog");
     this.settle(now);
+    if (bytes.length === 0) return this.charged;
     if (this.queued.size >= MAX_OUTBOUND_QUEUE_SLICES
       || bytes.length > MAX_OUTBOUND_QUEUE_BYTES - this.charged
       || !this.reserveParent(bytes.length)) {
@@ -117,6 +122,7 @@ class LinkOutboundOwner {
     try { this.channel.send(bytes); }
     catch (err) { this.releaseAll(); throw err; }
     this.settle(this.report());
+    return this.charged;
   }
 
   /** Reconcile platform progress before the node-wide parent admits another write. */
@@ -151,6 +157,9 @@ export class TransportHost {
   // in flight per link plus anything held for adapters that cannot pause.
   private inboundReadSlices = 0;
   private inboundReadBytes = 0;
+  /** Pausable links that finished a read while the inbound budget was spent: each reads
+   *  again, oldest first, once there is room. */
+  private readonly starved = new Fifo<() => void>();
   private outboundSlices = 0;
   private outboundBytes = 0;
   // The occupant's datagram sockets. A socket's reads wait here, at most MAX_UDP_HELD_BYTES
@@ -183,17 +192,23 @@ export class TransportHost {
     this.reset();
   }
 
-  private reserveInboundRead(length: number): boolean {
-    if (this.inboundReadSlices >= MAX_INBOUND_HOLD_SLICES
-      || length > MAX_INBOUND_HOLD_BYTES - this.inboundReadBytes) return false;
+  /** Charge one read to the inbound budget; past it, only a `forced` one is charged. */
+  private reserveInboundRead(length: number, forced: boolean): boolean {
+    if (!forced && (this.inboundReadSlices >= MAX_INBOUND_HOLD_SLICES
+      || length > MAX_INBOUND_HOLD_BYTES - this.inboundReadBytes)) return false;
     this.inboundReadSlices++;
     this.inboundReadBytes += length;
     return true;
   }
 
+  private inboundSpent(): boolean {
+    return this.inboundReadSlices >= MAX_INBOUND_HOLD_SLICES || this.inboundReadBytes >= MAX_INBOUND_HOLD_BYTES;
+  }
+
   private releaseInboundRead(length: number): void {
     this.inboundReadSlices--;
     this.inboundReadBytes -= length;
+    while (this.starved.size > 0 && !this.inboundSpent()) this.starved.shift()!();
   }
 
   private outboundFits(length: number): boolean {
@@ -226,6 +241,7 @@ export class TransportHost {
     // Through the normal close path, over a copy since it deletes as it goes. Clearing the
     // table first would make `channelClosed` skip notifying the occupant.
     for (const [linkId, link] of [...this.links]) this.dropLink(linkId, link);
+    this.starved.clear();
     // Sockets are the occupant's paths, session state as its links are.
     this.socketGen++;
     for (const id of this.sockets) this.opts.datagrams?.close(id);
@@ -287,15 +303,19 @@ export class TransportHost {
         return { linkId, stream: channel.stream === true };
       },
       send: (linkId, bytes) => {
-        if (!bound()) return;
+        if (!bound()) return 0;
         const link = this.links.get(linkId);
-        if (!link) return;
-        try { link.send(bytes); }
+        if (!link) return 0;
+        try { return link.send(bytes); }
         catch {
           // A throwing backend may already have written part of the bytes (an RTC write
           // split into chunks), and continuing would break the framing.
           this.dropLink(linkId, link);
+          return 0;
         }
+      },
+      pause: (linkId, paused) => {
+        if (bound()) this.links.get(linkId)?.pause(paused);
       },
       close: (linkId, graceful) => {
         if (!bound()) return;
@@ -307,7 +327,7 @@ export class TransportHost {
         // no-op.
         queueMicrotask(() => this.channelClosed(linkId, link));
       },
-      udpBind: () => (bound() ? this.bind() : Promise.resolve(NO_SOCKET)),
+      udpBind: (port) => (bound() ? this.bind(port) : Promise.resolve(NO_SOCKET)),
       udpSend: (batch) => {
         const raw = this.opts.datagrams;
         if (!bound() || !raw) return;
@@ -333,9 +353,9 @@ export class TransportHost {
   // The host reads no datagram and keeps no path (§12.7): it bounds what the occupant holds,
   // its sockets and what they read while it is busy.
 
-  /** A socket, or socket 0 when the platform has none, the cap is reached or the bind
-   *  failed. */
-  private async bind(): Promise<DatagramSocket> {
+  /** A socket on `port`, or one the OS picks for 0; socket 0 when the platform has none,
+   *  the cap is reached or the bind failed. */
+  private async bind(port: number): Promise<DatagramSocket> {
     const raw = this.opts.datagrams;
     if (!raw || this.sockets.size + this.binding >= MAX_UDP_SOCKETS) return NO_SOCKET;
     const gen = this.socketGen;
@@ -344,7 +364,7 @@ export class TransportHost {
       let id = 0;
       const b = await raw.bind((batch) => {
         if (id !== 0) this.heard(id, u8(batch));
-      }, UDP_SOCKET_BUFFER_BYTES, MAX_UDP_HELD_BYTES);
+      }, UDP_SOCKET_BUFFER_BYTES, MAX_UDP_HELD_BYTES, port);
       if (gen !== this.socketGen) { raw.close(b.id); return NO_SOCKET; }
       id = b.id;
       this.sockets.add(id);
@@ -415,6 +435,8 @@ export class TransportHost {
     // otherwise reads are held here. Every read reserves the driver-wide budget first.
     // Width of the read in the realm, or -1 for none (an empty read is still in flight).
     let activeBytes = -1;
+    // The occupant paused the link: no read reaches it until it resumes.
+    let paused = false;
     const held = new Fifo<Uint8Array>();
 
     const dropHeld = () => {
@@ -430,19 +452,36 @@ export class TransportHost {
       dropHeld();
       this.dropLink(linkId, link);
     };
-    /** A read finished: drain what was held, oldest first. A loop, because with nothing
-     *  bound a read finishes synchronously and recursion would grow the stack per read. */
+    const resume = () => {
+      if (paused || this.links.get(linkId) !== link) return;
+      try { channel.setReadable?.(true); }
+      catch { failReadSide(); }
+    };
+    /** A read finished: drain what was held, oldest first, then read again, a pausable
+     *  socket once the inbound budget has room. A loop, because with nothing bound a read
+     *  finishes synchronously and recursion would grow the stack per read. */
     const releaseRead = () => {
       releaseActive();
       for (;;) {
         if (this.links.get(linkId) !== link) { dropHeld(); return; }
+        if (paused) return;
         const next = held.shift();
         if (!next) break;
         if (!dispatchRead(next)) return; // in flight: its settle re-enters here
         releaseActive(); // nothing bound, or a synchronous failure
       }
-      try { channel.setReadable?.(true); }
-      catch { failReadSide(); }
+      if (channel.setReadable && this.inboundSpent()) this.starved.push(resume);
+      else resume();
+    };
+    // A read the platform had already granted still arrives, and waits for the resume.
+    link.pause = (on) => {
+      paused = on;
+      if (on) {
+        try { channel.setReadable?.(false); }
+        catch { failReadSide(); }
+      } else if (activeBytes < 0) {
+        releaseRead();
+      }
     };
     /** Hand one read to the realm. True when it finished synchronously (nothing bound);
      *  false when in flight or the link died. */
@@ -462,8 +501,10 @@ export class TransportHost {
       if (this.links.get(linkId) !== link) return;
       // Only a platform-framed message can be this large; refuse it before it is copied.
       if (bytes.length > MAX_LINK_READ_BYTES) { failReadSide(); return; }
-      if (!this.reserveInboundRead(bytes.length)) { failReadSide(); return; }
-      if (activeBytes < 0) {
+      // A pausable socket reads nothing more until it is resumed, so past the budget it waits
+      // for room (`releaseRead`) instead of failing.
+      if (!this.reserveInboundRead(bytes.length, channel.setReadable !== undefined)) { failReadSide(); return; }
+      if (activeBytes < 0 && !paused) {
         if (dispatchRead(bytes)) releaseRead();
         return;
       }

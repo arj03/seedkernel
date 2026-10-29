@@ -583,6 +583,25 @@ await test("two ends punch a path, and its stream carries bytes both ways", asyn
   A.close(); B.close();
 });
 
+// A relay answers STUN on the ports nodes ask it at, so the occupant may name the port.
+await test("a socket bound on a named port is there, and a port in use is socket 0", async () => {
+  const probe = createSocket("udp4");
+  await new Promise((r) => probe.bind(0, r));
+  const port = probe.address().port;
+  probe.close();
+  const driver = new TransportHost({ datagrams: nodeRawDatagrams(), suppressLinkLog: true });
+  driver.activate(() => Promise.resolve(new Uint8Array()));
+  const net = driver.rawNet();
+  try {
+    const s = await net.udpBind(port);
+    assert(s.id !== 0 && s.port === port, `bound on ${port}, got ${s.port}`);
+    assert((await net.udpBind(port)).id === 0, "the same port again is no socket");
+    assert((await net.udpBind(0)).port !== port, "port 0 is one the OS picks");
+  } finally {
+    driver.close();
+  }
+});
+
 await test("an end with no socket from its host has no path, which the transport takes as no route", async () => {
   const A = udpRealm({ ...nodeRawDatagrams(), bind: async () => { throw new Error("no sockets"); } });
   assert(await A.open(true) === null, "the negotiation is refused before it starts");

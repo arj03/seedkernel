@@ -3,6 +3,8 @@
 // sign what install would refuse.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createRequire } from "node:module";
+import type ts from "typescript";
 import { concatBytes, enc, Fifo, fromHex, toHex } from "../services/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
@@ -148,7 +150,7 @@ export interface AuthoredBundle {
 /** Assemble, validate with the verifier's checks, and sign the entire bundle. */
 export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, input: UnsignedBundle): AuthoredBundle {
   const modules: BundleModule[] = input.modules.map(({ name }) => ({ name }));
-  const guestBytes = enc.encode(input.guestSource);
+  const guestBytes = enc.encode(stripComments(input.guestSource));
   const guest: BundleGuest = {
     requires: input.guestRequires,
     ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
@@ -168,6 +170,43 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     manifest,
     author: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey),
   };
+}
+
+/** A guest's source without its comments, which nothing running reads: what `authorBundle`
+ *  signs. TypeScript's parser finds them, so a `//` in a string, a template or a regular
+ *  expression is never taken for one, and each is cut from the text as it stands, which is
+ *  never reprinted. A comment alone on its lines takes them with it; one beside code takes
+ *  the whitespace before it, and one that spans lines leaves the line break that semicolon
+ *  insertion reads. */
+export function stripComments(source: string): string {
+  const parser = createRequire(import.meta.url)("typescript") as typeof ts;
+  const src = source.replace(/\r\n?/g, "\n");
+  const file = parser.createSourceFile("guest.js", src,
+    { languageVersion: parser.ScriptTarget.Latest, jsDocParsingMode: parser.JSDocParsingMode.ParseNone }, false,
+    parser.ScriptKind.JS);
+  // Every comment is trivia of a token: trailing the one before it on its line, or else
+  // leading the one after it.
+  const comments = new Map<number, number>();
+  const visit = (node: ts.Node): void => {
+    for (const c of parser.getLeadingCommentRanges(src, node.pos) ?? []) comments.set(c.pos, c.end);
+    for (const c of parser.getTrailingCommentRanges(src, node.end) ?? []) comments.set(c.pos, c.end);
+    for (const child of node.getChildren(file)) visit(child);
+  };
+  visit(file);
+  let out = "", at = 0;
+  for (const [pos, end] of [...comments].sort((a, b) => a[0] - b[0])) {
+    const lineStart = src.lastIndexOf("\n", pos - 1) + 1;
+    const next = src.indexOf("\n", end), lineEnd = next < 0 ? src.length : next;
+    if (lineStart >= at && src.slice(lineStart, pos).trim() === "" && src.slice(end, lineEnd).trim() === "") {
+      out += src.slice(at, lineStart);
+      at = lineEnd + 1;
+    } else {
+      out += src.slice(at, pos).replace(/[ \t]+$/, "");
+      out += src.slice(pos, end).includes("\n") ? "\n" : /\s/.test(src[end] ?? "\n") ? "" : " ";
+      at = end;
+    }
+  }
+  return out + src.slice(at);
 }
 
 /** The op-frame functions as flat guest source, for a build tool to inline before signing.

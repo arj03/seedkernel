@@ -1741,6 +1741,88 @@ await test("DRIVER BACKPRESSURE: a hold answered synchronously drains whole", as
   assert(reads === BURST + 1, "and the link must be readable again once the hold is empty");
 });
 
+/** An adapter the driver pauses at the socket, as Node's and native's are: one read per
+ *  `setReadable(true)`. */
+class OneReadChannel {
+  data = null;
+  closes = 0;
+  resumes = 0;
+  backlog = 0;
+  send(bytes) { this.backlog += bytes.length; }
+  buffered() { return this.backlog; }
+  onData(cb) { this.data = cb; }
+  onClose() {}
+  setReadable(enabled) { if (enabled) this.resumes++; }
+  close() { this.closes++; }
+  emit(bytes) { this.data?.(bytes); }
+}
+
+/** A driver whose every `linkBytes` answer is released by hand, oldest first. */
+function queuedReadDriver(keep) {
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost({ channels: factory }));
+  const pending = [];
+  driver.activate((input) => {
+    if (opOf(input).op !== "linkBytes") return Promise.resolve(new Uint8Array());
+    return new Promise((r) => pending.push(() => r(new Uint8Array())));
+  });
+  return { factory, driver, pending };
+}
+
+// A relay holds one read from each of hundreds of busy sockets at once: past the inbound
+// budget a pausable socket waits for room instead of losing its link.
+await test("DRIVER BACKPRESSURE: a pausable socket past the inbound budget waits, not fails", async (keep) => {
+  const h = queuedReadDriver(keep);
+  await h.driver.start();
+  const READ = MAX_INBOUND_HOLD_BYTES / 8;
+  const channels = Array.from({ length: 9 }, () => h.factory.give(new OneReadChannel()));
+  await settle(0);
+  for (const c of channels) c.emit(new Uint8Array(READ));
+  assert(channels.every((c) => c.closes === 0), "a pausable socket past the budget keeps its link");
+  assert(h.pending.length === 9, `every read reached the realm, got ${h.pending.length}`);
+  h.pending.shift()();
+  await settle(0);
+  assert(channels[0].resumes === 0, "a socket done with its read waits while the budget is spent");
+  h.pending.shift()();
+  await settle(0);
+  assert(channels[0].resumes === 1 && channels[1].resumes === 1,
+    "both read again once there is room, the one that waited first");
+});
+
+// The occupant pauses a link's reads, and every read waits in the driver until it resumes.
+await test("DRIVER BACKPRESSURE: link/pause holds a link's reads until it resumes", async (keep) => {
+  const h = queuedReadDriver(keep);
+  await h.driver.start();
+  const channel = h.factory.give(new UnpausableChannel());
+  await settle(0);
+  const net = h.driver.rawNet();
+  net.pause(1, true);
+  channel.emit(Uint8Array.of(1));
+  channel.emit(Uint8Array.of(2));
+  assert(h.pending.length === 0, "no read of a paused link reaches the occupant");
+  net.pause(1, false);
+  assert(h.pending.length === 1, "the first read goes once it resumes");
+  h.pending.shift()();
+  await settle(0);
+  assert(h.pending.length === 1 && channel.closes === 0, "then the next, in order");
+});
+
+// `link/send` answers what the link still holds for the wire, so a forwarding occupant
+// knows when to stop reading the other side.
+await test("DRIVER BACKPRESSURE: a send answers the link's backlog, and an empty one only asks", async (keep) => {
+  const h = queuedReadDriver(keep);
+  await h.driver.start();
+  const channel = h.factory.give(new OneReadChannel());
+  await settle(0);
+  const net = h.driver.rawNet();
+  assert(net.send(1, new Uint8Array(100)) === 100, "the write is held");
+  assert(net.send(1, new Uint8Array(50)) === 150, "behind the one before it");
+  channel.backlog = 50;
+  assert(net.send(1, new Uint8Array(0)) === 50, "an empty send asks what is left");
+  assert(channel.backlog === 50, "and writes nothing");
+  assert(net.send(99, new Uint8Array(1)) === 0, "a link that is gone holds nothing");
+});
+
 // A reply applies only to the captured channel (§12.10).
 await test("DRIVER BOUNDARY: the down report names its own socket, once", async (keep) => {
   class ManualChannel {

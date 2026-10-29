@@ -21,7 +21,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "peers", "relay", "relay-secret", "contact-secret",
   "bundle", "op", "app", "local-config", "revoke", "uninstall",
-  "guest-timeout", "guest-memory", "transport",
+  "guest-timeout", "guest-memory", "transport", "transport-config",
 ]);
 /** The flags an `--op` to the node already serving `--dir` takes. */
 const CONTROL_FLAGS = new Set(["dir", "op", "app"]);
@@ -249,23 +249,25 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
   const relaySecret = relaySecretPath === undefined ? undefined : readSecret(host, relaySecretPath, "--relay-secret");
   const network = args.has("listen") || args.has("peers") || relay !== undefined;
-  for (const flag of ["transport", "contact-secret"]) {
+  for (const flag of ["transport", "transport-config", "contact-secret"]) {
     if (args.has(flag) && !network) {
       throw new Error(`--${flag} requires --listen, --peers or --relay, which enable the network it configures`);
     }
   }
   const listen = args.has("listen") ? parseListen(args.get("listen")!) : [];
   // Checked here, not at install, so a malformed file fails before the node listens.
-  let localConfig: JsonObject | undefined;
-  if (args.has("local-config")) {
-    const parsed: unknown = JSON.parse(dec.decode(mustRead(host, args.get("local-config")!, "--local-config")));
-    if (!isRecord(parsed)) throw new Error("--local-config must hold a JSON object");
-    localConfig = parsed as JsonObject;
-  }
+  const jsonFlag = (flag: string): JsonObject | undefined => {
+    if (!args.has(flag)) return undefined;
+    const parsed: unknown = JSON.parse(dec.decode(mustRead(host, args.get(flag)!, `--${flag}`)));
+    if (!isRecord(parsed)) throw new Error(`--${flag} must hold a JSON object`);
+    return parsed as JsonObject;
+  };
+  const localConfig = jsonFlag("local-config");
 
   // Transport config (§12.6.3), passed through unread: the transport checks it at load.
+  // `--peers` and `--contact-secret` take precedence over the file.
   const peers = list(args.get("peers"));
-  const transportConfig: JsonObject = {};
+  const transportConfig: JsonObject = jsonFlag("transport-config") ?? {};
   if (peers.length > 0) transportConfig.peers = peers;
   if (contactSecretPath !== undefined) {
     transportConfig.contactSecret = readSecret(host, contactSecretPath, "--contact-secret");
@@ -274,9 +276,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // One line each time a peer is linked, changes how it is reached, or goes, so an
   // operator, or a script driving the node, sees a relayed link move to a direct path
   // (§12.7). The shipped transport's status is `[relay u8]` and then `[key 32][direct u8]`
-  // per linked peer, repeated whole on each change, so only differences print.
+  // per linked peer, repeated whole on each change, so only differences print. A transport
+  // that reports itself in text (a relay's) starts with a printable byte, which that relay
+  // byte never is, and prints as it is.
   let routes = new Map<string, boolean>();
   const onStatus = (status: Uint8Array) => {
+    if (status[0] >= 0x20) { host.log(`  ${dec.decode(status)}`); return; }
     const now = new Map<string, boolean>();
     for (let off = 1; off + 33 <= status.length; off += 33) {
       now.set(toHex(status.subarray(off, off + 32)), status[off + 32] === 1);

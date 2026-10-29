@@ -48,7 +48,7 @@ export const HOST_SERVICES = {
   timer: { calls: ["arm", "clear"] },
   // Raw links, and the raw datagram sockets the occupant runs its UDP paths over (§12.7).
   link: {
-    calls: ["open", "send", "close", "deliver", "status", "udpBind", "udpSend", "udpClose"],
+    calls: ["open", "send", "pause", "close", "deliver", "status", "udpBind", "udpSend", "udpClose"],
     events: ["linkOpen", "linkBytes", "linkClosed", "datagrams"],
   },
   // Hand the loader a host blob to run next (§12.9). The blob authenticates itself, so the

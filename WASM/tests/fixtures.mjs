@@ -85,7 +85,7 @@ export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
  *  `transportAuthor` boots a small signed link occupant for explicit replacement tests. */
 export async function bootTestShell({ transportAuthor, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
-  const fixtureSource = "function handle() { return new Uint8Array(); } // fixture transport";
+  const fixtureSource = "const FIXTURE_TRANSPORT = true; function handle() { return new Uint8Array(); }";
   const transport = transportAuthor ? {
     transport: { bundle: authorBundle(sodium, transportAuthor, {
       app: "fixture-transport", version: 1, modules: [], services: ["_fixture-transport"],

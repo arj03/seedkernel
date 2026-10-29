@@ -44,10 +44,10 @@ const DOMAIN_RELAY = utf8Encode("seedkernel-relay-register-v1\0");
 //   BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret)
 // after the signature: proof of its secret that never sends it, and is good on this socket
 // only, since the signature is over its nonce. BLAKE2b cannot be length-extended, so
-// hashing the secret in needs no HMAC around it. Unkeyed, as the relay's Node has no keyed
-// BLAKE2b. seedrelay's tag. Whoever sees a registration can test guesses at the secret
-// against its MAC, and on ws:// that is anyone on the path, so the secret has to be too
-// long and too random to guess (seedrelay refuses a short one). For the same reason only
+// hashing the secret in needs no HMAC around it. seedrelay's tag. Whoever sees a
+// registration can test guesses at the secret against its MAC, and on ws:// that is anyone
+// on the path, so the secret has to be too long and too random to guess (seedrelay refuses
+// a short one). For the same reason only
 // the home relay, the one the secret was given with, gets the MAC, never a relay this node
 // only calls through. A relay without secrets ignores the MAC.
 const DOMAIN_SECRET = utf8Encode("seedrelay-secret-v1\0");

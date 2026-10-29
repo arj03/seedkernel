@@ -272,7 +272,7 @@ for (const argv of [["--app", "probe"], ["--app", "probe", "--op", "x", "--bundl
     "--local-config without an app target is refused before a shell is stood up");
 }
 // Transport-only flags without a network flag would be silently ignored, so they are refused.
-for (const flag of ["--transport", "--contact-secret"]) {
+for (const flag of ["--transport", "--transport-config", "--contact-secret"]) {
   const host = fakeHost(["--key", join(work, "orphan.key"), flag, join(work, "absent")]);
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
@@ -304,6 +304,28 @@ for (const flag of ["--transport", "--contact-secret"]) {
     "--contact-secret reaches the transport as the file says it, less its line ending");
   ok(JSON.stringify(host.stood.transport.config.peers) === JSON.stringify([ref, "not-a-ref"]),
     "--peers reaches the transport as typed");
+}
+// --transport-config is the boot transport's whole LOCAL, passed through unread; the flags
+// that also configure it take precedence. A transport that reports itself in text has its
+// status printed as it is.
+{
+  const configPath = join(work, "transport.json");
+  writeFileSync(configPath, JSON.stringify({ authorities: ["relay.test"], peers: ["from the file"] }));
+  const host = fakeHost(["--key", join(work, "t.key"), "--listen", "127.0.0.1:0", "--peers", "",
+    "--transport-config", configPath]);
+  await runCli(host);
+  ok(JSON.stringify(host.stood.transport.config.authorities) === '["relay.test"]',
+    "--transport-config reaches the transport as the file says it");
+  ok(JSON.stringify(host.stood.transport.config.peers) === '["from the file"]',
+    "an empty --peers leaves the file's peers in place");
+  host.stood.transport.onStatus(utf8.encode("+ member (1 in room, 1 rooms)"));
+  ok(host.lines.at(-1) === "  + member (1 in room, 1 rooms)", "a text status prints as it is");
+  writeFileSync(configPath, "[]");
+  const bad = fakeHost(["--key", join(work, "t2.key"), "--listen", "127.0.0.1:0", "--transport-config", configPath]);
+  let msg = "";
+  try { await runCli(bad); } catch (e) { msg = String(e.message); }
+  ok(msg.includes("--transport-config must hold a JSON object") && bad.stood === null,
+    "a --transport-config that is not a JSON object is refused before a shell is stood up");
 }
 {
   const host = fakeHost(["--key", join(work, "c3.key"), "--peers", "", "--contact-secret", join(work, "nope.hex")]);

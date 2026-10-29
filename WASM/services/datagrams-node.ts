@@ -11,13 +11,13 @@ import { concatBytes } from "./util.js";
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";
 
-/** A socket on a port the OS picks: `udp6` taking IPv4 too, or `udp4` on a machine
- *  without IPv6. */
-function bound(type: "udp4" | "udp6", bufferBytes: number): Promise<Socket> {
+/** A socket on `port` (0 for one the OS picks): `udp6` taking IPv4 too, or `udp4` on a
+ *  machine without IPv6. */
+function bound(type: "udp4" | "udp6", bufferBytes: number, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const s = createSocket({ type, ipv6Only: false, recvBufferSize: bufferBytes, sendBufferSize: bufferBytes });
     s.once("error", reject);
-    s.bind(0, () => { s.off("error", reject); resolve(s); });
+    s.bind(port, () => { s.off("error", reject); resolve(s); });
   });
 }
 
@@ -28,14 +28,15 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
   const sockets = new Map<number, { send(bytes: Uint8Array, port: number, host: string): void; close(): void }>();
   let seq = 0;
   return {
-    async bind(deliver, bufferBytes) {
+    async bind(deliver, bufferBytes, _heldBytes, port) {
       let s: Socket;
       try {
-        s = await bound(dualStack ? "udp6" : "udp4", bufferBytes);
+        s = await bound(dualStack ? "udp6" : "udp4", bufferBytes, port);
       } catch (err) {
-        if (!dualStack) throw err;
+        // A port in use is the port's failure, not a machine without IPv6.
+        if (!dualStack || (err as NodeJS.ErrnoException).code === "EADDRINUSE") throw err;
         dualStack = false;
-        s = await bound("udp4", bufferBytes);
+        s = await bound("udp4", bufferBytes, port);
       }
       const six = dualStack;
       // A send that fails is a lost datagram, which the stream already expects.

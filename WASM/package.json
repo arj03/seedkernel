@@ -66,6 +66,7 @@
       "default": "./build/host/platform-web.js"
     },
     "./host.skb": "./build/host.skb",
+    "./ws.wasm": "./build/ws.wasm",
     "./transport-bundle": {
       "types": "./build/host/transport-bundle.d.ts",
       "default": "./build/host/transport-bundle.js"

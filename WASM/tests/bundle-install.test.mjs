@@ -1427,12 +1427,12 @@ async function testCommitRevalidatesHostGates() {
   const racerKey = "racer";
   const blobAt = (version) => authorBundle(sodium, author, {
     app: "racer", version, modules: [],
-    guestSource: `${GUEST_TEXT}//v${version}`, guestRequires: [],
+    guestSource: `${GUEST_TEXT} const VERSION = ${version};`, guestRequires: [],
   }).blob;
   // Which version is installed, read from the guest source, the only thing that tells the
   // two candidates apart from inside the shell.
   const createRealm = async ({ source }) => ({
-    call: async () => Uint8Array.of(Number(/\/\/v(\d+)$/.exec(source)[1])),
+    call: async () => Uint8Array.of(Number(/const VERSION = (\d+);$/.exec(source)[1])),
     dispose() { },
   });
 
