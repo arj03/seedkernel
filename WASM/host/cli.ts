@@ -1,18 +1,18 @@
 // The operator side of a node, shared by every target: flags, defaults, deny-all without
 // `--policy` (§14), remedies before the bundle (§12.5), which failures are fatal, and the
 // console output. A `CliHost` supplies only what differs per target.
-import { toHex, fromHex, isHex64, isRecord, errMessage, enc, dec, u8 } from "../services/util.js";
+import { toHex, fromHex, isHex64, isRecord, errMessage, enc, dec, u8 } from "./util.js";
 import type { RawFiles } from "../services/fs-files.js";
-import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../services/subkeys.js";
+import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "./subkeys.js";
 import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
-import { OpArgs, writeOp } from "../services/op-frame.js";
+import { OpArgs, writeOp } from "./op-frame.js";
 import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort } from "../services/peer-addr.js";
-import type { TransportHost } from "./transport-host.js";
+import type { TransportHost } from "../services/link.js";
 import type { ListenAddress, LocalChannels } from "../services/socket-seam.js";
 import { controlInvoke, controlServes, serveControl } from "./control.js";
 import { DEFAULT_DIR } from "./abi.js";
-import type { AppHandle, BootShellOptions, Shell } from "./shell-core.js";
+import type { AppHandle, BootShellOptions, Shell, TransportOptions } from "./shell-core.js";
 /** Where the node's 32-byte master seed lives when `--key` is omitted (§12.6.2b). */
 export const DEFAULT_KEY = "./seedkernel.key";
 
@@ -34,7 +34,9 @@ export type CliFiles = Pick<RawFiles, "read" | "write">;
 /** What a node needs once the flags are read: the store, the policy, and `bootShell`'s
  *  own options. Each target builds the rest from its own parts (`standUp`). An embedder
  *  whose gate is not a policy file passes `admit` in place of `policyJson`. */
-export interface NodeSetup extends Pick<BootShellOptions, "identity" | "admit" | "transport" | "guestDeadlineMs" | "realmMemoryBytes"> {
+export interface NodeSetup extends Pick<BootShellOptions, "identity" | "admit" | "guestDeadlineMs" | "realmMemoryBytes"> {
+  /** The network, `bootShell`'s `services.transport` (§12.6). Omitted means none. */
+  transport?: TransportOptions;
   /** Directory backing the `fs` service. */
   dir: string;
   /** Policy file contents (policy.ts). Omit ⇒ deny-all for ordinary apps. */
@@ -304,7 +306,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       bundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
       config: transportConfig,
       onStatus,
-    } : false,
+    } : undefined,
     guestDeadlineMs: guestTimeout === 0 ? Infinity : guestTimeout,
     realmMemoryBytes: guestMemory === undefined ? undefined : guestMemory * 1024 * 1024,
   });

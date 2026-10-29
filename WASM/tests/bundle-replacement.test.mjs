@@ -15,12 +15,12 @@ const linkBundle = (author, version = 1, extra = {}) => bundle(author, "transpor
   guestRequires: ["node", "link"], services: ["_net"], ...extra,
 });
 
-async function node({ transport = false, store = new FreshnessMarks(), admit = () => true } = {}) {
+async function node({ transport, store = new FreshnessMarks(), admit = () => true } = {}) {
   const records = [], control = { hook: null };
   const identity = generateKeyPair();
   const result = await bootShell({
-    sodium, identity, fs: new MemoryFs(), freshnessStore: store,
-    transport, admit,
+    sodium, identity, freshnessStore: store,
+    services: { fs: new MemoryFs(), transport }, admit,
     createRealm: async (o) => {
       // Compile the fixture without executing guest top-level code.
       new Function(o.source);

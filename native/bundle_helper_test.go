@@ -29,7 +29,7 @@ import (
 var forwarderWasm []byte
 
 // The manifest signing constants these test bundles use, read from the shared bundle
-// (services/domains.ts) instead of copied here.
+// (host/domains.ts) instead of copied here.
 //
 // `bundleEnvelope` below is a separate implementation on purpose, so a mismatch with the
 // shared reader shows up. A copied constant has nothing to check: it can only be right or

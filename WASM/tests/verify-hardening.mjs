@@ -38,15 +38,18 @@ const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
  *  which policies and freshness marks use. `ed` also serves as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
-const { createRealmTimers } = await imp("build/host/realm-timers.js");
-const { toHex } = await imp("build/services/util.js");
+const { createRealmTimers, timerService } = await imp("build/services/timer.js");
+const { nodeService } = await imp("build/services/node.js");
+const { fsService } = await imp("build/services/fs.js");
+const { linkService, TransportHost } = await imp("build/services/link.js");
+const { toHex, HOST_CALLER_ID } = await imp("build/host/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createGuestSeam, CallBudget, HOST_CALLER_ID } = await imp("build/host/guest-seam.js");
+const { createGuestSeam, CallBudget } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALL_LOCAL = () => null;
 const TEST_LINK = { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) };
-const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
+const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 const { createWebRealm } = await imp("build/host/engine-web.js");
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
@@ -231,9 +234,9 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
 {
   const base = {
     sodium,
-    backends: {
-      node: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: sodium.crypto_sign_keypair() },
-      fs: new MemoryFs(), timer: TEST_TIMERS, link: TEST_LINK,
+    services: {
+      node: nodeService(sodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: sodium.crypto_sign_keypair() }),
+      fs: fsService(new MemoryFs()), timer: timerService(TEST_TIMERS), link: linkService(TEST_LINK),
     },
     callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
@@ -765,9 +768,9 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
     const seam = createGuestSeam({
       sodium: burningSodium,
       requires: ALL_HOST_SERVICES,
-      backends: {
-        node: { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity },
-        fs: new MemoryFs(), timer: TEST_TIMERS, link: TEST_LINK,
+      services: {
+        node: nodeService(burningSodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity }),
+        fs: fsService(new MemoryFs()), timer: timerService(TEST_TIMERS), link: linkService(TEST_LINK),
       },
       callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
@@ -860,7 +863,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 
   const seen = [];
   const { shell } = await bootShell({
-    sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
+    sodium, identity: kp.ed, modules: new ModuleTable(), services: { fs: new MemoryFs() },
     freshnessStore: new FreshnessMarks(),
     createRealm: async (o) => {
       seen.push(o);
@@ -925,7 +928,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   await reload({ guestDeadlineMs: Infinity });
   ok(seen.at(-1)?.deadlineMs === Infinity, "Infinity is still the one way to say no budget");
   for (const bad of [{ realmMemoryBytes: 0 }, { guestDeadlineMs: -5 }]) {
-    await rejects(bootShell({ sodium, identity: kp.ed, transport: false, ...bad }),
+    await rejects(bootShell({ sodium, identity: kp.ed, ...bad }),
       `a node default of ${JSON.stringify(bad)} fails the boot`);
   }
   const cyclic = {}; cyclic.self = cyclic;
@@ -962,7 +965,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // undefined and not unbounded. The shell resolves them so no factory owns the numbers.
   let seen2 = null;
   const { shell: bare } = await bootShell({
-    sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
+    sodium, identity: kp.ed, modules: new ModuleTable(), services: { fs: new MemoryFs() },
     freshnessStore: new FreshnessMarks(),
     createRealm: async (o) => {
       seen2 = o;
@@ -994,7 +997,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
 {
   const { MessageChannel } = await imp("build/services/net-channel.js");
   const { nodeChannels } = await imp("build/host/shell-node.js");
-  const { TransportHost } = await imp("build/host/transport-host.js");
+
   const ownedChannel = (channel, limits = {}) => {
     let ownerClosed = false;
     const closeChannel = channel.close.bind(channel);
@@ -1185,7 +1188,7 @@ console.log("\n§12.6 — host socket send queues are bounded");
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
-  // `timer` is an ordinary host service (services/domains.ts), so this tests that an
+  // `timer` is an ordinary host service (host/domains.ts), so this tests that an
   // ordinary app gets it: no transport bundle is installed below. If it were wired off the
   // transport driver, such an app would install and then fail at its first `host.call`.
   // Which deadline is due is the guest's own state, never a host-side id.
@@ -1221,12 +1224,9 @@ ${guestOpFraming()}
     };
     return signTestBundle(sodium, kp, manifest, guestBytes);
   };
-  // `fs: false` explicitly: these bundles do not require `fs`, and the in-memory default
-  // would give this node a backend it does not need.
   const newShell = async () => (await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(), createRealm: createWebRealm,
-    fs: false,
     admit: admitAll,
   })).shell;
 
@@ -1268,7 +1268,6 @@ ${guestOpFraming()}
   const { shell: stub } = await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
-    fs: false,
     createRealm: async (o) => {
       armed = o.hostCall;
       return {

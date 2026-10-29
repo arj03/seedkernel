@@ -8,7 +8,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, connect as tcpConnect, type Server, type Socket } from "node:net";
 import { nodeRawFiles } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
-import { EMPTY, errMessage } from "../services/util.js";
+import { EMPTY, errMessage } from "./util.js";
 import { webBridge } from "./platform-web.js";
 import { packageHostBlob } from "./crypto-node.js";
 import type { Platform } from "./platform.js";

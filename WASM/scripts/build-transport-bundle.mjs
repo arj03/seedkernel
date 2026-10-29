@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { readGuestSource } from "./guest-source.mjs";
 import { TRANSPORT_APP_CONFIG, TRANSPORT_SERVICE } from "./transport-config.mjs";
 import { authorBundle, buildAuthor, guestOpFraming } from "../build/scripts/bundle-author.js";
-import { toHex } from "../build/services/util.js";
+import { toHex } from "../build/host/util.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -45,7 +45,7 @@ async function main() {
 // The default transport bundle (§12.6), signed by the transport author
 //   ${toHex(author)}
 // under the hybrid suite (§14.1).
-import { fromBase64 } from "../services/util.js";
+import { fromBase64 } from "../host/util.js";
 /** The local service id this bundle claims, for \`Shell.call\`. A replacement transport
  *  may name its own. */
 export const TRANSPORT_SERVICE = "${TRANSPORT_SERVICE}";

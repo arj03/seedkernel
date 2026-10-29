@@ -1,23 +1,49 @@
 // Platform-neutral shell (§12.8). `bootShell` is the one assembly path: defaults, the slot
-// table and load order. Targets only swap platform members; signed bundles are the only
-// way to fill a slot (§12.4).
+// table, load order, and which host services this node offers. Targets only swap platform
+// members; signed bundles are the only way to fill a slot (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type HostCall, type LinkBackend, type LocalCall, type HostStaging } from "./guest-seam.js";
-import { TransportHost, type TransportHostOptions } from "./transport-host.js";
+import { createGuestSeam, type SeamCrypto, type HostCall, type LocalCall } from "./guest-seam.js";
 import { transportBundleBytes } from "./transport-bundle.js";
-import { type Fs } from "../services/fs.js";
-import { validatedFs, scopedFs } from "./fs-view.js";
-import { createRealmTimers } from "./realm-timers.js";
-import { createSlotTable, type AppSlot, type InboundObserver } from "./slot-table.js";
+import { createSlotTable } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, isRecord, errMessage, concatBytes, EMPTY } from "../services/util.js";
-import { sendProtocol } from "../services/op-frame.js";
-import { type CausalClock, type RealmFactory } from "./realm-queue.js";
-import type { Keypair } from "../services/subkeys.js";
+import { enc, fromHex, toHex, isHex64, isRecord, errMessage, concatBytes, EMPTY, HOST_CALLER_ID } from "./util.js";
+import { sendProtocol } from "./op-frame.js";
+import { type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
+import type { Keypair } from "./subkeys.js";
+// The host services: `node` and `timer` on every node, the others where offered.
+import { nodeService, slotSignScope } from "../services/node.js";
+import { createRealmTimers, timerService, type RealmTimers } from "../services/timer.js";
+import { fsService, scopedFs, validatedFs, type Fs } from "../services/fs.js";
+import { linkService, TransportHost, type LinkBackend, type TransportHostOptions } from "../services/link.js";
+import { hostService, type HostStaging } from "../services/host.js";
 
 /** Neutral realm contracts exposed through the shell facade clients configure. */
 export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
+
+/** Observe a slot's own answer to a peer-inbound frame, after it resolves. */
+export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array) => void;
+
+/** One installed app. `realm` is null only while the install is still building it; a
+ *  slot enters the table with its realm in place. */
+interface AppSlot {
+  verifiedBundle: LoadedBundle;
+  /** Whether it requires `link` (`reachesLink`), read once: such a slot runs its own
+   *  turns, signs under the link scope, and holds apps' sends to their claims. */
+  links: boolean;
+  pureModules: PureModules;
+  fsScope?: Fs;
+  /** The fs prefix this slot's view is scoped under (`appScopeFor`). */
+  appScope: string;
+  realm: Realm | null;
+  /** Set once the freshness mark and claims have committed; until then the seam refuses
+   *  every call (`seamFor`). */
+  active: boolean;
+  /** Per slot, so disposing a slot cancels only its own pending wake. */
+  timers: RealmTimers;
+  /** This install's answer observer; a replacement carries its own or none. */
+  onInbound?: InboundObserver;
+}
 
 /** Manifest verification plus the guest crypto ops; core libsodium satisfies both. */
 export type ShellSodium = ManifestVerifier & SeamCrypto;
@@ -53,7 +79,8 @@ export interface Shell {
    *  nothing claims it. Resolves `services`, never `protocols`. This is how an embedder or
    *  the CLI asks the transport to wait for a cohort, list peers, or add an address. */
   call(serviceId: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> | null;
-  /** Absent for a node with no disk, which refuses a bundle requiring `fs` at install. */
+  /** Absent on a node that does not offer `fs`, which refuses a bundle requiring it at
+   *  install. */
   fs?: Fs;
   sodium: ShellSodium;
   /** The only way a bundle enters this node: verify, admit, build modules, start the
@@ -71,7 +98,7 @@ export interface Shell {
 
 /** What an install returns: verified facts plus a slot-bound handle (§12.4). */
 export interface AppHandle extends LoadedBundle {
-  /** This app's fs view, already scoped. Absent on a shell with no fs. */
+  /** This app's fs view, already scoped. Absent on a node that does not offer `fs`. */
   fs?: Fs;
   /** The fs prefix this app's view is scoped under (`appScopeFor`), for reading the raw
    *  backend directly with `scopedFs(raw, appScope)`. */
@@ -84,7 +111,21 @@ export interface AppHandle extends LoadedBundle {
 // Re-exported so a target gets admission constructors and the fs view from the same module
 // as bootShell.
 export { denyAll, admitAll, authorAllowlist, policyFromJson, type Admit } from "./policy.js";
-export { scopedFs } from "./fs-view.js";
+export { scopedFs } from "../services/fs.js";
+
+/** The host services this node offers beyond `node` and `timer`, which every node has
+ *  (§12.2). One left out is not offered: a bundle requiring it does not install. A relay
+ *  is `{ transport }`, a node with no network `{ fs }`. */
+export interface NodeServices {
+  /** The store behind `fs`. Each app reaches only its own scope of it. */
+  fs?: Fs;
+  /** The sockets and the signed transport that occupies `link` (§12.6): given, the node
+   *  offers `link` and installs the transport at boot. The object is kept, so live
+   *  accessors keep working. */
+  transport?: TransportOptions;
+  /** The loader's host slots behind `host` (§12.9). */
+  host?: HostStaging;
+}
 
 /** This node's network (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
@@ -98,7 +139,8 @@ export interface TransportOptions extends TransportHostOptions {
   onStatus?: (status: Uint8Array) => void;
 }
 
-/** Assembly options (§12.8). Everything except `sodium` and `identity` has a default. */
+/** Assembly options (§12.8). Everything except `sodium` and `identity` has a default;
+ *  `services` defaults to none. */
 export interface BootShellOptions {
   /** Core libsodium with the ML-DSA-65 verifier mixed in. */
   sodium: ShellSodium;
@@ -108,8 +150,7 @@ export interface BootShellOptions {
   /** Admission for ordinary apps; deny-all when absent. `link` is authorized only by boot
    *  selection or by replacing its holder. Host gates apply to every bundle. */
   admit?: Admit;
-  /** Defaults to `MemoryFs`. `false` means a node with no fs backend at all. */
-  fs?: Fs | false;
+  services?: NodeServices;
   /** Persisted bundle-freshness store (§12.4). Default: in-memory `FreshnessMarks`. */
   freshnessStore?: FreshnessStore;
   /** Builder for a bundle's private modules (§4). Default: the worker-backed `ModuleTable`. */
@@ -123,12 +164,6 @@ export interface BootShellOptions {
   /** Default QuickJS heap limit per realm (`DEFAULT_REALM_MEMORY_BYTES`); an install
    *  overrides it with `InstallOptions.realmMemoryBytes`. */
   realmMemoryBytes?: number;
-  /** The sockets and signed transport (§12.6). Omitted or `false` means no network. The
-   *  object is kept, so live accessors keep working. */
-  transport?: TransportOptions | false;
-  /** The loader's host slots, behind the `host` service (§12.9). Without them an app that
-   *  requires `host` does not install. */
-  hostStaging?: HostStaging;
 }
 
 export interface BootResult {
@@ -158,20 +193,20 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   // A bad node-wide default fails the boot instead of every later install.
   boundsFor({});
   const sodium = opts.sodium;
+  const offered = opts.services ?? {};
+  // The one place the key rule is applied to a target's backend (`validatedFs`).
+  const fs = offered.fs && validatedFs(offered.fs);
   // JS-target defaults are imported lazily so the native binary never loads them.
-  const backend = opts.fs === false ? undefined : opts.fs ?? new ((await import("../services/fs-memory.js")).MemoryFs)();
-  // The one place the key rule is applied to a target's backend (fs-view.ts).
-  const fs = backend ? validatedFs(backend) : undefined;
   const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
   const createRealm = opts.createRealm
     ?? (async (o) => (await import("./engine-web.js")).createWebRealm(o));
   const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
-  const net = opts.transport === false ? undefined : opts.transport;
+  const net = offered.transport;
   const netHost = net ? new TransportHost(net) : null;
   const appAdmit = opts.admit ?? denyAll;
   let closed = false;
 
-  const table = createSlotTable();
+  const table = createSlotTable<AppSlot>();
   /** A slot for `loaded`, without its realm yet. The wake reads `slot.realm` when it
    *  fires, so it enters whichever realm is there then. */
   const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions,
@@ -180,7 +215,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const timers = createRealmTimers(
       // A host event under the host's caller id. There is no caller to reject to, so an
       // error is logged. The promise is returned because it gates the next wake
-      // (realm-timers.ts).
+      // (services/timer.ts).
       (input, causalClock) => slot.realm!.call(input, undefined, causalClock).catch((err: unknown) => {
         console.error(`[shell] guest error in timer: ${errMessage(err)}`);
       }),
@@ -285,6 +320,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       catch (err) { console.error(`[shell] the embedder's onStatus threw: ${errMessage(err)}`); }
     },
   } : undefined;
+  // Node-wide services share one handler set; the rest are scoped per slot.
+  const linkHandlers = link && linkService(link);
+  const hostHandlers = offered.host && hostService(offered.host);
   /** Wire the `host.call` seam for one slot (guest-seam.ts): only the services its bundle
    *  declares. */
   const seamFor = (slot: AppSlot): HostCall => {
@@ -294,12 +332,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       sodium,
       // The signed list, unmodified: host services and local service ids.
       requires: b.manifest.guest.requires,
-      backends: {
-        node: slotSignScope(opts, app, slot.links),
-        fs: slot.fsScope,
-        timer: slot.timers,
-        link,
-        host: opts.hostStaging,
+      services: {
+        node: nodeService(sodium, slotSignScope(opts, app, slot.links)),
+        timer: timerService(slot.timers),
+        fs: slot.fsScope && fsService(slot.fsScope),
+        link: linkHandlers,
+        host: hostHandlers,
       },
       // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
       // zeros is the host.

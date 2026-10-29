@@ -79,7 +79,7 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeG
 }
 
 // send queues bytes for the writer and takes ownership of them. A send on a dead channel
-// is dropped. There is no refusal here: `LinkOutboundOwner` (host/transport-host.ts)
+// is dropped. There is no refusal here: `LinkOutboundOwner` (services/link.ts)
 // bounds a link against buffered() before it sends.
 func (c *sockChannel) send(bytes []byte) {
 	c.mu.Lock()

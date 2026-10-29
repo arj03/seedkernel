@@ -20,7 +20,7 @@ export function guestSourcePaths() {
 
 /** The assembled guest program as text, which is what the manifest signs; verification
  *  decodes the packed guest back to text. `opFrameSource` comes from bundle-author.ts's
- *  `guestOpFraming`, which serializes the services/op-frame.ts functions.
+ *  `guestOpFraming`, which serializes the host/op-frame.ts functions.
  *
  *  The result is normalized to LF because this text is signed: `.gitattributes` checks
  *  the parts out LF, but an editor can still save CRLF in the working tree, and the same

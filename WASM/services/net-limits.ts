@@ -31,7 +31,7 @@ export const DEFAULT_MAX_RAW_LINKS = 4096;
  *  FIN. */
 export const TCP_KEEPALIVE_MS = 30_000;
 
-/** Datagram sockets the link occupant holds at once (transport-host.ts). A hard NAT's
+/** Datagram sockets the link occupant holds at once (services/link.ts). A hard NAT's
  *  birthday punch opens hundreds (§12.7); the transport bounds its own below this. */
 export const MAX_UDP_SOCKETS = 2048;
 

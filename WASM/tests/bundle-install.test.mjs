@@ -313,7 +313,7 @@ async function testManifestClaimIsTheRouting() {
       const seams = [];
       const node = await bootTestShell({
         identity,
-        transport: {},
+        services: { transport: {} },
         createRealm: async (o) => {
           seams.push(o.hostCall);
           return { call: async (input) => input.slice(32), dispose() {} };
@@ -505,13 +505,13 @@ async function testFs() {
 // Which keys a node accepts decides which blocks it stores and advertises, so it is
 // consensus: a Go node and a Node node that disagree about it disagree about their
 // contents. The rule lives in shared code (services/fs.ts `isSafeFsKey`), applied over
-// whatever backend a target supplies (`validatedFs`, host/fs-view.ts).
+// whatever backend a target supplies (`validatedFs`, services/fs.ts).
 
 async function testFsKeyRule() {
   console.log("Test: fs key space is one rule — isSafeFsKey over any backend (validatedFs)");
 
   const { isSafeFsKey } = await imp("build/services/fs.js");
-  const { validatedFs, scopedFs } = await imp("build/host/fs-view.js");
+  const { validatedFs, scopedFs } = await imp("build/services/fs.js");
 
   const legal = ["a", "a.blk", "A_b-c.9", "0".repeat(64) + ".blk", "_", "-", "..a", "a.."];
   for (const k of legal) assert(isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should hold`);
@@ -1185,7 +1185,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
   // candidate is only allowed as the replacement of the current link owner, so without
   // one this candidate would never reach the seam under test.
   const shell = await bootTestShell({
-    fs, freshnessStore: store, transportAuthor: author,
+    services: { fs }, freshnessStore: store, transportAuthor: author,
     createRealm: async ({ hostCall, source }) => {
       if (loadingNeighbor) {
         return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
@@ -1371,7 +1371,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
 // ─── Test: generated guest op-frame source is the canonical implementation ─────
 //
-// services/op-frame.ts defines the functions. `guestOpFraming` serializes the compiled
+// host/op-frame.ts defines the functions. `guestOpFraming` serializes the compiled
 // functions for import-free guests, and the transport build injects the same fragment.
 // Run the emitted program at every boundary so serialization cannot change behavior.
 function testGeneratedOpFrame() {

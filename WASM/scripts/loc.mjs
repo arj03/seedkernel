@@ -51,24 +51,33 @@ const sharedSet = new Set(
 const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
+  // The core.
   { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
     files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts",
       "WASM/host/slots.ts", "WASM/host/pure-module.ts"] },
-  { find: /`host\/transport-host\.ts`/,
-    files: ["WASM/host/transport-host.ts"] },
   { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,
-    files: ["WASM/host/guest-seam.ts", "WASM/host/realm-queue.ts",
-      "WASM/host/realm-timers.ts", "WASM/host/fs-view.ts"] },
+    files: ["WASM/host/guest-seam.ts", "WASM/host/realm-queue.ts"] },
   { find: /`host\/shell-core\.ts`/,
     files: ["WASM/host/shell-core.ts", "WASM/host/slot-table.ts"] },
-  { find: /`host\/cli\.ts`/,
-    files: ["WASM/host/cli.ts", "WASM/host/control.ts"] },
   { find: /`host\/engine-realm\.ts`, `host\/sodium-engine\.ts`/,
     files: ["WASM/host/engine-realm.ts", "WASM/host/sodium-engine.ts", "WASM/host/pq.ts"] },
   { find: /`host\/platform\.ts`, `host\/abi\.ts`/,
     files: ["WASM/host/platform.ts", "WASM/host/abi.ts", "WASM/host/host-main.ts", "WASM/host/native-polyfills.ts"] },
-  { find: /`services\/\*\.ts` \(\d+ shared files\)/,
-    files: [...sharedSet].filter((f) => f.startsWith("WASM/services/")) },
+  { find: /`host\/domains\.ts`, `host\/subkeys\.ts`/,
+    files: ["WASM/host/domains.ts", "WASM/host/subkeys.ts", "WASM/host/op-frame.ts", "WASM/host/util.ts", "WASM/host/utf8.ts"] },
+  // The host services.
+  { find: /`services\/node\.ts`, `services\/timer\.ts`/,
+    files: ["WASM/services/node.ts", "WASM/services/timer.ts"] },
+  { find: /`services\/fs\.ts`, `services\/fs-files\.ts`/,
+    files: ["WASM/services/fs.ts", "WASM/services/fs-files.ts"] },
+  { find: /`services\/link\.ts`/,
+    files: ["WASM/services/link.ts", "WASM/services/socket-seam.ts", "WASM/services/datagrams.ts",
+      "WASM/services/peer-addr.ts", "WASM/services/net-limits.ts"] },
+  { find: /\| `services\/host\.ts` \|/,
+    files: ["WASM/services/host.ts"] },
+  // The operator front-end.
+  { find: /`host\/cli\.ts`/,
+    files: ["WASM/host/cli.ts", "WASM/host/control.ts"] },
 ];
 
 // In the shared bundle but counted elsewhere: transport-bundle.ts, one line of signed bundle

@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const { DOMAIN_LINK_SCOPE } = await import(pathToFileURL(join(root, "build/services/domains.js")).href);
+const { DOMAIN_LINK_SCOPE } = await import(pathToFileURL(join(root, "build/host/domains.js")).href);
 
 const DOMAIN_RELAY = Buffer.from("seedkernel-relay-register-v1\0");
 const DOMAIN_SECRET = Buffer.from("seedrelay-secret-v1\0");

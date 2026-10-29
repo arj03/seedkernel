@@ -16,8 +16,8 @@ const { loadCrypto } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { runCli, parseArgs, parseHex32, loadedLine, DEFAULT_KEY } = await imp("build/host/cli.js");
 const { DEFAULT_DIR } = await imp("build/host/abi.js");
-const { deriveNodeKey } = await imp("build/services/subkeys.js");
-const { toHex } = await imp("build/services/util.js");
+const { deriveNodeKey } = await imp("build/host/subkeys.js");
+const { toHex } = await imp("build/host/util.js");
 
 const { ok, throws, summary } = testkit();
 const work = mkdtempSync(join(tmpdir(), "seedkernel-cli-"));
@@ -151,7 +151,7 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1
   const host = browserHost({ hostBlob: new Uint8Array(readFileSync(join(root, "build/host.skb"))) });
   const asked = [];
   const node = await host.standUp({
-    dir: "page", identity: host.sodium.crypto_sign_keypair(), transport: false,
+    dir: "page", identity: host.sodium.crypto_sign_keypair(),
     admit: (b) => { asked.push(b.manifest.app); return true; },
   });
   try {

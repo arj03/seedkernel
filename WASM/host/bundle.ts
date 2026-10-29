@@ -1,6 +1,6 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, isHex64, isRecord, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "../services/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "../services/domains.js";
+import { concatBytes, toHex, isHex64, isRecord, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "./util.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "./domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
 export type { JsonValue, JsonObject };
 

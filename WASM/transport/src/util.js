@@ -87,7 +87,7 @@ function args(u32s, u8s, tail) {
 // ── inbound argument decoding ─────────────────────────────────────────────────
 
 // Each op reads its own fixed field order: u32 BE, u8, and blobs as `[len u32 BE][bytes]`.
-// The host's writer is `OpArgs` (services/op-frame.ts).
+// The host's writer is `OpArgs` (host/op-frame.ts).
 function Reader(b) {
   this.b = b;
   this.off = 0;

@@ -144,11 +144,10 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     identity: generateKeyPair(),
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
-    fs: false,
-    transport: {
+    services: { transport: {
       config: { linkIdleTimeoutMs: 321, networkKey: "7a".repeat(32) },
       bundle: transportBlob,
-    },
+    } },
     createRealm: async (o) => {
       source = o.source;
       return { call: async () => new Uint8Array(), dispose() {} };
@@ -189,8 +188,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     sodium, identity,
     modules: new ModuleTable(),
     freshnessStore,
-    fs: false,
-    transport: { ...transportOptions, config: transportConfig },
+    services: { transport: { ...transportOptions, config: transportConfig } },
     createRealm: async (o) => {
       const realm = await createWebRealm(o);
       const pause = realmControl.pauseNext;

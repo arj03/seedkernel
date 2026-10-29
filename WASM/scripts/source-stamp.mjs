@@ -42,7 +42,7 @@ export function stampedSources(buildFiles) {
   return [...new Set([...ts, ...guest, ...ws, "scripts/transport-config.mjs"])].sort();
 }
 
-/** The stamp: `{ "services/util.ts": "<sha256 hex>", ... }`. */
+/** The stamp: `{ "host/util.ts": "<sha256 hex>", ... }`. */
 export function sourceStamp(buildFiles) {
   const out = {};
   for (const p of stampedSources(buildFiles)) {

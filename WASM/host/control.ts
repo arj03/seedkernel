@@ -8,7 +8,7 @@
 //   answer    [status u8][len u32][bytes]   status 0: the app's answer; 1: an error, as text
 //
 // One request per connection.
-import { errMessage, enc, dec, readU32BE, writeU32BE, u8 } from "../services/util.js";
+import { errMessage, enc, dec, readU32BE, writeU32BE, u8 } from "./util.js";
 import type { LocalChannels, RawLink } from "../services/socket-seam.js";
 import type { AppHandle } from "./shell-core.js";
 

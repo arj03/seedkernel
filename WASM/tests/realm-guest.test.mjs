@@ -15,7 +15,7 @@ import {
   toHex, concatBytes, verifyTestBundle,
   signTestBundle, authorBundle, GUEST_TEXT, GUEST_BYTES, GUEST,
   testAuthor, bootTestShell, imp, MemoryFs,
-  createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_CALL_LOCAL, testBackends,
+  createGuestSeam, withTestBudget, guestSignScope, appSignScope, ALL_HOST_SERVICES, TEST_CALL_LOCAL, testServices, slotSignScope,
   createWebRealm, callerOf, readOp, writeOp, forwarderBytes, installMod, makeHost, EMPTY,
 } from "./fixtures.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -66,7 +66,7 @@ async function testGuestSeam() {
   const seam = withTestBudget(createGuestSeam({
     sodium,
     requires: names,
-    backends: { ...testBackends(), node: signScope, fs },
+    services: testServices({ node: signScope, fs }),
     callLocal,
     // Scoped to one app, as the shell does: a bare name is a module in this app's map
     // and cannot reach outside it.
@@ -250,7 +250,6 @@ async function testPolicy() {
 async function testSigningScopeFollowsSlot() {
   console.log("Test: node/sign is the slot's scope — app scope for an app, link scope for the link slot, on every load path");
   const { admitAll } = await imp("build/host/policy.js");
-  const { slotSignScope } = await imp("build/host/guest-seam.js");
 
   const linkAuthor = testAuthor(), appAuthor = testAuthor();
   const identity = generateKeyPair();
@@ -638,7 +637,7 @@ async function testSeamGating() {
   const mk = (names) => withTestBudget(createGuestSeam({
     sodium,
     requires: names,
-    backends: { ...testBackends(), node: appSignScope(id, "probe") },
+    services: testServices({ node: appSignScope(id, "probe") }),
     callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   }));
@@ -698,7 +697,7 @@ async function testSeamGating() {
   // A declared service this node cannot provide fails the seam, so the install fails.
   let unbacked = "";
   try {
-    createGuestSeam({ sodium, requires: ["fs"], backends: { ...testBackends(), fs: undefined },
+    createGuestSeam({ sodium, requires: ["fs"], services: { ...testServices(), fs: undefined },
       callLocal: TEST_CALL_LOCAL, modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) } });
   } catch (e) { unbacked = e.message; }
   assert(unbacked.includes('requires "fs"'), `a declared fs on a diskless node is refused at construction (got: ${unbacked})`);
@@ -878,7 +877,7 @@ async function testModuleCallChargedToGuestBudget() {
   const seam = createGuestSeam({
     sodium,
     requires: ALL_HOST_SERVICES,
-    backends: testBackends(),
+    services: testServices(),
     callLocal: TEST_CALL_LOCAL,
     modules: {
       names: new Set(["spin"]),
@@ -965,7 +964,7 @@ async function testPreviousAbiRefused() {
     hostCall: createGuestSeam({
       sodium,
       requires: ALL_HOST_SERVICES,
-      backends: testBackends(),
+      services: testServices(),
       callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     }),
@@ -1150,7 +1149,7 @@ async function testOwnTurns() {
 
 // ─── Test: a standard handshake is buildable on the host names (Noise XX vectors) ───
 // The host's crypto/ names must expose their algorithms' whole standard interface, or a
-// replacement transport could not ship as a bundle (services/domains.ts). Published
+// replacement transport could not ship as a bundle (host/domains.ts). Published
 // Noise_XX vectors, replayed byte for byte through a seam with no services declared: the
 // same script native/guestseam_test.go runs against the Go primitives.
 async function testNoiseVectors() {
@@ -1160,7 +1159,7 @@ async function testNoiseVectors() {
   const seam = withTestBudget(createGuestSeam({
     sodium,
     requires: [],
-    backends: {},
+    services: {},
     callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   }));

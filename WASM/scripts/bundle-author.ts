@@ -5,13 +5,13 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import type ts from "typescript";
-import { concatBytes, enc, Fifo, fromHex, toHex } from "../services/util.js";
+import { concatBytes, enc, Fifo, fromHex, toHex } from "../host/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
-import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../services/domains.js";
-import { callerOf, readOp, writeOp, OpArgs } from "../services/op-frame.js";
-import { utf8Encode, utf8Decode } from "../services/utf8.js";
-import type { Keypair } from "../services/subkeys.js";
+import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../host/domains.js";
+import { callerOf, readOp, writeOp, OpArgs } from "../host/op-frame.js";
+import { utf8Encode, utf8Decode } from "../host/utf8.js";
+import type { Keypair } from "../host/subkeys.js";
 import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
 import {
   hybridAuthorId,

@@ -1,7 +1,7 @@
 // The realm contract and the per-realm pieces the realm driver (engine-realm.ts) builds
 // on: serialized entry into one confined realm, and the deadlines that bound it.
 
-import { EMPTY, Fifo } from "../services/util.js";
+import { EMPTY, Fifo } from "./util.js";
 import type { HostCall } from "./guest-seam.js";
 
 /** What a disposed realm fails every in-flight and queued caller with, on every target.

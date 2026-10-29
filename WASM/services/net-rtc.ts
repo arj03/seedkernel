@@ -22,7 +22,7 @@
 // safe; a console peer passes its own `peerConnectionFactory`.
 import { MessageChannel } from "./net-channel.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
-import { enc, dec, isRecord } from "./util.js";
+import { enc, dec, isRecord } from "../host/util.js";
 
 export interface RtcNetworkOptions {
   /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a

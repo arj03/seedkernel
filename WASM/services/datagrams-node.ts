@@ -6,7 +6,7 @@ import { lookup } from "node:dns";
 import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
 import { forEachDatagram, ipv6Bytes, type RawDatagrams } from "./datagrams.js";
-import { concatBytes } from "./util.js";
+import { concatBytes } from "../host/util.js";
 
 /** IPv4 as a dual-stack socket sends to and hears from it. */
 const MAPPED = "::ffff:";

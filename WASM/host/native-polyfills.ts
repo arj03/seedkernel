@@ -4,8 +4,8 @@
 //
 // Second in the host script, after the UTF-8 codec it fills TextEncoder and TextDecoder
 // with, so the globals exist before any module uses one at load time
-// (services/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
-import { utf8Decode, utf8Encode } from "../services/utf8.js";
+// (host/domains.ts builds its DOMAIN constants with a `TextEncoder` at module scope).
+import { utf8Decode, utf8Encode } from "./utf8.js";
 
 /** The `bridge` members this file uses (abi.ts declares the whole of it). */
 declare const bridge: { log(line: string): void };

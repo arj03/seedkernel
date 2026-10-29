@@ -1,7 +1,7 @@
 // A platform's raw datagram sockets (host/abi.ts `PlatformUdp`), which the host lends the
-// link occupant (§12.7, host/transport-host.ts). Raw primitives only: what a path is, which
+// link occupant (§12.7, services/link.ts). Raw primitives only: what a path is, which
 // addresses are candidates and how a stream gets across are the transport's (udp.js).
-import { dec, readU32BE } from "./util.js";
+import { dec, readU32BE } from "../host/util.js";
 
 /** A platform's datagram sockets. */
 export interface RawDatagrams {

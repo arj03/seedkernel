@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { engineSodium, type HostSodium } from "./sodium-engine.js";
 import { randomBytes, syncWebEngine } from "./platform-web.js";
 import { readHostBlob } from "./host-blob.js";
-import type { Keypair } from "../services/subkeys.js";
+import type { Keypair } from "./subkeys.js";
 
 /** The host's crypto, the ML-DSA-65 signing half a bundle author needs (§12.4) included. */
 export type HostCrypto = HostSodium;

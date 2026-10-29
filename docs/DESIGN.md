@@ -171,7 +171,7 @@
 
 ## 12.8 The shell: node assembly and the CLI
 
-**`bootShell` is the one assembly.** There is no layer beneath it for a target to reach: transport selection and load order are part of standing a node up, not steps a caller may skip. `bootNodeShell` is convenience for a Node application, not a second assembly.
+**`bootShell` is the one assembly.** There is no layer beneath it for a target to reach: transport selection, which host services a node offers, and load order are part of standing a node up, not steps a caller may skip. `bootNodeShell` is convenience for a Node application, not a second assembly.
 
 **The CLI is shared so decisions are made once.** Tokenizing arguments is a dozen lines; the flag set and the boot sequence are the point, because a decision made twice is eventually made differently. The `CliHost` members decide nothing.
 

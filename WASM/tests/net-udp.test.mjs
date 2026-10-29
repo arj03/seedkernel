@@ -1,7 +1,7 @@
 // The UDP path (§12.7): the transport's own (transport/src/udp.js, stream.js), which finds a
 // path between two of the host's datagram sockets and runs a reliable stream over it, and
 // the host's side, which lends the occupant the sockets and nothing more
-// (host/transport-host.ts). The stream and the punch run here as the transport's two parts
+// (services/link.ts). The stream and the punch run here as the transport's two parts
 // in a realm of their own, over the host's real datagram service, on an in-memory fabric
 // that loses, repeats and reorders, or on real UDP on this machine; the transport's move
 // to a UDP path runs whole nodes, with the in-process relay (fake-relay.mjs) for

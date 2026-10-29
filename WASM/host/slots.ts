@@ -16,7 +16,7 @@
 
 import { readHostBlob } from "./host-blob.js";
 import { DEFAULT_DIR, PLATFORM_ABI } from "./abi.js";
-import { EMPTY, errMessage, u8 } from "../services/util.js";
+import { EMPTY, errMessage, u8 } from "./util.js";
 
 /** Whole files, answered in the call: a loader's own. */
 export interface SlotFiles {

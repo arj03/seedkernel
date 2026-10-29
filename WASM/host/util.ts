@@ -17,6 +17,14 @@ export const dec = new TextDecoder();
 /** The shared empty answer; nothing writes into a zero-length array. */
 export const EMPTY = new Uint8Array(0);
 
+/** The seam's one-byte yes and no. */
+export const ONE = new Uint8Array([1]);
+export const ZERO = new Uint8Array([0]);
+
+/** The host's own caller id: 32 zero bytes, which no app label derives. Every other id is
+ *  a peer or a co-resident app. */
+export const HOST_CALLER_ID = new Uint8Array(32);
+
 /** A platform answer that may come now or later. */
 export type Maybe<T> = T | Promise<T>;
 /** Bytes a platform hands over; either form is the receiver's to keep. */

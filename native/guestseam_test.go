@@ -203,7 +203,7 @@ func jsBytes(t *testing.T, qc *qjs.Context, expr string) []byte {
 // TestGuestSeamNoiseVectors replays the published Noise XX vectors through the Go
 // primitives via the shared seam, the same script tests/realm-guest.test.mjs runs on the
 // JS target. The crypto/ names must expose their algorithms' whole interface, or a
-// replacement transport could not ship as a bundle (services/domains.ts).
+// replacement transport could not ship as a bundle (host/domains.ts).
 func TestGuestSeamNoiseVectors(t *testing.T) {
 	guestSeamRealm(t)
 	script, err := os.ReadFile("../WASM/tests/noise-vectors.js")

@@ -9,7 +9,7 @@
 // arrays, closures or copies to lay an operation out.
 
 import type { EngineExport, EngineInstance, EngineImports } from "./engine-realm.js";
-import type { Keypair } from "../services/subkeys.js";
+import type { Keypair } from "./subkeys.js";
 import type { ShellSodium } from "./shell-core.js";
 import { createMlDsa65, type MlDsa65Signer } from "./pq.js";
 import { WASM_PAGE_BYTES } from "./wasm-limits.js";

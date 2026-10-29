@@ -270,7 +270,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 		globalThis.__guestSeam = createGuestSeam({
 		  sodium,
 		  requires: [],
-		  backends: {},
+		  services: {},
 		  callLocal: () => null,
 		  modules: {
 		    names: new Set(["probe"]),

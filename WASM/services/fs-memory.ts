@@ -1,7 +1,7 @@
 // The in-memory `Fs` backend: portable, for tests and ephemeral nodes. It is the shared
 // store (fs-files.ts) over whole files held in a map, so it keeps the rules every other
-// target's store keeps; the seam is `fs.ts`. The per-app key rule is applied in
-// host/fs-view.ts, so what an app can reach does not depend on the backend.
+// target's store keeps. The per-app key rule is applied above it (`validatedFs`, fs.ts), so
+// what an app can reach does not depend on the backend.
 
 import { FilesFs, type RawFiles } from "./fs-files.js";
 

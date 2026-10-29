@@ -10,7 +10,7 @@
 import { ModuleTable } from "./module-table.js";
 import { readHostBlob } from "./host-blob.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
-import { dec, EMPTY } from "../services/util.js";
+import { dec, EMPTY } from "./util.js";
 import type { PureModules } from "./bundle.js";
 import type { EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";

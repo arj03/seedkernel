@@ -55,7 +55,7 @@ The operator chooses which authors may install code and which host services they
 
 There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and the host and every app reach it through the local service id it claims (§12.10).
 
-**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the table: `WASM/services/` holds the host services (the `HOST_SERVICES` table, their contracts and their platform backends), and `WASM/host/` holds admission, confinement, routing and the shell. `host/` imports `services/`, never the reverse.
+**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the tables below: `WASM/host/` is the core (admission, confinement, the guest seam, routing, the shell and the `HOST_SERVICES` vocabulary), and `WASM/services/` holds one file per host service, its seam handlers beside its backend, with their platform backends. A service imports the core; of the core, only the assembly (`bootShell`), the platform adapters and the operator front-end name a service.
 
 ## What a guest looks like
 
@@ -121,7 +121,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 **The first transport ships inside the host artifact**, because a networked node needs a transport before it can fetch anything. Later versions can arrive over the transport already running, like any other bundle.
 
-**A node runs without one.** `bootShell` installs no transport unless asked, and the CLI starts one only with `--listen`, `--peers` or `--relay` (§12.8). Such a node still admits and runs apps, with storage and local service calls; it has no peers, and a call to `_net` is refused because nothing claims it.
+**A node runs without one.** `bootShell` offers `link`, and so installs a transport, only when `services.transport` is given, and the CLI starts one only with `--listen`, `--peers` or `--relay` (§12.8). Such a node still admits and runs apps, with storage and local service calls; it has no peers, and a call to `_net` is refused because nothing claims it.
 
 ## What runs today
 
@@ -138,18 +138,33 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,857 LOC)**
+**Shared: one implementation for all three targets (3,872 LOC)**
+
+The core, which every node runs:
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 785 |
-| Transport driver: channels by link id and listeners, behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7). No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 427 |
-| Guest seam (§12.2): the call surface, the serialized realm queue, the realm wake and an app's `fs` view | `host/guest-seam.ts`, `host/realm-queue.ts`, `host/realm-timers.ts`, `host/fs-view.ts` | 635 |
-| Node assembly and claim routing (§12.8, §12.10): the boot assembly, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 400 |
-| Node startup, the operator flow on Node and native (§12.8): the flag set and its defaults, the order a node boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 378 |
+| Guest seam (§12.2): the call surface, which wires only the host services a node offers, and the serialized realm queue | `host/guest-seam.ts`, `host/realm-queue.ts` | 384 |
+| Node assembly and claim routing (§12.8, §12.10): the boot assembly, which names the services a node offers, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 406 |
 | Guest realms and the host's crypto (§12.3, §12.9): the realm driver over the platform's engine table, and libsodium and ML-DSA-65 on the same table | `host/engine-realm.ts`, `host/sodium-engine.ts`, `host/pq.ts` | 411 |
-| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 326 |
-| Host services: the `HOST_SERVICES` table and signing domains, the socket/`fs` contracts and the one directory-backed store, the key space and flood bounds, the master-seed subkey derivation (§12.6.2b), destination parsing and the raw-link event codec (`services/op-frame.ts`, also available to clients). Their platform backends are per-target, below | `services/*.ts` (9 shared files) | 495 |
+| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 329 |
+| The shared vocabulary: the `HOST_SERVICES` table and signing domains, the master-seed subkey derivation (§12.6.2b), the raw-link event codec (`host/op-frame.ts`, also available to clients) and byte helpers | `host/domains.ts`, `host/subkeys.ts`, `host/op-frame.ts`, `host/util.ts`, `host/utf8.ts` | 277 |
+
+The host services (§12.2), one row each. A node offers `node` and `timer` always and the others only where `bootShell`'s `services` names them; the code ships either way. Their platform backends are per-target, below:
+
+| Service | Where | LOC |
+| --- | --- | --- |
+| `node` and `timer`: signing under the calling slot's scope, and the realm's one replaceable wake | `services/node.ts`, `services/timer.ts` | 137 |
+| `fs`: one app's scoped view, the key rule, and the one directory-backed store | `services/fs.ts`, `services/fs-files.ts` | 157 |
+| `link`: the transport driver, channels by link id and listeners behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7); the socket contract, destination parsing and flood bounds. No protocol, no state machine, no address book, nothing peer-shaped | `services/link.ts`, `services/socket-seam.ts`, `services/datagrams.ts`, `services/peer-addr.ts`, `services/net-limits.ts` | 597 |
+| `host`: hand the loader a successor host blob (§12.9) | `services/host.ts` | 10 |
+
+The operator front-end, on Node and native only:
+
+| Concern | Where | LOC |
+| --- | --- | --- |
+| Node startup, the operator flow (§12.8): the flag set and its defaults, which services and boot transport a node gets, the order it boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 379 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 

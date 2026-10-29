@@ -1,8 +1,17 @@
-// One replaceable wake per realm (§12.3). Deadline tables belong in the guest heap.
-import { OpArgs } from "../services/op-frame.js";
-import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "./wasm-limits.js";
-import { HOST_CALLER_ID, type HostTimers } from "./guest-seam.js";
-import { monotonicMs, type CausalClock } from "./realm-queue.js";
+// `timer` (§12.3): one replaceable wake per realm, delivered as the `wake` host event.
+// Every node offers it. Deadline tables belong in the guest heap.
+import { OpArgs } from "../host/op-frame.js";
+import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "../host/wasm-limits.js";
+import { EMPTY, HOST_CALLER_ID, readU32BE } from "../host/util.js";
+import type { ServiceHandlers } from "../host/guest-seam.js";
+import { monotonicMs, type CausalClock } from "../host/realm-queue.js";
+
+/** One replaceable wake. */
+export interface HostTimers {
+  arm(ms: number): void;
+  /** Cancel the armed wake; a wake already in flight cannot be retracted. */
+  clear(): void;
+}
 
 export interface RealmTimers extends HostTimers {
   /** Permanently dispose the wake when its slot goes away. */
@@ -79,5 +88,20 @@ export function createRealmTimers(
     },
     clear,
     clearAll() { disposed = true; clear(); },
+  };
+}
+
+export function timerService(timers: HostTimers): ServiceHandlers<"timer"> {
+  return {
+    "timer/arm": (payload) => {
+      if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
+      timers.arm(readU32BE(payload, 0));
+      return EMPTY;
+    },
+    "timer/clear": (payload) => {
+      if (payload.byteLength !== 0) throw new Error("guest: timer/clear requires an empty body");
+      timers.clear();
+      return EMPTY;
+    },
   };
 }

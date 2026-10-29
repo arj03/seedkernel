@@ -14,7 +14,7 @@ import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_REALM_MEMORY_BYTES,
 } from "./wasm-limits.js";
-import { dec, enc, errMessage } from "../services/util.js";
+import { dec, enc, errMessage } from "./util.js";
 import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
   CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline,

@@ -12,8 +12,8 @@
 // (`readHostBlob`) of what is in its slots, which only a host put there. The native loader
 // reads the same layout in Go (native/hostblob.go).
 
-import { DOMAIN_HOST } from "../services/domains.js";
-import { dec, isRecord, toHex } from "../services/util.js";
+import { DOMAIN_HOST } from "./domains.js";
+import { dec, isRecord, toHex } from "./util.js";
 import { bodyReader, envelopeBody, verifyEnvelope, type ManifestVerifier } from "./bundle.js";
 
 /** What a host blob declares about itself. */

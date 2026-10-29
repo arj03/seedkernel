@@ -3,7 +3,7 @@
 // freshness) run before it for every bundle, transport included, and again at commit,
 // since what they read may have changed by then. Ordinary apps default to deny-all.
 
-import { errMessage, isHex64, isRecord, toHex } from "../services/util.js";
+import { errMessage, isHex64, isRecord, toHex } from "./util.js";
 import { type FreshnessStore, type VerifiedBundle } from "./bundle.js";
 
 /** The admission seam. Return `true` to admit, `false` to reject silently, or throw to

@@ -1,8 +1,8 @@
-// Socket driver: owns links and listeners, while protocol and peer state stay in the signed
-// guest (§12.1). Destinations are opaque, and events go to the current link occupant
-// (§12.10).
+// `link` (§12.1): the socket driver, which owns links and listeners while protocol and peer
+// state stay in the signed guest, and the handlers the link occupant reaches it through.
+// Destinations are opaque, and events go to the current occupant (§12.10).
 
-import { concatBytes, dec, EMPTY, errMessage, Fifo, readU32BE, u8 } from "../services/util.js";
+import { concatBytes, dec, enc, EMPTY, errMessage, Fifo, HOST_CALLER_ID, readU32BE, u8, writeU32BE } from "../host/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -15,13 +15,104 @@ import {
   MAX_UDP_HELD_BYTES,
   MAX_UDP_SOCKETS,
   UDP_SOCKET_BUFFER_BYTES,
-} from "../services/net-limits.js";
-import { type LinkEvent } from "../services/domains.js";
-import { datagramEnd, type RawDatagrams } from "../services/datagrams.js";
-import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "../services/socket-seam.js";
-import { HOST_CALLER_ID, type DatagramSocket, type RawNet } from "./guest-seam.js";
-import { REALM_DISPOSED } from "./realm-queue.js";
-import { OpArgs } from "../services/op-frame.js";
+} from "./net-limits.js";
+import { type LinkEvent } from "../host/domains.js";
+import { datagramEnd, type RawDatagrams } from "./datagrams.js";
+import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
+import type { ServiceHandlers } from "../host/guest-seam.js";
+import { REALM_DISPOSED, type CausalClock } from "../host/realm-queue.js";
+import { OpArgs } from "../host/op-frame.js";
+
+/** Raw links (§12.1): bytes over an opaque host-assigned link id. The socket driver's
+ *  half of the `link` service. */
+export interface RawNet {
+  /** Open an opaque destination; id 0 means no route (§12.1). */
+  open(dest: string): { linkId: number; stream: boolean };
+  /** Write whole bytes to a link, silently dropped if the link is gone, and answer what it
+   *  still holds for the wire (0 for a link that is gone). Empty bytes only ask. */
+  send(linkId: number, bytes: Uint8Array): number;
+  /** Stop reading a link, or read it again. */
+  pause(linkId: number, paused: boolean): void;
+  /** Tear a link down; `graceful` flushes already-written bytes first. */
+  close(linkId: number, graceful: boolean): void;
+  /** A datagram socket on `port`, or on one the OS picks for 0, for the occupant's UDP paths
+   *  (§12.7); its reads arrive as `datagrams` events. */
+  udpBind(port: number): Promise<DatagramSocket>;
+  /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
+   *  one that fails is lost. */
+  udpSend(batch: Uint8Array): void;
+  udpClose(id: number): void;
+}
+
+/** A bound socket: socket 0 when refused or failed. `addresses` are every address this
+ *  machine's sockets are reached at, `\n`-separated; which are candidates is the
+ *  occupant's. */
+export interface DatagramSocket { id: number; port: number; addresses: string }
+
+/** The `link` backend: the driver's raw links plus the shell's claim routing. */
+export interface LinkBackend extends RawNet {
+  /** Route one request the occupant decoded from its links to the claim's realm, called
+   *  with `[attribution 32][payload ...]` (§12.10). An unreachable claim and a failed
+   *  handler both answer empty. It enters another realm, so the caller must not wait on it
+   *  in the same turn; the answer resumes the caller as a new turn (`CallBudget.detach`). */
+  deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
+  /** The occupant's word on its own standing, in its own format, told each time it
+   *  changes; the host passes it to the embedder unread. */
+  status(status: Uint8Array): void;
+}
+
+/** The `link` handlers: raw bytes over an opaque link id (§12.1); inbound bytes arrive as
+ *  `handle` events. */
+export function linkService(net: LinkBackend): ServiceHandlers<"link"> {
+  return {
+    // -> [link u32][stream u8], link 0 for no route.
+    "link/open": (payload) => {
+      const link = net.open(dec.decode(payload));
+      return new OpArgs().u32(link.linkId).u8(link.stream ? 1 : 0).build();
+    },
+    // -> [backlog u32], what the link still holds for the wire; empty bytes only ask.
+    "link/send": (payload) => {
+      const out = new Uint8Array(4);
+      writeU32BE(out, 0, net.send(readU32BE(payload, 0), payload.subarray(4)));
+      return out;
+    },
+    // [link u32][paused u8]: while paused, none of the link's reads reach the occupant.
+    "link/pause": (payload) => {
+      net.pause(readU32BE(payload, 0), payload[4] === 1);
+      return EMPTY;
+    },
+    "link/close": (payload) => {
+      net.close(readU32BE(payload, 0), payload[4] === 1);
+      return EMPTY;
+    },
+    // [claimLen u8][claim][attribution 32][payload ...] (§12.10). Detached: the reply is
+    // new work on a shared link and must not inherit a read's spent budget, since a record
+    // cut halfway breaks the stream (§12.3). Everything after the claim is already the
+    // realm argument, so it is passed on as a view.
+    "link/deliver": (payload, budget) => {
+      budget.detach();
+      const attrAt = 1 + payload[0];
+      return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
+    },
+    // The occupant's standing, in its own format, for the embedder.
+    "link/status": (payload) => {
+      net.status(payload.slice());
+      return EMPTY;
+    },
+    // [port u16]? -> [socket u32][port u16][addresses utf8], socket 0 for none. No port, or
+    // 0, is one the OS picks.
+    "link/udpBind": (payload) => net.udpBind(payload.length >= 2 ? (payload[0] << 8) | payload[1] : 0)
+      .then((s) => new OpArgs().u32(s.id).u16(s.port).bytes(enc.encode(s.addresses)).build()),
+    "link/udpSend": (payload) => {
+      net.udpSend(payload);
+      return EMPTY;
+    },
+    "link/udpClose": (payload) => {
+      net.udpClose(readU32BE(payload, 0));
+      return EMPTY;
+    },
+  };
+}
 
 /** Link id 0 means no route; its `stream` bit is ignored. */
 const NO_ROUTE = { linkId: 0, stream: false } as const;
@@ -31,7 +122,7 @@ const NO_SOCKET: DatagramSocket = { id: 0, port: 0, addresses: "" };
 const ev = (name: LinkEvent) => new OpArgs(name);
 
 /** Ceiling on the sockets the driver holds, independent of any guest limit. */
-export { DEFAULT_MAX_RAW_LINKS } from "../services/net-limits.js";
+export { DEFAULT_MAX_RAW_LINKS } from "./net-limits.js";
 
 /** Active transport entrypoint, called with the whole realm argument
  *  `[caller 32][body ...]`; `null` means no occupant is bound. */
@@ -268,7 +359,7 @@ export class TransportHost {
   }
 
   // ── reaching the transport ──────────────────────────────────────────────────
-  // `OpArgs` (services/op-frame.ts) encodes the raw-link event ABI (§12.2).
+  // `OpArgs` (host/op-frame.ts) encodes the raw-link event ABI (§12.2).
 
   /** Call the transport. The realm serializes invocations, so one link's bytes arrive in
    *  order. */

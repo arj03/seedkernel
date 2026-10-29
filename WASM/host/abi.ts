@@ -15,7 +15,7 @@ import type { SyncEngine } from "./sodium-engine.js";
 import type { PureModuleLoader } from "./bundle.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { RawDatagrams } from "../services/datagrams.js";
-import type { Bytes, Maybe } from "../services/util.js";
+import type { Bytes, Maybe } from "./util.js";
 
 /** The ABI version a loader implements and the host script requires. */
 export const PLATFORM_ABI = 1;

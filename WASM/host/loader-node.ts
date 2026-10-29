@@ -7,7 +7,7 @@
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64] [--host <blob>]
 
 import { runInThisContext } from "node:vm";
-import { dec, errMessage } from "../services/util.js";
+import { dec, errMessage } from "./util.js";
 import { nodePlatform } from "./platform-node.js";
 import { nodeRawFiles } from "../services/fs-node.js";
 import { readHostBlob } from "./host-blob.js";

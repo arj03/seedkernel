@@ -14,7 +14,7 @@ export const { generateKeyPair, loadCrypto } = await imp("build/host/crypto-node
 export const { ModuleTable: JsModuleLoader } = await imp("build/host/module-table.js");
 export const { bootShell } = await imp("build/host/shell-core.js");
 export const { bootNodeShell } = await imp("build/host/shell-node.js");
-export const { TransportHost } = await imp("build/host/transport-host.js");
+export const { TransportHost } = await imp("build/services/link.js");
 
 // The host's crypto from the package's host blob, ML-DSA-65 signing included, which the
 // hybrid manifest suite needs (§12.4).
@@ -24,7 +24,8 @@ export const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 export const TEST_CONTACT = new Uint8Array(32).fill(3);
-export const { createGuestSeam, appSignScope, CallBudget } = await imp("build/host/guest-seam.js");
+export const { createGuestSeam, CallBudget } = await imp("build/host/guest-seam.js");
+export const { appSignScope, slotSignScope } = await imp("build/services/node.js");
 /** The bytes an app's scope adds after `DOMAIN_guest`: `app_len u8 ‖ app`. */
 export const guestSignScope = (app) => appSignScope(null, app).scope;
 /** A seam called straight from a test, with the budget a realm would pass: an unbounded
@@ -35,23 +36,32 @@ export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 /** Local service routing under which nothing claims any id. */
 export const TEST_CALL_LOCAL = () => null;
-export const { callerOf, readOp, writeOp } = await imp("build/services/op-frame.js");
-export const { utf8Encode, utf8Decode } = await imp("build/services/utf8.js");
+export const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
+export const { utf8Encode, utf8Decode } = await imp("build/host/utf8.js");
 /** Is this realm argument the host's wake event (§12.3)? */
 export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
-/** A stand-in behind every host service, so a test seam may declare any of them. */
-export const testBackends = () => ({
-  node: appSignScope(sodium.crypto_sign_keypair(), "test"),
-  fs: new MemoryFs(),
-  timer: TEST_TIMERS,
-  link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
-});
+export const { nodeService } = await imp("build/services/node.js");
+export const { fsService } = await imp("build/services/fs.js");
+export const { timerService } = await imp("build/services/timer.js");
+export const { linkService } = await imp("build/services/link.js");
+/** Every host service's handlers over a stand-in backend, so a test seam may declare any
+ *  of them. `backends` replaces a stand-in. */
+export const testServices = (backends = {}) => {
+  const b = {
+    node: appSignScope(sodium.crypto_sign_keypair(), "test"),
+    fs: new MemoryFs(),
+    timer: TEST_TIMERS,
+    link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
+    ...backends,
+  };
+  return { node: nodeService(sodium, b.node), fs: fsService(b.fs), timer: timerService(b.timer), link: linkService(b.link) };
+};
 export const enc = new TextEncoder();
 export const { NodeFs, nodeRawFiles } = await imp("build/services/fs-node.js");
 export const { FilesFs } = await imp("build/services/fs-files.js");
 export const { createWebRealm } = await imp("build/host/engine-web.js");
-export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/services/util.js");
+export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/host/util.js");
 export { bytesEqual } from "./bytes.mjs";
 
 // Install's admission step (§12.4): tests use the same code path an install does.
@@ -79,11 +89,11 @@ export const testAuthor = () => makeAuthor(sodium);
 export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
 
 /** A node for one test, through the shared assembly (`bootShell`, §12.8). The platform
- *  members are passed flat, as the assembly takes them; `fs` defaults to `false`, since
- *  most bundles here do not require `fs`.
+ *  members are passed flat, as the assembly takes them; it offers no optional service
+ *  unless `services` names it, since most bundles here require none.
  *
  *  `transportAuthor` boots a small signed link occupant for explicit replacement tests. */
-export async function bootTestShell({ transportAuthor, ...opts } = {}) {
+export async function bootTestShell({ transportAuthor, services, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const fixtureSource = "const FIXTURE_TRANSPORT = true; function handle() { return new Uint8Array(); }";
   const transport = transportAuthor ? {
@@ -96,9 +106,8 @@ export async function bootTestShell({ transportAuthor, ...opts } = {}) {
     sodium,
     modules: new JsModuleLoader(),
     freshnessStore: new FreshnessMarks(),
-    fs: false,
-    ...transport,
     ...opts,
+    services: { ...transport, ...services },
     identity,
     ...(transportAuthor && opts.createRealm ? { createRealm: async (o) =>
       o.source.endsWith(fixtureSource)

@@ -2,7 +2,7 @@
 // Noise_XXpsk3 _25519_ChaChaPoly_BLAKE2b vectors (tests/fixtures/noise-xx-vectors.json),
 // using only the guest-visible `crypto/` names. It tests those names, not a Noise library:
 // a replacement transport can only ship as a bundle if a standard handshake can be built
-// on them (services/domains.ts, HOST_TRANSFORM_NAMES). BLAKE2b-512 provides the hash and
+// on them (host/domains.ts, HOST_TRANSFORM_NAMES). BLAKE2b-512 provides the hash and
 // HMAC, the handshake hash goes in the AEAD's associated data, and the transport messages
 // leave it empty, all through the host. A plain script, so the JS suite
 // (tests/realm-guest.test.mjs) and the native one (native/guestseam_test.go) run the same

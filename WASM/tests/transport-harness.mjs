@@ -17,8 +17,8 @@ export const { createWebRealm } = await imp("build/host/engine-web.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { ModuleTable } = await imp("build/host/module-table.js");
-export const { TransportHost } = await imp("build/host/transport-host.js");
-export const { OpArgs } = await imp("build/services/op-frame.js");
+export const { TransportHost } = await imp("build/services/link.js");
+export const { OpArgs } = await imp("build/host/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** A `ChannelFactory` that hands the driver channels the test built, so the test keeps the
  *  instrumented object it asserts on (`wirePair`'s recorder, tamperer and backlog). Not a
@@ -274,10 +274,8 @@ export async function makeTransportHost(opts = {}) {
     identity,
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
-    // No fs: nothing here requires it.
-    fs: false,
     guestDeadlineMs: opts.guestDeadlineMs,
-    transport,
+    services: { transport },
     // `onHostCall` sees every host call this node's realms make and refuses one by
     // throwing; `onHostAnswer(name, answer, payload)` can replace its answer (with a slow
     // one, say).

@@ -52,8 +52,7 @@ async function makeNode(ws = false, extraConfig = {}) {
     sodium, identity,
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
-    fs: false,
-    transport: { ...transportOptions, config: transportConfig },
+    services: { transport: { ...transportOptions, config: transportConfig } },
     createRealm: async (o) => createWebRealm(o),
     admit: policy,
   });

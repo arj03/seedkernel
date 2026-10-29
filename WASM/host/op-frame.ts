@@ -1,5 +1,5 @@
 // Named-op envelope for the host's raw-link event ABI, and optional application framing.
-// Event names live in services/domains.ts; their byte layouts are in §12.2.
+// Event names live in host/domains.ts; their byte layouts are in §12.2.
 // bundle-author.ts's `guestOpFraming` serializes the three functions below into import-free
 // guests, and the transport build injects that source before signing, so they must
 // reference nothing outside themselves, not even this file's imports. The type system

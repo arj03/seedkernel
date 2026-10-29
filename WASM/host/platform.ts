@@ -20,7 +20,7 @@ import {
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE, WASM_PAGE_BYTES } from "./wasm-limits.js";
-import { u8 } from "../services/util.js";
+import { u8 } from "./util.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
@@ -242,23 +242,27 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
   async function standUp(cfg: NodeSetup): Promise<NodeRuntime> {
     const admit = cfg.admit ?? policyFromJson(cfg.policyJson);
     return bootShell({
-      sodium, identity: cfg.identity, modules, fs: new FilesFs(files, cfg.dir), admit,
+      sodium, identity: cfg.identity, modules, admit,
       createRealm,
       freshnessStore: freshnessStoreFor(files, cfg.dir),
-      // The network as configured, over the platform's sockets unless the caller brings
-      // its own.
-      transport: cfg.transport && {
-        ...cfg.transport,
-        channels: cfg.transport.channels ?? channels(),
-        datagrams: cfg.transport.datagrams ?? udp,
-      },
       guestDeadlineMs: cfg.guestDeadlineMs,
       realmMemoryBytes: cfg.realmMemoryBytes,
-      // The successor is this host's to vet, as an app bundle is; the loader only keeps it.
-      hostStaging: {
-        stage: async (blob: Uint8Array) => {
-          checkStagedHost(sodium, hostEnv, bridge.abi, blob);
-          await bridge.stageHost(blob);
+      services: {
+        fs: new FilesFs(files, cfg.dir),
+        // The network as configured, over the platform's sockets unless the caller brings
+        // its own.
+        transport: cfg.transport && {
+          ...cfg.transport,
+          channels: cfg.transport.channels ?? channels(),
+          datagrams: cfg.transport.datagrams ?? udp,
+        },
+        // The successor is this host's to vet, as an app bundle is; the loader only keeps
+        // it.
+        host: {
+          stage: async (blob: Uint8Array) => {
+            checkStagedHost(sodium, hostEnv, bridge.abi, blob);
+            await bridge.stageHost(blob);
+          },
         },
       },
     });

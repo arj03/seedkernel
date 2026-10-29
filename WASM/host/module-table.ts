@@ -7,7 +7,7 @@ import {
 } from "./wasm-limits.js";
 import { MODULE_FAILED, moduleSet, type ModuleResult, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
-import { errMessage } from "../services/util.js";
+import { errMessage } from "./util.js";
 import type { Worker as NodeWorker } from "node:worker_threads";
 
 // ─── module routing ─────────────────────────────────────────────────────

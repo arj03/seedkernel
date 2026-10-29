@@ -4,7 +4,7 @@
 
 import type { Fs, FsStat } from "./fs.js";
 import { FS_AVAILABLE_UNKNOWN } from "./fs.js";
-import { u8, type Bytes } from "./util.js";
+import { u8, type Bytes } from "../host/util.js";
 
 /** Whole files by path, as a platform offers them (host/abi.ts `PlatformFs`). Synchronous:
  *  the freshness marks are written inside install's commit window, which cannot await. */

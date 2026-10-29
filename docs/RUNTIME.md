@@ -65,7 +65,7 @@ The host knows nothing about chat or storage: it offers a fixed, generic surface
 
 ### 12.1 Host services: raw-byte backends
 
-The host provides five **host services**, `node`, `fs`, `timer`, `link` and `host` (`HOST_SERVICES`, `services/domains.ts`), and two ungated name families. All of them move raw bytes; the host never interprets what an app means by them.
+The host provides five **host services**, `node`, `fs`, `timer`, `link` and `host` (`HOST_SERVICES`, `host/domains.ts`), and two ungated name families. Each service is one file in `services/`, its handlers beside its backend. Every node offers `node` and `timer`; `fs`, `link` and `host` only where `bootShell`'s `services` names them (§12.8). All of them move raw bytes; the host never interprets what an app means by them.
 
 | Service | Methods | Backs |
 | --- | --- | --- |
@@ -96,11 +96,11 @@ The host provides five **host services**, `node`, `fs`, `timer`, `link` and `hos
 - **A `RawLink`** reports `stream` (1: a byte duplex the caller frames itself; 0: the platform delivers whole messages), and `buffered()`, the bytes it still holds. It carries no codec and no authority. Every `RawLink` is ordered.
 - **An `Arrival`** accompanies a platform-opened link: the label of the listener that accepted it, or `via`, the link it arrived through, which is how a WebRTC data channel names the negotiation link the occupant opened for it (§12.7). Guest-opened links have no `Arrival`.
 - **Listeners are labelled.** A `ListenAddress` is `{ label, host, port }`; the label reaches the occupant with every link that listener accepts, and the host never reads it. The shipped transport reads `ws` as RFC 6455 and any other label as length framing.
-- **Socket seams**, each handing a `RawLink` to the driver (`host/transport-host.ts`) through the one `ChannelFactory` seam: `tcpChannels` (`host/platform.ts`, one TCP listener per address over the platform's sockets; `nodeChannels` in `host/shell-node.ts` is it on `node:net`), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7), and `combineChannels` (`services/socket-seam.ts`) to put several behind one driver; on the native target `tcp.go`/`net.go`. The flood bounds are `services/net-limits.ts` (§12.6).
+- **Socket seams**, each handing a `RawLink` to the driver (`services/link.ts`) through the one `ChannelFactory` seam: `tcpChannels` (`host/platform.ts`, one TCP listener per address over the platform's sockets; `nodeChannels` in `host/shell-node.ts` is it on `node:net`), `services/net-ws.ts` (a browser `WebSocket`), `services/net-rtc.ts` (§12.7), and `combineChannels` (`services/socket-seam.ts`) to put several behind one driver; on the native target `tcp.go`/`net.go`. The flood bounds are `services/net-limits.ts` (§12.6).
 
 ### 12.2 The guest seam: the guest name ABI
 
-A guest reaches the world through one seam, `host.call(name, bytes)`, and is entered through one entrypoint, `handle(bytes)` (§12.3). `host/guest-seam.ts` services the seam.
+A guest reaches the world through one seam, `host.call(name, bytes)`, and is entered through one entrypoint, `handle(bytes)` (§12.3). `host/guest-seam.ts` services the seam, wiring only the host services the node offers that slot.
 
 **Names** are guest↔host identifiers, not wire values: opaque strings with no op-number registry. A name resolves to what the manifest declared it as:
 
@@ -159,7 +159,7 @@ Each slot has **one** signing scope, derived once at load from admitted facts (`
 
 #### Host events
 
-The host enters a realm with its own events. A realm that armed a wake receives `wake` when it fires; the slot holding `link`, and only it, receives the four link events, the `link` service's `events` list beside its `calls` in `services/domains.ts`. Each arrives at `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`services/op-frame.ts`); the envelope and field order are host ABI every guest that arms a wake, and every link occupant, must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
+The host enters a realm with its own events. A realm that armed a wake receives `wake` when it fires; the slot holding `link`, and only it, receives the four link events, the `link` service's `events` list beside its `calls` in `host/domains.ts`. Each arrives at `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`host/op-frame.ts`); the envelope and field order are host ABI every guest that arms a wake, and every link occupant, must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
 
 | Event | `opLen` | `args`, in byte order | Return body |
 | --- | --- | --- | --- |
@@ -312,9 +312,9 @@ The predicate is not re-asked at commit. Atomicity is specified in Atomic load a
 
 #### Boot transport
 
-`bootShell`'s `transport.bundle` defaults to the embedded artifact; selecting it authorizes its `link` independently of app policy, and it must declare `link`. `transport: false` (the `bootShell` default) creates none. The CLI enables networking only with `--listen`, `--peers` or `--relay`; `--transport` selects the boot blob, and it, `--transport-config` and `--contact-secret` are refused without one of those. After the transport is uninstalled or replaced by an ordinary app, starting another requires a new boot.
+`bootShell`'s `services.transport.bundle` defaults to the embedded artifact; selecting it authorizes its `link` independently of app policy, and it must declare `link`. Without `services.transport` (the `bootShell` default) the node offers no `link` and creates no transport. The CLI enables networking only with `--listen`, `--peers` or `--relay`; `--transport` selects the boot blob, and it, `--transport-config` and `--contact-secret` are refused without one of those. After the transport is uninstalled or replaced by an ordinary app, starting another requires a new boot.
 
-`transport.datagrams` lends the link occupant the platform's datagram sockets for its UDP paths (§12.7). The Node loader and the native binary pass their platform's; a node without them (a browser) has no UDP path.
+`services.transport.datagrams` lends the link occupant the platform's datagram sockets for its UDP paths (§12.7). The Node loader and the native binary pass their platform's; a node without them (a browser) has no UDP path.
 
 #### Policy file
 
@@ -340,7 +340,7 @@ Sensitive protocol and service names are pinned to approved owners (author and `
 
 Everything in this section is the **shipped transport bundle's guest program** (`transport/src/*.js`, with private modules `ws.wasm` and `mlkem768.wasm`), not host code. A replacement transport may differ; this is what ships. The first transport is embedded in the host artifact (`TRANSPORT_BUNDLE_B64`).
 
-- **Division of labour.** The host driver (`host/transport-host.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book, relays and the signaling of direct paths, UDP and WebRTC (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `services/op-frame.ts`.
+- **Division of labour.** The host driver (`services/link.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book, relays and the signaling of direct paths, UDP and WebRTC (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `host/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time, a `ready` waiter's capped short of `HOST.deadlineMs` so the wait settles before its invocation fails; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
 - **What a replacement changes without a host release.** Everything in this section and §12.7's relays and signaling: the handshake, key schedule, suite byte, record layer, framing, listener labels, address grammar, relay wire and config keys. The host sees no handshake width, the shell passes `--peers`, `--relay`, `--relay-secret` and `--contact-secret` through unread (§12.8), and each `crypto/` name takes its algorithm's whole interface (§12.1); an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's: the identity key's algorithm (`node/sign` and `node/verify` are Ed25519), the socket kinds a destination can name, and the link events (§12.2). The shell's calls into a transport are `relay` and `ready` on its service id, made when `--relay` and `--peers` are given (§12.8).
 
@@ -439,7 +439,7 @@ The host driver keeps its own coarse bounds beneath the transport's, on structur
 
 #### 12.6.2b One master seed, one identity
 
-A node stores one secret, a 32-byte **master seed**. `services/subkeys.ts` (`seedkernel-wasm/subkeys`, for a tool that boots the node a `--key` names) derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity: the peer id, `senderPk` and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2). Nothing revokes it: a leaked seed is a lost identity, and recovery is a new seed and peer id (§14).
+A node stores one secret, a 32-byte **master seed**. `host/subkeys.ts` (`seedkernel-wasm/subkeys`, for a tool that boots the node a `--key` names) derives its signing keypair under the closed, literal label `channel`; that public key **is** the node's identity: the peer id, `senderPk` and `HOST.identity`. The master signs nothing. The one key signs for both purposes, separated by signing scope (§12.2). Nothing revokes it: a leaked seed is a lost identity, and recovery is a new seed and peer id (§14).
 
 #### 12.6.3 The contact secret, the network key, and the peer list
 
@@ -456,7 +456,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 #### Configuration
 
 - The transport reads `networkKey` and `contactSecret` from `LOCAL` as 64 lowercase hex, rejects malformed values at load, and defaults each to 32 zero bytes (the public network, an open node).
-- Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ transport: { config } })` passes operator overrides as that load's `localConfig`.
+- Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ services: { transport: { config } } })` passes operator overrides as that load's `localConfig`.
 - Its identity comes from `HOST.identity`, never from config.
 - Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls. A `dest` of `relay+ws[s]://host:port` reaches the peer through that relay (§12.7).
 - The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret, the one in the address book, and none for a peer taught without one.
@@ -548,7 +548,7 @@ node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data --key .
 - **`--op name`** invokes the app `--bundle` just loaded, through that load's handle: stdin is the argument, stdout the response, framed as `[opLen u8][op][args]`. Logs go to stderr on both targets. When a node already serves `--dir`, the op goes to that node instead, through its control endpoint (below), and nothing boots. That node reads no other flag, so such an `--op` takes only `--app`, the app there (omitted, the node's only one); with `--bundle` or any other flag it is refused while a node serves the directory, rather than half obeyed. `--app` never goes with `--bundle`.
 - **The control endpoint.** A node that serves a bundle listens on a local socket, `<dir>.control` beside its data directory (`host/control.ts`), and on nothing else: no port is opened. It is a Unix domain socket, owner-only from the moment it is bound (the bind runs under a umask, so no connection can land before the mode is set), so being the user the node runs as is the operator authority the endpoint asks for. Node on Windows has only named pipes, so there `<dir>.control` is a file naming a random pipe, and the pipe's default ACL keeps others to reading; a native node there makes a real Unix socket, which takes its directory's ACL. The two kinds do not reach each other on Windows, and each refuses the other's file rather than reading it as nobody serving. The node speaks first, `[0]`, and the caller sends nothing before it, so a socket nothing serves never receives a request. One request per connection, `[len u32][appLen u8][app][op frame]`, answered `[status u8][len u32][bytes]`, status 0 the app's answer and 1 an error as text. A request reaches the app through `AppHandle.invoke`, the same caller-zero loopback `--op` uses, so it waits its turn in the app's realm as any invocation does. A socket nothing answers at is stale: `--op` then boots as before, and the next node to serve there replaces it; a live one is never replaced. The platform ABI's optional `listenLocal`/`connectLocal` carry it (§12.9); library callers use `serveControl` and `controlInvoke` from `seedkernel-wasm/control`, with `nodeLocalChannels()` from `seedkernel-wasm/shell-node` on Node.
 
-**The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`services/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
+**The request side.** An inbound frame and a host loopback both reach the app's one `handle` as `[caller 32][body]` (§12.3); `AppHandle.invoke` supplies the host's zero caller id. Bodies use the callee's format. Clients choosing the common `[opLen u8][op][args]` envelope take it from `seedkernel-wasm/op-frame` (`host/op-frame.ts`); the host never imports or interprets it. The driver resumes on the promise `handle` returned, so inbound handling may be asynchronous. Seedstore's WASM README has a complete storage walkthrough.
 
 ### 12.9 Loaders and the host blob
 

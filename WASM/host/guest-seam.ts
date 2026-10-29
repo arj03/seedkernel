@@ -1,23 +1,10 @@
 // `host.call(name, bytes)` (§12.2). One map per realm, built at construction from what
-// the bundle declares, so an undeclared service has no handler at all (§12.1).
-import { concatBytes, writeU32BE, readU32BE, enc, dec, EMPTY } from "../services/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, isService, type HostTransformName, type ServiceMethod, type ServiceName } from "../services/domains.js";
-import { type Fs } from "../services/fs.js";
+// the bundle declares, so an undeclared service has no handler at all (§12.1). Each host
+// service's handlers live with its backend in services/; this file knows none of them.
+import { concatBytes, readU32BE, ONE, ZERO } from "./util.js";
+import { isService, type HostTransformName, type ServiceMethod, type ServiceName } from "./domains.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, type CausalClock } from "./realm-queue.js";
-import { OpArgs } from "../services/op-frame.js";
-import type { Keypair } from "../services/subkeys.js";
-
-/** What a scoped SIGN/VERIFY signs under (§12.2): `domain ‖ scope ‖ msg`, `msg` never
- *  parsed. */
-export interface SignScope {
-  /** `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the link slot. */
-  domain: Uint8Array;
-  /** The app label for an app slot, empty for the link slot. */
-  scope: Uint8Array;
-  /** The node's identity keypair. */
-  key: Keypair;
-}
 
 /** The libsodium functions the host crypto names use. */
 export interface SeamCrypto {
@@ -30,67 +17,16 @@ export interface SeamCrypto {
   crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
 }
 
-/** Raw links (§12.1): bytes over an opaque host-assigned link id. The socket driver's
- *  half of the `link` service. */
-export interface RawNet {
-  /** Open an opaque destination; id 0 means no route (§12.1). */
-  open(dest: string): { linkId: number; stream: boolean };
-  /** Write whole bytes to a link, silently dropped if the link is gone, and answer what it
-   *  still holds for the wire (0 for a link that is gone). Empty bytes only ask. */
-  send(linkId: number, bytes: Uint8Array): number;
-  /** Stop reading a link, or read it again. */
-  pause(linkId: number, paused: boolean): void;
-  /** Tear a link down; `graceful` flushes already-written bytes first. */
-  close(linkId: number, graceful: boolean): void;
-  /** A datagram socket on `port`, or on one the OS picks for 0, for the occupant's UDP paths
-   *  (§12.7); its reads arrive as `datagrams` events. */
-  udpBind(port: number): Promise<DatagramSocket>;
-  /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
-   *  one that fails is lost. */
-  udpSend(batch: Uint8Array): void;
-  udpClose(id: number): void;
-}
+/** Argument bytes in, response bytes out, inline or async. */
+export type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
-/** A bound socket: socket 0 when refused or failed. `addresses` are every address this
- *  machine's sockets are reached at, `\n`-separated; which are candidates is the
- *  occupant's. */
-export interface DatagramSocket { id: number; port: number; addresses: string }
+/** One host service's handlers (services/), exactly its `HOST_SERVICES` calls: a missing
+ *  or extra method is a compile error. Every name contains a `/`, which module names
+ *  cannot (§12.4). */
+export type ServiceHandlers<S extends ServiceName> = Record<ServiceMethod<S>, SeamHandler>;
 
-/** The `link` backend: the driver's raw links plus the shell's claim routing. */
-export interface LinkBackend extends RawNet {
-  /** Route one request the occupant decoded from its links to the claim's realm, called
-   *  with `[attribution 32][payload ...]` (§12.10). An unreachable claim and a failed
-   *  handler both answer empty. It enters another realm, so the caller must not wait on it
-   *  in the same turn; the answer resumes the caller as a new turn (`CallBudget.detach`). */
-  deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
-  /** The occupant's word on its own standing, in its own format, told each time it
-   *  changes; the host passes it to the embedder unread. */
-  status(status: Uint8Array): void;
-}
-
-/** One replaceable wake, delivered as the `wake` host event. */
-export interface HostTimers {
-  arm(ms: number): void;
-  /** Cancel the armed wake; a wake already in flight cannot be retracted. */
-  clear(): void;
-}
-
-/** The loader's host slots (§12.9): keep a host blob as the one to run next, or refuse it
- *  with the reason. */
-export interface HostStaging {
-  stage(blob: Uint8Array): void | Promise<void>;
-}
-
-/** What stands behind each host service. */
-export interface SeamBackends {
-  /** This slot's signing scope (`slotSignScope`): signing is never raw. */
-  node: SignScope;
-  /** Already scoped to this app (`scopedFs`). */
-  fs: Fs;
-  timer: HostTimers;
-  link: LinkBackend;
-  host: HostStaging;
-}
+/** The host services this node offers one slot. One left out is not offered. */
+export type SeamServices = { [S in ServiceName]?: ServiceHandlers<S> };
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
 export type LocalCall = (id: string, payload: Uint8Array, deadlineMs?: number,
@@ -108,9 +44,9 @@ export interface GuestSeamDeps {
   sodium: SeamCrypto;
   /** Exactly the signed `guest.requires` (§12.2): host services and local service ids. */
   requires: Iterable<string>;
-  /** What this node provides. Only declared services are read; a declared one missing
-   *  here fails seam construction, so the bundle fails at install, not on first use. */
-  backends: Partial<SeamBackends>;
+  /** What this node offers. Only declared services are wired; a declared one missing here
+   *  fails seam construction, so the bundle fails at install, not on first use. */
+  services: SeamServices;
   /** How a declared local service id is answered, resolved at call time. */
   callLocal: LocalCall;
   modules: SeamModules;
@@ -165,14 +101,11 @@ export type HostCall = ((name: string, payload: Uint8Array, budget: CallBudget) 
   borrows?(name: string): boolean;
 };
 
-export { HOST_TRANSFORM_NAMES } from "../services/domains.js";
+export { HOST_TRANSFORM_NAMES } from "./domains.js";
 
 /** The `crypto/` names, derived from `HOST_TRANSFORM_NAMES` so vocabulary and table
  *  cannot drift. */
 type CryptoName = `crypto/${HostTransformName}`;
-
-/** Argument bytes in, response bytes out, inline or async. */
-type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
 
 /** The host crypto transforms (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
@@ -288,53 +221,6 @@ globalThis.__start = (id, argBuf) => {
 };
 `;
 
-/** The host's own caller id: 32 zero bytes, which no app label derives. Every other id is
- *  a peer or a co-resident app. */
-export const HOST_CALLER_ID = new Uint8Array(32);
-
-/** An ordinary app's signing scope (§12.2): `DOMAIN_guest ‖ app_len u8 ‖ app`. Derived
- *  from the label, so every node running the app derives the same bytes. */
-export function appSignScope(key: Keypair, app: string): SignScope {
-  const appBytes = enc.encode(app);
-  if (appBytes.length > 255) throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
-  return { domain: DOMAIN_GUEST, scope: concatBytes([Uint8Array.of(appBytes.length), appBytes]), key };
-}
-
-/** A slot's signing scope, derived at load from admitted facts only (§12.2): never
- *  `protocols`, which change between versions, nor the author, whose key can rotate. The
- *  `link` slot signs under `DOMAIN_link_scope` with an empty suffix; the transport tags its
- *  own handshake format inside the message, so changing it needs no host change. */
-export function slotSignScope(node: { identity: Keypair }, app: string, links: boolean): SignScope {
-  return links ? { domain: DOMAIN_LINK_SCOPE, scope: EMPTY, key: node.identity } : appSignScope(node.identity, app);
-}
-
-/** Sign and verify under one scope, over `domain ‖ scope ‖ msg`: `node/sign` and
- *  `node/verify`, and their host-side twin `appSigner`. */
-function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
-  sign(msg: Uint8Array): Uint8Array;
-  /** False on a bad signature, and on a `sig` or `pk` of the wrong shape. */
-  verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
-} {
-  const input = (msg: Uint8Array) => concatBytes([scope.domain, scope.scope, msg]);
-  return {
-    sign(msg) {
-      return sodium.crypto_sign_detached(input(msg), scope.key.privateKey);
-    },
-    verify(pk, sig, msg) {
-      try {
-        return sodium.crypto_sign_verify_detached(sig, input(msg), pk);
-      } catch {
-        return false;
-      }
-    },
-  };
-}
-
-/** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). */
-export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): ReturnType<typeof scopedSigner> {
-  return scopedSigner(sodium, appSignScope(key, app));
-}
-
 // The realm's memory limit does not cover host allocations, so the seam caps them itself.
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per crypto/random call
 
@@ -350,123 +236,11 @@ function aeadArgs(a: Uint8Array, op: string): { npub: Uint8Array; key: Uint8Arra
     body: a.subarray(48 + adLen),
   };
 }
-const ONE = new Uint8Array([1]);
-const ZERO = new Uint8Array([0]);
-
-function u64be(value: number): Uint8Array {
-  const out = new Uint8Array(8);
-  writeU32BE(out, 0, Math.floor(value / 0x100000000));
-  writeU32BE(out, 4, value >>> 0);
-  return out;
-}
-
-/** Each host service's handlers over its backend (§12.2). A missing or extra method is a
- *  compile error; every name contains a `/`, which module names cannot (§12.4). */
-const SERVICES: {
-  [S in ServiceName]: (backend: SeamBackends[S], sodium: SeamCrypto) => Record<ServiceMethod<S>, SeamHandler>
-} = {
-  // Signed under this slot's scope; the guest never picks a namespace.
-  node: (s, sodium) => {
-    const signer = scopedSigner(sodium, s);
-    return {
-      "node/sign": (payload) => signer.sign(payload),
-      // [pk 32][sig 64][msg ...] -> [ok u8]. Too short for the prefix throws; an empty msg
-      // is valid.
-      "node/verify": (payload) => {
-        if (payload.length < 96) throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
-        return signer.verify(payload.subarray(0, 32), payload.subarray(32, 96), payload.subarray(96)) ? ONE : ZERO;
-      },
-    };
-  },
-  // Synchronous like the store (fs.ts), so each answers inline. Views, not copies: the
-  // payload already belongs to this call, and backends copy (or write) before returning.
-  fs: (fs) => ({
-    "fs/get": (payload) => { const v = fs.get(dec.decode(payload)); return v ? concatBytes([ONE, v]) : ZERO; },
-    "fs/put": (payload) => {
-      const klen = readU32BE(payload, 0);
-      fs.put(dec.decode(payload.subarray(4, 4 + klen)), payload.subarray(4 + klen));
-      return EMPTY;
-    },
-    // -> [count u32]([len u32][key utf8])*
-    "fs/list": (payload) => {
-      const keys = fs.list(payload.length ? dec.decode(payload) : undefined);
-      return keys.reduce((out, k) => out.text(k), new OpArgs().u32(keys.length)).build();
-    },
-    "fs/delete": (payload) => { fs.delete(dec.decode(payload)); return EMPTY; },
-    // -> [size u32], all ones (-1) for absent.
-    "fs/size": (payload) => new OpArgs().u32(fs.size(dec.decode(payload)) >>> 0).build(),
-    "fs/stat": () => { const s = fs.stat(); return concatBytes([u64be(s.used), u64be(s.available)]); },
-  }),
-  host: (staging) => ({
-    "host/stage": async (payload) => { await staging.stage(payload); return EMPTY; },
-  }),
-  timer: (timers) => ({
-    "timer/arm": (payload) => {
-      if (payload.byteLength !== 4) throw new Error("guest: timer/arm requires [ms u32]");
-      timers.arm(readU32BE(payload, 0));
-      return EMPTY;
-    },
-    "timer/clear": (payload) => {
-      if (payload.byteLength !== 0) throw new Error("guest: timer/clear requires an empty body");
-      timers.clear();
-      return EMPTY;
-    },
-  }),
-  // Raw bytes over an opaque link id (§12.1); inbound bytes arrive as `handle` events.
-  link: (net) => ({
-    // -> [link u32][stream u8], link 0 for no route.
-    "link/open": (payload) => {
-      const link = net.open(dec.decode(payload));
-      return new OpArgs().u32(link.linkId).u8(link.stream ? 1 : 0).build();
-    },
-    // -> [backlog u32], what the link still holds for the wire; empty bytes only ask.
-    "link/send": (payload) => {
-      const out = new Uint8Array(4);
-      writeU32BE(out, 0, net.send(readU32BE(payload, 0), payload.subarray(4)));
-      return out;
-    },
-    // [link u32][paused u8]: while paused, none of the link's reads reach the occupant.
-    "link/pause": (payload) => {
-      net.pause(readU32BE(payload, 0), payload[4] === 1);
-      return EMPTY;
-    },
-    "link/close": (payload) => {
-      net.close(readU32BE(payload, 0), payload[4] === 1);
-      return EMPTY;
-    },
-    // [claimLen u8][claim][attribution 32][payload ...] (§12.10). Detached: the reply is
-    // new work on a shared link and must not inherit a read's spent budget, since a record
-    // cut halfway breaks the stream (§12.3). Everything after the claim is already the
-    // realm argument, so it is passed on as a view.
-    "link/deliver": (payload, budget) => {
-      budget.detach();
-      const attrAt = 1 + payload[0];
-      return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
-    },
-    // The occupant's standing, in its own format, for the embedder.
-    "link/status": (payload) => {
-      net.status(payload.slice());
-      return EMPTY;
-    },
-    // [port u16]? -> [socket u32][port u16][addresses utf8], socket 0 for none. No port, or
-    // 0, is one the OS picks.
-    "link/udpBind": (payload) => net.udpBind(payload.length >= 2 ? (payload[0] << 8) | payload[1] : 0)
-      .then((s) => new OpArgs().u32(s.id).u16(s.port).bytes(enc.encode(s.addresses)).build()),
-    "link/udpSend": (payload) => {
-      net.udpSend(payload);
-      return EMPTY;
-    },
-    "link/udpClose": (payload) => {
-      net.udpClose(readU32BE(payload, 0));
-      return EMPTY;
-    },
-  }),
-};
 
 /** The `host.call` a realm runs against. A refusal (unreachable name, spent budget) or a
  *  synchronous handler error throws at the call site; a failed round trip rejects. The
  *  realm handles serialization. */
-export function createGuestSeam({ sodium, requires, backends, callLocal, modules }: GuestSeamDeps): HostCall {
+export function createGuestSeam({ sodium, requires, services, callLocal, modules }: GuestSeamDeps): HostCall {
   // Every reachable name. Install keeps modules, local ids and host names disjoint
   // (bundle.ts), so insertion order does not matter.
   const routes = new Map<string, SeamHandler>();
@@ -477,9 +251,9 @@ export function createGuestSeam({ sodium, requires, backends, callLocal, modules
   for (const id of new Set(requires)) {
     // A service comes whole: declaring `node` wires `node/sign` and `node/verify`.
     if (isService(id)) {
-      const backend = backends[id];
-      if (backend === undefined) throw new Error(`guest-seam: the bundle requires "${id}", which this node does not provide`);
-      addHost(SERVICES[id](backend as never, sodium));
+      const handlers = services[id];
+      if (handlers === undefined) throw new Error(`guest-seam: the bundle requires "${id}", which this node does not provide`);
+      addHost(handlers);
       continue;
     }
     // Any other declared name is another realm's service. One that nothing claims is

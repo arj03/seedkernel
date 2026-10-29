@@ -12,7 +12,7 @@ import { WsNetwork } from "../build/services/net-ws.js";
 import { testkit } from "./testkit.mjs";
 import { guestOpFraming } from "./fixtures.mjs";
 import { readFileSync } from "node:fs";
-import { toHex } from "../build/services/util.js";
+import { toHex } from "../build/host/util.js";
 import { createWebRealm } from "../build/host/engine-web.js";
 
 const { test, assert, summary } = testkit();

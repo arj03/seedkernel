@@ -670,4 +670,4 @@ function statusChanged() {
   }).catch(() => {});
 }
 
-// No `shutdown` op: the host closes its own sockets and timers (transport-host.ts `close`).
+// No `shutdown` op: the host closes its own sockets and timers (services/link.ts `close`).

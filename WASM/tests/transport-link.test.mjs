@@ -13,11 +13,11 @@ import {
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
-import { HOST_CALLER_ID } from "../build/host/guest-seam.js";
+import { HOST_CALLER_ID } from "../build/host/util.js";
 
 /** Read a link event as the bound realm does. The driver passes the occupant the whole
  *  realm argument, `[caller 32][opLen u8][op][args ...]`, with the host's caller id in front
- *  (transport-host.ts `TransportCall`), so a test standing in for an occupant reads it at
+ *  (services/link.ts `TransportCall`), so a test standing in for an occupant reads it at
  *  the same seam the signed one does. */
 function opOf(input) {
   const body = input.subarray(HOST_CALLER_ID.length);
@@ -788,7 +788,7 @@ await test("SEND CLAIMS: an app sends only under the protocols it claims", async
   assert(refused.includes('does not claim "someone/else"'), `a send under another's id must be refused by name, got ${refused || "no error"}`);
   const ok = await st.A.request(st.B.peerId, PROTO, Uint8Array.of(4, 5));
   assert(ok.length === 2 && ok[1] === 5, "and one under its own still goes through");
-  const { sendProtocol, OpArgs } = await import("../build/services/op-frame.js");
+  const { sendProtocol, OpArgs } = await import("../build/host/op-frame.js");
   const whole = new OpArgs("send").u8(1).blob(new Uint8Array(32)).blob(Uint8Array.of(0x63, 0x68)).blob(Uint8Array.of(9)).build();
   assert(sendProtocol(whole) === "ch" && sendProtocol(new OpArgs("peers").build()) === null, "the protocol is read off a send, and off nothing else");
   for (let cut = 0; cut < whole.length - 5; cut++) {
@@ -967,7 +967,7 @@ await test("TIE-BREAK: records a losing dial sent behind msg3 are read, not drop
 });
 
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {
-  const { deriveNodeKey } = await import("../build/services/subkeys.js");
+  const { deriveNodeKey } = await import("../build/host/subkeys.js");
   const master = new Uint8Array(32).fill(5);
   const a = deriveNodeKey(sodium, master), b = deriveNodeKey(sodium, master);
   // Deterministic: a node rebuilds its key at boot from the one secret it stores.
@@ -977,7 +977,7 @@ await test("SUBKEYS: one master seed, one derived identity, deterministic", asyn
   // The master itself is never a signing key, only a derivation input.
   assert(hexOf(a.privateKey) !== hexOf(master), "the master seed must not be used as a key");
   // One key: purposes are kept apart by the domain and scope the host puts into every
-  // preimage, not by a second keypair (services/subkeys.ts).
+  // preimage, not by a second keypair (host/subkeys.ts).
   assert(!("channel" in a), "derivation returns the keypair directly");
 });
 

@@ -339,7 +339,7 @@ const testContactSecretHex = "03030303030303030303030303030303030303030303030303
 
 // testKeyHex creates a node master seed: 32 bytes of entropy as hex, the same 64 hex chars
 // --key holds. startNode derives the node's keypair from it inside the shared realm
-// (deriveNodeKey, services/subkeys.ts).
+// (deriveNodeKey, host/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
 	seed := make([]byte, 32)
@@ -374,8 +374,8 @@ globalThis.__buildGuestSeam = function (names, callLocal, scope) {
     // The declared names as given: a host service's methods are wired only if it is one
     // of these, and every other name here is a local service id (§12.10).
     requires: names,
-    // What this node provides; only the declared ones are wired.
-    backends: { node: scope || undefined, fs },
+    // What this node offers; only the declared ones are wired.
+    services: { node: scope ? nodeService(sodium, scope) : undefined, fs: fsService(fs) },
     // Local service id routing, done by the shell in production. Absent here means
     // nothing claims any id, which the seam reports by name instead of leaving the caller
     // waiting.
