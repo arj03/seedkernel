@@ -10,10 +10,7 @@ script, and nothing more.
 - **`csrc/shim.c`** — the flat `QJS_*` ABI `qjs.go` and `value.go` drive, and the
   execution deadline the guest realm's budget is built on (`QJS_SetDeadline` /
   `QJS_TakeInterrupted`). The exports are an allowlist in `csrc/qjswasm.cmake`.
-- **`csrc/*.patch`** — applied to the engine before the build.
-  `0001-wasi-stack-limit.patch` keeps QuickJS's stack limit, which quickjs-ng
-  switches off for WASI; without it, deep recursion runs off the wasm stack into a
-  trap that leaves the engine unusable, instead of throwing a `RangeError`.
+- **`csrc/*.patch`** — applied to the engine before the build, if there are any.
 - **`csrc/realm.c`** — the realm ABI (`R_*`) a guest realm is driven through from
   JS over the engine table (`WASM/host/engine-realm.ts`): numbers and one exchange
   buffer only, with the per-call work (arming the deadline, draining jobs, the

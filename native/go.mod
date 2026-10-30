@@ -20,4 +20,4 @@ require golang.org/x/sys v0.46.0 // indirect
 // a bound nobody has. A path replace made that impossible to check out and
 // verify. Pinned to a commit rather than a branch so a fork push cannot change what this
 // builds; drop the replace entirely if the change lands upstream.
-replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20261001105426-c6ee9f93fb2a
+replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20261030091612-094a828d7abd

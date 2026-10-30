@@ -37,9 +37,9 @@ static int64_t deadline_ns;
 static int interrupted;
 static int tick;
 
-static int deadline_handler(JSRuntime *rt, void *opaque)
+static int deadline_handler(JSContext *ctx, void *opaque)
 {
-    (void)rt;
+    (void)ctx;
     (void)opaque;
     int64_t deadline = deadline_ns;
     if (deadline <= 0)
