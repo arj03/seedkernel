@@ -60,8 +60,8 @@ const INTERRUPTED = -1;
 interface InvocationBudget extends Spend {
   budgetMs: number;
   wallDeadline: number;
-  /** Fails this invocation while its answer is pending. */
-  reject?: (err: Error) => void;
+  /** Fails this invocation while its answer is pending, answering whether it was. */
+  reject?: (err: Error) => boolean;
 }
 
 /** A realm factory over `engine`, running each realm on `qjs` (qjs.wasm). */
@@ -146,8 +146,13 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
           const len = stage(bytes ?? enc.encode(errMessage(error)));
           enter(under, budget.causalClock, (deadlineNs) => R_Settle(callId, bytes ? 1 : 0, len, deadlineNs));
         } catch (err) {
-          // Interrupted while resuming: nothing in the realm will settle the caller now.
-          under.reject?.(err instanceof Error ? err : new Error(String(err)));
+          // Interrupted or out of memory while resuming: guest code can't catch either, so
+          // nothing in the realm will settle what awaited this. The invocation that made the
+          // call may be answered already (a prefetch), which leaves the ones still open.
+          const failure = err instanceof Error ? err : new Error(String(err));
+          if (under.reject?.(failure)) return;
+          for (const invocation of invocations.values()) invocation.reject(failure);
+          invocations.clear();
         }
       });
     };
@@ -247,7 +252,11 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
       const id = ++invocationSeq;
       const answer = Promise.withResolvers<Uint8Array>();
       invocations.set(id, answer);
-      const fail = (err: Error): void => { takeInvocation(id)?.reject(err); };
+      const fail = (err: Error): boolean => {
+        const invocation = takeInvocation(id);
+        invocation?.reject(err);
+        return invocation !== undefined;
+      };
       budget.reject = fail;
       let deferred = false;
       causalContext.run(causalClock, () => {

@@ -1082,6 +1082,46 @@ async function testDeferredKeepsItsDeadline() {
   console.log("  OK\n");
 }
 
+// ─── Test: running out of memory reaches a waiting caller ───────────────────────────
+//
+// Guest code can't catch the engine's out-of-memory error, and an async function that dies
+// of it never rejects. So when the work that ran out was started by an invocation already
+// answered, the invocation waiting on that work must fail, not sit out its deadline.
+async function testOutOfMemoryFailsTheWaiter() {
+  console.log("Test: out of memory in an answered invocation's work fails the one waiting on it (§12.3)");
+
+  let settle;
+  const realm = await createWebRealm({
+    source: `let ahead;
+    async function handle(tag) {
+      globalThis.__deferred = true;
+      if (tag[0] === 1) {
+        ahead = (async () => { await host.call("park", tag); return new Uint8Array(32 << 20); })();
+        ahead.catch(() => {});
+        return tag;
+      }
+      return await ahead;
+    }`,
+    deadlineMs: 5000,
+    memoryLimitBytes: 16 << 20,
+    hostCall: () => new Promise((resolve) => { settle = resolve; }),
+  });
+  try {
+    await realm.call(Uint8Array.of(1));
+    const waiting = realm.call(Uint8Array.of(2)).then(() => "answered", (err) => err.message);
+    while (!settle) await sleep(0);
+    const start = performance.now();
+    settle(EMPTY);
+    const outcome = await waiting;
+    assert(/out of memory/.test(outcome), `the waiter hears why (${outcome})`);
+    assert(performance.now() - start < 1000, "at once, not at its deadline");
+  } finally {
+    realm.dispose();
+  }
+
+  console.log("  OK\n");
+}
+
 async function testDetachedAnswerIsANewTurn() {
   console.log("Test: a detached call's answer resumes as a new turn, not under a spent invocation (§12.3)");
 
@@ -1185,6 +1225,7 @@ await testModuleCallChargedToGuestBudget();
 await testPreviousAbiRefused();
 await testSafeRealmConcurrency();
 await testDeferredKeepsItsDeadline();
+await testOutOfMemoryFailsTheWaiter();
 await testDetachedAnswerIsANewTurn();
 await testOwnTurns();
 
