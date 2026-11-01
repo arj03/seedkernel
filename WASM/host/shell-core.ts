@@ -176,9 +176,9 @@ export interface BootResult {
 /** Boot a node and install the selected signed transport through the shared installer. */
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   /** One install's realm bounds: its own, else the node's, else the shared default.
-   *  Checked here because the engines disagree on out-of-range values: a heap limit that
-   *  truncates to 0 is unlimited on JS and refused on native, 2^32 wraps, and a budget
-   *  under 1 ms is no budget on native and refused on JS. */
+   *  Checked here because an out-of-range value would silently lift a bound: a heap limit
+   *  that truncates to 0 is no limit to the engine, nor is one of 2^32 or more on its
+   *  32-bit memory, and a budget of 0 turns off the wake's pacing (services/timer.ts). */
   const boundsFor = (load: InstallOptions): { deadlineMs: number; memoryBytes: number } => {
     const deadlineMs = load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
     const memoryBytes = load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES;
