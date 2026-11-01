@@ -63,10 +63,10 @@ reveals who sent every recorded handshake. Deferring identity disclosure until b
 and the ML-KEM secret exist makes concealment forward-secret and hybrid for both ends.
 
 The handshake therefore uses **no long-term Diffie–Hellman key at all**. `ee` is ephemeral
-on both sides; the contact secret and network key are KDF inputs. Two consequences worth
-having: the Ed25519 identity key stays signing-only, as §12.6 requires, without the
-Ed25519→Curve25519 conversion Secret Handshake needs; and a node address carries no DH or
-KEM key, so the address format does not depend on the suite (§11).
+on both sides; the contact secret is a KDF input and the network key seeds the transcript
+root (§6.2). Two consequences worth having: the Ed25519 identity key stays signing-only, as
+§12.6 requires, without the Ed25519→Curve25519 conversion Secret Handshake needs; and a node
+address carries no DH or KEM key, so the address format does not depend on the suite (§11).
 
 ---
 
@@ -80,11 +80,11 @@ signature, so an impostor draws msg1 and nothing more. This is SIGMA-I's order w
 responder's identity left off the wire, and it grades the caller as `XX` does (§8.1).
 
 Someone must go first; that is not solvable, only assignable. Assigning it to the receiver
-costs the receiver little. With a contact secret, only secret holders reach msg2, and the
-secret travels in an address that already names the key. What msg2 gives away is a
-signature an anonymous caller can check against candidate keys, and an anonymous caller
-reaches msg2 only on an open node. A node that must be invisible to scanners sets a contact
-secret; that is what the secret is for (§6.1).
+costs the receiver little. With a contact secret, only secret holders reach msg2, the two
+paths of §6.1 aside, and the secret travels in an address that already names the key. What
+msg2 gives away is a signature an anonymous caller can check against candidate keys, and an
+anonymous caller reaches msg2 only on an open node. A node that must be invisible to
+scanners sets a contact secret; that is what the secret is for (§6.1).
 
 The peer lint (§6.3) runs at msg3, on the caller's verified identity. A caller it declines is
 closed rather than stalled: it verified the receiver at msg2, so silence would conceal
@@ -106,7 +106,8 @@ layer refuses the same way: an over-cap length prefix or message is a refusal li
 other, because almost every four random bytes declare more than the cap, and closing on
 sight would let them identify the node. Two refusals close instead, because neither has
 anything left to hide: the caller's own at msg2 (a signature under a key it did not dial,
-or one its peer lint declines) and the receiver's peer lint at msg3 (§4).
+or one its peer lint declines) and the receiver's at msg3, by its peer lint or on an accept
+held for another peer (§4).
 
 The alternative, closing on a bad message, answers a question. "I am a seedkernel node
 and that is not the key" is exactly the oracle §1 removes, and it is available to anyone
@@ -171,6 +172,12 @@ active probing draws silence, so "a node speaks this protocol here" stops being 
 and msg2's signature reaches only parties whose address already names the key. The caller's
 identity does not depend on it: msg3 goes only to a receiver that proved the dialed key (§4).
 
+**Two paths run without it.** An accept for a key the node has welcomed also opens a msg1
+sealed under no secret, on a relayed call, where the relay names the caller. A direct path's
+data channel runs with none, since only the signaled peer can reach it ([DESIGN](DESIGN.md)
+§12.7). Each takes that one key at msg3 and no other, so the secret still gates every
+stranger ([RUNTIME](RUNTIME.md) §12.6.3).
+
 **Why a secret rather than a published key.** Gating msg1 on a long-term public key is
 WireGuard's `mac1` and Noise's `XK`, and it is weaker on both counts Noise names: the value
 ships in the address, so it gates nothing an address holder lacks, and a public value can be
@@ -224,9 +231,10 @@ The list is the transport's to enforce, so a malicious transport can bypass it (
 
 ## 7. Why one identity key, and not a key per purpose
 
-A node signs for two purposes with one key: the handshake, under `DOMAIN_link_scope`
-(with the transport's own `DOMAIN_channel ‖ root ‖ transcript ‖ id` inside), and an app's
-scoped records, under `DOMAIN_guest ‖ app`
+A node signs for two purposes with one key: the link, under `DOMAIN_link_scope` (the
+handshake with the transport's own `DOMAIN_channel ‖ root ‖ transcript ‖ id` inside, and
+relay registration under its `DOMAIN_relay`), and an app's scoped records, under
+`DOMAIN_guest ‖ app`
 ([RUNTIME](RUNTIME.md) §12.6.2b). Deriving a second keypair for the second purpose is the
 obvious hardening, and it is worth saying why it is not done.
 
@@ -379,6 +387,10 @@ identifies the protocol, not the peer, and hiding it would cost the self-describ
 and the migration path of §14.1. First message indistinguishable from random is a separate
 goal and belongs in its own suite.
 
+**A WebSocket listener answers as one.** It writes the HTTP upgrade before any msg1, so a
+prober learns a WebSocket server is there, though not whose. The silence of §5 starts behind
+that answer.
+
 **Impersonation after key compromise.** Seizing a node's master seed lets an attacker be
 that node, for good: nothing revokes it ([SECURITY](SECURITY.md) §14). Only §3's deferral
 limits the *retroactive* damage.
@@ -387,7 +399,7 @@ limits the *retroactive* damage.
 
 ## 10. Invariants worth a named test
 
-1. A node never transmits anything before opening the caller's msg1.
+1. An accepting node transmits nothing of the channel before opening the caller's msg1.
 2. A wrong contact secret, a malformed message, an over-cap frame and silence are mutually
    indistinguishable.
 3. Neither identity appears in cleartext anywhere on the wire.
@@ -395,7 +407,7 @@ limits the *retroactive* damage.
 5. The receiver's key never goes on the wire, and the caller's goes only to a receiver that
    proved the dialed key.
 6. Neither the contact secret nor the network key appears on the wire in the clear, and the
-   handshake carries neither (§9).
+   handshake carries neither (§6).
 7. Honest transports on different network keys never link.
 8. Subkey derivation is deterministic: a node rebuilds its identity from the seed alone.
 9. Only `close()` emits the end-of-stream record; every failure path is silent. *(§12.6.1)*
