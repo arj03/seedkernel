@@ -23,8 +23,8 @@ export interface Keypair {
 }
 
 /** Deterministic, so a node rebuilds its key at boot from the one secret it stores. The
- *  public half is the peer id and what `senderPk` carries on every dispatch; the key signs
- *  the handshake and an app's scoped `node/sign`. */
+ *  public half is the peer id and `HOST.identity`; the key signs the link slot's statements
+ *  and an app's scoped `node/sign`. */
 export function deriveNodeKey(sodium: SubkeyCrypto, master: Uint8Array): Keypair {
   if (master.length !== 32) throw new Error(`subkey: master seed must be 32 bytes (got ${master.length})`);
   const seed = sodium.crypto_generichash(32, concatBytes([

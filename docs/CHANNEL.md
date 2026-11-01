@@ -379,8 +379,8 @@ every later copy before promotion or asymmetric work, so the recording is worth 
 rather than one per copy sent. That memory is bounded and per-realm: a restart, or 4,096
 further proved handshakes, makes an old recording good for one more. Closing it outright
 needs freshness in msg1 (a challenge costing a round trip, a clock like WireGuard's
-timestamp, or a seen-set that survives restarts), and none is taken: this is the replay linkability Noise
-grades `XK` down for (§8.1).
+timestamp, or a seen-set that survives restarts), and none is taken: this is the replay
+linkability Noise grades `XK` down for (§8.1).
 
 **The protocol is fingerprintable.** A cleartext `0x03` at offset 0 says "seedkernel". That
 identifies the protocol, not the peer, and hiding it would cost the self-describing format

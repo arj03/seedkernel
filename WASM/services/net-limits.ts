@@ -5,8 +5,8 @@
 export const MAX_LINK_READ_BYTES = 2 * 1024 * 1024; // 2 MiB
 
 /** Inbound bytes one driver admits across dispatched and held reads, for the whole driver,
- *  not per link; a read past it fails the arriving link (§12.6). Seedstore's holder ingest
- *  bench, the worst case, peaks at ~6 MiB. */
+ *  not per link; a read past it fails a link that cannot pause, and a pausable one waits
+ *  for room (§12.6). Seedstore's holder ingest bench, the worst case, peaks at ~6 MiB. */
 export const MAX_INBOUND_HOLD_BYTES = 8 * MAX_LINK_READ_BYTES;
 
 /** Count companion to `MAX_INBOUND_HOLD_BYTES`, against floods of tiny reads. */
