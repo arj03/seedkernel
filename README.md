@@ -130,7 +130,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 - **The host updates itself, when the operator allows it.** An app can hand the host a newer host blob from the host author, fetched over the node's own network. The running host checks it as it checks an app bundle and hands it to the loader, which tries it once and commits it after a health window; one that fails first is dropped for the host it replaced (§12.9).
 - **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~21 µs; ~106 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
 - **The engine is fast enough for real storage.** In seedstore's tested network configurations, transfer rate and latency dominated, not the engine ([the overhead, measured](#the-overhead-measured)).
-- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.3](docs/RUNTIME.md#123-zero-authority-js-realms)).
+- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.6](docs/RUNTIME.md#126-nodenode-transport-channel-identity-binding)).
 - **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
 - **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
 
@@ -138,7 +138,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,872 LOC)**
+**Shared: one implementation for all three targets (3,879 LOC)**
 
 The core, which every node runs:
 
@@ -147,7 +147,7 @@ The core, which every node runs:
 | Bundle format, admission policy and resource limits (§12.4, §12.5, §4.1, §12.3), the module ABI (§4), the host blob, the check on a host's successor and the slots it is staged in (§12.9) | `host/bundle.ts`, `host/policy.ts`, `host/wasm-limits.ts`, `host/host-blob.ts`, `host/slots.ts`, `host/pure-module.ts` | 785 |
 | Guest seam (§12.2): the call surface, which wires only the host services a node offers, and the serialized realm queue | `host/guest-seam.ts`, `host/realm-queue.ts` | 384 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, which names the services a node offers, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 406 |
-| Guest realms and the host's crypto (§12.3, §12.9): the realm driver over the platform's engine table, and libsodium and ML-DSA-65 on the same table | `host/engine-realm.ts`, `host/sodium-engine.ts`, `host/pq.ts` | 411 |
+| Guest realms and the host's crypto (§12.3, §12.9): the realm driver over the platform's engine table, and libsodium and ML-DSA-65 on the same table | `host/engine-realm.ts`, `host/sodium-engine.ts`, `host/pq.ts` | 418 |
 | The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 329 |
 | The shared vocabulary: the `HOST_SERVICES` table and signing domains, the master-seed subkey derivation (§12.6.2b), the raw-link event codec (`host/op-frame.ts`, also available to clients) and byte helpers | `host/domains.ts`, `host/subkeys.ts`, `host/op-frame.ts`, `host/util.ts`, `host/utf8.ts` | 277 |
 
@@ -175,7 +175,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform and the page's loader, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,069 TS |
 | **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,484 Go |
 
-The transport bundle sits outside these host totals: 2,989 lines of `transport/src/*.js` plus a 6 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
+The transport bundle sits outside these host totals: 2,989 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. The transport bundle carries the same `mlkem768.wasm` on every target, as a private module. Native runs these WASM artifacts through wazero.
 

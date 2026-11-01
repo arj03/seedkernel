@@ -20,7 +20,7 @@ The message path does **no asymmetric cryptography and no recursion**: routing a
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6).
 - **Per bundle load:** one BLAKE2b-256 hash of the body and verification of both Ed25519 and ML-DSA-65 signatures (§12.4).
 
-All of it runs on the host's libsodium on the platform's engine table (§12.9), on every target. The Go/native target carries `*_bench_test.go` benchmarks over these hot paths; `npm test` from `WASM/` exercises them end-to-end on the JS target, and seedstore's `WASM/tests/bench.mjs` measures storage throughput.
+The host's libsodium and ML-DSA-65 run on the platform's engine table (§12.9), on every target, and ML-KEM-768 in the transport bundle's own module. The Go/native target carries `*_bench_test.go` benchmarks over these hot paths; `npm test` from `WASM/` exercises them end-to-end on the JS target, and seedstore's `WASM/tests/bench.mjs` measures storage throughput.
 
 ### 10.2 Distribution Size
 
@@ -28,17 +28,17 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): its loader (`host/platform-web.js`), the socket seams and bundle verification | ~57 KB |
+| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): its loader (`host/platform-web.js`), the socket seams and bundle verification | ~59 KB |
 | **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium and ML-DSA-65, signed (§12.9). A page's loader runs it on the browser platform | 1.25 MB |
-| of which the host script (`build/host.js`), with the transport bundle embedded as base64 (131 KB: its guest, signed without comments, `ws.wasm` and `mlkem768.wasm`) | 392 KB |
-| of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 623 KB |
+| of which the host script (`build/host.js`), with the transport bundle embedded as base64 (131 KB: its guest, signed without comments, `ws.wasm` and `mlkem768.wasm`) | 394 KB |
+| of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 624 KB |
 | of which libsodium.wasm (core build: the host's crypto) | 217 KB |
 | of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
 | **Total browser deployment** | **~1.3 MB (~530 KB gzipped)** |
 | mlkem768.wasm (ML-KEM-768) | 12 KB, counted inside the transport bundle |
 | **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~6.9 MB |
 
-`npm run build` emits the readable `build/` (~458 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~331 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach, a page's loader and the host modules a page that assembles with `bootShell` itself imports. It prints the gzipped size before and after minifying on every run.
+`npm run build` emits the readable `build/` (~460 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~331 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach, a page's loader and the host modules a page that assembles with `bootShell` itself imports. It prints the gzipped size before and after minifying on every run.
 
 ---
 
@@ -73,7 +73,7 @@ The host provides five **host services**, `node`, `fs`, `timer`, `link` and `hos
 | `fs` | `fs/get`, `fs/put`, `fs/list`, `fs/delete`, `fs/stat`, `fs/size` | Raw bytes under an opaque, flat key, scoped to the app label (§12.1). |
 | `timer` | `timer/arm`, `timer/clear` | The realm's one wake (§12.3). |
 | `link` | `link/open`, `link/send`, `link/pause`, `link/close`, `link/deliver`, `link/status`, `link/udpBind`, `link/udpSend`, `link/udpClose` | Raw links over opaque link ids, attributed inbound delivery, the occupant's status, and raw datagram sockets for its UDP paths (§12.7). **The link owner only** (§12.5). |
-| `host` | `host/stage` | Hands the loader a host blob to run next (§12.9). The blob authenticates itself, so any app may declare it; the loader's rules and the operator's `--host-updates` decide. A node with no loader slots (a library embedding, §12.8) refuses an app that declares it. |
+| `host` | `host/stage` | Hands the loader a host blob to run next (§12.9). The blob authenticates itself, so any app may declare it; the loader's rules and the operator's `--host-updates` decide. A `bootShell` without `services.host` refuses an app that declares it; a library node and a page offer the name and refuse every blob, having no slots to keep one in (§12.8). |
 | `crypto/*` | `blake2b`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `random` | `HOST_TRANSFORM_NAMES`, a frozen compatibility table of transforms the host already carries, each over its algorithm's whole standard interface (§12.2). `random` is host entropy. **Not a grant.** |
 | *bare names* | the bundle's own module names | The asking bundle's private WASM modules. **Not a grant.** |
 
@@ -143,7 +143,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 
 - **Every name answers a Promise.** A call that produced a value resolves to bytes; a call that did not rejects. Zero bytes is a value: `fs/put` answers empty on success, and a module that returned nothing is distinct from one that trapped, overran or was killed. A fan-out is the guest's own `Promise.all`.
 - **No name re-enters the calling realm.** A socket write does not deliver during the write, an armed timer fires on a later turn, and a call into another realm (a local service id, `link/deliver`) runs its callee on a later turn. A guest answering such a call fires it and returns rather than awaiting it inside its own frame.
-- **Mechanics.** The host injects `__host_call(name, callId, payload)`. A call that has to wait parks: `link/deliver`, a module name and a local service id. The preamble holds a Promise under `callId`, settled by `__settleHostCall`. The host takes it and `__start` between the preamble and the guest's source, so a guest that redefines one, as a getter say, never runs code outside its budget through it. Every other name gets its answer back in the frame that asked, so the guest's `await` continues in the same turn with no host turn in between.
+- **Mechanics.** The host injects `__host_call(name, callId, payload)`. A call that has to wait parks: `link/deliver`, `link/udpBind`, `host/stage`, a module name and a local service id. The preamble holds a Promise under `callId`, settled by `__settleHostCall`. The host takes it and `__start` between the preamble and the guest's source, so a guest that redefines one, as a getter say, never runs code outside its budget through it. Every other name gets its answer back in the frame that asked, so the guest's `await` continues in the same turn with no host turn in between.
 - **`__deferred`.** A guest that will answer on a later turn sets the host's `__deferred` flag; the invocation's queue spot frees at the end of its synchronous segment though nothing has settled. Its caller-owned deadline stays attached to the answer and settles a deferral that never completes. This is the one ABI bit beyond `handle` returning bytes.
 
 #### Signing scope
@@ -153,7 +153,7 @@ Each slot has **one** signing scope, derived once at load from admitted facts (`
 | Slot | Domain ‖ scope |
 | --- | --- |
 | an ordinary app | `DOMAIN_guest ‖ app_len u8 ‖ app` (`appSignScope`), from the manifest's `app` label, never the author |
-| the slot holding `link` | `DOMAIN_link_scope`, no further scope bytes (`linkSignScope`) |
+| the slot holding `link` | `DOMAIN_link_scope`, no further scope bytes |
 
 `node/sign` signs `domain ‖ scope ‖ msg`; `node/verify` checks a caller-named key's signature under the same prefix. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. Raw verification stays host-internal (`SeamCrypto`). The domain family is disjoint (§16.1). Every node running an app under the same label derives the same scope, whoever authored it. The format inside a scope, including the transport's `DOMAIN_channel` tag, is bundle content.
 
@@ -195,7 +195,7 @@ A guest runs as confined JS in a QuickJS realm holding only the ECMAScript intri
 - **One entrypoint.** `realm.call(bytes)` invokes the guest's `handle` with `[caller 32][body …]`. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, 32 zero bytes for the host itself and its events (the wake and the raw-link events). The body format is the callee's. A guest declares `handle`; nothing else is ever invoked.
 - **Invocations are serialized per realm** (`host/realm-queue.ts`, shared by both targets): one invocation holds the queue until it completes or sets `__deferred`.
 - **Top-level evaluation** runs at install, before commit, while the seam refuses every name (§3.1).
-- **Disposal fails what is parked.** `Shell.close()`, uninstall and revoke dispose a slot's realm at once, rejecting every invocation still parked in it and freeing the engine on a later turn. A handle held past that rejects, naming the slot.
+- **Disposal fails what is parked.** `Shell.close()`, uninstall and revoke dispose a slot's realm at once, rejecting every invocation still parked in it and freeing the engine. A handle held past that rejects, naming the slot.
 
 #### Preamble
 
@@ -254,7 +254,7 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 
 | Field | Type | Enforced | Meaning |
 | --- | --- | --- | --- |
-| `app` | string | yes | The slot's key: one slot per label per node, whoever authored it. Names the fs and signing scopes; what `replaces` and `uninstall` select; with the author, keys the freshness mark. Non-empty, at most 255 UTF-8 bytes. |
+| `app` | string | yes | The slot's key: one slot per label per node, whoever authored it. Names the fs and signing scopes; what `replaces` and `uninstall` select; with the author, keys the freshness mark. Non-empty, at most 255 UTF-8 bytes, with no control, line-separator, bidi or zero-width characters. |
 | `version` | integer | yes | Non-negative safe integer; the set's monotonic version (§12.4). |
 | `modules[]` | `{name}` | yes | One entry per private WASM module, in body order. `name` is what the guest passes to `host.call`: unique, `[A-Za-z0-9_-]`, alphanumeric first. Zero or more. |
 | `protocols[]` | string[] | yes | Protocol ids a **peer** may reach (§12.10). Optional. |
@@ -346,7 +346,7 @@ Everything in this section is the **shipped transport bundle's guest program** (
 
 #### Framing
 
-- Node↔node over TCP: a length prefix. Browser↔node: RFC 6455 over the same TCP socket, its headers in `framing.js` and its masking in `ws.wasm`. Platform `WebSocket` and `RTCDataChannel`: whole messages as delivered.
+- Node↔node over TCP: a length prefix. Browser↔node: RFC 6455 over the same TCP socket, its headers in `framing.js` and its masking in `ws.wasm`. Platform `WebSocket`: whole messages as delivered. `RTCDataChannel`: a byte stream under the same length prefix, whatever the platform's message limit (`RTC_CHUNK_BYTES`).
 - Each framer checks its cap against the declared length **before** buffering the body; a platform-framed message is measured on arrival. The cap is `MAX_HANDSHAKE_FRAME_BYTES` (8 KiB, `transport/src/framing.js`) until authentication and `maxFrameBytes` (`MAX_FRAME_BYTES` by default) after. `raiseCap()` lands once the authenticating step (msg2 dialing, msg3 accepting) has run; until then framers take one message at a time.
 - `Pieces` (`transport/src/util.js`) merges slices below 8 KiB (`MERGE_BELOW`) into a doubling tail buffer and keeps larger slices as they arrived. The WebSocket framer serializes `push`.
 
@@ -389,12 +389,12 @@ LABEL_msg3  = "seedkernel-c-msg3-v1\0"          LABEL_rekey = "seedkernel-sessio
 ```
 
 - **Parsing is by state.** The initiator reads msg2, the responder msg1 then msg3, and everything after authentication is a record. Each handshake message is accepted only at its exact width.
-- **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret and network key are KDF inputs. An all-zero X25519 result (a low-order point: `crypto/x25519/dh` answers `ok = 0`) or a KEM call the module refuses is a refusal like a seal that does not open: silence, on either side, the initiator at msg2 included.
+- **Keys.** `eph` is a fresh X25519 key per connection on each side; `kem_pk_i` is a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. `seal` is ChaCha20-Poly1305-IETF at nonce zero; each key seals exactly one message. No long-term DH or KEM key is used; the contact secret is a KDF input and the network key seeds `root`. An all-zero X25519 result (a low-order point: `crypto/x25519/dh` answers `ok = 0`) or a KEM call the module refuses is a refusal like a seal that does not open: silence, on either side, the initiator at msg2 included.
 - **Suite `0x03`** is the only suite: Ed25519 identity, ephemeral X25519 + ML-KEM-768, contact secret, ChaCha20-Poly1305 records. An unrecognised id draws silence. There is no list, fallback or negotiation. `suite` is folded into `h1`, so both signatures cover it.
 - **A dial pins its peer, and the receiver's key never travels.** `sig_r` is checked against the key the caller dialed; `id_r` is in the signed message but not on the wire. A signature under any other key, including the caller's own, closes the link before the caller names itself.
 - **Ordering.** An accepting node sends nothing until a msg1 opens under its contact secret, or under none from a caller it welcomes (§12.6.3). The receiver proves itself at msg2; the caller names itself at msg3, only to a receiver it has verified.
 - **Signatures** cover `DOMAIN_channel ‖ root ‖ transcript ‖ own id` under the host's `DOMAIN_link_scope`; `sig_r`'s transcript chains the suite, both ephemerals, the KEM key and ciphertext, and `sig_i`'s all of msg2 besides. The initiator authenticates the responder at msg2 (1 RTT) and sends its first records behind msg3; the responder authenticates the initiator at msg3 (1.5 RTT).
-- **Refusals before msg3 are silent.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until the deadline. A caller the peer lint declines at msg3 is closed at once: it has verified the receiver, so silence would conceal nothing. An initiator's rejection at msg2 (a bad signature, its own key, the peer lint) closes the link.
+- **Refusals before msg3 are silent.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until the deadline. A caller the peer lint declines at msg3, or that an accept held for another peer does not take, is closed at once: it has verified the receiver, so silence would conceal nothing. An initiator's rejection at msg2 (a bad signature, its own key, the peer lint) closes the link.
 - **Pre-auth sends** are queued oldest-dropped under both `MAX_QUEUE_BYTES` and `maxPreAuthQueueSlices`. When the link goes before authenticating (a dial that dies, or the loser of the double-connect tie-break), the queue passes to another link to the same peer.
 - **Double connect.** Two nodes dialing each other keep the link the smaller identity dialed. Only the loser's dialer closes it: a dialer sends behind msg3, before the far end has chosen, so the accepting end stops routing to the loser but reads it until the dialer's end-of-stream record. If the winner goes first, the loser routes again.
 
@@ -404,7 +404,7 @@ LABEL_msg3  = "seedkernel-c-msg3-v1\0"          LABEL_rekey = "seedkernel-sessio
 - The nonce is an implicit per-direction `(epoch, counter)`, never sent: the 12 bytes `epoch u32 ‖ 0x00000000 ‖ counter u32`, both starting at 0. It is strictly enforced on receive, and the receiving counter advances only on a record that opens; a bad tag or out-of-order counter tears the link down. After `REKEY_AFTER_FRAMES` records a direction ratchets, `k ← H(k ‖ LABEL_rekey)`, advancing the epoch and restarting the counter at 0; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
 - Only `close()` emits the authenticated end-of-stream record, a record with an empty plaintext (its 16-byte tag alone); an application frame is never empty, so the two cannot be confused. Every failure path is silent. The record goes out behind what was handed to the link before the close, so a frame sent and a peer forgotten right after still arrives; a failure drops what was waiting.
 - A graceful `link/close` asks the socket to flush its queued bytes before closing, bounded on TCP by `TCP_LINGER_MS` (`services/net-limits.ts`).
-- Records assume an ordered whole-message pipe, which every socket seam supplies.
+- Records assume an ordered whole-message pipe, which a framer, or a seam that frames for itself, supplies.
 
 #### 12.6.2 Half-open budgets
 
@@ -556,7 +556,7 @@ A node is a **loader** running a **host blob**. The loader is the only code fixe
 
 - **The host blob** (`host/host-blob.ts`, `build/host.skb`) is a suite `0x02` envelope (§12.4) under `DOMAIN_host`, so it never passes as an app bundle or an app bundle as a host. Its body is the manifest `{version, abi}`, the host script (`build/host.js`, the shared TypeScript bundled by `scripts/bundle-host.mjs`), `qjs.wasm`, `libsodium.wasm` and `mldsa65.wasm`. `npm run build` signs it with `host-author.key`, which the first build writes, at `package.json`'s `hostVersion`.
 - **The platform ABI** (`host/abi.ts`) is what a loader gives the host script: process I/O and entropy, private modules (§4), the engine table, files, TCP and UDP sockets, timers, and `stageHost`. Every member is a raw primitive. A call a platform can only answer asynchronously is awaited by the host on every loader. The script refuses a loader that implements another ABI version, and a loader passes over a slot whose blob needs one.
-- **The engine** instantiates wasm from bytes, calls its exports with numbers and reads and writes its memory. The Node and browser loaders pass it to the host script whole, over `WebAssembly`; the native loader passes a table of handles, which the host wraps into the same (`host/platform.ts`). The Node loader also lends a view of that memory, so a host call whose handler is done with its payload when it returns (`crypto/*`, `node/*`) reads it without a copy; the native host realm is another instance, so it always copies. Guest realms (§12.3) and the host's crypto (`host/sodium-engine.ts`) run on it, so the engine and the crypto ship in the blob.
+- **The engine** instantiates wasm from bytes, calls its exports with numbers and reads and writes its memory. The Node and browser loaders pass it to the host script whole, over `WebAssembly`; the native loader passes a table of handles, which the host wraps into the same (`host/platform.ts`). The Node and browser engines also lend a view of that memory, so a host call whose handler is done with its payload when it returns (`crypto/*`, `node/*`, `fs/*`) reads it without a copy; the native host realm is another instance, so it always copies. Guest realms (§12.3) and the host's crypto (`host/sodium-engine.ts`) run on it, so the engine and the crypto ship in the blob.
 - **Three loaders.** The native binary (`native/`) is Go over [wazero](https://wazero.io): the host script runs in a `qjs.wasm` instance from the blob, and Go owns the event loop (timers, the JS job queue, socket delivery). The Node loader (`host/loader-node.ts`, `npm run shell`) runs the host script in V8 on the Node platform (`host/platform-node.ts`), the ABI over `node:net`, `node:dgram`, `node:fs` and `WebAssembly`. The Node library (`bootNodeShell`, §12.8) runs the same host in-process on the same platform. A page's loader is `browserHost` (`host/platform-web.ts`): it evaluates the blob's host script, as the Node loader does, on the browser platform (`browserPlatform`: the engine table over `WebAssembly`, private modules in workers, an in-memory store by default, and no sockets), which takes `'unsafe-eval'` in the page's `script-src`. The page stands its node up through the same `standUp` with its own channels and admission gate. It has no slots: the origin that serves it is its trust root. A page that assembles with `bootShell` itself imports the host instead and takes only the blob's engine and crypto (`platformHost(browserPlatform(...))`).
 - **Checked by the host it replaces.** A loader holds no crypto and decides nothing about authorship. The running host checks a blob before handing it over (`checkStagedHost`, `host/host-blob.ts`), with its own libsodium and ML-DSA-65, as it checks an app bundle: both signatures, then the parts. The chain is rooted in the genesis blob built into the loader. A loader reads the layout of what is in its slots, which only a host put there, and trusts those files as it trusts the data directory beside them.
 - **Updates** follow one implementation of a loader's decisions, `host/slots.ts`: its flags, which blob each boot runs, and the trial. The Node loader imports it into the realm it runs the host in. The native binary runs it as `build/loader.js` in a QuickJS realm of its own (`native/hostslots.go`), never the host's, so there a broken host cannot break its own rollback. On both, the script comes only from what the loader was built with. Each loader keeps only the booting and the clock the health window runs on. The slots sit beside the data directory: `<dir>.host/committed.skb`, `pending.skb` and the `tried` mark.
@@ -591,7 +591,7 @@ A frame names a **protocol id**, never an app, author or module. Each installed 
 - **Claim charset**: alphanumeric or `_` first, then alphanumerics and `._/-`, at most 64 bytes. Uniqueness is per list; the same name in both lists is allowed. No spelling is reserved; `_net` is this repo's transport's convention.
 - **Peer delivery.** The link occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in the `peer` book alone and invokes the slot's `handle` with `attribution ‖ payload`. An unclaimed protocol, or a `services`-only name, is answered empty.
 - **Local calls.** `host.call(id, …)` on a local service id in the caller's own `guest.requires` resolves through the `local` book; the host prepends the caller's 32-byte id and the answer is the callee's `handle` result on a later turn.
-- **An app sends under its own claims.** A frame names only a protocol id, and the far end routes by it with this node's key in front, so an app may send only under the ids in its own `protocols`. An app that only sends under an id claims it too. The host writes the caller's claims into every call from an app to the link occupant, between the caller id and the body: `[caller 32][len u32][protocol ids, newline-separated][body]`. Holding the app to them is the occupant's; the shipped transport refuses a `send` under any other id. That prefix is the link occupant's contract with the host, and the rest of its vocabulary is its own. `Shell.call` is the embedder's own door, carries no claims and is not held to them.
+- **An app sends under its own claims.** A frame names only a protocol id, and the far end routes by it with this node's key in front, so an app may send only under the ids in its own `protocols`. An app that only sends under an id claims it too. On every call from an app to the link occupant the host reads the op, and for a `send` the protocol it names (`sendProtocol`, `host/op-frame.ts`), and refuses an id outside the caller's `protocols` at the call site. Those leading fields, `[op "send"][noReply u8][to blob][proto blob]`, are the link occupant's contract with the host, and the rest of its vocabulary is its own. `Shell.call` is the embedder's own door and is not held to them.
 - **Host doors.** `AppHandle.invoke(payload)` is slot-bound (a bundle claiming nothing has one) and prepends 32 zero bytes. `Shell.call(serviceId, payload)` resolves the `local` book with the host's caller id and returns `null` when nothing claims the name.
 - **The binding.** The driver follows the book, and the host wires the `link` service (the driver's raw links plus its own `deliver`) only into that slot.
 - **`InstallOptions.onInbound(claim, sender, answer)`** fires once a peer-inbound request to this load's slot resolves. It is observation only: it cannot change the answer, never fires for `invoke` or local calls, and a throw from it is reported and swallowed.
