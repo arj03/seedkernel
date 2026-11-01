@@ -72,7 +72,7 @@
 
 ## 12.4 Signed bundles
 
-**A bundle is a value, not a path.** One blob is read from disk, carried in an `OFFER` over a data channel, and stashed in browser storage without a second format or load path. Verification is channel-independent: a bundle from a USB stick verifies exactly like one pushed over a relay.
+**A bundle is a value, not a path.** One blob is read from disk, carried in an app's own frame over a link, and stashed in browser storage without a second format or load path. Verification is channel-independent: a bundle from a USB stick verifies exactly like one pushed over a relay.
 
 **What the manifest is for.**
 

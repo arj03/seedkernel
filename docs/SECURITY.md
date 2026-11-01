@@ -21,7 +21,7 @@ A chat text message arriving at a fully bootstrapped node, traced through every 
 5. **Invoke the module.** The host copies `input` into the module's `scratch` region and calls `handle(input_len)`. The module reads `[pk 32][type][body]`, writes the render bytes `[type][pk_len][pk][body]` back at `scratch`, and returns their length (§11). It imports nothing from the host, reaches nothing, and asks no one who sent this: everything it needs is in the input (§4.2).
 6. **Render.** The guest returns the render bytes from its `handle`; the page reads them off its load's `onInbound` (§12.10) and `postMessage`s them to the sandboxed iframe, which draws the line attributed to A. Done.
 
-That is the entire steady-state pipeline: one AEAD open, one routing lookup, one guest entrypoint call, one module call, one copy each way. It is pure data movement. Public-key cryptography runs only per link and per install (§10.1). A relayed `OFFER` (§11) re-runs the install check on the receiving node, which is why a *bundle* authenticates against its original author across any number of relays while a chat *message* authenticates only its single hop (§5).
+That is the entire steady-state pipeline: one AEAD open, one routing lookup, one guest entrypoint call, one module call, one copy each way. It is pure data movement. Public-key cryptography runs only per link and per install (§10.1). A bundle a peer offers (§11) re-runs the install check on the receiving node, which is why a *bundle* authenticates against its original author across any number of relays while a chat *message* authenticates only its single hop (§5).
 
 ---
 
