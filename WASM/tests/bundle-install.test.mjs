@@ -1040,7 +1040,7 @@ async function testWrongTypedStoreIsRefused() {
   // The shared store over the Node file seam distinguishes a missing first-boot file from
   // malformed or unreadable state. A directory at the file path is a portable read failure
   // that cannot be mistaken for ENOENT.
-  const { freshnessStoreFor } = await imp("build/host/cli.js");
+  const { freshnessStoreFor } = await imp("build/host/platform.js");
   const { nodeRawFiles } = await imp("build/services/fs-node.js");
   const { freshnessPathFor } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");

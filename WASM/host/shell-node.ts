@@ -5,11 +5,10 @@
 // pass the policy.
 import { readFileSync } from "node:fs";
 import { nodePlatform } from "./platform-node.js";
-import { platformHost, tcpChannels } from "./platform.js";
+import { platformHost, tcpChannels, type NodeRuntime, type NodeSetup } from "./platform.js";
 import { type ChannelFactory, type LocalChannels } from "../services/socket-seam.js";
 import { type AppHandle, type InstallOptions, type Shell } from "./shell-core.js";
 import { type Fs } from "../services/fs.js";
-import { type NodeRuntime as CliNodeRuntime, type NodeSetup } from "./cli.js";
 
 /** The Node shell: the platform-neutral `Shell` plus `installFile` and a non-optional
  *  `fs`. */
@@ -20,9 +19,9 @@ export interface NodeShell extends Shell {
   installFile(file: string, opts?: InstallOptions): Promise<AppHandle>;
 }
 
-/** The CLI's runtime pair, narrowed to this platform's shell, so the compiler checks that
- *  `standUp` returns it. */
-export interface NodeShellRuntime extends CliNodeRuntime {
+/** `standUp`'s runtime pair, narrowed to this platform's shell, so the compiler checks
+ *  that `standUp` returns it. */
+export interface NodeShellRuntime extends NodeRuntime {
   shell: NodeShell;
 }
 
@@ -50,8 +49,7 @@ export function nodeChannels(): ChannelFactory {
 /** Local sockets over node:net, for reaching a node's control endpoint from a library
  *  (seedkernel-wasm/control `controlInvoke`). */
 export function nodeLocalChannels(): LocalChannels {
-  const { listenLocal, connectLocal } = tcpChannels(nodePlatform().net);
-  return { listenLocal: listenLocal!, connectLocal: connectLocal! };
+  return tcpChannels(nodePlatform().net).local!;
 }
 
 /** Node's datagram sockets, the `transport.datagrams` option for a caller that assembles a

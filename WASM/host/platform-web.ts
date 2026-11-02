@@ -11,12 +11,11 @@
 
 import { ModuleTable } from "./module-table.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
-import { EMPTY } from "./util.js";
 import type { PureModules } from "./bundle.js";
 import type { EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
 import type { Platform } from "./platform.js";
-import { PLATFORM_ABI, type PlatformBridge, type WholeEngine } from "./abi.js";
+import type { HostBridge, WholeEngine } from "./abi.js";
 
 /** The parts of a host blob, unchecked: a page's own code can run on the blob's wasm
  *  without fetching it again (its libsodium.wasm, under its own glue). */
@@ -108,7 +107,7 @@ export function randomBytes(n: number): Uint8Array {
 // ── the platform ─────────────────────────────────────────────────────────────
 
 /** The bridge members the Node and browser platforms share. */
-export type WebBridge = Pick<PlatformBridge, "random"> & WholeEngine;
+export type WebBridge = Pick<HostBridge, "random"> & WholeEngine;
 
 /** Entropy, private modules in workers and the engine over WebAssembly, and the release of
  *  every module they hold. */
@@ -146,16 +145,13 @@ export interface BrowserPlatformOptions {
 /** A page's platform, and the release of every module and instance its host holds. */
 export function browserPlatform(o: BrowserPlatformOptions): Platform & { teardown(): void } {
   const web = webBridge();
-  const bridge: PlatformBridge = {
-    abi: PLATFORM_ABI,
-    banner: "seedkernel-browser",
-    argv: () => "[]",
-    log: (line) => { console.log(line); },
-    stdout: () => {},
-    stdin: () => EMPTY,
-    ...web.bridge,
-    hostBlob: () => o.hostBlob,
-    stageHost: () => { throw new Error("host: a page runs the host it is served and takes no updates"); },
+  return {
+    bridge: {
+      ...web.bridge,
+      hostBlob: () => o.hostBlob,
+      stageHost: () => { throw new Error("host: a page runs the host it is served and takes no updates"); },
+    },
+    fs: o.files ?? memoryRawFiles(),
+    teardown: web.teardown,
   };
-  return { bridge, fs: o.files ?? memoryRawFiles(), teardown: web.teardown };
 }

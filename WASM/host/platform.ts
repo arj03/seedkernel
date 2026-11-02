@@ -1,14 +1,14 @@
 // The host's side of the platform ABI (abi.ts, §12.9): adapts a loader's primitives
 // (private modules, entropy, files, TCP and UDP sockets, the engine table that realms and
-// the host's crypto run on) to what `bootShell` takes, and runs the operator flow. The same
-// code runs on every target: as the host script over a loader's globals (host-main.ts),
-// and in-process under the Node library (shell-node.ts). It awaits each call a platform
-// may answer asynchronously.
+// the host's crypto run on) to what `bootShell` takes. The same code runs on every target:
+// as the host script over a loader's globals (host-main.ts, which adds the operator flow),
+// in-process under the Node library (shell-node.ts) and on a page (platform-web.ts). It
+// awaits each call a platform may answer asynchronously.
 import { policyFromJson } from "./policy.js";
-import { moduleSet, type PureModuleLoader } from "./bundle.js";
-import { freshnessStoreFor, runCli, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { FreshnessMarks, freshnessPathFor, moduleSet, type PureModuleLoader } from "./bundle.js";
 import { parseDest } from "../services/peer-addr.js";
-import { bootShell } from "./shell-core.js";
+import { bootShell, type BootShellOptions, type Shell, type TransportOptions } from "./shell-core.js";
+import type { TransportHost } from "../services/link.js";
 import { engineSodium, type HostSodium, type SyncEngine } from "./sodium-engine.js";
 import type { RealmFactory } from "./realm-queue.js";
 import { engineRealms } from "./engine-realm.js";
@@ -20,26 +20,44 @@ import {
 } from "../services/net-limits.js";
 import { FilesFs } from "../services/fs-files.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_SCRATCH_SIZE, WASM_PAGE_BYTES } from "./wasm-limits.js";
-import { u8 } from "./util.js";
+import { dec, enc, errMessage, u8 } from "./util.js";
 import { moduleShims, scratchModule } from "./pure-module.js";
 import { checkStagedHost, readHostBlob } from "./host-blob.js";
 import {
   PLATFORM_ABI,
-  type EngineTable, type PlatformBridge, type PlatformDispatchers, type PlatformFs, type PlatformNet,
-  type PlatformUdp,
+  type EngineTable, type HostBridge, type PlatformFs, type PlatformNet, type PlatformUdp,
 } from "./abi.js";
 
-/** A loader's primitives, as the globals of abi.ts. A page has no sockets of its own
- *  (platform-web.ts): its channels are the ones it passes to `standUp`. */
+/** A loader's primitives, as the globals of abi.ts, less what only the script's entry
+ *  reads. A page has no sockets of its own (platform-web.ts): its channels are the ones it
+ *  passes to `standUp`. */
 export interface Platform {
-  bridge: PlatformBridge;
+  bridge: HostBridge;
   fs: PlatformFs;
   net?: PlatformNet;
   udp?: PlatformUdp;
 }
 
-/** A host over one platform: the entry its loader calls, and what a node is built from. */
-export interface PlatformHost extends PlatformDispatchers {
+/** What a node needs: the store, the policy, and `bootShell`'s own options. Each target
+ *  builds the rest from its own parts (`standUp`). An embedder whose gate is not a policy
+ *  file passes `admit` in place of `policyJson`. */
+export interface NodeSetup extends Pick<BootShellOptions, "identity" | "admit" | "guestDeadlineMs" | "realmMemoryBytes"> {
+  /** The network, `bootShell`'s `services.transport` (§12.6). Omitted means none. */
+  transport?: TransportOptions;
+  /** Directory backing the `fs` service. */
+  dir: string;
+  /** Policy file contents (policy.ts). Omit ⇒ deny-all for ordinary apps. */
+  policyJson?: string;
+}
+
+/** Platform-owned channel integration kept beside the shell. */
+export interface NodeRuntime {
+  shell: Shell;
+  transport: TransportHost | null;
+}
+
+/** A host over one platform: what a node is built from. */
+export interface PlatformHost {
   /** This node's crypto, run on the engine table (sodium-engine.ts). */
   sodium: HostSodium;
   /** The realm factory (§12.3): realms on the engine table (engine-realm.ts). */
@@ -49,10 +67,13 @@ export interface PlatformHost extends PlatformDispatchers {
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
   /** A node's TCP sockets, on a platform that has them. The platform's datagrams the
    *  transport runs its UDP paths over are lent through `standUp` (§12.7). */
-  channels(): ChannelFactory;
+  channels(): TcpChannels;
   /** A node's private modules (§4). */
   modules: PureModuleLoader;
 }
+
+/** A platform's TCP sockets, and its local ones for the control endpoint where it has them. */
+export type TcpChannels = ChannelFactory & { local?: LocalChannels };
 
 /** A deadline as the ABI carries it: `Infinity` as -1, omitted as the shared default. */
 const abiMs = (ms: number | undefined): number =>
@@ -61,7 +82,7 @@ const abiMs = (ms: number | undefined): number =>
 /** The driver's ChannelFactory over a platform's TCP sockets. Once per platform, since it
  *  installs the socket limits and the dispatchers events arrive through. `silentMs` is
  *  shortened only by tests. */
-export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): ChannelFactory & Partial<LocalChannels> {
+export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): TcpChannels {
   /** Open channels by socket id, and accept callbacks by bound port. */
   const chans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
   const accepts = new Map<number, (id: number, remoteAddr: string) => void>();
@@ -111,17 +132,15 @@ export function tcpChannels(net: PlatformNet, silentMs = SILENT_SOCKET_MS): Chan
     };
   }
 
-  // Local sockets, on a platform that has them; their listeners key below zero.
-  const local: Partial<LocalChannels> = net.listenLocal && net.connectLocal ? {
-    listenLocal: async (path, onAccept) => {
-      const key = await net.listenLocal!(path);
-      accepts.set(key, (id) => onAccept(makeLink(id)));
-    },
-    connectLocal: (path) => makeLink(net.connectLocal!(path)),
-  } : {};
-
   return {
-    ...local,
+    // Local sockets, on a platform that has them; their listeners key below zero.
+    local: net.listenLocal && net.connectLocal ? {
+      listenLocal: async (path, onAccept) => {
+        const key = await net.listenLocal!(path);
+        accepts.set(key, (id) => onAccept(makeLink(id)));
+      },
+      connectLocal: (path) => makeLink(net.connectLocal!(path)),
+    } : undefined,
     // The ABI has no TLS socket, so `wss://` is unroutable (§12.1).
     connect: (dest) => {
       const d = parseDest(dest);
@@ -220,11 +239,19 @@ const engineModules = (t: EngineTable): PureModuleLoader => ({
     (w) => w.dispose()),
 });
 
-export function platformHost({ bridge, fs: files, net, udp }: Platform): PlatformHost {
-  if (bridge.abi !== PLATFORM_ABI) {
-    throw new Error(`host: this loader implements platform ABI ${bridge.abi}, the host needs ${PLATFORM_ABI}`);
-  }
+/** The freshness store (§12.4) beside the data directory. An unreadable file fails the
+ *  boot instead of dropping every mark and revocation. */
+export function freshnessStoreFor(files: PlatformFs, dir: string): FreshnessMarks {
+  const path = freshnessPathFor(dir);
+  let raw;
+  // The operator's own file, so no cap.
+  try {
+    raw = files.read(path, Number.MAX_SAFE_INTEGER);
+  } catch (e) { throw new Error(`freshness store: cannot read ${path}: ${errMessage(e)}`, { cause: e }); }
+  return new FreshnessMarks(raw === null ? null : dec.decode(u8(raw)), (json) => files.write(path, enc.encode(json), true));
+}
 
+export function platformHost({ bridge, fs: files, net, udp }: Platform): PlatformHost {
   const { engine, modules } = "engine" in bridge ? bridge
     : { engine: tableEngine(bridge), modules: engineModules(bridge) };
   /** The running host blob, which carries the realm engine, this host's crypto and its
@@ -262,7 +289,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
         // it.
         host: {
           stage: async (blob: Uint8Array) => {
-            checkStagedHost(sodium, hostEnv, bridge.abi, blob);
+            checkStagedHost(sodium, hostEnv, PLATFORM_ABI, blob);
             await bridge.stageHost(blob);
           },
         },
@@ -270,28 +297,5 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
     });
   }
 
-  // ── the operator flow ──────────────────────────────────────────────────────────
-  /** This platform as `cli.ts` needs it; cli.ts makes every decision. */
-  const cliHost = (): CliHost => ({
-    read: (path, maxBytes) => files.read(path, maxBytes),
-    write: (path, bytes, durable) => files.write(path, bytes, durable),
-    banner: bridge.banner,
-    argv: JSON.parse(bridge.argv()) as string[],
-    log(line) { bridge.log(line); },
-    stdout(bytes) { bridge.stdout(bytes); },
-    stdin() { return u8(bridge.stdin()); },
-    sodium,
-    standUp,
-    ...(tcp?.listenLocal && tcp.connectLocal ? { local: tcp as LocalChannels } : {}),
-  });
-
-  return {
-    sodium, createRealm, standUp, channels, modules,
-    /** Run the operator flow. The loader reads back whether to keep running. */
-    async runMain() {
-      const { serving, close } = await runCli(cliHost());
-      if (!serving) close();
-      return serving;
-    },
-  };
+  return { sodium, createRealm, standUp, channels, modules };
 }

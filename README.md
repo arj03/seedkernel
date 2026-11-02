@@ -138,7 +138,7 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,876 LOC)**
+**Shared: one implementation for all three targets (3,882 LOC)**
 
 The core, which every node runs:
 
@@ -148,7 +148,7 @@ The core, which every node runs:
 | Guest seam (§12.2): the call surface, which wires only the host services a node offers, and the serialized realm queue | `host/guest-seam.ts`, `host/realm-queue.ts` | 384 |
 | Node assembly and claim routing (§12.8, §12.10): the boot assembly, which names the services a node offers, and the installed set and the claim books over it | `host/shell-core.ts`, `host/slot-table.ts` | 406 |
 | Guest realms and the host's crypto (§12.3, §12.9): the realm driver over the platform's engine table, and libsodium and ML-DSA-65 on the same table | `host/engine-realm.ts`, `host/sodium-engine.ts`, `host/pq.ts` | 418 |
-| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 330 |
+| The host's side of the platform ABI (§12.9): the ABI's types, the adapter from its primitives to `bootShell`, the host script's entry, and the Web globals QuickJS lacks | `host/platform.ts`, `host/abi.ts`, `host/host-main.ts`, `host/native-polyfills.ts` | 350 |
 | The shared vocabulary: the `HOST_SERVICES` table and signing domains, the master-seed subkey derivation (§12.6.2b), the raw-link event codec (`host/op-frame.ts`, also available to clients) and byte helpers | `host/domains.ts`, `host/subkeys.ts`, `host/op-frame.ts`, `host/util.ts`, `host/utf8.ts` | 271 |
 
 The host services (§12.2), one row each. A node offers `node` and `timer` always and the others only where `bootShell`'s `services` names them; the code ships either way. Their platform backends are per-target, below:
@@ -164,7 +164,7 @@ The operator front-end, on Node and native only:
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Node startup, the operator flow (§12.8): the flag set and its defaults, which services and boot transport a node gets, the order it boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 379 |
+| Node startup, the operator flow (§12.8): the flag set and its defaults, which services and boot transport a node gets, the order it boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 365 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
@@ -172,7 +172,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,064 TS |
+| **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,058 TS |
 | **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,484 Go |
 
 The transport bundle sits outside these host totals: 2,989 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.

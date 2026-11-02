@@ -24,16 +24,22 @@ export const PLATFORM_ABI = 1;
  *  and its loader's host slots beside it (slots.ts). */
 export const DEFAULT_DIR = "./data";
 
-/** The process, the engine (§12.9) and private modules (§4), which come in one of two
- *  pairs: `WholeEngine` (Node, the browser) or `EngineTable` (native). */
-export type PlatformBridge = BridgeProcess & (WholeEngine | EngineTable);
+/** Everything a loader installs: what the host script's entry reads, and the host's own
+ *  part. */
+export type PlatformBridge = BridgeEntry & HostBridge;
 
-interface BridgeProcess {
+/** What the host itself takes (platform.ts): the process, and the engine (§12.9) and
+ *  private modules (§4), which come in one of two pairs: `WholeEngine` (Node, the browser)
+ *  or `EngineTable` (native). A page supplies only this. */
+export type HostBridge = BridgeProcess & (WholeEngine | EngineTable);
+
+/** What only the host script's entry reads (host-main.ts): the ABI version, checked where
+ *  a loader meets the script, and the operator's console. */
+interface BridgeEntry {
   /** The ABI version this loader implements (`PLATFORM_ABI`). */
   readonly abi: number;
   /** The first word of the console banner, which names the loader. */
   readonly banner: string;
-
   /** Process arguments after the program name, as a JSON array. */
   argv(): string;
   /** One diagnostic line on stderr; stdout is the data channel. */
@@ -42,6 +48,9 @@ interface BridgeProcess {
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin, or empty when nothing was piped in. */
   stdin(): Bytes;
+}
+
+interface BridgeProcess {
   /** `n` bytes from the platform CSPRNG. */
   random(n: number): Bytes;
 

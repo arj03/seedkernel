@@ -28,7 +28,7 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): the host (`platformHost`) and its browser platform, the socket seams and bundle verification | ~156 KB |
+| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): the host (`platformHost`) and its browser platform, the socket seams and bundle verification | ~140 KB |
 | **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium, ML-DSA-65 and the default transport, signed (§12.9). The native and Node loaders run it | 1.18 MB |
 | of which the host script (`build/host.js`) | 219 KB |
 | of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 624 KB |
@@ -36,10 +36,10 @@ This is the one place these figures live.
 | of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KB |
 | of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm` and `mlkem768.wasm` (ML-KEM-768, 12 KB) | 131 KB |
 | **Web host blob** (`build/host-web.skb`): the same signed blob with an empty script, since a page imports the host instead | 993 KB |
-| **Total browser deployment**: the modules and the web host blob | **~1.1 MB (~475 KB gzipped)** |
+| **Total browser deployment**: the modules and the web host blob | **~1.1 MB (~470 KB gzipped)** |
 | **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MB), the Go runtime (~2.4 MB) and the genesis host blob | ~6.9 MB |
 
-`npm run build` emits the readable `build/` (~285 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~156 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach: the host modules a page imports. It prints the gzipped size before and after minifying on every run.
+`npm run build` emits the readable `build/` (~285 KB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~140 KB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach: the host modules a page imports. It prints the gzipped size before and after minifying on every run.
 
 ---
 
