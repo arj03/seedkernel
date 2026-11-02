@@ -313,7 +313,7 @@ async function testManifestClaimIsTheRouting() {
       const seams = [];
       const node = await bootTestShell({
         identity,
-        services: { transport: {} },
+        services: { transport: { bundle: (await imp("build/host/transport-bundle.js")).transportBundleBytes() } },
         createRealm: async (o) => {
           seams.push(o.hostCall);
           return { call: async (input) => input.slice(32), dispose() {} };

@@ -97,15 +97,6 @@ export function readU32BE(buf: Uint8Array, offset: number): number {
           (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
 }
 
-/** Base64 to bytes via the platform's `atob` (a browser global, also in Node 16+ and in
- *  the native shell's QuickJS). */
-export function fromBase64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
 /** Whether a parsed value is an object with keys, not an array or null: the shape every
  *  JSON document the host reads has at its root. */
 export function isRecord(v: unknown): v is Record<string, unknown> {

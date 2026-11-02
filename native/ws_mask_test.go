@@ -21,10 +21,10 @@ import (
 // assembly/ws/abi.ts
 const wsOpMask = 1
 
-// wsModuleJS lifts ws.wasm out of the transport bundle the host already embeds, so the
+// wsModuleJS lifts ws.wasm out of the transport bundle the host blob carries, so the
 // module under test is always the one that ships in the signed bundle.
 const wsModuleJS = `
-globalThis.__wsModuleBytes = () => verifyBundle(sodium, transportBundleBytes()).modules.find(({ mod }) => mod.name === "ws").wasm;
+globalThis.__wsModuleBytes = () => verifyBundle(sodium, readHostBlob(new Uint8Array(bridge.hostBlob())).transport).modules.find(({ mod }) => mod.name === "ws").wasm;
 `
 
 // wsInstance is ws.wasm on a runtime of the test's own, read and written directly: what

@@ -1,20 +1,21 @@
 // The platform over the Web APIs (§12.9): WebAssembly, workers and crypto.getRandomValues,
 // which Node has too. The engine table over WebAssembly and `webBridge` are what the Node
 // platform (platform-node.ts) shares with the browser's; `browserPlatform` is the browser's
-// whole platform, and `browserHost` the page's loader.
+// whole platform, which a page stands its host up on: `platformHost(browserPlatform(...))`.
 //
 // A page has no slots. The origin that serves it is its trust root, so it runs the host
-// blob it is served and takes no updates. It has no TCP or UDP sockets: it stands its node
-// up through the host's `standUp` (platform.ts) with its own channels (WebSocket, WebRTC).
+// modules and blob it is served and takes no updates. It imports the host rather than
+// evaluating the blob's script, so it is served build/host-web.skb, the blob without one.
+// It has no TCP or UDP sockets: it stands its node up through the host's `standUp`
+// (platform.ts) with its own channels (WebSocket, WebRTC).
 
 import { ModuleTable } from "./module-table.js";
-import { readHostBlob } from "./host-blob.js";
 import { memoryRawFiles } from "../services/fs-memory.js";
-import { dec, EMPTY } from "./util.js";
+import { EMPTY } from "./util.js";
 import type { PureModules } from "./bundle.js";
 import type { EngineImports, EngineInstance } from "./engine-realm.js";
 import type { RawFiles } from "../services/fs-files.js";
-import type { Platform, PlatformHost } from "./platform.js";
+import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type PlatformBridge, type WholeEngine } from "./abi.js";
 
 /** The parts of a host blob, unchecked: a page's own code can run on the blob's wasm
@@ -135,7 +136,7 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
 }
 
 export interface BrowserPlatformOptions {
-  /** The host blob the page is served (build/host.skb): its realm engine and its crypto. */
+  /** The host blob the page is served (build/host-web.skb): its realm engine and its crypto. */
   hostBlob: Uint8Array;
   /** Where the node keeps its files: its `fs`, and the freshness marks beside it. Default:
    *  memory, gone with the page. */
@@ -157,23 +158,4 @@ export function browserPlatform(o: BrowserPlatformOptions): Platform & { teardow
     stageHost: () => { throw new Error("host: a page runs the host it is served and takes no updates"); },
   };
   return { bridge, fs: o.files ?? memoryRawFiles(), teardown: web.teardown };
-}
-
-/** A page's loader: the host blob's own script, run on the browser platform as the Node
- *  loader runs it (loader-node.ts), so the page runs the host the Node and native nodes
- *  run. Evaluating it takes `'unsafe-eval'` in the page's `script-src`. A page that
- *  assembles its node with `bootShell` itself imports the host instead, and takes only the
- *  blob's engine and crypto: `platformHost(browserPlatform(...))`. */
-export function browserHost(o: BrowserPlatformOptions): PlatformHost & { teardown(): void } {
-  const platform = browserPlatform(o);
-  // The loader's globals (abi.ts); a page has no sockets.
-  Object.assign(globalThis, { bridge: platform.bridge, __fs: platform.fs, __net: undefined, __udp: undefined });
-  // Indirect, so the script runs in global scope, as on every loader, and leaves its entry
-  // there.
-  (0, eval)(dec.decode(readHostBlob(o.hostBlob).script));
-  const g = globalThis as unknown as Record<string, unknown>;
-  return {
-    runMain: g.runMain, standUp: g.standUp, createRealm: g.createRealm, sodium: g.sodium,
-    channels: g.platformChannels, modules: g.platformModules, teardown: platform.teardown,
-  } as PlatformHost & { teardown(): void };
 }

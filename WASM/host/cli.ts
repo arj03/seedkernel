@@ -6,7 +6,7 @@ import type { RawFiles } from "../services/fs-files.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "./subkeys.js";
 import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
 import { OpArgs, writeOp } from "./op-frame.js";
-import { TRANSPORT_SERVICE } from "./transport-bundle.js";
+import { TRANSPORT_SERVICE } from "./host-blob.js";
 import { parseHostPort } from "../services/peer-addr.js";
 import type { TransportHost } from "../services/link.js";
 import type { ListenAddress, LocalChannels } from "../services/socket-seam.js";

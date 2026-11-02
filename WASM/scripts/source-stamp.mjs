@@ -26,14 +26,13 @@ const wasmDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const posix = (p) => p.split(sep).join("/");
 
 /** Sources for one bundle-host input list, as WASM-relative posix paths, sorted.
- *  `build/x/y.js` is tsc's output for `x/y.ts`; host/transport-bundle.ts is itself
- *  generated, so the guest parts and the ws module stand in for it. */
+ *  `build/x/y.js` is tsc's output for `x/y.ts`. The host blob carries the transport
+ *  bundle beside the script, so its guest parts and the ws module are stamped too. */
 export function stampedSources(buildFiles) {
   const ts = buildFiles
     .map(posix)
     .filter((f) => f.startsWith("build/"))
-    .map((f) => f.slice("build/".length).replace(/\.js$/, ".ts"))
-    .filter((f) => f !== "host/transport-bundle.ts");
+    .map((f) => f.slice("build/".length).replace(/\.js$/, ".ts"));
   const guest = guestSourcePaths().map((p) => posix(relative(wasmDir, p)));
   const ws = readdirSync(join(wasmDir, "assembly", "ws"))
     .filter((f) => f.endsWith(".ts"))

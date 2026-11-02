@@ -4,7 +4,6 @@
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, type SeamCrypto, type HostCall, type LocalCall } from "./guest-seam.js";
-import { transportBundleBytes } from "./transport-bundle.js";
 import { createSlotTable } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
 import { enc, fromHex, toHex, isHex64, isRecord, errMessage, concatBytes, EMPTY, HOST_CALLER_ID } from "./util.js";
@@ -129,8 +128,8 @@ export interface NodeServices {
 
 /** This node's network (§12.6). */
 export interface TransportOptions extends TransportHostOptions {
-  /** The signed transport to install at boot; selecting it authorizes `link`. Defaults to
-   *  the bundle shipped with the package. */
+  /** The signed transport to install at boot; selecting it authorizes `link`. A host's
+   *  `standUp` defaults it to its blob's transport (platform.ts). */
   bundle?: Uint8Array;
   /** Installation-local configuration for the initial transport. */
   config?: JsonObject;
@@ -477,7 +476,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   // A failed boot returns no handle, so it tears down what it started.
   try {
     if (netHost) {
-      await installBundle(net!.bundle ?? transportBundleBytes(),
+      if (!net!.bundle) throw new Error("transport: no bundle to install");
+      await installBundle(net!.bundle,
         net!.config === undefined ? undefined : { localConfig: net!.config }, true);
       await netHost.start();
     }

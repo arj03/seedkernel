@@ -8,9 +8,10 @@ import { readHostBlob } from "./host-blob.js";
 import type { RealmFactory } from "./realm-queue.js";
 
 let qjsBytes: Promise<Uint8Array> | undefined;
-/** qjs.wasm, out of the package's host blob (build/host.skb, beside build/host/). */
+/** qjs.wasm, out of the package's web host blob (build/host-web.skb, beside build/host/),
+ *  the one a page stages. */
 function loadQjs(): Promise<Uint8Array> {
-  const url = new URL("../host.skb", import.meta.url);
+  const url = new URL("../host-web.skb", import.meta.url);
   const node = globalThis.process?.versions?.node;
   return qjsBytes ??= (node
     ? import("node:fs/promises").then(({ readFile }) => readFile(url)).then((b) => new Uint8Array(b))

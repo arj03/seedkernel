@@ -80,17 +80,13 @@ const sharedRows = [
     files: ["WASM/host/cli.ts", "WASM/host/control.ts"] },
 ];
 
-// In the shared bundle but counted elsewhere: transport-bundle.ts, one line of signed bundle
-// base64, not host code. Listed so reconciliation can tell it from files counted nowhere.
-const countedElsewhere = ["WASM/host/transport-bundle.ts"];
-
 /** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
  *  not include. Derived, so a new backend is counted automatically. */
 const jsFiles = ["services", "host"].flatMap((d) =>
   readdirSync(resolve(wasmDir, d))
     .filter((f) => f.endsWith(".ts"))
     .map((f) => `WASM/${d}/${f}`))
-  .filter((f) => !sharedSet.has(f) && !countedElsewhere.includes(f));
+  .filter((f) => !sharedSet.has(f));
 
 const goFiles = readdirSync(resolve(repoDir, "native"))
   .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
@@ -106,7 +102,7 @@ const rows = [
 const sharedTotal = sharedRows.reduce((n, r) => n + sum(r.files), 0);
 
 // ── reconcile the shared set against the rows ────────────────────────────────
-const accounted = new Set([...sharedRows.flatMap((r) => r.files), ...countedElsewhere]);
+const accounted = new Set(sharedRows.flatMap((r) => r.files));
 const orphans = [...sharedSet].filter((f) => !accounted.has(f));
 const phantoms = [...accounted].filter((f) => !sharedSet.has(f) && !f.startsWith("native/"));
 

@@ -6,6 +6,7 @@
 //   qjs        qjs.wasm, the engine guest realms run on (and, on native, the host realm)
 //   sodium     libsodium.wasm, the host's crypto
 //   mldsa      mldsa65.wasm, the host's ML-DSA-65 verifier
+//   transport  build/transport.skb, the signed transport bundle a node boots with (§12.6)
 //
 // The running host checks a blob before it hands it to the loader (`checkStagedHost`), with
 // its own crypto, as it checks an app bundle. A loader holds no crypto: it reads the layout
@@ -30,13 +31,17 @@ export interface HostParts {
   qjs: Uint8Array;
   sodium: Uint8Array;
   mldsa: Uint8Array;
+  transport: Uint8Array;
 }
 
 export interface HostBlob extends HostParts {
   manifest: HostManifest;
 }
 
-export const HOST_PART_NAMES = ["script", "qjs", "sodium", "mldsa"] as const;
+export const HOST_PART_NAMES = ["script", "qjs", "sodium", "mldsa", "transport"] as const;
+
+/** The local service id the host blob's transport claims under `services`. */
+export const TRANSPORT_SERVICE = "_net";
 
 /** Split a host blob without authenticating it. The parts alias `env`. */
 export function readHostBlob(env: Uint8Array): HostBlob {

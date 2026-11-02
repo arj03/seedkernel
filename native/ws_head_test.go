@@ -21,7 +21,7 @@ import (
 const wsHeadJS = `
 "use strict";
 {
-  const blob = transportBundleBytes();
+  const blob = readHostBlob(new Uint8Array(bridge.hostBlob())).transport;
   const bundle = verifyBundle(sodium, blob);
   const src = bundle.guestSource;
   // The whole preamble the program reads at load; the framer never spends the HOST budget.

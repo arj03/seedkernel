@@ -142,13 +142,15 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1
   }
 }
 
-// A page's node: the host blob's own script, run by the page's loader on the browser
-// platform (platform-web.ts), through the same standUp, with the page's own admission gate
-// in place of a policy file.
+// A page's node: the imported host on the browser platform (platform-web.ts) over the web
+// blob, through the same standUp, with the page's own admission gate in place of a policy
+// file.
 {
   const { authorBundle, testAuthor } = await import("./fixtures.mjs");
-  const { browserHost } = await imp("build/host/platform-web.js");
-  const host = browserHost({ hostBlob: new Uint8Array(readFileSync(join(root, "build/host.skb"))) });
+  const { browserPlatform } = await imp("build/host/platform-web.js");
+  const { platformHost } = await imp("build/host/platform.js");
+  const platform = browserPlatform({ hostBlob: new Uint8Array(readFileSync(join(root, "build/host-web.skb"))) });
+  const host = platformHost(platform);
   const asked = [];
   const node = await host.standUp({
     dir: "page", identity: host.sodium.crypto_sign_keypair(),
@@ -169,7 +171,7 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1
     ok(/no sockets/.test(msg), "a page's node is networked only through the page's own channels");
   } finally {
     node.shell.close();
-    host.teardown();
+    platform.teardown();
   }
 }
 

@@ -66,6 +66,7 @@
       "default": "./build/host/platform-web.js"
     },
     "./host.skb": "./build/host.skb",
+    "./host-web.skb": "./build/host-web.skb",
     "./ws.wasm": "./build/ws.wasm",
     "./transport-bundle": {
       "types": "./build/host/transport-bundle.d.ts",
@@ -88,26 +89,26 @@
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
     "build:host": "node scripts/prune-build.mjs && tsc -p .",
     "build:host:min": "node scripts/minify.mjs",
-    "build:native": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:native-host",
+    "build:native": "npm run build:ws && npm run build:host && npm run build:transport-bundle && npm run build:native-host",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build:pq": "node scripts/build-mldsa.mjs && node scripts/build-mlkem.mjs",
-    "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host-script && npm run build:loader-script && npm run build:host-blob && npm run build:host:min",
+    "build": "npm run build:ws && npm run build:host && npm run build:transport-bundle && npm run build:host-script && npm run build:loader-script && npm run build:host-blob && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium && npm run build:pq",
     "shell": "node build/host/loader-node.js",
     "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release && asc tests/fixtures/scratch-probe.ts --config asconfig.scratch-probe.json --target release",
     "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/cli.test.mjs && node tests/loader-node.test.mjs && node tests/host-updates.test.mjs && node tests/transport-link.test.mjs && node tests/transport-load.test.mjs && node tests/transport.test.mjs && node tests/transport-tcp.test.mjs && node tests/ws-framing.test.mjs && node tests/transport-bundle.test.mjs && node tests/net-rtc.test.mjs && node tests/net-udp.test.mjs && node tests/transport-relay.test.mjs && node tests/bundle-install.test.mjs && node tests/bundle-replacement.test.mjs && node tests/realm-guest.test.mjs && node tests/crypto.test.mjs",
     "test:load": "npm run build && node tests/transport-load.test.mjs",
     "loc": "node scripts/loc.mjs",
-    "build:transport-bundle": "tsc -p tsconfig.transport-prebuild.json && node scripts/build-transport-bundle.mjs",
-    "build:host-script": "node scripts/bundle-host.mjs build/host.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,appSignScope,nodeService,fsService,toHex,fromHex,freshnessPathFor,FilesFs,sodium,deriveNodeKey,verifyBundle,transportBundleBytes,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,DOMAIN_HOST,SUITE_MANIFEST_HYBRID_PQ,platformChannels,platformModules,moduleShims,combineChannels\" build/host/utf8.js build/host/native-polyfills.js build/host/util.js build/host/op-frame.js build/host/domains.js build/host/wasm-limits.js build/services/net-limits.js build/host/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/services/fs.js build/services/fs-files.js build/host/realm-queue.js build/host/slot-table.js build/services/node.js build/services/timer.js build/services/socket-seam.js build/services/datagrams.js build/services/link.js build/services/host.js build/host/transport-bundle.js build/host/shell-core.js build/services/peer-addr.js build/host/control.js build/host/cli.js build/host/engine-realm.js build/host/pq.js build/host/sodium-engine.js build/host/abi.js build/host/host-blob.js build/host/pure-module.js build/host/platform.js build/host/host-main.js",
+    "build:transport-bundle": "node scripts/build-transport-bundle.mjs",
+    "build:host-script": "node scripts/bundle-host.mjs build/host.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,appSignScope,nodeService,fsService,toHex,fromHex,freshnessPathFor,FilesFs,sodium,deriveNodeKey,verifyBundle,readHostBlob,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,DOMAIN_HOST,SUITE_MANIFEST_HYBRID_PQ,platformChannels,platformModules,moduleShims,combineChannels\" build/host/utf8.js build/host/native-polyfills.js build/host/util.js build/host/op-frame.js build/host/domains.js build/host/wasm-limits.js build/services/net-limits.js build/host/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/services/fs.js build/services/fs-files.js build/host/realm-queue.js build/host/slot-table.js build/services/node.js build/services/timer.js build/services/socket-seam.js build/services/datagrams.js build/services/link.js build/services/host.js build/host/shell-core.js build/services/peer-addr.js build/host/control.js build/host/cli.js build/host/engine-realm.js build/host/pq.js build/host/sodium-engine.js build/host/abi.js build/host/host-blob.js build/host/pure-module.js build/host/platform.js build/host/host-main.js",
     "build:loader-script": "node scripts/bundle-host.mjs build/loader.js \"Loader,loaderFlags,withoutOp,PLATFORM_ABI\" build/host/utf8.js build/host/native-polyfills.js build/host/util.js build/host/domains.js build/host/wasm-limits.js build/host/bundle.js build/host/host-blob.js build/host/abi.js build/host/slots.js",
     "build:native-host": "npm run build:host-script && npm run build:loader-script && npm run build:host-blob && node -e \"const f=require('fs'); f.copyFileSync('build/host.skb', '../native/host.skb'); f.copyFileSync('build/loader.js', '../native/loader.js')\"",
     "build:host-blob": "node scripts/build-host-blob.mjs"
   },
   "devDependencies": {
-    "libsodium-wrappers": "0.8.4",
     "@types/node": "^20.11.0",
     "assemblyscript": "0.28.14",
+    "libsodium-wrappers": "0.8.4",
     "typescript": "^5.4.0"
   }
 }

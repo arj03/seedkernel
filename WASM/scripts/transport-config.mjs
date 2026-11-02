@@ -1,8 +1,5 @@
 // The transport's signed defaults, written into manifest.guest.config.
 
-/** The local service id this bundle claims under `services`; the host gives it no meaning. */
-export const TRANSPORT_SERVICE = "_net";
-
 /** The largest frame, and so the largest application message. It must fit ws.wasm's
  *  scratch and the host's MAX_LINK_READ_BYTES (tests/transport.test.mjs). */
 export const MAX_FRAME_BYTES = 2 * 1024 * 1024;

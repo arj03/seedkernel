@@ -20,7 +20,7 @@ const HEALTH_MS = 400;
 const genesis = verifyHostBlob(sodium, readFileSync(join(root, "build/host.skb")));
 const hostKeys = hybridAuthorKeysFromSeed(sodium, Buffer.from(readFileSync(join(root, "host-author.key"), "utf8").trim(), "hex"));
 const hostBlob = (version, keys = hostKeys, script = genesis.script, abi = genesis.manifest.abi) => signHostBlob(sodium, keys, { version, abi },
-  { script, qjs: genesis.qjs, sodium: genesis.sodium, mldsa: genesis.mldsa });
+  { script, qjs: genesis.qjs, sodium: genesis.sodium, mldsa: genesis.mldsa, transport: genesis.transport });
 
 const author = testAuthor();
 writeFileSync(join(work, "updater.skb"), authorBundle(sodium, author, {

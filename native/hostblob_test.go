@@ -21,6 +21,7 @@ const (
 	partQjs
 	partSodium
 	partMldsa
+	partTransport
 )
 
 // hostPart is one part of env's body, read independently of readHostBlob.
@@ -37,8 +38,8 @@ func hostPart(t testing.TB, env []byte, part int) []byte {
 }
 
 // hostEnvelope independently frames and signs a host blob (WASM/host/host-blob.ts) under
-// DOMAIN_host as the realm spells it, with the genesis blob's engine and crypto and this
-// script, so a disagreement with either reader shows up.
+// DOMAIN_host as the realm spells it, with the genesis blob's engine, crypto and transport
+// and this script, so a disagreement with either reader shows up.
 func hostEnvelope(t testing.TB, a authorKeys, version, abi int, script string) []byte {
 	t.Helper()
 	manifest, err := json.Marshal(map[string]int{"version": version, "abi": abi})
@@ -47,7 +48,8 @@ func hostEnvelope(t testing.TB, a authorKeys, version, abi int, script string) [
 	}
 	var body []byte
 	for _, part := range [][]byte{manifest, []byte(script), hostPart(t, genesisHost, partQjs),
-		hostPart(t, genesisHost, partSodium), hostPart(t, genesisHost, partMldsa)} {
+		hostPart(t, genesisHost, partSodium), hostPart(t, genesisHost, partMldsa),
+		hostPart(t, genesisHost, partTransport)} {
 		body = binary.BigEndian.AppendUint32(body, uint32(len(part)))
 		body = append(body, part...)
 	}

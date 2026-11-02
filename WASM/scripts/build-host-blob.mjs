@@ -1,6 +1,6 @@
-// Builds the signed host blob (§12.9, host/host-blob.ts): the host script, the realm engine
-// and the host's crypto, signed under the hybrid suite. Writes build/host.skb, which every
-// loader carries as its genesis host.
+// Builds the signed host blob (§12.9, host/host-blob.ts): the host script, the realm engine,
+// the host's crypto and the default transport, signed under the hybrid suite. Writes
+// build/host.skb, which every loader carries as its genesis host.
 //
 // The author key is `--key <seed>` or host-author.key, generated on first build, so each
 // clone has its own host author. A loader that runs this blob accepts updates only from
@@ -19,14 +19,21 @@ const { sodium, keys } = buildAuthor(root, "host-author.key", process.argv.slice
 
 const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).hostVersion;
 if (!Number.isSafeInteger(version) || version < 1) throw new Error("package.json hostVersion must be a positive integer");
-const blob = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, {
+const parts = {
   script: readFileSync(join(root, "build", "host.js")),
   // Where the native build keeps it (native/qjs/build-qjs.sh), checked in there since
   // go:embed cannot reach outside native/.
   qjs: readFileSync(join(root, "..", "native", "qjs", "qjs.wasm")),
   sodium: readFileSync(join(root, "browser", "libsodium.wasm")),
   mldsa: readFileSync(join(root, "browser", "mldsa65.wasm")),
-});
+  transport: readFileSync(join(root, "build", "transport.skb")),
+};
+const blob = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, parts);
 writeFileSync(join(root, "build", "host.skb"), blob);
 console.log(`  host blob: build/host.skb (${blob.length} B), version ${version}, abi ${PLATFORM_ABI}`);
+// The same blob with an empty script, for a page that runs the host from this package's
+// modules (`platformHost` on `browserPlatform`) and so reads only the engine and crypto.
+const web = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, { ...parts, script: new Uint8Array(0) });
+writeFileSync(join(root, "build", "host-web.skb"), web);
+console.log(`  host blob: build/host-web.skb (${web.length} B), no script`);
 console.log(`  host author: ${toHex(hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey))} (hybrid 0x02)`);

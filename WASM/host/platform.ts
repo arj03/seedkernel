@@ -227,7 +227,8 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
 
   const { engine, modules } = "engine" in bridge ? bridge
     : { engine: tableEngine(bridge), modules: engineModules(bridge) };
-  /** The running host blob, which carries the realm engine and this host's crypto. */
+  /** The running host blob, which carries the realm engine, this host's crypto and its
+   *  default transport. */
   const hostEnv = u8(bridge.hostBlob());
   const hostParts = readHostBlob(hostEnv);
   const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)));
@@ -249,10 +250,11 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
       realmMemoryBytes: cfg.realmMemoryBytes,
       services: {
         fs: new FilesFs(files, cfg.dir),
-        // The network as configured, over the platform's sockets unless the caller brings
-        // its own.
+        // The network as configured: the blob's transport over the platform's sockets,
+        // unless the caller brings its own.
         transport: cfg.transport && {
           ...cfg.transport,
+          bundle: cfg.transport.bundle ?? hostParts.transport,
           channels: cfg.transport.channels ?? channels(),
           datagrams: cfg.transport.datagrams ?? udp,
         },
