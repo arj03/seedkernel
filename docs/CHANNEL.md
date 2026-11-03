@@ -406,8 +406,7 @@ limits the *retroactive* damage.
 4. msg1 contains no identity, so a recording plus a later key seizure reveals none.
 5. The receiver's key never goes on the wire, and the caller's goes only to a receiver that
    proved the dialed key.
-6. Neither the contact secret nor the network key appears on the wire in the clear, and the
-   handshake carries neither (§6).
+6. Neither the contact secret nor the network key goes on the wire (§6).
 7. Honest transports on different network keys never link.
 8. Subkey derivation is deterministic: a node rebuilds its identity from the seed alone.
 9. Only `close()` emits the end-of-stream record; every failure path is silent. *(§12.6.1)*
@@ -474,7 +473,7 @@ invariant that the bytes a node sends are the bytes it folds into the transcript
 bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
 both PQ widths with room while bounding a stranger to that cap times the unverified budget.
 `MAX_QUEUE_BYTES` is unaffected: it bounds queued application frames, not the handshake.
-The KEM does raise the memory a stranger holds for `UNVERIFIED_TIMEOUT_MS`. On a UDP path
+The KEM does raise the memory a stranger holds for `unverifiedTimeoutMs`. On a UDP path
 msg1 exceeds one 1,200-byte packet, which costs nothing: the handshake runs over the path's
 reliable stream (RUNTIME §12.7), which splits it like any other write. The contact-secret seal covers
 the KEM public key and is checked before the responder performs encapsulation, so

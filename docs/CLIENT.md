@@ -231,7 +231,7 @@ Every `bootShell` field but `sodium` and `identity` has a default (the module ta
 | --- | --- | --- |
 | `fs: backend` | `fs`, each app scoped to its own keys over the backend (`MemoryFs`, `NodeFs`, or any `Fs`) | No store; `Shell.fs` and `AppHandle.fs` are absent |
 | `transport: { …options }` | `link`, occupied by the transport. `bootShell` constructs and returns the `TransportHost` adapter, then installs the shipped bundle (or `transport.bundle` when supplied) during boot, with revocation and freshness enforced, loads it with `transport.config` as that load's `localConfig`, and starts listeners | No adapter; `BootResult.transport` is `null` and the node has no network |
-| `host: staging` | `host`, the loader's host slots (§12.9) | No host updates |
+| `host: staging` | `host`, the loader's host slots (§12.9) | No `host` service; a bundle requiring it does not install |
 
 A relay is `{ transport }`, a node with no network `{ fs }`.
 
@@ -270,20 +270,20 @@ The incoming author and app name may differ from the slot being retired. What a 
 ```js
 import { policyFromJson } from "seedkernel-wasm/shell-core";
 
-// Replace these placeholders with approved 64-character lowercase author ids.
+// Replace this placeholder with an approved 64-character lowercase author id.
 const appAuthor = "<approved app author id in hex>";
-const transportAuthor = "<approved transport author id in hex>";
 
 const basePolicy = policyFromJson(JSON.stringify({
   authors: [appAuthor],
 }));
-// Each pinned claim names the one author and app label allowed to hold it.
+// Each pinned claim names the one author and app label allowed to hold it; null reserves
+// it from every ordinary app.
 const protocolOwners = new Map([
   ["private-chat-v1", `${appAuthor}:private-chat`],
 ]);
 const serviceOwners = new Map([
   ["private-chat-local", `${appAuthor}:private-chat`],
-  ["_net", `${transportAuthor}:transport`],
+  ["_net", null],
 ]);
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -300,13 +300,13 @@ const approvedClaims = (v) => {
 const admit = async (v) => (await basePolicy(v)) && approvedClaims(v);
 ```
 
-Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks apply to ordinary app candidates, including an app trying to claim `_net`; bundles requiring `link` bypass the predicate (§12.5).
+Keep the claim pins in operator-controlled configuration and name the approved bundles' actual app labels and service ids. The maps are independent audiences; a claim in neither is judged by `basePolicy` alone. These checks see only ordinary app candidates: a transport requires `link` and bypasses the predicate (§12.5), so `_net` is pinned to nobody, which stops an ordinary app from claiming it.
 
 **Admitting is the whole permission.** The host confines a guest to its `guest.requires` and holds its sends to the protocol ids it claims (§12.10), but does not contain it within a service it was granted. Where a user decides what to install, show the bundle's `guest.requires` and `protocols` (§14).
 
 A load returns an **`AppHandle`**: the verified manifest and author, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot, so you drive the app through derivations the host has already made. Take the handle; do not re-derive its parts.
 
-`install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds (§12.3), and an `onInbound` observer (§12.10). None becomes signed bundle content; `localConfig` becomes `LOCAL` unchanged, for the transport too, whose keys are listed in §12.6. For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network.
+`install(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds (§12.3), and an `onInbound` observer (§12.10). None becomes signed bundle content; `localConfig` becomes `LOCAL` unchanged, for the transport too, whose keys and signed defaults are listed in [`scripts/transport-config.mjs`](../WASM/scripts/transport-config.mjs) (§12.6). For example, `transport: { config: { networkKey: "7a".repeat(32) } }` selects a network.
 
 The handle's `invoke` is bound to the slot this install stood. On an upgrade, the replacing install stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the install they intend to drive.
 

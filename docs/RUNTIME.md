@@ -257,7 +257,7 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 | --- | --- | --- | --- |
 | `app` | string | yes | The slot's key: one slot per label per node, whoever authored it. Names the fs and signing scopes; what `replaces` and `uninstall` select; with the author, keys the freshness mark. Non-empty, at most 255 UTF-8 bytes, with no control, line-separator, bidi or zero-width characters. |
 | `version` | integer | yes | Non-negative safe integer; the set's monotonic version (§12.4). |
-| `modules[]` | `{name}` | yes | One entry per private WASM module, in body order. `name` is what the guest passes to `host.call`: unique, `[A-Za-z0-9_-]`, alphanumeric first. Zero or more. |
+| `modules[]` | `{name}` | yes | One entry per private WASM module, in body order. `name` is what the guest passes to `host.call`: unique, `[A-Za-z0-9_-]`, alphanumeric first. Zero to `DEFAULT_MAX_BUNDLE_MODULES` (§16). |
 | `protocols[]` | string[] | yes | Protocol ids a **peer** may reach (§12.10). Optional. |
 | `services[]` | string[] | yes | Local service ids a **co-resident guest** or the host may reach. Optional. A name may appear in both lists. |
 | `guest` | `{requires, config?}` | yes | Required; a manifest without one is refused. |
@@ -339,7 +339,7 @@ Sensitive protocol and service names are pinned to approved owners (author and `
 
 ### 12.6 Node↔node transport: channel identity binding
 
-Everything in this section is the **shipped transport bundle's guest program** (`transport/src/*.js`, with private modules `ws.wasm` and `mlkem768.wasm`), not host code. A replacement transport may differ; this is what ships. The first transport is embedded in the host artifact (`TRANSPORT_BUNDLE_B64`).
+Everything in this section is the **shipped transport bundle's guest program** (`transport/src/*.js`, with private modules `ws.wasm` and `mlkem768.wasm`), not host code. A replacement transport may differ; this is what ships. The first transport ships inside the host blob (§12.9).
 
 - **Division of labour.** The host driver (`services/link.ts`) owns sockets by link id and the listeners, and hands a `link/open` destination to its socket factory. The transport guest owns the handshake, record layer, correlation table, peer set, request facade, address book, relays and the signaling of direct paths, UDP and WebRTC (§12.7). Apps reach it through the local service id it declares under `services` (`_net`); ops such as waiting for a cohort, listing peers and teaching an address (`addr`) are ordinary calls through it, framed with `host/op-frame.ts`.
 - **Deadlines.** Every link, open correlation and `ready` waiter holds a monotonic due time, a `ready` waiter's capped short of `HOST.deadlineMs` so the wait settles before its invocation fails; the realm's one wake is armed for the soonest, and each wake retires what is due and re-arms. The wake is armed only while something waits; a refused arm fails nothing. A pending request fails as soon as its peer loses its last routable link.
@@ -402,7 +402,7 @@ LABEL_msg3  = "seedkernel-c-msg3-v1\0"          LABEL_rekey = "seedkernel-sessio
 #### 12.6.1 Records and link teardown
 
 - Every post-handshake frame is a ChaCha20-Poly1305-IETF record with no associated data: the initiator seals with `k_i2r` and opens with `k_r2i`, the responder mirrors. There is one post-handshake frame type.
-- The nonce is an implicit per-direction `(epoch, counter)`, never sent: the 12 bytes `epoch u32 ‖ 0x00000000 ‖ counter u32`, both starting at 0. It is strictly enforced on receive, and the receiving counter advances only on a record that opens; a bad tag or out-of-order counter tears the link down. After `REKEY_AFTER_FRAMES` records a direction ratchets, `k ← H(k ‖ LABEL_rekey)`, advancing the epoch and restarting the counter at 0; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
+- The nonce is an implicit per-direction `(epoch, counter)`, never sent: the 12 bytes `epoch u32 ‖ 0x00000000 ‖ counter u32`, both starting at 0. It is strictly enforced on receive, and the receiving counter advances only on a record that opens; a bad tag or out-of-order counter tears the link down. After `rekeyAfterFrames` records a direction ratchets, `k ← H(k ‖ LABEL_rekey)`, advancing the epoch and restarting the counter at 0; reaching `REJECT_AFTER_EPOCHS` retires the link (§16.1).
 - Only `close()` emits the authenticated end-of-stream record, a record with an empty plaintext (its 16-byte tag alone); an application frame is never empty, so the two cannot be confused. Every failure path is silent. The record goes out behind what was handed to the link before the close, so a frame sent and a peer forgotten right after still arrives; a failure drops what was waiting.
 - A graceful `link/close` asks the socket to flush its queued bytes before closing, bounded on TCP by `TCP_LINGER_MS` (`services/net-limits.ts`).
 - Records assume an ordered whole-message pipe, which a framer, or a seam that frames for itself, supplies.
@@ -410,11 +410,11 @@ LABEL_msg3  = "seedkernel-c-msg3-v1\0"          LABEL_rekey = "seedkernel-sessio
 #### 12.6.2 Half-open budgets
 
 - **No asymmetric cryptography before proof.** An accepting link generates its X25519 and ML-KEM keypairs only once a msg1 opens.
-- **Three budgets**: `MAX_HALF_OPEN_UNVERIFIED` (1024) until msg1 opens, `MAX_HALF_OPEN_VERIFIED` (256) until the identity is proved, `MAX_AUTHED_LINKS` (256) for the link's life.
+- **Three budgets**: `maxHalfOpenUnverified` (1024) until msg1 opens, `maxHalfOpenVerified` (256) until the identity is proved, `maxAuthedLinks` (256) for the link's life.
 - **Every tier evicts; none refuses the newest.** The half-open tiers shed their oldest occupant; the authed tier sheds its quietest, since a record crossing a link re-books it at the tail.
 - **A proved msg1 is spent.** The initiator's ephemeral key is remembered (4,096, drop-oldest) and a second sighting draws silence before promotion or asymmetric work. Only proved msg1s are remembered.
-- **`MAX_HALF_OPEN_PER_SOURCE` (8)** spans all three tiers and is not evictable: an address at its limit is refused rather than pushing another address out.
-- **Three deadlines**: `UNVERIFIED_TIMEOUT_MS` until msg1 opens, `HANDSHAKE_TIMEOUT_MS` for the rest, `LINK_IDLE_TIMEOUT_MS` after. An authenticated link carrying no traffic either way is retired with the authenticated goodbye, and the address book redials on the next send.
+- **`maxHalfOpenPerSource` (8)** spans all three tiers and is not evictable: an address at its limit is refused rather than pushing another address out.
+- **Three deadlines**: `unverifiedTimeoutMs` until msg1 opens, `handshakeTimeoutMs` for the rest, `linkIdleTimeoutMs` after. An authenticated link carrying no traffic either way is retired with the authenticated goodbye, and the address book redials on the next send.
 
 Measured behaviour: `tests/transport-load.test.mjs`.
 
@@ -457,7 +457,7 @@ The transport enforces all three; a malicious transport can bypass the lint or f
 #### Configuration
 
 - The transport reads `networkKey` and `contactSecret` from `LOCAL` as 64 lowercase hex, rejects malformed values at load, and defaults each to 32 zero bytes (the public network, an open node).
-- Its other policy values resolve as `LOCAL.x ?? APP.x`; any that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ services: { transport: { config } } })` passes operator overrides as that load's `localConfig`.
+- Every other key resolves as `LOCAL.x ?? APP.x`; a numeric one that is not a non-negative finite number fails the load, so a transport bundle without `guest.config` is refused. `bootShell({ services: { transport: { config } } })` passes operator overrides as that load's `localConfig`. The keys and their signed defaults are listed in `scripts/transport-config.mjs`.
 - Its identity comes from `HOST.identity`, never from config.
 - Peers arrive in `transport.config.peers` as `pk[.secret]@dest` strings (this transport's own grammar, `peerRef` in `core.js`, refused at load when malformed) and through `addr` calls. A `dest` of `relay+ws[s]://host:port` reaches the peer through that relay (§12.7).
 - The host-only `contact` op (one blob: 32 bytes, or empty for an open node) moves the accept gate without reinstalling. Links already up keep their secret; `TransportHost.reset()` closes them if required. A dial presents the **peer's** secret, the one in the address book, and none for a peer taught without one.

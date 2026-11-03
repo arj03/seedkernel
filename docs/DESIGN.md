@@ -44,7 +44,7 @@
 
 ## 12.3 Zero-authority JS realms
 
-**One entrypoint, for initiator and holder alike.** Which role an invocation serves is read out of the guest's own body format, never selected by the host. A second, synchronous seam is not available to offer: a holder may need a module or another realm, and neither answers in the same turn. So both roles are ordinary async invocations of one entrypoint, and there is one shape to reason about.
+**One entrypoint, for requester and responder alike.** Which role an invocation serves is read out of the guest's own body format, never selected by the host. A second, synchronous seam is not available to offer: a responder may need a module or another realm, and neither answers in the same turn. So both roles are ordinary async invocations of one entrypoint, and there is one shape to reason about.
 
 **Invocations are serialized because re-entrancy is unreasonable.** The alternative is two frames resuming into each other at every await, in an order neither the author nor the host chose. The cost is head-of-line blocking, which `__deferred` relieves where it matters. The queue is shared code on both targets, because a guarantee that held on one and not the other would be a guarantee nobody has.
 
@@ -62,7 +62,7 @@
 
 **A response is charged at delivery, not before.** A request's width is a fact the caller already handed over; an answer's is one only the handler learns, and for a module or another realm that means running it. Learning it early would not buy a bound, since the delivery charge already is one, only a lower peak: the window where several parked answers are built and none charged, which the count ceiling already caps. An inline answer has no such window, being built and charged in the frame that asked. If a listing over a huge store becomes the real problem, the fix is a cursor on `fs/list`, bounding the answer by construction.
 
-**Budgets are advertised so a guest can pace itself.** `HOST` carries the host-call budget so a fan-out windowed to the byte budget turns a mid-PUT rejection into ordinary backpressure.
+**Budgets are advertised so a guest can pace itself.** `HOST` carries the host-call budget so a fan-out windowed to the byte budget turns a mid-fan-out rejection into ordinary backpressure.
 
 **Pool within a tenant, quota between them.** Every owner is per realm and the realm count is bounded, which is what makes per-realm numbers ceilings rather than floors. Apps on one node do not trust each other, and an allowance they draw on in common is a standing way for a busy app to starve a quiet one. Where the tenant is one, a shared pool is right: every socket belongs to the link slot, so outbound bytes pool across links.
 
@@ -70,7 +70,7 @@
 
 **One realm driver for every target.** A realm is one `qjs.wasm` instance driven over the engine table by shared code, so the rules for its budget, its host calls and its disposal exist once, rather than as two implementations kept equal by hand. The engine is the same build on every target, so a behavioural difference between targets is a build difference, not a version difference.
 
-**Execution time is the operator's.** Module memory is the author's to declare because it is a property of the code; how long *this* node will spend on one message is a property of the deployment. It matters most on the holder path, where an inbound frame runs guest code on the node's only thread: an interrupted guest throws, the transport answers a throwing guest empty, and a wedged guest costs one empty response rather than the link.
+**Execution time is the operator's.** Module memory is the author's to declare because it is a property of the code; how long *this* node will spend on one message is a property of the deployment. It matters most on the responding path, where an inbound frame runs guest code on the node's only thread: an interrupted guest throws, the transport answers a throwing guest empty, and a wedged guest costs one empty response rather than the link.
 
 ## 12.4 Signed bundles
 
@@ -201,7 +201,7 @@
 
 **Tried once, committed after a window, decided by the loader.** A blob that boots and then dies on its first link is the failure that matters, and only something that outlives the host can see it. The mark written before a trial turns a crash into a rollback at the next start without trusting the crashed code to report it; the window turns "it started" into "it served". The floor rises only at commit, so a rollback never goes below it, and there is never more than one known-good host to return to.
 
-**The browser's loader keeps no slots.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does, and the page runs the blob its origin serves. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
+**A page has no loader and keeps no slots.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does, and the page runs the blob its origin serves. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
 
 **Size.** The binary is one artifact (~7 MiB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install, and takes its engine from the blob. The protocol's own footprint is tens of KiB. On a JS host `qjs.wasm` is compiled when the first realm is made, so a host with no installed slot does not pay for one; native compiles it at start, since its loader and host realms run on it.
 

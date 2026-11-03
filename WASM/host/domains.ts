@@ -1,4 +1,4 @@
-// Signing prefixes and suite ids (§16.1). Every prefix ends in NUL, and they all live in
+// Signing prefixes and suite ids (§16.1). Every DOMAIN_ prefix ends in NUL, and they all live in
 // this one file so their disjointness can be checked in one place. Native evaluates this
 // same file (§12.9).
 import { enc } from "./util.js";

@@ -85,7 +85,7 @@ What remains is deliberate: *within its own scope* an admitted app speaks for th
 | | Memory | Compute |
 | --- | --- | --- |
 | **WASM module** | Declared in the module, refused at admission (§4.1) | Killed at the engine when the calling guest's remaining segment runs out, armed by default on every target (§4.3); the costs are below |
-| **JS guest** | Realm heap cap (§12.3) | Execution and handoff deadline (§12.3, §16.1) |
+| **JS guest** | Realm heap cap (§12.3) | Execution and handoff deadline (§12.3) |
 
 Beyond the table, boundedness follows the three laws of §12.3. Network-originated roots arrive only over mutually authenticated links, but authentication is attribution rather than trust, and until the transport schedules that ingress, peer- and host-initiated roots are bounded per invocation, not in aggregate: there is no node-wide CPU guarantee.
 
