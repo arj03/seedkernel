@@ -89,8 +89,9 @@ scanners sets a contact secret; that is what the secret is for (§6.1).
 The peer lint (§6.3) runs at msg3, on the caller's verified identity. A caller it declines is
 closed rather than stalled: it verified the receiver at msg2, so silence would conceal
 nothing and only leave it sending into a link that never answers. What that caller sees is
-its link come up at msg2 and close at once: the caller authenticates first, as a TLS 1.3
-client does before the server has checked its certificate.
+its link come up at msg2 and close at once: the caller finishes verifying the receiver
+before the receiver has verified it, as a TLS 1.3 client does before the server has checked
+the client's certificate.
 
 The caller's first records ride behind msg3, one round trip after msg1.
 
@@ -355,8 +356,7 @@ network key is adopted outright (§6.2).
 
 Not adopted wholesale because it requires the identity key to take a DH role, converting
 Ed25519 to Curve25519, which §12.6 rules out; and because it has no suite byte for the
-ML-KEM fields in suite `0x03`. The suite byte identifies the field layout; the handshake
-uses the same node address format and round-trip count described above.
+ML-KEM fields in suite `0x03`.
 
 ---
 
@@ -474,7 +474,8 @@ invariant that the bytes a node sends are the bytes it folds into the transcript
 bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
 both PQ widths with room while bounding a stranger to that cap times the unverified budget.
 `MAX_QUEUE_BYTES` is unaffected: it bounds queued application frames, not the handshake.
-The KEM does raise the memory a stranger holds for `UNVERIFIED_TIMEOUT_MS`, and on any
-datagram path msg1 does not fit one common-case MTU. The contact-secret seal covers
+The KEM does raise the memory a stranger holds for `UNVERIFIED_TIMEOUT_MS`. On a UDP path
+msg1 exceeds one 1,200-byte packet, which costs nothing: the handshake runs over the path's
+reliable stream (RUNTIME §12.7), which splits it like any other write. The contact-secret seal covers
 the KEM public key and is checked before the responder performs encapsulation, so
 unauthenticated junk does not reach the expensive transform.

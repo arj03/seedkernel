@@ -62,6 +62,8 @@
 
 **A response is charged at delivery, not before.** A request's width is a fact the caller already handed over; an answer's is one only the handler learns, and for a module or another realm that means running it. Learning it early would not buy a bound, since the delivery charge already is one, only a lower peak: the window where several parked answers are built and none charged, which the count ceiling already caps. An inline answer has no such window, being built and charged in the frame that asked. If a listing over a huge store becomes the real problem, the fix is a cursor on `fs/list`, bounding the answer by construction.
 
+**Budgets are advertised so a guest can pace itself.** `HOST` carries the host-call budget so a fan-out windowed to the byte budget turns a mid-PUT rejection into ordinary backpressure.
+
 **Pool within a tenant, quota between them.** Every owner is per realm and the realm count is bounded, which is what makes per-realm numbers ceilings rather than floors. Apps on one node do not trust each other, and an allowance they draw on in common is a standing way for a busy app to starve a quiet one. Where the tenant is one, a shared pool is right: every socket belongs to the link slot, so outbound bytes pool across links.
 
 **Bounds cross every seam or they do not exist.** A bound the host accepts but no target can set is a bound nobody has; one the realm factory takes and nothing upstream carries is dead. `--guest-timeout 0` reads as "no budget" so that disabling one is something an operator says, never what a mistyped flag does. An edge value that would silently lift a bound (a heap limit of 0 means "none" to the engine) is refused.
@@ -88,7 +90,7 @@
 
 **Verify is split from construction so consent is possible.** An interactive client can show a bundle's author and metadata and wait before any realm or module instance exists.
 
-**Runtime facts never come from config.** An author who baked the signing scope into `APP` would restate a load-time fact at build time, and a copy that silently disagrees fails as signatures that verify nowhere with nothing naming the cause. The same one-source rule governs the `DOMAIN_*` family. `HOST` budgets are advertised so a guest can *pace* itself: a fan-out windowed to the byte budget turns a mid-PUT rejection into ordinary backpressure. Transport policy values must be finite because an absent bound does not fail the comparison that applies it; it makes that comparison always false.
+**Runtime facts never come from config.** An author who baked the signing scope into `APP` would restate a load-time fact at build time, and a copy that silently disagrees fails as signatures that verify nowhere with nothing naming the cause. The same one-source rule governs the `DOMAIN_*` family.
 
 **The transport is keyed like any bundle.** A per-slot version floor would put every transport author on one version line with no owner: replacing A's v5 with B's transport would require B to number above a sequence B does not control. All it would buy is refusing B's stale v1 after A's v5, and that case needs someone other than the operator choosing which bundle replaces which. Nothing does: the transport changes only by boot selection or an install naming the owner it retires.
 
@@ -115,6 +117,8 @@
 **The protocol is content.** The handshake, records and routing are a signed bundle so a deployment can change them without a host fork. The *first* transport cannot travel: a node has no network until it has one, and fetching it over raw net from a peer it does not yet trust would open a metadata window before any channel exists to close it. So it ships in the artifact, and what travels is the next one. That holds only while nothing beneath the bundle assumes *this* handshake: the host sees no handshake width, the shell passes the transport's flags through unread, refusing only a `wss://` destination its sockets cannot reach, and the crypto names are complete (§12.2). The handshake's own reasoning (concealment, ordering, silence, the three secrets, one identity key) is in [CHANNEL](CHANNEL.md).
 
 **The pre-auth cap exists because the application cap would be a memory hole.** Applying the full frame cap to an unauthenticated peer would let a stranger reserve megabytes per connection; 8 KiB against the 1,024 unverified budget is 8 MiB (sizing against the PQ message widths: CHANNEL §11). The cap is raised only after the authenticating step runs because a full-size first record riding the same segment, measured against the pre-auth cap, would refuse a legitimate link.
+
+**Transport policy values must be finite.** An absent bound does not fail the comparison that applies it; it makes that comparison always false.
 
 **Reassembly is linear.** Joining every slice onto one buffer makes a dribbled full-size frame cost quadratic copies; keeping every slice costs a view and a pinned chunk per byte, times the half-open budget. Merging small slices into a doubling tail moves every byte a constant number of times. The WebSocket framer serializes `push` because `frames()` takes a frame before awaiting its decode, so a second parser would read the frame after it.
 
@@ -199,7 +203,7 @@
 
 **The browser's loader keeps no slots.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does, and the page runs the blob its origin serves. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
 
-**Size.** The binary is one artifact (~7 MB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install, and takes its engine from the blob. The protocol's own footprint is tens of KB. On a JS host `qjs.wasm` is compiled when the first realm is made, so a host with no installed slot does not pay for one; native compiles it at start, since its loader and host realms run on it.
+**Size.** The binary is one artifact (~7 MiB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install, and takes its engine from the blob. The protocol's own footprint is tens of KiB. On a JS host `qjs.wasm` is compiled when the first realm is made, so a host with no installed slot does not pay for one; native compiles it at start, since its loader and host realms run on it.
 
 **Minification is a second `tsc` pass**, not a bundler, over what a page vendors beside the blob; the blob's own script is the readable build. It strips comments with no new dependency, and the compiler is the one tool on hand that can tell a regex literal from a division, so nothing hand-written lexes the host.
 
