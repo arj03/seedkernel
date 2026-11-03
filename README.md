@@ -20,7 +20,7 @@ That suits three kinds of work:
 
 Beta: it works on all three targets, and everything measured below was measured on running code, but the only apps exercising it are [seedstore](https://github.com/arj03/seedstore) and those in [seedshell](https://github.com/arj03/seedshell), written alongside it. The guest seam, bundle format and channel suite still change, and a change there means re-signing an app's bundles.
 
-There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Peer authentication and `node/sign` are Ed25519 alone: breaking Ed25519 later would not reveal earlier session keys, which rest on the hybrid X25519 + ML-KEM-768 exchange, but it would let an attacker forge live handshakes until the host's signing interface and the transport bundle are upgraded, and long-lived signed app records need separate consideration. Treat the security properties as design intent, not as verified.
+There has been no external audit, and no cryptographer has reviewed the design ([SECURITY §14.2](docs/SECURITY.md#142-post-quantum-exposure-and-remaining-limits)); constant-time behaviour of the built post-quantum paths is an open item, since passing functional vectors does not establish it. Treat the security properties as design intent, not as verified. Which roles are post-quantum, and why, is [below](#post-quantum-by-role).
 
 ## 1. The model
 
@@ -132,7 +132,20 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 - **The engine is fast enough for real storage.** In seedstore's tested network configurations, transfer rate and latency dominated, not the engine ([the overhead, measured](#the-overhead-measured)).
 - **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.6](docs/RUNTIME.md#126-nodenode-transport-channel-identity-binding)).
 - **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
-- **Bundles are post-quantum signed.** The manifest suite is hybrid Ed25519 + ML-DSA-65. The host includes the verifier and requires both signatures before accepting a bundle.
+- **Traffic and bundles are post-quantum.** Every link's session keys come from a hybrid X25519 + ML-KEM-768 exchange, and every bundle carries hybrid Ed25519 + ML-DSA-65 signatures ([post-quantum by role](#post-quantum-by-role)).
+
+## Post-quantum by role
+
+Each cryptographic role is protected according to when a quantum attacker could use it. Every hybrid construction requires both halves, so the classical algorithm still protects each role if the post-quantum one turns out to be flawed while it is young ([SECURITY §14.1, §14.2](docs/SECURITY.md#141-cryptographic-suites-and-update-boundaries)).
+
+| Role | Algorithm | Why |
+| --- | --- | --- |
+| Session keys | X25519 **+ ML-KEM-768** | Traffic recorded today must stay sealed against a future quantum computer ("harvest now, decrypt later"). Both identities travel under the same hybrid secret, so a recording does not reveal who talked either. |
+| Bundle signatures | Ed25519 **+ ML-DSA-65** | A bundle is a long-lived artifact that spreads peer to peer. The author id is a hash over both public keys, so forging one half does not impersonate the author. |
+| Peer authentication | Ed25519 | Verified live, during the handshake. A recorded handshake gives a future attacker nothing to forge; only one holding a quantum computer at connection time could impersonate a node. |
+| App signatures (`node/sign`) | Ed25519 | Enough for anything verified once. An app that keeps signed records for years adds its own post-quantum signature or an external checkpoint inside the record (§14.2). |
+
+This matches where deployed protocols stand: TLS, Signal (PQXDH) and OpenSSH run a hybrid post-quantum key exchange by default and keep classical authentication, because harvested traffic is the threat that exists today and post-quantum signatures cost kilobytes per handshake. Moving peer authentication later is a transport bundle and host update over the normal update path; it changes every node's peer id, since an id that binds both keys is a hash rather than the Ed25519 key.
 
 ## One implementation, three targets
 

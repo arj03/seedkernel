@@ -1,6 +1,6 @@
 # seedkernel: security
 
-*A worked example of a message arriving at a node, then the trust model, the load-bearing invariants, and the channel AKE, collected in one place.*
+*A worked example of a message arriving at a node, then the trust model, the invariants it rests on, and the channel AKE, collected in one place.*
 
 > **Part of the [seedkernel](../README.md) spec.** Section numbers are global across the doc set, so a `(§X.Y)` reference points to whichever file below holds that section:
 >
@@ -27,7 +27,7 @@ That is the entire steady-state pipeline: one AEAD open, one routing lookup, one
 
 ## 14. Security considerations
 
-The security properties are introduced where they arise (§3.1, §4.2–§4.3, §12.2–§12.6); this section collects the trust assumptions and the load-bearing invariants in one place so an implementer or auditor can see the whole model at once.
+The security properties are introduced where they arise (§3.1, §4.2–§4.3, §12.2–§12.6); this section collects the trust assumptions and the invariants they rest on in one place so an implementer or auditor can see the whole model at once.
 
 **Trust boundaries depend on the protected property.** Anyone with host-process access controls slot construction, claim routing, and admission, so bundle signatures constrain an *author*, never the operator. The host, its platform and sandbox engines, bundled host crypto, and shipped host JS are trusted foundations. A bundle's confinement limits its powers; its replaceability says how it can be updated. Neither determines whether a particular security property depends on its behaviour.
 
@@ -117,7 +117,9 @@ Channel confidentiality, live authentication and long-lived application signatur
 
 **Recorded channel confidentiality depends on both ephemeral secrets.** Suite `0x03` derives every key from msg2 onward from X25519 and ML-KEM-768 (§12.6). Breaking X25519 alone is insufficient to decrypt a recording: the recorder must also break ML-KEM-768 or recover an endpoint's ephemeral KEM secret, and both ephemeral secrets are erased once session keys are derived and again at teardown. Endpoint compromise while secrets or plaintext are live remains outside that protection.
 
-**Live-verified authenticity is not harvest-vulnerable.** Bundle manifests already require hybrid Ed25519 + ML-DSA-65 signatures (§12.4), while a live channel AUTH remains Ed25519 (§12.6). A recording of either verification buys an attacker nothing: a future ability to forge cannot retroactively install a bundle or complete a past handshake. This reasoning does not extend to app signatures kept as long-lived records (§14.2).
+**Live-verified authenticity is not harvest-vulnerable.** Bundle manifests already require hybrid Ed25519 + ML-DSA-65 signatures (§12.4), while a live channel AUTH remains Ed25519 (§12.6). A recording of either verification buys an attacker nothing: a future ability to forge cannot retroactively install a bundle or complete a past handshake. Only an attacker holding a quantum computer at connection time could impersonate a node. This reasoning does not extend to app signatures kept as long-lived records (§14.2).
+
+**Why peer authentication stays classical for now.** This is where deployed protocols stand: TLS, Signal (PQXDH) and OpenSSH run a hybrid post-quantum key exchange by default and keep classical authentication, because harvested traffic is the threat that exists today. Post-quantum authentication also costs more here than in the manifest: an ML-DSA-65 key and signature add about 5.3 KB to each of msg2 and msg3, against a handshake of about 1.2 KB per message. Bundles are the other way round: they are long-lived, spread peer to peer and are verified once per install, so they are signed post-quantum now. Moving peer authentication later is a transport bundle and host update over the normal update path (§12.9, §12.10). It changes every node's peer id, since an id that binds both keys is a hash over them, as the author id already is, rather than the Ed25519 key itself.
 
 **The hash is already fine.** BLAKE2b-256 is the one system hash (§5). Grover gives at most a quadratic speedup on preimage search (256 bits down to a ~128-bit work factor), and the serial-depth requirements make even that unrealistic. Content-addressed blocks (`genesisHash(bytes) == block_id`) and author ids (§12.4) also need collision resistance, and at 256 bits the conclusion is unchanged. The app label is not another trust use of the hash: it is a literal manifest string (§5), hashed only to fit its fs prefix into a filename (§12.1).
 
@@ -130,12 +132,12 @@ Neither is a negotiation: one suite per link, one per manifest, unknown ids refu
 
 The two ids are **independent namespaces**, which is why they are named apart (`SUITE_CHANNEL_CONCEALED`, `SUITE_MANIFEST_HYBRID_PQ`) rather than sharing one constant. The manifest id is the host's because the host reads it before anything is trusted; the channel id is the transport bundle's because the AKE that reads it is entirely that program.
 
-**Channel suite `0x03`** is a **hybrid** key exchange: every key from msg2 onward derives from both the X25519 and the ML-KEM-768 secret, which keeps the classical half load-bearing while the PQ half is young. The KEM is the transport's own private module; where its secret enters the schedule and what it costs are CHANNEL §11.
+**Channel suite `0x03`** is a **hybrid** key exchange: every key from msg2 onward derives from both the X25519 and the ML-KEM-768 secret, so the classical half still protects the keys if ML-KEM-768 turns out to be flawed while it is young. The KEM is the transport's own private module; where its secret enters the schedule and what it costs are CHANNEL §11.
 
 **Manifest suite `0x02`.** Hybrid Ed25519 + ML-DSA-65 signatures cover `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ BLAKE2b-256(body)` (§12.4). Four properties carry it:
 
 - **Both must verify, not either.** "Either" is exactly as strong as the weaker algorithm. Requiring both means a flaw in the young half fails *closed* (valid bundles refused, an operator's recoverable problem) rather than open, and the bundle stays no weaker than a classical-only signature while ML-DSA is new. The ~5.3 KB of header (against 97 bytes) is paid once per install, off the message path (§13), which makes the manifest the cheapest place in the system to absorb it.
-- **The author id binds the whole key set.** The id is `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`, not the Ed25519 key. Otherwise an attacker who breaks Ed25519 forges that half, supplies a fresh ML-DSA key for the other, and is admitted as the real author, pin and lineage included. Hybrid signing would buy nothing at exactly the moment it was supposed to pay. The 32-byte width is load-bearing far outside the envelope (policy files, revocations, freshness marks), so a future suite deriving its own id gives an author a *new* identity: the honest reading, since a different suite is a different statement about who signed.
+- **The author id binds the whole key set.** The id is `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`, not the Ed25519 key. Otherwise an attacker who breaks Ed25519 forges that half, supplies a fresh ML-DSA key for the other, and is admitted as the real author, pin and lineage included. Hybrid signing would buy nothing at exactly the moment it was supposed to pay. The 32-byte width is relied on far outside the envelope (policy files, revocations, freshness marks), so a future suite deriving its own id gives an author a *new* identity: the honest reading, since a different suite is a different statement about who signed.
 - **Both keys are inside both preimages**, so the pair cannot be spliced: keeping the sound half's key and signature while substituting a key for the broken half invalidates the survivor.
 - **A host without an ML-DSA verifier refuses the bundle** with its own error rather than falling back to the Ed25519 signature alone, which would be the downgrade the whole construction exists to prevent. An envelope claiming `0x01` is also refused; Ed25519-only verification is not supported.
 
@@ -145,7 +147,7 @@ The two ids are **independent namespaces**, which is why they are named apart (`
 
 ### 14.2 Post-quantum exposure and remaining limits
 
-Manifests require hybrid signatures and channels use hybrid key establishment (§14.1). Channel AUTH and guest signatures remain Ed25519. None of this design has been reviewed by a cryptographer.
+Each role is protected according to when a quantum attacker could use it: session keys and manifests are hybrid post-quantum now, live channel AUTH is Ed25519 by design (§14.1), and guest signatures are Ed25519 with long-lived records left to the app (below). None of this design has been reviewed by a cryptographer.
 
 **Sealed boxes are a third asymmetric role, but they are the consumer's, not the runtime's.** Nothing on seedkernel's own path uses a long-term DH/KEM key or publishes sealed-box calls above the guest seam. A consumer that needs PQ sealing ships and versions that transform in its own bundle; the host does not provision `ml-kem-768/*` for it.
 
@@ -157,12 +159,12 @@ Manifests require hybrid signatures and channels use hybrid key establishment (�
 
 **Constant-time behaviour is an open item.** `mldsa65.wasm` (a host artifact, §14.1) and `mlkem768.wasm` (a private module of the transport bundle) are each built once from pinned source and run byte-identically on all targets, with no target-native implementation to drift. Constant-time behaviour of the built signing and decapsulation paths remains an independent review item; passing functional vectors does not establish that property.
 
-**Exposure as it stands.**
+**Coverage by role.**
 
 | Use | Primitive | Suite byte | Clock | Status |
 | --- | --- | --- | --- | --- |
 | Channel session keys (§12.6) | ephemeral X25519 **+ ML-KEM-768** | yes (§16.1) | harvest-now clock | **closed** for suite `0x03` |
-| Channel identity / AUTH (§12.6) | Ed25519 | yes (§16.1) | relaxed (verified live) | adequate per §14.1 |
+| Channel identity / AUTH (§12.6) | Ed25519 | yes (§16.1) | relaxed (verified live) | **classical by design**: a recording gives nothing to forge (§14.1) |
 | Manifest signature (§12.4) | Ed25519 **+ ML-DSA-65** | yes (§16.1) | relaxed (verified at install) | **closed**: suite `0x02`, admitted by policy |
 | Guest / app signatures (§12.2) | Ed25519 | no, deliberately | **depends on record lifetime** | the relaxed clock does not transfer; **the app's to close**, inside its own record |
 | Block ids and author ids (§5, §12.4) | BLAKE2b-256 | n/a | none | no change needed |

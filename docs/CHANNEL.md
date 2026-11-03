@@ -452,8 +452,8 @@ addresses use `pk[.secret]@host:port`.
 
 Msg1 carries the initiator's ML-KEM-768 encapsulation key and msg2 the responder's
 ciphertext with the receiver's signature: exactly 1,233 and 1,200 bytes.
-Session keys derive from both the X25519 and the KEM secret, so the classical half stays
-load-bearing while the PQ half is young. The worry that hybrid costs a round trip
+Session keys derive from both the X25519 and the KEM secret, so the classical half still
+protects them if the PQ half turns out to be flawed while it is young. The worry that hybrid costs a round trip
 belongs to a symmetric two-message layout; this one has explicit roles, so the responder
 encapsulates at exactly the point it is already generating an ephemeral of its own. Still
 three messages: 1 RTT to the initiator's authentication of the responder, 1.5 to the
