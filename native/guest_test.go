@@ -216,33 +216,6 @@ func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 	}
 }
 
-func TestGuestRealmRejectsDuplicateLiveHostCallID(t *testing.T) {
-	guestSeamRealm(t)
-	if _, err := qc.Eval("build.js", `
-		globalThis.__heldHostCalls = 0;
-		globalThis.__guestSeam = () => {
-		  __heldHostCalls++;
-		  return new Promise(() => {});
-		};
-	`); err != nil {
-		t.Fatal("build seam:", err)
-	}
-	newTestRealmBudget(t, "{}", `
-		function handle() {
-		  __host_call("first", 7, new ArrayBuffer(1));
-		  __host_call("second", 7, new ArrayBuffer(1));
-		  return new Uint8Array();
-		}
-	`, 1000)
-	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
-	if _, err := realmCall("duplicate", nil); err == nil {
-		t.Fatal("a duplicate live host-call id was accepted")
-	}
-	if got := evalString(t, "String(__heldHostCalls)"); got != "1" {
-		t.Fatalf("host received %s payloads, want one before duplicate-id rejection", got)
-	}
-}
-
 // TestEngineIDsAreMintedByTheirOwner checks the engine table's handle contract on the Go
 // side: the map that owns instances also assigns their opaque ids, so callers cannot reuse
 // or forge an id and one realm's engine can never silently replace another's.

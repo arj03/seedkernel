@@ -346,12 +346,6 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(Date.now() - t1 >= 4000, "the default budget is the documented 5s, not something tighter");
   defaulted.dispose();
 
-  // A guest can call the preamble's reports itself: a made-up id settles nothing, and a
-  // non-buffer answer fails its own invocation instead of stranding it.
-  const fake = await createWebRealm({ source: 'function handle() { __callDone(1e9, 0); return Uint8Array.of(7); }', hostCall: noop });
-  ok((await fake.call(new Uint8Array()))[0] === 7, "a fake __callDone id is ignored");
-  fake.dispose();
-
   // Fire-and-forget calls retain copied payloads and promise state in the host. Once the
   // per-realm count is reached, the next call fails before its payload crosses; settling
   // the retained calls returns the allowance to the realm.
@@ -414,25 +408,14 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "an immediate answer past the byte allowance rejects at the await, not at the call site");
   overAllowance.dispose();
 
-  const duplicateHeld = [];
-  const duplicateIds = await createWebRealm({
-    source: `function handle(a) {
-      __host_call("first", 77, new ArrayBuffer(1));
-      if (a[0]) __host_call("second", 77, new ArrayBuffer(1));
-      return new Uint8Array();
+  const hidden = await createWebRealm({
+    source: `function handle() {
+      return Uint8Array.of(["__host_call", "__callDone", "__callFail"].some((n) => n in globalThis) ? 1 : 0);
     }`,
-    hostCall: () => new Promise((resolve) => duplicateHeld.push(resolve)),
-    deadlineMs: 1000,
+    hostCall: noop,
   });
-  await rejects(duplicateIds.call(Uint8Array.of(1)), "a duplicate live host-call id is rejected");
-  ok(duplicateHeld.length === 1, "duplicate-id rejection occurs before a second host copy");
-  duplicateHeld.shift()(new Uint8Array());
-  await sleep(20);
-  const reused = duplicateIds.call(Uint8Array.of(0));
-  await sleep(0);
-  duplicateHeld.shift()(new Uint8Array());
-  ok((await reused).length === 0, "a settled id can be admitted again");
-  duplicateIds.dispose();
+  ok((await hidden.call(new Uint8Array()))[0] === 0, "the seam's raw functions are not on the guest's globalThis");
+  hidden.dispose();
 
   // Reach the byte limit with only eight calls, then check the ninth is rejected before
   // the host seam receives another copied payload.

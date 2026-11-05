@@ -181,12 +181,6 @@ static const char *charge(size_t bytes)
 
 static const char *admit(double id, size_t bytes)
 {
-    if (!(id >= 0 && id <= 9007199254740991.0 && id == (double)(int64_t)id))
-        return "guest: invalid host call id";
-    if (find_call(id) >= 0) {
-        snprintf(why, sizeof why, "guest: duplicate live host call id %lld", (long long)id);
-        return why;
-    }
     if (call_count >= max_calls) {
         snprintf(why, sizeof why, "guest: too many outstanding host calls (cap %d)", max_calls);
         return why;

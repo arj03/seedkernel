@@ -152,27 +152,32 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
 }
 
 /** Guest preamble: `host.call` and the entrypoint, `handle`, which receives
- *  `[caller 32][body ...]`. Every realm factory calls `handle` through `__start`, after
- *  installing `__host_call`, `__callDone` and `__callFail`, and settles a parked call
- *  through `__settleHostCall`. */
+ *  `[caller 32][body ...]`. Every realm factory installs `__host_call`, `__callDone` and
+ *  `__callFail`, which the preamble moves into its closure, calls `handle` through
+ *  `__start`, and settles a parked call through `__settleHostCall`. */
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }
 
 const GUEST_PREAMBLE = `
 "use strict";
-let __callSeq = 0;
-const __pending = Object.create(null);
+(() => {
+// Taken off globalThis, so the guest's own names never collide with the seam's.
+const hostCall = __host_call, callDone = __callDone, callFail = __callFail;
+delete globalThis.__host_call;
+delete globalThis.__callDone;
+delete globalThis.__callFail;
+let callSeq = 0;
+const pending = Object.create(null);
 globalThis.__settleHostCall = (callId, ok, v) => {
-  const p = __pending[callId];
-  if (!p) return;
-  delete __pending[callId];
+  const p = pending[callId];
+  delete pending[callId];
   if (ok) p.resolve(new Uint8Array(v));
   else p.reject(new Error(v));
 };
 // Bytes as the plain ArrayBuffer the realm reads (realm.c), copied only when a view covers
 // part of its buffer.
-function __ab(bytes, refusal) {
+function ab(bytes, refusal) {
   if (bytes instanceof ArrayBuffer) return bytes;
   if (bytes instanceof Uint8Array) {
     return (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer;
@@ -182,24 +187,24 @@ function __ab(bytes, refusal) {
 globalThis.host = {
   // Every name answers a Promise. A refused name throws here, at the call site.
   call(name, bytes) {
-    const callId = ++__callSeq;
+    const callId = ++callSeq;
     // The host answers in this frame when it already has the answer: with the bytes, or
     // with why they could not be handed over, which rejects. Otherwise it parks the call
     // and settles it on a later turn. Called before the table entry exists, so an answer
     // or a synchronous refusal leaves nothing to clean up.
-    const now = __host_call(name, callId, __ab(bytes, "guest: host.call takes Uint8Array | ArrayBuffer"));
+    const now = hostCall(name, callId, ab(bytes, "guest: host.call takes Uint8Array | ArrayBuffer"));
     if (typeof now === "string") return Promise.reject(new Error(now));
     if (now !== null && now !== undefined) return Promise.resolve(new Uint8Array(now));
     const parked = Promise.withResolvers();
-    __pending[callId] = parked;
+    pending[callId] = parked;
     return parked.promise;
   },
 };
 // Set by a guest whose answer will arrive in a later invocation of this realm, so the
 // queue frees the realm at the end of the synchronous part (realm-queue.ts).
 globalThis.__deferred = false;
-const __norm = (out) => __ab(out, "guest: entrypoint must return Uint8Array | ArrayBuffer");
-const __fail = (id, e) => __callFail(id, String(e && e.message || e));
+const norm = (out) => ab(out, "guest: entrypoint must return Uint8Array | ArrayBuffer");
+const fail = (id, e) => callFail(id, String(e && e.message || e));
 // Run handle for one invocation and report its answer as bytes, so no guest promise
 // reaches the host. Returns 1 when the invocation deferred.
 globalThis.__start = (id, argBuf) => {
@@ -209,16 +214,17 @@ globalThis.__start = (id, argBuf) => {
     if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
     const out = globalThis.handle(new Uint8Array(argBuf));
     if (out && typeof out.then === "function") {
-      out.then((v) => { try { __callDone(id, __norm(v)); } catch (e) { __fail(id, e); } },
-        (e) => __fail(id, e));
+      out.then((v) => { try { callDone(id, norm(v)); } catch (e) { fail(id, e); } },
+        (e) => fail(id, e));
     } else {
-      __callDone(id, __norm(out));
+      callDone(id, norm(out));
     }
   } catch (e) {
-    __fail(id, e);
+    fail(id, e);
   }
   return globalThis.__deferred === true ? 1 : 0;
 };
+})();
 `;
 
 // The realm's memory limit does not cover host allocations, so the seam caps them itself.
