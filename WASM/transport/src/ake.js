@@ -506,7 +506,7 @@ class Link {
   }
 
   /** The peer sent something unacceptable: abort once authenticated, stall before
-   *  (framing errors included), so a stranger learns nothing (docs/CHANNEL.md §5). */
+   *  (framing errors included), so a stranger learns nothing (docs/TRANSPORT.md, Refusals are silent). */
   refuse() {
     if (this.authed) this.abort(true);
     else this.stall();

@@ -74,7 +74,7 @@ lines */ ++b;`;
 // though the repo checks out LF, so the assembler normalizes; otherwise the same commit
 // could sign different bytes depending on who built it.
 assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its signed bytes are the same on every platform");
-// CHANNEL §10 invariant 15: the identity key never meets X25519. The guest holds no identity
+// TRANSPORT invariant 15: the identity key never meets X25519. The guest holds no identity
 // secret, so what a convenient refactor could lose is a DH taking a non-ephemeral scalar or
 // an identity public key, the Ed25519-to-Curve25519 shortcut. Every DH is the `scalarmult`
 // helper over this end's own ephemeral, and nothing else reaches the host's DH.

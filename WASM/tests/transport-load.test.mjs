@@ -1,4 +1,4 @@
-// Load behaviour of the half-open budgets (§12.6.2; CHANNEL §5, §11). The concealed
+// Load behaviour of the half-open budgets (§12.6.2; TRANSPORT, Refusals are silent). The concealed
 // handshake refuses strangers silently (an immediate close would be an oracle), so an
 // unproven connection holds a socket for the whole deadline, and these budgets protect the
 // node. Three questions: what an unproven connection costs, whether a flood from outside
@@ -72,7 +72,7 @@ async function member(fabric, serverNode, host) {
 
 const { test, assert, keep, note, sleep, summary } = testkit();
 
-console.log("\nTransport load behaviour (§12.6.2; CHANNEL §5)\n");
+console.log("\nTransport load behaviour (§12.6.2)\n");
 
 // ─────────────────────────────────────────────────────────────────────────────
 await test("a silent stranger costs NO asymmetric crypto", async () => {

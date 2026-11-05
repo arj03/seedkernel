@@ -111,7 +111,7 @@ The fixed `crypto/*` transforms are a compatibility and performance exception. T
 
 ## The transport is a bundle
 
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record. The protocol is the same over TCP, WebSocket, WebRTC and UDP, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([CHANNEL](docs/CHANNEL.md)).
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record. The protocol is the same over TCP, WebSocket, WebRTC and UDP, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([TRANSPORT](docs/TRANSPORT.md)).
 
 Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 masking in `ws.wasm` and ML-KEM-768 in `mlkem768.wasm`.
 
@@ -205,18 +205,18 @@ This repo is the runtime only. Apps live outside it and consume the published su
 
 ## The rest of the spec
 
-This file is §1; the rest of the spec lives in `docs/`, split by concern. README, PROTOCOL, RUNTIME and SECURITY share one global numbering of stable ids the source cites, so an unused number (§6–§9, §15) stays unused and a `(§X.Y)` reference resolves to exactly one of them. DESIGN mirrors RUNTIME's §12 numbers; CHANNEL and CLIENT number their own sections and are cited by name (CHANNEL §7):
+This file is §1; the rest of the spec lives in `docs/`, split by concern. README, PROTOCOL, RUNTIME, TRANSPORT and SECURITY share one global numbering of stable ids the source cites, so an unused number (§6–§9, §15) stays unused and a `(§X.Y)` reference resolves to exactly one of them. DESIGN mirrors RUNTIME's §12 numbers; CLIENT numbers its own sections and is cited by name (CLIENT §2):
 
 | Doc | Sections | Contents |
 | --- | --- | --- |
 | [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | Bundle slots, atomic claim replacement, the restartable WASM module ABI, names and hashes, and protocol constants. |
-| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the host's normative surface: host services, the guest-seam ABI, zero-authority JS realms, signed bundles and how the host admits them under policy, the node↔node transport, the Go/native binary, routing. Rules and ABI tables only, each stated once. |
+| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the host's normative surface: host services, the guest-seam ABI, zero-authority JS realms, signed bundles and how the host admits them under policy, the host's side of the node↔node transport, the Go/native binary, routing. Rules and ABI tables only, each stated once. |
 | [DESIGN](docs/DESIGN.md) | §12 | Why RUNTIME §12 is shaped the way it is, under the same section numbers. |
+| [TRANSPORT](docs/TRANSPORT.md) | §12.6.1–§12.6.3 | The shipped transport bundle, rules and rationale together: the concealed-identity handshake, records, half-open budgets, the contact secret, network key and peer list, configuration ops, relays, WebRTC and UDP paths, prior art, limits and the invariants its tests pin. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
-| [CHANNEL](docs/CHANNEL.md) | — | The concealed-identity channel handshake: what the three messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
 | [CLIENT](docs/CLIENT.md) | — | How to write a bundle and the client that hosts it: a runnable first bundle, the manifest declarations an app adds as it grows, dependency setup, node boot, platform adapters, loading and invocation, browser integration traps, and the two existing clients as worked examples. Build guide, not protocol. |
 
-To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. DESIGN, CHANNEL and CLIENT sit outside that sequence: the first two are rationale, the last the guide to building on the runtime.
+To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,TRANSPORT,SECURITY}.md`. DESIGN and CLIENT sit outside that sequence: the first is rationale, the second the guide to building on the runtime.
 
 ## Background
 
