@@ -681,11 +681,13 @@ class Link {
     await this.becomeAuthed();
   }
 
+  /** Each key is the link's as soon as it exists, so `teardown` wipes it on every path. */
   async deriveConcealedSession() {
-    const kI2R = await this.kdf([this.ee, this.kemSecret], this.th, LABEL_I2R);
-    const kR2I = await this.kdf([this.ee, this.kemSecret], this.th, LABEL_R2I);
-    this.sendKey = this.weDialed ? kI2R : kR2I;
-    this.recvKey = this.weDialed ? kR2I : kI2R;
+    const derive = (label) => this.kdf([this.ee, this.kemSecret], this.th, label);
+    if (this.weDialed) this.sendKey = await derive(LABEL_I2R);
+    else this.recvKey = await derive(LABEL_I2R);
+    if (this.weDialed) this.recvKey = await derive(LABEL_R2I);
+    else this.sendKey = await derive(LABEL_R2I);
     this.clearEphemeral(); // forward secrecy
   }
 
