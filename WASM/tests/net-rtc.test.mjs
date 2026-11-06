@@ -395,6 +395,41 @@ await test("a peer without WebRTC declines, and the relayed link stays", async (
     "`routes` reads the peer as relayed at both ends");
 });
 
+await test("a peer that signals faster than its negotiation takes them loses it, and the queue stays bounded", async (keep) => {
+  const relay = new FakeRelay(), world = new FakeWebRtc();
+  const [small, big] = sortedIdentities(2);
+  // A, the offerer, trickles far more candidate text than a path needs, while B's answering
+  // peer connection is still opening, so everything after the offer queues at B.
+  const flood = "x".repeat(8 * 1024);
+  const flooding = {
+    factory: (config) => {
+      const pc = world.factory(config);
+      const describe = pc.setLocalDescription.bind(pc);
+      pc.setLocalDescription = async () => {
+        await describe();
+        for (let i = 0; i < 64; i++) {
+          pc.emit("icecandidate", { candidate: { toJSON: () => ({ candidate: flood, sdpMid: "0", sdpMLineIndex: 0 }) } });
+        }
+      };
+      return pc;
+    },
+  };
+  const A = keep(await rtcNode(relay, flooding, { identity: small }));
+  const B = keep(await rtcNode(relay, world, {
+    identity: big,
+    onHostAnswer: (name, answer, payload) => {
+      if (name !== "link/open" || !Buffer.from(payload).toString().startsWith("rtc:answer")) return answer;
+      return new Promise((r) => setTimeout(() => r(answer), 300));
+    },
+  }));
+  await relayLink(A, B);
+  await until(() => B.made.length === 1 && B.made[0].closed, 4000, "B to drop the flooded negotiation");
+  assert(B.made[0].candidates.length === 0, "no queued candidate reaches the dropped peer connection");
+  assert((await routes(B)).get(A.peerId) === false, "B stays on the relayed link");
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(5));
+  assert(resp[0] === 5, "requests keep crossing the relay");
+});
+
 await test("negotiations are capped, and one that never connects is dropped on its deadline", async (keep) => {
   const relay = new FakeRelay();
   // A world where nothing ever connects: descriptions are set and never paired.

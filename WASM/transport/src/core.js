@@ -97,8 +97,12 @@ const requestTimeoutMs = policy("requestTimeoutMs");
 // The whole pre-auth handshake, and an accept's shorter clock until a msg1 opens.
 const handshakeTimeoutMs = policy("handshakeTimeoutMs");
 const unverifiedTimeoutMs = policy("unverifiedTimeoutMs");
-// Frames per direction between key ratchets; both ends must agree.
-const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
+// Frames per direction between key ratchets; both ends must agree. The counter is a u32 in
+// the record nonce (ake.js `nonce`), so a longer epoch would wrap it and reuse a nonce.
+const rekeyAfterFrames = policy("rekeyAfterFrames");
+if (!Number.isInteger(rekeyAfterFrames) || rekeyAfterFrames < 1 || rekeyAfterFrames > 2 ** 32) {
+  throw new Error("transport: config rekeyAfterFrames must be an integer from 1 to 2^32");
+}
 
 // Every link by its platform id. An entry stays after teardown until its `linkClosed`
 // reads why the link closed.

@@ -23,6 +23,10 @@ const SCHEMES = ["udp", "rtc"];
 /** A negotiation's id, chosen by the offering side, so a signal for a negotiation this end
  *  has dropped or replaced is told from one for the negotiation it holds. */
 const SID_LEN = 8;
+/** What one peer's queued signals may weigh, each its body plus `SIGNAL_WEIGHT`: an honest
+ *  negotiation queues a description and its candidates while a path opens. */
+const MAX_QUEUED_SIGNAL_WEIGHT = 256 * 1024;
+const SIGNAL_WEIGHT = 1024;
 
 // ── signaling ─────────────────────────────────────────────────────────────────
 //
@@ -73,9 +77,9 @@ class Direct {
     this.byCtl = new Map();  // negotiation link id to negotiation
     // Data links announced before `open` has recorded their negotiation.
     this.early = new Map();  // negotiation link id to { linkId, stream }
-    // Signals are applied one at a time, in arrival order: records are not, and a
-    // candidate must never reach the peer connection ahead of its description.
-    this.signals = Promise.resolve();
+    // Each peer's signals are applied one at a time, in arrival order: records are not, and
+    // a candidate must never reach the peer connection ahead of its description.
+    this.signals = new Map(); // peer hex to { tail, weight }
   }
 
   /** The ICE servers for a negotiation with `peer`: STUN at the relay it is linked
@@ -114,9 +118,23 @@ class Direct {
     return frame.length <= maxFrameBytes - TAG_LEN && router.sendInOrder(peer, frame);
   }
 
-  /** One signal from `peer` (router.js `KIND_CTL`), queued behind the ones before it. */
+  /** One signal from `peer` (router.js `KIND_CTL`), queued behind that peer's earlier ones.
+   *  A peer that signals faster than its negotiation takes them loses the negotiation
+   *  instead of growing the queue. */
   receive(peer, tag, body) {
-    this.signals = this.signals.then(() => this.onSignal(peer, tag, body)).catch(() => {});
+    let q = this.signals.get(peer);
+    if (!q) this.signals.set(peer, q = { tail: Promise.resolve(), weight: 0 });
+    const w = body.length + SIGNAL_WEIGHT;
+    if (q.weight + w > MAX_QUEUED_SIGNAL_WEIGHT) {
+      const e = this.byPeer.get(peer);
+      if (e) this.drop(e);
+      return;
+    }
+    q.weight += w;
+    q.tail = q.tail.then(() => this.onSignal(peer, tag, body)).catch(() => {}).then(() => {
+      q.weight -= w;
+      if (q.weight === 0) this.signals.delete(peer);
+    });
   }
 
   async onSignal(peer, tag, body) {

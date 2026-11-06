@@ -1260,6 +1260,20 @@ await test("rekey: mismatched intervals desync (the must-match warning is real)"
   await until(() => st.b.closed, 3000, "a desync must tear the link down, not silently corrupt");
 });
 
+await test("rekey: an interval the u32 nonce counter cannot hold fails the load", async (keep) => {
+  // Past 2^32 the counter would wrap inside one epoch and repeat a nonce under one key.
+  for (const rekeyAfterFrames of [0, 1.5, 2 ** 32 + 1, 2 ** 53]) {
+    let msg = "";
+    try {
+      keep(await makeTransportHost({ app: false, transportConfig: { rekeyAfterFrames } }));
+    } catch (e) {
+      msg = String(e?.message ?? e);
+    }
+    assert(msg.includes("rekeyAfterFrames"), `rekeyAfterFrames ${rekeyAfterFrames} must be refused, got "${msg}"`);
+  }
+  keep(await makeTransportHost({ app: false, transportConfig: { rekeyAfterFrames: 2 ** 32 } }));
+});
+
 await test("goodbye: a clean close is distinguishable from a truncation", async (keep) => {
   // The deliberate close comes from A's idle clock, as in the IDLE tests: silence for the
   // timeout, then the authenticated goodbye.

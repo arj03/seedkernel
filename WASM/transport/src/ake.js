@@ -608,11 +608,13 @@ class Link {
     rememberProbe(ephI);
     this.armDeadline(handshakeTimeoutMs);
     await this.ensureKeys();
+    // Each secret is the link's as soon as it exists, so `clearEphemeral` wipes it on
+    // every path out.
     const dh = await scalarmult(this.myEph.privateKey, ephI);
     if (!dh.ok) { this.stall(); return; }
+    this.ee = dh.x;
     const kem = await kemEncaps(kemPkI, await randomBytes(32));
     if (!kem.ok) { this.stall(); return; }
-    this.ee = dh.x;
     this.kemSecret = kem.sharedSecret;
     this.peerEph = ephI;
 
@@ -634,16 +636,18 @@ class Link {
     const head = w2.slice(0, EPH_LEN + KEM_CT_LEN);
     const ephR = head.slice(0, EPH_LEN);
     const kemCt = head.slice(EPH_LEN);
+    // Each secret is the link's as soon as it exists, as in `onMsg1`.
     const dh = await scalarmult(this.myEph.privateKey, ephR);
     if (!dh.ok) { this.stall(); return; }
+    this.ee = dh.x;
     const kem = await kemDecaps(this.myKem.privateKey, kemCt);
     if (!kem.ok) { this.stall(); return; }
+    this.kemSecret = kem.sharedSecret;
     const hs = await hash(this.th, head);
     const r = await this.openZero(
-      await this.kdf([dh.x, kem.sharedSecret], hs, LABEL_M2),
+      await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2),
       w2.slice(EPH_LEN + KEM_CT_LEN));
     if (!r.ok) { this.stall(); return; }
-    this.ee = dh.x; this.kemSecret = kem.sharedSecret;
     // The receiver must prove the dialed key. This end has sent nothing identifying yet,
     // so a failure closes instead of stalling.
     const idR = fromHex(this.dialedPeerId);
