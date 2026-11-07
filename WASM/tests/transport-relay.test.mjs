@@ -1,5 +1,5 @@
-// Relays (§12.7): a node registers its key on a relay with a signature, and reaches any
-// registered key through a splice the relay joins end to end, the channel handshake running
+// Relays (§12.7): a node holds one channel link to its relay, which is its registration,
+// and reaches any registered key through a splice the relay joins end to end, the channel handshake running
 // straight through it. The move to WebRTC, and the splice's retirement, are
 // net-rtc.test.mjs's. The relay is the in-process fake in fake-relay.mjs, which speaks
 // seedrelay's wire. Run after `npm run build`.
@@ -8,22 +8,19 @@ import { testkit } from "./testkit.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
 } from "./transport-harness.mjs";
-import { FakeRelay } from "./fake-relay.mjs";
+import { FakeRelay, relayUrl } from "./fake-relay.mjs";
 import { randomBytes } from "node:crypto";
 
 const { test, assert, summary } = testkit();
 const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
-const RELAY = "ws://relay:1";
-// A private relay's secret: random, since whoever sees a registration can test guesses at it.
-const SECRET = randomBytes(32).toString("hex");
+const RELAY = relayUrl("relay:1"), OTHER = relayUrl("other:1");
 
 const relayState = async (node) => (await transportOp(node, new OpArgs("relayState")))[0];
 const joinRelay = (node, url = RELAY) => transportOp(node, new OpArgs("relay").text(url));
 const addr = (node, peer, dest, secret = new Uint8Array(32)) =>
   transportOp(node, new OpArgs("addr").blob(Buffer.from(peer, "hex")).blob(secret).text(dest));
 const linked = async (a, b) => (await linkedPeers(a)).includes(b.peerId) && (await linkedPeers(b)).includes(a.peerId);
-const welcome = (node, peers) =>
-  transportOp(node, new OpArgs("welcome").blob(Buffer.concat(peers.map((p) => Buffer.from(p, "hex")))));
+const secrets = (node, list) => transportOp(node, new OpArgs("secrets").blob(Buffer.concat(list)));
 const forget = (node, peer) => transportOp(node, new OpArgs("forget").blob(Buffer.from(peer, "hex")));
 /** Whether `a`'s request reaches `b`. */
 const reaches = async (a, b) => {
@@ -70,64 +67,105 @@ await test("a node reaches a key through a relay, the handshake running through 
   assert(await linked(A, B), "both ends hold the link");
 });
 
-await test("a relay URL names a relay and nothing more", async (keep) => {
-  const A = keep(await relayNode(new FakeRelay("relay:1")));
-  let msg = "";
-  try { await joinRelay(A, RELAY + "/room"); } catch (e) { msg = String(e.message); }
-  assert(msg.includes("no path"), `a path is refused, got "${msg}"`);
-});
-
-await test("a registration signed for another relay is refused", async (keep) => {
-  // A relay reached as relay:1 that knows itself as elsewhere:1, as one relay passing
-  // another's nonce through would.
-  const relay = new FakeRelay("relay:1", { signedFor: "elsewhere:1" });
-  const B = keep(await relayNode(relay));
-  await joinRelay(B);
-  await settle(200);
-  assert(await relayState(B) === 2, "a node whose signature names another relay is not registered");
-  assert(relay.registered.size === 0);
-});
-
-await test("a private relay registers only a node given its secret, which never crosses the wire", async (keep) => {
-  const secret = SECRET;
-  const relay = new FakeRelay("relay:1", { secret });
-  const join = (node, s) => transportOp(node, new OpArgs("relay").text(RELAY).text(s));
-  const none = keep(await relayNode(relay));
-  await joinRelay(none);
-  const wrong = keep(await relayNode(relay));
-  await join(wrong, randomBytes(32).toString("hex"));
+await test("nothing on a relay link names a key: registration, calls and tells travel in records", async (keep) => {
+  const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay));
-  for (const n of [A, B]) await join(n, secret);
+  await relayed(A, B);
+  await transportOp(A, new OpArgs("tell").blob(Buffer.from(B.peerId, "hex")));
+  relay.tell(A.peerId, Buffer.from(B.peerId, "hex"));
+  await until(() => relay.tells.length === 1, 2000, "the tell to arrive");
+  const wire = Buffer.concat(relay.controlWire);
+  assert(wire.length > 2 * 1233, "both nodes' handshakes and records crossed the relay links");
+  for (const key of [A.peerId, B.peerId, relay.key]) {
+    assert(!wire.includes(Buffer.from(key, "hex")), `the key ${key.slice(0, 8)} is not on the wire`);
+  }
+});
+
+await test("a relay URL names a relay by its key and nothing more", async (keep) => {
+  const A = keep(await relayNode(new FakeRelay("relay:1")));
+  for (const [url, why] of [[RELAY + "/room", "a path"], ["ws://relay:1", "no key"], ["ws://ab@relay:1", "a short key"]]) {
+    let msg = "";
+    try { await joinRelay(A, url); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("<key>"), `${why} is refused, got "${msg}"`);
+  }
+});
+
+await test("a relay that cannot prove the key its URL names does not register the node", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const B = keep(await relayNode(relay));
+  // relay:1 dialed under another relay's key, as a relay posing as it would be.
+  await joinRelay(B, relayUrl("elsewhere:1").replace("@elsewhere:1", "@relay:1"));
+  await settle(200);
+  assert(await relayState(B) === 2, "a relay whose signature does not verify under the pinned key is not taken");
+  assert(relay.registered.size === 0, "and the node never named itself to it");
+});
+
+await test("a private relay registers only a node given its secret, in the URL or beside it", async (keep) => {
+  const secret = randomBytes(32);
+  const relay = new FakeRelay("relay:1", { secret });
+  const none = keep(await relayNode(relay, FAST));
+  await joinRelay(none);
+  const wrong = keep(await relayNode(relay, FAST));
+  await joinRelay(wrong, relay.url(randomBytes(32)));
+  const A = keep(await relayNode(relay));
+  const B = keep(await relayNode(relay));
+  await joinRelay(A, relay.url(secret));
+  await transportOp(B, new OpArgs("relay").text(RELAY).text(secret.toString("hex")));
   assert(await relayState(none) === 2 && await relayState(wrong) === 2, "no secret, or another, is not registered");
-  assert(await relayState(A) === 1 && await relayState(B) === 1, "the secret registers");
-  assert(relay.macs.every((mac) => mac.length === 64 && !mac.includes(Buffer.from(secret))), "a 64-byte MAC, never the secret");
+  assert(await relayState(A) === 1 && await relayState(B) === 1, "the secret registers, either way it is given");
   // The splice needs no proof of its own; A calls B through the private relay.
-  await addr(A, B.peerId, "relay+" + RELAY);
+  await addr(A, B.peerId, "relay+" + relay.url(secret));
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(4));
   assert(resp[0] === 4, "a request crosses the private relay");
 });
 
-await test("a node given a secret still registers on a relay without one, which ignores the MAC", async (keep) => {
-  const relay = new FakeRelay("relay:1");
-  const A = keep(await relayNode(relay));
-  await transportOp(A, new OpArgs("relay").text(RELAY).text(SECRET));
-  assert(await relayState(A) === 1, "registered");
-  assert(relay.macs.length === 1, "and the MAC was sent");
+await test("a peer's address through a private home relay need not carry its secret", async (keep) => {
+  const secret = randomBytes(32);
+  const relay = new FakeRelay("relay:1", { secret });
+  const A = keep(await relayNode(relay)), B = keep(await relayNode(relay));
+  for (const n of [A, B]) await joinRelay(n, relay.url(secret));
+  await addr(A, B.peerId, "relay+" + RELAY);
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(6));
+  assert(resp[0] === 6, "A calls B on the link it registered with");
+  assert(await relayState(A) === 1 && relay.controls.size === 2, "and keeps that one link, secret and all");
 });
 
-await test("the secret is proved to the home relay alone, not to a relay a peer is called through", async (keep) => {
-  const home = new FakeRelay("relay:1", { secret: SECRET });
+await test("a tell goes to the home relay and comes back through the status, unread", async (keep) => {
+  const home = new FakeRelay("relay:1"), other = new FakeRelay("other:1");
+  const told = [];
+  const A = keep(await makeTransportHost({
+    channels: either(home, other),
+    onStatus: (status) => { if (status[0] === 1) told.push(Buffer.from(status.subarray(1)).toString()); },
+  }));
+  const B = keep(await relayNode(other));
+  assert((await transportOp(A, new OpArgs("tell").blob(Buffer.from("early"))))[0] === 0, "no home relay takes a tell yet");
+  await joinRelay(A);
+  await joinRelay(B, OTHER);
+  home.onTell = (key, bytes) => home.tell(key, Buffer.concat([Buffer.from("re: "), bytes]));
+  assert((await transportOp(A, new OpArgs("tell").blob(Buffer.from("join lobby"))))[0] === 1, "the home relay takes one");
+  await until(() => told.length === 1, 2000, "the relay's answer to reach the host");
+  assert(told[0] === "re: join lobby" && home.tells.length === 1, `the host hears what the relay says, got ${told}`);
+  // A relay the node only calls through is not heard.
+  await addr(A, B.peerId, "relay+" + OTHER);
+  await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  other.tell(A.peerId, Buffer.from("stray"));
+  await settle(100);
+  assert(told.length === 1, "a relay A only calls through is not passed on");
+});
+
+await test("a relay a peer is called through gets no secret of the home relay's", async (keep) => {
+  const secret = randomBytes(32);
+  const home = new FakeRelay("relay:1", { secret });
   const other = new FakeRelay("other:1");
   const A = keep(await makeTransportHost({ channels: either(home, other) }));
   const B = keep(await relayNode(other));
-  await transportOp(A, new OpArgs("relay").text(RELAY).text(SECRET));
-  await joinRelay(B, "ws://other:1");
-  await addr(A, B.peerId, "relay+ws://other:1");
+  await joinRelay(A, home.url(secret));
+  await joinRelay(B, OTHER);
+  await addr(A, B.peerId, "relay+" + OTHER);
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(5));
   assert(resp[0] === 5, "A calls B through the other relay");
-  assert(home.macs.length === 1, "the home relay got the MAC");
-  assert(other.registered.has(A.peerId) && other.macs.length === 0, "the other registered A without one");
+  assert(other.registered.has(A.peerId), "the other relay, open, registered A without the home relay's secret");
 });
 
 await test("a relay a peer was only called through is left once it idles, and the home relay kept", async (keep) => {
@@ -135,8 +173,8 @@ await test("a relay a peer was only called through is left once it idles, and th
   const A = keep(await makeTransportHost({ channels: either(home, other), transportConfig: { linkIdleTimeoutMs: 200 } }));
   const B = keep(await relayNode(other));
   await joinRelay(A);
-  await joinRelay(B, "ws://other:1");
-  await addr(A, B.peerId, "relay+ws://other:1");
+  await joinRelay(B, OTHER);
+  await addr(A, B.peerId, "relay+" + OTHER);
   await A.request(B.peerId, PROTO, Uint8Array.of(1));
   assert(other.registered.has(A.peerId), "a call registers the caller on the relay it goes through");
   await until(() => !other.registered.has(A.peerId), 3000, "the idle relay to be left");
@@ -156,9 +194,8 @@ await test("a relay socket whose close the host refuses is closed on a later wak
   await joinRelay(A);
   assert(relay.registered.has(A.peerId), "registered");
   await joinRelay(A, "");
-  assert(refusals === 1 && relay.registered.has(A.peerId), "the refused close leaves the socket open");
-  await until(() => !relay.registered.has(A.peerId), 2000, "the owed close, refused once more, then taken");
-  assert(refusals === 0, "the retry was refused too, and asked again");
+  await until(() => !relay.registered.has(A.peerId), 2000, "the goodbye to leave the relay");
+  await until(() => refusals === 0, 2000, "the owed close, refused once more, then asked again");
 });
 
 await test("a key the relay does not know fails the request at once", async (keep) => {
@@ -226,70 +263,81 @@ await test("the callee's contact secret still gates a relayed dial", async (keep
   assert(!(await linkedPeers(B)).includes(A.peerId));
 });
 
-await test("a welcomed caller is answered without the contact secret, and nobody else is", async (keep) => {
+await test("a caller holding one of the node's other secrets is answered, and nobody else is", async (keep) => {
+  // A room's secret, which both A and B know, beside B's own contact secret.
   const relay = new FakeRelay("relay:1");
-  const secret = new Uint8Array(32).fill(1);
-  const A = keep(await relayNode(relay, FAST));   // welcomed, and given no secret
-  const C = keep(await relayNode(relay, FAST));   // not welcomed
+  const secret = new Uint8Array(32).fill(1), room = new Uint8Array(32).fill(3);
+  const A = keep(await relayNode(relay, FAST));
+  const C = keep(await relayNode(relay, FAST));
   const B = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
   for (const n of [A, B, C]) await joinRelay(n);
-  await welcome(B, [A.peerId]);
-  for (const n of [A, C]) await addr(n, B.peerId, "relay+" + RELAY);
-  assert(await reaches(A, B), "the welcomed caller links with no secret");
-  assert(!(await reaches(C, B)) && !(await linkedPeers(B)).includes(C.peerId),
-    "a caller B does not welcome still needs its secret");
+  await secrets(B, [room]);
+  await addr(A, B.peerId, "relay+" + RELAY, room);
+  await addr(C, B.peerId, "relay+" + RELAY);
+  assert(await reaches(A, B), "the room's secret opens B's accept");
+  assert(!(await reaches(C, B)) && !(await linkedPeers(B)).includes(C.peerId), "a caller with neither draws nothing");
   await addr(C, B.peerId, "relay+" + RELAY, secret);
-  assert(await reaches(C, B), "and links once it presents it");
+  assert(await reaches(C, B), "and the contact secret still opens it");
 });
 
-await test("a welcomed caller that holds the contact secret links with it too", async (keep) => {
+await test("what the relay names a caller decides nothing", async (keep) => {
+  // A relay that names every caller as A, who shares a room with B. C, holding no secret,
+  // gets nothing in A's name; C holding the room's secret links as itself.
   const relay = new FakeRelay("relay:1");
-  const secret = new Uint8Array(32).fill(1);
-  const A = keep(await relayNode(relay, FAST));
-  const B = keep(await relayNode(relay, { contactSecret: secret, ...FAST }));
-  for (const n of [A, B]) await joinRelay(n);
-  await welcome(B, [A.peerId]);
-  await addr(A, B.peerId, "relay+" + RELAY, secret);
-  assert(await reaches(A, B), "the secret opens a welcomed accept as it opens any");
-});
-
-await test("a welcome is for that key alone: nobody else passes the gate in its name", async (keep) => {
-  // A relay that names every caller as A, whom B welcomes. C's msg1 then opens with no
-  // secret, but C cannot prove A's key at msg3, and B takes no other.
-  const relay = new FakeRelay("relay:1");
+  const room = new Uint8Array(32).fill(3);
   const A = keep(await relayNode(relay, FAST));
   const C = keep(await relayNode(relay, FAST));
   const B = keep(await relayNode(relay, { contactSecret: new Uint8Array(32).fill(1), ...FAST }));
   for (const n of [A, B, C]) await joinRelay(n);
-  await welcome(B, [A.peerId]);
+  await secrets(B, [room]);
   relay.callerName = A.peerId;
   await addr(C, B.peerId, "relay+" + RELAY);
   assert(!(await reaches(C, B)), "the caller behind A's name gets nothing through");
   assert((await linkedPeers(B)).length === 0, "and B holds no link to anyone");
+  await addr(C, B.peerId, "relay+" + RELAY, room);
+  assert(await reaches(C, B), "with the room's secret it links");
+  assert((await linkedPeers(B)).includes(C.peerId) && !(await linkedPeers(B)).includes(A.peerId),
+    "as the key it proved, not the one the relay named");
 });
 
-await test("welcome names the whole set, and forget drops a peer's links and its address", async (keep) => {
+await test("secrets names the whole list, and forget drops a peer's links and its address", async (keep) => {
   const relay = new FakeRelay("relay:1");
+  const room = new Uint8Array(32).fill(3);
   const A = keep(await relayNode(relay, FAST));
   const B = keep(await relayNode(relay, { contactSecret: new Uint8Array(32).fill(1), ...FAST }));
   for (const n of [A, B]) await joinRelay(n);
-  await welcome(B, [A.peerId]);
-  await addr(A, B.peerId, "relay+" + RELAY);
-  assert(await reaches(A, B) && await linked(A, B), "linked while welcomed");
+  await secrets(B, [room]);
+  await addr(A, B.peerId, "relay+" + RELAY, room);
+  assert(await reaches(A, B) && await linked(A, B), "linked under the room's secret");
   // B hangs up on A: the link goes at both ends, with a goodbye.
   await forget(B, A.peerId);
   await until(async () => !(await linkedPeers(A)).includes(B.peerId) && !(await linkedPeers(B)).includes(A.peerId),
     2000, "the link to close at both ends");
-  // A still has B's address and calls again, but B no longer welcomes it.
-  await welcome(B, []);
-  assert(!(await reaches(A, B)), "a peer left out of the next welcome needs the secret again");
+  // A still has B's address and calls again, but B has left the room.
+  await secrets(B, []);
+  assert(!(await reaches(A, B)), "a secret left out of the next list opens nothing");
   // And a forgotten address is no address: the request fails without a call.
   const calls = relay.calls;
   await forget(A, B.peerId);
   assert(!(await reaches(A, B)) && relay.calls === calls, "a forgotten peer is not dialed");
   let msg = "";
-  try { await transportOp(A, new OpArgs("welcome").blob(Uint8Array.of(1, 2, 3))); } catch (e) { msg = String(e.message ?? e); }
-  assert(msg.includes("32-byte"), `a malformed welcome is refused, got "${msg}"`);
+  try { await transportOp(A, new OpArgs("secrets").blob(Uint8Array.of(1, 2, 3))); } catch (e) { msg = String(e.message ?? e); }
+  assert(msg.includes("32-byte"), `a malformed list is refused, got "${msg}"`);
+});
+
+await test("a peer address naming the wrong key for the home relay fails its dial and leaves the relay link up", async (keep) => {
+  const relay = new FakeRelay("relay:1");
+  const A = keep(await relayNode(relay, FAST));
+  const B = keep(await relayNode(relay, FAST));
+  for (const n of [A, B]) await joinRelay(n);
+  const links = relay.controls.size;
+  // relay:1's address, under another relay's key.
+  const wrong = OTHER.replace("@other:1", "@relay:1");
+  await addr(A, B.peerId, "relay+" + wrong);
+  assert(!(await reaches(A, B)), "the dial through a relay pinned to another key fails");
+  assert(await relayState(A) === 1 && relay.controls.size === links, "A stays registered on its home relay, on the same link");
+  await addr(A, B.peerId, "relay+" + RELAY);
+  assert(await reaches(A, B), "and the right address still reaches B");
 });
 
 await test("a peer forgotten while its dial is in flight is not linked", async (keep) => {
@@ -316,7 +364,7 @@ await test("a peer forgotten while its dial is in flight is not linked", async (
     "and no link comes up behind the forget");
 });
 
-await test("a caller outside the callee's admitPeers gets no socket", async (keep) => {
+await test("a caller outside the callee's admitPeers is closed at msg3, as on any accept", async (keep) => {
   const relay = new FakeRelay("relay:1");
   const A = keep(await relayNode(relay, { transportConfig: { handshakeTimeoutMs: 300 } }));
   const B = keep(await relayNode(relay, { admitPeers: [generateKeyPair().publicKey] }));
@@ -325,7 +373,24 @@ await test("a caller outside the callee's admitPeers gets no socket", async (kee
   let failed = false;
   try { await A.request(B.peerId, PROTO, Uint8Array.of(1)); } catch { failed = true; }
   assert(failed, "the request fails");
-  assert(relay.calls === 1 && relay.splices.length === 0, "the callee never opened its end");
+  assert(relay.calls === 1 && relay.splices.length === 1, "the callee opened its end, whatever the relay named");
+  assert(!(await linkedPeers(B)).includes(A.peerId), "and did not link the caller");
+});
+
+await test("a call on a relay the node only calls through is not taken", async (keep) => {
+  const home = new FakeRelay("relay:1"), other = new FakeRelay("other:1");
+  const A = keep(await makeTransportHost({ channels: either(home, other) }));
+  const B = keep(await relayNode(other, { transportConfig: { handshakeTimeoutMs: 300 } }));
+  await joinRelay(A);
+  await joinRelay(B, OTHER);
+  await addr(A, B.peerId, "relay+" + OTHER);
+  await A.request(B.peerId, PROTO, Uint8Array.of(1));
+  await forget(B, A.peerId);
+  await addr(B, A.peerId, "relay+" + OTHER);
+  assert(other.registered.has(A.peerId), "A is still registered where it called through");
+  let failed = false;
+  try { await B.request(A.peerId, PROTO, Uint8Array.of(2)); } catch { failed = true; }
+  assert(failed && other.calls === 2 && other.splices.length === 1, "B's call there reaches A and is not taken");
 });
 
 await test("a restarted relay is redialed, and the next send links again", async (keep) => {
@@ -346,7 +411,7 @@ await test("the host is told its status when the relay's state changes", async (
   // A status may be told again unchanged.
   const told = [];
   const states = () => told.filter((s, i) => s !== told[i - 1]).join();
-  const A = keep(await relayNode(relay, { onStatus: (status) => told.push(status[0]) }));
+  const A = keep(await relayNode(relay, { onStatus: (status) => { if (status[0] === 0) told.push(status[1]); } }));
   await joinRelay(A);
   assert(states() === "2,1", `joining tells it is on its way, then registered, got ${told}`);
   relay.restart();
@@ -397,10 +462,11 @@ await test("the host is told its status when who is linked changes, ahead of a n
   const heard = [];
   const A = keep(await relayNode(relay));
   const B = keep(await relayNode(relay, {
-    // `[relay u8]`, then `[key 32][direct u8]` per linked peer.
+    // `[0][relay u8]`, then `[key 32][direct u8]` per linked peer.
     onStatus: (status) => {
+      if (status[0] !== 0) return;
       const linked = [];
-      for (let off = 1; off + 33 <= status.length; off += 33) {
+      for (let off = 2; off + 33 <= status.length; off += 33) {
         linked.push(Buffer.from(status.subarray(off, off + 32)).toString("hex") + (status[off + 32] === 1 ? "d" : "r"));
       }
       heard.push(linked.join());

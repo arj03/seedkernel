@@ -78,7 +78,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	// Bind A's listener (sets its port), then point B at A.
 	awaitOK(t, "start", "(async () => { await __setup; globalThis.__nodeBApp = await __nodeB.shell.install(__probe); await netA.start(); await __nodeA.shell.install(__probe); return new Uint8Array(0); })()", 5*time.Second)
 	// Eval would block on the promise without advancing the event loop.
-	awaitOK(t, "addr", `teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"))`, 5*time.Second)
+	awaitOK(t, "addr", `contactOf(__nodeA.shell).then((s) => teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.portOf("tcp"), s))`, 5*time.Second)
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and
 	// await the response, which suspends until the host realm's socket round trip settles

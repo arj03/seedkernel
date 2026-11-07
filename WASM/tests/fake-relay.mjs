@@ -1,36 +1,97 @@
 // An in-process relay speaking the relay wire the transport bundle speaks (transport/src/
-// relay.js; the real server is seedrelay): signed registration, calls and splices. Its
-// links are whole-message `RawLink`s, as a browser WebSocket's are. It checks registrations
-// against the host's signing domain, so a wrong format fails here as it would against
-// seedrelay, and, given a secret, checks a private relay's MAC as seedrelay does.
+// relay.js; the real server is seedrelay): a node's relay link runs the channel handshake
+// with the relay as its responder, pinned to the relay's key, and the relay wire travels
+// in its records; then calls, splices and tells. Its links are whole-message `RawLink`s,
+// as a browser WebSocket's are. The handshake here is written out apart from the
+// transport's, from libsodium and the ML-KEM module, so a transport that drifts from the
+// documented construction (docs/TRANSPORT.md, Handshake) fails here as it would against
+// seedrelay.
 
-import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const { DOMAIN_LINK_SCOPE } = await import(pathToFileURL(join(root, "build/host/domains.js")).href);
+const imp = (p) => import(pathToFileURL(join(root, p)).href);
+const { DOMAIN_LINK_SCOPE } = await imp("build/host/domains.js");
+const { loadCrypto } = await imp("build/host/crypto-node.js");
+const { ModuleTable } = await imp("build/host/module-table.js");
+const sodium = await loadCrypto();
+const kem = await new ModuleTable().build([{ name: "mlkem", wasm: readFileSync(join(root, "browser/mlkem768.wasm")) }]);
 
-const DOMAIN_RELAY = Buffer.from("seedkernel-relay-register-v1\0");
-const DOMAIN_SECRET = Buffer.from("seedrelay-secret-v1\0");
-const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
-const T_CHALLENGE = 0x00, T_REGISTER = 0x01, T_CALL = 0x05, T_UNREACHABLE = 0x06;
+const utf8 = (s) => new TextEncoder().encode(s);
+const cat = (...parts) => Buffer.concat(parts.map((p) => Buffer.from(p)));
+const hex = (b) => Buffer.from(b).toString("hex");
+const H = (...parts) => sodium.crypto_generichash(32, cat(...parts), null);
+const ZERO32 = new Uint8Array(32), NONCE0 = new Uint8Array(12);
+const X25519_BASE = Uint8Array.of(9, ...new Uint8Array(31));
 
-/** seedrelay's MAC: BLAKE2b-512(DOMAIN_SECRET ‖ pk ‖ sig ‖ secret), which Node computes
- *  unkeyed as the transport's `crypto/blake2b` does. */
-export function secretMac(secret, pk, sig) {
-  return createHash("blake2b512").update(DOMAIN_SECRET).update(pk).update(sig).update(secret).digest();
+const DOMAIN_CHANNEL = utf8("seedkernel-channel-id-v1\0");
+const LABEL = {
+  probe: utf8("seedkernel-c-probe-v1\0"), m2: utf8("seedkernel-c-msg2-v1\0"), m3: utf8("seedkernel-c-msg3-v1\0"),
+  i2r: utf8("seedkernel-session-i->r-v1\0"), r2i: utf8("seedkernel-session-r->i-v1\0"),
+  rekey: utf8("seedkernel-session-rekey-v1\0"),
+};
+const SUITE = 0x03, M1_LEN = 1233, M3_LEN = 112, KEM_PK_LEN = 1184;
+/** The public network's root: every relay link is on it, whatever the node's network. */
+const ROOT = H(DOMAIN_CHANNEL, ZERO32);
+const R_REGISTERED = 0x01, R_CALL = 0x05, R_UNREACHABLE = 0x06, R_TELL = 0x08;
+
+const seal = (key, nonce, pt) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(pt, null, null, nonce, key);
+function open(key, nonce, ct) {
+  try { return sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, null, nonce, key); }
+  catch { return null; }
+}
+function recordNonce(epoch, ctr) {
+  const n = new Uint8Array(12);
+  const v = new DataView(n.buffer);
+  v.setUint32(0, epoch);
+  v.setUint32(8, ctr);
+  return n;
+}
+/** One direction of a record stream: the implicit (epoch, counter) nonce, ratcheting the
+ *  key every `rekeyAfterFrames` records as the transport does. */
+function direction(key, rekeyAfterFrames) {
+  let epoch = 0, ctr = 0;
+  const step = () => {
+    if (++ctr < rekeyAfterFrames) return;
+    key = H(key, LABEL.rekey);
+    epoch++;
+    ctr = 0;
+  };
+  return {
+    seal(pt) {
+      const ct = seal(key, recordNonce(epoch, ctr), pt);
+      step();
+      return ct;
+    },
+    open(ct) {
+      const pt = open(key, recordNonce(epoch, ctr), ct);
+      if (pt) step();
+      return pt;
+    },
+  };
+}
+
+/** A relay's identity, a function of its authority so a test can name its URL before
+ *  making it (`relayUrl`). */
+const relayIdentity = (authority) => sodium.crypto_sign_seed_keypair(H(utf8("fake-relay\0"), utf8(authority)));
+
+/** The URL a node registers with on the FakeRelay at `authority`,
+ *  `ws://<key>[.<secret>]@authority`; `relay+` and it is a peer's address behind it. */
+export function relayUrl(authority = "relay", secret = null) {
+  return `ws://${hex(relayIdentity(authority).publicKey)}${secret ? "." + hex(secret) : ""}@${authority}`;
 }
 
 export class FakeRelay {
-  /** `authority` is the host[:port] the relay's URLs name, which registrations sign;
-   *  `signedFor` makes it check them against another. With a `secret` it is a private
-   *  relay, taking only registrations that carry its MAC; without, it ignores a MAC. */
-  constructor(authority = "relay", { signedFor = authority, secret = null } = {}) {
+  /** `authority` is the host[:port] the relay's URLs name. With a `secret` (32 bytes) it is
+   *  a private relay: its contact secret, which a node's msg1 must open under. */
+  constructor(authority = "relay", { secret = null, rekeyAfterFrames = 1 << 24 } = {}) {
     this.authority = authority;
-    this.signedFor = signedFor;
-    this.secret = secret;
-    this.macs = [];              // every MAC a registration carried
+    this.secret = secret ?? ZERO32;
+    this.rekeyAfterFrames = rekeyAfterFrames;
+    this.identity = relayIdentity(authority);
+    this.key = hex(this.identity.publicKey);
     this.controls = new Set();
     this.registered = new Map(); // key hex to its control
     this.pending = new Map();    // ticket hex to { ends: [] }
@@ -39,11 +100,17 @@ export class FakeRelay {
     this.spliceBytes = 0;        // bytes forwarded through splices
     this.refuseSplices = false;  // a relay that takes calls but joins nothing
     this.callerName = null;      // a lying relay: the key hex it names every caller as
+    this.controlWire = [];       // every message a relay link carried, either way
+    this.tells = [];             // [key hex, bytes] for every tell a node sent
+    this.onTell = null;          // (keyHex, bytes) for a test that answers them
     // A relay too slow to forward anything: splice bytes wait here, counted, until resume().
     this.paused = false;
     this.pausedBytes = 0;
     this.stalled = [];
   }
+
+  /** The URL a node registers with (`relayUrl`). */
+  url(secret = null) { return relayUrl(this.authority, secret); }
 
   factory() {
     return {
@@ -78,36 +145,96 @@ export class FakeRelay {
     return end;
   }
 
+  /** A node's relay link: the handshake, then records, each message taken in order. A
+   *  record is read as it arrives once nothing waits before it, as seedrelay reads its
+   *  links, so a call is heard before the splice socket the node opens behind it. */
   control() {
-    const c = { key: null, nonce: randomBytes(32) };
-    c.end = this.link((b) => this.onControl(c, Buffer.from(b)));
+    const c = { key: null, hs: null, recv: null, send: null, work: Promise.resolve(), waiting: 0 };
+    c.end = this.link((b) => {
+      this.controlWire.push(b);
+      if (c.recv && c.waiting === 0) { this.onRecord(c, b); return; }
+      c.waiting++;
+      c.work = c.work.then(() => this.onControl(c, b)).catch(() => c.end.kill()).finally(() => { c.waiting--; });
+    });
     c.end.gone = () => this.leave(c);
     this.controls.add(c);
-    c.end.deliver(Buffer.concat([Buffer.of(T_CHALLENGE), c.nonce]));
     return c.end.raw;
   }
 
+  /** One record of the relay wire, on a registered link. */
+  record(c, ...parts) { this.put(c, c.send.seal(cat(...parts))); }
+
+  /** One message to a node on its relay link. */
+  put(c, bytes) {
+    this.controlWire.push(bytes);
+    c.end.deliver(bytes);
+  }
+
+  /** Tell a registered node `bytes`, as a relay service would. */
+  tell(keyHex, bytes) {
+    const c = this.registered.get(keyHex);
+    if (c) this.record(c, Uint8Array.of(R_TELL), bytes);
+  }
+
   onControl(c, b) {
-    if (b[0] === T_REGISTER && (b.length === 97 || b.length === 161) && !c.key) {
-      const pk = b.subarray(1, 33), sig = b.subarray(33, 97), mac = b.subarray(97);
-      const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, pk]), format: "der", type: "spki" });
-      const msg = Buffer.concat([DOMAIN_LINK_SCOPE, DOMAIN_RELAY, Buffer.from(this.signedFor), c.nonce]);
-      if (!verify(null, msg, key, sig)) { c.end.kill(); return; }
-      if (mac.length > 0) this.macs.push(Buffer.from(mac));
-      if (this.secret !== null && !secretMac(this.secret, pk, sig).equals(mac)) { c.end.kill(); return; }
-      c.key = pk.toString("hex");
-      this.registered.set(c.key, c);
-      c.end.deliver(Buffer.of(T_REGISTER));
-    } else if (b[0] === T_CALL && b.length === 49 && c.key) {
+    if (c.recv) return this.onRecord(c, b);
+    return c.hs ? this.onMsg3(c, b) : this.onMsg1(c, b);
+  }
+
+  /** msg1: silence for anything that does not open under the relay's contact secret. */
+  async onMsg1(c, w1) {
+    if (w1.length !== M1_LEN || w1[0] !== SUITE) return;
+    const eph = w1.subarray(1, 33), kemPk = w1.subarray(33, 33 + KEM_PK_LEN);
+    const probe = H(this.secret, H(ROOT, w1.subarray(0, 1), eph, kemPk), LABEL.probe);
+    if (!open(probe, NONCE0, w1.subarray(33 + KEM_PK_LEN))) return;
+    const sk = sodium.randombytes_buf(32);
+    const ee = sodium.crypto_scalarmult(sk, eph);
+    const r = (await kem.call("mlkem", cat(Uint8Array.of(1), kemPk, sodium.randombytes_buf(32)))).bytes;
+    if (r[0] !== 1) return;
+    const head = cat(sodium.crypto_scalarmult(sk, X25519_BASE), r.subarray(1, 1089));
+    const pq = r.subarray(1089);
+    const h1 = H(ROOT, w1);
+    const hs = H(h1, head);
+    const sig = sodium.crypto_sign_detached(cat(DOMAIN_LINK_SCOPE, DOMAIN_CHANNEL, ROOT, hs, this.identity.publicKey), this.identity.privateKey);
+    const w2 = cat(head, seal(H(ee, pq, this.secret, hs, LABEL.m2), NONCE0, sig));
+    c.hs = { ee, pq, th: H(h1, w2) };
+    this.put(c, w2);
+  }
+
+  /** msg3: the node names itself, which registers it. */
+  onMsg3(c, w3) {
+    const { ee, pq, th } = c.hs;
+    if (w3.length !== M3_LEN) return;
+    const plain = open(H(ee, pq, this.secret, th, LABEL.m3), NONCE0, w3);
+    if (!plain) return;
+    const id = plain.subarray(0, 32), sig = plain.subarray(32, 96);
+    if (!sodium.crypto_sign_verify_detached(sig, cat(DOMAIN_LINK_SCOPE, DOMAIN_CHANNEL, ROOT, th, id), id)) return;
+    const h3 = H(th, w3);
+    c.recv = direction(H(ee, pq, this.secret, h3, LABEL.i2r), this.rekeyAfterFrames);
+    c.send = direction(H(ee, pq, this.secret, h3, LABEL.r2i), this.rekeyAfterFrames);
+    c.hs = null;
+    c.key = hex(id);
+    this.registered.set(c.key, c);
+    this.record(c, Uint8Array.of(R_REGISTERED));
+  }
+
+  onRecord(c, ct) {
+    const m = c.recv.open(ct);
+    // A bad record, or the node's goodbye, ends the link.
+    if (!m || m.length === 0) { c.end.kill(); return; }
+    if (m[0] === R_CALL && m.length === 49) {
       this.calls++;
-      const to = b.subarray(1, 33), ticket = b.subarray(33);
-      const callee = this.registered.get(to.toString("hex"));
-      if (!callee || callee.key === c.key || this.pending.has(ticket.toString("hex"))) {
-        c.end.deliver(Buffer.concat([Buffer.of(T_UNREACHABLE), to, ticket]));
+      const to = m.subarray(1, 33), ticket = m.subarray(33);
+      const callee = this.registered.get(hex(to));
+      if (!callee || callee.key === c.key || this.pending.has(hex(ticket))) {
+        this.record(c, Uint8Array.of(R_UNREACHABLE), to, ticket);
         return;
       }
-      this.pending.set(ticket.toString("hex"), { ends: [] });
-      callee.end.deliver(Buffer.concat([Buffer.of(T_CALL), Buffer.from(this.callerName ?? c.key, "hex"), ticket]));
+      this.pending.set(hex(ticket), { ends: [] });
+      this.record(callee, Uint8Array.of(R_CALL), Buffer.from(this.callerName ?? c.key, "hex"), ticket);
+    } else if (m[0] === R_TELL) {
+      this.tells.push([c.key, m.subarray(1)]);
+      this.onTell?.(c.key, m.subarray(1));
     } else {
       c.end.kill();
     }

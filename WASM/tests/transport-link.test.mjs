@@ -8,7 +8,7 @@ import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createWebRealm,
   transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
-  LoopbackChannels, generatorRequest,
+  LoopbackChannels, generatorRequest, transportOp, OpArgs,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -554,6 +554,43 @@ await test("CONTACT SECRET: the address book alone does not grant a probe", asyn
   await settle();
   assert(chans[1].sent.length === 0, `outsider drew ${chans[1].sent.length} message(s); must draw none`);
   assert(!(await aUp(st)) && !(await bUp(st)), "a wrong contact secret must not authenticate");
+});
+
+await test("SECURE BY DEFAULT: a node given no secret is gated by its key's own, which lasts as long as the key", async (keep) => {
+  const identity = generateKeyPair();
+  const chans = wirePair();
+  const st = keep(await linked(chans, {}, { contactSecret: "key", identity }));
+  await settle();
+  assert(chans[1].sent.length === 0 && !(await bUp(st)), "a caller without the node's secret draws silence");
+  const secret = await transportOp(st.B, new OpArgs("contact"));
+  assert(secret.length === 32 && secret.some((b) => b !== 0), "the node answers the secret its address carries");
+  const again = keep(await makeTransportHost({ channels: new InjectedChannels(), contactSecret: "key", identity }));
+  assert(Buffer.from(await transportOp(again, new OpArgs("contact"))).equals(Buffer.from(secret)),
+    "the same key derives the same secret, so the address survives a restart");
+  const other = keep(await makeTransportHost({ channels: new InjectedChannels(), contactSecret: "key" }));
+  assert(!Buffer.from(await transportOp(other, new OpArgs("contact"))).equals(Buffer.from(secret)), "another key, another secret");
+  const holder = wirePair();
+  await openPair(st.A, st.B, holder, secret);
+  await until(async () => await bUp(st), 4000, "the link to a caller holding the node's secret");
+  assert((await transportOp(st.B, new OpArgs("contact").blob(new Uint8Array(0)))).length === 0, "opening the node answers no secret");
+});
+
+await test("SECRETS: an accept opens under any of the node's secrets, and under nothing else", async (keep) => {
+  // A room's secret, say, held by everyone in the room: a caller that presents it is
+  // answered as one presenting the contact secret is, on a direct accept as on a relayed one.
+  const ROOM = new Uint8Array(32).fill(3);
+  const st = keep(await upPair());
+  await transportOp(st.B, new OpArgs("secrets").blob(ROOM));
+  const room = wirePair();
+  await openPair(st.A, st.B, room, ROOM);
+  await until(() => room[1].sent.length > 0, 4000, "msg2 to a caller holding one of the node's secrets");
+  const stranger = wirePair();
+  await openPair(st.A, st.B, stranger, new Uint8Array(32).fill(9));
+  await settle();
+  assert(stranger[1].sent.length === 0, "a caller holding none of them draws silence");
+  let msg = "";
+  try { await transportOp(st.B, new OpArgs("secrets").blob(new Uint8Array(17 * 32))); } catch (e) { msg = String(e.message ?? e); }
+  assert(msg.includes("at most"), `more secrets than the cap are refused, got "${msg}"`);
 });
 
 await test("a silent connection buys no hash: the session root is computed once", async (keep) => {

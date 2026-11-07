@@ -17,18 +17,28 @@ if (LOCAL.networkKey !== undefined && !hex32(LOCAL.networkKey)) {
 }
 const networkKey = LOCAL.networkKey === undefined ? ZERO32 : fromHex(LOCAL.networkKey);
 
-// Inbound gate; zero means open. The host-only `contact` op rotates it at runtime (§12.6.3).
-let contactSecret = ZERO32;
-if (LOCAL.contactSecret !== undefined) {
+// The inbound gate (§12.6.3). A node has one by default, the key's own (ake.js
+// `keySecret`), so nobody it has not given its address to is answered; config
+// `contactSecret` names another in hex, or "open" for none, which answers anyone. The
+// host-only `contact` op reads it and sets it at runtime. Null is the key's own.
+let contactSecret = null;
+if (LOCAL.contactSecret === "open") contactSecret = ZERO32;
+else if (LOCAL.contactSecret !== undefined) {
   if (!hex32(LOCAL.contactSecret)) {
-    throw new Error("transport: config contactSecret must be 64 lowercase hex characters");
+    throw new Error("transport: config contactSecret must be 64 lowercase hex characters, or \"open\"");
   }
   contactSecret = fromHex(LOCAL.contactSecret);
 }
-// Peers this node welcomes, by key in hex: a call one of them places through a relay is
-// answered without the contact secret (relay.js `accept`). The host-only `welcome` op
-// names them.
-let welcomed = new Set();
+/** The contact secret in force: all zero for an open node. */
+async function ownSecret() { return contactSecret ?? keySecret(); }
+// More secrets a msg1 may open under beside the contact secret, such as one per room the
+// app is in, which everyone who knows that room holds. The host-only `secrets` op names
+// them. Each costs every accept one more trial open, so there are at most
+// MAX_EXTRA_SECRETS.
+const MAX_EXTRA_SECRETS = 16;
+let extraSecrets = [];
+/** What an accept's msg1 may open under (ake.js `acceptSecrets`), the contact secret first. */
+async function acceptSecrets() { return [await ownSecret(), ...extraSecrets]; }
 
 /** One policy number: the installation's override, else the author's signed default.
  *  Each bounds a resource, so a missing one fails the load instead of running unbounded. */
@@ -47,8 +57,8 @@ if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config adm
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
 /** One cohort member as an operator types it: `pk[.secret]@dest`, where `.secret` is that
  *  peer's contact secret and `dest` is `[scheme://]host:port[/path]` (bare means tcp), or
- *  `relay+ws[s]://host:port` for a peer reached through that relay. The host never reads
- *  it (§12.8). */
+ *  `relay+ws[s]://<key>[.<secret>]@host:port` for a peer reached through that relay
+ *  (`relayAddr`). The host never reads it (§12.8). */
 function peerRef(spec) {
   const bad = (why) => new Error(`transport: config peers entry ${JSON.stringify(spec)}: ${why}`);
   if (typeof spec !== "string" || spec.indexOf("@") < 0) throw bad("want pk[.secret]@dest");
@@ -58,10 +68,10 @@ function peerRef(spec) {
   if (secret !== undefined && !hex32(secret)) throw bad("the contact secret must be 64 hex characters");
   const where = spec.slice(at + 1).trim();
   const dest = where.includes("://") ? where : "tcp://" + where;
-  const m = /^[a-z][a-z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^\s:/[\]]+):(\d{1,5})(?:\/\S*)?$/i.exec(dest);
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^\s@/]+@)?(?:\[[^\]]+\]|[^\s:/[\]@]+):(\d{1,5})(?:\/\S*)?$/i.exec(dest);
   if (!m || Number(m[1]) < 1 || Number(m[1]) > 65535) throw bad("the destination must be [scheme://]host:port[/path]");
-  if (dest.startsWith(RELAY_SCHEME) && !relayOrigin(dest.slice(RELAY_SCHEME.length))) {
-    throw bad("a relay must be relay+ws:// or relay+wss://");
+  if (dest.startsWith(RELAY_SCHEME) && !relayAddr(dest.slice(RELAY_SCHEME.length))) {
+    throw bad("a relay must be relay+ws[s]://<key>[.<secret>]@host:port");
   }
   return { peer: fromHex(pk), secret: secret === undefined ? ZERO32 : fromHex(secret), dest };
 }
@@ -249,17 +259,6 @@ class LinkLimiter {
   }
 }
 
-// Proved msg1s, by the initiator's ephemeral key, so a replayed recording is refused (a
-// msg1 is not bound to its connection). Only proved ones are remembered, so a stranger
-// cannot flush the set; the oldest is evicted at the cap.
-const MAX_SEEN_PROBES = 4096;
-const seenProbes = new Set();
-function probeSeen(ephI) { return seenProbes.has(toHex(ephI)); }
-function rememberProbe(ephI) {
-  if (seenProbes.size >= MAX_SEEN_PROBES) seenProbes.delete(seenProbes.values().next().value);
-  seenProbes.add(toHex(ephI));
-}
-
 // ── the routing core ──────────────────────────────────────────────────────────
 
 class Core {
@@ -328,7 +327,7 @@ class Core {
   async dialDest(peerId, dest, secret) {
     const relayed = dest.startsWith(RELAY_SCHEME);
     const opened = relayed
-      ? await relays.call(peerId, relayOrigin(dest.slice(RELAY_SCHEME.length)))
+      ? await relays.call(peerId, relayAddr(dest.slice(RELAY_SCHEME.length)))
       : { ...(await netLinkOpen(dest)), dest };
     if (opened.linkId === 0) return null;
     // Forgotten while the dial was in flight: nothing wants this link now.
@@ -495,6 +494,21 @@ function handle(argBytes) {
 /** The realm's wake (§12.3): walk the deadlines (`onWake`). */
 entry("wake", () => { onWake(); });
 
+/** What the per-source cap counts an accepted socket's address by (§12.6.2): an IPv4
+ *  address, or an IPv6 address's /64, since one machine is routinely given a whole /64 and
+ *  would otherwise be a source per address it cares to send from. */
+function sourceOf(addr) {
+  const v4 = /^(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
+  if (v4 || !addr.includes(":")) return v4 ? v4[1] : addr;
+  const [head, tail] = addr.toLowerCase().replace(/%.*$/, "").split("::");
+  const groups = head === "" ? [] : head.split(":");
+  if (tail !== undefined) {
+    const rest = tail === "" ? [] : tail.split(":");
+    groups.push(...Array(Math.max(0, 8 - groups.length - rest.length)).fill("0"), ...rest);
+  }
+  return groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":") + "::/64";
+}
+
 /** Platform-opened link event (§12.2): an accepted socket, or a WebRTC data channel that
  *  arrived through the negotiation link named by `via`. */
 entry("linkOpen", (r) => {
@@ -509,7 +523,8 @@ entry("linkOpen", (r) => {
     listener: listener.length > 0 ? utf8Decode(listener) : "",
     dest: "",
     linkSecret: null,
-    source: source.length > 0 ? utf8Decode(source) : undefined,
+    acceptSecrets,
+    source: source.length > 0 ? sourceOf(utf8Decode(source)) : undefined,
     limiter: core.limiter, // accepts spend half-open budget; dials do not
     dialedPeerId: null,
   });
@@ -596,41 +611,71 @@ entry("ice", (r) => {
   return utf8Encode(JSON.stringify(direct.iceServersFor(toHex(r.peer("ice")))));
 });
 
-/** Register on the relay at this `ws://`/`wss://` URL, so peers can reach this node through
- *  it, leaving any other; empty leaves (relay.js). An optional second text is the relay's
- *  secret, for a private one. Answers `relayState` as it stands once the attempt is over.
- *  Deferred: registering waits on the relay's challenge, which arrives in a later
- *  invocation. */
+/** Register on the relay at this `ws[s]://<key>[.<secret>]@host:port` (`relayAddr`), so
+ *  peers can reach this node through it, leaving any other; empty leaves (relay.js). An
+ *  optional second text is the relay's contact secret in hex, for a private one, so it
+ *  need not travel in the URL. Answers `relayState` as it stands once the attempt is over,
+ *  or once `ready`'s cap has passed, since a relay that refuses the node says nothing
+ *  until the handshake deadline. Deferred: registering waits on the relay link's
+ *  handshake, which comes in later invocations. */
 entry("relay", (r) => {
-  const d = defer();
   const url = utf8Decode(r.blob());
-  const secret = r.more() ? r.blob() : null;
-  relays.join(url, secret).then(() => d.resolve(Uint8Array.of(relays.state())), d.reject);
+  const secret = r.more() ? utf8Decode(r.blob()).trim().toLowerCase() : null;
+  if (url !== "" && !relayAddr(url)) throw new Error("transport: relay needs ws[s]://<key>[.<secret>]@host:port, with no path");
+  if (secret !== null && !hex32(secret)) throw new Error("transport: a relay secret must be 64 hex characters");
+  const d = defer();
+  let over = false;
+  core.readyWaiters.push({ check: () => over, d, due: dueIn(readyCapMs), answer: () => Uint8Array.of(relays.state()) });
+  // A failed attempt already shows in `relayState` (a redial is due), so it answers as one.
+  void relays.join(url, secret === null ? null : fromHex(secret)).catch(() => {}).finally(() => {
+    over = true;
+    core.checkReady();
+  });
+  return d.promise;
+});
+
+/** Hand one blob to the home relay, unread (relay.js `tell`): what the relay offers beside
+ *  calls, such as rooms, is the host's and the relay's. Answers `[1]` once it is on the
+ *  wire, `[0]` when there is no registered home relay to take it. The relay's own come
+ *  back through `link/status` (`statusChanged`). Deferred. */
+entry("tell", (r) => {
+  const bytes = r.blob();
+  if (1 + bytes.length > maxFrameBytes - TAG_LEN) throw new Error("transport: tell over the frame cap");
+  const d = defer();
+  relays.tell(bytes).then((went) => d.resolve(Uint8Array.of(went ? 1 : 0)), d.reject);
   return d.promise;
 });
 
 /** `[state u8]`: 0 no relay, 1 registered on it, 2 waiting to redial it. */
 entry("relayState", () => Uint8Array.of(relays.state()));
 
-/** Rotate the inbound contact secret (§12.6.3). */
+/** The inbound contact secret (§12.6.3): with a blob, set it first, 32 bytes, or none for
+ *  an open node. Answers the one in force, which the node's address carries
+ *  (`pk.secret@dest`), empty when the node is open. Deferred: the key's own is derived by
+ *  a host call. */
 entry("contact", (r) => {
-  const secret = r.blob();
-  if (secret.length !== 0 && secret.length !== PK_LEN) {
-    throw new Error("transport: contact needs 32 bytes, or none for an open node");
+  if (r.more()) {
+    const secret = r.blob();
+    if (secret.length !== 0 && secret.length !== PK_LEN) {
+      throw new Error("transport: contact needs 32 bytes, or none for an open node");
+    }
+    contactSecret = secret.length === 0 ? ZERO32 : secret.slice();
   }
-  contactSecret = secret.length === 0 ? ZERO32 : secret.slice();
+  const d = defer();
+  ownSecret().then((s) => d.resolve(bytesCompare(s, ZERO32) === 0 ? EMPTY : s), d.reject);
+  return d.promise;
 });
 
-/** Welcome these peers and no others, `[key 32]*` in one blob: a call one of them places
- *  through a relay is answered whether or not it presents the contact secret (relay.js
- *  `accept`). They are whoever the app has agreed to be reached by, its room-mates or a
- *  list of friends it keeps; the contact secret gates everyone else. */
-entry("welcome", (r) => {
-  const keys = r.blob();
-  if (keys.length % PK_LEN !== 0) throw new Error("transport: welcome needs 32-byte peer ids");
-  const next = new Set();
-  for (let off = 0; off < keys.length; off += PK_LEN) next.add(toHex(keys.subarray(off, off + PK_LEN)));
-  welcomed = next;
+/** The secrets a msg1 may also open under, `[secret 32]*` in one blob, the whole list each
+ *  time, empty for none. Whoever holds one is answered as if it held the contact secret: a
+ *  room's secret, say, for everyone who knows that room. Links already up stay up. */
+entry("secrets", (r) => {
+  const bytes = r.blob();
+  if (bytes.length % PK_LEN !== 0) throw new Error("transport: secrets needs 32-byte secrets");
+  if (bytes.length / PK_LEN > MAX_EXTRA_SECRETS) throw new Error(`transport: at most ${MAX_EXTRA_SECRETS} secrets`);
+  const next = [];
+  for (let off = 0; off < bytes.length; off += PK_LEN) next.push(bytes.slice(off, off + PK_LEN));
+  extraSecrets = next;
 });
 
 /** Forget one peer: its address, and every link to it (`forgetPeer`). */
@@ -661,16 +706,21 @@ function routes() {
 }
 entry("routes", routes);
 
+/** What `link/status` says, by its first byte: this node's standing, or what the home
+ *  relay told it (relay.js `told`). */
+const STATUS_LINKS = 0, STATUS_RELAY = 1;
+
 /** The home relay's state changed (relay.js), or a peer's links did (router.js): tell the
- *  host both, `[relay u8]` as `relayState` answers it and then what `routes` answers. Once
- *  the turn is over, since a pool is not whole between two steps of one. */
+ *  host both, `[STATUS_LINKS][relay u8]` with the byte `relayState` answers and then what
+ *  `routes` answers. Once the turn is over, since a pool is not whole between two steps of
+ *  one. */
 let statusDue = false;
 function statusChanged() {
   if (statusDue) return;
   statusDue = true;
   void Promise.resolve().then(() => {
     statusDue = false;
-    return host.call(N_LINK_STATUS, concatBytes([Uint8Array.of(relays.state()), routes()]));
+    return host.call(N_LINK_STATUS, concatBytes([Uint8Array.of(STATUS_LINKS, relays.state()), routes()]));
   }).catch(() => {});
 }
 

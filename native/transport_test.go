@@ -137,7 +137,7 @@ func runTwoNode(t *testing.T, transport, host, portField, listenArgs string) {
 		  await a.transport.start();
 		  await a.shell.install(__probe);
 		  const bApp = await b.shell.install(__probe);
-		  teachAddr(b.shell, aId, "%s://%s:" + a.transport.%s);
+		  teachAddr(b.shell, aId, "%s://%s:" + a.transport.%s, await contactOf(a.shell));
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][to blob][proto blob][payload blob]. The op name in front is the
 		  // app's framing, built here (the shell passes bytes unread and adds the caller

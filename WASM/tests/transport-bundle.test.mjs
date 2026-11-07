@@ -176,7 +176,9 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     authors: [appAuthorHex],
   }));
   const transportOptions = { channels, listen, bundle: transportBlob };
-  const transportConfig = {};
+  // Open, since this suite is about the bundle's load and replacement; the default gate is
+  // transport-link's.
+  const transportConfig = { contactSecret: "open" };
   // A test may pause a candidate right after its realm starts, before the shell commits
   // it: its LOCAL config is in place, but the incumbent still owns `_net`, which makes
   // address-book updates during replacement deterministic to test.

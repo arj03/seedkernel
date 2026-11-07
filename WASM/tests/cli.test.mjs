@@ -406,7 +406,8 @@ for (const flag of ["--transport", "--transport-config", "--contact-secret"]) {
     shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(Uint8Array.of(1)); } },
   });
   const result = await runCli(host);
-  ok(calls.length === 1 && calls[0].startsWith("\x05relay") && calls[0].endsWith(url), "--relay is the transport's relay op, unread");
+  const relayOps = calls.filter((c) => c.startsWith("\x05relay"));
+  ok(relayOps.length === 1 && relayOps[0].endsWith(url), "--relay is the transport's relay op, unread");
   ok(host.stood.transport !== false, "--relay enables the network");
   ok(result.serving, "a node on a relay keeps serving without a listener");
   ok(host.lines.some((l) => l === "  relay  ws://relay.example:80 (registered)"), "the relay is printed, as registered");
@@ -425,6 +426,18 @@ for (const flag of ["--transport", "--transport-config", "--contact-secret"]) {
     ok(msg.includes(flag + ":") && msg.includes("no TLS"), `${flag} with a wss:// address is refused, since no console target speaks TLS`);
   }
 }
+// A node prints the contact secret its address carries, which the transport answers to
+// `contact`, and says so when it is open.
+{
+  const answering = (contact) => ({ shell: { call: (_svc, b) => Promise.resolve(
+    new TextDecoder().decode(b).startsWith("\x07contact") ? contact : Uint8Array.of(1)) } });
+  const gated = fakeHost(["--key", join(work, "cs.key"), "--relay", "ws://relay.example:80"], answering(new Uint8Array(32).fill(0xab)));
+  await runCli(gated);
+  ok(gated.lines.includes("  contact " + "ab".repeat(32)), "the contact secret is printed, for the node's address");
+  const open = fakeHost(["--key", join(work, "co.key"), "--relay", "ws://relay.example:80"], answering(new Uint8Array(0)));
+  await runCli(open);
+  ok(open.lines.some((l) => l.startsWith("  contact open")), "an open node says it is open");
+}
 // --relay-secret names a file, as --contact-secret does, and its contents follow the URL in
 // the `relay` op, unread.
 {
@@ -437,7 +450,8 @@ for (const flag of ["--transport", "--transport-config", "--contact-secret"]) {
     shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(new Uint8Array(0)); } },
   });
   await runCli(host);
-  ok(calls.length === 1 && calls[0].includes(url) && calls[0].endsWith("\x00\x00\x00\x40" + secret),
+  const relayOps = calls.filter((c) => c.startsWith("\x05relay"));
+  ok(relayOps.length === 1 && relayOps[0].includes(url) && relayOps[0].endsWith("\x00\x00\x00\x40" + secret),
     "--relay-secret follows the URL in the relay op, as the file says it, less its line ending");
   ok(!host.lines.some((l) => l.includes(secret)), "the secret is never printed");
   let msg = "";

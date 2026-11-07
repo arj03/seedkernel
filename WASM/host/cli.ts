@@ -251,15 +251,17 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
   // One line each time a peer is linked, changes how it is reached, or goes, so an
   // operator, or a script driving the node, sees a relayed link move to a direct path
-  // (§12.7). The shipped transport's status is `[relay u8]` and then `[key 32][direct u8]`
-  // per linked peer, repeated whole on each change, so only differences print. A transport
-  // that reports itself in text (a relay's) starts with a printable byte, which that relay
-  // byte never is, and prints as it is.
+  // (§12.7). The shipped transport's standing is `[0][relay u8]` and then
+  // `[key 32][direct u8]` per linked peer, repeated whole on each change, so only
+  // differences print; `[1]` and after it is what its home relay told it, the embedder's
+  // to read. A transport that reports itself in text (a relay's) starts with a printable
+  // byte, which neither kind is, and prints as it is.
   let routes = new Map<string, boolean>();
   const onStatus = (status: Uint8Array) => {
     if (status[0] >= 0x20) { host.log(`  ${dec.decode(status)}`); return; }
+    if (status[0] !== 0) return;
     const now = new Map<string, boolean>();
-    for (let off = 1; off + 33 <= status.length; off += 33) {
+    for (let off = 2; off + 33 <= status.length; off += 33) {
       now.set(toHex(status.subarray(off, off + 32)), status[off + 32] === 1);
     }
     for (const [k, direct] of now) {
@@ -303,6 +305,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   host.log(`  cohort ${peers.length} peer(s)`);
   if (relay !== undefined) host.log(`  relay  ${relay} (${registered ? "registered" : "not registered, redialing"})`);
   for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
+  // The contact secret a peer's address for this node carries, `pk.secret@dest`: the shipped
+  // transport's, by default its key's own. A transport that answers no `contact` prints none.
+  if (network) {
+    const secret = await shell.call(TRANSPORT_SERVICE, new OpArgs("contact").build())?.catch(() => null);
+    if (secret) host.log(`  contact ${secret.length > 0 ? toHex(secret) : "open: anyone who reaches this node is answered"}`);
+  }
 
   // Operator remedies (§12.5) before the bundle, so a node never briefly installs what it
   // was told to remove.

@@ -211,7 +211,7 @@ class Direct {
     if (!e || e.data) { (channel ?? hostChannel(linkId)).close(false); return; }
     const link = e.data = core.openLink({
       linkId, stream, channel, dest: "", listener: "", source: undefined,
-      linkSecret: ZERO32,
+      linkSecret: ZERO32, acceptSecrets: () => [ZERO32],
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,

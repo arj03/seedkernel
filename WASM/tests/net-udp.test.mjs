@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { importBuilt, testkit } from "./testkit.mjs";
-import { FakeRelay } from "./fake-relay.mjs";
+import { FakeRelay, relayUrl } from "./fake-relay.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair, generatorRequest, TransportHost,
   LoopbackChannels,
@@ -971,7 +971,7 @@ function sortedIdentities(n) {
 }
 
 /** Register both on `relay` and link `a` to `b` through it. */
-async function relayLink(a, b, origin = "ws://relay") {
+async function relayLink(a, b, origin = relayUrl("relay")) {
   for (const n of [a, b]) await joinRelay(n, origin);
   await transportOp(a, new OpArgs("addr").blob(Buffer.from(b.peerId, "hex")).blob(new Uint8Array(32)).text("relay+" + origin));
   await a.request(b.peerId, PROTO, Uint8Array.of(0));
@@ -988,7 +988,7 @@ await test("two nodes linked through the relay move to a UDP path", async (keep)
   const relay = new FakeRelay("relay:8080");
   const A = keep(await makeTransportHost({ channels: relay.factory(), datagrams: nodeRawDatagrams() }));
   const B = keep(await makeTransportHost({ channels: relay.factory(), datagrams: nodeRawDatagrams() }));
-  await relayLink(A, B, "ws://relay:8080");
+  await relayLink(A, B, relayUrl("relay:8080"));
   await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 5000, "the splice to be retired");
   const before = relay.spliceBytes;
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
@@ -1005,7 +1005,7 @@ await test("over a path that loses, repeats and reorders, the transport's record
   const net = fabric({ loss: 0.03, dup: 0.02, late: 0.02 });
   const A = keep(await makeTransportHost({ channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.1", false)) }));
   const B = keep(await makeTransportHost({ channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.2", true)) }));
-  await relayLink(A, B, "ws://relay:8080");
+  await relayLink(A, B, relayUrl("relay:8080"));
   await until(async () => (await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true,
     5000, "both to move to the path");
   for (const n of [1024 * 1024, 64 * 1024, 1]) {
@@ -1026,7 +1026,7 @@ await test("a peer back over TCP while its dead UDP path is still held gets ever
     identity: large, channels: combineChannels(relay.factory(), loop.view()),
     listen: [{ label: "tcp", host: "loopback", port: 0 }], datagrams: rawOver(net.machine("10.0.0.2", true)),
   }));
-  await relayLink(A, B, "ws://relay:8080");
+  await relayLink(A, B, relayUrl("relay:8080"));
   await until(async () => (await routes(B)).get(A.peerId) === true, 5000, "B to route A over the UDP path");
   net.cut();
   A.shell.close();

@@ -47,9 +47,11 @@ try {
   const [, holderKey] = await holder.until(/^seedkernel-shell ([0-9a-f]{64})$/m);
   const [, port] = await holder.until(/listening on :(\d+)/);
   ok(Number(port) > 0, "the holder serves on a bound port");
+  // Gated by default: its address carries the contact secret it prints.
+  const [, holderSecret] = await holder.until(/contact ([0-9a-f]{64})$/m);
 
   const payload = Uint8Array.of(1, 2, 3);
-  const sender = start("sender", ["--peers", `${holderKey}@tcp://127.0.0.1:${port}`, "--op", "send"],
+  const sender = start("sender", ["--peers", `${holderKey}.${holderSecret}@tcp://127.0.0.1:${port}`, "--op", "send"],
     sendArgs(holderKey, payload, { proto: "probe" }));
   const sent = await sender.exit;
   ok(sent.code === 0, `the sender exits cleanly (stderr: ${sent.err.trim().split("\n").pop()})`);

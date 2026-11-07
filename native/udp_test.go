@@ -3,8 +3,8 @@ package main
 // The UDP path on the native binary (§12.7): two nodes meet through a relay, the transport
 // moves them to a UDP path over Go's datagram primitive (udp.go), and requests cross it.
 // The relay is an in-realm fake speaking the relay wire over whole-message links, as the
-// shared JS suite's fake-relay.mjs does; it checks no signatures, since only the move off
-// it is under test. Its STUN address does not resolve, so the path is punched between this
+// shared JS suite's fake-relay.mjs does: the handshake as the relay link's responder, then
+// calls in records. Its STUN address does not resolve, so the path is punched between this
 // machine's own addresses.
 //
 // The benchmarks are BenchmarkNetRoundTrip, BenchmarkNetFetch64K and BenchmarkNetUpload1M
@@ -17,6 +17,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -28,11 +30,11 @@ import (
 // net_bench_test.go's do from B to A, and udpCheck asks for a block and sends one, both
 // intact and neither through the relay.
 //
-// The three %q holes, in order: the app bundle hex, the app author's hex id, and the
-// protocol id D sends under.
+// The four %q holes, in order: the ML-KEM module hex, the app bundle hex, the app author's
+// hex id, and the protocol id D sends under.
 const udpPairHarness = `
 	globalThis.__udpRelay = (() => {
-	  const T_CHALLENGE = 0, T_REGISTER = 1, T_CALL = 5, T_UNREACHABLE = 6;
+	  const T_REGISTERED = 1, T_CALL = 5, T_UNREACHABLE = 6;
 	  const registered = new Map(), pending = new Map();
 	  const stats = { spliceBytes: 0 };
 	  const cat = (...parts) => {
@@ -57,24 +59,71 @@ const udpPairHarness = `
 	    };
 	    return end;
 	  };
+	  // The relay's side of a relay link: the channel handshake as its responder, on the
+	  // public network's root, then the relay wire in records (fake-relay.mjs has the same).
+	  const enc = (s) => new TextEncoder().encode(s);
+	  const H = (...parts) => sodium.crypto_generichash(32, cat(...parts), null);
+	  const DOMAIN_LINK_SCOPE = enc("seedkernel-link-scope-v1\0"), DOMAIN_CHANNEL = enc("seedkernel-channel-id-v1\0");
+	  const L = (s) => enc("seedkernel-" + s + "-v1\0");
+	  const ROOT = H(DOMAIN_CHANNEL, new Uint8Array(32)), NONCE0 = new Uint8Array(12), SECRET = new Uint8Array(32);
+	  const relayId = sodium.crypto_sign_keypair();
+	  const kem = platformModules.build([{ name: "mlkem", wasm: fromHex(%q) }]);
+	  const aead = {
+	    seal: (k, n, m) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(m, null, null, n, k),
+	    open: (k, n, c) => { try { return sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, c, null, n, k); } catch { return null; } },
+	  };
+	  const nonce = (ctr) => { const n = new Uint8Array(12); n[8] = ctr >>> 24; n[9] = (ctr >>> 16) & 255; n[10] = (ctr >>> 8) & 255; n[11] = ctr & 255; return n; };
+	  const onMsg1 = async (c, w1) => {
+	    if (w1.length !== 1233 || w1[0] !== 3) return;
+	    const eph = w1.subarray(1, 33), kemPk = w1.subarray(33, 1217);
+	    if (!aead.open(H(SECRET, H(ROOT, w1.subarray(0, 1), eph, kemPk), L("c-probe")), NONCE0, w1.subarray(1217))) return;
+	    const sk = sodium.randombytes_buf(32);
+	    const r = (await (await kem).call("mlkem", cat(Uint8Array.of(1), kemPk, sodium.randombytes_buf(32)))).bytes;
+	    const ee = sodium.crypto_scalarmult(sk, eph), pq = r.subarray(1089);
+	    const head = cat(sodium.crypto_scalarmult(sk, Uint8Array.of(9, ...new Uint8Array(31))), r.subarray(1, 1089));
+	    const h1 = H(ROOT, w1), hs = H(h1, head);
+	    const sig = sodium.crypto_sign_detached(cat(DOMAIN_LINK_SCOPE, DOMAIN_CHANNEL, ROOT, hs, relayId.publicKey), relayId.privateKey);
+	    const w2 = cat(head, aead.seal(H(ee, pq, SECRET, hs, L("c-msg2")), NONCE0, sig));
+	    c.hs = { ee, pq, th: H(h1, w2) };
+	    c.end.deliver(w2);
+	  };
+	  const onMsg3 = (c, w3) => {
+	    const { ee, pq, th } = c.hs;
+	    const plain = w3.length === 112 ? aead.open(H(ee, pq, SECRET, th, L("c-msg3")), NONCE0, w3) : null;
+	    if (!plain) return;
+	    const h3 = H(th, w3);
+	    c.recv = { key: H(ee, pq, SECRET, h3, L("session-i->r")), ctr: 0 };
+	    c.send = { key: H(ee, pq, SECRET, h3, L("session-r->i")), ctr: 0 };
+	    c.hs = null;
+	    c.key = toHex(plain.subarray(0, 32));
+	    registered.set(c.key, c);
+	    record(c, Uint8Array.of(T_REGISTERED));
+	  };
+	  const record = (c, ...parts) => c.end.deliver(aead.seal(c.send.key, nonce(c.send.ctr++), cat(...parts)));
+	  const onRecord = (c, ct) => {
+	    const b = aead.open(c.recv.key, nonce(c.recv.ctr), ct);
+	    if (!b || b.length === 0) { c.end.kill(); return; }
+	    c.recv.ctr++;
+	    if (b[0] === T_CALL && b.length === 49) {
+	      const callee = registered.get(toHex(b.subarray(1, 33))), ticket = b.subarray(33);
+	      if (!callee || callee === c) { record(c, Uint8Array.of(T_UNREACHABLE), b.subarray(1)); return; }
+	      pending.set(toHex(ticket), { ends: [] });
+	      record(callee, Uint8Array.of(T_CALL), fromHex(c.key), ticket);
+	    } else {
+	      c.end.kill();
+	    }
+	  };
+	  // Records are read as they come once nothing waits before them, so a call is heard
+	  // before the splice socket opened behind it.
 	  const control = () => {
-	    const c = { key: null };
+	    const c = { key: null, hs: null, recv: null, send: null, work: Promise.resolve(), waiting: 0 };
 	    c.end = link((b) => {
-	      if (b[0] === T_REGISTER && !c.key) {
-	        c.key = toHex(b.subarray(1, 33));
-	        registered.set(c.key, c);
-	        c.end.deliver(Uint8Array.of(T_REGISTER));
-	      } else if (b[0] === T_CALL && b.length === 49 && c.key) {
-	        const callee = registered.get(toHex(b.subarray(1, 33))), ticket = b.subarray(33);
-	        if (!callee || callee === c) { c.end.deliver(cat(Uint8Array.of(T_UNREACHABLE), b.subarray(1))); return; }
-	        pending.set(toHex(ticket), { ends: [] });
-	        callee.end.deliver(cat(Uint8Array.of(T_CALL), fromHex(c.key), ticket));
-	      } else {
-	        c.end.kill();
-	      }
+	      if (c.recv && c.waiting === 0) { onRecord(c, b); return; }
+	      c.waiting++;
+	      c.work = c.work.then(() => (c.recv ? onRecord(c, b) : c.hs ? onMsg3(c, b) : onMsg1(c, b)))
+	        .catch(() => c.end.kill()).finally(() => { c.waiting--; });
 	    });
 	    c.end.gone = () => { if (c.key && registered.get(c.key) === c) registered.delete(c.key); };
-	    c.end.deliver(cat(Uint8Array.of(T_CHALLENGE), sodium.randombytes_buf(32)));
 	    return c.end.raw;
 	  };
 	  const spliceEnd = (ticket) => {
@@ -98,6 +147,7 @@ const udpPairHarness = `
 	  };
 	  return {
 	    stats,
+	    url: "ws://" + toHex(relayId.publicKey) + "@relay",
 	    factory: () => ({
 	      connect(dest) {
 	        const m = /^ws:\/\/relay\/v1\/(?:\?splice=([0-9a-f]{32}))?$/.exec(dest);
@@ -137,10 +187,10 @@ const udpPairHarness = `
 	  await c.shell.install(__udpAppBlob);
 	  const dApp = await d.shell.install(__udpAppBlob);
 	  for (const n of [c, d]) {
-	    const r = await n.shell.call("_net", opFrame("relay", blob(new TextEncoder().encode("ws://relay"))));
+	    const r = await n.shell.call("_net", opFrame("relay", blob(new TextEncoder().encode(__udpRelay.url))));
 	    if (r[0] !== 1) throw new Error("udp: not registered on the relay");
 	  }
-	  await teachAddr(d.shell, cId, "relay+ws://relay");
+	  await teachAddr(d.shell, cId, "relay+" + __udpRelay.url, await contactOf(c.shell));
 
 	  // The transport's 'send' op argument: [noReply u8][to blob][proto blob][payload blob].
 	  const proto = new TextEncoder().encode(%q);
@@ -202,7 +252,11 @@ func setupUdpPair(tb testing.TB) {
 	}
 	author := testAuthor(tb)
 	blob := signedBundleBytes(tb, author, benchProto, 1, netBenchGuestSource, []string{"_net"})
-	src := fmt.Sprintf(udpPairHarness, hex.EncodeToString(blob), hex.EncodeToString(author.id()), benchProto)
+	mlkem, err := os.ReadFile(filepath.Join("..", "WASM", "browser", "mlkem768.wasm"))
+	if err != nil {
+		tb.Fatal("mlkem768.wasm:", err)
+	}
+	src := fmt.Sprintf(udpPairHarness, hex.EncodeToString(mlkem), hex.EncodeToString(blob), hex.EncodeToString(author.id()), benchProto)
 	if _, err := qc.Eval("udp-pair-harness.js", src); err != nil {
 		tb.Fatal("harness:", err)
 	}

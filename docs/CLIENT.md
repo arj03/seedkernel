@@ -327,13 +327,16 @@ const taught = shell.call(TRANSPORT_SERVICE, new OpArgs("addr")
 if (!taught) throw new Error("this node has no transport");
 await taught;
 
-// Rotate this node's contact secret; an empty blob opens it.
+// This node's contact secret, for its address (pk.secret@dest): by default the transport
+// derives it from the node's key. Given a blob it is set first; an empty blob opens the node,
+// which puts it in public. It answers the secret in force, empty when open.
+const mySecret = await shell.call(TRANSPORT_SERVICE, new OpArgs("contact").build());
 await shell.call(TRANSPORT_SERVICE, new OpArgs("contact").blob(newSecret).build());
 
-// Welcome these peers, [key 32]* in one blob, room-mates or a list of friends the app keeps:
-// their calls through a relay need no contact secret. The whole set each time. And forget
-// one peer: its address and its links.
-await shell.call(TRANSPORT_SERVICE, new OpArgs("welcome").blob(welcomedKeys).build());
+// More secrets a caller may present instead of the contact secret, [secret 32]* in one blob,
+// such as one per room the app is in (seedrelay's roomSecret). The whole list each time.
+// And forget one peer: its address and its links.
+await shell.call(TRANSPORT_SERVICE, new OpArgs("secrets").blob(roomSecrets).build());
 await shell.call(TRANSPORT_SERVICE, new OpArgs("forget").blob(peerId).build());
 
 // Wait for the cohort or the deadline; the op settles either way. Or dial one peer: [1] once

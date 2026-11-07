@@ -103,6 +103,8 @@ const nativeHandleHarness = `
     if (!answer) throw new Error("native test: nothing claims _net on this node");
     return answer;
   };
+  // The contact secret a node's address carries, by default its key's own.
+  globalThis.contactOf = (shell) => shell.call("_net", opFrame("contact", new Uint8Array(0)));
 })();
 `
 

@@ -255,8 +255,11 @@ export async function makeTransportHost(opts = {}) {
     ...(opts.networkKey === undefined ? {} : {
       networkKey: Buffer.from(opts.networkKey).toString("hex"),
     }),
-    ...(opts.contactSecret === undefined ? {} : {
-      contactSecret: Buffer.from(opts.contactSecret).toString("hex"),
+    // A node is gated by its key's own secret unless told otherwise. Most tests here are
+    // about something else, so their nodes are open unless they name a secret; "key" keeps
+    // the default.
+    ...(opts.contactSecret === "key" || (opts.contactSecret === undefined && opts.transportConfig?.contactSecret !== undefined) ? {} : {
+      contactSecret: opts.contactSecret === undefined ? "open" : Buffer.from(opts.contactSecret).toString("hex"),
     }),
     ...(opts.admitPeers === undefined ? {} : {
       admitPeers: opts.admitPeers.map((peer) => Buffer.from(peer).toString("hex")),

@@ -37,6 +37,10 @@
       "types": "./build/host/subkeys.d.ts",
       "default": "./build/host/subkeys.js"
     },
+    "./module-table": {
+      "types": "./build/host/module-table.d.ts",
+      "default": "./build/host/module-table.js"
+    },
     "./fs-memory": {
       "types": "./build/services/fs-memory.d.ts",
       "default": "./build/services/fs-memory.js"
@@ -68,6 +72,8 @@
     "./host.skb": "./build/host.skb",
     "./host-web.skb": "./build/host-web.skb",
     "./ws.wasm": "./build/ws.wasm",
+    "./mlkem768.wasm": "./browser/mlkem768.wasm",
+    "./guest-source": "./scripts/guest-source.mjs",
     "./transport-bundle": {
       "types": "./build/host/transport-bundle.d.ts",
       "default": "./build/host/transport-bundle.js"

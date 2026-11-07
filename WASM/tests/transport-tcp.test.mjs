@@ -45,7 +45,8 @@ async function makeNode(ws = false, extraConfig = {}) {
     ],
     bundle: transportBlob,
   };
-  const transportConfig = { ...extraConfig };
+  // Open, since this suite is about the sockets; the default gate is transport-link's.
+  const transportConfig = { contactSecret: "open", ...extraConfig };
   // bootShell owns the adapter but leaves the load and listeners to this test, which
   // starts them by hand below.
   const { shell, transport } = await bootShell({

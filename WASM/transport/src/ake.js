@@ -151,17 +151,36 @@ function kemDecaps(sk, ct) {
       ? { ok: true, sharedSecret: r.slice(1) }
       : { ok: false, sharedSecret: null }));
 }
-/** The root every handshake starts from: the channel tag hashed over the network key.
- *  Both are fixed for the bundle's life, so it is hashed once and every link shares the
- *  answer; per link, any stranger who opened a socket bought a host call. Asked for on the
- *  first link, since a host call at load is refused, and asked again after a failure. */
-let channelRoot = null;
-function rootKey() {
-  if (channelRoot === null) {
-    channelRoot = hash(DOMAIN_CHANNEL, networkKey);
-    channelRoot.catch(() => { channelRoot = null; });
+/** The root every handshake starts from: the channel tag hashed over a network key, this
+ *  node's or, for a relay link (relay.js), the public network's. Each is hashed once and
+ *  every link shares the answer; per link, any stranger who opened a socket bought a host
+ *  call. Asked for on the first link, since a host call at load is refused, and asked
+ *  again after a failure. */
+const channelRoots = new Map();
+function rootKey(key) {
+  const id = toHex(key);
+  let root = channelRoots.get(id);
+  if (!root) {
+    root = hash(DOMAIN_CHANNEL, key);
+    channelRoots.set(id, root);
+    root.catch(() => { channelRoots.delete(id); });
   }
-  return channelRoot;
+  return root;
+}
+/** A node's own contact secret, when it is given none (§12.6.3): a hash of its signature
+ *  over DOMAIN_CONTACT. Ed25519 signs deterministically, so it lasts as long as the key and
+ *  needs nothing stored, and only the key's holder can compute it. The tag cannot begin a
+ *  channel identity message, so the signature stands for nothing a link carries, and it
+ *  never leaves this realm. Asked for on first use, since a host call at load is refused,
+ *  and asked again after a failure. */
+const DOMAIN_CONTACT = utf8Encode("seedkernel-contact-secret-v1\0");
+let ownKeySecret = null;
+function keySecret() {
+  if (ownKeySecret === null) {
+    ownKeySecret = host.call(N_SIGN, DOMAIN_CONTACT).then((sig) => hash(DOMAIN_CONTACT, sig));
+    ownKeySecret.catch(() => { ownKeySecret = null; });
+  }
+  return ownKeySecret;
 }
 /** The channel's identity-signature payload; the host prefixes its scope. */
 function channelIdentityMessage(root, th, id) {
@@ -197,6 +216,17 @@ function netLinkDeliver(claim, attribution, payload) {
   return host.call(N_LINK_DELIVER, concatBytes([Uint8Array.of(claim.length), claim, attribution, payload]));
 }
 
+// Proved msg1s, by the initiator's ephemeral key, so a replayed recording is refused (a
+// msg1 is not bound to its connection). Only proved ones are remembered, so a stranger
+// cannot flush the set; the oldest is evicted at the cap.
+const MAX_SEEN_PROBES = 4096;
+const seenProbes = new Set();
+function probeSeen(ephI) { return seenProbes.has(toHex(ephI)); }
+function rememberProbe(ephI) {
+  if (seenProbes.size >= MAX_SEEN_PROBES) seenProbes.delete(seenProbes.values().next().value);
+  seenProbes.add(toHex(ephI));
+}
+
 /** Peer lint (§12.6), on a verified identity: msg3 when accepting, msg2 when dialing. */
 function admits(peerBytes) {
   if (admitPeers === null) return true;
@@ -225,10 +255,20 @@ class Link {
     this.onFrame = spec.onFrame;
     // Called the moment the link closes, before its teardown runs.
     this.onClose = spec.onClose;
-    // Dials use the peer's secret; accepts use this node's current one (§12.6.3).
-    this.contactSecret = spec.linkSecret || contactSecret;
-    // An accept from a welcomed key: a msg1 that presents no secret opens it too.
-    this.welcome = spec.welcome === true;
+    // A dial presents the peer's secret; an accept takes the first of its own that its msg1
+    // opens under (§12.6.3).
+    this.contactSecret = spec.linkSecret ?? null;
+    // An accept's secrets, tried in order: a function answering them, read when a msg1
+    // arrives so each accept sees the current ones (core.js `acceptSecrets`).
+    this.acceptSecrets = spec.acceptSecrets;
+    // The network the root is for: this node's, or the public one for a relay link.
+    this.networkKey = spec.networkKey ?? networkKey;
+    // The peer lint (`admits`), which a relay link, pinned to its relay, skips.
+    this.lint = spec.lint !== false;
+    // How long the link may carry nothing once authenticated; 0 keeps it.
+    this.idleMs = spec.idleMs ?? linkIdleTimeoutMs;
+    // Records per direction between ratchets, which both ends must agree on.
+    this.rekeyAfterFrames = spec.rekeyAfterFrames ?? rekeyAfterFrames;
     this.root = null; // set by the boot chain below
 
     this.peerPubkey = null;
@@ -279,7 +319,7 @@ class Link {
     // Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
     // contact secret (§12.6). A failed boot aborts, and the chain recovers.
     this.work = (async () => {
-      this.root = await rootKey();
+      this.root = await rootKey(this.networkKey);
       if (this.weDialed) {
         await this.ensureKeys();
         this.armDeadline(handshakeTimeoutMs);
@@ -309,11 +349,11 @@ class Link {
     this.due = ms > 0 ? dueIn(ms) : Infinity;
   }
 
-  /** The post-auth idle clock: `linkIdleTimeoutMs` since anything last crossed. Traffic
-   *  only moves `lastSeen`; the deadline is re-read on a wake. */
+  /** The post-auth idle clock: `idleMs` since anything last crossed. Traffic only moves
+   *  `lastSeen`; the deadline is re-read on a wake. */
   armIdle() {
     this.lastSeen = now();
-    this.due = linkIdleTimeoutMs > 0 ? dueIn(linkIdleTimeoutMs) : Infinity;
+    this.due = this.idleMs > 0 ? dueIn(this.idleMs) : Infinity;
   }
 
   /** One wake (core.js `onWake`): past `due`, a handshake times out and an idle link
@@ -325,8 +365,10 @@ class Link {
     if (!this.authed) {
       this.timedOut = true;
       this.abort();
-    } else if (t - this.lastSeen < linkIdleTimeoutMs) {
-      this.due = this.lastSeen + linkIdleTimeoutMs;
+    } else if (this.idleMs <= 0) {
+      this.due = Infinity;
+    } else if (t - this.lastSeen < this.idleMs) {
+      this.due = this.lastSeen + this.idleMs;
     } else {
       this.close();
     }
@@ -339,7 +381,8 @@ class Link {
     if (this.slot) this.slot.limiter.touch(this.slot);
   }
 
-  // Queue (pre-auth) or send (post-auth, as an AEAD record) a frame.
+  /** Queue (pre-auth) or send (post-auth, as an AEAD record) a frame. A record answers a
+   *  promise that settles once it is on the wire or the link has failed. */
   send(frame) {
     if (this.closed) return;
     // A frame that would seal past the cap would tear the link down at the receiver.
@@ -357,7 +400,7 @@ class Link {
       this.markTraffic();
       this.outboundQueuedSlices++;
       this.outboundQueuedBytes += frame.length;
-      void this.enqueue(async () => {
+      return this.enqueue(async () => {
         try {
           if (this.closed && !this.parting) return;
           await this.wireRecord(frame);
@@ -366,7 +409,6 @@ class Link {
           this.outboundQueuedBytes -= frame.length;
         }
       });
-      return;
     }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
@@ -553,8 +595,14 @@ class Link {
     finally { key.fill(0); }
   }
 
-  async probeKey(suiteByte, ephI, kemPkI) {
-    return this.kdf([], await hash(this.root, suiteByte, ephI, kemPkI), LABEL_PROBE);
+  /** What the probe key derives from before the secret is mixed in (`probeKey`), so an
+   *  accept trying several secrets hashes it once. */
+  probeContext(suiteByte, ephI, kemPkI) {
+    return hash(this.root, suiteByte, ephI, kemPkI);
+  }
+
+  probeKey(ctx) {
+    return this.kdf([], ctx, LABEL_PROBE);
   }
 
   /** Sign the transcript with the node's key under `DOMAIN_link_scope`. A refusal is a local
@@ -583,7 +631,7 @@ class Link {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
     const kemPk = this.myKem.publicKey;
     const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
-      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), EMPTY)]);
+      await this.sealZero(await this.probeKey(await this.probeContext(SUITE_BYTE, eph, kemPk)), EMPTY)]);
     this.th = await hash(this.root, w1);
     await this.wire(w1);
   }
@@ -593,11 +641,15 @@ class Link {
     const ephI = w1.slice(SUITE_LEN, SUITE_LEN + EPH_LEN);
     const kemPkI = w1.slice(SUITE_LEN + EPH_LEN, SUITE_LEN + EPH_LEN + KEM_PK_LEN);
     const seal = w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN);
-    let probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI), seal);
-    // A welcomed caller need not hold the contact secret: its msg1 may be sealed under none.
-    if (!probe.ok && this.welcome) {
-      this.contactSecret = ZERO32;
-      probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI), seal);
+    // The first secret the probe opens under is the link's, so every later key mixes it.
+    let secrets;
+    try { secrets = await this.acceptSecrets(); } catch { this.stall(); return; }
+    const ctx = await this.probeContext(w1.slice(0, SUITE_LEN), ephI, kemPkI);
+    let probe = { ok: false };
+    for (const secret of secrets) {
+      this.contactSecret = secret;
+      probe = await this.openZero(await this.probeKey(ctx), seal);
+      if (probe.ok) break;
     }
     if (!probe.ok) { this.stall(); return; }
     // A msg1 can be replayed, so each is accepted once, before any expensive work
@@ -653,7 +705,7 @@ class Link {
     const idR = fromHex(this.dialedPeerId);
     if (bytesCompare(idR, ownPk) === 0) { this.abort(); return; }
     if (!(await verify(idR, r.pt, channelIdentityMessage(this.root, hs, idR)))) { this.abort(true); return; }
-    if (!admits(idR)) { this.abort(true); return; }
+    if (this.lint && !admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = this.dialedPeerId;
 
     const h2 = await hash(this.th, w2);
@@ -674,7 +726,7 @@ class Link {
     // The lint, on a verified key, and the one peer this accept is for, if it has one. It
     // closes instead of stalling, since the dialer already verified this node at msg2
     // (§12.6).
-    if (!admits(idI) || (this.acceptPeerId && toHex(idI) !== this.acceptPeerId)) { this.abort(true); return; }
+    if ((this.lint && !admits(idI)) || (this.acceptPeerId && toHex(idI) !== this.acceptPeerId)) { this.abort(true); return; }
     this.peerPubkey = idI; this.peerId = toHex(idI);
     this.th = await hash(this.th, w3);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
@@ -722,7 +774,7 @@ class Link {
 
   async seal(frame) {
     const ct = await aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
-    if (++this.sendCtr >= rekeyAfterFrames) {
+    if (++this.sendCtr >= this.rekeyAfterFrames) {
       this.sendKey = await this.ratchet(this.sendKey);
       this.sendEpoch++;
       this.sendCtr = 0;
@@ -739,7 +791,7 @@ class Link {
     if (!r.ok) { this.abort(true); return; }
     this.markTraffic();
     // Advance only on success.
-    if (++this.recvCtr >= rekeyAfterFrames) {
+    if (++this.recvCtr >= this.rekeyAfterFrames) {
       this.recvKey = await this.ratchet(this.recvKey);
       this.recvEpoch++;
       this.recvCtr = 0;

@@ -9,7 +9,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { importBuilt, testkit } from "./testkit.mjs";
-import { FakeRelay } from "./fake-relay.mjs";
+import { FakeRelay, relayUrl } from "./fake-relay.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair,
 } from "./transport-harness.mjs";
@@ -313,7 +313,7 @@ function sortedIdentities(n) {
 }
 
 /** Register both on `relay` and link `a` to `b` through it. */
-async function relayLink(a, b, origin = "ws://relay") {
+async function relayLink(a, b, origin = relayUrl("relay")) {
   for (const n of [a, b]) await joinRelay(n, origin);
   await transportOp(a, new OpArgs("addr").blob(Buffer.from(b.peerId, "hex")).blob(new Uint8Array(32)).text("relay+" + origin));
   await a.request(b.peerId, PROTO, Uint8Array.of(0));
@@ -323,7 +323,7 @@ await test("two nodes linked through the relay move to WebRTC", async (keep) => 
   const relay = new FakeRelay("relay:8080"), world = new FakeWebRtc();
   const A = keep(await rtcNode(relay, world));
   const B = keep(await rtcNode(relay, world));
-  await relayLink(A, B, "ws://relay:8080");
+  await relayLink(A, B, relayUrl("relay:8080"));
   await until(async () => (await linkedPeers(A)).includes(B.peerId) && (await linkedPeers(B)).includes(A.peerId),
     4000, "the link");
   await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the splice to be retired");
@@ -347,8 +347,8 @@ await test("WebRTC runs without contact secrets: a callee offers to a caller it 
   const calleeSecret = new Uint8Array(32).fill(3);
   const B = keep(await rtcNode(relay, world, { identity: small, contactSecret: calleeSecret }));
   const A = keep(await rtcNode(relay, world, { identity: large, contactSecret: new Uint8Array(32).fill(4) }));
-  await joinRelay(B, "ws://relay");
-  await transportOp(A, new OpArgs("addr").blob(Buffer.from(B.peerId, "hex")).blob(calleeSecret).text("relay+ws://relay"));
+  await joinRelay(B, relayUrl("relay"));
+  await transportOp(A, new OpArgs("addr").blob(Buffer.from(B.peerId, "hex")).blob(calleeSecret).text("relay+" + relayUrl("relay")));
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(1));
   assert(resp[0] === 1, "the relayed link carries a request");
   await until(() => relay.splices.length === 1 && relay.splices[0].every((e) => e.dead), 4000, "the move to WebRTC");
