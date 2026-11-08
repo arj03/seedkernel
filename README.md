@@ -4,17 +4,17 @@ Seedkernel runs signed apps in a sandbox (JavaScript or WebAssembly) across brow
 
 That suits three kinds of work:
 
-- **Hosting third-party extensions.** The operator controls which authors can install code and what each extension can access. Extensions run in isolated slots without direct access to the host's file system, sockets or process.
-- **Distributing app updates as signed bundles.** A release is one blob (manifest, guest and modules under hybrid author signatures), verified at admission, checked against a version floor, and landed as one atomic slot commit. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
-- **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and the apps in [seedshell](https://github.com/arj03/seedshell) get the same guest seam, the same authenticated channel and the same storage interface in a browser tab, on a Node CLI and inside the native binary.
+- **Hosting third-party extensions.** The operator controls which authors can install code and what each extension can access. Extensions run isolated, without direct access to the host's file system, sockets or process.
+- **Distributing app updates as signed bundles.** A release is one blob under the author's signatures, verified on install, refused if older than what is installed, and swapped in atomically. Updates travel over the same peer network as app data. The runtime verifies the author's signatures without needing to trust the peer delivering the bundle.
+- **Building peer applications on a shared runtime.** [seedstore](https://github.com/arj03/seedstore) and the apps in [seedshell](https://github.com/arj03/seedshell) get the same app interface, the same authenticated channel and the same storage in a browser tab, on a Node CLI and inside the native binary.
 
 **Build an app: [Writing bundles and clients](docs/CLIENT.md).** For scale, the guest of seedshell's chat app is a few dozen lines of app logic over a small AssemblyScript module, while seedstore's storage orchestration runs to roughly a thousand. Neither implements the channel handshake or the bundle verifier. [The guide](docs/CLIENT.md#how-much-code) breaks that down and includes a runnable first bundle.
 
 ## What it costs
 
 - **More machinery than you need** for an ordinary web app, a single-purpose server, or anything whose author and operator are the same party. A process boundary or a container is the cheaper answer there.
-- **A guest is a sandboxed JS realm, not Node or a browser.** Dependencies are bundled in and must work without Node APIs, the DOM or `fetch`, and work has to fit a per-realm heap and time budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
-- **You still write everything above the runtime.** Authorization rules, data model and persistence design, recovery after a realm is discarded, user key management, and the whole UI. What Seedkernel saves you is the runtime and transport plumbing.
+- **An app is sandboxed JavaScript, not Node or a browser.** Dependencies are bundled in and must work without Node APIs, the DOM or `fetch`, and work has to fit a per-app heap and time budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
+- **You still write everything above the runtime.** Authorization rules, data model and persistence design, recovery after the host restarts your app, user key management, and the whole UI. What Seedkernel saves you is the runtime and transport plumbing.
 
 ## Status
 
@@ -24,7 +24,7 @@ There has been no external audit, and no cryptographer has reviewed the design (
 
 ## 1. The model
 
-The model has two parts, a host and the bundles it admits. The host runs each bundle in its own slot and controls its access to the host's facilities:
+*Seedkernel* is the project; *the host* is the runtime it builds. The host admits *bundles*, each an app, and runs each in its own *slot*: the app's private code, state and storage. A bundle reaches the host's facilities, its *host services*, only as granted. Whoever embeds the host drives it through a *shell*: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close.
 
 ```
 +-------------------------+  +-------------------------+
@@ -43,19 +43,15 @@ The model has two parts, a host and the bundles it admits. The host runs each bu
 
 | Component | Role |
 | --- | --- |
-| **Host** | The runtime outside installed bundles: one signed host blob (the shared host script, the engine its realms run on, and its crypto) that a small fixed loader runs over one platform ABI, natively or on Node; a page imports the host itself (§12.9). It verifies and admits bundles, builds their private slots, confines execution through its sandbox engines, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
+| **Host** | The runtime outside installed bundles: one signed host blob that a small fixed loader runs, natively or on Node, or that a page imports (§12.9). It verifies and admits bundles, builds their slots, confines execution, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
 | ↳ **Host services** | What a confined app cannot obtain for itself, the `HOST_SERVICES` set (§12.1): `node` (signing with the node's private key), `fs` (storage), `timer` (the realm's wake), `link` (sockets) and `host` (staging a new host blob). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
 | **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. |
 | ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
-| ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have three required exports and **no host imports**, only the fixed inert language-runtime shims in §4.2. The host stages input at `scratch`, calls `handle`, and reads the result. Modules have no I/O and no public routing claims, and their names are private to the slot rather than entries in a shared namespace (§3). |
-
-**Claims** decide which app receives what. A manifest claims the ids its app answers: `protocols` for requests from peers, `services` for calls from co-resident guests and the host. Each id has one owner, and routing is one lookup (§12.10). A guest calls another app's service id the way it calls a host service, by naming it in `guest.requires`. A claim grants no authority, but it selects which admitted app receives decrypted input (§14).
+| ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have **no host imports** and no I/O, and their names are private to the slot (§3). |
 
 The operator chooses which authors may install code and which host services they may receive; the host enforces those grants at admission and at the guest seam. Application-level authorization and behaviour live in the bundles.
 
-There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and the host and every app reach it through the local service id it claims (§12.10).
-
-**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close.
+There is one app shape, one install path (§12.4) and one guest seam (§12.2). The transport uses them like any other app: it reaches sockets by name, and the host and every app reach it through a local service id (§12.10).
 
 ## What a guest looks like
 
@@ -93,19 +89,15 @@ Response returns through the transport bundle
 for encryption, then through the host's socket
 ```
 
-Routing is one protocol-claim lookup (§12.10): the transport has already authenticated and decoded the frame, so the host needs no wire parser or per-message signature scheme of its own.
+**Claims** decide which app receives what. A manifest claims the ids its app answers: `protocols` for requests from peers, `services` for calls from co-resident guests and the host. Each id has one owner, and routing is one lookup (§12.10): the transport has already authenticated and decoded the frame, so the host needs no wire parser or per-message signature scheme of its own. A guest calls another app's service id the way it calls a host service, by naming it in `guest.requires`. A claim grants no authority, but it selects which admitted app receives decrypted input (§14).
 
-The host limits guest access, execution time and retained memory. These limits bound individual requests, but continuous peer traffic has no aggregate CPU guarantee. The transport authenticates the immediate peer; apps that relay messages must establish the original author's identity themselves. See [execution and resource limits](docs/RUNTIME.md#123-zero-authority-js-realms) and [trust boundaries](docs/SECURITY.md#14-security-considerations).
+Guest limits bound individual requests; continuous peer traffic has no aggregate CPU guarantee ([execution and resource limits](docs/RUNTIME.md#123-zero-authority-js-realms), [trust boundaries](docs/SECURITY.md#14-security-considerations)).
 
 ## What belongs in the host
 
-The host provides what a bundle cannot supply for itself; bundles implement everything else. The host writes bytes to a socket, and decides which installed guest may use that socket; the transport bundle decides how to authenticate a peer and encrypt a message. For storage, the host reads and writes bytes under opaque keys and gives each app a private namespace; the app defines its records, content hashes and encryption at rest.
+The host provides what a bundle cannot supply for itself; bundles implement everything else. The host writes bytes to a socket and decides which guest may use it; the transport bundle decides how to authenticate a peer and encrypt a message. The host stores bytes under opaque keys in a private namespace per app; the app defines its records, content hashes and encryption at rest. The host signs with the node's key, derived from a stored master seed, choosing the signing domain and the caller's scope without reading the payload. Because the host never interprets these bytes, bundles can change their wire and storage formats through a signed update while the host enforces the same boundaries. A bug in a bundle reaches only its own slot, never the host, the node key or another app.
 
-Host services leave application meaning to bundles. `link` uses opaque link ids, and `fs` uses flat storage keys. A signing request uses the node's private key, derived from a stored master seed; the host selects the signing domain and the caller's scope without interpreting the payload. This lets bundles change their wire and storage formats while the host continues to enforce the same boundaries. Functionality that can operate within those boundaries belongs in bundles, where it can change through a signed update.
-
-**Each responsibility is its own bundle**, the transport the node's network and an app its logic, and the host keeps what confinement itself rests on. A bug in a bundle reaches only its own realm, never the host, the node key or another slot; a bundle comes from any author the operator admits; and it swaps inside a running node ([DESIGN §12.6](docs/DESIGN.md#126-nodenode-transport-channel-identity-binding)).
-
-The host is one signed blob, and the loader that runs it is the only code fixed when a node is deployed. A running node takes a newer blob from the same host author when its operator allows it, tries it once, and keeps it only if it serves through a health window (§12.9). Bundles can be replaced within a running host; they cannot replace the host.
+The host is one signed blob, and the loader that runs it is the only code fixed when a node is deployed. Bundles can be replaced within a running host; they cannot replace the host.
 
 ## The transport is a bundle
 
@@ -119,12 +111,11 @@ Choosing the transport grants it access to sockets, session keys and plaintext. 
 
 ## What runs today
 
-- **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. Every target runs the same signed host blob's engine and crypto through the same assembly: the native binary and the Node CLI start it through their loaders, and a web page imports the host's modules and takes only the blob's engine and crypto, since a page is served its host and takes no updates. Every target runs guests on the same QuickJS build, and nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
+- **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. Every target runs the same host blob and runs guests on the same QuickJS build, so nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
 - **The native node is one 5.2 MiB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KiB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
 - **The host updates itself, when the operator allows it.** An app can hand the host a newer host blob from the host author, fetched over the node's own network. The running host checks it as it checks an app bundle and hands it to the loader, which tries it once and commits it after a health window; one that fails first is dropped for the host it replaced (§12.9).
 - **The engine is fast enough for real storage.** In seedstore's tested network configurations, transfer rate and latency dominated, not the engine ([seedstore's performance notes](https://github.com/arj03/seedstore/blob/main/docs/PERFORMANCE.md)).
 - **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
-- **Traffic and bundles are post-quantum.** Every link's session keys come from a hybrid X25519 + ML-KEM-768 exchange, and every bundle carries hybrid Ed25519 + ML-DSA-65 signatures ([post-quantum by role](#post-quantum-by-role)).
 
 ## Post-quantum by role
 
