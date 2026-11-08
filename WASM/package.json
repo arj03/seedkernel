@@ -98,6 +98,7 @@
     "build:native": "npm run build:ws && npm run build:host && npm run build:transport-bundle && npm run build:native-host",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build:pq": "node scripts/build-mldsa.mjs && node scripts/build-mlkem.mjs",
+    "build:quic": "node scripts/build-quic.mjs",
     "build": "npm run build:ws && npm run build:host && npm run build:transport-bundle && npm run build:host-script && npm run build:loader-script && npm run build:host-blob && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium && npm run build:pq",
     "shell": "node build/host/loader-node.js",

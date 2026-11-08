@@ -28,15 +28,15 @@ This is the one place these figures live.
 | Component | Size |
 |---|---|
 | `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): the host (`platformHost`) and its browser platform, the socket seams and bundle verification | ~140 KiB |
-| **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium, ML-DSA-65 and the default transport, signed (§12.9). The native and Node loaders run it | 1.18 MiB |
-| of which the host script (`build/host.js`) | 219 KiB |
+| **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium, ML-DSA-65 and the default transport, signed (§12.9). The native and Node loaders run it | 1.42 MiB |
+| of which the host script (`build/host.js`) | 220 KiB |
 | of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 624 KiB |
 | of which libsodium.wasm (core build: the host's crypto) | 217 KiB |
 | of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KiB |
-| of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm` and `mlkem768.wasm` (ML-KEM-768, 12 KiB) | 134 KiB |
-| **Web host blob** (`build/host-web.skb`): the same signed blob with an empty script, since a page imports the host instead | 996 KiB |
-| **Total browser deployment**: the modules and the web host blob | **~1.1 MiB (~470 KiB gzipped)** |
-| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MiB), the Go runtime (~2.4 MiB) and the genesis host blob | ~6.9 MiB |
+| of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm`, `mlkem768.wasm` (ML-KEM-768, 12 KiB) and `quic.wasm` (the UDP path's QUIC connection, ngtcp2, 243 KiB) | 369 KiB |
+| **Web host blob** (`build/host-web.skb`): the same signed blob with an empty script, since a page imports the host instead, and the transport built without `quic.wasm` (`build/transport-web.skb`, 126 KiB), since a page has no datagram sockets | 988 KiB |
+| **Total browser deployment**: the modules and the web host blob | **~1.10 MiB (~468 KiB gzipped)** |
+| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MiB), the Go runtime (~2.4 MiB) and the genesis host blob | ~6.7 MiB |
 
 `npm run build` emits the readable `build/` (~285 KiB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~140 KiB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach: the host modules a page imports. It prints the gzipped size before and after minifying on every run.
 
@@ -81,7 +81,7 @@ The host provides five **host services**, `node`, `fs`, `timer`, `link` and `hos
 - **An undeclared service is not wired.** An fs-less bundle gets no fs backend at all, not a backend behind a check. A declared service the node cannot back (`fs` on a diskless node) refuses the install.
 - **`crypto/*` and bare module names are ungated** and cannot be declared. New pure computation ships as a module of the bundle that needs it; `HOST_TRANSFORM_NAMES` takes no new algorithms. A name it does hold takes its algorithm's whole standard interface (BLAKE2b's output length and key, the AEAD's associated data), never the subset one bundle uses, so a standard protocol over these algorithms is a bundle, not a host release (`tests/noise-vectors.js` replays published Noise XX vectors through them on both targets).
 - **Time is not a service.** Every realm reads `Date.now()` and `performance.now()` as ordinary engine built-ins.
-- **Anything with structure lives in a bundle, never in host code.** Protocol logic is the bundle's guest JS: the transport's handshake, relays and UDP stream. A byte transform whose cost is per byte is one of the bundle's private WASM modules: RFC 6455 masking and the handshake accept are `ws.wasm` in the transport bundle, erasure coding is an app's `codec.wasm`.
+- **Anything with structure lives in a bundle, never in host code.** Protocol logic is the bundle's guest JS: the transport's handshake, relays and UDP punch. Work whose cost is per byte or per packet is one of the bundle's private WASM modules: RFC 6455 masking and the handshake accept are `ws.wasm` in the transport bundle, a UDP path's QUIC connection is its `quic.wasm`, erasure coding is an app's `codec.wasm`.
 
 #### fs
 
@@ -133,7 +133,7 @@ Any other name is refused. Install keeps the three disjoint: every host name con
 | `link/deliver` | `[claimLen u8][claim utf8][attribution 32][payload ..]` | the claimant's answer, routed through the `peer` book (§12.10). Empty both for a claim no peer may reach and for a handler that failed. |
 | `link/status` | occupant-defined bytes describing its own reachability (the shipped transport's format is in [TRANSPORT](TRANSPORT.md), Configuration) | (empty). The occupant says it each time its state changes, and the host hands the bytes unread to the embedder's `onStatus` (`bootShell`'s transport options), so a host follows the occupant's state without polling it. The format is the occupant's; the shell's console decodes the shipped transport's, and prints one that starts with a printable byte, such as a relay's log line, as text. |
 | `link/udpBind` | `[port u16]`, or nothing for 0 | `[socket u32][port u16][addresses utf8 ..]`: a datagram socket on that port, or on one the OS picks for 0, dual-stack where the machine has IPv6, and every address the machine's sockets are reached at, `\n`-separated. Socket 0 when the host has no datagram sockets, has lent `MAX_UDP_SOCKETS`, or the bind failed. Its reads arrive as `datagrams` events. |
-| `link/udpSend` | `([socket u32][hostLen u8][host utf8][port u16][len u16][bytes])*`: a turn's datagrams, each to an IPv4 or IPv6 address, or to a name, which resolves to IPv4 | (empty). A datagram that cannot be sent is lost, as is one from a socket this occupant does not hold; one running past the payload rejects the call. |
+| `link/udpSend` | `([socket u32][host][port u16][len u16][bytes])*`: a turn's datagrams, the host `[4][ip 4]` or `[16][ip 16]` as the `datagrams` event spells an address, or a name as `[0][len u8][name utf8]`, which resolves to IPv4 | (empty). A datagram that cannot be sent is lost, as is one from a socket this occupant does not hold; one running past the payload rejects the call. |
 | `link/udpClose` | `[socket u32]` | (empty), behind what the socket was given to send |
 | `timer/arm` | `[ms u32]` | (empty). Replaces this realm's one armed wake, due in 0..2147483647 ms; it arrives as the `wake` host event (§12.2). A realm that has spent its clock share has it slipped, not failed. |
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a notification already handed to the realm is not retracted. |

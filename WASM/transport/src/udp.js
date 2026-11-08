@@ -3,7 +3,7 @@
 // messages as the host's `rtc:` negotiation links (direct.js), so signaling is the same for
 // both kinds. What differs is what the messages hold:
 //
-//   description  this end's token, 8 random bytes in hex, which every packet to it carries
+//   description  this end's token, 8 random bytes in hex, which every probe to it carries
 //   candidate    an IPv4 `host:port` or IPv6 `[host]:port` this end's socket may be
 //                reached at: its own addresses, then what each STUN server sees; or
 //                `host:*`, this end's NAT gives each destination its own port (below)
@@ -12,7 +12,8 @@
 // candidate it probes every candidate until one answers, and the first answer is its path.
 // A probe leaving through a NAT opens it for the peer's probes back, so two ends whose
 // NATs keep one public port per socket meet. Nothing here is trusted beyond the token:
-// the link runs its handshake over the stream, as over any other.
+// the path is a QUIC connection (quic.js) whose handshake is the link's own, so only the
+// peer the negotiation names can complete it.
 //
 // A socket is dual-stack where the machine has IPv6. An IPv6 address is mostly routed end
 // to end, behind a firewall that lets replies in, which the same probes open as they open
@@ -33,23 +34,17 @@
 //   PROBE_ACK  [type][receiver's token 8][the probe's challenge 8]
 //
 // A probe carries its sender's token, so it can be answered, and a random challenge. The
-// token is in every packet in the clear and so proves nothing; the path is taken only on an
-// ack that echoes the challenge from the address it was sent to, which only something that
-// received the probe can send, never on a DATA or other packet that merely shows the token.
-// A probe can be answered before the peer's description has come the long way round, and its
-// source is a candidate too. The stream's packets (stream.js) share the socket; a STUN
-// answer is told apart by its cookie.
+// token is in every probe in the clear and so proves nothing; the offering end takes the path
+// only on an ack that echoes the challenge from the address it was sent to, which only
+// something that received the probe can send. A probe can be answered before the peer's
+// description has come the long way round, and its source is a candidate too.
 //
-// A path can move. A stream packet from another address means the peer's NAT, or the
-// peer, now sends from there, but a packet only shows its token, which anyone who has seen
-// one can copy. So this end probes the new address with a fresh challenge, as it did to take
-// the path at all, and moves only when the answer echoes it, from there, and only if that
-// address has been heard from more recently than the old one, so a late packet cannot pull
-// the path back. A machine with several addresses sends from the one its route to the
-// destination takes, so two ends can each see the other arrive from an address that is not
-// its path, and both following at once only swaps them, round after round. So the offering
-// end follows at once, and the answering end only once nothing has come from its path for
-// `FOLLOW_MS`, by when an offering end that followed has settled it.
+// The offering end then dials the connection from the socket the ack came to, to the path's
+// address, and the answering end takes the socket the first QUIC packet reaches it on, from
+// an address whose probe it has seen, as its path. Every QUIC packet has the fixed bit
+// (0x40) set and the probes have it clear, so one byte tells them apart; a STUN answer is
+// told apart by its cookie. Past the punch, QUIC is the path: a peer whose NAT moves it is followed once the
+// new address answers a challenge only the peer can, since QUIC seals that too.
 //
 // The host reads none of it (§12.7): what its sockets read comes as one `datagrams` event
 // a turn, and what this end sends goes out as one `link/udpSend` a turn.
@@ -58,14 +53,13 @@ const N_UDP_BIND = "link/udpBind";
 const N_UDP_SEND = "link/udpSend";
 const N_UDP_CLOSE = "link/udpClose";
 
-const TYPE_PROBE = 0x70, TYPE_PROBE_ACK = 0x71;
-const TOKEN = 8;
+/** The probes' types, with QUIC's fixed bit clear (the header). */
+const TYPE_PROBE = 0x30, TYPE_PROBE_ACK = 0x31;
+const QUIC_FIXED_BIT = 0x40;
+const TOKEN = 8, SEED = 32;
 const PROBE_BYTES = 1 + 2 * TOKEN + 8, PROBE_ACK_BYTES = 1 + TOKEN + 8;
 /** How often every candidate is probed until one answers. */
 const PROBE_MS = 50;
-/** How long the answering end's path stays quiet before it follows the peer elsewhere: well
- *  past the round trip in which the offering end follows (the header). */
-const FOLLOW_MS = 1000;
 /** The most of a peer's candidates probed. The peer names them, so without a cap it could
  *  aim this node's probes at any number of addresses. */
 const MAX_PEER_CANDIDATES = 16;
@@ -87,13 +81,13 @@ const MAX_NODE_BIRTHDAY_SOCKETS = 1024;
 const SPRAY_EACH = 64, SPRAY_MAX = 4096;
 /** The ports a NAT maps to: those above the privileged ones. */
 const SPRAY_LOW = 1024, SPRAY_PORTS = 65536 - SPRAY_LOW;
-/** Entropy each negotiation keeps for the challenges of path moves, drawn again once
- *  spent: a host call answers on a later turn. */
-const SPARE = 64;
 /** What one `link/udpSend` carries at most, so a burst does not take the host-call budget
  *  the record layer shares. */
 const SEND_BATCH = 256 * 1024;
 const DESCRIPTION = /^[0-9a-f]{16}$/;
+/** The addresses whose probes the answering end has seen, any of which its connection may
+ *  come from: a peer's are a handful. */
+const MAX_PROBED = 64;
 const CANDIDATE = /^(?:((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})|\[([0-9a-f:]{2,39})\]):(\d{1,5}|\*)$/;
 
 // ── STUN ──────────────────────────────────────────────────────────────────────
@@ -136,8 +130,28 @@ function mappedAddress(msg, txn) {
 
 // ── addresses ─────────────────────────────────────────────────────────────────
 
-/** An address, as sent to: `port` 0 is `host:*`, any port of a hard NAT. */
-function addrOf(host, port) { return { host, port, b: utf8Encode(host) }; }
+/** An address, as sent to: `port` 0 is `host:*`, any port of a hard NAT. `b` is the host as
+ *  `link/udpSend` takes it: `[4][ip 4]` or `[16][ip 16]`, or a name as `[0][len u8][name]`. */
+function addrOf(host, port) { return { host, port, b: hostBytes(host) }; }
+
+function hostBytes(host) {
+  if (host.includes(":")) return concatBytes([Uint8Array.of(16), ipv6Bytes(host)]);
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) return Uint8Array.of(4, ...v4.slice(1).map(Number));
+  const name = utf8Encode(host);
+  return concatBytes([Uint8Array.of(0, name.length), name]);
+}
+
+/** The 16 bytes of an IPv6 address in the shape `isIPv6` takes. */
+function ipv6Bytes(text) {
+  const [head, tail] = text.split("::");
+  const groups = (part) => (part ? part.split(":").map((g) => parseInt(g, 16)) : []);
+  const front = groups(head), back = groups(tail);
+  const all = tail === undefined ? front : [...front, ...new Array(8 - front.length - back.length).fill(0), ...back];
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) writeU16BE(out, 2 * i, all[i]);
+  return out;
+}
 
 /** Whether `text` is an IPv6 address in lowercase hex: eight groups, or fewer around one
  *  `::`, with no zone and no IPv4 tail. */
@@ -191,7 +205,7 @@ function stunServers(iceServers) {
   const out = [];
   for (const s of iceServers) {
     for (const u of [s && s.urls].flat()) {
-      const m = typeof u === "string" ? /^stun:([^:[\]?]+)(?::(\d{1,5}))?$/.exec(u) : null;
+      const m = typeof u === "string" ? /^stun:([\w.-]{1,253})(?::(\d{1,5}))?$/.exec(u) : null;
       if (m) out.push(addrOf(m[1], m[2] ? Number(m[2]) : 3478));
     }
   }
@@ -205,7 +219,7 @@ class Udp {
   constructor() {
     this.listeners = new Map(); // socket id to its negotiation
     this.live = new Set();      // negotiations, for the wake
-    /** Streams that took packets in this event, for one read and one ack each after it. */
+    /** Connections that took packets in this event, for one call each after it. */
     this.turns = [];
     /** What goes out this turn, as `link/udpSend` takes it. */
     this.out = new Uint8Array(SEND_BATCH);
@@ -236,7 +250,7 @@ class Udp {
     if (!socket) return null;
     let entropy;
     try {
-      entropy = await randomBytes(2 * TOKEN + 12 * stun.length + SPARE);
+      entropy = await randomBytes(2 * TOKEN + SEED + 12 * stun.length);
     } catch {
       this.close(socket.id);
       return null;
@@ -254,14 +268,13 @@ class Udp {
 
   /** Send `p` from socket `id` to `to`, at `port` if given, with the turn's others. */
   sendto(id, to, p, port = to.port) {
-    const need = 9 + to.b.length + p.length;
+    const need = 8 + to.b.length + p.length;
     if (this.outLen + need > this.out.length) this.flush();
     const o = this.out;
     let at = this.outLen;
     writeU32BE(o, at, id);
-    o[at + 4] = to.b.length;
-    o.set(to.b, at + 5);
-    at += 5 + to.b.length;
+    o.set(to.b, at + 4);
+    at += 4 + to.b.length;
     writeU16BE(o, at, port);
     writeU16BE(o, at + 2, p.length);
     o.set(p, at + 4);
@@ -272,8 +285,14 @@ class Udp {
     }
   }
 
+  /** Datagrams already in `link/udpSend`'s shape (quic.js), behind what this turn sent. */
+  send(batch) {
+    this.flush();
+    try { void host.call(N_UDP_SEND, batch).catch(() => {}); } catch { /* lost */ }
+  }
+
   /** What this turn sent, in one host call. One the budget refuses is lost datagrams, which
-   *  the stream recovers. */
+   *  the connection recovers. */
   flush() {
     if (this.outLen === 0) return;
     const batch = this.out.slice(0, this.outLen);
@@ -297,6 +316,10 @@ class Udp {
       const id = r.u32(), b = r.blob();
       const to = this.listeners.get(id);
       if (!to) continue;
+      // The connection takes the batch whole; past the punch nothing else here reads it.
+      const fed = to.quic !== null;
+      if (fed) to.quic.feed(b);
+      if (to.path) continue;
       // A batch is mostly one peer's, so its address is spelled once, not once a datagram:
       // an IPv4 one is told from the last by its four bytes as a number, an IPv6 one by
       // comparing its sixteen bytes with the last's (`v6`, their offset in the batch).
@@ -320,9 +343,11 @@ class Udp {
         }
         at += n;
         const len = readU16BE(b, at + 2);
-        to.onPacket(id, b.subarray(at + 4, at + 4 + len), from, readU16BE(b, at));
+        to.onPacket(id, b.subarray(at + 4, at + 4 + len), from, readU16BE(b, at), b.subarray(at - n - 1, at + 2));
         at += 4 + len;
       }
+      // The answering end's connection began in this batch (`take`): it has it whole.
+      if (!fed && to.quic) to.quic.feed(b);
     }
     const turns = this.turns;
     this.turns = [];
@@ -339,28 +364,30 @@ class Udp {
 
 // ── one negotiation ───────────────────────────────────────────────────────────
 
-/** A negotiation: its sockets, its candidates and the punch, and the stream that becomes
+/** A negotiation: its sockets, its candidates and the punch, and the connection that becomes
  *  the data link once a path is found. A local link to direct.js, under its own id. */
 class UdpNegotiation {
   constructor(offer, stun, socket, entropy) {
     this.offer = offer;
     this.linkId = udp.nextId();
     this.token = entropy.subarray(0, TOKEN);
-    /** The token as two words, which every packet is checked against. */
+    /** The token as two words, which every probe is checked against. */
     this.tokenHi = readU32BE(this.token, 0);
     this.tokenLo = readU32BE(this.token, 4);
     /** The challenge every probe carries, which an ack must echo for the path to be taken. */
     this.challenge = entropy.subarray(TOKEN, 2 * TOKEN);
+    /** This end's seed for its connection (quic.js). */
+    this.seed = entropy.subarray(2 * TOKEN, 2 * TOKEN + SEED);
+    const txns = 2 * TOKEN + SEED;
     /** The STUN servers not yet answered, and each one's answer, the address it saw. */
-    this.asking = stun.map((server, i) => ({ server, txn: entropy.subarray(2 * TOKEN + 12 * i, 2 * TOKEN + 12 * i + 12) }));
+    this.asking = stun.map((server, i) => ({ server, txn: entropy.subarray(txns + 12 * i, txns + 12 * i + 12) }));
     this.mapped = [];
-    this.spare = entropy.subarray(2 * TOKEN + 12 * stun.length);
-    this.spareAt = 0;
-    this.refilling = false;
     /** direct.js's side: `up(tag, text)`, `open(linkId, channel)` and `closed(linkId)`. */
     this.sink = null;
     this.peerToken = null;
     this.peerCandidates = [];
+    /** `socket host port` of each probe the answering end has seen (`MAX_PROBED`). */
+    this.probed = new Set();
     /** The addresses of a hard peer's NAT, from its `host:*` candidates. */
     this.peerHard = [];
     this.own = new Set();
@@ -373,11 +400,9 @@ class UdpNegotiation {
     /** A hard end's birthday sockets until a path is found: null until they are asked
      *  for. */
     this.extra = null;
-    this.path = null;
-    /** When the path last carried a packet from the peer. */
-    this.pathHeard = 0;
-    /** An address the peer's packets now come from, being probed before the path moves. */
-    this.moving = null;
+    /** Whether the punch is over: this end has its path, and its connection on it. */
+    this.path = false;
+    this.quic = null;
     /** The next probe round, and the rounds sent; the next STUN retry, and those left. */
     this.roundAt = Infinity;
     this.rounds = 0;
@@ -390,8 +415,6 @@ class UdpNegotiation {
     this.reservedExtra = 0;
     this.dead = false;
     this.dataId = 0;
-    // The stream stopping, for whatever reason, ends the negotiation.
-    this.data = new UdpStream(() => this.close());
     udp.listen(this.socket, this);
   }
 
@@ -535,9 +558,10 @@ class UdpNegotiation {
     for (const c of this.peerCandidates) udp.sendto(s.id, c, p);
   }
 
-  /** One datagram, to socket `id` from `host`:`port`. Its bytes are this realm's. */
-  onPacket(id, p, host, port) {
-    if (this.dead || port < 1) return;
+  /** One datagram, to socket `id` from `host`:`port`, which `addr` is as the batch spells it
+   *  (`[n u8][ip n][port u16]`). Its bytes are this realm's. */
+  onPacket(id, p, host, port, addr) {
+    if (this.dead || port < 1 || p.length === 0) return;
     if (isStun(p)) {
       for (let i = 0; i < this.asking.length; i++) {
         const mapped = mappedAddress(p, this.asking[i].txn);
@@ -545,11 +569,17 @@ class UdpNegotiation {
       }
       return;
     }
-    if (p.length < PATH_HEADER || readU32BE(p, 1) !== this.tokenHi || readU32BE(p, 5) !== this.tokenLo) return;
+    // QUIC: the answering end's path, from an address whose probe it has seen.
+    if (p[0] & QUIC_FIXED_BIT) {
+      if (!this.offer && !this.path && this.probed.has(`${id} ${host} ${port}`)) this.take(id, addr);
+      return;
+    }
+    if (p.length < PROBE_ACK_BYTES || readU32BE(p, 1) !== this.tokenHi || readU32BE(p, 5) !== this.tokenLo) return;
     if (p[0] === TYPE_PROBE) {
       if (p.length !== PROBE_BYTES) return;
       this.peerToken ??= p.slice(1 + TOKEN, 1 + 2 * TOKEN);
-      const from = addrOf(host, port);
+      if (this.probed.size < MAX_PROBED) this.probed.add(`${id} ${host} ${port}`);
+      const from = { host, port, b: addr.slice(0, -2) };
       // The ack is the probe from the sender's token on, its type written over the last
       // byte of this end's token.
       p[TOKEN] = TYPE_PROBE_ACK;
@@ -561,85 +591,36 @@ class UdpNegotiation {
       this.addPeer(from);
     } else if (p[0] === TYPE_PROBE_ACK) {
       if (p.length !== PROBE_ACK_BYTES) return;
-      const echoed = p.subarray(1 + TOKEN);
-      if (this.path) this.moved(host, port, echoed);
-      else if (bytesCompare(echoed, this.challenge) === 0) this.choose(id, host, port);
-    } else if (this.path) {
-      // The data link, once there is one: the way back, the peer having moved, or the path.
-      if (host === this.path.host && port === this.path.port) this.pathHeard = now();
-      else this.probeMove(host, port);
-      this.data.receive(p);
+      if (this.offer && bytesCompare(p.subarray(1 + TOKEN), this.challenge) === 0) this.choose(id, addr);
     }
   }
 
-  /** The peer's packets come from an address that is not the path: challenge it, at most
-   *  once a `PROBE_MS` while they keep coming, and on the answering end only once the path
-   *  has been quiet for `FOLLOW_MS`. */
-  probeMove(host, port) {
-    const t = now();
-    if (!this.offer && t - this.pathHeard < FOLLOW_MS) return;
-    let m = this.moving;
-    if (m && m.addr.host === host && m.addr.port === port) {
-      m.heard = t;
-      if (t - m.sentAt < PROBE_MS) return;
-    } else {
-      const challenge = this.fresh();
-      if (!challenge) return;
-      m = this.moving = { addr: addrOf(host, port), challenge, sentAt: 0, heard: t };
-    }
-    m.sentAt = t;
-    const probe = this.probePacket();
-    probe.set(m.challenge, 1 + 2 * TOKEN);
-    udp.sendto(this.socket, m.addr, probe);
-  }
-
-  /** Eight bytes of the spare entropy, or null while it is drawn again. */
-  fresh() {
-    if (this.spareAt + 8 > this.spare.length) {
-      if (!this.refilling && !this.dead) {
-        this.refilling = true;
-        const done = (b) => {
-          this.refilling = false;
-          if (b) { this.spare = b; this.spareAt = 0; }
-        };
-        try { randomBytes(SPARE).then(done, () => done(null)); } catch { this.refilling = false; }
-      }
-      return null;
-    }
-    this.spareAt += 8;
-    return this.spare.subarray(this.spareAt - 8, this.spareAt);
-  }
-
-  /** An answer to a challenge: the path moves, if it came from the address challenged and
-   *  that address is the one the peer was heard from last. */
-  moved(host, port, echoed) {
-    const m = this.moving;
-    if (!m || m.addr.host !== host || m.addr.port !== port || m.heard < this.pathHeard) return;
-    if (bytesCompare(echoed, m.challenge) !== 0) return;
-    this.moving = null;
-    this.path = m.addr;
-    this.pathHeard = m.heard;
-    this.data.repath(now() - m.sentAt);
-  }
-
-  /** The path is the peer's `host`:`port` from socket `id`, which may be a birthday socket:
-   *  the other sockets close, the STUN servers are not asked again, and the stream is the
-   *  data link. */
-  choose(id, host, port) {
+  /** The offering end's path is the peer's address `addr` from socket `id`, which may be a
+   *  birthday socket: the connection is dialed there. */
+  choose(id, addr) {
     if (this.path || !this.peerToken) return;
-    this.path = addrOf(host, port);
-    this.pathHeard = now();
+    this.take(id, addr.slice());
+  }
+
+  /** The path is socket `id`'s, which may be a birthday socket, to the peer at `remote`: the
+   *  other sockets close, the STUN servers are not asked again, and the connection, which
+   *  the offering end dials there and the answering end takes from there alone, goes to
+   *  direct.js as the data link, whose handshake is the connection's. */
+  take(id, remote) {
+    this.path = true;
     this.keepOnly(id);
     this.stopPunching();
-    const token = this.peerToken;
-    // The stream starts with no round-trip time: the peer's clock is not trusted for one,
-    // and its first data acks measure the path.
-    this.data.start((p) => {
-      p.set(token, 1);
-      udp.sendto(this.socket, this.path, p);
-    });
+    this.quic = new QuicPath(() => this.onQuicGone());
+    this.quic.open(this.seed, this.socket, remote, this.offer);
     this.dataId = udp.nextId();
-    this.sink.open(this.dataId, this.data);
+    this.sink.open(this.dataId, this.quic);
+  }
+
+  /** The connection stopped, for whatever reason, which ends the negotiation, and once it
+   *  has said so, its last socket. */
+  onQuicGone() {
+    if (this.dead) this.keepOnly(0);
+    else this.close();
   }
 
   /** A description or candidate from the peer, which direct.js has from the authenticated
@@ -649,9 +630,10 @@ class UdpNegotiation {
     if (tag === RTC_OFFER || tag === RTC_ANSWER) {
       // An offer reaches only the answering side, an answer only the offering one.
       if ((tag === RTC_OFFER) === this.offer || !DESCRIPTION.test(text)) { this.close(); return; }
+      if (this.peerToken) return;
       this.peerToken = fromHex(text);
-      // Up on a later turn, not inside the signal being applied.
       if (tag === RTC_OFFER) {
+        // Up on a later turn, not inside the signal being applied.
         void Promise.resolve().then(() => {
           if (!this.dead && this.held) this.describe();
         });
@@ -670,16 +652,21 @@ class UdpNegotiation {
     if (this.dead) return Infinity;
     if (t >= this.stunAt) this.askStun();
     if (t >= this.roundAt) this.round();
-    return Math.min(this.stunAt, this.roundAt, this.data.onWake(t));
+    return Math.min(this.stunAt, this.roundAt, this.quic ? this.quic.onWake(t) : Infinity);
   }
 
-  /** End the negotiation and its data link, whoever asked. */
+  /** End the negotiation and its data link, whoever asked. A connection still open closes
+   *  first, telling the peer, and the path's socket goes once it has. */
   close() {
     if (this.dead) return;
     this.dead = true;
     this.stopPunching();
-    this.data.end();
-    this.keepOnly(0);
+    if (this.quic && !this.quic.gone) {
+      this.keepOnly(this.path ? this.socket : 0);
+      this.quic.end();
+    } else {
+      this.keepOnly(0);
+    }
     udp.live.delete(this);
     if (!this.sink) return;
     if (this.dataId !== 0) this.sink.closed(this.dataId);

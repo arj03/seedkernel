@@ -1,6 +1,7 @@
 // Builds the signed transport bundle (§12.6): the guest parts, ws.wasm and
 // mlkem768.wasm, signed under the hybrid suite (§12.4, §14.1). Writes build/transport.skb
-// (gitignored), which the host blob carries as its `transport` part (host/host-blob.ts).
+// (gitignored), which the host blob carries as its `transport` part (host/host-blob.ts),
+// and build/transport-web.skb, the same without quic.wasm, which the web host blob carries.
 //
 // The author key is `--key <seed>` or transport/author.key, generated on first build, so
 // each clone has its own author (§12.5). Both halves of the hybrid key derive from it.
@@ -24,24 +25,29 @@ async function main() {
   // RFC 6455 framing and the handshake KEM are bundle content.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
   const mlkemWasm = readFileSync(join(root, "browser", "mlkem768.wasm"));
-  const { blob, author } = authorBundle(sodium, keys, {
+  // The UDP paths' QUIC connection (transport/quic, scripts/build-quic.mjs).
+  const quicWasm = readFileSync(join(root, "transport", "quic", "quic.wasm"));
+  const sign = (modules) => authorBundle(sodium, keys, {
     app: "transport",
     version: 1,
     // Local only: a `services` claim, never a peer-reachable `protocols` one.
     services: [TRANSPORT_SERVICE],
-    modules: [
-      { name: "ws", wasm: wsWasm },
-      { name: "mlkem", wasm: mlkemWasm },
-    ],
+    modules,
     guestSource: guest,
     // `link` goes only to the boot-selected transport or an explicit replacement (§12.5).
     guestRequires: ["node", "link", "timer"],
     // Signed defaults; an installation overrides any of them through LOCAL.
     guestConfig: TRANSPORT_APP_CONFIG,
   });
+  const shared = [{ name: "ws", wasm: wsWasm }, { name: "mlkem", wasm: mlkemWasm }];
+  const { blob, author } = sign([...shared, { name: "quic", wasm: quicWasm }]);
   // `author` is the key-set hash (bundle.ts `hybridAuthorId`), not the Ed25519 key.
   writeFileSync(join(root, "build", "transport.skb"), blob);
   console.log(`  transport bundle: build/transport.skb (${blob.length} B)`);
+  // A page has no datagram sockets, so its UDP code never runs and needs no QUIC module.
+  const web = sign(shared).blob;
+  writeFileSync(join(root, "build", "transport-web.skb"), web);
+  console.log(`  transport bundle: build/transport-web.skb (${web.length} B), no quic`);
   console.log(`  transport author: ${toHex(author)} (hybrid 0x02)`);
   console.log(`  ed25519 half:     ${toHex(keys.ed.publicKey)}`);
 }

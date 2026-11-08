@@ -61,6 +61,8 @@ const LABEL_M2 = utf8Encode("seedkernel-c-msg2-v1\0");
 const LABEL_M3 = utf8Encode("seedkernel-c-msg3-v1\0");
 const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
+const LABEL_HS_I2R = utf8Encode("seedkernel-channel-handshake-i->r-v1\0");
+const LABEL_HS_R2I = utf8Encode("seedkernel-channel-handshake-r->i-v1\0");
 
 // The channel format tag: seeds the session root and prefixes every identity-signature
 // payload. Transport content, not a host signing domain (§12.6.2b).
@@ -198,7 +200,7 @@ async function netLinkOpen(dest) {
 /** Resolves once the host has accepted the bytes. */
 function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)); }
 /** A host link as the channel a `Link` writes to: `send(bytes)` resolves once the bytes are
- *  taken, and `close(graceful)` ends it. A link this realm runs itself (stream.js) is a
+ *  taken, and `close(graceful)` ends it. A link this realm runs itself (quic.js) is a
  *  channel of its own. */
 function hostChannel(linkId) {
   return { send: (bytes) => netLinkSend(linkId, bytes), close: (graceful) => netLinkClose(linkId, graceful) };
@@ -296,6 +298,9 @@ class Link {
     this.lastSeen = 0;        // when anything last crossed, for the idle window
     this.sendKey = null;
     this.recvKey = null;
+    // A channel that carries the handshake in its own (quic.js) seals every packet under the
+    // keys it derives, so the records go in the clear above it: one AEAD a packet, not two.
+    this.plain = typeof this.channel.handshake === "function";
     this.sendEpoch = 0;
     this.sendCtr = 0;
     this.recvEpoch = 0;
@@ -446,7 +451,7 @@ class Link {
       let saidGoodbye = false;
       // Read again behind the records before it: a failure meanwhile ends the parting, and
       // those records may have used the last epoch.
-      if (this.parting && this.authed && this.sendKey && this.sendEpoch < REJECT_AFTER_EPOCHS) {
+      if (this.parting && this.authed && (this.plain || this.sendKey) && this.sendEpoch < REJECT_AFTER_EPOCHS) {
         try {
           await this.wire(await this.seal(EMPTY));
           // A codec with its own end-of-stream signal sends it too.
@@ -492,9 +497,30 @@ class Link {
 
   // ── handshake ───────────────────────────────────────────────────────────────
 
-  /** Put one link message on the wire, framed if the platform does not frame it. */
+  /** Put one link message on the wire, framed if the platform does not frame it, or a
+   *  handshake message into a channel that carries the handshake itself. */
   wire(msg) {
+    if (this.plain && !this.authed) return this.channel.handshake(msg);
     return this.framer ? this.framer.send(msg) : this.channel.send(msg);
+  }
+
+  /** A handshake message from a channel that carries the handshake itself, which nothing
+   *  past authentication is. */
+  onHandshake(m) {
+    if (this.closed || this.stalled) return;
+    if (m.length > MAX_HANDSHAKE_FRAME_BYTES) { this.refuse(); return; }
+    void this.enqueue(() => (this.authed ? this.refuse() : this.onMessage(m)));
+  }
+
+  /** That channel's handshake secrets, from the second message on, under which it carries
+   *  the third: each end's under its own label, as the session keys are. */
+  async channelHandshakeKeys(th) {
+    const i2r = await this.kdf([this.ee, this.kemSecret], th, LABEL_HS_I2R);
+    const r2i = await this.kdf([this.ee, this.kemSecret], th, LABEL_HS_R2I);
+    if (this.weDialed) this.channel.handshakeKeys(i2r, r2i);
+    else this.channel.handshakeKeys(r2i, i2r);
+    i2r.fill(0);
+    r2i.fill(0);
   }
 
   /** Seal one record and put it on the wire, failing the link if that fails (§12.6). */
@@ -572,6 +598,13 @@ class Link {
     if (this.slot && !this.slot.limiter.hold(this.slot)) { this.abort(); return; }
     this.armIdle();
     if (this.framer) this.framer.raiseCap();
+    if (this.plain) {
+      // The channel seals under them from here on, and the link keeps no copy.
+      this.channel.keys(this.sendKey, this.recvKey);
+      this.sendKey.fill(0);
+      this.recvKey.fill(0);
+      this.sendKey = this.recvKey = null;
+    }
     this.onAuth(this.peerId, this);
     // The tie-break may have closed this link, handing its queue to the winner.
     if (this.closed) return;
@@ -680,6 +713,7 @@ class Link {
     const w2 = concatBytes([head,
       await this.sealZero(await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), sig)]);
     this.th = await hash(h1, w2);
+    if (this.plain) await this.channelHandshakeKeys(this.th);
     await this.wire(w2);
   }
 
@@ -709,6 +743,7 @@ class Link {
     this.peerPubkey = idR; this.peerId = this.dialedPeerId;
 
     const h2 = await hash(this.th, w2);
+    if (this.plain) await this.channelHandshakeKeys(h2);
     const sig = await this.signTranscript(h2);
     if (!sig) return;
     const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([ownPk, sig]));
@@ -773,6 +808,7 @@ class Link {
   }
 
   async seal(frame) {
+    if (this.plain) return frame;
     const ct = await aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
     if (++this.sendCtr >= this.rekeyAfterFrames) {
       this.sendKey = await this.ratchet(this.sendKey);
@@ -785,22 +821,28 @@ class Link {
   /** An authenticated record. Unlike the handshake it aborts on anything wrong, since
    *  concealment protects against strangers, not a proven peer. */
   async onRecord(body) {
-    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
-    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
-    const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
-    if (!r.ok) { this.abort(true); return; }
-    this.markTraffic();
-    // Advance only on success.
-    if (++this.recvCtr >= this.rekeyAfterFrames) {
-      this.recvKey = await this.ratchet(this.recvKey);
-      this.recvEpoch++;
-      this.recvCtr = 0;
+    let pt = body;
+    if (this.plain) {
+      if (body.length > maxFrameBytes) { this.abort(true); return; }
+    } else {
+      if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
+      if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
+      const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
+      if (!r.ok) { this.abort(true); return; }
+      pt = r.pt;
+      // Advance only on success.
+      if (++this.recvCtr >= this.rekeyAfterFrames) {
+        this.recvKey = await this.ratchet(this.recvKey);
+        this.recvEpoch++;
+        this.recvCtr = 0;
+      }
     }
+    this.markTraffic();
     // The reserved empty record: an authenticated end-of-stream.
-    if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
+    if (pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
     // Not awaited, so the next record never waits on an answer. Both forms of the peer's
     // id travel: hex for routing, bytes for attribution.
-    this.onFrame(this.peerId, r.pt, this.peerPubkey, this);
+    this.onFrame(this.peerId, pt, this.peerPubkey, this);
   }
 
   /** The socket went away. */

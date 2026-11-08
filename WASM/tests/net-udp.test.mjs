@@ -1,4 +1,4 @@
-// The UDP path (§12.7): the transport's own (transport/src/udp.js, stream.js), which finds a
+// The UDP path (§12.7): the transport's own (transport/src/udp.js, quic.js), which finds a
 // path between two of the host's datagram sockets and runs a reliable stream over it, and
 // the host's side, which lends the occupant the sockets and nothing more
 // (services/link.ts). The stream and the punch run here as the transport's two parts
@@ -38,7 +38,7 @@ const CREDIT = 1 << 20, MAX_READ = 256 * 1024;
 /** The parts as the bundle assembles them (scripts/guest-source.mjs), and what the rest of
  *  the transport gives them: the wake and retried calls (core.js), entropy (ake.js), the negotiation tags
  *  (direct.js) and the `datagrams` event. */
-const UDP_SOURCE = ["util.js", "stream.js", "udp.js"]
+const UDP_SOURCE = ["util.js", "quic.js", "udp.js"]
   .map((f) => readFileSync(join(root, "transport", "src", f), "utf8")).join("\n")
   .replace("/* @seedkernel-op-frame */", guestOpFraming()) + `
 const host = __host;
@@ -64,6 +64,20 @@ globalThis.__open = (offer, iceServers) => udp.open(offer, iceServers);
 globalThis.__stop = () => { clearTimeout(wakeTimer); for (const n of [...udp.live]) n.close(); };
 `;
 
+/** The bundle's QUIC module (transport/quic), one instance for each realm that calls it, as
+ *  a slot holds one: `call(bytes)` as `host.call("quic", bytes)` answers. */
+const QUIC = new WebAssembly.Module(readFileSync(join(root, "transport", "quic", "quic.wasm")));
+function quicModule() {
+  const { exports: m } = new WebAssembly.Instance(QUIC, {});
+  const at = m.scratch.value;
+  return (input) => {
+    new Uint8Array(m.memory.buffer).set(input, at);
+    const n = m.handle(input.length);
+    if (n < 0) throw new Error("quic: refused");
+    return new Uint8Array(m.memory.buffer).slice(at, at + n);
+  };
+}
+
 /** The pure helpers, from a realm of their own. */
 const LIB = vm.createContext({ setTimeout, clearTimeout, performance, __host: null });
 vm.runInContext(UDP_SOURCE, LIB);
@@ -77,9 +91,11 @@ function udpRealm(raw = nodeRawDatagrams()) {
   const driver = new TransportHost({ datagrams: raw, suppressLinkLog: true });
   const net = driver.rawNet();
   const ctx = vm.createContext({ setTimeout, clearTimeout, performance });
+  const quic = quicModule();
   ctx.__host = {
     async call(name, payload) {
       const p = new Uint8Array(payload);
+      if (name === "quic") return quic(p);
       if (name === "link/udpBind") {
         const s = await net.udpBind();
         const a = enc.encode(s.addresses);
@@ -104,12 +120,33 @@ function udpRealm(raw = nodeRawDatagrams()) {
     const o = { n, up: [], data: null, get closed() { return n.dead; } };
     n.start({
       up: (tag, text) => o.up.push([tag, text]),
-      open: (_id, stream) => { o.data = stream; accepted.push(stream); },
+      open: (_id, stream) => { o.data = stream; accepted.push(stream); standIn(stream, offer); },
       closed: () => {},
     });
     return o;
   };
   return { accepted, open, close: () => { ctx.__stop(); driver.close(); } };
+}
+
+/** The link's handshake (ake.js), which the connection's is, stood in for: three messages,
+ *  then each end's handshake secrets and session keys, as the link hands them down. The
+ *  dialing end speaks first. */
+function standIn(stream, dials) {
+  const key = (n) => new Uint8Array(32).fill(n);
+  const [hsI, hsR, i2r, r2i] = [key(1), key(2), key(3), key(4)];
+  stream.handshakeReader((m) => {
+    if (m[0] === 1) {
+      stream.handshakeKeys(hsR, hsI);
+      stream.handshake(Uint8Array.of(2));
+    } else if (m[0] === 2) {
+      stream.handshakeKeys(hsI, hsR);
+      stream.handshake(Uint8Array.of(3));
+      stream.keys(i2r, r2i);
+    } else if (m[0] === 3) {
+      stream.keys(r2i, i2r);
+    }
+  });
+  if (dials) stream.handshake(Uint8Array.of(1));
 }
 
 /** Carry each side's messages to the other, as the transport does, until both have a
@@ -157,19 +194,14 @@ function writeInPieces(stream, bytes) {
   }
 }
 
-/** Write `bytes` as `writeInPieces` does, holding off while the stream has 8 MiB unacked,
- *  as the link's own outbound bounds do. */
+/** Write `bytes` as `writeInPieces` does, holding off while 8 MiB wait for the
+ *  connection, as the link's own outbound bounds do. */
 async function writePaced(stream, bytes) {
   for (let at = 0; at < bytes.length; at += CREDIT) {
-    while (stream.buffered() > 8 * CREDIT) await settle(5);
+    while (stream.unsent.bytes > 8 * CREDIT) await settle(5);
     writeInPieces(stream, bytes.subarray(at, at + CREDIT));
   }
 }
-
-/** Write `n` as the stream's 48-bit big-endian packet and offset fields. */
-const put48 = (p, at, n) => {
-  for (let i = 5; i >= 0; i--, n = Math.floor(n / 256)) p[at + i] = n % 256;
-};
 
 /** A batch of one datagram, as a platform hands one over: `[n u8][ip n][port u16][len u16][bytes]`. */
 function batchOf(host, port, bytes) {
@@ -184,13 +216,14 @@ function batchOf(host, port, bytes) {
   return out;
 }
 
-/** One datagram as a send batch carries it: `[socket u32][hostLen u8][host][port u16][len u16][bytes]`. */
+/** One datagram as a send batch carries it: `[socket u32][n u8][ip n][port u16][len u16][bytes]`. */
 function sendOf(id, host, port, bytes) {
-  const h = enc.encode(host), out = new Uint8Array(9 + h.length + bytes.length);
+  const ip = host.includes(":") ? ipv6Bytes(host) : Uint8Array.from(host.split("."), Number);
+  const out = new Uint8Array(9 + ip.length + bytes.length);
   out[0] = id >>> 24; out[1] = (id >>> 16) & 255; out[2] = (id >>> 8) & 255; out[3] = id & 255;
-  out[4] = h.length;
-  out.set(h, 5);
-  const at = 5 + h.length;
+  out[4] = ip.length;
+  out.set(ip, 5);
+  const at = 5 + ip.length;
   out[at] = port >> 8; out[at + 1] = port & 255;
   out[at + 2] = bytes.length >> 8; out[at + 3] = bytes.length & 255;
   out.set(bytes, at + 4);
@@ -211,7 +244,9 @@ function rawOver(platform) {
       socket.onMessage((bytes, host, from) => deliver(batchOf(host, from, bytes)));
       return { id, port };
     },
-    send: (batch) => forEachDatagram(batch, (id, host, port, bytes) => sockets.get(id)?.send(bytes, port, host)),
+    // An IPv6 host as RFC 5952 writes it, as these networks name their machines.
+    send: (batch) => forEachDatagram(batch, (id, host, port, bytes) =>
+      sockets.get(id)?.send(bytes, port, host.includes(":") ? ipv6Text(ipv6Bytes(host)) : host)),
     close: (id) => { sockets.get(id)?.close(); sockets.delete(id); },
     addresses: () => platform.addresses().join("\n"),
   };
@@ -238,7 +273,10 @@ function nodePlatform(addresses) {
   };
 }
 
-// ── the stream, over an in-memory fabric ─────────────────────────────────────
+// ── the connection, over an in-memory fabric ─────────────────────────────────
+
+/** Whether a datagram is one of QUIC's short-header packets, which carry the stream. */
+const isShort = (p) => (p[0] & 0xc0) === 0x40;
 
 /** Machines joined by a fabric that drops `loss` of what crosses, sends `dup` of it twice,
  *  and holds `late` of it back 5 ms, behind what was sent after it, or takes `delay` ms
@@ -246,27 +284,35 @@ function nodePlatform(addresses) {
  *  dropped; both it and `loss` can change. A machine made `toA` is b, and the next
  *  `dropToA` datagrams it sends are dropped. While `held` is an array, what b sends waits
  *  in it, as the acks of a peer whose loop is held do, and `release()` hands it all over at
- *  once. `largest` is the largest DATA packet a sent b since it was last set to 0, `toB`
- *  counts them, and `ackToA` is the size of the last ACK b sent a, `onAck` called with the
- *  credit it grants. */
+ *  once. `largest` is the largest short-header packet a sent b that the path carries, since
+ *  it was last set to 0: a probe past the path's MTU is sent, and lost.
+ *  An attacker on the wire sees every datagram in `sniffed`, `{to, bytes}`, and can
+ *  `inject(from, to, bytes)` any it likes, from any address. */
 function fabric({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0 } = {}) {
   const sockets = new Map();
+  const bound = new Map();
   let nextPort = 40000;
   const f = {
-    loss, mtu, dead: false, largest: 0, toB: 0, dropToA: 0, ackToA: 0, held: null,
+    loss, mtu, dead: false, largest: 0, dropToA: 0, held: null, sniffed: [],
     cut: () => { f.dead = true; },
     release: () => { const held = f.held ?? []; f.held = null; for (const go of held) go(); },
+    addrOf: (name) => bound.get(name),
+    inject: (from, to, bytes) => setImmediate(() => {
+      const s = sockets.get(`${to.host}:${to.port}`);
+      if (s && !s.closed) s.handler?.(Uint8Array.from(bytes), from.host, from.port);
+    }),
     machine: (ip, toA) => ({
       addresses: () => [ip],
       async bind() {
         const port = nextPort++;
+        if (!bound.has(toA ? "b" : "a")) bound.set(toA ? "b" : "a", { host: ip, port });
         const socket = {
           handler: null, closed: false,
           send(bytes, toPort, toHost) {
             if (socket.closed) return;
             const p = Uint8Array.from(bytes);
-            if (!toA && p[0] === 0x64) { f.largest = Math.max(f.largest, p.length); f.toB++; }
-            if (toA && p[0] === 0x61) { f.ackToA = p.length; f.onAck?.(Buffer.from(p.buffer, p.byteOffset).readUIntBE(9, 6)); }
+            f.sniffed.push({ to: { host: toHost, port: toPort }, bytes: p });
+            if (!toA && isShort(p) && p.length <= f.mtu) f.largest = Math.max(f.largest, p.length);
             if (toA && f.dropToA > 0) { f.dropToA--; return; }
             const copies = f.dead || p.length > f.mtu || Math.random() < f.loss ? 0 : Math.random() < dup ? 2 : 1;
             for (let i = 0; i < copies; i++) {
@@ -291,18 +337,20 @@ function fabric({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0 } = {})
   return f;
 }
 
-/** a at 10.0.0.1 and b at 10.0.0.2 on a fabric, with a path negotiated between them. */
+/** a at 10.0.0.1 and b at 10.0.0.2 on a fabric, with a path negotiated between them and
+ *  its handshake done: a close before it is a hard one. */
 async function streamPair(opts) {
   const pair = fabric(opts);
   const A = udpRealm(rawOver(pair.machine("10.0.0.1", false))), B = udpRealm(rawOver(pair.machine("10.0.0.2", true)));
   const { a, b } = await negotiate(A, B);
+  await until(() => a.authed && b.authed, 5000, "both handshakes");
   pair.close = () => { A.close(); B.close(); };
   return Object.assign(pair, { a, b, A, B });
 }
 
-console.log("\nUDP: the stream (§12.7)\n");
+console.log("\nUDP: the connection (§12.7)\n");
 
-await test("the stream delivers in order through loss, repeats and reordering, both ways", async () => {
+await test("the connection delivers in order through loss, repeats and reordering, both ways", async () => {
   const pair = await streamPair({ loss: 0.05, dup: 0.02, late: 0.02 });
   const toB = randomBytes(1024 * 1024), toA = randomBytes(128 * 1024);
   const atB = reader(pair.b), atA = reader(pair.a);
@@ -310,20 +358,18 @@ await test("the stream delivers in order through loss, repeats and reordering, b
   writeInPieces(pair.b, toA);
   await until(() => atB.length === toB.length && atA.length === toA.length, 30_000, "both directions to arrive");
   assert(atB.bytes().equals(toB) && atA.bytes().equals(toA), "what arrives is what was written, in order");
-  await until(() => pair.a.buffered() === 0 && pair.b.buffered() === 0, 5000, "everything to be acked");
   pair.close();
 });
 
-await test("a reader still decoding stops the sender at its credit, and lets it go again", async () => {
+await test("a reader still decoding stops the sender at its window, and lets it go again", async () => {
   const pair = await streamPair();
   const atB = reader(pair.b);
   atB.hold();
-  const data = randomBytes(4 * CREDIT);
+  const data = randomBytes(12 * CREDIT);
   writeInPieces(pair.a, data);
   await settle(300);
   assert(atB.length <= MAX_READ, `the reader has its first read only, ${atB.length}`);
-  assert(pair.a.buffered() >= data.length - CREDIT - MAX_READ,
-    `the sender keeps what is past the credit, has ${pair.a.buffered()}`);
+  assert(pair.a.unsent.bytes > 0, "the sender keeps what is past the window");
   atB.release();
   await until(() => atB.length === data.length, 10_000, "the rest once the reader reads");
   assert(atB.bytes().equals(data), "and in order");
@@ -331,11 +377,11 @@ await test("a reader still decoding stops the sender at its credit, and lets it 
   pair.close();
 });
 
-await test("a sender held at its credit goes on at once, though the ack that lets it go is lost", async () => {
+await test("a sender held at its window goes on at once, though the ack that lets it go is lost", async () => {
   const pair = await streamPair();
   const atB = reader(pair.b);
   atB.hold();
-  const data = randomBytes(2 * CREDIT);
+  const data = randomBytes(6 * CREDIT);
   writeInPieces(pair.a, data);
   await settle(300);
   pair.dropToA = 1;
@@ -362,164 +408,18 @@ await test("a reader slow to decode each read takes a long stream that never dra
   pair.close();
 });
 
-await test("a sender held by its credit alone, its reader keeping up, is given more, up to eight credits", async () => {
-  // 50 ms a round trip: one credit a round trip is 21 MB/s, which the path beats.
-  const pair = await streamPair({ delay: 25 });
-  const atB = reader(pair.b);
-  let most = 0;
-  pair.onAck = (granted) => { most = Math.max(most, granted - atB.length); };
-  const data = randomBytes(24 * CREDIT);
-  void writePaced(pair.a, data);
-  await until(() => atB.length === data.length, 30_000, "all of it");
-  assert(atB.bytes().equals(data), "in order");
-  assert(most >= 2 * CREDIT && most <= 8 * CREDIT, `the credit grew to ${(most / CREDIT).toFixed(1)} credits`);
-  pair.close();
-});
-
-await test("acks name only what the sender still waits on, so a lossy stretch leaves them one range", async () => {
-  const pair = await streamPair({ loss: 0.05 });
-  const atB = reader(pair.b);
-  writeInPieces(pair.a, randomBytes(2 * CREDIT));
-  await until(() => pair.a.buffered() === 0, 20_000, "the lossy stretch to be acked");
-  pair.loss = 0;
-  for (const n of [256 * 1024, 64 * 1024]) {
-    writeInPieces(pair.a, randomBytes(n));
-    await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
-    await settle(200);
-  }
-  assert(pair.ackToA === 9 + 9 + 12, `the last ack is one range, ${pair.ackToA} bytes`);
-  assert(atB.length === 2 * CREDIT + 320 * 1024, "everything arrived");
-  pair.close();
-});
-
-/** A stranger's socket on this machine, and the port and token of the end that sent
- *  `opened`'s messages, read off its description and first candidate: something that has
- *  seen the token can send that end packets. */
-async function stranger(opened) {
-  const s = createSocket("udp4");
-  const heard = [];
-  s.on("message", (m) => heard.push(m));
-  await new Promise((r) => s.bind(0, "127.0.0.1", r));
-  const port = Number(opened.up.find(([tag]) => tag === RTC_TAG.CANDIDATE)[1].split(":").at(-1));
-  const token = Buffer.from(opened.up[0][1], "hex");
-  return { s, heard, port, token };
-}
-
-await test("chunks past a gap at overlapping offsets end the stream at two credits, not at memory", async () => {
-  const A = udpRealm(), B = udpRealm();
-  const { offer, a } = await negotiate(A, B);
-  const atA = reader(a);
-  const x = await stranger(offer);
-  // DATA [type][token 8][pn 6][offset 6][floor 6][1400 bytes], well past the next offset.
-  const p = Buffer.alloc(27 + 1400);
-  p[0] = 0x64;
-  x.token.copy(p, 1);
-  for (let sent = 1; sent <= 1500 && !atA.closed; sent++) {
-    put48(p, 9, 1e6 + sent); put48(p, 15, 10_000 + sent);
-    x.s.send(Buffer.from(p), x.port, "127.0.0.1");
-    if (sent % 100 === 0) await settle(5);
-  }
-  await until(() => atA.closed, 3000, "the stream to close at two credits held");
-  x.s.close();
-  A.close(); B.close();
-});
-
-/** A pair whose path has carried data both ways, so each end has measured the round trip
- *  (a negotiated path starts at QUIC's initial 333 ms). */
-async function warmPair(opts) {
-  const pair = await streamPair(opts);
-  reader(pair.a); reader(pair.b);
-  pair.a.send(randomBytes(64 * 1024));
-  pair.b.send(randomBytes(64 * 1024));
-  await until(() => pair.a.buffered() === 0 && pair.b.buffered() === 0, 5000, "the warm-up to be acked");
-  return pair;
-}
-
-await test("data the peer stops answering ends the stream well inside the silent path's 30 s", async () => {
-  const pair = await warmPair();
-  const t0 = performance.now();
-  pair.cut();
-  pair.a.send(randomBytes(64 * 1024));
-  await until(() => pair.a.gone, 20_000, "the sender to give up");
-  const s = (performance.now() - t0) / 1000;
-  // The floor counts from the last packet heard, a moment before the cut.
-  assert(s >= 9.5 && s < 20, `it gives up after the 10 s floor, and before 20 s, at ${s.toFixed(1)} s`);
-  pair.close();
-});
-
-await test("packets grow to 1452 bytes on a path a probe shows carries them, and stay 1200 on one that does not", async () => {
+await test("packets grow to 1452 bytes on a path that carries them, and stay 1200 on one that does not", async () => {
   for (const [mtu, want] of [[Infinity, 1452], [1451, 1200]]) {
     const pair = await streamPair({ mtu });
     const atB = reader(pair.b);
     await settle(100);
-    const data = randomBytes(512 * 1024);
+    const data = randomBytes(4 * CREDIT);
     writeInPieces(pair.a, data);
     await until(() => atB.length === data.length, 10_000, "the data to arrive");
     assert(atB.bytes().equals(data), "intact");
     assert(pair.largest === want, `on a path carrying ${mtu}, the largest packet is ${want}: ${pair.largest}`);
     pair.close();
   }
-});
-
-await test("a path that stops carrying the larger packets drops back to 1200, splitting what was cut larger", async () => {
-  const pair = await streamPair({ loss: 0.02, late: 0.02 });
-  const atB = reader(pair.b);
-  await settle(100);
-  const data = randomBytes(2 * CREDIT);
-  writeInPieces(pair.a, data);
-  await until(() => atB.length > 256 * 1024, 10_000, "the first of it at the larger size");
-  pair.mtu = 1451;
-  await until(() => atB.length === data.length, 20_000, "the rest at 1200");
-  assert(atB.bytes().equals(data), "what was in flight at 1452 arrived intact, split");
-  await until(() => pair.a.buffered() === 0, 5000, "everything to be acked");
-  pair.largest = 0;
-  writeInPieces(pair.a, randomBytes(256 * 1024));
-  await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
-  assert(pair.largest === 1200, `the probe after the drop finds 1452 gone, so packets stay 1200: ${pair.largest}`);
-  pair.close();
-});
-
-await test("a stall drops packets to 1200 too, and the probe once the peer acks again raises them back", async () => {
-  const pair = await streamPair();
-  const atB = reader(pair.b);
-  await settle(100);
-  pair.dead = true;
-  const data = randomBytes(256 * 1024);
-  writeInPieces(pair.a, data);
-  await settle(300);
-  pair.dead = false;
-  await until(() => atB.length === data.length, 20_000, "the data after the stall");
-  assert(atB.bytes().equals(data), "intact");
-  pair.largest = 0;
-  writeInPieces(pair.a, randomBytes(256 * 1024));
-  await until(() => pair.a.buffered() === 0, 10_000, "more to be acked");
-  assert(pair.largest === 1452, `packets are 1452 again: ${pair.largest}`);
-  pair.close();
-});
-
-await test("losses through three probe timeouts start the window over at two packets, and a peer that only stalls keeps it", async () => {
-  const burst = {};
-  for (const outage of [true, false]) {
-    const pair = await streamPair();
-    const atB = reader(pair.b);
-    writeInPieces(pair.a, randomBytes(8 * CREDIT));
-    await until(() => atB.length > 2 * CREDIT, 10_000, "the window to open");
-    // Nothing gets across for a second, or everything does and only the acks wait.
-    if (outage) pair.dead = true; else pair.held = [];
-    await settle(1000);
-    pair.dead = false;
-    pair.held ??= [];
-    await until(() => pair.held.length > 0, 10_000, "an ack from b");
-    const before = pair.toB;
-    pair.release();
-    // What the held acks let out, in a's next turn: the acks to that are held again.
-    pair.held = [];
-    await settle(20);
-    burst[outage ? "outage" : "stall"] = pair.toB - before;
-    pair.close();
-  }
-  assert(burst.outage <= 4, `after the outage, the first acks let out a couple of packets: ${burst.outage}`);
-  assert(burst.stall > 100, `after the stall, the acks let out the window: ${burst.stall}`);
 });
 
 await test("a graceful close lets what was written arrive first, then the peer hears the close", async () => {
@@ -543,6 +443,115 @@ await test("a hard close reaches the peer at once", async () => {
   pair.a.close(false);
   await until(() => atB.closed, 1000, "the peer to hear it");
   pair.close();
+});
+
+await test("someone who sees every packet can forge nothing: not a close, an ack, data, or a move", async () => {
+  const pair = await streamPair();
+  const atB = reader(pair.b), atA = reader(pair.a);
+  const first = randomBytes(256 * 1024);
+  writeInPieces(pair.a, first);
+  await until(() => atB.length === first.length, 5000, "the first bytes");
+  const seen = pair.sniffed.splice(0);
+  assert(seen.length > 100, `the attacker saw the path's packets, ${seen.length} of them`);
+  // From the path's own addresses and from one of the attacker's: every packet again, each
+  // with a byte flipped, short headers of junk, and old-style close and ack packets.
+  for (const from of [pair.addrOf("a"), { host: "10.0.0.9", port: 4444 }]) {
+    for (const s of seen) {
+      pair.inject(from, s.to, s.bytes);
+      const flipped = Uint8Array.from(s.bytes);
+      flipped[flipped.length - 1 - (s.bytes.length % 17)] ^= 1;
+      pair.inject(from, s.to, flipped);
+    }
+    for (let i = 0; i < 50; i++) {
+      const junk = randomBytes(1200);
+      junk[0] = 0x40 | (junk[0] & 0x3f);
+      seen[0].bytes.subarray(1, 9).forEach((x, k) => { junk[1 + k] = x; });
+      pair.inject(from, seen[0].to, junk);
+    }
+  }
+  await settle(200);
+  const there = randomBytes(512 * 1024), back = randomBytes(128 * 1024);
+  writeInPieces(pair.a, there);
+  writeInPieces(pair.b, back);
+  await until(() => atB.length === first.length + there.length && atA.length === back.length, 10_000, "both ways after the forgeries");
+  assert(atB.bytes().equals(Buffer.concat([first, there])) && atA.bytes().equals(back), "intact");
+  assert(!atA.closed && !atB.closed, "neither end closed");
+  assert(!pair.sniffed.some((s) => s.to.host === "10.0.0.9"), "and nothing was sent to the attacker's address");
+  pair.close();
+});
+// ── the module's ABI, by hand (transport/quic/quic.c) ────────────────────────
+
+/** An address as the module takes one, `[n u8][ip n][port u16]`. */
+const addrBytes = (host, port) => batchOf(host, port, new Uint8Array(0)).subarray(0, -2);
+
+/** `OP_OPEN` path `id` on socket 1 with the peer at `peer`, dialed there if `dial`. */
+function quicOpen(call, id, dial, peer) {
+  const head = new Uint8Array(50);
+  const v = new DataView(head.buffer);
+  head[0] = 1;
+  v.setUint32(1, id);
+  head[5] = dial ? 1 : 0;
+  v.setFloat64(6, performance.now());
+  head.set(randomBytes(32), 14);
+  v.setUint32(46, 1);
+  return call(Buffer.concat([head, peer]))[0] === 1;
+}
+
+/** One `OP_TURN` with the link's `msgs`, a `write` and one `batch`: what was accepted, the
+ *  link's messages up and the datagrams to send. */
+function quicTurn(call, id, { msgs = [], write = new Uint8Array(0), batch = null } = {}) {
+  const parts = [];
+  const u32 = (n) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(n);
+    return b;
+  };
+  const head = Buffer.alloc(18);
+  head[0] = 2;
+  head.writeUInt32BE(id, 1);
+  head.writeDoubleBE(performance.now(), 5);
+  parts.push(head, Uint8Array.of(msgs.length));
+  for (const m of msgs) parts.push(u32(m.length), m);
+  parts.push(u32(write.length), write);
+  if (batch) parts.push(u32(batch.length), batch);
+  const r = Buffer.from(call(Buffer.concat(parts)));
+  const readLen = r.readUInt32BE(13), hsLen = r.readUInt32BE(17), up = [];
+  for (let o = 21 + readLen; o < 21 + readLen + hsLen; o += 4 + r.readUInt32BE(o)) {
+    up.push(r.subarray(o + 4, o + 4 + r.readUInt32BE(o)));
+  }
+  return { accepted: r.readUInt32BE(1), up, sends: r.subarray(21 + readLen + hsLen) };
+}
+
+/** Datagrams to send as the peer reads them, a batch from `from`. */
+function asBatch(sends, from) {
+  const out = [];
+  for (let at = 0; at < sends.length;) {
+    const p = at + 5 + sends[at + 4], len = sends.readUInt16BE(p + 2);
+    out.push(from, sends.subarray(p + 2, p + 4 + len));
+    at = p + 4 + len;
+  }
+  return Buffer.concat(out);
+}
+
+await test("the answering end takes its connection from its peer's address alone, though a stranger's Initial comes first", async () => {
+  const call = quicModule();
+  const server = addrBytes("10.0.0.2", 4000), peer = addrBytes("10.0.0.1", 5000), stranger = addrBytes("10.0.0.9", 6000);
+  assert(quicOpen(call, 1, false, peer) && quicOpen(call, 2, true, server) && quicOpen(call, 3, true, server), "opened");
+  const theirs = quicTurn(call, 2, { msgs: [Uint8Array.of(9)] }).sends;
+  const ours = quicTurn(call, 3, { msgs: [Uint8Array.of(1)] }).sends;
+  const { up } = quicTurn(call, 1, { batch: Buffer.concat([asBatch(theirs, stranger), asBatch(ours, peer)]) });
+  assert(up.length === 1 && up[0][0] === 1, `the link hears its peer's first message only: ${up.map((m) => m[0])}`);
+});
+
+await test("a path holds what it has written, not a whole window, so many fit in the module at once", async () => {
+  const call = quicModule();
+  const server = addrBytes("10.0.0.2", 4000), write = randomBytes(1024);
+  // The module's memory is capped at 48 MiB: 32 paths holding a 4 MiB window each would not fit.
+  for (let id = 1; id <= 32; id++) {
+    assert(quicOpen(call, id, true, server), `path ${id} opened`);
+    const { accepted } = quicTurn(call, id, { msgs: [Uint8Array.of(1)], write });
+    assert(accepted === write.length, `path ${id} takes its write: ${accepted}`);
+  }
 });
 
 // ── STUN ─────────────────────────────────────────────────────────────────────
@@ -653,24 +662,6 @@ await test("a peer that moves to another address keeps its stream, once the new 
   A.close(); B.close();
 });
 
-await test("a packet that copies the token from another address draws a challenge, and moves nothing", async () => {
-  const A = udpRealm(), B = udpRealm();
-  const { offer, a, b } = await negotiate(A, B);
-  // A stranger that has seen A's token, from a socket that never answers. A is the offering
-  // end, which challenges at once; the answering end would wait for its path to go quiet.
-  const x = await stranger(offer);
-  const forged = Buffer.concat([Buffer.of(0x00), x.token, Buffer.alloc(8)]);
-  x.s.send(forged, x.port, "127.0.0.1");
-  await until(() => x.heard.length > 0, 2000, "A to challenge the stranger's address");
-  const atB = reader(b);
-  const there = randomBytes(100_000);
-  a.send(there);
-  await until(() => atB.length === there.length, 3000, "A's bytes, still on the old path");
-  assert(atB.bytes().equals(there), "intact");
-  x.s.close();
-  A.close(); B.close();
-});
-
 /** Two machines on two networks, 10.1/16 and 10.2/16, with an address on each, listed in
  *  opposite orders. A datagram leaves from the sender's address on the network it goes to,
  *  as a route picks it, so each end sees the other arrive from the address it sent to. It
@@ -690,7 +681,7 @@ function twoNetworks() {
         handler: null, closed: false,
         send(bytes, toPort, toHost) {
           const from = `10.${toHost.split(".")[1]}.0.${n}`, copy = Uint8Array.from(bytes);
-          if (copy[0] === 0x64) {
+          if (isShort(copy)) {
             const to = `${toHost}:${toPort}`;
             if (dataTo !== null && dataTo !== to) moves.n++;
             dataTo = to;

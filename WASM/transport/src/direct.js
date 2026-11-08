@@ -203,8 +203,8 @@ class Direct {
    *  the peer it signaled, and the answering side accepts that peer and no other. Both run
    *  open, with no contact secret: the channel exists only through signaling over the
    *  authenticated link, so only that peer can reach it, and a key it brought along would
-   *  otherwise pass a gate it never opened. A UDP negotiation's data link is its stream
-   *  (`channel`), which the link reads. */
+   *  otherwise pass a gate it never opened. A UDP negotiation's data link is its connection
+   *  (`channel`), which carries the link's handshake as well as its records. */
   bindData(via, linkId, stream, channel) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
@@ -217,7 +217,10 @@ class Direct {
       dialedPeerId: e.offer ? e.peer : null,
       acceptPeerId: e.offer ? null : e.peer,
     });
-    if (channel) channel.reader((bytes) => link.onWire(bytes));
+    if (channel) {
+      channel.handshakeReader((m) => link.onHandshake(m));
+      channel.reader((bytes) => link.onWire(bytes));
+    }
   }
 
   /** End a negotiation this end gave up on. It leaves `byCtl` at once, so a data link it

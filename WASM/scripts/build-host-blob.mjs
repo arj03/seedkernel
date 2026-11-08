@@ -32,8 +32,13 @@ const blob = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, parts);
 writeFileSync(join(root, "build", "host.skb"), blob);
 console.log(`  host blob: build/host.skb (${blob.length} B), version ${version}, abi ${PLATFORM_ABI}`);
 // The same blob with an empty script, for a page that runs the host from this package's
-// modules (`platformHost` on `browserPlatform`) and so reads only the engine and crypto.
-const web = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, { ...parts, script: new Uint8Array(0) });
+// modules (`platformHost` on `browserPlatform`) and so reads only the engine, the crypto
+// and the transport, whose web build leaves out the QUIC module a page cannot use.
+const web = signHostBlob(sodium, keys, { version, abi: PLATFORM_ABI }, {
+  ...parts,
+  script: new Uint8Array(0),
+  transport: readFileSync(join(root, "build", "transport-web.skb")),
+});
 writeFileSync(join(root, "build", "host-web.skb"), web);
 console.log(`  host blob: build/host-web.skb (${web.length} B), no script`);
 console.log(`  host author: ${toHex(hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey))} (hybrid 0x02)`);

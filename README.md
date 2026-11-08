@@ -111,9 +111,9 @@ The fixed `crypto/*` transforms are a compatibility and performance exception. T
 
 ## The transport is a bundle
 
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then carries every frame as a forward-secret ChaCha20-Poly1305 record. The protocol is the same over TCP, WebSocket, WebRTC and UDP, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([TRANSPORT](docs/TRANSPORT.md)). Every node and relay is gated by default: it answers only callers holding the contact secret its address carries, derived from its key unless one is set. Opening one is choosing to be in public, connection storms included.
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then seals every frame under forward-secret ChaCha20-Poly1305 keys: as a record, or on a UDP path in the QUIC packets that carry it. The protocol is the same over TCP, WebSocket, WebRTC and UDP, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([TRANSPORT](docs/TRANSPORT.md)). Every node and relay is gated by default: it answers only callers holding the contact secret its address carries, derived from its key unless one is set. Opening one is choosing to be in public, connection storms included.
 
-Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 masking in `ws.wasm` and ML-KEM-768 in `mlkem768.wasm`.
+Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 masking in `ws.wasm`, ML-KEM-768 in `mlkem768.wasm`, and a UDP path's QUIC connection in `quic.wasm` (ngtcp2).
 
 This makes the **protocol replaceable without a fork**: a deployment can change its handshake, framing or dial policy by selecting a new transport bundle. A running node can atomically replace its transport, even across authors. An upgrade is a **reconnect**: the old links, session state and address book are discarded, and the embedder supplies peers in the replacement's configuration. The node keeps its listeners active (§12.10).
 
@@ -151,7 +151,7 @@ This matches where deployed protocols stand: TLS, Signal (PQXDH) and OpenSSH run
 
 All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,892 LOC)**
+**Shared: one implementation for all three targets (3,899 LOC)**
 
 The core, which every node runs:
 
@@ -170,7 +170,7 @@ The host services (§12.2), one row each. A node offers `node` and `timer` alway
 | --- | --- | --- |
 | `node` and `timer`: signing under the calling slot's scope, and the realm's one replaceable wake | `services/node.ts`, `services/timer.ts` | 137 |
 | `fs`: one app's scoped view, the key rule, and the one directory-backed store | `services/fs.ts`, `services/fs-files.ts` | 157 |
-| `link`: the transport driver, channels by link id and listeners behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7); the socket contract, destination parsing and flood bounds. No protocol, no state machine, no address book, nothing peer-shaped | `services/link.ts`, `services/socket-seam.ts`, `services/datagrams.ts`, `services/peer-addr.ts`, `services/net-limits.ts` | 597 |
+| `link`: the transport driver, channels by link id and listeners behind three socket events, and the datagram sockets the transport's UDP paths run over (§12.7); the socket contract, destination parsing and flood bounds. No protocol, no state machine, no address book, nothing peer-shaped | `services/link.ts`, `services/socket-seam.ts`, `services/datagrams.ts`, `services/peer-addr.ts`, `services/net-limits.ts` | 604 |
 | `host`: hand the loader a successor host blob (§12.9) | `services/host.ts` | 10 |
 
 The operator front-end, on Node and native only:
@@ -186,9 +186,9 @@ Sharing this code keeps admission and confinement rules consistent across target
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,058 TS |
-| **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,484 Go |
+| **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,482 Go |
 
-The transport bundle sits outside these host totals: 3,067 lines of `transport/src/*.js` plus a 5 KiB `ws.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a reliable stream (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
+The transport bundle sits outside these host totals: 2,847 lines of `transport/src/*.js` plus a 5 KiB `ws.wasm` and a 243 KiB `quic.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a QUIC connection whose handshake is the link's own (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
 
 All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. The transport bundle carries the same `mlkem768.wasm` on every target, as a private module. Native runs these WASM artifacts through wazero.
 

@@ -3,7 +3,7 @@
 // on the port asked for, or one the OS picks, dual-stack where the machine has IPv6. Its
 // reader goroutine holds what it reads until the loop takes it, and the loop hands each
 // batch to the callback the socket was bound with in one call, as `[n u8][ip n][port u16][len u16][bytes]` per
-// datagram, n 4 for IPv4 and 16 for IPv6: the transport's stream (stream.js) reads and
+// datagram, n 4 for IPv4 and 16 for IPv6: the transport's connection (quic.js) reads and
 // acks once a turn, so a crossing per turn is all it needs.
 package main
 
@@ -80,40 +80,39 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		r.SetPropertyStr("port", qc.NewInt32(int32(conn.LocalAddr().(*net.UDPAddr).Port)))
 		return r, nil
 	}))
-	// A turn's datagrams, `([socket u32][hostLen u8][host][port u16][len u16][bytes])*`, which
-	// the host has checked. A send that fails is a lost datagram, IPv6 from an IPv4 socket
-	// among them. An address is sent to at once, from a view of the batch; a name is
-	// resolved to IPv4 off the loop goroutine, from a copy. A batch is mostly one path's, so
-	// a socket is looked up and a host parsed once a run.
+	// A turn's datagrams, `([socket u32][host][port u16][len u16][bytes])*`, which the host
+	// has checked: the host `[4][ip 4]` or `[16][ip 16]`, or a name as `[0][len u8][name]`
+	// (services/datagrams.ts `datagramEnd`). A send that fails is a lost datagram, IPv6 from
+	// an IPv4 socket among them. An address is sent to at once, from a view of the batch; a
+	// name is resolved to IPv4 off the loop goroutine, from a copy. A batch is mostly one
+	// path's, so a socket is looked up once a run.
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
 		b, err := args[0].View()
 		if err != nil {
 			return nil, err
 		}
 		var s *udpSock
-		sid, host := int64(-1), ""
-		var ip netip.Addr
-		var ipErr error
+		sid := int64(-1)
 		for at := 0; at < len(b); {
-			p := at + 5 + int(b[at+4])
+			n := int(b[at+4])
+			p := at + 5 + n
+			if n == 0 {
+				p = at + 6 + int(b[at+5])
+			}
 			port, end := binary.BigEndian.Uint16(b[p:]), p+4+int(binary.BigEndian.Uint16(b[p+2:]))
 			if id := int64(binary.BigEndian.Uint32(b[at:])); id != sid {
 				s, sid = u.get(id), id
 			}
-			if h := b[at+5 : p]; string(h) != host {
-				host = string(h)
-				ip, ipErr = netip.ParseAddr(host)
-			}
-			bytes := b[p+4 : end]
+			bytes, host := b[p+4:end], b[at+5:p]
 			at = end
 			if s == nil {
 				continue
 			}
-			if ipErr == nil {
+			if ip, ok := netip.AddrFromSlice(host); ok && n != 0 {
 				s.conn.WriteToUDPAddrPort(bytes, netip.AddrPortFrom(ip, port))
 				continue
 			}
-			conn, name, copied := s.conn, host, append([]byte(nil), bytes...)
+			conn, name, copied := s.conn, string(host[1:]), append([]byte(nil), bytes...)
 			go func() {
 				if to, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(name, strconv.Itoa(int(port)))); err == nil {
 					conn.WriteToUDP(copied, to)
@@ -159,7 +158,7 @@ func (u *udpHost) get(id int64) *udpSock {
 // read is a socket's reader goroutine: one queued delivery takes whatever has arrived by
 // the time the loop runs it.
 func (u *udpHost) read(id int64, s *udpSock) {
-	// Past the largest datagram the path sends (transport/src/stream.js `MAX_PACKET`), and small, since a
+	// Past the largest datagram the path sends (transport/quic/quic.c's 1452), and small, since a
 	// hard NAT's end opens hundreds of sockets at once.
 	buf := make([]byte, 2048)
 	for {

@@ -38,8 +38,9 @@ export interface RawNet {
   /** A datagram socket on `port`, or on one the OS picks for 0, for the occupant's UDP paths
    *  (§12.7); its reads arrive as `datagrams` events. */
   udpBind(port: number): Promise<DatagramSocket>;
-  /** A turn's datagrams, each `[socket u32][hostLen u8][host][port u16][len u16][bytes]`;
-   *  one that fails is lost. */
+  /** A turn's datagrams, each `[socket u32][host][port u16][len u16][bytes]`, the host an
+   *  address as the reads spell it or a name (datagrams.ts `datagramEnd`); one that fails is
+   *  lost. */
   udpSend(batch: Uint8Array): void;
   udpClose(id: number): void;
 }

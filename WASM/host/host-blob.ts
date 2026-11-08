@@ -6,7 +6,8 @@
 //   qjs        qjs.wasm, the engine guest realms run on (and, on native, the host realm)
 //   sodium     libsodium.wasm, the host's crypto
 //   mldsa      mldsa65.wasm, the host's ML-DSA-65 verifier
-//   transport  build/transport.skb, the signed transport bundle a node boots with (§12.6)
+//   transport  the signed transport bundle a node boots with (§12.6): build/transport.skb,
+//              or in the web blob build/transport-web.skb, which has no QUIC module
 //
 // The running host checks a blob before it hands it to the loader (`checkStagedHost`), with
 // its own crypto, as it checks an app bundle. A loader holds no crypto: it reads the layout

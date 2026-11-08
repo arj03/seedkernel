@@ -23,18 +23,29 @@ export interface RawDatagrams {
   addresses(): string;
 }
 
-/** Where the send-batch datagram at `at` ends, `[socket u32][hostLen u8][host utf8]
- *  [port u16][len u16][bytes]`: past the batch when it runs off its end. */
+/** Where the host of the send-batch datagram at `at` ends. A datagram is `[socket u32][host]
+ *  [port u16][len u16][bytes]`, the host `[4][ip 4]` or `[16][ip 16]` as the read batches
+ *  spell it, or a name as `[0][len u8][name utf8]`; another first byte is no host. */
+function hostEnd(batch: Uint8Array, at: number): number {
+  const n = batch[at + 4];
+  return n === 4 || n === 16 ? at + 5 + n : n === 0 ? at + 6 + (batch[at + 5] ?? 0) : Infinity;
+}
+
+/** Where the send-batch datagram at `at` ends: past the batch when it runs off its end. */
 export function datagramEnd(batch: Uint8Array, at: number): number {
-  const p = at + 5 + (batch[at + 4] ?? 0);
+  const p = hostEnd(batch, at);
   return p + 4 > batch.length ? Infinity : p + 4 + ((batch[p + 2] << 8) | batch[p + 3]);
 }
 
-/** Each datagram of a send batch, in order; the host has already checked its bounds. */
+/** Each datagram of a send batch, in order, its host as text; the host has already checked
+ *  its bounds. */
 export function forEachDatagram(batch: Uint8Array, fn: (id: number, host: string, port: number, bytes: Uint8Array) => void): void {
   for (let at = 0; at < batch.length;) {
-    const p = at + 5 + batch[at + 4], end = datagramEnd(batch, at);
-    fn(readU32BE(batch, at), dec.decode(batch.subarray(at + 5, p)), (batch[p] << 8) | batch[p + 1], batch.subarray(p + 4, end));
+    const p = hostEnd(batch, at), end = datagramEnd(batch, at), n = batch[at + 4];
+    const host = n === 4 ? batch.subarray(at + 5, p).join(".")
+      : n === 16 ? Array.from({ length: 8 }, (_, i) => ((batch[at + 5 + 2 * i] << 8) | batch[at + 6 + 2 * i]).toString(16)).join(":")
+        : dec.decode(batch.subarray(at + 6, p));
+    fn(readU32BE(batch, at), host, (batch[p] << 8) | batch[p + 1], batch.subarray(p + 4, end));
     at = end;
   }
 }

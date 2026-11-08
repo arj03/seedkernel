@@ -1,5 +1,5 @@
 // The transport bundle's guest program: transport/src/*.js concatenated in a fixed order
-// (util, ake, framing, router, relay, stream, udp, direct, core). The order matters (the
+// (util, ake, framing, router, relay, quic, udp, direct, core). The order matters (the
 // parts share one scope, and "use strict" must come first), and this is the only list of
 // parts. The op-frame source replaces the marker in util.js. No dependencies, so loc.mjs
 // can use the path list. The first three are the channel alone (`readChannelSource`),
@@ -11,7 +11,7 @@ import { dirname, join, resolve } from "node:path";
 
 const wasmDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-export const GUEST_PARTS = ["util.js", "ake.js", "framing.js", "router.js", "relay.js", "stream.js", "udp.js", "direct.js", "core.js"];
+export const GUEST_PARTS = ["util.js", "ake.js", "framing.js", "router.js", "relay.js", "quic.js", "udp.js", "direct.js", "core.js"];
 const OP_FRAME_MARKER = "/* @seedkernel-op-frame */";
 
 /** The channel: the helpers, the link with its handshake and records, and the framers. */
