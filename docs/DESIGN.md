@@ -175,7 +175,7 @@
 
 **A page has no loader and keeps no slots.** Its origin serves the page and anything the page would use to check a blob, so a signature check there proves only what TLS already does, and the page runs the blob its origin serves. A pinned loader (an extension, a signed web bundle) would change that; it is a packaging decision for the embedder, not a host feature.
 
-**Size.** The binary is one artifact (~7 MiB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install, and takes its engine from the blob. The protocol's own footprint is tens of KiB. On a JS host `qjs.wasm` is compiled when the first realm is made, so a host with no installed slot does not pay for one; native compiles it at start, since its loader and host realms run on it.
+**Size.** The binary is one artifact (~5 MiB) with no external dependencies, the right shape for a server or appliance; a JS host needs a Node install, and takes its engine from the blob. The protocol's own footprint is tens of KiB. On a JS host `qjs.wasm` is compiled when the first realm is made, so a host with no installed slot does not pay for one; native compiles it at start, since its loader and host realms run on it.
 
 **Minification is a second `tsc` pass**, not a bundler, over what a page vendors beside the blob; the blob's own script is the readable build. It strips comments with no new dependency, and the compiler is the one tool on hand that can tell a regex literal from a division, so nothing hand-written lexes the host.
 

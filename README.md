@@ -13,7 +13,7 @@ That suits three kinds of work:
 ## What it costs
 
 - **More machinery than you need** for an ordinary web app, a single-purpose server, or anything whose author and operator are the same party. A process boundary or a container is the cheaper answer there.
-- **A guest is not a Node or browser environment.** It has ECMAScript plus a few engine extras (`queueMicrotask`, `performance`, `atob`/`btoa`, `DOMException`), four injected globals and one `host.call` seam: no Node APIs, no DOM, no `fetch`, no runtime package imports. Dependencies have to be bundled into flat guest source and must not want any of those. Execution is serialized per realm and bounded in heap and time, so bursty or long work has to fit the deployment's budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
+- **A guest is a sandboxed JS realm, not Node or a browser.** Dependencies are bundled in and must work without Node APIs, the DOM or `fetch`, and work has to fit a per-realm heap and time budget ([CLIENT](docs/CLIENT.md#add-only-the-interfaces-your-app-needs)).
 - **You still write everything above the runtime.** Authorization rules, data model and persistence design, recovery after a realm is discarded, user key management, and the whole UI. What Seedkernel saves you is the runtime and transport plumbing.
 
 ## Status
@@ -55,7 +55,7 @@ The operator chooses which authors may install code and which host services they
 
 There is one app shape, one install path (§12.4), one guest seam (§12.2) and one post-handshake frame plane (§12.6). The transport uses all four like any other app: it reaches sockets by name, and the host and every app reach it through the local service id it claims (§12.10).
 
-**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close. The native binary (§12.9) is the same host in one executable. The source follows the tables below: `WASM/host/` is the core (admission, confinement, the guest seam, routing, the shell and the `HOST_SERVICES` vocabulary), and `WASM/services/` holds one file per host service, its seam handlers beside its backend, with their platform backends. Services depend on the core, and `bootShell` assembles the two into the host. The platform adapters supply the services' backends.
+**Names.** *Seedkernel* is the project; *the host* is the runtime it builds. The host offers *host services* to guests and a *shell* to whoever embeds it: `bootShell` (§12.8) returns the `Shell` handle a client or the CLI uses to install, call, revoke and close.
 
 ## What a guest looks like
 
@@ -107,30 +107,22 @@ Host services leave application meaning to bundles. `link` uses opaque link ids,
 
 The host is one signed blob, and the loader that runs it is the only code fixed when a node is deployed. A running node takes a newer blob from the same host author when its operator allows it, tries it once, and keeps it only if it serves through a health window (§12.9). Bundles can be replaced within a running host; they cannot replace the host.
 
-The fixed `crypto/*` transforms are a compatibility and performance exception. They reuse primitives already shipped with the host, avoiding duplicate implementations and extra module calls on existing paths. New computation ships in the bundle that needs it.
-
 ## The transport is a bundle
 
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then seals every frame under forward-secret ChaCha20-Poly1305 keys: as a record, or on a UDP path in the QUIC packets that carry it. The protocol is the same over TCP, WebSocket, WebRTC and UDP, and does not rely on TLS for its security properties, although WSS and WebRTC add TLS/DTLS underneath ([TRANSPORT](docs/TRANSPORT.md)). Every node and relay is gated by default: it answers only callers holding the contact secret its address carries, derived from its key unless one is set. Opening one is choosing to be in public, connection storms included.
-
-Its **guest** holds session state across calls and reaches sockets through the host; the node's private signing key stays in the host. Computation runs in the bundle's private WASM modules: RFC 6455 masking in `ws.wasm`, ML-KEM-768 in `mlkem768.wasm`, and a UDP path's QUIC connection in `quic.wasm` (ngtcp2).
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then seals every frame under forward-secret ChaCha20-Poly1305 keys, with the same protocol over TCP, WebSocket, WebRTC and UDP (QUIC) ([TRANSPORT](docs/TRANSPORT.md)). The node's signing key stays in the host.
 
 This makes the **protocol replaceable without a fork**: a deployment can change its handshake, framing or dial policy by selecting a new transport bundle. A running node can atomically replace its transport, even across authors. An upgrade is a **reconnect**: the old links, session state and address book are discarded, and the embedder supplies peers in the replacement's configuration. The node keeps its listeners active (§12.10).
 
 Choosing the transport grants it access to sockets, session keys and plaintext. The initial transport is selected at boot, and live changes must explicitly replace the current transport; ordinary app installation cannot acquire `link`. The transport must therefore be trusted with the traffic it handles ([SECURITY §14](docs/SECURITY.md#14-security-considerations)).
 
-**The first transport ships inside the host artifact**; later versions arrive over the transport already running, like any other bundle.
-
-**A node runs without one.** `bootShell` offers `link`, and so installs a transport, only when `services.transport` is given, and the CLI starts one only with `--listen`, `--peers` or `--relay` (§12.8). Such a node still admits and runs apps, with storage and local service calls; it has no peers, and a call to `_net` is refused because nothing claims it.
+**The first transport ships inside the host artifact**; later versions arrive over the transport already running, like any other bundle. A node with no transport still runs apps, just without peers.
 
 ## What runs today
 
 - **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. Every target runs the same signed host blob's engine and crypto through the same assembly: the native binary and the Node CLI start it through their loaders, and a web page imports the host's modules and takes only the blob's engine and crypto, since a page is served its host and takes no updates. Every target runs guests on the same QuickJS build, and nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
-- **The native node is one 7 MiB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KiB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
+- **The native node is one 5.2 MiB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KiB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
 - **The host updates itself, when the operator allows it.** An app can hand the host a newer host blob from the host author, fetched over the node's own network. The running host checks it as it checks an app bundle and hands it to the loader, which tries it once and commits it after a health window; one that fails first is dropped for the host it replaced (§12.9).
-- **Confinement has a measured cost.** On the JS targets each module call is a worker round trip (~21 µs; ~106 µs moving 64 KiB each way), which dominates tiny transforms and fades on large ones. Native checks deadlines inline instead, slowing app-module compute by 7–21% (§14).
 - **The engine is fast enough for real storage.** In seedstore's tested network configurations, transfer rate and latency dominated, not the engine ([seedstore's performance notes](https://github.com/arj03/seedstore/blob/main/docs/PERFORMANCE.md)).
-- **Network buffers have explicit limits.** Socket write backlogs and reads waiting on a busy guest are bounded by both byte size and item count. Data remains accounted for as it moves between buffers. The host pauses reads where possible; when limits are exceeded, it closes the affected link ([RUNTIME §12.6](docs/RUNTIME.md#126-nodenode-transport-channel-identity-binding)).
 - **Code really does arrive only as a bundle.** The chat demo installs its whole UI and logic at runtime, and so does [seedstore](https://github.com/arj03/seedstore), a real high performance storage layer.
 - **Traffic and bundles are post-quantum.** Every link's session keys come from a hybrid X25519 + ML-KEM-768 exchange, and every bundle carries hybrid Ed25519 + ML-DSA-65 signatures ([post-quantum by role](#post-quantum-by-role)).
 
@@ -145,7 +137,7 @@ Each cryptographic role is protected according to when a quantum attacker could 
 | Peer authentication | Ed25519 | Verified live, during the handshake. A recorded handshake gives a future attacker nothing to forge; only one holding a quantum computer at connection time could impersonate a node. |
 | App signatures (`node/sign`) | Ed25519 | Enough for anything verified once. An app that keeps signed records for years adds its own post-quantum signature or an external checkpoint inside the record (§14.2). |
 
-This matches where deployed protocols stand: TLS, Signal (PQXDH) and OpenSSH run a hybrid post-quantum key exchange by default and keep classical authentication, because harvested traffic is the threat that exists today and post-quantum signatures cost kilobytes per handshake. Moving peer authentication later is a transport bundle and host update over the normal update path; it changes every node's peer id, since an id that binds both keys is a hash rather than the Ed25519 key.
+This matches TLS, Signal (PQXDH) and OpenSSH: hybrid post-quantum key exchange, classical authentication, since post-quantum signatures cost kilobytes per handshake. Peer authentication can move to post-quantum later through an ordinary transport and host update, without a fork.
 
 ## One implementation, three targets
 
@@ -188,9 +180,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,058 TS |
 | **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,497 Go |
 
-The transport bundle sits outside these host totals: 2,847 lines of `transport/src/*.js` plus a 5 KiB `ws.wasm` and a 243 KiB `quic.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a QUIC connection whose handshake is the link's own (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
-
-All targets carry the same `libsodium.wasm` and `mldsa65.wasm`, the host's crypto, including verification for manifest suite `0x02`, inside the host blob and run on each target's engine table, a page's included; the loaders hold none. The transport bundle carries the same `mlkem768.wasm` on every target, as a private module. Native runs these WASM artifacts through wazero.
+The transport bundle sits outside these host totals: 2,847 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2) (§12.7). The host's crypto, `libsodium.wasm` and `mldsa65.wasm`, ships inside the host blob, the same on every target.
 
 ## Build this repo
 
@@ -201,7 +191,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedshell](https://github.com/arj03/seedshell) (a browser page that hosts apps, the chat demo of §11 among them, and a headless Node shell that hosts one; both are built on the `Shell` of §12.8, which is this repo's). `npm run build:browser` produces the browser artifacts they vendor. The relay both use, where nodes register their keys and reach each other before moving to a direct link, and where the apps meet peers in rooms, is a deployment concern rather than runtime surface, so it lives outside this repo: [seedrelay](https://github.com/arj03/seedrelay), a bundle a node runs as its transport, which seedshell's `npm run relay` starts. The transport bundle speaks its wire; the host holds only the sockets and peer connections (§12.7).
+This repo is the runtime only. Apps live outside it and consume `seedkernel-wasm`: [seedstore](https://github.com/arj03/seedstore) (a P2P storage node) and [seedshell](https://github.com/arj03/seedshell) (browser and headless shells hosting apps, the chat demo of §11 among them). `npm run build:browser` produces the browser artifacts they vendor. The relay they meet through is [seedrelay](https://github.com/arj03/seedrelay), a bundle a node runs as its transport.
 
 ## The rest of the spec
 
