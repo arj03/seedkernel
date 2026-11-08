@@ -153,10 +153,10 @@ func newEngineInstance(qc *qjs.Context, bytes []byte, importObject *qjs.Value, b
 	e := &engineInstance{}
 	// The process-wide cache the host realm compiled qjs.wasm into, so every realm runs
 	// one copy of the engine's machine code.
-	cfg := wazero.NewRuntimeConfig()
+	cfg := wazero.NewRuntimeConfigCompiler()
 	if bounded {
 		// WithCloseOnContextDone compiles in the check that enforces the §4.3 bound.
-		cfg = wazero.NewRuntimeConfigCompiler().WithCloseOnContextDone(true)
+		cfg = cfg.WithCloseOnContextDone(true)
 	}
 	e.rt = wazero.NewRuntimeWithConfig(ctx, cfg.WithCompilationCache(qjs.SharedCache()))
 	defer func() {

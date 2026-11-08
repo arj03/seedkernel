@@ -6,6 +6,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	crand "crypto/rand"
 	_ "embed"
@@ -18,11 +20,24 @@ import (
 	"seedkernel/qjs"
 )
 
-// genesisHost is the host blob this binary was built with (scripts/build-host-blob.mjs),
-// the one it runs unless told otherwise.
+// genesisGz is the host blob this binary was built with (scripts/build-host-blob.mjs),
+// gzipped by build:native-host: most of it is wasm, which gzip takes to 40%.
 //
-//go:embed host.skb
-var genesisHost []byte
+//go:embed host.skb.gz
+var genesisGz []byte
+
+// genesisHost is genesisGz inflated, the blob this binary runs unless told otherwise.
+var genesisHost = func() []byte {
+	r, err := gzip.NewReader(bytes.NewReader(genesisGz))
+	if err != nil {
+		panic(err)
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
 
 var (
 	ctx = context.Background()

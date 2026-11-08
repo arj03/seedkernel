@@ -578,7 +578,7 @@ static void config(path *p, ngtcp2_callbacks *cb, ngtcp2_settings *st, ngtcp2_tr
   st->max_stream_window = WINDOW;
   // BBR, not CUBIC: one path stands where TCP opens 8 connections, and at each loss one CUBIC
   // flow gives up 30% of its rate where 8 give up 4% of theirs together. On a WAN pair CUBIC
-  // moved PUT at 0.74x TCP's 8 connections, BBR at 1.04x.
+  // was slower than TCP's 8 connections, BBR faster.
   st->cc_algo = NGTCP2_CC_ALGO_BBR;
   ngtcp2_transport_params_default(tp);
   tp->initial_max_streams_bidi = 0;

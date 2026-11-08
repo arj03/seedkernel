@@ -97,7 +97,7 @@ func New(wasm []byte, opts ...Option) (rt *Runtime, err error) {
 		}
 	}()
 	// Each runtime compiles its own module; the shared cache keeps that cheap.
-	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(SharedCache())
+	wcfg := wazero.NewRuntimeConfigCompiler().WithCompilationCache(SharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
 	// A GoModuleFunc: WithFunc's reflection cost ~1µs per JS→Go call.

@@ -15,7 +15,7 @@
 
 # The host blob this binary embeds as its genesis host, copied in by `npm run build:native`
 # (WASM/scripts/build-host-blob.mjs).
-/host.skb
+/host.skb.gz
 
 # The shared loader script (WASM/host/slots.ts) this binary embeds, copied in by
 # `npm run build:native`.

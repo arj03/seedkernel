@@ -36,7 +36,7 @@ This is the one place these figures live.
 | of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm`, `mlkem768.wasm` (ML-KEM-768, 12 KiB) and `quic.wasm` (the UDP path's QUIC connection, ngtcp2, 243 KiB) | 369 KiB |
 | **Web host blob** (`build/host-web.skb`): the same signed blob with an empty script, since a page imports the host instead, and the transport built without `quic.wasm` (`build/transport-web.skb`, 126 KiB), since a page has no datagram sockets | 988 KiB |
 | **Total browser deployment**: the modules and the web host blob | **~1.10 MiB (~468 KiB gzipped)** |
-| **Native binary**, stripped, per `GOOS`/`GOARCH`: mostly wazero's compiler backend (~4 MiB), the Go runtime (~2.4 MiB) and the genesis host blob | ~6.7 MiB |
+| **Native binary**, per `GOOS`/`GOARCH` (amd64 or arm64, the platforms wazero compiles for), built with `go build -tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`, which drops wazero's interpreter, its DWARF stack traces and the symbol table: mostly wazero's compiler backend (~4 MiB), the Go runtime (~2.4 MiB) and the genesis host blob, gzipped (~0.6 MiB) | ~5.2 MiB |
 
 `npm run build` emits the readable `build/` (~285 KiB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~140 KiB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach: the host modules a page imports. It prints the gzipped size before and after minifying on every run.
 

@@ -186,7 +186,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,058 TS |
-| **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,482 Go |
+| **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,497 Go |
 
 The transport bundle sits outside these host totals: 2,847 lines of `transport/src/*.js` plus a 5 KiB `ws.wasm` and a 243 KiB `quic.wasm`. It handles TCP framing, RFC 6455, relays, the signaling of direct paths across the targets that support them, and the UDP path between two nodes with UDP sockets of their own, punched through NATs and carrying a QUIC connection whose handshake is the link's own (§12.7). That runs on Node and in the native binary, over each target's datagram sockets (`services/datagrams-node.ts`, counted with JS, and `native/udp.go`), which the host lends the transport and never reads.
 

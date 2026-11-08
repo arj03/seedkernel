@@ -7,10 +7,10 @@ package main
 
 import (
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,13 +59,16 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 		return nil, nil
 	}))
 	l.qc.Global().SetPropertyStr("bridge", b)
-	j, err := json.Marshal(argv)
-	if err == nil {
-		err = l.call(loaderScript, nil)
+	// argv crosses as one string, each argument behind a NUL, which no argument holds.
+	var args strings.Builder
+	for _, a := range argv {
+		args.WriteString("\x00" + a)
 	}
+	err = l.call(loaderScript, nil)
 	if err == nil {
-		err = l.call(`globalThis.__loader = new Loader(__fs, JSON.parse(__a0), new Uint8Array(__a1), __a2 || undefined,
-			bridge.log, bridge.after)`, nil, string(j), genesis, os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
+		err = l.call(`globalThis.__loader = new Loader(__fs, __a0.split('\0').slice(1), new Uint8Array(__a1),
+			__a2 || undefined, bridge.log, bridge.after)`, nil, args.String(), genesis,
+			os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
 	}
 	if err == nil {
 		err = l.call(`PLATFORM_ABI`, func(v *qjs.Value) { l.abi = int(v.Int32()) })
