@@ -12,7 +12,7 @@
 // attacker who sees the path can forge nothing on it.
 
 const N_QUIC = "quic";
-const Q_OPEN = 1, Q_TURN = 2, Q_DROP = 3;
+const Q_OPEN = 1, Q_TURN = 2, Q_DROP = 3, Q_SCREEN = 4;
 const QF_FIN = 1, QF_CLOSE = 2, QF_HS_KEYS = 4, QF_KEYS = 8;
 const QE_FINISHED = 1, QE_CLOSED = 2, QE_MORE = 4;
 /** The most one read hands the link, and the most of what it wrote one call carries. */
@@ -21,7 +21,7 @@ const MAX_WRITE = 128 * 1024;
 /** The datagrams one call carries at most, within the module's scratch: a whole
  *  `datagrams` event (net-limits.ts `MAX_LINK_READ_BYTES`). */
 const MAX_IN = 2 * 1024 * 1024 + 64 * 1024;
-const HEAD_IN = 18, HEAD_OUT = 21;
+const HEAD_IN = 18, HEAD_OUT = 22;
 /** The link's handshake messages one call carries at most: the module takes four. */
 const MAX_HS = 4;
 /** Written and not yet taken by the connection, past which a write fails the link, as the
@@ -72,11 +72,15 @@ class QuicPath {
     this.busy = false;
     this.again = false;
     this.finSent = false;
+    /** A listener's: told each time the connection IDs the path answers to change, as the
+     *  first four bytes of each (udp.js `QuicListener`). */
+    this.onIds = null;
   }
 
   /** Open the connection on `socket` with the peer at `remote` (`[n u8][ip n][port u16]`, as
-   *  a batch spells it): dialed there if `dial`, else taken only from there. */
-  open(seed, socket, remote, dial) {
+   *  a batch spells it): dialed there if `dial`, else taken only from there, and with a
+   *  listener's `key` only from an Initial that echoes that listener's Retry. */
+  open(seed, socket, remote, dial, key = EMPTY) {
     const head = new Uint8Array(1 + 4 + 1 + 8 + 32 + 4);
     head[0] = Q_OPEN;
     writeU32BE(head, 1, this.id);
@@ -85,7 +89,7 @@ class QuicPath {
     head.set(seed, 14);
     writeU32BE(head, 46, socket);
     this.busy = true;
-    this.opened = this.call(concatBytes([head, remote])).then((r) => {
+    this.opened = this.call(concatBytes([head, remote, key])).then((r) => {
       this.busy = false;
       if (!r || r[0] !== 1) { this.fail(); return; }
       this.kick();
@@ -272,8 +276,8 @@ class QuicPath {
     return out;
   }
 
-  /** `[events][accepted u32][due f64][read len u32][handshake len u32][read]
-   *  ([len u32][message])*[sends]`, the sends as `link/udpSend` takes them. */
+  /** `[events][accepted u32][due f64][read len u32][handshake len u32][ids u8][read]
+   *  ([len u32][message])*([id u32])*[sends]`, the sends as `link/udpSend` takes them. */
   output(r, flags) {
     // What was asked once is done, and the keys it carried are the module's alone.
     this.flags &= ~(flags & (QF_HS_KEYS | QF_KEYS | QF_CLOSE));
@@ -290,10 +294,15 @@ class QuicPath {
     }
     const due = new DataView(r.buffer, r.byteOffset).getFloat64(5);
     const readLen = readU32BE(r, 13), hsLen = readU32BE(r, 17);
-    const at = HEAD_OUT, sends = at + readLen + hsLen;
+    const at = HEAD_OUT, ids = at + readLen + hsLen, sends = ids + 4 * r[21];
     // Out first: what the answer sends is due now, whatever the link does next.
     if (sends < r.length) udp.send(r.subarray(sends));
-    for (let o = at + readLen; o < sends;) {
+    if (sends > ids && this.onIds) {
+      const words = [];
+      for (let o = ids; o < sends; o += 4) words.push(readU32BE(r, o));
+      this.onIds(words);
+    }
+    for (let o = at + readLen; o < ids;) {
       const n = readU32BE(r, o);
       if (this.onHandshake) this.onHandshake(r.slice(o + 4, o + 4 + n));
       o += 4 + n;

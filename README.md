@@ -134,7 +134,7 @@ This matches TLS, Signal (PQXDH) and OpenSSH: hybrid post-quantum key exchange, 
 
 All three targets share bundle admission, policy and routing, and a networked node on any of them runs the same signed transport bundle. Each supplies its own platform adapters. The native binary embeds the shared JavaScript host and runs it in QuickJS. The tables separate shared code from platform code; `npm run loc` in `WASM/` computes the figures.
 
-**Shared: one implementation for all three targets (3,899 LOC)**
+**Shared: one implementation for all three targets (3,914 LOC)**
 
 The core, which every node runs:
 
@@ -160,7 +160,7 @@ The operator front-end, on Node and native only:
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Node startup, the operator flow (§12.8): the flag set and its defaults, which services and boot transport a node gets, the order it boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 370 |
+| Node startup, the operator flow (§12.8): the flag set and its defaults, which services and boot transport a node gets, the order it boots in, what it prints, and the control endpoint an `--op` reaches a serving node through | `host/cli.ts`, `host/control.ts` | 385 |
 
 Sharing this code keeps admission and confinement rules consistent across targets. Platform adapters connect it to each target's I/O and execution engines.
 
@@ -171,7 +171,7 @@ Sharing this code keeps admission and confinement rules consistent across target
 | **JS** (browser + Node) | the Node platform (the platform ABI over `node:net`, `node:dgram` and `node:fs`) and the Node loader on it, the browser platform, the WebAssembly engine table, sockets (TCP and UDP on Node, WS and WebRTC wherever the runtime offers them), the `fs` backend, worker-backed private modules, Node's crypto seam, entry points | 1,058 TS |
 | **Native** (Go) | the loader: the realm the shared host slots run in, QuickJS embedding, the event loop, the engine table over wazero with its bounded instances for private modules, raw net, fs and UDP | 1,497 Go |
 
-The transport bundle sits outside these host totals: 2,847 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2) (§12.7). The host's crypto, `libsodium.wasm` and `mldsa65.wasm`, ships inside the host blob, the same on every target.
+The transport bundle sits outside these host totals: 3,012 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2) (§12.7). The host's crypto, `libsodium.wasm` and `mldsa65.wasm`, ships inside the host blob, the same on every target.
 
 ## Build this repo
 

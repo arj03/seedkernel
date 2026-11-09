@@ -516,10 +516,10 @@ function quicTurn(call, id, { msgs = [], write = new Uint8Array(0), batch = null
   if (batch) parts.push(u32(batch.length), batch);
   const r = Buffer.from(call(Buffer.concat(parts)));
   const readLen = r.readUInt32BE(13), hsLen = r.readUInt32BE(17), up = [];
-  for (let o = 21 + readLen; o < 21 + readLen + hsLen; o += 4 + r.readUInt32BE(o)) {
+  for (let o = 22 + readLen; o < 22 + readLen + hsLen; o += 4 + r.readUInt32BE(o)) {
     up.push(r.subarray(o + 4, o + 4 + r.readUInt32BE(o)));
   }
-  return { accepted: r.readUInt32BE(1), up, sends: r.subarray(21 + readLen + hsLen) };
+  return { accepted: r.readUInt32BE(1), up, sends: r.subarray(22 + readLen + hsLen + 4 * r[21]) };
 }
 
 /** Datagrams to send as the peer reads them, a batch from `from`. */
@@ -1041,6 +1041,96 @@ await test("a peer with no UDP path declines it, and the offering side offers We
   assert(!seen.some((d) => d.startsWith("udp:")), "the UDP offer never reached the host's sockets");
   assert((await linkedPeers(A)).includes(B.peerId) && (await routes(A)).get(B.peerId) === false,
     "with neither, the relayed link stays");
+});
+
+console.log("\nUDP: a node listening for QUIC, dialed at quic:// (§12.7)\n");
+
+/** A node listening for QUIC on a port the OS picks, and that port. */
+async function quicListener(opts = {}) {
+  const node = await makeTransportHost({ ...opts, datagrams: nodeRawDatagrams(), transportConfig: { quicPort: 0 } });
+  const a = await transportOp(node, new OpArgs("quic"));
+  return { node, port: (a[0] << 8) | a[1] };
+}
+
+await test("a node dials another at quic://ip:port, with no relay, and the link carries requests both ways", async (keep) => {
+  const { node: B, port } = await quicListener();
+  keep(B);
+  assert(port > 0, "the listener reports the port it bound");
+  const A = keep(await makeTransportHost({ datagrams: nodeRawDatagrams() }));
+  await A.addr(B.peerId, `quic://127.0.0.1:${port}`);
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
+  assert(resp.length === 3 && resp[2] === 9, "a request crosses");
+  const big = await B.request(A.peerId, PROTO, generatorRequest(1024 * 1024, 5));
+  assert(big.length === 1024 * 1024 && big.every((x, i) => x === ((i * 5) & 255)), "and a large one back, intact");
+  assert((await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true, "a direct link at both ends");
+});
+
+await test("one listening socket takes many nodes at once, each on its own connection", async (keep) => {
+  const { node: B, port } = await quicListener();
+  keep(B);
+  const dialers = [];
+  for (let i = 0; i < 4; i++) dialers.push(keep(await makeTransportHost({ datagrams: nodeRawDatagrams() })));
+  for (const A of dialers) await A.addr(B.peerId, `quic://127.0.0.1:${port}`);
+  const answers = await Promise.all(dialers.map((A, i) => A.request(B.peerId, PROTO, generatorRequest(256 * 1024, i + 1))));
+  assert(answers.every((a, i) => a.length === 256 * 1024 && a.every((x, j) => x === ((j * (i + 1)) & 255))), "every node's answer, intact");
+  assert((await linkedPeers(B)).length === 4, "four links on the one socket");
+});
+
+await test("a gated listener answers only a dialer that holds its contact secret", async (keep) => {
+  const { node: B, port } = await quicListener({ contactSecret: "key" });
+  keep(B);
+  const secret = await transportOp(B, new OpArgs("contact"));
+  const stranger = keep(await makeTransportHost({ datagrams: nodeRawDatagrams() }));
+  await stranger.addr(B.peerId, `quic://127.0.0.1:${port}`);
+  let refused = false;
+  await stranger.request(B.peerId, PROTO, Uint8Array.of(1), 3000).catch(() => { refused = true; });
+  assert(refused && (await linkedPeers(B)).length === 0, "a dialer without the secret is never linked");
+  const friend = keep(await makeTransportHost({ datagrams: nodeRawDatagrams() }));
+  await friend.addr(B.peerId, `quic://127.0.0.1:${port}`, secret);
+  const resp = await friend.request(B.peerId, PROTO, Uint8Array.of(4));
+  assert(resp.length === 1 && resp[0] === 4, "one with it is answered");
+});
+
+await test("a stranger's first Initial is answered with a Retry, and only one that echoes it from that address is let in", async (keep) => {
+  const { node: B, port } = await quicListener();
+  keep(B);
+  const client = quicModule();
+  const sock = createSocket("udp4");
+  await new Promise((r) => sock.bind(0, "127.0.0.1", r));
+  const heard = [];
+  sock.on("message", (m) => heard.push(new Uint8Array(m)));
+  const peer = Uint8Array.of(4, 127, 0, 0, 1, port >> 8, port & 255);
+  const open = new Uint8Array(1 + 4 + 1 + 8 + 32 + 4 + peer.length);
+  open[0] = 1; open[4] = 1; open[5] = 1;
+  new DataView(open.buffer).setFloat64(6, performance.now());
+  open.set(randomBytes(32), 14);
+  open.set(peer, 50);
+  assert(client(open)[0] === 1, "the client path opens");
+  /** One turn of the client's, with `got` (from B) in, its datagrams to B sent. */
+  const turn = (got = []) => {
+    const batch = got.flatMap((g) => [...peer.subarray(0, 5), port >> 8, port & 255, g.length >> 8, g.length & 255, ...g]);
+    const t = new Uint8Array(18 + 1 + 4 + (batch.length ? 4 + batch.length : 0));
+    t[0] = 2; t[4] = 1;
+    new DataView(t.buffer).setFloat64(5, performance.now());
+    if (batch.length) { new DataView(t.buffer).setUint32(23, batch.length); t.set(batch, 27); }
+    const a = client(t);
+    const v = new DataView(a.buffer);
+    let at = 22 + v.getUint32(13) + v.getUint32(17) + 4 * a[21];
+    while (at < a.length) {
+      const n = a[at + 4], len = v.getUint16(at + 5 + n + 2);
+      sock.send(a.subarray(at + 5 + n + 4, at + 5 + n + 4 + len), port, "127.0.0.1");
+      at += 5 + n + 4 + len;
+    }
+  };
+  turn();
+  await until(() => heard.length > 0, 2000, "an answer to the Initial");
+  assert((heard[0][0] & 0xf0) === 0xf0, "the answer is a Retry");
+  assert((await linkedPeers(B)).length === 0, "and the listener holds nothing for it");
+  const retry = heard.splice(0);
+  turn(retry);
+  await until(() => heard.length > 0, 2000, "an answer to the Initial with its token");
+  assert((heard[0][0] & 0xf0) === 0xc0, "which is the server's Initial: the token let it in");
+  sock.close();
 });
 
 summary("UDP");

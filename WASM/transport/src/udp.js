@@ -258,10 +258,10 @@ class Udp {
     return new UdpNegotiation(offer, stun, socket, entropy);
   }
 
-  /** `{id, port, addresses}`, or null. */
-  async bind() {
+  /** `{id, port, addresses}` on `port`, or one the OS picks for 0; or null. */
+  async bind(port = 0) {
     let r;
-    try { r = await host.call(N_UDP_BIND, EMPTY); } catch { return null; }
+    try { r = await host.call(N_UDP_BIND, port ? Uint8Array.of(port >> 8, port & 0xff) : EMPTY); } catch { return null; }
     const id = readU32BE(r, 0);
     return id === 0 ? null : { id, port: readU16BE(r, 4), addresses: utf8Decode(r.subarray(6)) };
   }
@@ -316,6 +316,8 @@ class Udp {
       const id = r.u32(), b = r.blob();
       const to = this.listeners.get(id);
       if (!to) continue;
+      // A socket of QUIC's alone (`QuicListener`, `QuicDial`) reads its batch itself.
+      if (to.onBatch) { to.onBatch(b); continue; }
       // The connection takes the batch whole; past the punch nothing else here reads it.
       const fed = to.quic !== null;
       if (fed) to.quic.feed(b);
@@ -349,9 +351,46 @@ class Udp {
       // The answering end's connection began in this batch (`take`): it has it whole.
       if (!fed && to.quic) to.quic.feed(b);
     }
+    this.runTurns();
+  }
+
+  /** One call for each connection that took packets since the last of these. */
+  runTurns() {
     const turns = this.turns;
     this.turns = [];
     for (const s of turns) s.turn();
+  }
+
+  /** Listen for QUIC on `port` (`QuicListener`): the port bound, or 0 for none. */
+  async listenQuic(port) {
+    const socket = await this.bind(port);
+    if (!socket) return 0;
+    let key;
+    try { key = await randomBytes(SEED); } catch { this.close(socket.id); return 0; }
+    // It holds its socket and its wake, which hold it.
+    new QuicListener(socket, key);
+    return socket.port;
+  }
+
+  /** Dial a `quic://` destination (`quicTarget`) from a socket of its own:
+   *  `{linkId, channel}`, the channel the connection, or null for no route. */
+  async dialQuic(dest) {
+    const remote = quicTarget(dest);
+    const socket = remote && (await this.bind());
+    if (!socket) return null;
+    let seed;
+    try { seed = await randomBytes(SEED); } catch { this.close(socket.id); return null; }
+    const linkId = this.nextId();
+    const owner = { onBatch: (b) => { quic.feed(b); }, onWake: (t) => quic.onWake(t) };
+    const quic = new QuicPath(() => {
+      this.live.delete(owner);
+      this.close(socket.id);
+      localClosed(linkId);
+    });
+    this.listen(socket.id, owner);
+    this.live.add(owner);
+    quic.open(seed, socket.id, remote, true);
+    return { linkId, channel: quic };
   }
 
   /** One wake (core.js `onWake`): every negotiation's timers, and the soonest next. */
@@ -687,5 +726,157 @@ class UdpNegotiation {
   stopPunching() {
     this.roundAt = Infinity;
     this.stunAt = Infinity;
+  }
+}
+
+// ── listening and dialing ─────────────────────────────────────────────────────
+// A node can also be reached over UDP directly, with no relay and no punch, as a TCP
+// listener is reached: `quic://ip:port` dials a QUIC connection to a node whose config names
+// a `quicPort` (`QuicListener`), and the link runs on it as on an upgraded path. The
+// listener answers anyone, as a TCP listener does, and the contact secret gates the
+// handshake the same way, since msg1 crosses in the first Initial.
+//
+// One socket carries every connection it accepts, told apart by the connection ID each
+// packet is addressed to: each path names its IDs as they change (quic.js `onIds`), and the
+// first four bytes of each route to it. A packet addressed to no path is a stranger's: an
+// Initial is answered with a stateless Retry, and only one that echoes it opens a path
+// (quic.c `OP_SCREEN`), so a spoofed source costs one small answer and no state. The
+// accept is then a link like a TCP accept, held to the same half-open limiter, and to
+// `MAX_QUIC_HALF_OPEN` paths besides, since each holds a connection in quic.wasm's memory.
+
+const QUIC_SCHEME = "quic://";
+/** The listener's paths whose link is not yet authenticated, at most. */
+const MAX_QUIC_HALF_OPEN = 64;
+/** The Initials one screen takes at most (quic.c `SCREEN_MAX`). */
+const SCREEN_MAX = 2048;
+const QUIC_LONG_HEADER = 0x80;
+
+/** The peer a `quic://` destination names, `[n u8][ip n][port u16]`, or null: it must be an
+ *  IP address, since the connection is taken only from the address it dials. */
+function quicTarget(dest) {
+  const c = dest.startsWith(QUIC_SCHEME) ? candidateOf(dest.slice(QUIC_SCHEME.length)) : null;
+  if (!c || c.port === 0 || c.b[0] === 0) return null;
+  const out = new Uint8Array(c.b.length + 2);
+  out.set(c.b);
+  writeU16BE(out, c.b.length, c.port);
+  return out;
+}
+
+/** The first four bytes of the connection ID the QUIC packet of `len` bytes at `p` is
+ *  addressed to, or -1. A short header's is one of this end's own, 16 bytes long. */
+function dcidWord(b, p, len) {
+  if (!(b[p] & QUIC_LONG_HEADER)) return len >= 17 ? readU32BE(b, p + 1) : -1;
+  return len >= 10 && b[p + 5] >= 4 ? readU32BE(b, p + 6) : -1;
+}
+
+/** Run `link` on a QUIC path, whose handshake is the link's (quic.js). */
+function runOnQuic(link, quic) {
+  quic.handshakeReader((m) => link.onHandshake(m));
+  quic.reader((bytes) => link.onWire(bytes));
+}
+
+class QuicListener {
+  constructor(socket, key) {
+    this.socket = socket.id;
+    this.port = socket.port;
+    /** What its Retry tokens are keyed under (quic.c `token_ok`). */
+    this.key = key;
+    this.routes = new Map(); // a connection ID's first four bytes to its path
+    this.links = new Map();  // each path to its link
+    udp.listen(this.socket, this);
+    udp.live.add(this);
+  }
+
+  /** The socket's datagrams: each run of them for one path goes to it, and the strangers'
+   *  long-header packets to the screen. */
+  onBatch(b) {
+    const strangers = [];
+    let run = 0, runPath = null;
+    for (let at = 0; at + 5 <= b.length;) {
+      const start = at, p = at + 1 + b[at] + 4, len = readU16BE(b, p - 2);
+      at = p + len;
+      const path = len > 0 && b[p] & QUIC_FIXED_BIT ? this.routes.get(dcidWord(b, p, len)) ?? null : null;
+      if (path !== runPath) {
+        if (runPath) runPath.feed(b.subarray(run, start));
+        run = start;
+        runPath = path;
+      }
+      if (!path && len > 0 && b[p] & QUIC_LONG_HEADER && strangers.length < SCREEN_MAX) strangers.push(b.subarray(start, at));
+    }
+    if (runPath) runPath.feed(b.subarray(run));
+    if (strangers.length > 0) this.screen(strangers);
+  }
+
+  /** `[Q_SCREEN][now f64][key 32][socket u32]` and the strangers' datagrams: the module
+   *  sends the Retries, and names the Initials whose token stood. */
+  screen(strangers) {
+    const head = new Uint8Array(1 + 8 + 32 + 4);
+    head[0] = Q_SCREEN;
+    new DataView(head.buffer).setFloat64(1, now());
+    head.set(this.key, 9);
+    writeU32BE(head, 41, this.socket);
+    let answer;
+    try { answer = host.call(N_QUIC, concatBytes([head, ...strangers])); } catch { return; }
+    void answer.then((a) => {
+      const n = readU16BE(a, 0);
+      if (a.length > 2 + 2 * n) udp.send(a.subarray(2 + 2 * n));
+      for (let i = 0; i < n; i++) this.accept(strangers[readU16BE(a, 2 + 2 * i)]);
+      udp.runTurns();
+    }, () => {});
+  }
+
+  /** A path for Initial `d` (`[n u8][ip n][port u16][len u16][bytes]`), whose Retry token
+   *  stood, and the link on it as on an accepted socket. */
+  accept(d) {
+    const n = d[0], p = 1 + n + 4, word = dcidWord(d, p, d.length - p);
+    // A copy of one already let in.
+    const known = this.routes.get(word);
+    if (known) { known.feed(d); return; }
+    let halfOpen = 0;
+    for (const link of this.links.values()) {
+      if (!link.authed) halfOpen++;
+    }
+    if (halfOpen >= MAX_QUIC_HALF_OPEN) return;
+    const linkId = udp.nextId();
+    const quic = new QuicPath(() => this.gone(quic, linkId));
+    quic.words = [word];
+    quic.onIds = (ids) => this.route(quic, ids);
+    this.routes.set(word, quic);
+    const link = core.openLink({
+      linkId, stream: true, channel: quic, dest: "", listener: "quic",
+      weDialed: false, linkSecret: null, acceptSecrets,
+      source: sourceOf(n === 4 ? `${d[1]}.${d[2]}.${d[3]}.${d[4]}` : ipv6Text(d, 1)),
+      limiter: core.limiter, dialedPeerId: null,
+    });
+    this.links.set(quic, link);
+    // Refused by the limiter: nothing was opened.
+    if (link.closed) { quic.fail(); return; }
+    runOnQuic(link, quic);
+    quic.feed(d);
+    const remote = d.slice(0, 1 + n + 2);
+    void randomBytes(SEED).then((seed) => quic.open(seed, this.socket, remote, false, this.key), () => quic.fail());
+  }
+
+  /** The IDs a path answers to now, beside the one its client first reached it on. */
+  route(quic, ids) {
+    for (const w of quic.words.slice(1)) {
+      if (this.routes.get(w) === quic) this.routes.delete(w);
+    }
+    quic.words = [quic.words[0], ...ids];
+    for (const w of ids) this.routes.set(w, quic);
+  }
+
+  gone(quic, linkId) {
+    for (const w of quic.words) {
+      if (this.routes.get(w) === quic) this.routes.delete(w);
+    }
+    this.links.delete(quic);
+    localClosed(linkId);
+  }
+
+  onWake(t) {
+    let next = Infinity;
+    for (const quic of this.links.keys()) next = Math.min(next, quic.onWake(t));
+    return next;
   }
 }

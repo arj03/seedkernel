@@ -1,7 +1,10 @@
 // quic.wasm: the connection of a UDP path (§12.7), ngtcp2 behind the pure-module ABI (§4).
 // The transport's udp.js finds the path and owns the socket; this module is the QUIC
 // connection over it, one per path, and touches no socket: datagrams come in with each call
-// and the datagrams to send go out in its answer.
+// and the datagrams to send go out in its answer. A listening socket carries many paths,
+// which udp.js tells apart by the connection IDs each one names (`OP_TURN`), and a
+// stranger's address is validated with a stateless Retry before a path opens for it
+// (`OP_SCREEN`).
 //
 // The link's own handshake (ake.js) is the connection's, in TLS's place: its messages cross
 // in CRYPTO frames, which this module hands up and takes down, and it hands down the keys
@@ -39,7 +42,7 @@ FILE *const stderr = NULL;
 int fprintf(FILE *restrict f, const char *restrict fmt, ...) { return 0; }
 int fputc(int c, FILE *f) { return c; }
 
-enum { OP_OPEN = 1, OP_TURN = 2, OP_DROP = 3 };
+enum { OP_OPEN = 1, OP_TURN = 2, OP_DROP = 3, OP_SCREEN = 4 };
 /** A turn's flags. */
 enum { F_FIN = 1, F_CLOSE = 2, F_HS_KEYS = 4, F_KEYS = 8 };
 /** A turn's events: everything written is acked, the connection is over, and what came is
@@ -233,6 +236,10 @@ struct path {
   /** The server's peer, the one address its connection is taken from. */
   ngtcp2_sockaddr_union peer;
   ngtcp2_sockaddr_union local;
+  /** A listener's: the key its Retry tokens are checked under (`token_ok`), and whether the
+   *  connection IDs it answers to changed since an answer last named them. */
+  int listener, cids_dirty;
+  uint8_t listen_key[32];
   uint8_t seed[32];
   uint32_t rng_ctr;
   /** Each level's handshake data as it comes, ngtcp2 handing it over in pieces; what of it
@@ -459,6 +466,107 @@ static void delete_cipher_cb(ngtcp2_conn *conn, ngtcp2_crypto_cipher_ctx *c, voi
   free(c->native_handle);
 }
 
+// ── Retry ────────────────────────────────────────────────────────────────────
+
+// A listener answers a stranger's first Initial with a Retry, and a path opens only for an
+// Initial that echoes its token from the address the Retry went to: a spoofed source never
+// sees the token, so it costs the listener one small answer and no state, and the path is
+// validated from its first packet. The token is `[odcid len u8][odcid][issued f64]`, and the
+// Retry's source ID, which the client's next Initial is addressed to, is keyed over the
+// token and the address: that ID is the token's MAC.
+
+/** How long a Retry token stands, in the realm's milliseconds. */
+#define TOKEN_MS 10000.0
+/** The Initials one screen names at most: a `datagrams` event's worth. */
+#define SCREEN_MAX 2048
+
+/** The Retry integrity key: fixed, as RFC 9001's is, since a Retry proves only that it was
+ *  not damaged; the server's parameters, under the link's keys, say whether it sent one. */
+static void retry_key(uint8_t k[32]) {
+  static const uint8_t fixed[32];
+  kdf(k, fixed, "seedkernel-quic-retry-v1");
+}
+
+/** The Retry source ID for `token` sent to `from`, under the listener's key. */
+static void retry_cid(ngtcp2_cid *cid, const uint8_t key[32], const ngtcp2_sockaddr_union *from, const uint8_t *token,
+                      size_t n) {
+  uint8_t h[32];
+  crypto_blake2b_ctx c;
+  crypto_blake2b_keyed_init(&c, 32, key, 32);
+  crypto_blake2b_update(&c, (const uint8_t *)from, sizeof *from);
+  crypto_blake2b_update(&c, token, n);
+  crypto_blake2b_final(&c, h);
+  ngtcp2_cid_init(cid, h, 16);
+}
+
+/** Whether Initial `hd` from `from` carries a token of this listener's, fresh, and is
+ *  addressed to that token's Retry source ID; if so, `odcid` is the ID the client first
+ *  chose. */
+static int token_ok(const uint8_t key[32], const ngtcp2_sockaddr_union *from, const ngtcp2_pkt_hd *hd, double now_ms,
+                    ngtcp2_cid *odcid) {
+  const uint8_t *t = hd->token;
+  if (hd->tokenlen < 9 || t[0] > NGTCP2_MAX_CIDLEN || hd->tokenlen != (size_t)t[0] + 9) return 0;
+  reader r = {t + 1 + t[0], 8, 0, 0};
+  double issued = f64(&r);
+  if (!(issued <= now_ms && now_ms - issued <= TOKEN_MS)) return 0;
+  ngtcp2_cid want;
+  retry_cid(&want, key, from, t, hd->tokenlen);
+  if (hd->dcid.datalen != 16 || crypto_verify16(hd->dcid.data, want.data)) return 0;
+  ngtcp2_cid_init(odcid, t + 1, t[0]);
+  return 1;
+}
+
+/** `[now f64][key 32][socket u32][batch]`, the batch the listening socket's datagrams no
+ *  path answers to: each Initial without a token is answered with a Retry, and each whose
+ *  token stands is named, by its place in the batch, for a path to open for. Answers
+ *  `[n u16]([index u16])*[sends]`. */
+static int op_screen(reader *r) {
+  double now_ms = f64(r);
+  const uint8_t *key = take(r, 32);
+  uint32_t socket = u32(r);
+  if (r->bad) return -1;
+  uint8_t k[32];
+  retry_key(k);
+  ngtcp2_crypto_aead aead = {NULL, 16};
+  ngtcp2_crypto_aead_ctx ctx = {k};
+  // The sends go behind room for every name, which close up on them at the end.
+  size_t n = 0, sends = 2 + 2 * SCREEN_MAX;
+  out_at = sends;
+  for (uint32_t i = 0; r->at < r->n; i++) {
+    ngtcp2_sockaddr_union from;
+    if (!read_addr(r, &from)) return -1;
+    size_t len = u16(r);
+    const uint8_t *pkt = take(r, len);
+    if (r->bad) return -1;
+    ngtcp2_pkt_hd hd;
+    ngtcp2_cid odcid;
+    if (ngtcp2_accept(&hd, pkt, len) != 0) continue;
+    if (hd.tokenlen > 0) {
+      if (n < SCREEN_MAX && token_ok(key, &from, &hd, now_ms, &odcid)) {
+        answer[2 + 2 * n] = (uint8_t)(i >> 8), answer[3 + 2 * n] = (uint8_t)i;
+        n++;
+      }
+      continue;
+    }
+    uint8_t token[1 + NGTCP2_MAX_CIDLEN + 8], buf[256];
+    size_t tn = 1 + hd.dcid.datalen + 8;
+    token[0] = (uint8_t)hd.dcid.datalen;
+    memcpy(token + 1, hd.dcid.data, hd.dcid.datalen);
+    uint64_t v;
+    memcpy(&v, &now_ms, 8);
+    for (int b = 7; b >= 0; b--, v >>= 8) token[1 + hd.dcid.datalen + b] = (uint8_t)v;
+    ngtcp2_cid scid;
+    retry_cid(&scid, key, &from, token, tn);
+    ngtcp2_ssize w = ngtcp2_pkt_write_retry(buf, sizeof buf, hd.version, &hd.scid, &scid, &hd.dcid, token, tn,
+                                            encrypt_cb, &aead, &ctx);
+    if (w > 0 && out_at + 1600 <= SEND_MAX) put_send(socket, &from, buf, (size_t)w);
+  }
+  crypto_wipe(k, sizeof k);
+  answer[0] = (uint8_t)(n >> 8), answer[1] = (uint8_t)n;
+  memmove(answer + 2 + 2 * n, answer + sends, out_at - sends);
+  return (int)(2 + 2 * n + out_at - sends);
+}
+
 // ── what ngtcp2 asks of the path ─────────────────────────────────────────────
 
 /** Randomness, drawn from the seed `OP_OPEN` hands in. */
@@ -478,6 +586,12 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
   kdf(key, p->seed, "seedkernel-quic-reset-v1");
   crypto_blake2b_keyed(t, 32, key, 32, cid->data, len);
   memcpy(token->data, t, sizeof token->data);
+  p->cids_dirty = 1;
+  return 0;
+}
+
+static int remove_cid_cb(ngtcp2_conn *conn, const ngtcp2_cid *cid, void *ud) {
+  ((path *)ud)->cids_dirty = 1;
   return 0;
 }
 
@@ -498,8 +612,12 @@ static int recv_client_initial_cb(ngtcp2_conn *conn, const ngtcp2_cid *dcid, voi
   return 0;
 }
 
-/** No path ever retries: the peer is known. */
-static int recv_retry_cb(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd, void *ud) { return NGTCP2_ERR_CALLBACK_FAILURE; }
+/** A listener's Retry: the Initial keys are fixed, not drawn from the new ID, so they go in
+ *  again as they were. */
+static int recv_retry_cb(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd, void *ud) {
+  FAIL(install_initial(ud));
+  return 0;
+}
 
 static int stream_open_cb(ngtcp2_conn *conn, int64_t id, void *ud) {
   path *p = ud;
@@ -561,6 +679,7 @@ static void config(path *p, ngtcp2_callbacks *cb, ngtcp2_settings *st, ngtcp2_tr
   cb->recv_retry = recv_retry_cb;
   cb->rand = rand_cb;
   cb->get_new_connection_id2 = new_cid_cb;
+  cb->remove_connection_id = remove_cid_cb;
   cb->update_key = update_key_cb;
   cb->delete_crypto_aead_ctx = delete_aead_cb;
   cb->delete_crypto_cipher_ctx = delete_cipher_cb;
@@ -622,9 +741,10 @@ static ngtcp2_path path_of(path *p, const ngtcp2_sockaddr_union *remote) {
   return (ngtcp2_path){{&p->local.sa, addr_len(&p->local)}, {(ngtcp2_sockaddr *)&remote->sa, addr_len(remote)}, NULL};
 }
 
-/** `[path u32][client u8][now f64][seed 32][socket u32][peer]`, the peer's address the one
- *  the client dials and the only one the server takes the connection from; answers
- *  `[ok u8]`. */
+/** `[path u32][client u8][now f64][seed 32][socket u32][peer]([listener key 32])`, the
+ *  peer's address the one the client dials and the only one the server takes the connection
+ *  from. A server given a listener's key takes it only from an Initial that echoes that
+ *  listener's Retry (`token_ok`). Answers `[ok u8]`. */
 static int op_open(reader *r) {
   uint32_t id = u32(r);
   int client = u8(r) == 1;
@@ -633,6 +753,8 @@ static int op_open(reader *r) {
   uint32_t socket = u32(r);
   ngtcp2_sockaddr_union remote;
   if (r->bad || !read_addr(r, &remote)) return -1;
+  const uint8_t *listen_key = !client && r->at < r->n ? take(r, 32) : NULL;
+  if (r->bad) return -1;
   drop(id);
   path *p = calloc(1, sizeof *p);
   if (!p) return -1;
@@ -642,6 +764,10 @@ static int op_open(reader *r) {
   p->stream = p->rstream = -1;
   p->peer = remote;
   memcpy(p->seed, seed, 32);
+  if (listen_key) {
+    p->listener = 1;
+    memcpy(p->listen_key, listen_key, 32);
+  }
   p->next = paths;
   paths = p;
   if (client) {
@@ -655,11 +781,16 @@ static int op_open(reader *r) {
     rand_cb(dcid.data, 16, &rc);
     rand_cb(scid.data, 16, &rc);
     ngtcp2_path path = path_of(p, &remote);
-    if (ngtcp2_conn_client_new(&p->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &cb, &st, &tp, NULL, p)) {
+    uint8_t *rk = malloc(32);
+    if (rk) retry_key(rk);
+    if (!rk || ngtcp2_conn_client_new(&p->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &cb, &st, &tp, NULL, p)) {
+      free(rk);
       p->conn = NULL;
       drop(id);
       return -1;
     }
+    // A listener's Retry is checked under it; it goes with the connection (`delete_aead_cb`).
+    ngtcp2_conn_set_retry_aead(p->conn, &(ngtcp2_crypto_aead){NULL, 16}, &(ngtcp2_crypto_aead_ctx){rk});
     ngtcp2_conn_set_keep_alive_timeout(p->conn, 5 * NGTCP2_SECONDS);
   }
   answer[0] = 1;
@@ -667,18 +798,29 @@ static int op_open(reader *r) {
 }
 
 /** The server's connection, from the client's first Initial, from the peer's address
- *  alone: both are as `read_addr` spells them, so the bytes compare. */
-static int accept_from(path *p, const ngtcp2_sockaddr_union *from, const uint8_t *pkt, size_t n, ngtcp2_tstamp now) {
+ *  alone: both are as `read_addr` spells them, so the bytes compare. A listener's is from
+ *  an Initial that echoes its Retry, which validates the address. */
+static int accept_from(path *p, const ngtcp2_sockaddr_union *from, const uint8_t *pkt, size_t n, double now_ms) {
+  ngtcp2_tstamp now = ts_of(now_ms);
   ngtcp2_pkt_hd hd;
+  ngtcp2_cid odcid;
   if (memcmp(from, &p->peer, sizeof *from) || ngtcp2_accept(&hd, pkt, n) != 0) return -1;
+  if (p->listener && !token_ok(p->listen_key, from, &hd, now_ms, &odcid)) return -1;
   ngtcp2_callbacks cb;
   ngtcp2_settings st;
   ngtcp2_transport_params tp;
   ngtcp2_cid scid;
   ngtcp2_rand_ctx rc = {p};
   config(p, &cb, &st, &tp, now);
-  tp.original_dcid = hd.dcid;
+  tp.original_dcid = p->listener ? odcid : hd.dcid;
   tp.original_dcid_present = 1;
+  if (p->listener) {
+    tp.retry_scid = hd.dcid;
+    tp.retry_scid_present = 1;
+    st.token = hd.token;
+    st.tokenlen = hd.tokenlen;
+    st.token_type = NGTCP2_TOKEN_TYPE_RETRY;
+  }
   scid.datalen = 16;
   rand_cb(scid.data, 16, &rc);
   ngtcp2_path path = path_of(p, from);
@@ -687,6 +829,7 @@ static int accept_from(path *p, const ngtcp2_sockaddr_union *from, const uint8_t
     return -1;
   }
   ngtcp2_conn_set_keep_alive_timeout(p->conn, 5 * NGTCP2_SECONDS);
+  p->cids_dirty = 1;
   return 0;
 }
 
@@ -795,13 +938,15 @@ static int transmit(path *p, ngtcp2_tstamp now, size_t sends) {
 /** `[path u32][now f64][flags u8][read max u32]([handshake secrets 64] with F_HS_KEYS)
  *  ([session keys 64] with F_KEYS)[n u8]([len u32][message])*[write len u32][write]
  *  ([len u32][batch])*`, answered `[events u8][accepted u32][due f64][read len u32]
- *  [handshake len u32][read]([len u32][message])*[sends]`.
+ *  [handshake len u32][ids u8][read]([len u32][message])*([id u32])*[sends]`.
  *
  *  The secrets are this end's then the peer's. The messages are the link's handshake, both
  *  ways. A batch is the path socket's datagrams as the host's `datagrams` event carries
  *  them, `[n u8][ip n][port u16][len u16][bytes]` each, of which the module takes the QUIC
  *  ones; `sends` is the datagrams to send as `link/udpSend` takes them. `due` is when to
- *  call again, in the realm's milliseconds, or -1 for no timer. */
+ *  call again, in the realm's milliseconds, or -1 for no timer. A listener's path names
+ *  the connection IDs it answers to whenever they change, each by its first four bytes,
+ *  which udp.js routes the listening socket's datagrams by. */
 static int op_turn(reader *r) {
   uint32_t id = u32(r);
   double now_ms = f64(r);
@@ -827,7 +972,7 @@ static int op_turn(reader *r) {
   put("\0\0\0\0\0", 5);
   put_f64_at(out_at, -1);
   out_at += 8;
-  put("\0\0\0\0\0\0\0\0", 8);
+  put("\0\0\0\0\0\0\0\0\0", 9);
   if (!p) {
     answer[0] = E_CLOSED;
     return (int)out_at;
@@ -847,7 +992,7 @@ static int op_turn(reader *r) {
       const uint8_t *pkt = take(&b, len);
       if (b.bad) return -1;
       if (len == 0 || !(pkt[0] & 0x40)) continue;
-      if (!p->conn && (!p->server || accept_from(p, &from, pkt, len, now))) continue;
+      if (!p->conn && (!p->server || accept_from(p, &from, pkt, len, now_ms))) continue;
       if (!p->completed && len <= sizeof p->held[0].b) {
         int i = p->nheld++ % HELD_MAX;
         p->held[i].from = from;
@@ -897,10 +1042,18 @@ static int op_turn(reader *r) {
     full = transmit(p, now, sends);
   }
 
-  // The answer's head, what was read and the link's messages, then the datagrams already in
-  // place behind them.
+  // A listener's connection IDs, when they changed: at most a pool's worth.
+  ngtcp2_cid cids[8];
+  size_t ids = 0;
+  if (p->listener && p->cids_dirty && p->conn && !p->closed && ngtcp2_conn_get_scid(p->conn, NULL) <= 8) {
+    ids = ngtcp2_conn_get_scid(p->conn, cids);
+    p->cids_dirty = 0;
+  }
+
+  // The answer's head, what was read, the link's messages and the IDs, then the datagrams
+  // already in place behind them.
   size_t send_len = out_at - sends, hs = p->hs_up_len;
-  memmove(answer + sends + read + hs, answer + sends, send_len);
+  memmove(answer + sends + read + hs + 4 * ids, answer + sends, send_len);
   if (read) {
     memcpy(answer + sends, p->rbuf + p->rhead, read);
     p->rhead += read;
@@ -914,12 +1067,16 @@ static int op_turn(reader *r) {
   }
   memcpy(answer + sends + read, p->hs_up, hs);
   p->hs_up_len = 0;
+  for (size_t i = 0; i < ids; i++) {
+    const uint8_t *c = cids[i].data;
+    put_u32_at(sends + read + hs + 4 * i, (uint32_t)c[0] << 24 | (uint32_t)c[1] << 16 | (uint32_t)c[2] << 8 | c[3]);
+  }
   if (p->completed && p->rlen > 0) p->events |= E_MORE;
   if (!p->finished_told && p->fin_sent && p->acked >= p->end) {
     p->finished_told = 1;
     p->events |= E_FINISHED;
   }
-  out_at = sends + read + hs + send_len;
+  out_at = sends + read + hs + 4 * ids + send_len;
   answer[0] = p->events;
   p->events = 0;
   put_u32_at(1, accepted);
@@ -930,6 +1087,7 @@ static int op_turn(reader *r) {
   }
   put_u32_at(13, (uint32_t)read);
   put_u32_at(17, (uint32_t)hs);
+  answer[21] = (uint8_t)ids;
   return (int)out_at;
 }
 
@@ -947,6 +1105,9 @@ __attribute__((export_name("handle"))) int32_t handle(int32_t len) {
   case OP_DROP:
     drop(u32(&r));
     n = r.bad ? -1 : 0;
+    break;
+  case OP_SCREEN:
+    n = op_screen(&r);
     break;
   default:
     n = -1;

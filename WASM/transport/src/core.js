@@ -73,11 +73,18 @@ function peerRef(spec) {
   if (dest.startsWith(RELAY_SCHEME) && !relayAddr(dest.slice(RELAY_SCHEME.length))) {
     throw bad("a relay must be relay+ws[s]://<key>[.<secret>]@host:port");
   }
+  if (dest.startsWith(QUIC_SCHEME) && !quicTarget(dest)) throw bad("a quic destination must be quic://ip:port, an IP address");
   return { peer: fromHex(pk), secret: secret === undefined ? ZERO32 : fromHex(secret), dest };
 }
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const cohort = configuredPeers.map(peerRef);
+// The UDP port to listen for QUIC on (udp.js `QuicListener`), 0 for one the OS picks;
+// absent for none. Installation config: a deployment's port, as `--listen quic=` sets it.
+const quicPort = LOCAL.quicPort;
+if (quicPort !== undefined && !(Number.isInteger(quicPort) && quicPort >= 0 && quicPort <= 65535)) {
+  throw new Error("transport: config quicPort must be a port number");
+}
 const maxFrameBytes = policy("maxFrameBytes");
 // Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
@@ -326,22 +333,33 @@ class Core {
    *  The link, or null for no route or a peer forgotten meanwhile. */
   async dialDest(peerId, dest, secret) {
     const relayed = dest.startsWith(RELAY_SCHEME);
+    // A `quic://` link is this realm's own connection (udp.js `dialQuic`), not a host link.
+    const quic = dest.startsWith(QUIC_SCHEME);
     const opened = relayed
       ? await relays.call(peerId, relayAddr(dest.slice(RELAY_SCHEME.length)))
-      : { ...(await netLinkOpen(dest)), dest };
+      : quic
+        ? (await udp.dialQuic(dest)) ?? { linkId: 0 }
+        : { ...(await netLinkOpen(dest)), dest };
     if (opened.linkId === 0) return null;
     // Forgotten while the dial was in flight: nothing wants this link now.
-    if (!this.addrs.has(peerId)) { netLinkClose(opened.linkId, false); return null; }
-    return this.openLink({
+    if (!this.addrs.has(peerId)) {
+      if (quic) opened.channel.close(false);
+      else netLinkClose(opened.linkId, false);
+      return null;
+    }
+    const link = this.openLink({
       linkId: opened.linkId,
-      stream: opened.stream,
-      dest: opened.dest,
+      stream: quic || opened.stream,
+      channel: opened.channel,
+      dest: quic ? "" : opened.dest,
       weDialed: true,
       linkSecret: secret,
       limiter: null,
       dialedPeerId: peerId,
       relayed,
     });
+    if (quic) runOnQuic(link, opened.channel);
+    return link;
   }
 
   /** An accepted channel or a fresh dial; `spec` passes through to `Link` whole. */
@@ -479,9 +497,14 @@ function entry(name, fn) { ops[name] = fn; }
 /** The ops an app may name; null-prototype, so `toString` is not one. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
+/** The QUIC listener's port once it is bound, 0 for none: bound on the first invocation,
+ *  since the realm makes no host call while it loads. */
+let quicListening = null;
+
 function handle(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   if (owedAt < Infinity) wakeBy(owedAt);
+  quicListening ??= quicPort === undefined ? Promise.resolve(0) : udp.listenQuic(quicPort);
   const { op, args } = readOp(body);
   const r = new Reader(args);
   const fn = ops[op];
@@ -676,6 +699,14 @@ entry("secrets", (r) => {
   const next = [];
   for (let off = 0; off < bytes.length; off += PK_LEN) next.push(bytes.slice(off, off + PK_LEN));
   extraSecrets = next;
+});
+
+/** `[port u16]`, the UDP port the QUIC listener is bound to (config `quicPort`), 0 for none
+ *  or a bind that failed. Deferred: the bind is a host call. */
+entry("quic", () => {
+  const d = defer();
+  quicListening.then((port) => d.resolve(Uint8Array.of(port >> 8, port & 0xff)), d.reject);
+  return d.promise;
 });
 
 /** Forget one peer: its address, and every link to it (`forgetPeer`). */

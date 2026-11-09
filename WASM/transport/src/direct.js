@@ -217,10 +217,7 @@ class Direct {
       dialedPeerId: e.offer ? e.peer : null,
       acceptPeerId: e.offer ? null : e.peer,
     });
-    if (channel) {
-      channel.handshakeReader((m) => link.onHandshake(m));
-      channel.reader((bytes) => link.onWire(bytes));
-    }
+    if (channel) runOnQuic(link, channel);
   }
 
   /** End a negotiation this end gave up on. It leaves `byCtl` at once, so a data link it
