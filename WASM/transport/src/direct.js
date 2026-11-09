@@ -21,8 +21,9 @@ const RTC_DECLINE = 0x78;
 /** The kinds of path, in the order they are offered. */
 const SCHEMES = ["udp", "rtc"];
 /** A negotiation's id, chosen by the offering side, so a signal for a negotiation this end
- *  has dropped or replaced is told from one for the negotiation it holds. */
-const SID_LEN = 8;
+ *  has dropped or replaced is told from one for the negotiation it holds. It is random and
+ *  crosses only in records, so it is also the data link's contact secret (`bindData`). */
+const SID_LEN = 32;
 /** What one peer's queued signals may weigh, each its body plus `SIGNAL_WEIGHT`: an honest
  *  negotiation queues a description and its candidates while a path opens. */
 const MAX_QUEUED_SIGNAL_WEIGHT = 256 * 1024;
@@ -33,7 +34,7 @@ const SIGNAL_WEIGHT = 1024;
 // A signal is a control frame on the peer's first link (router.js `KIND_CTL`,
 // `sendInOrder`), so a candidate never passes its description on another link:
 //
-//   [KIND_CTL][tag u8][sid 8][UTF-8 text]
+//   [KIND_CTL][tag u8][sid 32][UTF-8 text]
 //
 // with tag `o` (offer), `u` (UDP offer), `a` (answer), `c` (candidate) or `x` (decline,
 // empty), the text as the path's host gives it. It comes from the authenticated peer, so
@@ -201,17 +202,20 @@ class Direct {
 
   /** The data channel of negotiation `via` arrived as `linkId`: the offering side dials
    *  the peer it signaled, and the answering side accepts that peer and no other. Both run
-   *  open, with no contact secret: the channel exists only through signaling over the
-   *  authenticated link, so only that peer can reach it, and a key it brought along would
-   *  otherwise pass a gate it never opened. A UDP negotiation's data link is its connection
-   *  (`channel`), which carries the link's handshake as well as its records. */
+   *  under the negotiation's id as the contact secret, which only the two ends hold: a UDP
+   *  path is taken on tokens that cross in the clear (udp.js), so an open accept would sign a
+   *  msg2 for whoever saw the punch. Neither end's own secret is asked for, and a key the
+   *  peer brought along would otherwise pass a gate it never opened. A UDP negotiation's
+   *  data link is its connection (`channel`), which carries the link's handshake as well as
+   *  its records. */
   bindData(via, linkId, stream, channel) {
     const e = this.byCtl.get(via);
     if (!e && !linksById.has(via)) { this.early.set(via, { linkId, stream }); return; }
     if (!e || e.data) { (channel ?? hostChannel(linkId)).close(false); return; }
+    const secret = fromHex(e.sid);
     const link = e.data = core.openLink({
       linkId, stream, channel, dest: "", listener: "", source: undefined,
-      linkSecret: ZERO32, acceptSecrets: () => [ZERO32],
+      linkSecret: secret, acceptSecrets: () => [secret],
       weDialed: e.offer,
       limiter: e.offer ? null : core.limiter,
       dialedPeerId: e.offer ? e.peer : null,
