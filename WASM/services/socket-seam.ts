@@ -30,11 +30,14 @@ export interface Arrival {
 }
 
 /** Where a listener binds; port 0 lets the OS pick. The label reaches the occupant with
- *  every accepted link, so the transport decides which codec a listener speaks. */
+ *  every accepted link, so the transport decides which codec a listener speaks. A `udp`
+ *  listener accepts nothing: it is one datagram socket the occupant reads, named to it by
+ *  label in a `listening` event (services/link.ts). */
 export interface ListenAddress {
   label: string;
   host: string;
   port: number;
+  udp?: boolean;
 }
 
 export interface ChannelFactory {

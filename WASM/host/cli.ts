@@ -83,23 +83,17 @@ function list(v: string | undefined): string[] {
   return v === undefined ? [] : v.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/** The label for a `--listen` entry that names none. The shipped transport treats every
- *  label except `ws` as length framing. */
-const DEFAULT_LISTEN_LABEL = "tcp";
-
-/** The `--listen` label for the shipped transport's QUIC listener: a UDP port the transport
- *  binds itself, so it goes to its config as `quicPort`, not to the host's TCP listeners. */
-const QUIC_LISTEN_LABEL = "quic";
-
-/** `--listen [label=]host:port,...`: one listener per entry. The transport decides what a
- *  label means; only its shape is checked here. */
+/** `--listen [label=][tcp://|udp://]host:port,...`: one listener per entry, a TCP one unless
+ *  the address says `udp://`, labelled with its kind when it names no label. The transport
+ *  decides what a label means; only its shape is checked here. */
 function parseListen(v: string): ListenAddress[] {
   return list(v).map((entry) => {
     const eq = entry.indexOf("=");
-    const label = eq < 0 ? DEFAULT_LISTEN_LABEL : entry.slice(0, eq);
+    const scheme = /^(tcp|udp):\/\//.exec(entry.slice(eq + 1));
+    const label = eq < 0 ? scheme?.[1] ?? "tcp" : entry.slice(0, eq);
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(label)) throw new Error(`--listen: bad label in ${JSON.stringify(entry)}`);
-    const at = parseHostPort(entry.slice(eq + 1), { defaultHost: "0.0.0.0", allowEphemeral: true });
-    return { label, ...at };
+    const at = parseHostPort(entry.slice(eq + 1 + (scheme?.[0].length ?? 0)), { defaultHost: "0.0.0.0", allowEphemeral: true });
+    return scheme?.[1] === "udp" ? { label, ...at, udp: true } : { label, ...at };
   });
 }
 
@@ -234,14 +228,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       throw new Error(`--${flag} requires --listen, --peers or --relay, which enable the network it configures`);
     }
   }
-  const listenAll = args.has("listen") ? parseListen(args.get("listen")!) : [];
-  const listen = listenAll.filter((l) => l.label !== QUIC_LISTEN_LABEL);
-  const quicListen = listenAll.filter((l) => l.label === QUIC_LISTEN_LABEL);
-  if (quicListen.length > 1) throw new Error("--listen: one quic listener at most");
-  // A datagram socket binds every address of the machine.
-  if (quicListen.some((l) => l.host !== "0.0.0.0" && l.host !== "::")) {
-    throw new Error("--listen: a quic listener binds every address, so its host must be 0.0.0.0, :: or empty");
-  }
+  const listen = args.has("listen") ? parseListen(args.get("listen")!) : [];
   // Checked here, not at install, so a malformed file fails before the node listens.
   const jsonFlag = (flag: string): JsonObject | undefined => {
     if (!args.has(flag)) return undefined;
@@ -259,7 +246,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   if (contactSecretPath !== undefined) {
     transportConfig.contactSecret = readSecret(host, contactSecretPath, "--contact-secret");
   }
-  if (quicListen.length > 0) transportConfig.quicPort = quicListen[0].port;
 
   // One line each time a peer is linked, changes how it is reached, or goes, so an
   // operator, or a script driving the node, sees a relayed link move to a direct path
@@ -310,22 +296,13 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // Wait for the cohort through the transport's service id. Best effort: `ready` settles
   // at its deadline instead of rejecting, so a missing peer delays boot but never fails it.
   if (peers.length > 0) await transportCall(shell, new OpArgs("ready").u32(5000), "--peers");
-  // The QUIC listener is bound by the transport, which answers its port; a failed bind is as
-  // fatal as a TCP listener's.
-  let quicPort = 0;
-  if (quicListen.length > 0) {
-    const a = await transportCall(shell, new OpArgs("quic"), "--listen quic=");
-    quicPort = a.length === 2 ? (a[0] << 8) | a[1] : 0;
-    if (quicPort === 0) throw new Error(`--listen: cannot bind the quic listener's UDP port ${quicListen[0].port}`);
-  }
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);
   host.log(`  policy ${policyPath ?? "(none — app installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
   if (relay !== undefined) host.log(`  relay  ${relay} (${registered ? "registered" : "not registered, redialing"})`);
-  for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}`);
-  if (quicPort > 0) host.log(`  ${QUIC_LISTEN_LABEL.padEnd(6)} listening on :${quicPort} (udp)`);
+  for (const l of net?.listening ?? []) host.log(`  ${l.label.padEnd(6)} listening on :${l.port}${l.udp ? " (udp)" : ""}`);
   // The contact secret a peer's address for this node carries, `pk.secret@dest`: the shipped
   // transport's, by default its key's own. A transport that answers no `contact` prints none.
   if (network) {
@@ -368,7 +345,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
   const close = () => shell.close();
   // A node on a relay serves through it, listening or not.
-  if (!net?.listening.some((l) => l.port > 0) && quicPort === 0 && relay === undefined) return { serving: false, close };
+  if (!net?.listening.some((l) => l.port > 0) && relay === undefined) return { serving: false, close };
   // Inbound requests already route to the loaded app by protocol id (§12.8, §12.10).
   if (loaded !== undefined) {
     host.log("  serving the app's request side from the confined guest");

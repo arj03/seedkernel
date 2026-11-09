@@ -79,12 +79,6 @@ function peerRef(spec) {
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const cohort = configuredPeers.map(peerRef);
-// The UDP port to listen for QUIC on (udp.js `QuicListener`), 0 for one the OS picks;
-// absent for none. Installation config: a deployment's port, as `--listen quic=` sets it.
-const quicPort = LOCAL.quicPort;
-if (quicPort !== undefined && !(Number.isInteger(quicPort) && quicPort >= 0 && quicPort <= 65535)) {
-  throw new Error("transport: config quicPort must be a port number");
-}
 const maxFrameBytes = policy("maxFrameBytes");
 // Records waiting to be sealed, before any socket-side cap can see them.
 const maxOutboundQueueBytes = 8 * maxFrameBytes;
@@ -497,14 +491,9 @@ function entry(name, fn) { ops[name] = fn; }
 /** The ops an app may name; null-prototype, so `toString` is not one. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-/** The QUIC listener's port once it is bound, 0 for none: bound on the first invocation,
- *  since the realm makes no host call while it loads. */
-let quicListening = null;
-
 function handle(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   if (owedAt < Infinity) wakeBy(owedAt);
-  quicListening ??= quicPort === undefined ? Promise.resolve(0) : udp.listenQuic(quicPort);
   const { op, args } = readOp(body);
   const r = new Reader(args);
   const fn = ops[op];
@@ -701,12 +690,12 @@ entry("secrets", (r) => {
   extraSecrets = next;
 });
 
-/** `[port u16]`, the UDP port the QUIC listener is bound to (config `quicPort`), 0 for none
- *  or a bind that failed. Deferred: the bind is a host call. */
-entry("quic", () => {
-  const d = defer();
-  quicListening.then((port) => d.resolve(Uint8Array.of(port >> 8, port & 0xff)), d.reject);
-  return d.promise;
+/** A `udp` listener's socket, `[socket u32][label text]`, bound for this occupant: the one
+ *  labelled `quic` listens for QUIC (udp.js `QuicListener`), and any other is closed. */
+entry("listening", (r) => {
+  const socket = r.u32();
+  if (utf8Decode(r.blob()) === LISTENER_QUIC) void udp.listenQuic(socket);
+  else udp.close(socket);
 });
 
 /** Forget one peer: its address, and every link to it (`forgetPeer`). */

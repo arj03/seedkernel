@@ -381,31 +381,18 @@ for (const flag of ["--transport", "--transport-config", "--contact-secret"]) {
   ok(host.lines.includes("  ws     listening on :7001"), "one line per listener, under its label");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }
-// `--listen quic=` is the transport's own UDP socket: it goes to the transport's config, not
-// to the host's TCP listeners, and the port the transport bound is the one reported.
+// A `udp://` entry is a datagram listener, labelled `udp` when it names no label; the host
+// binds it and the label reaches the transport unread, as a TCP listener's does.
 {
-  const calls = [];
-  const host = fakeHost(["--key", join(work, "q1.key"), "--listen", "quic=:7000"], {
-    shell: { call: (_svc, b) => { calls.push(new TextDecoder().decode(b)); return Promise.resolve(Uint8Array.of(0x1b, 0x58)); } },
-  });
+  const host = fakeHost(["--key", join(work, "q1.key"), "--listen", "quic=udp://:7000,udp://[::]:0,tcp://127.0.0.1:0"],
+    { listening: [{ label: "quic", host: "0.0.0.0", port: 7000, udp: true }] });
   const r = await runCli(host);
-  ok(host.stood.transport.listen.length === 0 && host.stood.transport.config.quicPort === 7000,
-    "a quic listener is the transport's quicPort, not a host listener");
-  ok(calls.some((c) => c.startsWith("\x04quic")), "its port is asked of the transport");
-  ok(r.serving && host.lines.includes("  quic   listening on :7000 (udp)"), "and a node listening on it alone serves");
-}
-for (const [spec, why] of [["quic=127.0.0.1:7000", "binds every address"], ["quic=:7000,quic=:7001", "one quic listener"]]) {
-  const host = fakeHost(["--key", join(work, "q2.key"), "--listen", spec]);
-  let msg = "";
-  try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes(why), `--listen ${spec} is refused: ${why}`);
-}
-{
-  const host = fakeHost(["--key", join(work, "q3.key"), "--listen", "quic=:7000"],
-    { shell: { call: () => Promise.resolve(Uint8Array.of(0, 0)) } });
-  let msg = "";
-  try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("cannot bind the quic listener"), "a quic port the transport cannot bind is fatal");
+  const [quic, bare, tcp] = host.stood.transport.listen;
+  ok(quic.label === "quic" && quic.udp === true && quic.host === "0.0.0.0" && quic.port === 7000,
+    "label=udp://:port is a labelled datagram listener on every address");
+  ok(bare.label === "udp" && bare.udp === true && bare.host === "::", "an unlabelled udp:// entry is labelled udp");
+  ok(tcp.label === "tcp" && tcp.udp === undefined && tcp.host === "127.0.0.1", "tcp:// is a stream listener, as a bare address is");
+  ok(r.serving && host.lines.includes("  quic   listening on :7000 (udp)"), "and a node listening on udp alone serves");
 }
 // A label is checked for shape, so an address can never be read as a label.
 {

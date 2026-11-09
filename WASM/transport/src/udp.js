@@ -361,15 +361,12 @@ class Udp {
     for (const s of turns) s.turn();
   }
 
-  /** Listen for QUIC on `port` (`QuicListener`): the port bound, or 0 for none. */
-  async listenQuic(port) {
-    const socket = await this.bind(port);
-    if (!socket) return 0;
+  /** Listen for QUIC on the host's `udp` listener socket `id` (`QuicListener`). */
+  async listenQuic(id) {
     let key;
-    try { key = await randomBytes(SEED); } catch { this.close(socket.id); return 0; }
+    try { key = await randomBytes(SEED); } catch { this.close(id); return; }
     // It holds its socket and its wake, which hold it.
-    new QuicListener(socket, key);
-    return socket.port;
+    new QuicListener(id, key);
   }
 
   /** Dial a `quic://` destination (`quicTarget`) from a socket of its own:
@@ -731,8 +728,9 @@ class UdpNegotiation {
 
 // ── listening and dialing ─────────────────────────────────────────────────────
 // A node can also be reached over UDP directly, with no relay and no punch, as a TCP
-// listener is reached: `quic://ip:port` dials a QUIC connection to a node whose config names
-// a `quicPort` (`QuicListener`), and the link runs on it as on an upgraded path. The
+// listener is reached: `quic://ip:port` dials a QUIC connection to a node whose host lends it
+// a `udp` listener labelled `quic` (`QuicListener`), and the link runs on it as on an
+// upgraded path. The
 // listener answers anyone, as a TCP listener does, and the contact secret gates the
 // handshake the same way, since msg1 crosses in the first Initial.
 //
@@ -745,6 +743,8 @@ class UdpNegotiation {
 // `MAX_QUIC_HALF_OPEN` paths besides, since each holds a connection in quic.wasm's memory.
 
 const QUIC_SCHEME = "quic://";
+/** The label of the host's `udp` listener this transport runs QUIC on. */
+const LISTENER_QUIC = "quic";
 /** The listener's paths whose link is not yet authenticated, at most. */
 const MAX_QUIC_HALF_OPEN = 64;
 /** The Initials one screen takes at most (quic.c `SCREEN_MAX`). */
@@ -777,8 +777,7 @@ function runOnQuic(link, quic) {
 
 class QuicListener {
   constructor(socket, key) {
-    this.socket = socket.id;
-    this.port = socket.port;
+    this.socket = socket;
     /** What its Retry tokens are keyed under (quic.c `token_ok`). */
     this.key = key;
     this.routes = new Map(); // a connection ID's first four bytes to its path
@@ -843,7 +842,7 @@ class QuicListener {
     quic.onIds = (ids) => this.route(quic, ids);
     this.routes.set(word, quic);
     const link = core.openLink({
-      linkId, stream: true, channel: quic, dest: "", listener: "quic",
+      linkId, stream: true, channel: quic, dest: "", listener: LISTENER_QUIC,
       weDialed: false, linkSecret: null, acceptSecrets,
       source: sourceOf(n === 4 ? `${d[1]}.${d[2]}.${d[3]}.${d[4]}` : ipv6Text(d, 1)),
       limiter: core.limiter, dialedPeerId: null,

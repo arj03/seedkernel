@@ -264,8 +264,13 @@ export class TransportHost {
   private heldDatagramBytes = 0;
   private readsBusy = false;
   private readsDue = false;
+  /** The ports the `udp` listeners took for the current occupant, in `listen` order. */
+  private udpListening: Promise<number[]> = Promise.resolve([]);
 
   constructor(opts: TransportHostOptions) {
+    // A datagram socket binds every address.
+    const bad = opts.listen?.find((a) => a.udp && a.host !== "0.0.0.0" && a.host !== "::");
+    if (bad) throw new Error(`link: udp listener ${bad.label} binds every address, so its host must be 0.0.0.0 or ::`);
     this.opts = opts;
   }
 
@@ -276,6 +281,20 @@ export class TransportHost {
   activate(call: TransportCall): void {
     this.release();
     this.call = call;
+    this.udpListening = this.bindUdpListeners();
+  }
+
+  /** Each `udp` listener's socket: one of the occupant's own (`bind`), so it goes with the
+   *  occupant, named to it by label in a `listening` event. The ports bound, 0 for none. */
+  private async bindUdpListeners(): Promise<number[]> {
+    const ports: number[] = [];
+    for (const a of this.opts.listen ?? []) {
+      if (!a.udp) continue;
+      const s = await this.bind(a.port);
+      if (s.id !== 0) this.tell(ev("listening").u32(s.id).text(a.label));
+      ports.push(s.port);
+    }
+    return ports;
   }
 
   release(): void {
@@ -649,12 +668,16 @@ export class TransportHost {
       .text(channel.remoteAddr ?? ""));
   }
 
-  /** Bind the listeners (if any) through the channel factory, and take its accept sink. */
+  /** Bind the stream listeners (if any) through the channel factory, and take its accept
+   *  sink; the `udp` ones are the occupant's (`bindUdpListeners`). A listener that cannot
+   *  bind fails the start. */
   async start(): Promise<void> {
-    if (!this.opts.channels) return;
     const addrs = this.opts.listen ?? [];
-    const ports = await this.opts.channels.listen(
-      addrs,
+    const udpPorts = await this.udpListening;
+    const failed = addrs.filter((a) => a.udp).find((_, i) => !udpPorts[i]);
+    if (failed) throw new Error(`link: cannot bind udp listener ${failed.label} on port ${failed.port}`);
+    const ports = !this.opts.channels ? [] : await this.opts.channels.listen(
+      addrs.filter((a) => !a.udp),
       (channel, arrival) => {
         if (!this.available()) {
           this.shut(channel);
@@ -666,7 +689,8 @@ export class TransportHost {
         this.announce(linkId, channel, arrival);
       },
     );
-    this.listening = addrs.map((a, i) => ({ ...a, port: ports[i] ?? 0 }));
+    let s = 0, u = 0;
+    this.listening = addrs.map((a) => ({ ...a, port: (a.udp ? udpPorts[u++] : ports[s++]) ?? 0 }));
   }
 
   /** Tear the driver down without the occupant's cooperation, which a wedged occupant

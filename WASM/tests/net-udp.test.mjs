@@ -1045,17 +1045,19 @@ await test("a peer with no UDP path declines it, and the offering side offers We
 
 console.log("\nUDP: a node listening for QUIC, dialed at quic:// (§12.7)\n");
 
-/** A node listening for QUIC on a port the OS picks, and that port. */
+/** A node whose host lends its transport a `udp` listener labelled `quic`, on a port the
+ *  OS picks, and that port. */
 async function quicListener(opts = {}) {
-  const node = await makeTransportHost({ ...opts, datagrams: nodeRawDatagrams(), transportConfig: { quicPort: 0 } });
-  const a = await transportOp(node, new OpArgs("quic"));
-  return { node, port: (a[0] << 8) | a[1] };
+  const node = await makeTransportHost({
+    ...opts, datagrams: nodeRawDatagrams(), listen: [{ label: "quic", host: "0.0.0.0", port: 0, udp: true }],
+  });
+  return { node, port: node.driver.portOf("quic") };
 }
 
 await test("a node dials another at quic://ip:port, with no relay, and the link carries requests both ways", async (keep) => {
   const { node: B, port } = await quicListener();
   keep(B);
-  assert(port > 0, "the listener reports the port it bound");
+  assert(port > 0, "the host reports the port it bound");
   const A = keep(await makeTransportHost({ datagrams: nodeRawDatagrams() }));
   await A.addr(B.peerId, `quic://127.0.0.1:${port}`);
   const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
@@ -1089,6 +1091,38 @@ await test("a gated listener answers only a dialer that holds its contact secret
   await friend.addr(B.peerId, `quic://127.0.0.1:${port}`, secret);
   const resp = await friend.request(B.peerId, PROTO, Uint8Array.of(4));
   assert(resp.length === 1 && resp[0] === 4, "one with it is answered");
+});
+
+await test("a udp listener binds every address, and one whose port is taken fails the node's start", async () => {
+  let refused = "";
+  try { new TransportHost({ listen: [{ label: "quic", host: "127.0.0.1", port: 0, udp: true }] }); } catch (e) { refused = e.message; }
+  assert(refused.includes("binds every address"), "a udp listener on one address is refused");
+  const { node: first, port } = await quicListener();
+  let failed = "";
+  await makeTransportHost({ datagrams: nodeRawDatagrams(), listen: [{ label: "quic", host: "0.0.0.0", port, udp: true }] })
+    .catch((e) => { failed = e.message; });
+  first.shell.close();
+  assert(failed.includes("cannot bind udp listener quic"), `a taken port fails the start: ${failed}`);
+});
+
+await test("a udp listener is bound afresh, on its port, for each occupant that takes link", async () => {
+  const probe = createSocket("udp4");
+  await new Promise((r) => probe.bind(0, r));
+  const port = probe.address().port;
+  probe.close();
+  const driver = new TransportHost({ datagrams: nodeRawDatagrams(), suppressLinkLog: true, listen: [{ label: "quic", host: "0.0.0.0", port, udp: true }] });
+  const heard = [[], []];
+  const occupant = (i) => (input) => { heard[i].push(new TextDecoder().decode(input.subarray(33, 33 + input[32]))); return Promise.resolve(new Uint8Array()); };
+  try {
+    driver.activate(occupant(0));
+    await driver.start();
+    assert(driver.portOf("quic") === port && heard[0].includes("listening"), "the first occupant is told of its socket");
+    driver.activate(occupant(1));
+    await until(() => heard[1].includes("listening"), 2000, "the next occupant's listening event");
+    assert(heard[1].length === 1, "the next occupant gets the port again, its predecessor's socket closed");
+  } finally {
+    driver.close();
+  }
 });
 
 await test("a stranger's first Initial is answered with a Retry, and only one that echoes it from that address is let in", async (keep) => {

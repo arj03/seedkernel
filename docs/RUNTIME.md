@@ -27,15 +27,15 @@ This is the one place these figures live.
 
 | Component | Size |
 |---|---|
-| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): the host (`platformHost`) and its browser platform, the socket seams and bundle verification | ~140 KiB |
+| `services/*.js` + hand-written `host/*.js` a page imports beside the blob, minified (`build-min`): the host (`platformHost`) and its browser platform, the socket seams and bundle verification | ~142 KiB |
 | **Host blob** (`build/host.skb`): the host script, `qjs.wasm`, libsodium, ML-DSA-65 and the default transport, signed (§12.9). The native and Node loaders run it | 1.43 MiB |
 | of which the host script (`build/host.js`) | 222 KiB |
 | of which `qjs.wasm`, the realm engine, built for size (`-Os`, native/qjs/build-qjs.sh) | 624 KiB |
 | of which libsodium.wasm (core build: the host's crypto) | 217 KiB |
 | of which mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`) | 16 KiB |
-| of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm`, `mlkem768.wasm` (ML-KEM-768, 12 KiB) and `quic.wasm` (the UDP path's QUIC connection, ngtcp2, 247 KiB) | 379 KiB |
+| of which the transport bundle (`build/transport.skb`): its guest, signed without comments, `ws.wasm`, `mlkem768.wasm` (ML-KEM-768, 12 KiB) and `quic.wasm` (the UDP path's QUIC connection, ngtcp2, 247 KiB) | 378 KiB |
 | **Web host blob** (`build/host-web.skb`): the same signed blob with an empty script, since a page imports the host instead, and the transport built without `quic.wasm` (`build/transport-web.skb`, 132 KiB), since a page has no datagram sockets | 994 KiB |
-| **Total browser deployment**: the modules and the web host blob | **~1.11 MiB (~469 KiB gzipped)** |
+| **Total browser deployment**: the modules and the web host blob | **~1.11 MiB (~470 KiB gzipped)** |
 | **Native binary**, per `GOOS`/`GOARCH` (amd64 or arm64, the platforms wazero compiles for), built with `go build -tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`, which drops wazero's interpreter, its DWARF stack traces and the symbol table: mostly wazero's compiler backend (~4 MiB), the Go runtime (~2.4 MiB) and the genesis host blob, gzipped (~0.6 MiB) | ~5.2 MiB |
 
 `npm run build` emits the readable `build/` (~285 KiB of JS in `host/` and `services/`) and the comment-stripped `build-min/` (~140 KiB), a second `tsc` pass with `removeComments` (`scripts/minify.mjs` over `tsconfig.min.json`) holding only what the browser entry points reach: the host modules a page imports. It prints the gzipped size before and after minifying on every run.
@@ -159,7 +159,7 @@ Each slot has **one** signing scope, derived once at load from admitted facts (`
 
 #### Host events
 
-The host enters a realm with its own events. A realm that armed a wake receives `wake` when it fires; the slot holding `link`, and only it, receives the four link events, the `link` service's `events` list beside its `calls` in `host/domains.ts`. Each arrives at `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`host/op-frame.ts`); the envelope and field order are host ABI every guest that arms a wake, and every link occupant, must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
+The host enters a realm with its own events. A realm that armed a wake receives `wake` when it fires; the slot holding `link`, and only it, receives the five link events, the `link` service's `events` list beside its `calls` in `host/domains.ts`. Each arrives at `handle` as `[32 zero bytes][opLen u8][op ASCII][args …]`, encoded with `OpArgs` (`host/op-frame.ts`); the envelope and field order are host ABI every guest that arms a wake, and every link occupant, must accept. There is no padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, `0` or `1`.
 
 | Event | `opLen` | `args`, in byte order | Return body |
 | --- | --- | --- | --- |
@@ -168,6 +168,7 @@ The host enters a realm with its own events. A realm that armed a wake receives 
 | `linkBytes` | 9 | `[linkId u32][bytes blob]` | ignored; the driver awaits completion before admitting the next read on this link |
 | `linkClosed` | 10 | `[linkId u32]` | `[severity u8][reason utf8 ..]`; the driver prints a reason above severity 0. An absent or rejected answer reads as an empty reason at severity 0 |
 | `datagrams` | 9 | `([socket u32][batch blob])*` to the end, each batch `([n u8][ip n][port u16][len u16][bytes])*`, n 4 for IPv4 and 16 for IPv6 | ignored; the driver holds the next until it settles |
+| `listening` | 9 | `[socket u32][label text]` | ignored. A `udp` listener (`--listen label=udp://:port`), bound as one of the occupant's datagram sockets each time an occupant takes `link`, so it goes with the occupant as its other sockets do. Its reads arrive as `datagrams` events |
 
 - `linkId` 0 is never a live link. `linkOpen` announces a platform-accepted or platform-initiated socket; a guest-opened link gets its id and `stream` from `link/open` instead, with no event.
 - Missing arrival metadata encodes as an empty listener and `via` 0. A `via` names the live link this one arrived through, 0 when there is none or it has already gone. A missing source address is empty text. Listener, `via` and address are platform metadata, not authenticated identity.
@@ -399,7 +400,7 @@ node build/host/loader-node.js --policy ./allowed-keys.json --dir ./data --key .
 
 - **`runCli` is shared by both loaders**, in the host script (§12.9). It owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy`, the order (remedies, then the bundle, then the one-shots, then serve) and every printed line. A target supplies a `CliHost`: file reads and writes, argv and a banner, one console line, raw stdin and stdout, entropy, and `standUp` to stand a node up on that platform. Unknown flags are errors.
 - **`--key`** holds the 32-byte master seed; `deriveNodeKey` derives the keypair from it on both targets.
-- **`--listen [label=]host:port,…`** binds one listener per entry, labelled `tcp` when it names no label. An IPv6 host goes in brackets, `[::]:9000`. The label reaches the transport with every link the listener accepts, unread (§12.1).
+- **`--listen [label=][tcp://|udp://]host:port,…`** binds one listener per entry, TCP unless the address says `udp://`, labelled with its kind when it names no label. An IPv6 host goes in brackets, `[::]:9000`; a `udp` listener binds every address, so its host is `0.0.0.0` or `::`. The label reaches the transport unread (§12.1): with every link a TCP listener accepts, and in a `listening` event for a `udp` one's socket. The shipped transport runs QUIC on a `udp` listener labelled `quic` (`--listen quic=udp://:7000`).
 - **`--transport`** selects a signed transport bundle from disk instead of the embedded one. A relay node runs seedrelay's bundle this way, as its transport.
 - **`--transport-config`** names a JSON object that becomes the boot transport's `LOCAL` unread; `--peers` and `--contact-secret` take precedence over its own entries.
 - **`--contact-secret`** names a file, never the secret itself; its contents, less the line ending, become `transport.config.contactSecret` unread: 64 hex characters, or `open` for a node that answers anyone, which is a node in public. Without it the shipped transport derives the secret from the node's key, and the node prints it at boot as `contact <hex>`, the part of its address after `pk.`.
