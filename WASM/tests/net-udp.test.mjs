@@ -436,6 +436,22 @@ await test("a graceful close lets what was written arrive first, then the peer h
   pair.close();
 });
 
+await test("a graceful close hands the peer's reader what it had not read yet, though it was acked", async () => {
+  const pair = await streamPair();
+  const atB = reader(pair.b);
+  atB.hold();
+  const data = randomBytes(1024 * 1024);
+  writeInPieces(pair.a, data);
+  pair.a.close(true);
+  await until(() => pair.a.gone, 10_000, "the closing end to see it all acked and close");
+  await settle(100);
+  assert(!atB.closed && atB.length <= MAX_READ, `the peer keeps what it holds, ${atB.length} read`);
+  atB.release();
+  await until(() => atB.closed, 10_000, "the close once the reader has the rest");
+  assert(atB.length === data.length && atB.bytes().equals(data), `all of it came before the close: ${atB.length}`);
+  pair.close();
+});
+
 await test("a hard close reaches the peer at once", async () => {
   const pair = await streamPair();
   const atB = reader(pair.b);

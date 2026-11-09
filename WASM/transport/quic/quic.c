@@ -833,12 +833,15 @@ static int accept_from(path *p, const ngtcp2_sockaddr_union *from, const uint8_t
   return 0;
 }
 
-/** The connection is over: tell the peer, if `rv` is ngtcp2's own error, and stop. */
+/** The connection is over: tell the peer, unless it already knows or is not to hear of it,
+ *  and stop. */
 static void end_conn(path *p, int rv, ngtcp2_tstamp now) {
   if (p->closed) return;
   p->closed = 1;
   p->events |= E_CLOSED;
-  if (!p->conn || rv == NGTCP2_ERR_DRAINING || rv == NGTCP2_ERR_IDLE_CLOSE || rv == NGTCP2_ERR_DROP_CONN) return;
+  if (!p->conn || rv == NGTCP2_ERR_DRAINING || rv == NGTCP2_ERR_IDLE_CLOSE || rv == NGTCP2_ERR_DROP_CONN ||
+      rv == NGTCP2_ERR_RETRY || rv == NGTCP2_ERR_RECV_VERSION_NEGOTIATION)
+    return;
   ngtcp2_ccerr ccerr;
   ngtcp2_path_storage ps;
   uint8_t buf[1500];
@@ -855,11 +858,12 @@ static void end_conn(path *p, int rv, ngtcp2_tstamp now) {
   }
 }
 
-/** One datagram into the connection, which ends it if ngtcp2 says so. */
+/** One datagram into the connection: any error ngtcp2 returns ends it, since a packet it
+ *  merely drops reads as 0. */
 static void read_one(path *p, const ngtcp2_sockaddr_union *from, const uint8_t *pkt, size_t len, ngtcp2_tstamp now) {
   ngtcp2_path path = path_of(p, from);
   int rv = ngtcp2_conn_read_pkt(p->conn, &path, NULL, pkt, len, now);
-  if (rv == NGTCP2_ERR_DRAINING || (rv && ngtcp2_err_is_fatal(rv))) end_conn(p, rv, now);
+  if (rv) end_conn(p, rv, now);
 }
 
 /** The held datagrams, read again in the order they came (`held`). */
@@ -1077,8 +1081,11 @@ static int op_turn(reader *r) {
     p->events |= E_FINISHED;
   }
   out_at = sends + read + hs + 4 * ids + send_len;
-  answer[0] = p->events;
-  p->events = 0;
+  // A connection that is over still hands up what came before it ended: its close waits
+  // until the reader has taken that, as ngtcp2 acks what arrives, not what is read.
+  uint8_t held = p->rlen > 0 ? p->events & E_CLOSED : 0;
+  answer[0] = p->events & ~held;
+  p->events = held;
   put_u32_at(1, accepted);
   if (p->conn && !p->closed) {
     ngtcp2_tstamp due = ngtcp2_conn_get_expiry(p->conn);
