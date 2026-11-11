@@ -523,7 +523,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	}
 }
 
-// A guest that never yields is stopped by its execution budget (§12.3, §16.1).
+// A guest that never yields is stopped by its execution budget (§12.3).
 //
 // QuickJS's own interrupt, armed by the realm on every entry (realm.c), as on the JS
 // targets: the overrun is a throw, the caller gets an error, and the realm is still usable.

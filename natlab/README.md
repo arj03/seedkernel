@@ -1,6 +1,6 @@
 # natlab: NAT traversal in a virtual network
 
-Tests the UDP direct path (RUNTIME §12.7) against real NAT behaviour, without real routers.
+Tests the UDP direct path ([TRANSPORT, UDP paths](../docs/TRANSPORT.md#udp-paths)) against real NAT behaviour, without real routers.
 [patchbay](https://github.com/n0-computer/patchbay), the lab iroh tests its hole punching
 with, builds routers and hosts out of Linux network namespaces with NAT rules in nftables.
 Two native nodes sit behind a pair of NAT routers, register on a public seedrelay that also
@@ -59,8 +59,8 @@ Logs for each sim, each node's console and its probe's output, are under
 
 `strict` against `moderate` takes the birthday paradox: the relay answers STUN on two ports,
 so the strict end sees its two answers differ, and the UDP path then has it open 256 ports
-toward the peer while the moderate end probes random ports until one lands (RUNTIME
-§12.7). Two `strict` ends would each have to guess the other's random port for the other's
+toward the peer while the moderate end probes random ports until one lands ([TRANSPORT,
+Hard NATs](../docs/TRANSPORT.md#udp-paths)). Two `strict` ends would each have to guess the other's random port for the other's
 random port, so that pair is expected to stay on the relay.
 
 ## IPv6

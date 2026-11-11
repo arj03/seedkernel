@@ -1,5 +1,5 @@
 // `fs` (§12.1): raw bytes under an opaque flat key. Content addressing and quotas are
-// app policy. Keys are filenames on both backends; the charset is in §16.1.
+// app policy. Keys are filenames on both backends; the charset is in §12.2.
 import { concatBytes, dec, EMPTY, ONE, ZERO, readU32BE, writeU32BE } from "../host/util.js";
 import { OpArgs } from "../host/op-frame.js";
 import type { ServiceHandlers } from "../host/guest-seam.js";
@@ -28,7 +28,7 @@ export interface Fs {
   stat(): FsStat;
 }
 
-// The key charset is consensus (§16.1), applied once in shared code.
+// The key charset is consensus (§12.2), applied once in shared code.
 
 /** The key charset. Also the scope charset. */
 const SAFE_CHARS = /^[A-Za-z0-9._-]+$/;

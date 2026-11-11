@@ -14,7 +14,7 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   maxPreAuthQueueSlices: 4096,
   linkIdleTimeoutMs: 300_000,
   // How long a correlation waits for its peer. Set it below the invocation deadline for an
-  // app to have time to try another holder (§16.1).
+  // app to have time to try another holder.
   requestTimeoutMs: 10_000,
   admitPeers: Object.freeze([]),
   // Peers to dial, as `pk[.secret]@dest` (core.js `peerRef`). Deployment-specific, so set

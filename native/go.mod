@@ -23,5 +23,5 @@ require golang.org/x/sys v0.46.0 // indirect
 //
 // Two build tags in the fork drop code the loader never runs: wazero_nointerp the interpreter
 // (the loader configures only the compiler) and wazero_nodwarf debug/dwarf (source lines in
-// wasm stack traces). The release build passes both, docs/RUNTIME.md.
+// wasm stack traces). The release build passes both, README.md §10.2.
 replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20261108160129-f7610ddd1d4c

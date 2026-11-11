@@ -1,8 +1,7 @@
 // Computes the README's LOC figures ("one implementation, three targets"): `npm run loc`
-// exits 1 on drift, and `--write` updates the README. Counted by the README's own rule
-// (non-test sources, no blank or comment lines). The shared set is derived from
-// build:host-script and checked against the rows, so a shared file missing from every row
-// also fails.
+// exits 1 on drift, and `--write` updates the README. Counts non-test sources, without
+// blank or comment lines. Every set is derived, the shared one from the scripts that build
+// it, so a new file is counted without touching this script.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -45,41 +44,6 @@ const sharedSet = new Set(
   ([pkg.scripts["build:host-script"], pkg.scripts["build:loader-script"]].join(" ").match(/build\/[^\s/]+\/\S+\.js/g) ?? [])
     .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
-// ── the rows, exactly as the README groups them ──────────────────────────────
-// `find` matches the row's file cell, not its prose, so rewording cannot break a count;
-// `--write` puts `render(n)` into the row's last cell.
-const cell = (n) => `| ${fmt(n)} |`;
-
-const sharedRows = [
-  // The core.
-  { find: /`host\/bundle\.ts`, `host\/policy\.ts`/,
-    files: ["WASM/host/bundle.ts", "WASM/host/policy.ts", "WASM/host/wasm-limits.ts", "WASM/host/host-blob.ts",
-      "WASM/host/slots.ts", "WASM/host/pure-module.ts"] },
-  { find: /`host\/guest-seam\.ts`, `host\/realm-queue\.ts`/,
-    files: ["WASM/host/guest-seam.ts", "WASM/host/realm-queue.ts"] },
-  { find: /`host\/shell-core\.ts`/,
-    files: ["WASM/host/shell-core.ts", "WASM/host/slot-table.ts"] },
-  { find: /`host\/engine-realm\.ts`, `host\/sodium-engine\.ts`/,
-    files: ["WASM/host/engine-realm.ts", "WASM/host/sodium-engine.ts", "WASM/host/pq.ts"] },
-  { find: /`host\/platform\.ts`, `host\/abi\.ts`/,
-    files: ["WASM/host/platform.ts", "WASM/host/abi.ts", "WASM/host/host-main.ts", "WASM/host/native-polyfills.ts"] },
-  { find: /`host\/domains\.ts`, `host\/subkeys\.ts`/,
-    files: ["WASM/host/domains.ts", "WASM/host/subkeys.ts", "WASM/host/op-frame.ts", "WASM/host/util.ts", "WASM/host/utf8.ts"] },
-  // The host services.
-  { find: /`services\/node\.ts`, `services\/timer\.ts`/,
-    files: ["WASM/services/node.ts", "WASM/services/timer.ts"] },
-  { find: /`services\/fs\.ts`, `services\/fs-files\.ts`/,
-    files: ["WASM/services/fs.ts", "WASM/services/fs-files.ts"] },
-  { find: /`services\/link\.ts`/,
-    files: ["WASM/services/link.ts", "WASM/services/socket-seam.ts", "WASM/services/datagrams.ts",
-      "WASM/services/peer-addr.ts", "WASM/services/net-limits.ts"] },
-  { find: /\| `services\/host\.ts` \|/,
-    files: ["WASM/services/host.ts"] },
-  // The operator front-end.
-  { find: /`host\/cli\.ts`/,
-    files: ["WASM/host/cli.ts", "WASM/host/control.ts"] },
-];
-
 /** Per-target JS: every non-test TS under services/ and host/ that the shared bundle does
  *  not include. Derived, so a new backend is counted automatically. */
 const jsFiles = ["services", "host"].flatMap((d) =>
@@ -92,57 +56,28 @@ const goFiles = readdirSync(resolve(repoDir, "native"))
   .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
   .map((f) => `native/${f}`);
 
-const rows = [
-  ...sharedRows.map((r) => ({ ...r, n: sum(r.files), render: cell })),
-  { find: /\*\*JS\*\* \(browser \+ Node\)/, n: sum(jsFiles),
-    render: (n) => `| ${fmt(n)} TS |` },
-  { find: /\*\*Native\*\* \(Go\)/, n: sum(goFiles),
-    render: (n) => `| ${fmt(n)} Go |` },
-];
-const sharedTotal = sharedRows.reduce((n, r) => n + sum(r.files), 0);
-
-// ── reconcile the shared set against the rows ────────────────────────────────
-const accounted = new Set(sharedRows.flatMap((r) => r.files));
-const orphans = [...sharedSet].filter((f) => !accounted.has(f));
-const phantoms = [...accounted].filter((f) => !sharedSet.has(f) && !f.startsWith("native/"));
-
 // ── report ───────────────────────────────────────────────────────────────────
+// Each pattern matches only the number, found by its row label or source path, so
+// rewording the prose around it cannot break a count.
+const row = (label, unit) => new RegExp(`(?<=^\\| \\*\\*${label}\\*\\* .*\\| )[\\d,]+(?= ${unit} \\|)`, "m");
+const figures = [
+  ["shared", row("Shared", "TS"), sum([...sharedSet])],
+  ["per-target JS", row("JS", "TS"), sum(jsFiles)],
+  ["native Go", row("Native", "Go"), sum(goFiles)],
+  ["transport/src/*.js", /[\d,]+(?= lines of `transport\/src\/\*\.js`)/, sum(guestSourcePaths())],
+];
+
 const write = process.argv.includes("--write");
 let readme = readFileSync(readmePath, "utf8");
-const lines = readme.split(/\r?\n/);
 let drift = 0;
 
-for (const row of rows) {
-  const i = lines.findIndex((l) => row.find.test(l));
-  if (i < 0) {
-    console.error(`  MISSING  no README row matches ${row.find}`);
+for (const [label, re, n] of figures) {
+  const m = readme.match(re);
+  if (!m) {
+    console.error(`  MISSING  no README figure matches ${label}`);
     drift++;
     continue;
   }
-  const want = row.render(row.n);
-  const have = lines[i].slice(lines[i].lastIndexOf("|", lines[i].length - 2));
-  const label = lines[i].split("|")[1].trim().replace(/`/g, "").slice(0, 52);
-  if (have.trim() === want.trim()) {
-    console.log(`  ok       ${String(row.n).padStart(5)}  ${label}`);
-  } else {
-    drift++;
-    console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(row.n).padStart(5)}  ${label}   README says ${have.trim()}`);
-    lines[i] = lines[i].slice(0, lines[i].lastIndexOf("|", lines[i].length - 2)) + want;
-  }
-}
-readme = lines.join("\n");
-
-// Prose figures (not cells): match only the number, using the heading or source path
-// to identify it. The transport count does not depend on the surrounding sentence.
-// The shared total lives in the heading; the guest figure is summed from guest-source.mjs.
-const proseFigures = [
-  ["shared total (heading)", /(?<=all three targets \()[\d,]+(?= LOC\))/, sharedTotal],
-  ["transport/src/*.js", /[\d,]+(?= lines of `transport\/src\/\*\.js`)/,
-    sum(guestSourcePaths())],
-];
-for (const [label, re, n] of proseFigures) {
-  const m = readme.match(re);
-  if (!m) { console.error(`  MISSING  no README figure matches ${label}`); drift++; continue; }
   const want = fmt(n);
   if (m[0] === want) {
     console.log(`  ok       ${String(n).padStart(5)}  ${label}`);
@@ -153,15 +88,10 @@ for (const [label, re, n] of proseFigures) {
   }
 }
 
-for (const f of orphans)
-  console.error(`  ORPHAN   ${f} is in the shared bundle but in no README row`);
-for (const f of phantoms)
-  console.error(`  PHANTOM  ${f} is in a README row but not in the shared bundle`);
-
 if (write && (drift > 0)) {
   writeFileSync(readmePath, readme);
   console.log(`\nloc: README updated (${drift} figure${drift === 1 ? "" : "s"}).`);
-} else if (drift > 0 || orphans.length || phantoms.length) {
+} else if (drift > 0) {
   console.error("\nloc: README is out of date; run `npm run loc -- --write`.");
   process.exit(1);
 } else {

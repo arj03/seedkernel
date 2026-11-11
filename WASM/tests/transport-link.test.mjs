@@ -1684,7 +1684,7 @@ await test("DRIVER BACKPRESSURE: an unpausable adapter's burst is held, in order
 });
 
 // The hold is bounded: a peer that outruns the realm loses its link instead of growing
-// the driver's queue (§16.1).
+// the driver's queue (§12.6).
 await test("DRIVER BACKPRESSURE: a peer outrunning the realm loses its link", async (keep) => {
   const h = heldReadDriver(keep);
   await h.driver.start();

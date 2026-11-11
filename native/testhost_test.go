@@ -414,7 +414,7 @@ func newTestRealm(tb testing.TB, appJSON, source string) {
 }
 
 // newTestRealmBudget is newTestRealm with an explicit execution budget in ms (0 = the
-// target default, §16.1). Separate so the budget test can use a short one without every
+// target default, §12.3). Separate so the budget test can use a short one without every
 // other test paying for a non-default path.
 func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	tb.Helper()

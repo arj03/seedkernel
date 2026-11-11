@@ -90,7 +90,7 @@ func (a authorKeys) id() []byte {
 	return blake2b256(pre)
 }
 
-// blake2b256 is the one system hash (§16.1), as the host's libsodium computes it.
+// blake2b256 is the one system hash (§5), as the host's libsodium computes it.
 func blake2b256(b []byte) []byte {
 	h := blake2b.Sum256(b)
 	return h[:]

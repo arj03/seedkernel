@@ -192,7 +192,7 @@ class ReqRes {
 
   /** Send one request for an app. `d` is its deferred (null for noReply, corr 0). `proto`
    *  and `payload` are borrowed views, so `buildReq` runs before any await.
-   *  `requestTimeoutMs` bounds the correlation, not the caller (§16.1); a frame no link
+   *  `requestTimeoutMs` bounds the correlation, not the caller (§12.3); a frame no link
    *  accepted fails at once. */
   request(d, to, proto, payload, noReply) {
     const corr = noReply ? 0 : this.nextCorr++;

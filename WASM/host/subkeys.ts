@@ -5,7 +5,7 @@
 // label, so the peer id can rotate without changing the key file format. One key serves
 // every purpose; what a signature means comes from the domain and scope the host picks
 // for the calling slot (guest-seam.ts), not from the key. Why not a second keypair:
-// docs/DESIGN.md §12.6.
+// docs/ARCHITECTURE.md §12.6.2b.
 
 import { DOMAIN_SUBKEY } from "./domains.js";
 import { concatBytes, enc } from "./util.js";
