@@ -111,6 +111,8 @@ Application throughput is the apps' to measure: seedstore keeps its figures in [
 
 ### 10.2 Distribution Size
 
+Native and Node:
+
 | Component | Size |
 |---|---|
 | **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.43 MiB |
@@ -119,10 +121,15 @@ Application throughput is the apps' to measure: seedstore keeps its figures in [
 | of which `libsodium.wasm` | 217 KiB |
 | of which `mldsa65.wasm` | 16 KiB |
 | of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (247 KiB) | 378 KiB |
+| **Native binary** per `GOOS`/`GOARCH`, built with `-tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`: wazero with its compiler backend (~2.9 MiB), the Go runtime (~1.3 MiB), the host blob above, gzipped (~0.6 MiB), and the loader itself (~0.4 MiB) | ~5.2 MiB |
+
+Browser:
+
+| Component | Size |
+|---|---|
 | **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 132 KiB transport without `quic.wasm` | 994 KiB |
 | Host modules a page imports beside it, minified (`build-min`) | ~142 KiB |
 | **Total browser deployment** | **~1.11 MiB (~470 KiB gzipped)** |
-| **Native binary** per `GOOS`/`GOARCH`, built with `-tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`: wazero with its compiler backend (~2.9 MiB), the Go runtime (~1.3 MiB), the genesis host blob, gzipped (~0.6 MiB), and the loader itself (~0.4 MiB) | ~5.2 MiB |
 
 ## One implementation, three targets
 
