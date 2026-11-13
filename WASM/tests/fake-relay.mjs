@@ -154,7 +154,14 @@ export class FakeRelay {
       this.controlWire.push(b);
       if (c.recv && c.waiting === 0) { this.onRecord(c, b); return; }
       c.waiting++;
-      c.work = c.work.then(() => this.onControl(c, b)).catch(() => c.end.kill()).finally(() => { c.waiting--; });
+      // Counted down the moment the step ends, so a record right behind a synchronous one
+      // is read as it arrives, not queued behind the chain's own bookkeeping.
+      c.work = c.work.then(() => {
+        let step;
+        try { step = this.onControl(c, b); } catch { c.end.kill(); }
+        if (!(step instanceof Promise)) { c.waiting--; return; }
+        return step.catch(() => c.end.kill()).then(() => { c.waiting--; });
+      });
     });
     c.end.gone = () => this.leave(c);
     this.controls.add(c);

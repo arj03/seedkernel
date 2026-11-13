@@ -241,6 +241,8 @@ class ReqRes {
 
   /** Hand a request frame to a link; one no link takes fails its request at once. */
   put(corr, to, frame) {
+    // A routed peer takes it now, without the dial path's promise.
+    if (to !== ownId && core.place(to, frame)) return;
     const unanswerable = () => this.finish(corr, null);
     core.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
   }

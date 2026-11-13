@@ -43,7 +43,7 @@ This file has two parts:
 
 ## 12.2 The guest seam: the guest name ABI
 
-A guest reaches the world through one call, `host.call(name, bytes)`, which answers a Promise. It is entered through one function, `handle(bytes)` (§12.3). Multi-byte integers are big-endian.
+A guest reaches the world through one call, `host.call(name, bytes)`, which answers a Promise. `bytes` is a `Uint8Array` or `ArrayBuffer`, or an array of them, which the call sends back to back: a guest hands over an argument's parts without concatenating them. It is entered through one function, `handle(bytes)` (§12.3). Multi-byte integers are big-endian.
 
 ### Names
 

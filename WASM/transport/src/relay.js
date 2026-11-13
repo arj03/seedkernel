@@ -293,6 +293,6 @@ class Relays {
 
   /** What the home relay told this node, for the host (`link/status`). */
   told(bytes) {
-    callRetried(N_LINK_STATUS, concatBytes([Uint8Array.of(STATUS_RELAY), bytes]));
+    callRetried(N_LINK_STATUS, [Uint8Array.of(STATUS_RELAY), bytes]);
   }
 }

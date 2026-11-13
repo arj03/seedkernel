@@ -71,7 +71,8 @@ function newSandbox(arrayType = Uint8Array) {
     Uint8Array: arrayType, TextEncoder, TextDecoder, Promise, RegExp, console,
     host: { call: (id, req) => {
       if (id !== "ws") throw new Error(`ws-framing harness: unexpected host.call id ${id}`);
-      return Promise.resolve(wsRawCall(req));
+      // The realm lays a call's parts back to back (realm.c).
+      return Promise.resolve(wsRawCall(Array.isArray(req) ? concat(req) : req));
     } },
     N_WS: "ws",
     maxFrameBytes: TEST_MAX_FRAME_BYTES,
@@ -84,17 +85,24 @@ function newSandbox(arrayType = Uint8Array) {
 
 const WS = newSandbox();
 
-/** A `WsFramer` plus the bytes it wrote, in write order. */
+/** A `WsFramer` plus the bytes it wrote, in write order, each write whole. */
 function makeFramer(client, authority = "") {
   const outbox = [];
-  const framer = new WS.WsFramer((bytes) => { outbox.push(bytes); return true; }, client, authority);
+  const framer = new WS.WsFramer((bytes, tail) => { outbox.push(tail ? concat([bytes, tail]) : bytes); return true; }, client, authority);
   return { framer, outbox };
 }
 
 /** Make raw, correctly masked client frames. Only a frame source: this instance's own
- *  handshake (`prepared`) writes into a throwaway sink, which `.frame()` does not use. */
+ *  handshake (`prepared`) is written first, and `.frame()` answers only its own write. */
 function frameFactory() {
-  return makeFramer(true).framer;
+  const { framer, outbox } = makeFramer(true);
+  return {
+    async frame(opcode, payload) {
+      await framer.prepared;
+      await framer.write(opcode, payload);
+      return outbox.pop();
+    },
+  };
 }
 
 /** Force a fragment start (`wsFrame` always sets FIN=1); flipping the bit after encoding
@@ -149,8 +157,7 @@ async function run() {
     for (let i = 0; i < 32; i++) ok(framer.push(frame, (p) => delivered.push(p)), "small complete length frame accepted");
     ok(allocated <= 2 * frame.length * 32, "complete small frames allocate at most twice their wire bytes");
     ok(delivered.length === 32 && delivered.every((p) => bytesEq(p, frame.subarray(4))), "small frames deliver intact");
-    frame.fill(0);
-    ok(delivered.every((p) => p[0] === 42), "delivered frames own their bytes after input reuse");
+    ok(delivered.every((p) => p.buffer === frame.buffer), "a frame inside one read is delivered as a view of it, not a copy");
   }
   {
     // A borrowed small view may have spare capacity containing someone else's bytes.

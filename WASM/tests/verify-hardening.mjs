@@ -561,7 +561,7 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
     };
     const shared = createDeadlineQueue();
     const batched = serializeCalls(shared,
-      (payload) => ({ result: Promise.resolve(payload), cancel: () => {} }), () => null, 5000);
+      (payload, ms, clock, answer) => { answer.resolve(payload); return { cancel: () => {} }; }, () => null, 5000);
     await Promise.all([batched(Uint8Array.of(1)), batched(Uint8Array.of(2)), batched(Uint8Array.of(3))]);
     ok(deadlineArms === 1 && deadlineClears === 0,
       "fast serialized calls share one armed deadline instead of cycling timers");
@@ -576,12 +576,10 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   const gates = [];
   const seen = [];
   const queuedDeadlines = createDeadlineQueue();
-  const queued = serializeCalls(queuedDeadlines, (payload) => {
+  const queued = serializeCalls(queuedDeadlines, (payload, ms, clock, answer) => {
     seen.push(payload);
-    let release, fail;
-    const gate = new Promise((resolve, reject) => { release = resolve; fail = reject; });
-    gates.push(release);
-    return { result: gate.then(() => payload), cancel: (reason) => fail(reason) };
+    gates.push(() => answer.resolve(payload));
+    return { cancel: (reason) => answer.reject(reason) };
   }, () => closed ? new Error("closed") : null, 500);
   const one = Uint8Array.of(1);
   const firstInvocation = queued(one);

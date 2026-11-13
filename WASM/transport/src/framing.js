@@ -17,11 +17,9 @@ class LengthFramer {
     this.cap = MAX_HANDSHAKE_FRAME_BYTES;
   }
 
+  /** `[len u32][msg]`, with `msg` handed on as it is. */
   send(msg) {
-    const out = new Uint8Array(4 + msg.length);
-    writeU32BE(out, 0, msg.length);
-    out.set(msg, 4);
-    return this.put(out);
+    return this.put(argU32(msg.length), msg);
   }
 
   raiseCap() { this.cap = maxFrameBytes; }
@@ -47,7 +45,7 @@ class LengthFramer {
       if (len > this.cap) return false;
       if (this.parts.bytes < 4 + len) return true;
       this.parts.take(4);
-      const step = deliver(this.parts.takeCopy(len));
+      const step = deliver(this.parts.take(len));
       if (this.cap !== maxFrameBytes) return Promise.resolve(step).then(() => this.parse(deliver));
     }
   }
@@ -59,6 +57,7 @@ class LengthFramer {
 // and written here; the per-byte work (masking, the accept value) runs in this bundle's
 // `ws.wasm`, so a frame that is not masked, every one a server sends, never reaches it.
 const WS_OP_MASK = 1, WS_OP_ACCEPT = 2, WS_OP_BASE64 = 3;
+const WS_MASK_OP = Uint8Array.of(WS_OP_MASK);
 const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
 /** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
 const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
@@ -89,17 +88,17 @@ function maskKey() {
   });
 }
 
-/** One frame with FIN set (RFC 6455 §5.2), in the shortest length form. With a `key` it is
- *  a masking request for ws.wasm, `[WS_OP_MASK][frame]` with the payload still clear. */
-function wsFrame(opcode, payload, key) {
-  const n = payload.length, ext = n < 126 ? 0 : n < 65536 ? 2 : 8;
+/** The head of one frame with FIN set (RFC 6455 §5.2) and an `n`-byte payload, in the
+ *  shortest length form; the payload follows it. With a `key` it heads a masking request
+ *  for ws.wasm, `[WS_OP_MASK][head]` and then the payload still clear. */
+function wsFrame(opcode, n, key) {
+  const ext = n < 126 ? 0 : n < 65536 ? 2 : 8;
   const at = key ? 1 : 0, head = 2 + ext + (key ? 4 : 0);
-  const out = new Uint8Array(at + head + n);
+  const out = new Uint8Array(at + head);
   out[at] = 0x80 | opcode;
   out[at + 1] = (key ? 0x80 : 0) | (ext === 0 ? n : ext === 2 ? 126 : 127);
   if (ext === 2) writeU16BE(out, at + 2, n);
   else if (ext === 8) writeU32BE(out, at + 6, n);
-  out.set(payload, at + head);
   if (!key) return out;
   out[0] = WS_OP_MASK;
   out.set(key, at + head - 4);
@@ -160,9 +159,9 @@ class WsFramer {
     if (this.client) {
       // The client's GET, built with two module calls; `upgrade` awaits it.
       this.prepared = (async () => {
-        const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), await randomBytes(16)]));
+        const r = await wsCall([Uint8Array.of(WS_OP_BASE64), await randomBytes(16)]);
         this.key = utf8Decode(r);
-        this.expectAccept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
+        this.expectAccept = utf8Decode(await wsCall([Uint8Array.of(WS_OP_ACCEPT), r]));
         this.put(utf8Encode(
           "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\n" +
           "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -179,18 +178,18 @@ class WsFramer {
   /** Drop what is buffered: the link refused its peer and reads nothing more (ake.js `stall`). */
   discard() { this.parts = new Pieces(MERGE_BELOW); this.frags = []; this.fragBytes = 0; }
 
-  /** One frame, or a promise of it when ws.wasm masks it: every frame a client sends. */
-  frame(opcode, payload) {
-    if (!this.client) return wsFrame(opcode, payload, null);
+  /** Put one frame: a server's as its head and the payload, a client's once ws.wasm has
+   *  masked it. */
+  write(opcode, payload) {
+    if (!this.client) return this.put(wsFrame(opcode, payload.length, null), payload);
+    const masked = (key) => wsCall([wsFrame(opcode, payload.length, key), payload]).then((f) => this.put(f));
     const key = maskKey();
-    return key instanceof Uint8Array
-      ? wsCall(wsFrame(opcode, payload, key))
-      : key.then((k) => wsCall(wsFrame(opcode, payload, k)));
+    return key instanceof Uint8Array ? masked(key) : key.then(masked);
   }
 
   /** Frame one message and put it, in order, on the write chain. */
   enqueue(opcode, payload) {
-    return this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => this.put(f));
+    return this.writes = this.writes.then(() => this.write(opcode, payload));
   }
 
   send(msg) {
@@ -264,7 +263,7 @@ class WsFramer {
     }
     const key = headerValue(head, "sec-websocket-key");
     if (!key) throw new Error("ws: missing Sec-WebSocket-Key");
-    const accept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), utf8Encode(key)])));
+    const accept = utf8Decode(await wsCall([Uint8Array.of(WS_OP_ACCEPT), utf8Encode(key)]));
     this.put(utf8Encode(
       "HTTP/1.1 101 Switching Protocols\r\n" +
       "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -285,13 +284,10 @@ class WsFramer {
       let payload;
       if (this.client) {
         this.parts.take(h.head);
-        payload = this.parts.takeCopy(h.len);
+        payload = this.parts.take(h.len);
       } else {
-        // Taken with room for the request's op byte in front. A view of the answer is
-        // safe: each call returns a fresh buffer.
-        const req = this.parts.takeCopy(h.head + h.len, 1);
-        req[0] = WS_OP_MASK;
-        payload = (await wsCall(req)).subarray(h.head);
+        // A view of the answer is safe: each call returns a fresh buffer.
+        payload = (await wsCall([WS_MASK_OP, this.parts.take(h.head + h.len)])).subarray(h.head);
       }
       if (opcode === WS_OP_CONT) {
         if (this.fragOpcode < 0) return false;

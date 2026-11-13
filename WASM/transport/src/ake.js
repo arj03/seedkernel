@@ -52,8 +52,6 @@ const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                 // 112
 // The one suite this transport speaks, not negotiated (§12.6, §14.1).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
-const ZERO_NPUB = new Uint8Array(NPUB_LEN);
-
 // Directional session-key labels and the ratchet label: distinct, versioned, trailing NUL.
 const LABEL_REKEY = utf8Encode("seedkernel-session-rekey-v1\0");
 const LABEL_PROBE = utf8Encode("seedkernel-c-probe-v1\0");
@@ -73,39 +71,41 @@ const REJECT_AFTER_EPOCHS = 1 << 16; // ratchets per direction before the link r
 const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-oldest)
 
 // ── the seam helpers ──────────────────────────────────────────────────────────
+//
+// A call's arguments go to `host.call` as their parts, which the realm lays back to back,
+// so none of these concatenates them.
 
 /** BLAKE2b-256 over the concatenation; `crypto/blake2b` takes `[outLen][keyLen][key][msg]`. */
 const HASH_256 = new Uint8Array([32, 0]);
 function hash(...parts) {
-  return host.call(P_HASH, concatBytes([HASH_256, ...parts]));
+  return host.call(P_HASH, [HASH_256, ...parts]);
 }
 async function verify(pk, sig, msg) {
-  const r = await host.call(N_VERIFY, concatBytes([pk, sig, msg]));
+  const r = await host.call(N_VERIFY, [pk, sig, msg]);
   return r[0] === 1;
 }
 function randomBytes(n) {
   return host.call(N_RANDOM, argU32(n));
 }
-/** `[npub 12][key 32][adLen u32][ad][msg]`. This suite binds no associated data, so
- *  `adLen` stays zero. */
-function aeadArgs(key, npub, msg) {
-  const at = npub.length + key.length + 4;
-  const out = new Uint8Array(at + msg.length);
-  out.set(npub, 0); out.set(key, npub.length); out.set(msg, at);
-  return out;
+/** An AEAD call's `[npub 12][key 32][adLen u32]`, ahead of its message: the nonce from the
+ *  implicit (epoch, counter) pair, never transmitted. This suite binds no associated data,
+ *  so `adLen` stays zero. */
+function aeadHead(key, epoch, ctr) {
+  const head = new Uint8Array(NPUB_LEN + 32 + 4);
+  writeU32BE(head, 0, epoch);
+  writeU32BE(head, 8, ctr);
+  head.set(key, NPUB_LEN);
+  return head;
 }
-function aeadEnc(key, npub, msg) {
-  return host.call(P_SEAL, aeadArgs(key, npub, msg));
+function aeadEnc(key, epoch, ctr, msg) {
+  return host.call(P_SEAL, [aeadHead(key, epoch, ctr), msg]);
 }
-async function aeadDec(key, npub, ct) {
-  const r = await host.call(P_OPEN, aeadArgs(key, npub, ct));
-  return r[0] === 1 ? { ok: true, pt: r.subarray(1) } : { ok: false, pt: null };
+/** `[1][plaintext]`, or `[0]` when `ct` does not open. */
+function aeadDec(key, epoch, ctr, ct) {
+  return host.call(P_OPEN, [aeadHead(key, epoch, ctr), ct]);
 }
 async function scalarmult(sk, pk) {
-  const out = new Uint8Array(64);
-  out.set(sk, 0); out.set(pk, 32);
-  const r = await host.call(P_DH, out);
-  out.fill(0); // it held a copy of the private scalar
+  const r = await host.call(P_DH, [sk, pk]);
   return r[0] === 1 ? { ok: true, x: r.subarray(1) } : { ok: false, x: null };
 }
 /** An ephemeral X25519 pair. */
@@ -116,14 +116,12 @@ async function boxKeypair() {
   return { publicKey: r.x, privateKey: sk };
 }
 /** One call into the ML-KEM module: `[op][parts ...]` in, `take` reads the answer. The
- *  request, the inputs in `wipe` and the answer are zeroed on every path. */
+ *  inputs in `wipe` and the answer are zeroed on every path. */
 async function kemCall(op, parts, wipe, take) {
-  const req = concatBytes([Uint8Array.of(op), ...parts]);
   let r;
   try {
-    r = await host.call(N_MLKEM, req);
+    r = await host.call(N_MLKEM, [Uint8Array.of(op), ...parts]);
   } finally {
-    req.fill(0);
     for (const secret of wipe) secret.fill(0);
   }
   try {
@@ -197,13 +195,16 @@ async function netLinkOpen(dest) {
   const r = await host.call(N_LINK_OPEN, utf8Encode(dest));
   return { linkId: readU32BE(r, 0), stream: r[4] === 1 };
 }
-/** Resolves once the host has accepted the bytes. */
-function netLinkSend(linkId, bytes) { return host.call(N_LINK_SEND, args([linkId], [], bytes)); }
-/** A host link as the channel a `Link` writes to: `send(bytes)` resolves once the bytes are
- *  taken, and `close(graceful)` ends it. A link this realm runs itself (quic.js) is a
- *  channel of its own. */
+/** Resolves once the host has accepted `bytes`, then `tail` if given. */
+function netLinkSend(linkId, bytes, tail) {
+  const id = argU32(linkId);
+  return host.call(N_LINK_SEND, tail ? [id, bytes, tail] : [id, bytes]);
+}
+/** A host link as the channel a `Link` writes to: `send(bytes, tail)` writes `bytes` and
+ *  then `tail`, if given, resolving once they are taken, and `close(graceful)` ends it. A
+ *  link this realm runs itself (quic.js) is a channel of its own. */
 function hostChannel(linkId) {
-  return { send: (bytes) => netLinkSend(linkId, bytes), close: (graceful) => netLinkClose(linkId, graceful) };
+  return { send: (bytes, tail) => netLinkSend(linkId, bytes, tail), close: (graceful) => netLinkClose(linkId, graceful) };
 }
 /** Never throws out of a teardown: a close the host-call budget refuses is asked again
  *  (`callRetried`, core.js). */
@@ -215,7 +216,7 @@ function netLinkClose(linkId, graceful) {
  *  (empty for an unreachable claim or a failed handler). Do not wait on it in the same
  *  turn: the answer comes in another turn of this realm. */
 function netLinkDeliver(claim, attribution, payload) {
-  return host.call(N_LINK_DELIVER, concatBytes([Uint8Array.of(claim.length), claim, attribution, payload]));
+  return host.call(N_LINK_DELIVER, [Uint8Array.of(claim.length), claim, attribution, payload]);
 }
 
 // Proved msg1s, by the initiator's ephemeral key, so a replayed recording is refused (a
@@ -242,7 +243,7 @@ class Link {
   constructor(spec) {
     this.linkId = spec.linkId;
     this.channel = spec.channel ?? hostChannel(spec.linkId);
-    this.framer = makeFramer(spec.stream, (bytes) => this.channel.send(bytes), spec.dest, spec.listener);
+    this.framer = makeFramer(spec.stream, (bytes, tail) => this.channel.send(bytes, tail), spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
     // A splice through a relay (relay.js), rather than a path of its own to the peer.
     this.relayed = spec.relayed === true;
@@ -309,8 +310,20 @@ class Link {
     this.ee = null;
 
     // One work chain per link, so handshake steps never interleave and records keep
-    // arrival order (the record layer counts nonces).
-    this.work = Promise.resolve();
+    // arrival order (the record layer counts nonces): a step runs at once while the chain is
+    // idle and waits behind the running one otherwise (`enqueue`).
+    this.busy = false;
+    this.waiting = new Fifo();
+    this.stepDone = () => {
+      this.busy = false;
+      while (!this.busy && this.waiting.size > 0) {
+        const w = this.waiting.shift();
+        w.resolve(this.runStep(w.step, w.arg));
+      }
+    };
+    // What a framed read delivered last, for `onWire` to answer.
+    this.lastStep = undefined;
+    this.deliver = (m) => (this.lastStep = this.enqueue(this.onMessage, m));
 
     // The half-open slot before any key material, so a refusal costs no keypair.
     if (spec.limiter) {
@@ -321,9 +334,13 @@ class Link {
       }
     }
 
-    // Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
-    // contact secret (§12.6). A failed boot aborts, and the chain recovers.
-    this.work = (async () => {
+    void this.enqueue(this.boot);
+  }
+
+  /** Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
+   *  contact secret (§12.6). A failed boot aborts. */
+  async boot() {
+    try {
       this.root = await rootKey(this.networkKey);
       if (this.weDialed) {
         await this.ensureKeys();
@@ -332,15 +349,30 @@ class Link {
       } else {
         this.armDeadline(unverifiedTimeoutMs);
       }
-    })().catch(() => this.abort());
+    } catch {
+      this.abort();
+    }
   }
 
-  /** Run `fn` as the next step of the work chain. The result settles with fn's outcome;
-   *  the chain itself swallows it, so a failed step never wedges the rest. */
-  enqueue(fn) {
-    const done = this.work.then(fn);
-    this.work = done.catch(() => {});
-    return done;
+  /** Run `step` (a method of this link, given `arg`) as the next step of the work chain: at
+   *  once while the chain is idle, behind the running step otherwise. Answers what the step
+   *  answers, or a promise of its end while it runs or waits; never a rejection, so a
+   *  failed step never wedges the rest. */
+  enqueue(step, arg) {
+    if (this.busy) return new Promise((resolve) => { this.waiting.push({ step, arg, resolve }); });
+    const r = this.runStep(step, arg);
+    if (!this.busy) this.stepDone(); // what the step queued while it ran
+    return r;
+  }
+
+  /** One step, holding the chain until it ends. */
+  runStep(step, arg) {
+    this.busy = true;
+    let r;
+    try { r = step.call(this, arg); } catch { /* swallowed, as a rejection is */ }
+    if (r instanceof Promise) return r.then(this.stepDone, this.stepDone);
+    this.busy = false;
+    return r;
   }
 
   async ensureKeys() {
@@ -405,15 +437,7 @@ class Link {
       this.markTraffic();
       this.outboundQueuedSlices++;
       this.outboundQueuedBytes += frame.length;
-      return this.enqueue(async () => {
-        try {
-          if (this.closed && !this.parting) return;
-          await this.wireRecord(frame);
-        } finally {
-          this.outboundQueuedSlices--;
-          this.outboundQueuedBytes -= frame.length;
-        }
-      });
+      return this.enqueue(this.sendRecord, frame);
     }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
@@ -447,23 +471,26 @@ class Link {
     this.closedLocally = true;
     if (defensive) this.aborted = true;
     this.severWire();
-    void this.enqueue(async () => {
-      let saidGoodbye = false;
-      // Read again behind the records before it: a failure meanwhile ends the parting, and
-      // those records may have used the last epoch.
-      if (this.parting && this.authed && (this.plain || this.sendKey) && this.sendEpoch < REJECT_AFTER_EPOCHS) {
-        try {
-          await this.wire(await this.seal(EMPTY));
-          // A codec with its own end-of-stream signal sends it too.
-          if (this.framer && this.framer.goodbye) await this.framer.goodbye();
-          saidGoodbye = true;
-        } catch { /* the channel is already gone */ }
-      }
-      this.teardown();
-      // Graceful only after a goodbye, so the close flushes it.
-      this.channel.close(saidGoodbye);
-    });
     this.onClose(this);
+    void this.enqueue(this.part);
+  }
+
+  /** `end`'s step, behind the records handed to the link before it. */
+  async part() {
+    let saidGoodbye = false;
+    // Read again behind the records before it: a failure meanwhile ends the parting, and
+    // those records may have used the last epoch.
+    if (this.parting && this.authed && (this.plain || this.sendKey) && this.sendEpoch < REJECT_AFTER_EPOCHS) {
+      try {
+        await this.wire(await this.seal(EMPTY));
+        // A codec with its own end-of-stream signal sends it too.
+        if (this.framer && this.framer.goodbye) await this.framer.goodbye();
+        saidGoodbye = true;
+      } catch { /* the channel is already gone */ }
+    }
+    this.teardown();
+    // Graceful only after a goodbye, so the close flushes it.
+    this.channel.close(saidGoodbye);
   }
 
   /** A deliberate local shutdown, and the only path that says goodbye. */
@@ -509,7 +536,11 @@ class Link {
   onHandshake(m) {
     if (this.closed || this.stalled) return;
     if (m.length > MAX_HANDSHAKE_FRAME_BYTES) { this.refuse(); return; }
-    void this.enqueue(() => (this.authed ? this.refuse() : this.onMessage(m)));
+    void this.enqueue(this.handshakeStep, m);
+  }
+
+  handshakeStep(m) {
+    return this.authed ? this.refuse() : this.onMessage(m);
   }
 
   /** That channel's handshake secrets, from the second message on, under which it carries
@@ -523,54 +554,48 @@ class Link {
     r2i.fill(0);
   }
 
-  /** Seal one record and put it on the wire, failing the link if that fails (§12.6). */
-  async wireRecord(frame) {
+  /** Seal a record `send` took and put it on the wire, unless the link closed without
+   *  parting meanwhile, failing the link if that fails (§12.6). */
+  async sendRecord(frame) {
     try {
-      await this.wire(await this.seal(frame));
+      if (!this.closed || this.parting) await this.wire(await this.seal(frame));
     } catch {
       this.abort();
+    } finally {
+      this.outboundQueuedSlices--;
+      this.outboundQueuedBytes -= frame.length;
     }
   }
 
-  /** Inbound bytes, decoded on the work chain. Answers once this read is decoded, not
-   *  once any request it carried is answered. */
+  /** Inbound bytes, decoded on the work chain. Answers once this read is decoded (a
+   *  promise only while that waits on something), not once any request it carried is
+   *  answered. */
   onWire(bytes) {
     // A stall is terminal: later reads are dropped unparsed.
-    if (this.closed || this.stalled) return Promise.resolve();
+    if (this.closed || this.stalled) return;
     if (!this.framer) {
       // Platform-framed links get the same two-stage cap.
-      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.refuse(); return Promise.resolve(); }
-      return this.enqueue(() => this.onMessage(bytes));
+      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.refuse(); return; }
+      return this.enqueue(this.onMessage, bytes);
     }
     // Steps settle in order and never reject, so the read is done when the last one is.
-    let last;
-    const deliver = (m) => (last = this.enqueue(() => this.onMessage(m)));
-    try {
-      const ok = this.framer.push(bytes, deliver);
-      return Promise.resolve(ok).then(
-        (good) => {
-          if (!good) { this.refuse(); return; }
-          return last;
-        },
-        () => { this.refuse(); },
-      );
-    } catch {
-      this.refuse();
-      return Promise.resolve();
-    }
+    this.lastStep = undefined;
+    let ok;
+    try { ok = this.framer.push(bytes, this.deliver); } catch { this.refuse(); return; }
+    if (ok === true) return this.lastStep;
+    if (ok === false) { this.refuse(); return; }
+    return ok.then((good) => (good ? this.lastStep : this.refuse()), () => this.refuse());
   }
 
   /** Route one whole link message. It carries no type: this end's role and progress pick
    *  the handler, which checks the exact width (§12.6). */
   onMessage(m) {
     // Frames queued behind a refusal are dropped here.
-    if (this.closed || this.stalled) return Promise.resolve();
-    const step = this.authed
-      ? this.onRecord(m)
-      : this.weDialed
-        ? this.onMsg2(m)
-        : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
-    return Promise.resolve(step).catch(() => { this.refuse(); });
+    if (this.closed || this.stalled) return;
+    // A record answers its own failures.
+    if (this.authed) return this.onRecord(m);
+    const step = this.weDialed ? this.onMsg2(m) : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
+    return step.catch(() => { this.refuse(); });
   }
 
   /** The peer sent something unacceptable: abort once authenticated, stall before
@@ -608,7 +633,11 @@ class Link {
     this.onAuth(this.peerId, this);
     // The tie-break may have closed this link, handing its queue to the winner.
     if (this.closed) return;
-    for (const frame of this.takeQueued()) await this.wireRecord(frame);
+    for (const frame of this.takeQueued()) {
+      this.outboundQueuedSlices++;
+      this.outboundQueuedBytes += frame.length;
+      await this.sendRecord(frame);
+    }
   }
 
   // ── the concealed-identity handshake (suite 0x03, §12.6) ────────────────────
@@ -619,12 +648,15 @@ class Link {
   }
 
   async sealZero(key, plain) {
-    const ct = await aeadEnc(key, ZERO_NPUB, plain);
+    const ct = await aeadEnc(key, 0, 0, plain);
     key.fill(0);
     return ct;
   }
   async openZero(key, ct) {
-    try { return await aeadDec(key, ZERO_NPUB, ct); }
+    try {
+      const r = await aeadDec(key, 0, 0, ct);
+      return r[0] === 1 ? { ok: true, pt: r.subarray(1) } : { ok: false, pt: null };
+    }
     finally { key.fill(0); }
   }
 
@@ -793,50 +825,58 @@ class Link {
     if (this.kemSecret) { this.kemSecret.fill(0); this.kemSecret = null; }
   }
 
-  /** A 12-byte nonce from the implicit (epoch, counter) pair, never transmitted. */
-  nonce(epoch, ctr) {
-    const n = new Uint8Array(NPUB_LEN);
-    writeU32BE(n, 0, epoch);
-    writeU32BE(n, 8, ctr);
-    return n;
-  }
-
   async ratchet(k) {
     const next = await hash(k, LABEL_REKEY);
     k.fill(0);
     return next;
   }
 
-  async seal(frame) {
+  /** One record under the send key, which ratchets once `rekeyAfterFrames` have used it. */
+  seal(frame) {
     if (this.plain) return frame;
-    const ct = await aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
-    if (++this.sendCtr >= this.rekeyAfterFrames) {
-      this.sendKey = await this.ratchet(this.sendKey);
-      this.sendEpoch++;
-      this.sendCtr = 0;
-    }
-    return ct;
+    const ct = aeadEnc(this.sendKey, this.sendEpoch, this.sendCtr, frame);
+    return ++this.sendCtr < this.rekeyAfterFrames ? ct : this.rekeySend(ct);
+  }
+
+  async rekeySend(ct) {
+    const sealed = await ct;
+    this.sendKey = await this.ratchet(this.sendKey);
+    this.sendEpoch++;
+    this.sendCtr = 0;
+    return sealed;
   }
 
   /** An authenticated record. Unlike the handshake it aborts on anything wrong, since
    *  concealment protects against strangers, not a proven peer. */
-  async onRecord(body) {
-    let pt = body;
+  onRecord(body) {
     if (this.plain) {
       if (body.length > maxFrameBytes) { this.abort(true); return; }
-    } else {
-      if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
-      if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
-      const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
-      if (!r.ok) { this.abort(true); return; }
-      pt = r.pt;
+      try { this.received(body); } catch { this.abort(true); }
+      return;
+    }
+    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
+    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
+    return this.openRecord(body);
+  }
+
+  async openRecord(body) {
+    try {
+      const r = await aeadDec(this.recvKey, this.recvEpoch, this.recvCtr, body);
+      if (r[0] !== 1) { this.abort(true); return; }
       // Advance only on success.
       if (++this.recvCtr >= this.rekeyAfterFrames) {
         this.recvKey = await this.ratchet(this.recvKey);
         this.recvEpoch++;
         this.recvCtr = 0;
       }
+      this.received(r.subarray(1));
+    } catch {
+      this.abort(true);
     }
+  }
+
+  /** A record's plaintext. */
+  received(pt) {
     this.markTraffic();
     // The reserved empty record: an authenticated end-of-stream.
     if (pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }

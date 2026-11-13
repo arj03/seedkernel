@@ -89,7 +89,7 @@ class QuicPath {
     head.set(seed, 14);
     writeU32BE(head, 46, socket);
     this.busy = true;
-    this.opened = this.call(concatBytes([head, remote, key])).then((r) => {
+    this.opened = this.call([head, remote, key]).then((r) => {
       this.busy = false;
       if (!r || r[0] !== 1) { this.fail(); return; }
       this.kick();
@@ -123,17 +123,18 @@ class QuicPath {
 
   // ── the channel ──
 
-  send(bytes) {
+  /** `bytes`, then `tail` if given (ake.js `hostChannel`). */
+  send(bytes, tail) {
     if (this.gone || this.closing) throw new Error("udp: link is closed");
-    if (this.unsent.bytes + bytes.length > MAX_BUFFERED) throw new Error("udp: outbound limit exceeded");
-    if (bytes.length === 0) return SENT;
+    if (this.unsent.bytes + bytes.length + (tail ? tail.length : 0) > MAX_BUFFERED) throw new Error("udp: outbound limit exceeded");
     this.unsent.push(bytes);
+    if (tail) this.unsent.push(tail);
     this.kick();
     return SENT;
   }
 
-  /** The link that reads the streams: `read(bytes)` answers a promise of having decoded
-   *  them, and nothing more is handed over until it settles. */
+  /** The link that reads the streams: `read(bytes)` decodes them, answering a promise when
+   *  it has not finished, and nothing more is handed over until it settles. */
   reader(read) {
     this.read = read;
     this.kick();
@@ -227,7 +228,7 @@ class QuicPath {
 
   /** `[Q_TURN][id u32][now f64][flags][read max u32]([handshake secrets 64])
    *  ([session keys 64])[n u8]([len u32][message])*[write len u32][write]` and the
-   *  batches that came, `[len u32][batch]` each, in one buffer. */
+   *  batches that came, `[len u32][batch]` each, as the parts of one call. */
   input(flags) {
     const hsKeys = flags & QF_HS_KEYS ? this.hsKeys : EMPTY;
     const keys = flags & QF_KEYS ? this.keySet : EMPTY;
@@ -244,36 +245,24 @@ class QuicPath {
     while (take < this.inbound.length && (take === 0 || bytes + 4 + this.inbound[take].length <= MAX_IN)) {
       bytes += 4 + this.inbound[take++].length;
     }
-    let hs = 1;
-    for (const m of msgs) hs += 4 + m.length;
-    const at = HEAD_IN + hsKeys.length + keys.length;
-    const out = new Uint8Array(at + hs + 4 + write + bytes);
-    out[0] = Q_TURN;
-    writeU32BE(out, 1, this.id);
-    new DataView(out.buffer).setFloat64(5, now());
-    out[13] = flags;
-    writeU32BE(out, 14, this.read && !this.reading ? MAX_READ : 0);
-    out.set(hsKeys, HEAD_IN);
-    out.set(keys, HEAD_IN + hsKeys.length);
-    let o = at;
-    out[o++] = msgs.length;
-    for (const m of msgs) {
-      writeU32BE(out, o, m.length);
-      out.set(m, o + 4);
-      o += 4 + m.length;
-    }
-    writeU32BE(out, o, write);
-    if (write > 0) out.set(this.unsent.peek(write), o + 4);
-    o += 4 + write;
-    for (let i = 0; i < take; i++) {
-      const batch = this.inbound[i];
-      writeU32BE(out, o, batch.length);
-      out.set(batch, o + 4);
-      o += 4 + batch.length;
-    }
+    const head = new Uint8Array(HEAD_IN + 1);
+    head[0] = Q_TURN;
+    writeU32BE(head, 1, this.id);
+    new DataView(head.buffer).setFloat64(5, now());
+    head[13] = flags;
+    writeU32BE(head, 14, this.read && !this.reading ? MAX_READ : 0);
+    head[HEAD_IN] = msgs.length;
+    // The keys sit between the head and the count.
+    const parts = hsKeys.length + keys.length > 0
+      ? [head.subarray(0, HEAD_IN), hsKeys, keys, head.subarray(HEAD_IN)]
+      : [head];
+    for (const m of msgs) parts.push(argU32(m.length), m);
+    parts.push(argU32(write));
+    if (write > 0) this.unsent.views(write, parts);
+    for (let i = 0; i < take; i++) parts.push(argU32(this.inbound[i].length), this.inbound[i]);
     this.inbound.splice(0, take);
     if (this.inbound.length > 0) this.again = true;
-    return out;
+    return parts;
   }
 
   /** `[events][accepted u32][due f64][read len u32][handshake len u32][ids u8][read]
@@ -310,7 +299,10 @@ class QuicPath {
     this.readMore = (events & QE_MORE) !== 0;
     if (readLen > 0 && this.read && !this.gone) {
       this.reading = true;
-      this.read(r.subarray(at, at + readLen)).then(this.readDone, this.readDone);
+      // A promise only while the link is still decoding.
+      const decoding = this.read(r.subarray(at, at + readLen));
+      if (decoding) decoding.then(this.readDone, this.readDone);
+      else this.readDone();
     } else if (this.readMore && this.read && !this.reading) {
       // Asked while the link was still decoding, which it has since finished.
       this.again = true;

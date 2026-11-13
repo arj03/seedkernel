@@ -14,13 +14,18 @@ export const REALM_DISPOSED = "guest realm disposed";
 export const HOST_CALL_SPENT = "guest: handoff deadline exhausted before host.call";
 export const HOST_CALL_LATE = "guest: host.call handoff deadline exceeded";
 
-/** One entrypoint invocation. Settling `result` releases the realm. A `deferred` one
- *  released the realm when its synchronous part ended and answers later under the same
- *  deadline. */
+/** Who an invocation answers, once: called as methods, so one record can be both the queue
+ *  entry and its answer. */
+export interface Answer {
+  resolve(value: Uint8Array): void;
+  reject(reason: unknown): void;
+}
+
+/** One entrypoint invocation. Answering releases the realm. A `deferred` one released the
+ *  realm when its synchronous part ended and answers later under the same deadline. */
 export interface Invocation {
-  result: Promise<Uint8Array>;
   deferred?: boolean;
-  /** The deadline passed: drop settlement state and reject `result` with `reason`. */
+  /** The deadline passed: drop settlement state and reject the answer with `reason`. */
   cancel(reason: Error): void;
 }
 
@@ -194,20 +199,26 @@ export function settleByDeadline(deadlines: { add(d: Deadline): void; drop(d: De
 /** Serialize realm entry under one deadline that starts at admission and covers queue
  *  wait, execution and a deferred answer. With `ownTurns`, the deadline covers wait and
  *  answer while the turn itself runs on the realm's own ceiling. Payloads are borrowed
- *  from bounded upstream owners, so the queue needs no depth cap of its own. */
+ *  from bounded upstream owners, so the queue needs no depth cap of its own.
+ *
+ *  An idle realm is entered at admission, unless `inside` says a realm is running right now
+ *  (this admission is a host call one made): entering then would nest in that frame and
+ *  charge its clock, so the entry waits for a fresh turn, as it does behind another. */
 export function serializeCalls(
   deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
-  invoke: (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock) => Invocation,
+  invoke: (payload: Uint8Array, deadlineMs: number, causalClock: CausalClock | undefined, answer: Answer) => Invocation,
   notReady: () => Error | null,
   defaultDeadlineMs: number,
   ownTurns = false,
+  inside: () => boolean = () => false,
 ): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";
-  interface Entry extends Deadline {
+  /** The queue record, and the invocation's answer (`resolve`/`reject`). */
+  interface Entry extends Deadline, Answer {
     payload: Uint8Array;
     causalClock?: CausalClock;
-    resolve(value: Uint8Array): void;
-    reject(reason: unknown): void;
+    pass(value: Uint8Array): void;
+    fail(reason: unknown): void;
     invocation?: Invocation;
     settled: boolean;
   }
@@ -225,8 +236,8 @@ export function serializeCalls(
     entry.settled = true;
     entry.payload = EMPTY;
     deadlines.drop(entry);
-    if (ok) entry.resolve(value as Uint8Array);
-    else entry.reject(value);
+    if (ok) entry.pass(value as Uint8Array);
+    else entry.fail(value);
   };
   /** Give the realm to whoever is next, on a fresh turn. */
   const pump = (): void => {
@@ -241,15 +252,25 @@ export function serializeCalls(
     running = undefined;
     pump();
   };
-  /** Shared by every entry, so admission allocates only the record. `this` is the entry. */
+  // Shared by every entry, so admission allocates only the record. `this` is the entry.
   function expire(this: Entry): void {
     const err = new Error(LATE);
     finish(this, false, err);
     this.invocation?.cancel(err);
     release(this);
   }
+  function resolve(this: Entry, value: Uint8Array): void {
+    finish(this, true, value);
+    release(this);
+  }
+  function reject(this: Entry, reason: unknown): void {
+    finish(this, false, reason);
+    release(this);
+  }
+  /** Enter entries until one holds the realm. Holds `pumping`, so an answer reported
+   *  inside lets this loop go on rather than scheduling a turn. */
   const enterNext = (): void => {
-    pumping = false;
+    pumping = true;
     while (running === undefined && waiting.size > 0) {
       const entry = waiting.shift() as Entry;
       if (entry.settled) continue;              // expired while queued
@@ -261,13 +282,11 @@ export function serializeCalls(
       running = entry;
       try {
         entry.invocation = invoke(entry.payload,
-          ownTurns ? defaultDeadlineMs : entry.at === Infinity ? Infinity : entry.at - now, entry.causalClock);
+          ownTurns ? defaultDeadlineMs : entry.at === Infinity ? Infinity : entry.at - now, entry.causalClock, entry);
       } catch (thrown) { running = undefined; finish(entry, false, thrown); continue; }
-      entry.invocation.result.then(
-        (value) => { finish(entry, true, value); release(entry); },
-        (thrown: unknown) => { finish(entry, false, thrown); release(entry); });
-      if (entry.invocation.deferred) void settled.then(() => release(entry));
+      if (entry.invocation.deferred && running === entry) running = undefined;
     }
+    pumping = false;
   };
 
   return (payload, suppliedDeadlineMs, causalClock) => {
@@ -278,14 +297,14 @@ export function serializeCalls(
     // A callee may tighten its ceiling, never mint time for the caller.
     try { at = deadlineAt(Math.min(suppliedDeadlineMs ?? defaultDeadlineMs, defaultDeadlineMs)); }
     catch (err) { return Promise.reject(err); }
-    return new Promise<Uint8Array>((resolve, reject) => {
-      const entry: Entry = { at, payload, causalClock, resolve, reject, settled: false, expire };
+    return new Promise<Uint8Array>((pass, fail) => {
+      const entry: Entry = { at, payload, causalClock, pass, fail, settled: false, expire, resolve, reject };
       if (at !== Infinity) deadlines.add(entry);
       // `add` may already have expired it; if so, do not queue it.
-      if (!entry.settled) {
-        waiting.push(entry);
-        pump();
-      }
+      if (entry.settled) return;
+      waiting.push(entry);
+      if (running === undefined && !pumping && !inside()) enterNext();
+      else pump();
     });
   };
 }

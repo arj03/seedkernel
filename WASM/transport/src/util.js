@@ -195,24 +195,29 @@ class Pieces {
   }
 
   /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
-   *  copy across pieces. */
-  take(n) { return this.consume(n, undefined, 0); }
-
-  /** The next `n` bytes as a buffer the caller owns, with `prefix` free bytes in front for
-   *  it to fill. A framer's frames take this, since the pieces it was handed are borrowed. */
-  takeCopy(n, prefix = 0) { return this.consume(n, new Uint8Array(prefix + n), prefix); }
-
-  consume(n, out, prefix) {
+   *  copy across pieces. A piece is never written once pushed, so a view stays good. */
+  take(n) {
     this.bytes -= n;
+    let out;
     for (let got = 0; got < n;) {
       const piece = this.list[this.head], k = Math.min(piece.length - this.at, n - got);
-      if (k === n && out === undefined) out = piece.subarray(this.at, this.at + k);
-      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), prefix + got);
+      if (k === n) out = piece.subarray(this.at, this.at + k);
+      else (out ??= new Uint8Array(n)).set(piece.subarray(this.at, this.at + k), got);
       got += k;
       this.at += k;
       if (this.at === piece.length) this.shift();
     }
     return out;
+  }
+
+  /** The first `n` bytes, of the `bytes` there are, pushed onto `parts` as views of their
+   *  pieces without consuming them. */
+  views(n, parts) {
+    for (let i = this.head, from = this.at; n > 0; i++, from = 0) {
+      const p = this.list[i], k = Math.min(p.length - from, n);
+      parts.push(from === 0 && k === p.length ? p : p.subarray(from, from + k));
+      n -= k;
+    }
   }
 }
 

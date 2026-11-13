@@ -175,24 +175,16 @@ globalThis.__settleHostCall = (callId, ok, v) => {
   if (ok) p.resolve(new Uint8Array(v));
   else p.reject(new Error(v));
 };
-// Bytes as the plain ArrayBuffer the realm reads (realm.c), copied only when a view covers
-// part of its buffer.
-function ab(bytes, refusal) {
-  if (bytes instanceof ArrayBuffer) return bytes;
-  if (bytes instanceof Uint8Array) {
-    return (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer;
-  }
-  throw new Error(refusal);
-}
 globalThis.host = {
-  // Every name answers a Promise. A refused name throws here, at the call site.
+  // Every name answers a Promise. A refused name throws here, at the call site. bytes is
+  // a Uint8Array or ArrayBuffer, or an array of them sent back to back (realm.c).
   call(name, bytes) {
     const callId = ++callSeq;
     // The host answers in this frame when it already has the answer: with the bytes, or
     // with why they could not be handed over, which rejects. Otherwise it parks the call
     // and settles it on a later turn. Called before the table entry exists, so an answer
     // or a synchronous refusal leaves nothing to clean up.
-    const now = hostCall(name, callId, ab(bytes, "guest: host.call takes Uint8Array | ArrayBuffer"));
+    const now = hostCall(name, callId, bytes);
     if (typeof now === "string") return Promise.reject(new Error(now));
     if (now !== null && now !== undefined) return Promise.resolve(new Uint8Array(now));
     const parked = Promise.withResolvers();
@@ -203,7 +195,6 @@ globalThis.host = {
 // Set by a guest whose answer will arrive in a later invocation of this realm, so the
 // queue frees the realm at the end of the synchronous part (realm-queue.ts).
 globalThis.__deferred = false;
-const norm = (out) => ab(out, "guest: entrypoint must return Uint8Array | ArrayBuffer");
 const fail = (id, e) => callFail(id, String(e && e.message || e));
 // Run handle for one invocation and report its answer as bytes, so no guest promise
 // reaches the host. Returns 1 when the invocation deferred.
@@ -214,10 +205,10 @@ globalThis.__start = (id, argBuf) => {
     if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
     const out = globalThis.handle(new Uint8Array(argBuf));
     if (out && typeof out.then === "function") {
-      out.then((v) => { try { callDone(id, norm(v)); } catch (e) { fail(id, e); } },
+      out.then((v) => { try { callDone(id, v); } catch (e) { fail(id, e); } },
         (e) => fail(id, e));
     } else {
-      callDone(id, norm(out));
+      callDone(id, out);
     }
   } catch (e) {
     fail(id, e);

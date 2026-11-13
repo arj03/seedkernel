@@ -44,6 +44,32 @@ type Runtime struct {
 	// nothing. Calls nest (JS→Go→JS→Go), so each depth in flight has its own.
 	goArgs  [][]Value
 	goDepth int
+
+	// A Go→JS call's argument vector in wasm memory (Invoke), per depth and kept: the callee
+	// reads its arguments in place for as long as it runs, so a nested call takes the next.
+	argv        []argvBuf
+	invokeDepth int
+}
+
+type argvBuf struct {
+	ptr uint64
+	n   int
+}
+
+// argvAt answers depth d's argument vector, grown to hold n arguments.
+func (r *Runtime) argvAt(d, n int) uint64 {
+	if d == len(r.argv) {
+		r.argv = append(r.argv, argvBuf{})
+	}
+	b := &r.argv[d]
+	if b.n < n {
+		if b.ptr != 0 {
+			r.freeAt(b.ptr)
+		}
+		b.n = max(n, 8)
+		b.ptr = r.mallocN(8 * b.n)
+	}
+	return b.ptr
 }
 
 // fnPool is one export's free list of resolved instances, held by pointer so an engine

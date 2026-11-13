@@ -218,55 +218,118 @@ static JSValue throw_message(JSContext *c, const char *msg, size_t len)
     return JS_Throw(c, err);
 }
 
+/* The bytes of a byte argument, an ArrayBuffer or a Uint8Array's window on one, in place.
+   NULL with an exception for anything else, and may be NULL without one for no bytes.
+   Runs no guest code. */
+static uint8_t *bytes_of(JSContext *c, JSValueConst v, size_t *len)
+{
+    *len = 0;
+    if (JS_IsArrayBuffer(v))
+        return JS_GetArrayBuffer(c, len, v);
+    return JS_GetUint8Array(c, len, v);
+}
+
+static JSValue not_bytes(JSContext *c)
+{
+    static const char msg[] = "guest: host.call takes Uint8Array | ArrayBuffer, or an array of them";
+    if (JS_HasException(c))
+        JS_FreeValue(c, JS_GetException(c));
+    return throw_message(c, msg, sizeof msg - 1);
+}
+
+/* host.call(name, id, bytes): the payload is one byte argument or an array of them, which
+   lands in the exchange buffer back to back, so a guest never concatenates its arguments. */
 static JSValue host_call(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     (void)this_val;
     (void)argc;
     double id;
-    size_t name_len, payload_len;
+    size_t name_len, len;
     if (JS_ToFloat64(c, &id, argv[1]) < 0)
         return JS_EXCEPTION;
-    uint8_t *payload = JS_GetArrayBuffer(c, &payload_len, argv[2]);
-    if (!payload && JS_HasException(c))
+    const char *name = JS_ToCStringLen(c, &name_len, argv[0]);
+    if (!name)
         return JS_EXCEPTION;
+    /* Every part is taken before any window is read: taking one can run guest code, which
+       could move the bytes of a window already read. */
+    JSValue one = argv[2];
+    JSValue *parts = &one;
+    int64_t n = 1;
+    JSValue v = JS_EXCEPTION;
+    if (JS_IsArray(argv[2])) {
+        if (JS_GetLength(c, argv[2], &n) < 0 || !(parts = js_malloc(c, sizeof *parts * (size_t)(n > 0 ? n : 1)))) {
+            n = 0;
+            goto out;
+        }
+        for (int64_t k = 0; k < n; k++) {
+            parts[k] = JS_GetPropertyInt64(c, argv[2], k);
+            if (JS_IsException(parts[k])) {
+                n = k;
+                goto out;
+            }
+        }
+    }
+    /* Summed wide and clamped, so the same window passed many times cannot wrap it. */
+    uint64_t total = 0;
+    for (int64_t k = 0; k < n; k++) {
+        if (!bytes_of(c, parts[k], &len) && JS_HasException(c)) {
+            v = not_bytes(c);
+            goto out;
+        }
+        total += len;
+    }
+    size_t payload_len = total > max_bytes ? max_bytes + 1 : (size_t)total;
     /* Admitted before the payload leaves the guest heap. */
     const char *refused = admit(id, payload_len);
-    if (refused)
-        return throw_message(c, refused, strlen(refused));
+    if (refused) {
+        v = throw_message(c, refused, strlen(refused));
+        goto out;
+    }
     int i = call_count - 1;
-    const char *name = JS_ToCStringLen(c, &name_len, argv[0]);
-    if (!name || !R_Buf((int32_t)(name_len + payload_len))) {
+    if (!R_Buf((int32_t)(name_len + payload_len))) {
         release(i);
-        if (name)
-            JS_FreeCString(c, name);
-        return name ? JS_ThrowOutOfMemory(c) : JS_EXCEPTION;
+        v = JS_ThrowOutOfMemory(c);
+        goto out;
     }
     int ascii = 1;
     for (size_t k = 0; k < name_len; k++)
         ascii &= (unsigned char)name[k] < 0x80;
     memcpy(xbuf, name, name_len);
-    memcpy(xbuf + name_len, payload, payload_len);
-    JS_FreeCString(c, name);
+    size_t at = name_len;
+    for (int64_t k = 0; k < n; k++) {
+        uint8_t *p = bytes_of(c, parts[k], &len);
+        if (len)
+            memcpy(xbuf + at, p, len);
+        at += len;
+    }
     int64_t left = QJS_DeadlineLeft();
     int32_t r = realm_host_call(id, left < 0 ? -1.0 : (double)left / 1e6, xbuf,
                                 ascii ? (int32_t)name_len : -(int32_t)name_len, (int32_t)payload_len);
-    size_t len = (size_t)((uint32_t)r >> 2);
+    size_t answer_len = (size_t)((uint32_t)r >> 2);
     int kind = r & 3;
-    if (kind == ANSWER_PARKED)
-        return JS_NULL;
+    if (kind == ANSWER_PARKED) {
+        v = JS_NULL;
+        goto out;
+    }
     /* The import cannot have settled this call, so it is still in the ledger. */
     i = find_call(id);
-    JSValue v;
     if (kind == ANSWER_BYTES) {
         /* Charged while it is copied in; a refused copy rejects with the reason. */
-        refused = reserve(i, len);
-        v = refused ? JS_NewString(c, refused) : JS_NewArrayBufferCopy(c, xbuf, len);
+        refused = reserve(i, answer_len);
+        v = refused ? JS_NewString(c, refused) : JS_NewArrayBufferCopy(c, xbuf, answer_len);
     } else if (kind == ANSWER_REJECT) {
-        v = JS_NewStringLen(c, (const char *)xbuf, len);
+        v = JS_NewStringLen(c, (const char *)xbuf, answer_len);
     } else {
-        v = throw_message(c, (const char *)xbuf, len);
+        v = throw_message(c, (const char *)xbuf, answer_len);
     }
     release(i);
+out:
+    if (parts != &one) {
+        for (int64_t k = 0; k < n; k++)
+            JS_FreeValue(c, parts[k]);
+        js_free(c, parts);
+    }
+    JS_FreeCString(c, name);
     return v;
 }
 
@@ -278,7 +341,7 @@ static JSValue call_done(JSContext *c, JSValueConst this_val, int argc, JSValueC
     size_t len;
     if (JS_ToFloat64(c, &id, argv[0]) < 0)
         return JS_EXCEPTION;
-    uint8_t *bytes = JS_GetArrayBuffer(c, &len, argv[1]);
+    uint8_t *bytes = bytes_of(c, argv[1], &len);
     if (!bytes && JS_HasException(c)) {
         JS_FreeValue(c, JS_GetException(c));
         static const char msg[] = "guest: entrypoint result is not bytes";

@@ -470,6 +470,23 @@ async function testSafeJs() {
     assertEqual([...again], [11], "realm is reusable across calls");
     realm.dispose();
   }
+  {
+    // A call's payload may come as parts, laid back to back; a view is read in place.
+    const seen = [];
+    const src = `
+      function handle(a) {
+        if (a[0] === 1) return host.call("echo", [a.subarray(1, 3), new Uint8Array(0), a.buffer, a.subarray(4)]);
+        try { host.call("echo", [a, 5]); } catch (e) { return Uint8Array.from(e.message, (c) => c.charCodeAt(0)); }
+        return new Uint8Array([0]);
+      }
+    `;
+    const realm = await createWebRealm({ source: src, hostCall: (name, payload) => { seen.push(payload.slice()); return payload.slice(0, 1); } });
+    await realm.call(new Uint8Array([1, 7, 8, 9, 6]));
+    assertEqual([...seen[0]], [7, 8, 1, 7, 8, 9, 6, 6], "host.call sends an array's parts back to back");
+    const refused = new TextDecoder().decode(await realm.call(new Uint8Array([2])));
+    assert(refused.includes("host.call takes") && seen.length === 1, `a part that is not bytes is refused at the call site, before the host (got: ${refused})`);
+    realm.dispose();
+  }
 
   // 3. Control flow runs as ordinary async guest JS, including a concurrent fan-out with
   //    the guest's own Promise.all, which real promises at the seam make possible.

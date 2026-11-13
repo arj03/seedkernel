@@ -264,24 +264,19 @@ func (c *Context) throwError(err error) uint64 {
 
 // Invoke calls fn with the given this and args, returning its result or a JS error.
 func (c *Context) Invoke(fn, this Value, args ...Value) (Value, error) {
-	argc, argvPtr := c.marshalArgs(args)
-	if argvPtr != 0 {
-		defer c.rt.freeAt(argvPtr)
+	r := c.rt
+	var argv uint64
+	if len(args) > 0 {
+		d := r.invokeDepth
+		r.invokeDepth++
+		defer func() { r.invokeDepth = d }()
+		argv = r.argvAt(d, len(args))
+		for i, a := range args {
+			r.mem.WriteUint64Le(uint32(argv)+uint32(i*8), a.raw)
+		}
 	}
-	res := c.callV("QJS_Call", c.handle, fn.raw, this.raw, argc, argvPtr)
+	res := c.callV("QJS_Call", c.handle, fn.raw, this.raw, uint64(len(args)), argv)
 	return c.normalize(res)
-}
-
-// marshalArgs writes the args contiguously into wasm memory.
-func (c *Context) marshalArgs(args []Value) (uint64, uint64) {
-	if len(args) == 0 {
-		return 0, 0
-	}
-	ptr := c.rt.mallocN(8 * len(args))
-	for i, a := range args {
-		c.rt.mem.WriteUint64Le(uint32(ptr)+uint32(i*8), a.raw)
-	}
-	return uint64(len(args)), ptr
 }
 
 // normalize converts a pending exception into a Go error. A returned Error value is data,

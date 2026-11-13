@@ -60,7 +60,10 @@ export function wsBase64(bytes) {
 
 /** Encode one frame. `mask` is 4 bytes for a client frame, null for a server one. */
 export function encodeFrame(opcode, payload, mask) {
-  const f = wsFrame(opcode, payload, mask);
+  const head = wsFrame(opcode, payload.length, mask);
+  const f = new Uint8Array(head.length + payload.length);
+  f.set(head);
+  f.set(payload, head.length);
   if (!mask) return f;
   const out = call(f);
   if (out.length === 0) throw new Error("ws: masking failed");

@@ -19,8 +19,12 @@ import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
   CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline,
   HOST_CALL_LATE, REALM_DISPOSED,
-  type CausalClock, type Invocation, type RealmFactory,
+  type Answer, type CausalClock, type Invocation, type RealmFactory,
 } from "./realm-queue.js";
+
+/** Realm entries running on this host, across every realm: an admission made inside one
+ *  waits for a fresh turn (`serializeCalls`). */
+let entered = 0;
 
 /** One instance from the platform's engine table. Numbers cross as JS numbers (the table
  *  carries i32 and f64, never i64), bytes through linear memory. A call that traps throws,
@@ -75,7 +79,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
 
     // Callers awaiting an invocation's answer (§12.3), by invocation id. Removed on
     // settlement, so a late report finds nothing.
-    const invocations = new Map<number, { resolve(bytes: Uint8Array): void; reject(err: Error): void }>();
+    const invocations = new Map<number, Answer>();
     let invocationSeq = 0;
     const takeInvocation = (id: number) => {
       const invocation = invocations.get(id);
@@ -123,9 +127,11 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
       const start = monotonicMs();
       const left = Math.min(budget.budgetMs - budget.consumedMs, budget.wallDeadline - start);
       let r: number;
+      entered++;
       try {
         r = entry(left === Infinity ? 0 : Math.max(1, Math.floor(left * 1e6)));
       } finally {
+        entered--;
         const elapsed = monotonicMs() - start;
         budget.consumedMs += elapsed;
         causalClock?.charge(elapsed);
@@ -246,11 +252,11 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
 
     /** One invocation, once the queue has given it the realm. Not `async`, because the
      *  queue needs the `Invocation` when the synchronous part ends, before the answer exists. */
-    const invoke = (payload: Uint8Array, deadlineMs: number, causalClock?: CausalClock): Invocation => {
+    const invoke = (payload: Uint8Array, deadlineMs: number, causalClock: CausalClock | undefined,
+      answer: Answer): Invocation => {
       // Kept through every host-call settlement; a later entry gets its own.
       const budget = create(deadlineMs);
       const id = ++invocationSeq;
-      const answer = Promise.withResolvers<Uint8Array>();
       invocations.set(id, answer);
       const fail = (err: Error): boolean => {
         const invocation = takeInvocation(id);
@@ -270,12 +276,12 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
           fail(err instanceof Error ? err : new Error(String(err)));
         }
       });
-      return { result: answer.promise, deferred, cancel: fail };
+      return { deferred, cancel: fail };
     };
 
     return {
       call: serializeCalls(deadlines.entry, invoke, () => (alive ? null : new Error(REALM_DISPOSED)),
-        configuredMs, opts.ownTurns),
+        configuredMs, opts.ownTurns, () => entered > 0),
       dispose: () => discard(),
     };
   };

@@ -94,7 +94,8 @@ function udpRealm(raw = nodeRawDatagrams()) {
   const quic = quicModule();
   ctx.__host = {
     async call(name, payload) {
-      const p = new Uint8Array(payload);
+      // The realm lays a call's parts back to back (realm.c).
+      const p = new Uint8Array(Array.isArray(payload) ? Buffer.concat(payload) : payload);
       if (name === "quic") return quic(p);
       if (name === "link/udpBind") {
         const s = await net.udpBind();

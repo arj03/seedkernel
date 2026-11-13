@@ -815,7 +815,7 @@ class QuicListener {
     head.set(this.key, 9);
     writeU32BE(head, 41, this.socket);
     let answer;
-    try { answer = host.call(N_QUIC, concatBytes([head, ...strangers])); } catch { return; }
+    try { answer = host.call(N_QUIC, [head, ...strangers]); } catch { return; }
     void answer.then((a) => {
       const n = readU16BE(a, 0);
       if (a.length > 2 + 2 * n) udp.send(a.subarray(2 + 2 * n));

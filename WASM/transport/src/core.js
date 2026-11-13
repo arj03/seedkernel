@@ -740,7 +740,7 @@ function statusChanged() {
   statusDue = true;
   void Promise.resolve().then(() => {
     statusDue = false;
-    return host.call(N_LINK_STATUS, concatBytes([Uint8Array.of(STATUS_LINKS, relays.state()), routes()]));
+    return host.call(N_LINK_STATUS, [Uint8Array.of(STATUS_LINKS, relays.state()), routes()]);
   }).catch(() => {});
 }
 
