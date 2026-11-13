@@ -161,7 +161,7 @@ A realm starts with no authority and receives only names, so the list in `guest.
 
 The host invokes the guest's `handle` with `[caller 32][body ..]` and nothing else. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, and 32 zero bytes for the host and its events. The body format is the callee's. `handle` may return bytes or a Promise of bytes, as `host.call` takes them: an array of parts is answered back to back.
 
-Which role an invocation serves, requester or responder, is read from the guest's own body format, never selected by the host. A synchronous second entry is not possible to offer, since a responder may need a module or another realm, and neither answers in the same turn. So both roles are ordinary async invocations of one function.
+Which role an invocation serves, requester or responder, is read from the guest's own body format, never selected by the host. A synchronous second entry is not possible to offer, since a responder may need a module or another realm, and neither is bound to answer in the same turn. So both roles are ordinary async invocations of one function.
 
 ### Invocations are serialized
 

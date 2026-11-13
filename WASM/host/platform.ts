@@ -235,7 +235,7 @@ function engineModule(t: EngineTable, wasm: Uint8Array) {
  *  timed on its clock. A call is synchronous, so its time is already inside that segment. */
 const engineModules = (t: EngineTable): PureModuleLoader => ({
   build: (mods) => moduleSet(mods, (wasm) => engineModule(t, wasm),
-    async (w, payload, deadlineMs) => ({ bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 }),
+    (w, payload, deadlineMs) => ({ bytes: w.call(payload, abiMs(deadlineMs)), ms: 0 }),
     (w) => w.dispose()),
 });
 

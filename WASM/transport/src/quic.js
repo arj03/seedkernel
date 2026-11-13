@@ -313,8 +313,9 @@ class QuicPath {
       this.again = true;
     }
     if (flags & QF_CLOSE || events & QE_CLOSED) { this.fail(); return; }
+    const was = this.dueAt;
     this.dueAt = due < 0 ? Infinity : due;
-    if (this.dueAt < Infinity) wakeBy(this.dueAt);
+    wakeBy(this.dueAt, was);
   }
 
   /** What the connection holds goes with it. */

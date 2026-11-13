@@ -139,8 +139,12 @@ function dueIn(ms) {
   return at;
 }
 
-/** Make sure a wake comes by `at`. */
-function wakeBy(at) {
+/** Make sure a wake comes by `at`. Where `at` puts off a deadline `was` that the wake is
+ *  armed for, by more than was left of it, the wake is armed again for what is soonest now:
+ *  one host call, where the stale wake would be an invocation that finds nothing due. A
+ *  deadline that only creeps, as a busy connection's does, leaves the wake standing. */
+function wakeBy(at, was) {
+  if (was === wakeAt && at - was > was - now() && !walking && owed.length === 0) return onWake();
   if (at >= wakeAt) return;
   wakeAt = at;
   if (!walking) arm(at);

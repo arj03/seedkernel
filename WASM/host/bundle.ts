@@ -73,9 +73,10 @@ export interface ModuleResult {
   ms: number;
 }
 
-/** One slot's private pure modules. The builder cleans up partial instances. */
+/** One slot's private pure modules. The builder cleans up partial instances. A call
+ *  answers at once where the module runs inside it. */
 export interface PureModules {
-  call(name: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult>;
+  call(name: string, payload: Uint8Array, deadlineMs?: number): ModuleResult | Promise<ModuleResult>;
   dispose(): void;
 }
 
@@ -415,7 +416,7 @@ export const MODULE_FAILED: ModuleResult = Object.freeze({ bytes: null, ms: 0 })
  *  the set does not hold fails. */
 export async function moduleSet<M>(mods: { name: string; wasm: Uint8Array }[],
   make: (wasm: Uint8Array) => M | Promise<M>,
-  call: (m: M, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult>,
+  call: (m: M, payload: Uint8Array, deadlineMs?: number) => ModuleResult | Promise<ModuleResult>,
   release: (m: M) => void): Promise<PureModules> {
   const made = await Promise.allSettled(mods.map(async ({ wasm }) => make(wasm)));
   const built = new Map<string, M>();
@@ -434,7 +435,7 @@ export async function moduleSet<M>(mods: { name: string; wasm: Uint8Array }[],
   return {
     call: (name, payload, deadlineMs) => {
       const m = built.get(name);
-      return m === undefined ? Promise.resolve(MODULE_FAILED) : call(m, payload, deadlineMs);
+      return m === undefined ? MODULE_FAILED : call(m, payload, deadlineMs);
     },
     dispose: () => {
       for (const m of built.values()) release(m);

@@ -37,7 +37,7 @@ export type LocalCall = (id: string, payload: Uint8Array, deadlineMs?: number,
 export interface SeamModules {
   names: ReadonlySet<string>;
   /** `deadlineMs` is the calling guest's remaining segment, never guest-supplied. */
-  call: (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult>;
+  call: (name: string, payload: Uint8Array, deadlineMs?: number) => ModuleResult | Promise<ModuleResult>;
 }
 
 export interface GuestSeamDeps {
@@ -263,14 +263,19 @@ export function createGuestSeam({ sodium, requires, services, callLocal, modules
   }
   // This slot's private modules, charged to the caller's segment (§4.3).
   for (const name of modules.names) {
-    routes.set(name, (payload, budget) => modules.call(name, payload, budget.remainingMs).then(({ bytes, ms }) => {
-      // The module's own processing time, not wall clock, or queue wait behind one worker
-      // would be charged quadratically.
-      budget.charge(ms);
-      // Null is failure; empty is a module that said nothing (§12.2).
-      if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
-      return bytes;
-    }));
+    routes.set(name, (payload, budget) => {
+      const r = modules.call(name, payload, budget.remainingMs);
+      // A module that ran inside the call answers in it, its time already in the segment.
+      if (!(r instanceof Promise) && r.bytes !== null) return r.bytes;
+      return Promise.resolve(r).then(({ bytes, ms }) => {
+        // The module's own processing time, not wall clock, or queue wait behind one worker
+        // would be charged quadratically.
+        budget.charge(ms);
+        // Null is failure; empty is a module that said nothing (§12.2).
+        if (bytes === null) throw new Error("guest-seam: module " + name + " failed");
+        return bytes;
+      });
+    });
   }
   const seam: HostCall = (name, payload, budget) => {
     const route = routes.get(name);
