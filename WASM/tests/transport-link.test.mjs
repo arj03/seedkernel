@@ -11,7 +11,7 @@ import {
   LoopbackChannels, generatorRequest, transportOp, OpArgs,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
-import { bytesEqual } from "./bytes.mjs";
+import { bytesEqual, joined } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
 import { HOST_CALLER_ID } from "../build/host/util.js";
 
@@ -20,7 +20,7 @@ import { HOST_CALLER_ID } from "../build/host/util.js";
  *  (services/link.ts `TransportCall`), so a test standing in for an occupant reads it at
  *  the same seam the signed one does. */
 function opOf(input) {
-  const body = input.subarray(HOST_CALLER_ID.length);
+  const body = joined(input).subarray(HOST_CALLER_ID.length);
   const n = body[0];
   return { op: new TextDecoder().decode(body.subarray(1, 1 + n)), args: body.subarray(1 + n) };
 }

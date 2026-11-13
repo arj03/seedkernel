@@ -25,6 +25,10 @@ export const ZERO = new Uint8Array([0]);
  *  a peer or a co-resident app. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 
+/** Bytes as one buffer, or as parts that go back to back: a realm copies parts in one by
+ *  one (engine-realm.ts `stage`), so whoever frames bytes need not concatenate them. */
+export type Parts = Uint8Array | readonly Uint8Array[];
+
 /** A platform answer that may come now or later. */
 export type Maybe<T> = T | Promise<T>;
 /** Bytes a platform hands over; either form is the receiver's to keep. */

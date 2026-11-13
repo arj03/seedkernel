@@ -6,7 +6,7 @@ import { appScopeFor, FreshnessMarks, genesisHash, reachesLink, verifyBundle, lo
 import { createGuestSeam, type SeamCrypto, type HostCall, type LocalCall } from "./guest-seam.js";
 import { createSlotTable } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, isRecord, errMessage, concatBytes, EMPTY, HOST_CALLER_ID } from "./util.js";
+import { enc, fromHex, toHex, isHex64, isRecord, errMessage, EMPTY, HOST_CALLER_ID } from "./util.js";
 import { sendProtocol } from "./op-frame.js";
 import { type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "./subkeys.js";
@@ -276,7 +276,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  (a wake, a link event, a peer request) enter through `realm.call` directly. */
   const enter = (slot: AppSlot, caller: Uint8Array, body: Uint8Array,
     deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
-    slot.realm!.call(concatBytes([caller, body]), deadlineMs, causalClock);
+    slot.realm!.call([caller, body], deadlineMs, causalClock);
   /** A local service id's claimant, entered as `caller`, resolved at call time so a
    *  service installed or replaced later is found. */
   const callLocal = (caller: Uint8Array): LocalCall => (id, payload, deadlineMs, causalClock) => {

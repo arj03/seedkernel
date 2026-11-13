@@ -1,7 +1,7 @@
 // The realm contract and the per-realm pieces the realm driver (engine-realm.ts) builds
 // on: serialized entry into one confined realm, and the deadlines that bound it.
 
-import { EMPTY, Fifo } from "./util.js";
+import { EMPTY, Fifo, type Parts } from "./util.js";
 import type { HostCall } from "./guest-seam.js";
 
 /** What a disposed realm fails every in-flight and queued caller with, on every target.
@@ -57,7 +57,7 @@ export interface RealmOptions {
 export interface Realm {
   /** Invoke `handle` with `[caller 32][body ...]`, serialized per realm. An omitted
    *  deadline means a host-initiated call on this realm's own ceiling. */
-  call(payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
+  call(payload: Parts, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
   dispose(): void;
 }
 
@@ -206,16 +206,16 @@ export function settleByDeadline(deadlines: { add(d: Deadline): void; drop(d: De
  *  charge its clock, so the entry waits for a fresh turn, as it does behind another. */
 export function serializeCalls(
   deadlines: { add(d: Deadline): void; drop(d: Deadline): void },
-  invoke: (payload: Uint8Array, deadlineMs: number, causalClock: CausalClock | undefined, answer: Answer) => Invocation,
+  invoke: (payload: Parts, deadlineMs: number, causalClock: CausalClock | undefined, answer: Answer) => Invocation,
   notReady: () => Error | null,
   defaultDeadlineMs: number,
   ownTurns = false,
   inside: () => boolean = () => false,
-): (payload: Uint8Array, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
+): (payload: Parts, deadlineMs?: number, causalClock?: CausalClock) => Promise<Uint8Array> {
   const LATE = "guest: realm invocation handoff deadline exceeded";
   /** The queue record, and the invocation's answer (`resolve`/`reject`). */
   interface Entry extends Deadline, Answer {
-    payload: Uint8Array;
+    payload: Parts;
     causalClock?: CausalClock;
     pass(value: Uint8Array): void;
     fail(reason: unknown): void;

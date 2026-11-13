@@ -14,7 +14,7 @@ import {
   DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   DEFAULT_REALM_MEMORY_BYTES,
 } from "./wasm-limits.js";
-import { dec, enc, errMessage } from "./util.js";
+import { dec, enc, errMessage, type Parts } from "./util.js";
 import { CallBudget, guestPreamble, type Spend } from "./guest-seam.js";
 import {
   CausalContext, createRealmDeadlines, monotonicMs, serializeCalls, settleByDeadline,
@@ -107,16 +107,27 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
     // when it grows, and realm.c passes the address with every import that grew it.
     let bufPtr = 0;
     let bufLen = -1;
-    /** Stage bytes in the exchange buffer, answering their length. */
-    const stage = (bytes: Uint8Array): number => {
-      if (bytes.length > bufLen) {
-        const ptr = R_Buf(bytes.length);
+    /** Stage bytes in the exchange buffer, parts back to back, answering their length. */
+    const stage = (bytes: Parts): number => {
+      // Indexed, not `for...of`: an iterator is an allocation per call on the native loop.
+      const one = bytes instanceof Uint8Array;
+      let len = 0;
+      if (one) len = bytes.length;
+      else for (let i = 0; i < bytes.length; i++) len += bytes[i].length;
+      if (len > bufLen) {
+        const ptr = R_Buf(len);
         if (ptr === 0) throw new Error("guest: realm out of memory");
         bufPtr = ptr;
-        bufLen = bytes.length;
+        bufLen = len;
       }
-      if (bytes.length > 0) inst.write(bufPtr, bytes);
-      return bytes.length;
+      if (one) {
+        if (len > 0) inst.write(bufPtr, bytes);
+        return len;
+      }
+      for (let i = 0, at = bufPtr; i < bytes.length; at += bytes[i++].length) {
+        if (bytes[i].length > 0) inst.write(at, bytes[i]);
+      }
+      return len;
     };
 
     // One entry into the realm under `budget`'s clock. realm.c arms the engine's interrupt
@@ -190,7 +201,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
             // With no time left in the segment, this refuses.
             const budget = new CallBudget(remainingMs < 0 ? Infinity : remainingMs, causalContext.current, made);
             const result = opts.hostCall(name, bytes.subarray(nameBytes), budget);
-            if (result instanceof Uint8Array) return (stage(result) << 2) | ANSWERED;
+            if (!(result instanceof Promise)) return (stage(result) << 2) | ANSWERED;
             settleByDeadline(deadlines.hostCall, budget.remainingMs, result, HOST_CALL_LATE,
               (answer, error) => settle(callId, answer, error, budget, made));
             return PARKED;
@@ -252,7 +263,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
 
     /** One invocation, once the queue has given it the realm. Not `async`, because the
      *  queue needs the `Invocation` when the synchronous part ends, before the answer exists. */
-    const invoke = (payload: Uint8Array, deadlineMs: number, causalClock: CausalClock | undefined,
+    const invoke = (payload: Parts, deadlineMs: number, causalClock: CausalClock | undefined,
       answer: Answer): Invocation => {
       // Kept through every host-call settlement; a later entry gets its own.
       const budget = create(deadlineMs);

@@ -229,6 +229,72 @@ static uint8_t *bytes_of(JSContext *c, JSValueConst v, size_t *len)
     return JS_GetUint8Array(c, len, v);
 }
 
+/* Bytes the guest hands over: one byte argument, or an array of them that go back to back,
+   so a guest never concatenates them. Every part is taken before any window is read:
+   taking one can run guest code, which could move the bytes of a window already read. */
+typedef struct {
+    JSValue one, *parts;
+    int64_t n;
+} Parts;
+
+static void parts_free(JSContext *c, Parts *p);
+
+/* 0, or -1 with an exception and nothing to free. */
+static int parts_take(JSContext *c, JSValueConst v, Parts *p)
+{
+    p->one = v;
+    p->parts = &p->one;
+    p->n = 1;
+    if (!JS_IsArray(v))
+        return 0;
+    int64_t n;
+    if (JS_GetLength(c, v, &n) < 0 || !(p->parts = js_malloc(c, sizeof *p->parts * (size_t)(n > 0 ? n : 1))))
+        return -1;
+    for (p->n = 0; p->n < n; p->n++) {
+        p->parts[p->n] = JS_GetPropertyInt64(c, v, p->n);
+        if (JS_IsException(p->parts[p->n])) {
+            parts_free(c, p);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void parts_free(JSContext *c, Parts *p)
+{
+    if (p->parts == &p->one)
+        return;
+    for (int64_t k = 0; k < p->n; k++)
+        JS_FreeValue(c, p->parts[k]);
+    js_free(c, p->parts);
+}
+
+/* Their total length, summed wide and clamped to cap + 1, so the same window passed many
+   times cannot wrap it; or -1 with an exception when a part is not bytes. Runs no guest
+   code, so the windows stay put until parts_copy. */
+static int64_t parts_len(JSContext *c, Parts *p, size_t cap)
+{
+    uint64_t total = 0;
+    size_t len;
+    for (int64_t k = 0; k < p->n; k++) {
+        if (!bytes_of(c, p->parts[k], &len) && JS_HasException(c))
+            return -1;
+        total += len;
+    }
+    return (int64_t)(total > cap ? (uint64_t)cap + 1 : total);
+}
+
+static void parts_copy(JSContext *c, Parts *p, uint8_t *to)
+{
+    size_t len;
+    for (int64_t k = 0; k < p->n; k++) {
+        uint8_t *b = bytes_of(c, p->parts[k], &len);
+        if (len)
+            memcpy(to, b, len);
+        to += len;
+    }
+}
+
 static JSValue not_bytes(JSContext *c)
 {
     static const char msg[] = "guest: host.call takes Uint8Array | ArrayBuffer, or an array of them";
@@ -237,48 +303,30 @@ static JSValue not_bytes(JSContext *c)
     return throw_message(c, msg, sizeof msg - 1);
 }
 
-/* host.call(name, id, bytes): the payload is one byte argument or an array of them, which
-   lands in the exchange buffer back to back, so a guest never concatenates its arguments. */
+/* host.call(name, id, bytes). */
 static JSValue host_call(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     (void)this_val;
     (void)argc;
     double id;
-    size_t name_len, len;
+    size_t name_len;
     if (JS_ToFloat64(c, &id, argv[1]) < 0)
         return JS_EXCEPTION;
     const char *name = JS_ToCStringLen(c, &name_len, argv[0]);
     if (!name)
         return JS_EXCEPTION;
-    /* Every part is taken before any window is read: taking one can run guest code, which
-       could move the bytes of a window already read. */
-    JSValue one = argv[2];
-    JSValue *parts = &one;
-    int64_t n = 1;
-    JSValue v = JS_EXCEPTION;
-    if (JS_IsArray(argv[2])) {
-        if (JS_GetLength(c, argv[2], &n) < 0 || !(parts = js_malloc(c, sizeof *parts * (size_t)(n > 0 ? n : 1)))) {
-            n = 0;
-            goto out;
-        }
-        for (int64_t k = 0; k < n; k++) {
-            parts[k] = JS_GetPropertyInt64(c, argv[2], k);
-            if (JS_IsException(parts[k])) {
-                n = k;
-                goto out;
-            }
-        }
+    Parts p;
+    if (parts_take(c, argv[2], &p) < 0) {
+        JS_FreeCString(c, name);
+        return JS_EXCEPTION;
     }
-    /* Summed wide and clamped, so the same window passed many times cannot wrap it. */
-    uint64_t total = 0;
-    for (int64_t k = 0; k < n; k++) {
-        if (!bytes_of(c, parts[k], &len) && JS_HasException(c)) {
-            v = not_bytes(c);
-            goto out;
-        }
-        total += len;
+    JSValue v;
+    int64_t total = parts_len(c, &p, max_bytes);
+    if (total < 0) {
+        v = not_bytes(c);
+        goto out;
     }
-    size_t payload_len = total > max_bytes ? max_bytes + 1 : (size_t)total;
+    size_t payload_len = (size_t)total;
     /* Admitted before the payload leaves the guest heap. */
     const char *refused = admit(id, payload_len);
     if (refused) {
@@ -295,13 +343,7 @@ static JSValue host_call(JSContext *c, JSValueConst this_val, int argc, JSValueC
     for (size_t k = 0; k < name_len; k++)
         ascii &= (unsigned char)name[k] < 0x80;
     memcpy(xbuf, name, name_len);
-    size_t at = name_len;
-    for (int64_t k = 0; k < n; k++) {
-        uint8_t *p = bytes_of(c, parts[k], &len);
-        if (len)
-            memcpy(xbuf + at, p, len);
-        at += len;
-    }
+    parts_copy(c, &p, xbuf + name_len);
     int64_t left = QJS_DeadlineLeft();
     int32_t r = realm_host_call(id, left < 0 ? -1.0 : (double)left / 1e6, xbuf,
                                 ascii ? (int32_t)name_len : -(int32_t)name_len, (int32_t)payload_len);
@@ -324,32 +366,47 @@ static JSValue host_call(JSContext *c, JSValueConst this_val, int argc, JSValueC
     }
     release(i);
 out:
-    if (parts != &one) {
-        for (int64_t k = 0; k < n; k++)
-            JS_FreeValue(c, parts[k]);
-        js_free(c, parts);
-    }
+    parts_free(c, &p);
     JS_FreeCString(c, name);
     return v;
 }
 
+/* An invocation's answer, bytes as host.call takes them: one buffer is lent as it is, and
+   parts are gathered into a scratch copy, not the exchange buffer, whose address the
+   embedder keeps. */
 static JSValue call_done(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     (void)this_val;
     (void)argc;
+    static const char msg[] = "guest: entrypoint result is not bytes";
     double id;
     size_t len;
     if (JS_ToFloat64(c, &id, argv[0]) < 0)
         return JS_EXCEPTION;
-    uint8_t *bytes = bytes_of(c, argv[1], &len);
-    if (!bytes && JS_HasException(c)) {
-        JS_FreeValue(c, JS_GetException(c));
-        static const char msg[] = "guest: entrypoint result is not bytes";
+    Parts p;
+    if (parts_take(c, argv[1], &p) < 0)
+        return JS_EXCEPTION;
+    JSValue v = JS_UNDEFINED;
+    int64_t total = parts_len(c, &p, INT32_MAX);
+    if (total < 0 || total > INT32_MAX) {
+        if (JS_HasException(c))
+            JS_FreeValue(c, JS_GetException(c));
         realm_call_fail(id, msg, (int32_t)(sizeof msg - 1));
-        return JS_UNDEFINED;
+    } else if (p.n == 1) {
+        uint8_t *bytes = bytes_of(c, p.parts[0], &len);
+        realm_call_done(id, bytes, (int32_t)len);
+    } else {
+        uint8_t *out = js_malloc(c, total > 0 ? (size_t)total : 1);
+        if (out) {
+            parts_copy(c, &p, out);
+            realm_call_done(id, out, (int32_t)total);
+            js_free(c, out);
+        } else {
+            v = JS_EXCEPTION;
+        }
     }
-    realm_call_done(id, bytes, (int32_t)len);
-    return JS_UNDEFINED;
+    parts_free(c, &p);
+    return v;
 }
 
 static JSValue call_fail(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv)

@@ -1,7 +1,7 @@
 // `host.call(name, bytes)` (§12.2). One map per realm, built at construction from what
 // the bundle declares, so an undeclared service has no handler at all (§12.1). Each host
 // service's handlers live with its backend in services/; this file knows none of them.
-import { concatBytes, readU32BE, ONE, ZERO } from "./util.js";
+import { readU32BE, ONE, ZERO, type Parts } from "./util.js";
 import { isService, type HostTransformName, type ServiceMethod, type ServiceName } from "./domains.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, type CausalClock } from "./realm-queue.js";
@@ -18,7 +18,7 @@ export interface SeamCrypto {
 }
 
 /** Argument bytes in, response bytes out, inline or async. */
-export type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>;
+export type SeamHandler = (payload: Uint8Array, budget: CallBudget) => Parts | Promise<Uint8Array>;
 
 /** One host service's handlers (services/), exactly its `HOST_SERVICES` calls: a missing
  *  or extra method is a compile error. Every name contains a `/`, which module names
@@ -95,7 +95,7 @@ export class CallBudget {
  *  and the realm hands them to the guest in the frame that asked: no host promise, no
  *  deadline and no later turn, which is most of what a call costs. One that has to wait
  *  returns a Promise. The guest sees a Promise either way. */
-export type HostCall = ((name: string, payload: Uint8Array, budget: CallBudget) => Uint8Array | Promise<Uint8Array>) & {
+export type HostCall = ((name: string, payload: Uint8Array, budget: CallBudget) => Parts | Promise<Uint8Array>) & {
   /** Whether `name`'s handler is done with its payload when it returns, so the realm may
    *  lend it a view of its memory instead of a copy (engine-realm.ts). Absent: never. */
   borrows?(name: string): boolean;
@@ -135,7 +135,7 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     "crypto/chacha20poly1305-ietf/open": (a) => {
       const { npub, key, ad, body } = aeadArgs(a, "open");
       try {
-        return concatBytes([ONE, sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, body, ad, npub, key)]);
+        return [ONE, sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, body, ad, npub, key)];
       } catch {
         return ZERO;
       }
@@ -143,7 +143,7 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     // [sk 32][pk 32] -> [ok u8][shared 32]. ok=0: low-order point.
     "crypto/x25519/dh": (a) => {
       try {
-        return concatBytes([ONE, sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))]);
+        return [ONE, sodium.crypto_scalarmult(a.subarray(0, 32), a.subarray(32, 64))];
       } catch {
         return ZERO;
       }

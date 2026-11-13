@@ -2,6 +2,7 @@
 // and guest fixtures, and the test-only module host.
 
 import { spawn } from "node:child_process";
+import { joined } from "./bytes.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -29,9 +30,12 @@ export const { appSignScope, slotSignScope } = await imp("build/services/node.js
 /** The bytes an app's scope adds after `DOMAIN_guest`: `app_len u8 ‖ app`. */
 export const guestSignScope = (app) => appSignScope(null, app).scope;
 /** A seam called straight from a test, with the budget a realm would pass: an unbounded
- *  segment with no causal root and a fresh spend record. */
-export const withTestBudget = (seam) => (name, payload) =>
-  seam(name, payload, new CallBudget(Infinity, undefined, { consumedMs: 0 }));
+ *  segment with no causal root and a fresh spend record. An answer in parts comes back
+ *  joined, as the guest would read it. */
+export const withTestBudget = (seam) => (name, payload) => {
+  const r = seam(name, payload, new CallBudget(Infinity, undefined, { consumedMs: 0 }));
+  return r instanceof Promise ? r : joined(r);
+};
 export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 /** Local service routing under which nothing claims any id. */
@@ -39,6 +43,7 @@ export const TEST_CALL_LOCAL = () => null;
 export const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 export const { utf8Encode, utf8Decode } = await imp("build/host/utf8.js");
 /** Is this realm argument the host's wake event (§12.3)? */
+export { joined };
 export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
 export const { nodeService } = await imp("build/services/node.js");

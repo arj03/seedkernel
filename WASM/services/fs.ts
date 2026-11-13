@@ -114,7 +114,7 @@ function u64be(value: number): Uint8Array {
  *  backends copy (or write) before returning. */
 export function fsService(fs: Fs): ServiceHandlers<"fs"> {
   return {
-    "fs/get": (payload) => { const v = fs.get(dec.decode(payload)); return v ? concatBytes([ONE, v]) : ZERO; },
+    "fs/get": (payload) => { const v = fs.get(dec.decode(payload)); return v ? [ONE, v] : ZERO; },
     "fs/put": (payload) => {
       const klen = readU32BE(payload, 0);
       fs.put(dec.decode(payload.subarray(4, 4 + klen)), payload.subarray(4 + klen));

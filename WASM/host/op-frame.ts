@@ -102,6 +102,14 @@ export class OpArgs {
     for (const p of this.parts) { out.set(p, off); off += p.length; }
     return out;
   }
+  /** As `build`, but as a realm's parts with the last field left out of the copy, so a
+   *  socket read goes into the realm as it came. */
+  split(prefix?: Uint8Array): Uint8Array[] {
+    const last = this.parts.pop();
+    if (last === undefined) return [this.build(prefix)];
+    this.len -= last.length;
+    return [this.build(prefix), last];
+  }
 }
 
 /** The protocol id the transport's `send` op sends under, read off a `host.call` body, or

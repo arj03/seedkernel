@@ -2,7 +2,7 @@
 // state stay in the signed guest, and the handlers the link occupant reaches it through.
 // Destinations are opaque, and events go to the current occupant (§12.10).
 
-import { concatBytes, dec, enc, EMPTY, errMessage, Fifo, HOST_CALLER_ID, readU32BE, u8, writeU32BE } from "../host/util.js";
+import { concatBytes, dec, enc, EMPTY, errMessage, Fifo, HOST_CALLER_ID, readU32BE, u8, writeU32BE, type Parts } from "../host/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -127,7 +127,7 @@ export { DEFAULT_MAX_RAW_LINKS } from "./net-limits.js";
 
 /** Active transport entrypoint, called with the whole realm argument
  *  `[caller 32][body ...]`; `null` means no occupant is bound. */
-export type TransportCall = (input: Uint8Array) => Promise<Uint8Array> | null;
+export type TransportCall = (input: Parts) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
   /** Live raw links this driver holds at once (default `DEFAULT_MAX_RAW_LINKS`). Bounds the
@@ -385,7 +385,7 @@ export class TransportHost {
    *  order. */
   private toTransport(args: OpArgs): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
-    return this.call(args.build(HOST_CALLER_ID));
+    return this.call(args.split(HOST_CALLER_ID));
   }
 
   /** Log a rejected op, except a realm disposed by this driver's own teardown. */

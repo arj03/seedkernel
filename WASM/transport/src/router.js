@@ -159,8 +159,8 @@ class ReqRes {
     this.relayed = new Map();
   }
 
-  /** Settle an outstanding request: `[1][payload]`, or `[0]` when `payload` is null (peer
-   *  down, or timed out). */
+  /** Settle an outstanding request: `[1][payload]`, as parts the realm answers without
+   *  joining them, or `[0]` when `payload` is null (peer down, or timed out). */
   finish(corr, payload) {
     const p = this.pending.get(corr);
     if (!p) return;
@@ -169,7 +169,7 @@ class ReqRes {
       const q = this.relayed.get(p.to);
       if (q) { q.bytes -= p.relayedBytes; this.pumpRelayed(p.to); }
     }
-    p.d.resolve(payload === null ? Uint8Array.of(0) : concatBytes([Uint8Array.of(1), payload]));
+    p.d.resolve(payload === null ? Uint8Array.of(0) : [Uint8Array.of(1), payload]);
   }
 
   /** Whether `from` may put one more request of `weight` on `link/deliver` (core.js
