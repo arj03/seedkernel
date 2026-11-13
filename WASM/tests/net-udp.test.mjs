@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { importBuilt, testkit } from "./testkit.mjs";
 import { FakeRelay, relayUrl } from "./fake-relay.mjs";
+import { joined } from "./bytes.mjs";
 import {
   makeTransportHost, until, linkedPeers, transportOp, OpArgs, PROTO, generateKeyPair, generatorRequest, TransportHost,
   LoopbackChannels,
@@ -113,7 +114,7 @@ function udpRealm(raw = nodeRawDatagrams()) {
     },
   };
   vm.runInContext(UDP_SOURCE, ctx);
-  driver.activate((input) => ctx.__handle(input));
+  driver.activate((input) => ctx.__handle(joined(input)));
   const accepted = [];
   const open = async (offer, iceServers = []) => {
     const n = await ctx.__open(offer, iceServers);
@@ -147,7 +148,8 @@ function standIn(stream, dials) {
       stream.keys(r2i, i2r);
     }
   });
-  if (dials) stream.handshake(Uint8Array.of(1));
+  // As wide as ake.js's first message, so the client's first flight takes two datagrams.
+  if (dials) stream.handshake(new Uint8Array(1233).fill(1));
 }
 
 /** Carry each side's messages to the other, as the transport does, until both have a
@@ -283,18 +285,19 @@ const isShort = (p) => (p[0] & 0xc0) === 0x40;
  *  and holds `late` of it back 5 ms, behind what was sent after it, or takes `delay` ms
  *  each way. `cut()` drops everything from then on, and a datagram larger than `mtu` is
  *  dropped; both it and `loss` can change. A machine made `toA` is b, and the next
- *  `dropToA` datagrams it sends are dropped. While `held` is an array, what b sends waits
+ *  `dropToA` datagrams it sends are dropped, as are the long-header packets either end sends
+ *  whose index among them is in `dropLong`. While `held` is an array, what b sends waits
  *  in it, as the acks of a peer whose loop is held do, and `release()` hands it all over at
  *  once. `largest` is the largest short-header packet a sent b that the path carries, since
  *  it was last set to 0: a probe past the path's MTU is sent, and lost.
  *  An attacker on the wire sees every datagram in `sniffed`, `{to, bytes}`, and can
  *  `inject(from, to, bytes)` any it likes, from any address. */
-function fabric({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0 } = {}) {
+function fabric({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0, dropLong = [] } = {}) {
   const sockets = new Map();
   const bound = new Map();
   let nextPort = 40000;
   const f = {
-    loss, mtu, dead: false, largest: 0, dropToA: 0, held: null, sniffed: [],
+    loss, mtu, dead: false, largest: 0, dropToA: 0, long: 0, held: null, sniffed: [],
     cut: () => { f.dead = true; },
     release: () => { const held = f.held ?? []; f.held = null; for (const go of held) go(); },
     addrOf: (name) => bound.get(name),
@@ -315,6 +318,7 @@ function fabric({ loss = 0, dup = 0, late = 0, mtu = Infinity, delay = 0 } = {})
             f.sniffed.push({ to: { host: toHost, port: toPort }, bytes: p });
             if (!toA && isShort(p) && p.length <= f.mtu) f.largest = Math.max(f.largest, p.length);
             if (toA && f.dropToA > 0) { f.dropToA--; return; }
+            if ((p[0] & 0xc0) === 0xc0 && dropLong.includes(f.long++)) return;
             const copies = f.dead || p.length > f.mtu || Math.random() < f.loss ? 0 : Math.random() < dup ? 2 : 1;
             for (let i = 0; i < copies; i++) {
               const arrive = () => {
@@ -350,6 +354,14 @@ async function streamPair(opts) {
 }
 
 console.log("\nUDP: the connection (§12.7)\n");
+
+await test("a server whose first Initial is the second piece of the client's first message starts again from the next", async () => {
+  // The first piece lost, ngtcp2 tells the server to send a Retry; the path is validated
+  // already, so it waits for the client's retransmission instead of ending.
+  const pair = await streamPair({ dropLong: [0] });
+  assert(pair.a.authed && pair.b.authed, "both handshakes complete");
+  pair.close();
+});
 
 await test("the connection delivers in order through loss, repeats and reordering, both ways", async () => {
   const pair = await streamPair({ loss: 0.05, dup: 0.02, late: 0.02 });
@@ -1022,6 +1034,20 @@ await test("over a path that loses, repeats and reorders, the transport's record
   }
 });
 
+await test("a data link whose first message is lost twice still comes up, after a stranger's bound", async (keep) => {
+  // The client's first piece is lost in its first two flights, so the server reads the first
+  // message about 3 s in, past the 2 s an accept from a stranger is given.
+  const relay = new FakeRelay("relay:8080");
+  const net = fabric({ dropLong: [0, 2] });
+  const A = keep(await makeTransportHost({ channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.1", false)) }));
+  const B = keep(await makeTransportHost({ channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.2", true)) }));
+  await relayLink(A, B, relayUrl("relay:8080"));
+  await until(async () => (await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true,
+    6000, "both to move to the path");
+  const resp = await A.request(B.peerId, PROTO, Uint8Array.of(7, 8, 9));
+  assert(resp.length === 3 && resp[2] === 9, "a request crosses it");
+});
+
 await test("a peer back over TCP while its dead UDP path is still held gets every answer", async (keep) => {
   // A crashed peer sends no CLOSE, so B holds its UDP path until the stream's silence clock
   // runs out. An answer goes back on the link its request came in on, never onto that path.
@@ -1129,7 +1155,7 @@ await test("a udp listener is bound afresh, on its port, for each occupant that 
   probe.close();
   const driver = new TransportHost({ datagrams: nodeRawDatagrams(), suppressLinkLog: true, listen: [{ label: "quic", host: "0.0.0.0", port, udp: true }] });
   const heard = [[], []];
-  const occupant = (i) => (input) => { heard[i].push(new TextDecoder().decode(input.subarray(33, 33 + input[32]))); return Promise.resolve(new Uint8Array()); };
+  const occupant = (i) => (parts) => { const input = joined(parts); heard[i].push(new TextDecoder().decode(input.subarray(33, 33 + input[32]))); return Promise.resolve(new Uint8Array()); };
   try {
     driver.activate(occupant(0));
     await driver.start();

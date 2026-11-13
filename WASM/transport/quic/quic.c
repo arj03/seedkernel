@@ -859,17 +859,25 @@ static void end_conn(path *p, int rv, ngtcp2_tstamp now) {
 }
 
 /** One datagram into the connection: any error ngtcp2 returns ends it, since a packet it
- *  merely drops reads as 0. */
+ *  merely drops reads as 0. A server's first Initial can carry a later piece of the client's
+ *  first message, the first lost or late, which ngtcp2 answers with "send a Retry" (or "drop
+ *  the connection"): the address needs no validating, so the server starts again from the
+ *  next Initial (`accept_from`) and reads the held datagrams after it. */
 static void read_one(path *p, const ngtcp2_sockaddr_union *from, const uint8_t *pkt, size_t len, ngtcp2_tstamp now) {
   ngtcp2_path path = path_of(p, from);
   int rv = ngtcp2_conn_read_pkt(p->conn, &path, NULL, pkt, len, now);
-  if (rv) end_conn(p, rv, now);
+  if (p->server && !p->completed && (rv == NGTCP2_ERR_RETRY || rv == NGTCP2_ERR_DROP_CONN)) {
+    ngtcp2_conn_del(p->conn);
+    p->conn = NULL;
+  } else if (rv) {
+    end_conn(p, rv, now);
+  }
 }
 
 /** The held datagrams, read again in the order they came (`held`). */
 static void replay(path *p, ngtcp2_tstamp now) {
   int n = p->nheld < HELD_MAX ? p->nheld : HELD_MAX, first = p->nheld - n;
-  for (int i = 0; i < n && !p->closed; i++) {
+  for (int i = 0; i < n && p->conn && !p->closed; i++) {
     int at = (first + i) % HELD_MAX;
     read_one(p, &p->held[at].from, p->held[at].b, p->held[at].len, now);
   }
@@ -996,7 +1004,8 @@ static int op_turn(reader *r) {
       const uint8_t *pkt = take(&b, len);
       if (b.bad) return -1;
       if (len == 0 || !(pkt[0] & 0x40)) continue;
-      if (!p->conn && (!p->server || accept_from(p, &from, pkt, len, now_ms))) continue;
+      int fresh = !p->conn;
+      if (fresh && (!p->server || accept_from(p, &from, pkt, len, now_ms))) continue;
       if (!p->completed && len <= sizeof p->held[0].b) {
         int i = p->nheld++ % HELD_MAX;
         p->held[i].from = from;
@@ -1004,6 +1013,8 @@ static int op_turn(reader *r) {
         memcpy(p->held[i].b, pkt, len);
       }
       read_one(p, &from, pkt, len, now);
+      // A connection started again (`read_one`) reads what came before its first packet.
+      if (fresh && p->conn && p->nheld > 1) replay(p, now);
     }
   }
 

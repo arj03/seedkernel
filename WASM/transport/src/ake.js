@@ -338,7 +338,10 @@ class Link {
   }
 
   /** Only a dialer speaks unprompted; an accept waits for a msg1 that opens under the
-   *  contact secret (§12.6). A failed boot aborts. */
+   *  contact secret (§12.6). An accept for one expected peer, a negotiation's data link,
+   *  waits as long as its dialer does: the negotiation's own deadline bounds it, and on a
+   *  lossy UDP path the msg1 retransmissions back off past the stranger's bound. A failed
+   *  boot aborts. */
   async boot() {
     try {
       this.root = await rootKey(this.networkKey);
@@ -347,7 +350,7 @@ class Link {
         this.armDeadline(handshakeTimeoutMs);
         await this.sendMsg1();
       } else {
-        this.armDeadline(unverifiedTimeoutMs);
+        this.armDeadline(this.acceptPeerId ? handshakeTimeoutMs : unverifiedTimeoutMs);
       }
     } catch {
       this.abort();
