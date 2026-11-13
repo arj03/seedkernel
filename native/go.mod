@@ -24,4 +24,7 @@ require golang.org/x/sys v0.46.0 // indirect
 // Two build tags in the fork drop code the loader never runs: wazero_nointerp the interpreter
 // (the loader configures only the compiler) and wazero_nodwarf debug/dwarf (source lines in
 // wasm stack traces). The release build passes both, README.md §10.2.
-replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20261108160129-f7610ddd1d4c
+//
+// It also lowers a vector shift by a constant to one immediate shift, and a one-source
+// i8x16.shuffle to one PSHUFB, on amd64: seedstore's SIMD codec runs ~5% faster.
+replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20261113223600-d51fe578d5f4
