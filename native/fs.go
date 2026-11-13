@@ -53,58 +53,58 @@ func writeFileAtomic(path string, b []byte, durable bool) error {
 // exposeFs installs `__fs`, typed in host/abi.ts.
 func exposeFs(qc *qjs.Context) {
 	o := qc.NewObject()
-	o.SetPropertyStr("mkdir", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
-		return nil, os.MkdirAll(args[0].String(), 0o755)
+	o.SetPropertyStr("mkdir", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
+		return qjs.Value{}, os.MkdirAll(args[0].String(), 0o755)
 	}))
-	o.SetPropertyStr("read", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("read", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// Only absence maps to null; every other failure throws.
 		path, limit := args[0].String(), args[1].Int64()
 		f, err := os.Open(path)
 		if errors.Is(err, os.ErrNotExist) {
 			return qc.NewNull(), nil
 		} else if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		defer f.Close()
 		// Refused before it is read, so a file planted in the store cannot become a host
 		// allocation.
 		fi, err := f.Stat()
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		if !fi.Mode().IsRegular() || fi.Size() > limit {
-			return nil, fmt.Errorf("%s: not a regular file of at most %d bytes", path, limit)
+			return qjs.Value{}, fmt.Errorf("%s: not a regular file of at most %d bytes", path, limit)
 		}
 		b := make([]byte, fi.Size())
 		if _, err := io.ReadFull(f, b); err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		return qc.NewArrayBuffer(b), nil
 	}))
-	o.SetPropertyStr("write", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("write", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// Bytes borrowed last (qjs.Value.View).
 		path := args[0].String()
 		durable := len(args) > 2 && args[2].Int32() != 0
 		b, err := args[1].View()
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
-		return nil, writeFileAtomic(path, b, durable)
+		return qjs.Value{}, writeFileAtomic(path, b, durable)
 	}))
-	o.SetPropertyStr("remove", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("remove", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		return qc.NewBool(os.Remove(args[0].String()) == nil), nil
 	}))
-	o.SetPropertyStr("size", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("size", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		fi, err := os.Stat(args[0].String())
 		if err != nil || !fi.Mode().IsRegular() {
 			return qc.NewInt32(-1), nil
 		}
 		return qc.NewInt64(fi.Size()), nil
 	}))
-	o.SetPropertyStr("list", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("list", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		entries, err := os.ReadDir(args[0].String())
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
@@ -115,7 +115,7 @@ func exposeFs(qc *qjs.Context) {
 		// \n-joined; a key cannot contain '\n'.
 		return qc.NewString(strings.Join(names, "\n")), nil
 	}))
-	o.SetPropertyStr("available", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("available", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// No portable free-disk figure.
 		return qc.NewInt32(-1), nil
 	}))

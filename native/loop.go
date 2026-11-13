@@ -22,7 +22,7 @@ type eventLoop struct {
 	stopped bool
 
 	// onSettle is the in-flight await's result sink, which __settle routes into.
-	onSettle func(fulfilled bool, value *qjs.Value)
+	onSettle func(fulfilled bool, value qjs.Value)
 
 	// stepTimer is step()'s reusable wait timer, stopped between turns.
 	stepTimer *time.Timer
@@ -35,8 +35,8 @@ type eventLoop struct {
 type jsTimer struct {
 	id       int64
 	deadline time.Time
-	cb       *qjs.Value // a retained (Dup'd) JS callback; Free()d when fired or cleared
-	index    int        // heap index, maintained by timerHeap
+	cb       qjs.Value // a retained (Dup'd) JS callback; Free()d when fired or cleared
+	index    int       // heap index, maintained by timerHeap
 }
 
 // timerHeap is a min-heap of pending timers ordered by deadline.
@@ -75,7 +75,7 @@ func (el *eventLoop) pumpAll() {
 
 func (el *eventLoop) install() {
 	g := el.c.Global()
-	g.SetPropertyStr("setTimeout", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	g.SetPropertyStr("setTimeout", el.c.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		var ms int64
 		if len(args) >= 2 {
 			ms = max(args[1].Int64(), 0)
@@ -87,20 +87,20 @@ func (el *eventLoop) install() {
 		el.byID[id] = tm
 		return qc.NewInt64(id), nil
 	}))
-	g.SetPropertyStr("clearTimeout", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	g.SetPropertyStr("clearTimeout", el.c.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		if tm, ok := el.byID[args[0].Int64()]; ok {
 			heap.Remove(&el.timers, tm.index)
 			delete(el.byID, tm.id)
 			tm.cb.Free()
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	// __settle(fulfilled, value) settles the await in flight.
-	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	g.SetPropertyStr("__settle", el.c.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		if el.onSettle != nil {
 			el.onSettle(args[0].Int32() != 0, args[1])
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	// queueMicrotask and performance.now are the engine's own.
 }
@@ -110,7 +110,7 @@ func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 
 // dispatch calls a retained JS callback and frees its result and `args`. A throw is the
 // callback's own failure, so it is logged under `who`, not returned.
-func dispatch(c *qjs.Context, who string, cb *qjs.Value, args ...*qjs.Value) {
+func dispatch(c *qjs.Context, who string, cb qjs.Value, args ...qjs.Value) {
 	res, err := c.Invoke(cb, c.NewUndefined(), args...)
 	res.Free()
 	for _, a := range args {
@@ -174,9 +174,9 @@ func (el *eventLoop) run() {
 // await evaluates an async JS expression in the host realm and drives the loop until it
 // settles. read takes the fulfilled value, borrowed for the call; a rejection is the error.
 // Awaits must not nest: el.onSettle is a single slot.
-func (el *eventLoop) await(callExpr string, read func(*qjs.Value)) error {
+func (el *eventLoop) await(callExpr string, read func(qjs.Value)) error {
 	var rejected error
-	el.onSettle = func(fulfilled bool, v *qjs.Value) {
+	el.onSettle = func(fulfilled bool, v qjs.Value) {
 		if fulfilled {
 			read(v)
 		} else {

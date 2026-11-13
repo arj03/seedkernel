@@ -275,13 +275,13 @@ func awaitWithin(expr string, timeout time.Duration) (value []byte, err error) {
 	err = el.await(`((p) => { let t; return Promise.race([p, new Promise((_, no) => {
 		t = setTimeout(() => no(new Error("await: timed out")), `+ms+`); })]).finally(() => clearTimeout(t)); })(`+expr+`)`,
 		// Bytes, or none for anything else.
-		func(v *qjs.Value) { value, _ = v.Bytes() })
+		func(v qjs.Value) { value, _ = v.Bytes() })
 	return value, err
 }
 
 // callRealm calls one of the host script's entry points with args staged as __a0…__aN, and
 // pumps the loop until its promise settles or timeout passes.
-func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, error) {
+func callRealm(name string, timeout time.Duration, args ...qjs.Value) ([]byte, error) {
 	if qc == nil {
 		return nil, errors.New("seedkernel: boot has not run")
 	}

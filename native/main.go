@@ -113,54 +113,54 @@ func exposeBridge(qc *qjs.Context) {
 	b.SetPropertyStr("abi", qc.NewInt32(int32(ldr.abi)))
 	b.SetPropertyStr("banner", qc.NewString("seedkernel-native"))
 	// The operator's world (host/cli.ts): arguments and stdio; its files are `__fs`.
-	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("argv", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// JSON, since an argument may contain any separator.
 		var j string
-		err := ldr.call(`JSON.stringify(__loader.hostArgs)`, func(v *qjs.Value) { j = v.String() })
+		err := ldr.call(`JSON.stringify(__loader.hostArgs)`, func(v qjs.Value) { j = v.String() })
 		return qc.NewString(j), err
 	}))
 	// The running host blob, which carries the realm engine and the host's crypto.
-	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("hostBlob", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		return qc.NewArrayBuffer(bootBlob), nil
 	}))
 	// Keep a host blob, which the running host checked, as the pending host (hostslots.go).
 	// When the loader boots it now, the loop stops after this turn.
-	b.SetPropertyStr("stageHost", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("stageHost", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		env, err := args[0].Bytes()
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		var now bool
 		err = ldr.call(`__loader.stage(new Uint8Array(__a0))`, readBool(&now), env)
 		el.stopped = el.stopped || now
-		return nil, err
+		return qjs.Value{}, err
 	}))
-	b.SetPropertyStr("random", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("random", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		out := make([]byte, args[0].Int32())
 		crand.Read(out)
 		return qc.NewArrayBuffer(out), nil
 	}))
-	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("log", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// The realm's console; stderr, since stdout is `--op`'s data channel.
 		fmt.Fprintln(os.Stderr, args[0].String())
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
-	b.SetPropertyStr("stdout", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("stdout", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		bytes, err := args[0].View()
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		_, err = os.Stdout.Write(bytes)
-		return nil, err
+		return qjs.Value{}, err
 	}))
-	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("stdin", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// `--op`'s argument, read whole and only on demand. A terminal is nothing piped in.
 		if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
 			return qc.NewArrayBuffer([]byte{}), nil
 		}
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		return qc.NewArrayBuffer(bytes), nil
 	}))
@@ -193,7 +193,7 @@ func main() {
 	go func() { <-sig; os.Exit(0) }()
 	for {
 		// A blob that is not bytes fails at boot, as a truncated one does.
-		if err := ldr.call(`__loader.choose()`, func(v *qjs.Value) { bootBlob, _ = v.Bytes() }); err != nil {
+		if err := ldr.call(`__loader.choose()`, func(v qjs.Value) { bootBlob, _ = v.Bytes() }); err != nil {
 			fatal("host slots", err)
 		}
 		again, err := runHost()

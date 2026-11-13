@@ -41,7 +41,7 @@ func buildModules(t testing.TB, key string, names []string, wasms ...[]byte) err
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []*qjs.Value{qc.NewString(key), qc.NewString(string(j))}
+	args := []qjs.Value{qc.NewString(key), qc.NewString(string(j))}
 	for _, w := range wasms {
 		args = append(args, qc.NewArrayBuffer(w))
 	}

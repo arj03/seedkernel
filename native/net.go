@@ -37,9 +37,9 @@ type netHost struct {
 	// Installed by host/platform.ts before any socket opens.
 	keepAlive  time.Duration
 	closeGrace time.Duration
-	fnDeliver  *qjs.Value
-	fnClosed   *qjs.Value
-	fnAccept   *qjs.Value
+	fnDeliver  qjs.Value
+	fnClosed   qjs.Value
+	fnAccept   qjs.Value
 }
 
 // newNetHost is a netHost with nothing installed yet.
@@ -52,7 +52,7 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := newNetHost(el, qc)
 	o := qc.NewObject()
 
-	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("install", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		n.keepAlive = time.Duration(args[0].Int64()) * time.Millisecond
@@ -60,66 +60,66 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		n.fnDeliver = args[2].GetPropertyStr("deliver")
 		n.fnClosed = args[2].GetPropertyStr("closed")
 		n.fnAccept = args[2].GetPropertyStr("accept")
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 
-	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("connect", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		addr := net.JoinHostPort(args[0].String(), strconv.Itoa(int(args[1].Int32())))
 		return qc.NewInt64(n.dial(addr)), nil
 	}))
-	o.SetPropertyStr("listen", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("listen", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		bound, err := n.listen(args[0].String(), int(args[1].Int32()))
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		return qc.NewInt32(int32(bound)), nil
 	}))
-	o.SetPropertyStr("listenLocal", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("listenLocal", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		key, err := n.listenLocal(args[0].String())
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		return qc.NewInt32(int32(key)), nil
 	}))
-	o.SetPropertyStr("connectLocal", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("connectLocal", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		path := args[0].String()
 		if err := checkLocalPath(path, false); err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		return qc.NewInt64(n.dialNet("unix", path)), nil
 	}))
 	// No answer: the driver has already charged these bytes (sockChannel.send).
-	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		if ch := n.get(args[0].Int64()); ch != nil {
 			// A copy, not a View: the bytes outlive this turn in the send queue.
 			if b, err := args[1].Bytes(); err == nil {
 				ch.send(b)
 			}
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
-	o.SetPropertyStr("buffered", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("buffered", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		if ch := n.get(args[0].Int64()); ch != nil {
 			return qc.NewInt64(int64(ch.buffered())), nil
 		}
 		return qc.NewInt64(0), nil
 	}))
-	o.SetPropertyStr("resume", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("resume", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		if ch := n.get(args[0].Int64()); ch != nil {
 			ch.resume()
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
-	o.SetPropertyStr("closeListeners", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("closeListeners", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		n.closeListeners()
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
-	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// A deliberate close never fires onClose, so the entry is dropped here.
 		if ch := n.take(args[0].Int64()); ch != nil {
 			ch.close(len(args) >= 2 && args[1].Int32() != 0)
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	qc.Global().SetPropertyStr("__net", o)
 	return n
@@ -250,12 +250,19 @@ func (n *netHost) close() {
 
 // onMsg/onClose run on a reader goroutine and hand the work to the loop goroutine.
 func (n *netHost) onMsg(id int64) func([]byte) {
+	// The delivery task is made once per channel, not per read, so a read posts without
+	// allocating. pending is the read it delivers: the reader's buffer, borrowed. The spent
+	// read token keeps the next read from overwriting it, or pending, before the task has
+	// copied it; the channel handoffs (post, then the token's return) order the two.
+	var pending []byte
+	deliver := func() {
+		b := pending
+		pending = nil
+		n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
+	}
 	return func(b []byte) {
-		// b is the reader's buffer, borrowed: the spent read token keeps the next read
-		// from overwriting it before the task copies it.
-		n.el.post(func() {
-			n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b))
-		})
+		pending = b
+		n.el.post(deliver)
 	}
 }
 
@@ -270,6 +277,6 @@ func (n *netHost) onClose(id int64) func() {
 }
 
 // invoke calls a retained JS dispatcher and frees the arguments.
-func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
+func (n *netHost) invoke(fn qjs.Value, args ...qjs.Value) {
 	dispatch(n.qc, "netHost: dispatcher error", fn, args...)
 }

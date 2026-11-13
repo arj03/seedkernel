@@ -19,7 +19,9 @@ import (
 
 // goFunc is a Go function exposed to JS via (*Context).Function. A call short of an
 // argument it indexes panics, which callGo turns into a JS exception.
-type goFunc = func(*Context, []*Value) (*Value, error)
+// The arguments are borrowed for the call: the slice is reused by the next call at the same
+// depth, so a function that keeps an argument Dups it. A zero result answers undefined.
+type goFunc = func(*Context, []Value) (Value, error)
 
 // Runtime owns one engine: the wazero runtime, the qjs module, and the QuickJS runtime and
 // context inside it. Single-threaded.
@@ -37,6 +39,11 @@ type Runtime struct {
 	undefined, null uint64
 	// Whether ints box as tag 0 over their 32 bits, so Go reads and makes them itself.
 	fastInt bool
+
+	// A JS→Go call's arguments (callGo), per depth and reused, so a crossing allocates
+	// nothing. Calls nest (JS→Go→JS→Go), so each depth in flight has its own.
+	goArgs  [][]Value
+	goDepth int
 }
 
 // fnPool is one export's free list of resolved instances, held by pointer so an engine
@@ -366,8 +373,13 @@ func (r *Runtime) readString(packed uint64) string {
 // call; `this` is ignored.
 func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 	c := r.ctxt
+	// This depth's argument buffer is ours until we return; a JS→Go call made from inside
+	// fn takes the next one.
+	d := r.goDepth
+	r.goDepth++
 	// A panic becomes a JS exception rather than a trap.
 	defer func() {
+		r.goDepth = d
 		if rec := recover(); rec != nil {
 			stack[0] = c.throwError(fmt.Errorf("%v", rec))
 		}
@@ -375,20 +387,24 @@ func (r *Runtime) callGo(_ context.Context, _ api.Module, stack []uint64) {
 
 	argc, argv, id := api.DecodeU32(stack[2]), api.DecodeU32(stack[3]), api.DecodeU32(stack[4])
 	fn := r.funcs[id]
-	vals := make([]Value, argc)
-	args := make([]*Value, argc)
+	if d == len(r.goArgs) {
+		r.goArgs = append(r.goArgs, nil)
+	}
+	if uint32(cap(r.goArgs[d])) < argc {
+		r.goArgs[d] = make([]Value, argc)
+	}
+	args := r.goArgs[d][:argc]
 	for i := range args {
 		h, _ := r.mem.ReadUint64Le(argv + uint32(i)*8)
-		vals[i] = Value{c: c, raw: h}
-		args[i] = &vals[i]
+		args[i] = Value{c: c, raw: h}
 	}
 	res, err := fn(c, args)
 	switch {
 	case err != nil:
 		stack[0] = c.throwError(err)
-	case res == nil:
+	case res.c == nil:
 		stack[0] = r.undefined
 	default:
-		stack[0] = res.Raw()
+		stack[0] = res.raw
 	}
 }

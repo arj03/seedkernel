@@ -33,26 +33,28 @@ type udpHost struct {
 	// buffer drops one, and the stream sends it again.
 	held    atomic.Int64
 	heldMax atomic.Int64
-}
 
-// The largest delivered batch a socket keeps to fill again: a few datagrams.
-const udpSpareMax = 8 << 10
+	// Delivered batch buffers, shared by every socket so a burst's buffer is filled again
+	// rather than regrown. The GC lets idle ones go, so no socket keeps its largest.
+	batches sync.Pool
+}
 
 type udpSock struct {
 	conn    *net.UDPConn
-	deliver *qjs.Value // the callback it was bound with, freed on close
+	deliver qjs.Value // the callback it was bound with, freed on close
 
 	mu     sync.Mutex
-	held   []byte // datagrams read and not yet delivered, packed
-	spare  []byte // the batch delivered last, which the reader fills next: the loop's alone
-	posted bool   // a delivery is queued on the loop
+	held   *[]byte // datagrams read and not yet delivered, packed, in a pooled buffer
+	posted bool    // a delivery is queued on the loop
+	task   func() // the delivery the reader posts, made once so posting allocates nothing
 }
 
 // exposeUdp installs `__udp`.
 func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 	u := &udpHost{el: el, qc: qc, socks: map[int64]*udpSock{}}
+	u.batches.New = func() any { return new([]byte) }
 	o := qc.NewObject()
-	o.SetPropertyStr("bind", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("bind", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// Go binds [::] dual-stack where the machine has IPv6, and 0.0.0.0 where it has not, on
 		// the port asked for, or one the OS picks for 0.
 		port := 0
@@ -61,7 +63,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		}
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		// The buffers the host asks for; a kernel that caps the size grants what it allows,
 		// which is no reason to fail.
@@ -74,6 +76,7 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		id := u.nextID
 		u.socks[id] = s
 		u.mu.Unlock()
+		s.task = func() { u.deliver(id, s) }
 		go u.read(id, s)
 		r := qc.NewObject()
 		r.SetPropertyStr("id", qc.NewInt64(id))
@@ -86,10 +89,10 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 	// an IPv4 socket among them. An address is sent to at once, from a view of the batch; a
 	// name is resolved to IPv4 off the loop goroutine, from a copy. A batch is mostly one
 	// path's, so a socket is looked up once a run.
-	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		b, err := args[0].View()
 		if err != nil {
-			return nil, err
+			return qjs.Value{}, err
 		}
 		var s *udpSock
 		sid := int64(-1)
@@ -119,9 +122,9 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 				}
 			}()
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
-	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("close", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		id := args[0].Int64()
 		u.mu.Lock()
 		s := u.socks[id]
@@ -132,10 +135,10 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 			// A delivery still queued finds the socket gone and never reaches it.
 			s.deliver.Free()
 		}
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	// Every address; which are candidates is the transport's (udp.js).
-	o.SetPropertyStr("addresses", qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	o.SetPropertyStr("addresses", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		addrs, _ := net.InterfaceAddrs()
 		ips := make([]string, 0, len(addrs))
 		for _, a := range addrs {
@@ -183,16 +186,19 @@ func (u *udpHost) read(id int64, s *udpSock) {
 			continue
 		}
 		s.mu.Lock()
-		s.held = append(s.held, byte(len(ip)))
-		s.held = append(s.held, ip...)
-		s.held = binary.BigEndian.AppendUint16(s.held, from.Port())
-		s.held = binary.BigEndian.AppendUint16(s.held, uint16(n))
-		s.held = append(s.held, buf[:n]...)
+		if s.held == nil {
+			s.held = u.batches.Get().(*[]byte)
+		}
+		h := append(*s.held, byte(len(ip)))
+		h = append(h, ip...)
+		h = binary.BigEndian.AppendUint16(h, from.Port())
+		h = binary.BigEndian.AppendUint16(h, uint16(n))
+		*s.held = append(h, buf[:n]...)
 		post := !s.posted
 		s.posted = true
 		s.mu.Unlock()
 		if post {
-			u.el.post(func() { u.deliver(id, s) })
+			u.el.post(s.task)
 		}
 	}
 }
@@ -200,23 +206,23 @@ func (u *udpHost) read(id int64, s *udpSock) {
 // deliver runs on the loop goroutine and hands JS everything held.
 func (u *udpHost) deliver(id int64, s *udpSock) {
 	s.mu.Lock()
-	batch := s.held
-	s.held, s.posted = s.spare, false
+	held := s.held
+	s.held, s.posted = nil, false
 	s.mu.Unlock()
+	batch := *held
 	// Released here, whether or not the socket is still there to take it.
 	u.held.Add(-int64(len(batch)))
-	if u.get(id) == nil {
-		return
+	ab := qjs.Value{}
+	if u.get(id) != nil {
+		ab = u.qc.NewArrayBuffer(batch)
 	}
-	ab := u.qc.NewArrayBuffer(batch)
-	// The realm has its own copy, so the reader fills this one again, without growing it.
-	// A burst's buffer is let go, or every socket would keep its largest: the held budget
-	// counts bytes in use, not what sockets keep.
-	s.spare = nil
-	if cap(batch) <= udpSpareMax {
-		s.spare = batch[:0]
+	// The realm has its own copy, so the buffer goes back for any socket to fill again,
+	// without regrowing it.
+	*held = batch[:0]
+	u.batches.Put(held)
+	if !ab.IsZero() {
+		dispatch(u.qc, "udpHost: dispatcher error", s.deliver, ab)
 	}
-	dispatch(u.qc, "udpHost: dispatcher error", s.deliver, ab)
 }
 
 // close tears the sockets down with their realm.

@@ -69,7 +69,7 @@ func TestWASIStubsAreUnreachable(t *testing.T) {
 		`JSON.parse("[".repeat(100000) + "]".repeat(100000))`,
 		`new Array(2e7).fill(0)`,
 	} {
-		if v, err := c.Eval("wasi-probe.js", src); err == nil && v != nil {
+		if v, err := c.Eval("wasi-probe.js", src); err == nil {
 			v.Free()
 		}
 		_ = c.Pump()

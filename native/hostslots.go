@@ -43,12 +43,12 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 	l := &loader{rt: rt, qc: rt.Context()}
 	exposeFs(l.qc)
 	b := l.qc.NewObject()
-	b.SetPropertyStr("log", l.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("log", l.qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		fmt.Fprintln(os.Stderr, "  host   "+args[0].String())
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	// The clock: fn runs after ms, in turn with the other callers.
-	b.SetPropertyStr("after", l.qc.Function(func(qc *qjs.Context, args []*qjs.Value) (*qjs.Value, error) {
+	b.SetPropertyStr("after", l.qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		fn := args[1].Dup()
 		time.AfterFunc(time.Duration(args[0].Int64())*time.Millisecond, func() {
 			l.mu.Lock()
@@ -56,7 +56,7 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 			dispatch(l.qc, "loader", fn)
 			fn.Free()
 		})
-		return nil, nil
+		return qjs.Value{}, nil
 	}))
 	l.qc.Global().SetPropertyStr("bridge", b)
 	// argv crosses as one string, each argument behind a NUL, which no argument holds.
@@ -71,7 +71,7 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 			os.Getenv("SEEDKERNEL_HOST_HEALTH_MS"))
 	}
 	if err == nil {
-		err = l.call(`PLATFORM_ABI`, func(v *qjs.Value) { l.abi = int(v.Int32()) })
+		err = l.call(`PLATFORM_ABI`, func(v qjs.Value) { l.abi = int(v.Int32()) })
 	}
 	if err != nil {
 		rt.Close()
@@ -82,12 +82,12 @@ func newLoader(engine []byte, argv []string, genesis []byte) (*loader, error) {
 
 // call evaluates expr in turn with the other callers, with args (strings, bytes, bools)
 // as __a0…__aN, and hands its value to read, borrowed for the call; nil ignores it.
-func (l *loader) call(expr string, read func(*qjs.Value), args ...any) error {
+func (l *loader) call(expr string, read func(qjs.Value), args ...any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	g := l.qc.Global()
 	for i, a := range args {
-		var v *qjs.Value
+		var v qjs.Value
 		switch a := a.(type) {
 		case string:
 			v = l.qc.NewString(a)
@@ -115,6 +115,6 @@ func (l *loader) call(expr string, read func(*qjs.Value), args ...any) error {
 }
 
 // readBool reads a JS boolean into out.
-func readBool(out *bool) func(*qjs.Value) {
-	return func(v *qjs.Value) { *out = v.Int32() != 0 }
+func readBool(out *bool) func(qjs.Value) {
+	return func(v qjs.Value) { *out = v.Int32() != 0 }
 }

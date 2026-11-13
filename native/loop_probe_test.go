@@ -138,9 +138,9 @@ func TestLoopTimerRunsDuringTaskBacklog(t *testing.T) {
 	defer rt.Close()
 	l := newEventLoop(rt.Context())
 	count, fired := 0, false
-	cb := l.c.Function(func(c *qjs.Context, _ []*qjs.Value) (*qjs.Value, error) {
+	cb := l.c.Function(func(c *qjs.Context, _ []qjs.Value) (qjs.Value, error) {
 		fired, l.stopped = true, true
-		return nil, nil
+		return qjs.Value{}, nil
 	})
 	var task func()
 	task = func() {

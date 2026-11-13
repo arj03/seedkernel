@@ -113,7 +113,7 @@ func TestSlotsPassOverWhatIsNotAHost(t *testing.T) {
 			t.Fatal(err)
 		}
 		var got []byte
-		err := l.call(`__loader.choose()`, func(v *qjs.Value) { got, _ = v.Bytes() })
+		err := l.call(`__loader.choose()`, func(v qjs.Value) { got, _ = v.Bytes() })
 		if err != nil || string(got) != string(genesisHost) {
 			t.Fatalf("%s: the slots did not fall back on the genesis blob (%v)", what, err)
 		}
@@ -148,7 +148,7 @@ func TestLoaderFlags(t *testing.T) {
 	call := func(fn string, argv []string, out any) error {
 		j, _ := json.Marshal(argv)
 		var s string
-		err := l.call(`JSON.stringify(`+fn+`(JSON.parse(__a0)))`, func(v *qjs.Value) { s = v.String() }, string(j))
+		err := l.call(`JSON.stringify(`+fn+`(JSON.parse(__a0)))`, func(v qjs.Value) { s = v.String() }, string(j))
 		if err == nil {
 			err = json.Unmarshal([]byte(s), out)
 		}
