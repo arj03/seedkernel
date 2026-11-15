@@ -58,6 +58,9 @@ export type Engine = (wasm: Uint8Array, imports: EngineImports) => EngineInstanc
 const PARKED = 0, ANSWERED = 1, REFUSED = 3;
 /** An R_* entry whose deadline fired (realm.c). */
 const INTERRUPTED = -1;
+/** From this size, bytes for the guest are written into the buffer it receives them in
+ *  (realm.c `R_Arg`): one more call into the realm, one copy fewer. */
+const HAND_OVER_BYTES = 16 * 1024;
 
 /** One invocation's execution record. Each host call keeps the record it was made under
  *  and resumes on it, since a deferred invocation outlives its entry (§12.3). */
@@ -102,29 +105,35 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
 
     // ── the instance ─────────────────────────────────────────────────────────
     let inst!: EngineInstance;
-    let R_Buf!: EngineExport, R_Invoke!: EngineExport, R_Settle!: EngineExport;
+    let R_Buf!: EngineExport, R_Arg!: EngineExport, R_Invoke!: EngineExport, R_Settle!: EngineExport;
     // The exchange buffer's address, and the most this side has grown it to. It moves only
     // when it grows, and realm.c passes the address with every import that grew it.
     let bufPtr = 0;
     let bufLen = -1;
-    /** Stage bytes in the exchange buffer, parts back to back, answering their length. */
-    const stage = (bytes: Parts): number => {
+    /** Stage bytes in the exchange buffer, parts back to back, answering their length.
+     *  `toGuest` bytes are the guest's next argument or answer, and large ones are staged
+     *  in the buffer it will hold. */
+    const stage = (bytes: Parts, toGuest = false): number => {
       // Indexed, not `for...of`: an iterator is an allocation per call on the native loop.
       const one = bytes instanceof Uint8Array;
       let len = 0;
       if (one) len = bytes.length;
       else for (let i = 0; i < bytes.length; i++) len += bytes[i].length;
-      if (len > bufLen) {
-        const ptr = R_Buf(len);
-        if (ptr === 0) throw new Error("guest: realm out of memory");
-        bufPtr = ptr;
+      let to = bufPtr;
+      if (toGuest && len >= HAND_OVER_BYTES) {
+        to = R_Arg(len);
+        if (to === 0) throw new Error("guest: realm out of memory");
+      } else if (len > bufLen) {
+        to = R_Buf(len);
+        if (to === 0) throw new Error("guest: realm out of memory");
+        bufPtr = to;
         bufLen = len;
       }
       if (one) {
-        if (len > 0) inst.write(bufPtr, bytes);
+        if (len > 0) inst.write(to, bytes);
         return len;
       }
-      for (let i = 0, at = bufPtr; i < bytes.length; at += bytes[i++].length) {
+      for (let i = 0, at = to; i < bytes.length; at += bytes[i++].length) {
         if (bytes[i].length > 0) inst.write(at, bytes[i]);
       }
       return len;
@@ -160,7 +169,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
       const under = budget.detached ? create() : made;
       causalContext.run(budget.causalClock, () => {
         try {
-          const len = stage(bytes ?? enc.encode(errMessage(error)));
+          const len = bytes ? stage(bytes, true) : stage(enc.encode(errMessage(error)));
           enter(under, budget.causalClock, (deadlineNs) => R_Settle(callId, bytes ? 1 : 0, len, deadlineNs));
         } catch (err) {
           // Interrupted or out of memory while resuming: guest code can't catch either, so
@@ -201,7 +210,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
             // With no time left in the segment, this refuses.
             const budget = new CallBudget(remainingMs < 0 ? Infinity : remainingMs, causalContext.current, made);
             const result = opts.hostCall(name, bytes.subarray(nameBytes), budget);
-            if (!(result instanceof Promise)) return (stage(result) << 2) | ANSWERED;
+            if (!(result instanceof Promise)) return (stage(result, true) << 2) | ANSWERED;
             settleByDeadline(deadlines.hostCall, budget.remainingMs, result, HOST_CALL_LATE,
               (answer, error) => settle(callId, answer, error, budget, made));
             return PARKED;
@@ -244,6 +253,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
     };
     try {
       R_Buf = guarded("R_Buf");
+      R_Arg = guarded("R_Arg");
       R_Invoke = guarded("R_Invoke");
       R_Settle = guarded("R_Settle");
       const R_Eval = guarded("R_Eval");
@@ -278,7 +288,7 @@ export function engineRealms(engine: Engine, qjs: Uint8Array): RealmFactory {
       let deferred = false;
       causalContext.run(causalClock, () => {
         try {
-          const len = stage(payload);
+          const len = stage(payload, true);
           // Runs `handle` to its first await and drains the continuations it queued.
           deferred = enter(budget, causalClock, (deadlineNs) => R_Invoke(id, len, deadlineNs)) === 1;
         } catch (err) {

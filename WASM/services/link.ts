@@ -383,9 +383,9 @@ export class TransportHost {
 
   /** Call the transport. The realm serializes invocations, so one link's bytes arrive in
    *  order. */
-  private toTransport(args: OpArgs): Promise<Uint8Array> | null {
+  private toTransport(event: OpArgs | Parts): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
-    return this.call(args.split(HOST_CALLER_ID));
+    return this.call(event instanceof OpArgs ? event.split(HOST_CALLER_ID) : event);
   }
 
   /** Log a rejected op, except a realm disposed by this driver's own teardown. */
@@ -555,6 +555,9 @@ export class TransportHost {
     // The occupant paused the link: no read reaches it until it resumes.
     let paused = false;
     const held = new Fifo<Uint8Array>();
+    // A `linkBytes` event up to its read, `[caller][op][link u32][len u32]`, framed once:
+    // only the length changes, and one read per link is in the realm at a time.
+    const readHead = ev("linkBytes").u32(linkId).u32(0).build(HOST_CALLER_ID);
 
     const dropHeld = () => {
       for (let i = 0; i < held.size; i++) this.releaseInboundRead(held.at(i).length);
@@ -607,7 +610,8 @@ export class TransportHost {
       try { channel.setReadable?.(false); }
       catch { releaseActive(); failReadSide(); return false; }
       let result: Promise<Uint8Array> | null;
-      try { result = this.toTransport(ev("linkBytes").u32(linkId).blob(bytes)); }
+      writeU32BE(readHead, readHead.length - 4, bytes.length);
+      try { result = this.toTransport([readHead, bytes]); }
       catch (err) { this.reportOpError("linkBytes", err); return true; }
       if (!result) return true;
       void result.then(releaseRead, (err: unknown) => { this.reportOpError("linkBytes", err); releaseRead(); });

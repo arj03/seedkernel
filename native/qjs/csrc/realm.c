@@ -33,6 +33,7 @@
 
 /* From shim.c: the runtime constructor, which arms the deadline interrupt handler. */
 JSContext *QJS_New(uint64_t memory_limit, int track_rejections);
+JSValue QJS_OwnArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len);
 void QJS_SetDeadline(int64_t ns_from_now);
 int64_t QJS_DeadlineLeft(void);
 int QJS_TakeInterrupted(void);
@@ -79,6 +80,42 @@ uint8_t *R_Buf(int32_t len)
         xcap = cap;
     }
     return xbuf;
+}
+
+/* Bytes on their way to the guest are staged in the exchange buffer and copied out of it,
+   unless the embedder asked for the buffer the guest receives them in (R_Arg) and wrote
+   them there: a large payload is then copied once. */
+static uint8_t *handed;
+
+/* A buffer of len bytes on the realm's heap, which the next R_Invoke, R_Settle or
+   host-call answer hands the guest as its bytes. 0 when the heap cannot hold it. One not
+   taken by then is freed. */
+uint8_t *R_Arg(int32_t len)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    js_free_rt(rt, handed);
+    handed = js_malloc_rt(rt, len > 0 ? (size_t)len : 1);
+    return handed;
+}
+
+static void unstage(void)
+{
+    js_free_rt(JS_GetRuntime(ctx), handed);
+    handed = NULL;
+}
+
+/* The len bytes the embedder staged, as the guest's ArrayBuffer. */
+static JSValue staged(size_t len)
+{
+    uint8_t *buf = handed;
+    handed = NULL;
+    if (!buf) {
+        buf = js_malloc_rt(JS_GetRuntime(ctx), len ? len : 1);
+        if (!buf)
+            return JS_ThrowOutOfMemory(ctx);
+        memcpy(buf, xbuf, len);
+    }
+    return QJS_OwnArrayBuffer(ctx, buf, len);
 }
 
 /* Appends what fits of s at xbuf + at, answering the new length. */
@@ -358,12 +395,13 @@ static JSValue host_call(JSContext *c, JSValueConst this_val, int argc, JSValueC
     if (kind == ANSWER_BYTES) {
         /* Charged while it is copied in; a refused copy rejects with the reason. */
         refused = reserve(i, answer_len);
-        v = refused ? JS_NewString(c, refused) : JS_NewArrayBufferCopy(c, xbuf, answer_len);
+        v = refused ? JS_NewString(c, refused) : staged(answer_len);
     } else if (kind == ANSWER_REJECT) {
         v = JS_NewStringLen(c, (const char *)xbuf, answer_len);
     } else {
         v = throw_message(c, (const char *)xbuf, answer_len);
     }
+    unstage();
     release(i);
 out:
     parts_free(c, &p);
@@ -482,7 +520,7 @@ int32_t R_Eval(int32_t len, int32_t preamble, double deadline_ns)
    jobs it queued. Answers 1 when the guest deferred its answer, 0 when not. */
 int32_t R_Invoke(double id, int32_t len, double deadline_ns)
 {
-    JSValue args[2] = { JS_NewFloat64(ctx, id), JS_NewArrayBufferCopy(ctx, xbuf, (size_t)len) };
+    JSValue args[2] = { JS_NewFloat64(ctx, id), staged((size_t)len) };
     QJS_SetDeadline((int64_t)deadline_ns);
     JSValue r = JS_Call(ctx, start_fn, JS_UNDEFINED, 2, args);
     JS_FreeValue(ctx, args[1]);
@@ -502,17 +540,19 @@ int32_t R_Invoke(double id, int32_t len, double deadline_ns)
 int32_t R_Settle(double call_id, int32_t ok, int32_t len, double deadline_ns)
 {
     int i = find_call(call_id);
-    if (i < 0)
+    if (i < 0) {
+        unstage();
         return 0;
+    }
     JSValue arg;
     const char *refused = ok ? reserve(i, (size_t)len) : NULL;
     if (refused) {
         ok = 0;
         arg = JS_NewString(ctx, refused);
     } else {
-        arg = ok ? JS_NewArrayBufferCopy(ctx, xbuf, (size_t)len)
-                 : JS_NewStringLen(ctx, (const char *)xbuf, (size_t)len);
+        arg = ok ? staged((size_t)len) : JS_NewStringLen(ctx, (const char *)xbuf, (size_t)len);
     }
+    unstage();
     release(i);
     JSValue args[3] = { JS_NewFloat64(ctx, call_id), JS_NewBool(ctx, ok), arg };
     QJS_SetDeadline((int64_t)deadline_ns);

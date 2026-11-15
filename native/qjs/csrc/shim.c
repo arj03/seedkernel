@@ -256,11 +256,30 @@ uint64_t QJS_ToCString(JSContext *ctx, JSValue v)
 
 /* ── bytes ───────────────────────────────────────────────────────────────── */
 
-/* A zeroed ArrayBuffer of len bytes, for the caller to fill in place through
-   QJS_GetBytes. */
+static void *bytes_realloc(JSRuntime *rt, void *opaque, void *ptr, size_t size)
+{
+    (void)opaque;
+    return js_realloc_rt(rt, ptr, size);
+}
+
+/* An ArrayBuffer over buf, at least one byte from js_malloc_rt, which it takes on every
+   path. */
+JSValue QJS_OwnArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len)
+{
+    JSValue v = JS_NewArrayBuffer(ctx, buf, len, 0, bytes_realloc, NULL, false);
+    if (JS_IsException(v))
+        js_free_rt(JS_GetRuntime(ctx), buf);
+    return v;
+}
+
+/* An ArrayBuffer of len bytes for the caller to fill in place through QJS_GetBytes. The
+   bytes are not cleared: the caller writes every one before JS runs again. */
 JSValue QJS_NewArrayBuffer(JSContext *ctx, size_t len)
 {
-    return JS_NewArrayBufferCopy(ctx, NULL, len);
+    uint8_t *buf = js_malloc_rt(JS_GetRuntime(ctx), len ? len : 1);
+    if (!buf)
+        return JS_ThrowOutOfMemory(ctx);
+    return QJS_OwnArrayBuffer(ctx, buf, len);
 }
 
 /* The bytes an ArrayBuffer or a TypedArray covers, packed; all ones with the exception

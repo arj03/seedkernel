@@ -74,6 +74,7 @@ target_link_options(qjswasm PRIVATE
     "LINKER:--export=JS_GetException"
 
     "LINKER:--export=R_Buf"
+    "LINKER:--export=R_Arg"
     "LINKER:--export=R_Init"
     "LINKER:--export=R_Eval"
     "LINKER:--export=R_Invoke"
