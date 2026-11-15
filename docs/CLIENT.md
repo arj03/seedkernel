@@ -256,7 +256,7 @@ Apps import only `seedkernel-wasm` and `seedkernel-wasm/*`, as [`WASM/package.js
 - `./control`: `controlInvoke`, `controlServes`, `serveControl`.
 - `./node`: `appSigner`, a host-side mirror of one app's scoped sign and verify.
 - `./subkeys`: `deriveNodeKey`, the node keypair from a master seed (§12.6.2b).
-- `.`: Node's `loadCrypto` and `generateKeyPair`. `loadCrypto` is the host's own trust root from the package's host blob (BLAKE2b, Ed25519, X25519, ChaCha20-Poly1305, ML-DSA-65, randomness) and nothing more; an app needing more of libsodium takes its own.
+- `.`: Node's `loadCrypto` and `generateKeyPair`. `loadCrypto` is the host's own trust root from the package's host blob (Ed25519, X25519, ML-DSA-65, randomness), with the platform's AES-256-GCM and SHA-256 beside it, and nothing more; an app needing more of libsodium takes its own.
 
 **Platforms**
 - `./platform`, `./platform-web`, `./host-web.skb`: a host over a platform; the browser platform; the blob a page serves.

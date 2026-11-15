@@ -69,33 +69,29 @@ func TestGuestSeamOps(t *testing.T) {
 
 	// A primitive is reached by name under `crypto/`; there is no op number per algorithm.
 
-	// crypto/blake2b, [outLen][keyLen][key][msg], over RFC 7693's whole interface: the
-	// system hash's 32 bytes, and the published 64-byte unkeyed and keyed answers.
-	h := callBytes("crypto/blake2b", append([]byte{32, 0}, "hello seedkernel"...))
-	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"), null)`)
-	if !bytes.Equal(h, want) {
-		t.Fatalf("crypto/blake2b(32) = %x, want %x", h, want)
+	// crypto/sha256 and crypto/aes256gcm, the platform's own (here Go's): FIPS 180-4's
+	// "abc", and the GCM specification's AES-256 test cases 13 and 14 (zero key and nonce).
+	if got := hex.EncodeToString(callBytes("crypto/sha256", []byte("abc"))); got != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+		t.Fatalf("crypto/sha256(abc) = %s", got)
 	}
-	blake2bKat := func(arg []byte, wantHex string) {
+	gcm := func(name string, body []byte) []byte {
 		t.Helper()
-		if got := hex.EncodeToString(callBytes("crypto/blake2b", arg)); got != wantHex {
-			t.Fatalf("crypto/blake2b(%x) = %s, want %s", arg[:2], got, wantHex)
-		}
+		// [npub 12][key 32][adLen u32], all zero, then the body.
+		return callBytes(name, append(make([]byte, 12+32+4), body...))
 	}
-	// RFC 7693 Appendix A: BLAKE2b-512("abc").
-	blake2bKat(append([]byte{64, 0}, "abc"...),
-		"ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
-	// BLAKE2's keyed KAT, first entry: key 00..3f, empty message.
-	katKey := make([]byte, 64)
-	for i := range katKey {
-		katKey[i] = byte(i)
+	if got := hex.EncodeToString(gcm("crypto/aes256gcm/seal", nil)); got != "530f8afbc74536b9a963b4f1c4cb738b" {
+		t.Fatalf("crypto/aes256gcm/seal(empty) = %s", got)
 	}
-	blake2bKat(append([]byte{64, 64}, katKey...),
-		"10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568")
-	for _, bad := range [][]byte{{}, {0, 0}, {65, 0}, {32, 65}, {32, 8, 1, 2}} {
-		if err := refused("crypto/blake2b", bad); err == nil {
-			t.Fatalf("crypto/blake2b(%x) answered, want a mis-framing error", bad)
-		}
+	ct := gcm("crypto/aes256gcm/seal", make([]byte, 16))
+	if got := hex.EncodeToString(ct); got != "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919" {
+		t.Fatalf("crypto/aes256gcm/seal(0^16) = %s", got)
+	}
+	if got := gcm("crypto/aes256gcm/open", ct); !bytes.Equal(got, append([]byte{1}, make([]byte, 16)...)) {
+		t.Fatalf("crypto/aes256gcm/open = %x", got)
+	}
+	ct[0] ^= 1
+	if got := gcm("crypto/aes256gcm/open", ct); !bytes.Equal(got, []byte{0}) {
+		t.Fatalf("crypto/aes256gcm/open of a flipped bit = %x, want [0]", got)
 	}
 
 	// node/sign and node/verify are scoped (§12.2): the host applies DOMAIN_guest ‖ scope

@@ -5,9 +5,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import type ts from "typescript";
-import { concatBytes, enc, Fifo, fromHex, toHex } from "../host/util.js";
+import { concatBytes, enc, Fifo, fromHex, toHex, u8, type Bytes } from "../host/util.js";
 import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
+import { nodeSymmetric } from "../host/crypto-node.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../host/domains.js";
 import { callerOf, readOp, writeOp, OpArgs } from "../host/op-frame.js";
 import { utf8Encode, utf8Decode } from "../host/utf8.js";
@@ -41,7 +42,7 @@ export interface HybridAuthorKeys {
 /** What deriving an author's key set needs: the two keygens and the hash between them. */
 export interface AuthorSeedCrypto {
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
-  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+  sha256(msg: Uint8Array): Bytes;
   ml_dsa65_keypair_from_seed(seed: Uint8Array): Keypair;
 }
 
@@ -60,7 +61,7 @@ export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Ar
   return {
     ed: sodium.crypto_sign_seed_keypair(seed),
     mlDsa: sodium.ml_dsa65_keypair_from_seed(
-      sodium.crypto_generichash(32, concatBytes([seed, AUTHOR_MLDSA_SEED_LABEL]), null)),
+      u8(sodium.sha256(concatBytes([seed, AUTHOR_MLDSA_SEED_LABEL])))),
   };
 }
 
@@ -69,7 +70,7 @@ export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Ar
  *  writes, so each clone has its own author (§12.5). Both halves derive from the seed. */
 export function buildAuthor(root: string, keyFile: string, argv: string[]): { sodium: HostSodium; keys: HybridAuthorKeys } {
   const sodium = engineSodium(syncWebEngine, readFileSync(join(root, "browser", "libsodium.wasm")),
-    readFileSync(join(root, "browser", "mldsa65.wasm")), randomBytes);
+    readFileSync(join(root, "browser", "mldsa65.wasm")), randomBytes, nodeSymmetric);
   const flag = argv.indexOf("--key");
   const keyPath = join(root, keyFile);
   let seed: Uint8Array;

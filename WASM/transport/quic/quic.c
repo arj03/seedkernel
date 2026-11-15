@@ -15,14 +15,13 @@
 // sealed under keys only the two authenticated ends hold, once: the link's records go in the
 // clear above the connection.
 //
-// Every packet is ChaCha20-Poly1305 with ChaCha20 header protection, as RFC 9001 §5.4.4 has
-// for that suite; the derivations are BLAKE2b, keyed (Monocypher).
+// Every packet is AES-256-GCM with AES-256 header protection, as RFC 9001 §5.4.3 has for
+// that suite, sealed by the host (`host_crypto`); the derivations, the tokens and the DRBG
+// are HMAC-SHA256 over the host's SHA-256.
 #include <ngtcp2/ngtcp2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "monocypher.h"
 
 // ── the module ABI (§4) ──────────────────────────────────────────────────────
 
@@ -165,9 +164,43 @@ static ngtcp2_tstamp ts_of(double ms) { return EPOCH_NS + (uint64_t)((ms > 0 ? m
 
 // ── keys ─────────────────────────────────────────────────────────────────────
 
-/** BLAKE2b-256 keyed with `key`, over `label`. */
+__attribute__((import_module("host_crypto"), import_name("sha256")))
+void host_sha256(uint8_t *dest, const uint8_t *msg, size_t n);
+
+/** Zeroes a key where the compiler cannot drop the stores. */
+static void wipe(void *p, size_t n) {
+  volatile uint8_t *v = p;
+  while (n--) *v++ = 0;
+}
+
+/** Whether two runs differ, in time independent of where. */
+static int differ(const uint8_t *a, const uint8_t *b, size_t n) {
+  uint8_t d = 0;
+  for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
+  return d != 0;
+}
+
+/** The longest message `hmac` takes: a Retry's address and token. */
+#define MAC_MAX 128
+
+/** HMAC-SHA256 (RFC 2104) keyed with `key`, over `a ‖ b`. */
+static void hmac(uint8_t out[32], const uint8_t key[32], const void *a, size_t an, const void *b, size_t bn) {
+  uint8_t buf[64 + MAC_MAX], inner[32];
+  if (an + bn > MAC_MAX) __builtin_trap();
+  for (int i = 0; i < 64; i++) buf[i] = (i < 32 ? key[i] : 0) ^ 0x36;
+  memcpy(buf + 64, a, an);
+  memcpy(buf + 64 + an, b, bn);
+  host_sha256(inner, buf, 64 + an + bn);
+  for (int i = 0; i < 64; i++) buf[i] ^= 0x36 ^ 0x5c;
+  memcpy(buf + 64, inner, 32);
+  host_sha256(out, buf, 96);
+  wipe(buf, sizeof buf);
+  wipe(inner, sizeof inner);
+}
+
+/** HMAC-SHA256 keyed with `key`, over `label`. */
 static void kdf(uint8_t out[32], const uint8_t key[32], const char *label) {
-  crypto_blake2b_keyed(out, 32, key, 32, (const uint8_t *)label, strlen(label));
+  hmac(out, key, label, strlen(label), NULL, 0);
 }
 
 /** A secret's packet key, as an AEAD or header-protection context holds it. */
@@ -183,14 +216,15 @@ static void iv_of(uint8_t iv[12], const uint8_t secret[32]) {
   memcpy(iv, t, 12);
 }
 
-/** How many packets a 1-RTT key seals before ngtcp2 updates it. */
-#define GENERATION_PACKETS (1ULL << 24)
+/** How many packets a 1-RTT key seals before ngtcp2 updates it: AES-GCM's confidentiality
+ *  limit (RFC 9001 §6.6). */
+#define GENERATION_PACKETS (1ULL << 23)
 
 static ngtcp2_crypto_ctx crypto_ctx(void) {
   ngtcp2_crypto_ctx c = {0};
   c.aead.max_overhead = 16;
   c.max_encryption = GENERATION_PACKETS;
-  c.max_decryption_failure = 1ULL << 36;
+  c.max_decryption_failure = 1ULL << 52;
   return c;
 }
 
@@ -241,7 +275,7 @@ struct path {
   int listener, cids_dirty;
   uint8_t listen_key[32];
   uint8_t seed[32];
-  uint32_t rng_ctr;
+  uint64_t rng_ctr;
   /** Each level's handshake data as it comes, ngtcp2 handing it over in pieces; what of it
    *  is the link's, for the answer; the link's messages sent so far; and whether the peer's
    *  transport parameters are in and the link has its session keys (`F_KEYS`). */
@@ -333,7 +367,7 @@ static int complete(path *p) {
   if (p->completed || !p->have_keys || !p->have_params) return 0;
   p->completed = 1;
   int rv = install_data(p, p->keys);
-  crypto_wipe(p->keys, sizeof p->keys);
+  wipe(p->keys, sizeof p->keys);
   if (rv) return rv;
   ngtcp2_conn_tls_handshake_completed(p->conn);
   return 0;
@@ -352,7 +386,7 @@ static int complete(path *p) {
 enum { HS_LINK = 1, HS_PARAMS = 2 };
 
 /** A run of parameters, as the server holds the client's Initial ones to check. */
-static void params_hash(uint8_t out[32], const uint8_t *b, size_t n) { crypto_blake2b(out, 32, b, n); }
+static void params_hash(uint8_t out[32], const uint8_t *b, size_t n) { host_sha256(out, b, n); }
 
 static int submit_link(path *p, const uint8_t *msg, size_t n) {
   uint8_t b[HS_MAX];
@@ -386,7 +420,7 @@ static int recv_crypto_data(ngtcp2_conn *conn, ngtcp2_encryption_level lv, uint6
     } else if (m[at] == HS_PARAMS && lv == NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE && !p->have_params) {
       if (p->server) {
         params_hash(h, body, len);
-        if (!p->initial_params || crypto_verify32(h, p->params)) return NGTCP2_ERR_CALLBACK_FAILURE;
+        if (!p->initial_params || differ(h, p->params, 32)) return NGTCP2_ERR_CALLBACK_FAILURE;
       } else {
         FAIL(ngtcp2_conn_decode_and_set_remote_transport_params(conn, body, len));
       }
@@ -409,36 +443,40 @@ static int recv_crypto_data(ngtcp2_conn *conn, ngtcp2_encryption_level lv, uint6
 }
 
 // ── packet protection ────────────────────────────────────────────────────────
+//
+// AES-256-GCM, with AES-256 header protection (RFC 9001 §5.3, §5.4.3), done by the host in
+// place on this module's memory: the platform's own AES, which uses the CPU's AES
+// instructions where wasm has none.
+
+__attribute__((import_module("host_crypto"), import_name("seal")))
+void host_seal(uint8_t *dest, const uint8_t *key, const uint8_t *pt, size_t n, const uint8_t *nonce,
+               const uint8_t *aad, size_t alen);
+__attribute__((import_module("host_crypto"), import_name("open")))
+int32_t host_open(uint8_t *dest, const uint8_t *key, const uint8_t *ct, size_t n, const uint8_t *nonce,
+                  const uint8_t *aad, size_t alen);
+__attribute__((import_module("host_crypto"), import_name("block")))
+void host_block(uint8_t *dest, const uint8_t *key, const uint8_t *in);
 
 static int encrypt_cb(uint8_t *dest, const ngtcp2_crypto_aead *aead, const ngtcp2_crypto_aead_ctx *ctx,
                       const uint8_t *pt, size_t n, const uint8_t *nonce, size_t nlen, const uint8_t *aad,
                       size_t alen) {
-  crypto_aead_ctx c;
-  crypto_aead_init_ietf(&c, ctx->native_handle, nonce);
-  crypto_aead_write(&c, dest, dest + n, aad, alen, pt, n);
-  crypto_wipe(&c, sizeof c);
+  host_seal(dest, ctx->native_handle, pt, n, nonce, aad, alen);
   return 0;
 }
 
-/** Opens into `dest`, or leaves it as it was: the tag is checked first. */
 static int decrypt_cb(uint8_t *dest, const ngtcp2_crypto_aead *aead, const ngtcp2_crypto_aead_ctx *ctx,
                       const uint8_t *ct, size_t n, const uint8_t *nonce, size_t nlen, const uint8_t *aad,
                       size_t alen) {
   if (n < 16) return NGTCP2_ERR_DECRYPT;
-  crypto_aead_ctx c;
-  crypto_aead_init_ietf(&c, ctx->native_handle, nonce);
-  int bad = crypto_aead_read(&c, dest, ct + n - 16, aad, alen, ct, n - 16);
-  crypto_wipe(&c, sizeof c);
-  return bad ? NGTCP2_ERR_DECRYPT : 0;
+  return host_open(dest, ctx->native_handle, ct, n, nonce, aad, alen) ? NGTCP2_ERR_DECRYPT : 0;
 }
 
-/** RFC 9001 §5.4.4: the counter is the sample's first four bytes, little-endian, the nonce
- *  the other twelve. */
+/** The mask is the first five bytes of the sample's AES-256 encryption. */
 static int hp_mask_cb(uint8_t *dest, const ngtcp2_crypto_cipher *hp, const ngtcp2_crypto_cipher_ctx *ctx,
                       const uint8_t *sample) {
-  static const uint8_t zero[NGTCP2_HP_MASKLEN];
-  uint32_t ctr = sample[0] | sample[1] << 8 | sample[2] << 16 | (uint32_t)sample[3] << 24;
-  crypto_chacha20_ietf(dest, zero, NGTCP2_HP_MASKLEN, ctx->native_handle, sample + 4, ctr);
+  uint8_t block[16];
+  host_block(block, ctx->native_handle, sample);
+  memcpy(dest, block, NGTCP2_HP_MASKLEN);
   return 0;
 }
 
@@ -457,12 +495,12 @@ static int update_key_cb(ngtcp2_conn *conn, uint8_t *rx_secret, uint8_t *tx_secr
 }
 
 static void delete_aead_cb(ngtcp2_conn *conn, ngtcp2_crypto_aead_ctx *c, void *ud) {
-  if (c->native_handle) crypto_wipe(c->native_handle, 32);
+  if (c->native_handle) wipe(c->native_handle, 32);
   free(c->native_handle);
 }
 
 static void delete_cipher_cb(ngtcp2_conn *conn, ngtcp2_crypto_cipher_ctx *c, void *ud) {
-  if (c->native_handle) crypto_wipe(c->native_handle, 32);
+  if (c->native_handle) wipe(c->native_handle, 32);
   free(c->native_handle);
 }
 
@@ -491,11 +529,7 @@ static void retry_key(uint8_t k[32]) {
 static void retry_cid(ngtcp2_cid *cid, const uint8_t key[32], const ngtcp2_sockaddr_union *from, const uint8_t *token,
                       size_t n) {
   uint8_t h[32];
-  crypto_blake2b_ctx c;
-  crypto_blake2b_keyed_init(&c, 32, key, 32);
-  crypto_blake2b_update(&c, (const uint8_t *)from, sizeof *from);
-  crypto_blake2b_update(&c, token, n);
-  crypto_blake2b_final(&c, h);
+  hmac(h, key, from, sizeof *from, token, n);
   ngtcp2_cid_init(cid, h, 16);
 }
 
@@ -511,7 +545,7 @@ static int token_ok(const uint8_t key[32], const ngtcp2_sockaddr_union *from, co
   if (!(issued <= now_ms && now_ms - issued <= TOKEN_MS)) return 0;
   ngtcp2_cid want;
   retry_cid(&want, key, from, t, hd->tokenlen);
-  if (hd->dcid.datalen != 16 || crypto_verify16(hd->dcid.data, want.data)) return 0;
+  if (hd->dcid.datalen != 16 || differ(hd->dcid.data, want.data, 16)) return 0;
   ngtcp2_cid_init(odcid, t + 1, t[0]);
   return 1;
 }
@@ -561,7 +595,7 @@ static int op_screen(reader *r) {
                                             encrypt_cb, &aead, &ctx);
     if (w > 0 && out_at + 1600 <= SEND_MAX) put_send(socket, &from, buf, (size_t)w);
   }
-  crypto_wipe(k, sizeof k);
+  wipe(k, sizeof k);
   answer[0] = (uint8_t)(n >> 8), answer[1] = (uint8_t)n;
   memmove(answer + 2 + 2 * n, answer + sends, out_at - sends);
   return (int)(2 + 2 * n + out_at - sends);
@@ -569,11 +603,21 @@ static int op_screen(reader *r) {
 
 // ── what ngtcp2 asks of the path ─────────────────────────────────────────────
 
-/** Randomness, drawn from the seed `OP_OPEN` hands in. */
+/** Randomness, drawn from the seed `OP_OPEN` hands in: HMAC-SHA256 under it, over a label
+ *  and a counter, 32 bytes a block. */
 static void rand_cb(uint8_t *dest, size_t n, const ngtcp2_rand_ctx *rc) {
   path *p = rc->native_handle;
-  memset(dest, 0, n);
-  p->rng_ctr = crypto_chacha20_ietf(dest, dest, n, p->seed, (const uint8_t *)"seedkernel-q", p->rng_ctr);
+  static const char label[] = "seedkernel-quic-rng-v1";
+  while (n > 0) {
+    uint8_t ctr[8], block[32];
+    for (int b = 7; b >= 0; b--) ctr[b] = (uint8_t)(p->rng_ctr >> (8 * (7 - b)));
+    p->rng_ctr++;
+    hmac(block, p->seed, label, sizeof label - 1, ctr, sizeof ctr);
+    size_t k = n < sizeof block ? n : sizeof block;
+    memcpy(dest, block, k);
+    wipe(block, sizeof block);
+    dest += k, n -= k;
+  }
 }
 
 /** A connection ID, and its stateless reset token keyed by the path's own secret. */
@@ -584,7 +628,7 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
   rand_cb(cid->data, len, &rc);
   cid->datalen = len;
   kdf(key, p->seed, "seedkernel-quic-reset-v1");
-  crypto_blake2b_keyed(t, 32, key, 32, cid->data, len);
+  hmac(t, key, cid->data, len, NULL, 0);
   memcpy(token->data, t, sizeof token->data);
   p->cids_dirty = 1;
   return 0;
@@ -727,7 +771,7 @@ static void drop(uint32_t id) {
     for (uint64_t c = 0; c < CHUNKS; c++) {
       free_chunk(p, c);
     }
-    crypto_wipe(p, sizeof *p);
+    wipe(p, sizeof *p);
     free(p);
     return;
   }

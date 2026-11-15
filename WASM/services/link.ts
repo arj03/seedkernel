@@ -17,7 +17,7 @@ import {
   UDP_SOCKET_BUFFER_BYTES,
 } from "./net-limits.js";
 import { type LinkEvent } from "../host/domains.js";
-import { datagramEnd, type RawDatagrams } from "./datagrams.js";
+import { datagramEnd, readsWithin, type RawDatagrams } from "./datagrams.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
 import type { ServiceHandlers } from "../host/guest-seam.js";
 import { REALM_DISPOSED, type CausalClock } from "../host/realm-queue.js";
@@ -488,17 +488,23 @@ export class TransportHost {
   }
 
   /** A socket's read, for the next event. Past what the host holds it is dropped, as a full
-   *  socket buffer drops one. */
+   *  socket buffer drops one. A platform that held more than one event carries (native's
+   *  reader, while the loop was busy) is cut between datagrams, so no event is past
+   *  MAX_LINK_READ_BYTES: the occupant reads one whole (quic.js). */
   private heard(id: number, batch: Uint8Array): void {
     if (!this.sockets.has(id) || batch.length > MAX_UDP_HELD_BYTES - this.heldDatagramBytes) return;
     this.heldDatagramBytes += batch.length;
-    let last = this.reads.size > 0 ? this.reads.at(this.reads.size - 1) : undefined;
-    if (!last || last.bytes + batch.length > MAX_LINK_READ_BYTES) {
-      last = { args: ev("datagrams"), bytes: 0 };
-      this.reads.push(last);
+    for (let at = 0; at < batch.length;) {
+      const end = readsWithin(batch, at, MAX_LINK_READ_BYTES);
+      let last = this.reads.size > 0 ? this.reads.at(this.reads.size - 1) : undefined;
+      if (!last || last.bytes + end - at > MAX_LINK_READ_BYTES) {
+        last = { args: ev("datagrams"), bytes: 0 };
+        this.reads.push(last);
+      }
+      last.args.u32(id).blob(batch.subarray(at, end));
+      last.bytes += end - at;
+      at = end;
     }
-    last.args.u32(id).blob(batch);
-    last.bytes += batch.length;
     this.pumpReads();
   }
 

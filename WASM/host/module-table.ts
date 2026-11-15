@@ -4,9 +4,10 @@
 import {
   DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_SCRATCH_SIZE,
+  readModuleLimits,
 } from "./wasm-limits.js";
 import { MODULE_FAILED, moduleSet, type ModuleResult, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { moduleShims, scratchModule } from "./pure-module.js";
+import { hostCryptoImports, moduleShims, scratchModule } from "./pure-module.js";
 import { errMessage } from "./util.js";
 import type { Worker as NodeWorker } from "node:worker_threads";
 
@@ -19,6 +20,11 @@ export interface ModuleTableOptions {
    *  and respawned and the call answers empty. `Infinity` disables it. */
   deadlineMs?: number;
 }
+
+/** Whether module workers serve the `host_crypto` imports (pure-module.ts
+ *  `hostCryptoImports`): by node:crypto, which only Node has. A page refuses a module that
+ *  imports them at install. */
+const HOST_CRYPTO = typeof process === "object" && typeof process.versions?.node === "string";
 
 /** What the table holds per module name. The instance lives in the worker; the host holds
  *  the verified bytes (to respawn after a kill), the live worker, and the state that runs
@@ -80,13 +86,19 @@ let module = null;
 // Node's eval:true workers have no Web globals, so the port is parentPort via require. In
 // a browser dedicated worker, self is the port.
 const port = (typeof require === "function" ? require("node:worker_threads").parentPort : null) ?? self;
+// The platform's crypto on the module's memory, by node:crypto in a Node worker.
+const hostCrypto = typeof require === "function"
+  ? (memory) => (${hostCryptoImports.toString()})(require("node:crypto"), memory)
+  : () => ({});
 const fail = (message) => port.postMessage({ type: "loadError", message: String(message) });
 port.onmessage = (e) => {
   const m = e.data;
   if (m.type === "load") {
     try {
-      const exps = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), moduleShims()).exports;
-      const mem = exps.memory instanceof WebAssembly.Memory ? exps.memory : null;
+      let mem = null;
+      const exps = new WebAssembly.Instance(new WebAssembly.Module(m.wasm),
+        { ...moduleShims(), ...hostCrypto(() => mem) }).exports;
+      mem = exps.memory instanceof WebAssembly.Memory ? exps.memory : null;
       module = scratchModule({
         handle: typeof exps.handle === "function" ? exps.handle : undefined,
         global: (name) => (exps[name] instanceof WebAssembly.Global ? exps[name].value : null),
@@ -173,8 +185,13 @@ export class ModuleTable implements PureModuleLoader {
 
   /** Build one slot's modules, all or none (§3.1), their workers loading side by side, so a
    *  refused bundle leaves no orphaned workers. Names and bytes were checked at install
-   *  (bundle.ts). */
-  build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
+   *  (bundle.ts); a module needing crypto this table does not serve is refused before any
+   *  worker starts. */
+  async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
+    for (const { name, wasm } of mods) {
+      const needs = HOST_CRYPTO ? null : readModuleLimits(wasm).hostCrypto;
+      if (needs !== null) throw new Error(`'${name}' imports ${needs}, which this platform does not provide`);
+    }
     return moduleSet(mods, (wasm) => this.spawn(wasm),
       (ref, payload, deadlineMs) => this.callModule(ref, payload, deadlineMs),
       (ref) => this.teardown(ref));

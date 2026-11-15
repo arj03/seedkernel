@@ -18,7 +18,7 @@ import type { RawDatagrams } from "../services/datagrams.js";
 import type { Bytes, Maybe } from "./util.js";
 
 /** The ABI version a loader implements and the host script requires. */
-export const PLATFORM_ABI = 1;
+export const PLATFORM_ABI = 2;
 
 /** Where a node's store lives when `--dir` is omitted, on every target: the host's (cli.ts)
  *  and its loader's host slots beside it (slots.ts). */
@@ -53,6 +53,15 @@ interface BridgeEntry {
 interface BridgeProcess {
   /** `n` bytes from the platform CSPRNG. */
   random(n: number): Bytes;
+  /** AES-256-GCM: `pt` sealed under `key` (32 bytes) and `nonce` (12), answering
+   *  ciphertext ‖ tag (16): the platform's own on every target, asynchronous where only
+   *  WebCrypto has it. Each reads its arguments before it returns, even when it answers
+   *  later: they may be views of a realm's memory that the next entry overwrites. */
+  aesGcmSeal(key: Uint8Array, nonce: Uint8Array, ad: Uint8Array, pt: Uint8Array): Maybe<Bytes>;
+  /** The plaintext of ciphertext ‖ tag, or null when the tag is wrong. */
+  aesGcmOpen(key: Uint8Array, nonce: Uint8Array, ad: Uint8Array, ct: Uint8Array): Maybe<Bytes | null>;
+  /** SHA-256, natively. Optional: without it the host hashes with the blob's libsodium. */
+  sha256?(msg: Uint8Array): Bytes;
 
   /** The running host blob (host-blob.ts), which carries the realm engine and the host's
    *  crypto. */
@@ -62,6 +71,9 @@ interface BridgeProcess {
    *  refusal throws its reason. */
   stageHost(blob: Uint8Array): Maybe<void>;
 }
+
+/** The platform's symmetric primitives, which the host's crypto passes on. */
+export type Symmetric = Pick<BridgeProcess, "aesGcmSeal" | "aesGcmOpen" | "sha256">;
 
 /** The engine whole, from a loader that can hand the host script objects. It cannot end a
  *  synchronous wasm call at a deadline, so it runs each private module in an isolate of its
@@ -96,6 +108,8 @@ export interface EngineTable {
   engineGlobal(id: number, name: string): number | null;
   engineRead(id: number, ptr: number, len: number): Bytes;
   engineWrite(id: number, ptr: number, bytes: Uint8Array): void;
+  /** Zero `len` bytes at `ptr`, in place. */
+  engineFill(id: number, ptr: number, len: number): void;
   engineDispose(id: number): void;
 }
 

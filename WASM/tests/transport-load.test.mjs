@@ -26,8 +26,8 @@ function countingSodium(base) {
     crypto_scalarmult: "scalarmult",
     crypto_sign_detached: "sign",
     crypto_sign_verify_detached: "verify",
-    crypto_aead_chacha20poly1305_ietf_encrypt: "aead",
-    crypto_aead_chacha20poly1305_ietf_decrypt: "aead",
+    aesGcmSeal: "aead",
+    aesGcmOpen: "aead",
   };
   const sodium = new Proxy(base, {
     get(t, p, r) {
@@ -112,7 +112,7 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
     // byte matters: with a wrong one the guest refuses on the byte alone, a cheaper path
     // than a real attacker gets.
     const junk = new Uint8Array(1233);
-    junk[0] = 0x03; // SUITE_CHANNEL_CONCEALED
+    junk[0] = 0x04; // SUITE_CHANNEL_CONCEALED
     for (let j = 1; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
     d.ch.send(junk);
     dials.push(d);

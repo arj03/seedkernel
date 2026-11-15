@@ -21,7 +21,7 @@ This file follows a bundle's life:
 - **§12.4 Signed bundles**: the envelope, the manifest, the author's keys and freshness.
 - **§12.5 The admission policy**: who may install, and how a slot is replaced or revoked.
 - **§3.1 Atomic load and replacement**: why a failed load leaves nothing behind.
-- **§4 The WASM module ABI**: what a module exports, why it imports nothing, and what it may assume.
+- **§4 The WASM module ABI**: what a module exports, what it may import, and what it may assume.
 - **§16 Module limits**: the numbers every node applies alike.
 
 ---
@@ -37,15 +37,15 @@ body = [manifest_len u32][manifest JSON][guest_len u32][guest UTF-8]
 ```
 
 - Every length is an unsigned 32-bit big-endian byte count. There are no filenames. Missing fields or trailing bytes reject the bundle.
-- **Both signatures**, Ed25519 and ML-DSA-65, are over `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ BLAKE2b-256(body)` (§16.1). **Both must verify**, and the body is authenticated before any of it is interpreted. The signatures commit to every byte and position in the body, so there is no separate content-hash check.
+- **Both signatures**, Ed25519 and ML-DSA-65, are over `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ SHA-256(body)` (§16.1). **Both must verify**, and the body is authenticated before any of it is interpreted. The signatures commit to every byte and position in the body, so there is no separate content-hash check.
 - **Suite** `0x02` is the only one accepted. Another id is refused with its own error, distinct from a bad signature, and suite ids are never reused.
-- **The author id** is `BLAKE2b-256(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`. Policy entries, revocations and freshness marks name it.
+- **The author id** is `SHA-256(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)`. Policy entries, revocations and freshness marks name it.
 
 Why both halves must verify, why the suite byte is signed, and why the author id hashes the whole key set is §14.1. A host blob uses this same envelope under `DOMAIN_host` (§12.9).
 
 ### Author keys
 
-An author's two keys derive from one 32-byte seed: Ed25519 from the seed itself, and ML-DSA-65 from `BLAKE2b-256(seed ‖ AUTHOR_MLDSA_SEED_LABEL)` (§16.1). The seed is the 32-byte Ed25519 seed, not libsodium's 64-byte secret key. The label is frozen and declared in one file: a copy that drifted would show up as a changed author id, so every policy entry would miss and every freshness lineage restart, and no test catches that when each copy agrees only with itself. `scripts/bundle-author.ts` is the reference signer.
+An author's two keys derive from one 32-byte seed: Ed25519 from the seed itself, and ML-DSA-65 from `SHA-256(seed ‖ AUTHOR_MLDSA_SEED_LABEL)` (§16.1). The seed is the 32-byte Ed25519 seed, not libsodium's 64-byte secret key. The label is frozen and declared in one file: a copy that drifted would show up as a changed author id, so every policy entry would miss and every freshness lineage restart, and no test catches that when each copy agrees only with itself. `scripts/bundle-author.ts` is the reference signer.
 
 ### Manifest
 
@@ -148,11 +148,22 @@ Bytes cross through a **scratch region** in the module's own memory. There is no
 
 **Declared tables count against the same budget.** A table is the other allocation a module buys by declaring it, so a bound on memory alone would leave the same exhaustion open under another section. Each declared element is charged `WASM_TABLE_ELEMENT_BYTES` (§16) and added to the module's memory. A table must declare a maximum, be neither imported, shared nor 64-bit indexed, and hold `funcref` or `externref`: a table the check cannot read is a table it cannot charge.
 
-### 4.2 No host imports: the isolation boundary
+### 4.2 Imports: the isolation boundary
 
-A module imports nothing from the runtime. The only imports it may carry are AssemblyScript's runtime shims, `env.abort`, `env.seed` and `env.trace`, and every node resolves exactly that set and nothing else: `seed` returns a constant, `trace` drops its arguments, and `abort` traps, so a module that aborts fails its call everywhere. Any other import, WASI included, refuses the install before instantiation.
+A module reaches nothing through its imports. The only ones it may carry are AssemblyScript's runtime shims, `env.abort`, `env.seed` and `env.trace`, which every node resolves, and the platform's AES and SHA-256, `host_crypto.seal`, `host_crypto.open`, `host_crypto.block` and `host_crypto.sha256`. `seed` returns a constant, `trace` drops its arguments, and `abort` traps, so a module that aborts fails its call everywhere. Any other import, WASI included, refuses the install before instantiation.
 
-The set is fixed rather than per-target because one `trace()` or `Math.random()` anywhere in a module is the difference between loading and a missing-import failure: a node resolving a subset would refuse modules another node accepts, at instantiation, far from anything that reads like an import problem.
+The `host_crypto` imports are computation the CPU does faster than wasm can, since wasm has no AES or SHA instructions: AES-256-GCM, one AES-256 block and SHA-256, done by the host in place on the module's own memory, on pointers into it. What a call costs is the target's: ~0.3 µs for a packet's seal on the native loader, and on Node ~3 µs for a seal or open whatever the size, where `node:crypto` sets up a GCM cipher per call, and ~0.6 µs for a block, whose cipher Node keeps per key. So a module that seals packet by packet, as `quic.wasm` does, gains on native and loses on Node.
+
+| Import | Arguments (i32) | Effect |
+| --- | --- | --- |
+| `host_crypto.seal` | `dest, key, pt, n, nonce, aad, alen` | writes `n + 16` bytes at `dest`: `pt` (`n` bytes) sealed under the 32-byte `key` and 12-byte `nonce`, binding `alen` bytes at `aad`, then the tag |
+| `host_crypto.open` | `dest, key, ct, n, nonce, aad, alen` | answers 0 and writes `n - 16` bytes of plaintext at `dest`, or answers 1 when the tag does not verify |
+| `host_crypto.block` | `dest, key, in` | writes the AES-256 encryption of the 16 bytes at `in` to `dest` |
+| `host_crypto.sha256` | `dest, msg, n` | writes the 32-byte SHA-256 of the `n` bytes at `msg` to `dest` |
+
+They are a platform capability, as datagram sockets are: a platform that has them serves all four, and one that does not refuses a module importing any of them at install, by the import's name, before the module is instantiated.
+
+The shim set is fixed rather than per-target because one `trace()` or `Math.random()` anywhere in a module is the difference between loading and a missing-import failure: a node resolving a subset would refuse modules another node accepts, at instantiation, far from anything that reads like an import problem.
 
 So a module **cannot** reach the filesystem, network, clock or any I/O; call another module or look up a name; or ask who sent its input, who signed anything or who called it. Its input carries everything it knows. When it needs the sender's identity, the guest prepends it to the input from the authenticated channel.
 

@@ -63,6 +63,8 @@ export interface ModuleLimits {
   initialTableElements: number;
   /** The same at declared maxima, or null when any table declares none (refused). */
   maxTableElements: number | null;
+  /** The first `host_crypto` import, or null: whether the module needs the platform's crypto. */
+  hostCrypto: string | null;
 }
 
 interface Cursor { readonly b: Uint8Array; i: number; }
@@ -90,10 +92,12 @@ function readName(c: Cursor): string {
   return name;
 }
 
-/** The only imports a module may make: the inert runtime shims `moduleShims` answers
- *  (pure-module.ts), all functions. Anything else, a WASI call or a memory, table or
- *  global included, is refused here, so a module loads on every target or on none. */
-const MODULE_IMPORTS = new Set(["env.abort", "env.seed", "env.trace"]);
+/** The only imports a module may make, all functions: the inert runtime shims
+ *  `moduleShims` answers (pure-module.ts), and the platform's AES and SHA-256 on the
+ *  module's own memory (`host_crypto`), a platform capability (§4.2). Anything else, a WASI
+ *  call or a memory, table or global included, is refused here. */
+const MODULE_IMPORTS = new Set(["env.abort", "env.seed", "env.trace",
+  "host_crypto.seal", "host_crypto.open", "host_crypto.block", "host_crypto.sha256"]);
 
 /** A `limits` record: flags, initial, then maximum if declared. Shared (0x02) and 64-bit
  *  (0x04+) are outside the §4 contract and refused by name. */
@@ -130,13 +134,14 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
   let memory: MemoryLimits | null = null;
   let initialTableElements = 0;
   let maxTableElements: number | null = 0;
+  let hostCrypto: string | null = null;
   while (c.i < wasm.length) {
     const id = wasm[c.i++];
     const size = readVarU32(c);
     const end = c.i + size;
     if (end > wasm.length) throw new Error("wasm: truncated section");
     if (id === 2) {
-      // Imports: the runtime shims and nothing else (§4.2).
+      // Imports: the runtime shims and the platform's crypto, nothing else (§4.2).
       const count = readVarU32(c);
       for (let k = 0; k < count; k++) {
         const name = readName(c) + "." + readName(c);
@@ -145,6 +150,7 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
           throw new Error(`wasm: module imports ${JSON.stringify(name)} — refused (§4.2: a module imports only ${[...MODULE_IMPORTS].join(", ")})`);
         }
         readVarU32(c);                                        // func: typeidx
+        if (hostCrypto === null && name.startsWith("host_crypto.")) hostCrypto = name;
       }
     } else if (id === 4) {
       // Tables: ordinary compiler output, so charged like pages rather than refused.
@@ -164,7 +170,7 @@ export function readModuleLimits(wasm: Uint8Array): ModuleLimits {
     // Skip to the section end, so an appended field cannot desynchronise the walk.
     c.i = end;
   }
-  return { memory, initialTableElements, maxTableElements };
+  return { memory, initialTableElements, maxTableElements, hostCrypto };
 }
 
 /** Host bytes a module's declared maxima amount to. Reached only through

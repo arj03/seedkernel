@@ -45,7 +45,7 @@ func TestAppPolicyCannotInstallTransport(t *testing.T) {
 func TestTransportNetworkOptional(t *testing.T) {
 	bootRealmIn(t, t.TempDir())
 	got := awaitOK(t, "transport without app policy", `(async () => {
-	  const identity = deriveNodeKey(sodium, sodium.randombytes_buf(32));
+	  const identity = await deriveNodeKey(sodium, sodium.randombytes_buf(32));
 	  for (const network of [false, true]) {
 	    const node = await standUp({ dir: __dir, identity, transport: network ? {} : false });
 	    try {

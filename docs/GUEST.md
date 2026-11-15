@@ -61,9 +61,9 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 | Name | Request | Response |
 | --- | --- | --- |
-| `crypto/blake2b` | `[outLen u8][keyLen u8][key][msg ..]`, `outLen` 1..64, `keyLen` 0..64 | `outLen` bytes of BLAKE2b (RFC 7693), keyed when `keyLen` > 0 |
-| `crypto/chacha20poly1305-ietf/seal` | `[npub 12][key 32][adLen u32][ad][msg ..]` | `ciphertext ‖ tag 16` (RFC 8439), binding `ad` |
-| `crypto/chacha20poly1305-ietf/open` | `[npub 12][key 32][adLen u32][ad][ciphertext ‖ tag ..]` | `[1][plaintext ..]`, or `[0]` when the tag does not verify |
+| `crypto/sha256` | `[msg ..]` | 32 bytes of SHA-256 (FIPS 180-4) |
+| `crypto/aes256gcm/seal` | `[npub 12][key 32][adLen u32][ad][msg ..]` | `ciphertext ‖ tag 16` (AES-256-GCM, SP 800-38D), binding `ad` |
+| `crypto/aes256gcm/open` | `[npub 12][key 32][adLen u32][ad][ciphertext ‖ tag ..]` | `[1][plaintext ..]`, or `[0]` when the tag does not verify |
 | `crypto/x25519/dh` | `[sk 32][pk 32]` | `[1][shared 32]`, or `[0]` for a low-order point. Against the base point it derives a public key. |
 | `crypto/random` | `[n u32]` | `n` bytes of host entropy |
 | `node/sign` | message bytes | 64-byte Ed25519 signature under the node identity over `domain ‖ scope ‖ msg` (Signing scope) |
@@ -94,7 +94,7 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 **fs is scoped to the app label.** A guest's keys live under its `app` label: `fs/list` with an empty prefix enumerates only that app's keys, no key names another app's, and keys come back without the scope. Every bundle under the same label, whoever authored it, sees the same store (§5). `fs/stat` is not scoped: `used` and `available` describe the physical backend, since a per-app `available` would be a fiction when apps share one disk.
 
-**A host transform takes its algorithm's whole standard interface** (the AEAD's associated data, BLAKE2b's output length and key), never the subset one bundle uses. The table itself is frozen and takes no new algorithms; new computation ships as a module of the bundle that needs it. The table exists only because the host already carries the code (§14). A name trimmed to one bundle's use makes the next bundle re-ship that code, or wait for a host release to adopt a standard protocol such as Noise. Published Noise XX vectors run through these names on every target and hold the interfaces there (`tests/noise-vectors.js`).
+**A host transform takes its algorithm's whole standard interface** (the AEAD's associated data and nonce), never the subset one bundle uses. The table takes no new algorithms; new computation ships as a module of the bundle that needs it. SHA-256 and AES-256-GCM are in it because the platform has them natively (the CPU's AES and SHA instructions, through Go, OpenSSL or WebCrypto; a page hashes with the host's libsodium), which a module compiled to wasm cannot match; the rest because the host already carries the code (§14). A name trimmed to one bundle's use makes the next bundle re-ship that code, or wait for a host release to adopt a standard protocol such as Noise. Published Noise XX vectors (`25519_AESGCM_SHA256`) run through these names on every target and hold the interfaces there (`tests/noise-vectors.js`).
 
 **`node/verify` is a grant, not a transform**, because its prefix is the host-derived scope, and "does this verify under *my* scope?" is a fact the guest cannot state for itself.
 
@@ -112,7 +112,7 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 **No name re-enters the calling realm.** A socket write does not deliver during the write, an armed timer fires on a later turn, and a call into another realm (a local service id, `link/deliver`) runs its callee on a later turn. A guest answering such a call fires it and returns rather than awaiting it inside its own frame, because invocations are serialized per realm (§12.3) and a re-entrant answer would deadlock on the frame that asked for it.
 
-**`fs/*`, `crypto/*` and `node/*` answer within the asking turn**: the guest's `await` continues with no host turn in between. Module calls, local service ids, `link/deliver`, `link/udpBind` and `host/stage` answer on a later turn. The file primitive under every fs backend is synchronous on every target, so a guest cannot work on one backend and fail on another by accident. A durable browser backend therefore has to be synchronous too (OPFS sync access handles in a Worker, or a store loaded from IndexedDB and persisted behind it).
+**`fs/*`, `crypto/*` and `node/*` answer within the asking turn**: the guest's `await` continues with no host turn in between. The exceptions are `crypto/aes256gcm/seal` and `crypto/aes256gcm/open`, which answer when the platform's AES does: in the turn on native and Node, on a later turn on a page. Module calls, local service ids, `link/deliver`, `link/udpBind` and `host/stage` answer on a later turn. The file primitive under every fs backend is synchronous on every target, so a guest cannot work on one backend and fail on another by accident. A durable browser backend therefore has to be synchronous too (OPFS sync access handles in a Worker, or a store loaded from IndexedDB and persisted behind it).
 
 **`__deferred`.** A guest that will answer on a later turn sets `globalThis.__deferred = true` during the synchronous part of `handle`. The realm's queue is freed at the end of that segment though nothing has settled; the invocation's deadline stays attached to the answer and settles one that never arrives. This is the one ABI bit beyond `handle` returning bytes. Serializing invocations is right when the answer comes from outside, since a guest parked on a module call is suspended mid-update and must hold the queue. It is wrong when the answer arrives *through* the realm: the transport answers an app's send by reading bytes off a link, and that read is another invocation of the same realm, so awaiting inside the frame would hold the queue against the only event that could settle it. The flag hands over queue occupancy, never time, which is why the deadline stays.
 
@@ -143,6 +143,7 @@ No padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLeng
 
 - **`linkId` 0 is never a live link.** `linkOpen` announces a socket the platform accepted or opened; a link the guest opened gets its id from `link/open` instead, with no event.
 - **Arrival metadata is platform metadata, not identity.** `listener` is the label of the listener that accepted the link, `via` the live link it arrived through (how a WebRTC data channel names the negotiation link that opened it, §12.7), and `remoteAddr` the source address. Each is empty or 0 when absent.
+- **A `datagrams` event's batches are at most `MAX_LINK_READ_BYTES` together**, cut between datagrams when the platform held more, so an occupant can take one event whole.
 - **`listening`** hands the occupant a `udp` listener the operator configured, as one of its own datagram sockets. It is bound each time an occupant takes `link`, so it goes with the occupant as its other sockets do.
 
 There is one envelope because host events and peer requests arrive at the same `handle`, and the zero caller id is one no peer or realm can hold, so no host input is told apart by its length or position. A wake carries no payload because the guest keeps its own deadline table and reads its own clock (§12.3).

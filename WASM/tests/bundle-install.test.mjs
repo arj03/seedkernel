@@ -1198,7 +1198,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
         ["_svc", new Uint8Array()],
         ["link/open", new Uint8Array(32)],
         ["crypto/random", Uint8Array.of(0, 0, 0, 1)],
-        ["crypto/blake2b", Uint8Array.of(32, 0)],
+        ["crypto/sha256", Uint8Array.of(1)],
         ["fwd", Uint8Array.of(4)],
       ]) {
         try { await withTestBudget(hostCall)(name, payload); } catch { refused.push(name); }
@@ -1240,7 +1240,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second init path");
     assertEqual(candidates[0].refused.sort(),
-      ["_svc", "crypto/blake2b", "crypto/random", "fs/put", "fwd", "link/open"],
+      ["_svc", "crypto/random", "crypto/sha256", "fs/put", "fwd", "link/open"],
       "a candidate reaches nothing at all — not a write, another realm, a link, or a read");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual(fs.stat().used, 0, "…and it left nothing on disk");

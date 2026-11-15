@@ -374,20 +374,38 @@ class Core {
     return link;
   }
 
-  /** A link authenticated. A relayed one starts the move to a direct path; a direct one
-   *  takes the requests held back from the relay (router.js `pumpRelayed`), and one this
-   *  end accepted retires the relayed links it replaces (`retireRelayed`). */
+  /** A link authenticated, ending the peer's links to an earlier incarnation (`supersede`).
+   *  A relayed one starts the move to a direct path; a direct one takes the requests held
+   *  back from the relay (router.js `pumpRelayed`), and one this end accepted retires the
+   *  relayed links it replaces (`retireRelayed`). */
   onAuth(peerId, link) {
     Core.drop(this.connecting, link.dialedPeerId, link);
-    if (!router.promote(peerId, link)) return;
+    const routed = router.promote(peerId, link);
+    this.supersede(peerId, link.peerIncarnation);
+    if (!routed) return;
     if (link.relayed) { void direct.upgrade(peerId).catch(() => {}); return; }
     // The requests held back from the relay go out on the direct link.
     reqres.pumpRelayed(peerId);
     if (!link.weDialed) router.retireRelayed(peerId);
   }
 
+  /** The peer's links to any incarnation but `incarnation` are ones an earlier run left
+   *  without a goodbye, which a UDP path does not report until its idle timeout. They
+   *  abort, failing what waits on them, and so does a direct path's negotiation over them. */
+  supersede(peerId, incarnation) {
+    const pool = router.pools.get(peerId);
+    const left = [...pool.links, ...pool.held].filter((l) => l.peerIncarnation !== incarnation);
+    if (left.length === 0) return;
+    for (const l of left) {
+      l.abort();
+    }
+    const e = direct.byPeer.get(peerId);
+    if (e && e.data && e.data.closed) direct.drop(e);
+  }
+
   /** The transport's own message from a peer (router.js `KIND_CTL`): a retire closes a
-   *  relayed link once a direct one routes, and otherwise leaves it to the idle clock. */
+   *  relayed link once a direct one routes, and otherwise leaves it to the idle clock, and
+   *  the rest are direct.js's signals. */
   onControl(peerId, frame, link) {
     const tag = frame[1];
     if (tag !== CTL_RETIRE) direct.receive(peerId, tag, frame.subarray(2));
@@ -402,7 +420,12 @@ class Core {
     // to its peer fails what waits on it now, not at its timeout, a `dial` waiter too.
     const peerId = link.peerId || link.dialedPeerId;
     if (peerId) {
-      for (const frame of link.takeQueued()) this.place(peerId, frame);
+      for (const frame of link.takeQueued()) reqres.sentOn(frame, this.place(peerId, frame));
+      // A link that broke, with no goodbye either way, fails what went out on it and is
+      // unanswered now, not at its timeout, though the peer has other links: what it lost
+      // gets no answer. A deliberate close leaves them, since the peer answers on another
+      // link one it no longer routes (Router `sendOn`).
+      if (!link.parting && !link.peerSaidGoodbye) reqres.linkDown(link);
       if (!link.authed && router.linkCount(peerId) === 0 && !this.connecting.has(peerId)) {
         reqres.peerDown(peerId);
         this.checkReady();
@@ -412,20 +435,22 @@ class Core {
   }
 
   /** Put a frame on a link that can carry it to `to`: an authenticated one, else the queue
-   *  of a dial still handshaking. False when there is neither. */
+   *  of a dial still handshaking. The link that took it, or false when there is neither. */
   place(to, frame) {
-    if (router.send(to, frame)) return true;
+    const routed = router.send(to, frame);
+    if (routed) return routed;
     const pool = this.connecting.get(to);
     if (!pool || pool.length === 0) return false;
     pool[0].send(frame);
-    return true;
+    return pool[0];
   }
 
-  /** Send to a peer, dialing first if nothing routes to it. Returns whether a link took
-   *  the frame; false means it was dropped for lack of a route. */
+  /** Send to a peer, dialing first if nothing routes to it. Returns the link that took the
+   *  frame; false means it was dropped for lack of a route. */
   async sendFrame(to, frame) {
     if (to === ownId) return false;
-    if (this.place(to, frame)) return true;
+    const placed = this.place(to, frame);
+    if (placed) return placed;
     if (!this.addrs.has(to)) return false;
     await this.dial(to);
     return this.place(to, frame);
@@ -608,7 +633,9 @@ entry("addr", (r) => {
   const peer = r.peer("addr");
   const secret = r.blob();
   if (secret.length !== 0 && secret.length !== PK_LEN) throw new Error("transport: addr needs a 32-byte contact secret, or none");
-  core.addAddr(peer, secret, utf8Decode(r.blob()));
+  const dest = utf8Decode(r.blob());
+  if (dest.startsWith(QUIC_SCHEME) && !quicTarget(dest)) throw new Error("transport: addr: a quic destination must be quic://ip:port, an IP address");
+  core.addAddr(peer, secret, dest);
 });
 
 /** Dial one known peer, `[peer 32][timeout u32]`: answers `[1]` once it is linked, `[0]`

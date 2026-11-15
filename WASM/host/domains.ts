@@ -24,17 +24,18 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 /** Author ML-DSA seed label (§16.1). KDF tag, not a signing prefix. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 /** Host crypto transforms available to every guest without declaring them. New transforms
- *  belong in bundles, not here. Each of these stays because the host already ships the
- *  implementation, and a module cannot use the host's copy without exposing the memory
- *  the node key lives in (docs/SECURITY.md), so the list cannot shrink further.
+ *  belong in bundles, not here. SHA-256 and AES-256-GCM are the platform's own where it has
+ *  them (abi.ts `Symmetric`), which no module compiled to wasm can match. X25519 and
+ *  entropy are already in the host: X25519 comes with the libsodium that is there for
+ *  Ed25519 (docs/SECURITY.md).
  *
- *  Each exposes its algorithm's full standard interface (RFC 7693, RFC 8439), so a
+ *  Each exposes its algorithm's full standard interface (FIPS 180-4, SP 800-38D), so a
  *  replacement transport can build a standard protocol without a host release
  *  (tests/noise-vectors.js). */
 export const HOST_TRANSFORM_NAMES = [
-  "blake2b",
-  "chacha20poly1305-ietf/seal",
-  "chacha20poly1305-ietf/open",
+  "sha256",
+  "aes256gcm/seal",
+  "aes256gcm/open",
   "x25519/dh",
   "random",
 ] as const;

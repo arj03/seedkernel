@@ -1,19 +1,18 @@
 // `host.call(name, bytes)` (§12.2). One map per realm, built at construction from what
 // the bundle declares, so an undeclared service has no handler at all (§12.1). Each host
 // service's handlers live with its backend in services/; this file knows none of them.
-import { readU32BE, ONE, ZERO, type Parts } from "./util.js";
+import { readU32BE, concatBytes, u8, ONE, ZERO, type Bytes, type Parts } from "./util.js";
+import type { Symmetric } from "./abi.js";
 import { isService, type HostTransformName, type ServiceMethod, type ServiceName } from "./domains.js";
 import type { ModuleResult } from "./bundle.js";
 import { HOST_CALL_SPENT, type CausalClock } from "./realm-queue.js";
 
-/** The libsodium functions the host crypto names use. */
-export interface SeamCrypto {
-  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+/** The libsodium functions and platform primitives the host crypto names use. */
+export interface SeamCrypto extends Pick<Symmetric, "aesGcmSeal" | "aesGcmOpen"> {
+  sha256(msg: Uint8Array): Bytes;
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
   randombytes_buf(n: number): Uint8Array;
-  crypto_aead_chacha20poly1305_ietf_encrypt(message: Uint8Array, additional_data: Uint8Array | null, secret_nonce: Uint8Array | null, public_nonce: Uint8Array, key: Uint8Array): Uint8Array;
-  crypto_aead_chacha20poly1305_ietf_decrypt(secret_nonce: Uint8Array | null, ciphertext: Uint8Array, additional_data: Uint8Array | null, public_nonce: Uint8Array, key: Uint8Array): Uint8Array;
   crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
 }
 
@@ -110,35 +109,29 @@ type CryptoName = `crypto/${HostTransformName}`;
 /** The host crypto transforms (§12.1). */
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   return {
-    // [outLen u8][keyLen u8][key][msg] -> outLen bytes (RFC 7693: 1..64, keyed or not).
-    "crypto/blake2b": (a) => {
-      const outLen = a[0], keyLen = a[1];
-      if (a.length < 2 || outLen < 1 || outLen > 64 || keyLen > 64 || a.length < 2 + keyLen) {
-        throw new Error("guest-seam: crypto/blake2b wants [outLen 1..64][keyLen 0..64][key][msg]");
-      }
-      return sodium.crypto_generichash(outLen, a.subarray(2 + keyLen), keyLen === 0 ? null : a.subarray(2, 2 + keyLen));
+    // [msg] -> 32 bytes.
+    "crypto/sha256": (a) => u8(sodium.sha256(a)),
+    // [npub 12][key 32][adLen u32][ad][msg] -> msg ‖ tag 16. Views, not copies: the
+    // primitives read their arguments before they return, and this is the record layer's
+    // hot path.
+    "crypto/aes256gcm/seal": (a) => {
+      const { npub, key, ad, body } = aeadArgs(a, "seal");
+      const r = sodium.aesGcmSeal(key, npub, ad, body);
+      return r instanceof Promise ? r.then(u8) : u8(r);
+    },
+    // [npub 12][key 32][adLen u32][ad][ct ‖ tag] -> [1][pt] | [0]. A bad tag is an answer;
+    // a mis-framed call throws.
+    "crypto/aes256gcm/open": (a) => {
+      const { npub, key, ad, body } = aeadArgs(a, "open");
+      const r = sodium.aesGcmOpen(key, npub, ad, body);
+      if (!(r instanceof Promise)) return r === null ? ZERO : [ONE, u8(r)];
+      return r.then((pt) => (pt === null ? ZERO : concatBytes([ONE, u8(pt)])));
     },
     // [n u32] -> n bytes of host entropy.
     "crypto/random": (a) => {
       const n = readU32BE(a, 0);
       if (n > MAX_RANDOM_BYTES) throw new Error("guest-seam: crypto/random size over cap");
       return sodium.randombytes_buf(n);
-    },
-    // [npub 12][key 32][adLen u32][ad][msg] -> msg ‖ tag 16. Views, not copies: the
-    // primitives copy their inputs, and this is the record layer's hot path.
-    "crypto/chacha20poly1305-ietf/seal": (a) => {
-      const { npub, key, ad, body } = aeadArgs(a, "seal");
-      return sodium.crypto_aead_chacha20poly1305_ietf_encrypt(body, ad, null, npub, key);
-    },
-    // [npub 12][key 32][adLen u32][ad][ct ‖ tag] -> [1][pt] | [0]. A bad tag is an answer;
-    // a mis-framed call throws.
-    "crypto/chacha20poly1305-ietf/open": (a) => {
-      const { npub, key, ad, body } = aeadArgs(a, "open");
-      try {
-        return [ONE, sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, body, ad, npub, key)];
-      } catch {
-        return ZERO;
-      }
     },
     // [sk 32][pk 32] -> [ok u8][shared 32]. ok=0: low-order point.
     "crypto/x25519/dh": (a) => {
@@ -221,15 +214,15 @@ globalThis.__start = (id, argBuf) => {
 // The realm's memory limit does not cover host allocations, so the seam caps them itself.
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per crypto/random call
 
-/** The AEAD names' framing, `[npub 12][key 32][adLen u32][ad][body]`; empty `ad` is null. */
-function aeadArgs(a: Uint8Array, op: string): { npub: Uint8Array; key: Uint8Array; ad: Uint8Array | null; body: Uint8Array } {
-  if (a.length < 48) throw new Error(`guest-seam: chacha20poly1305-ietf/${op} wants [npub 12][key 32][adLen u32][ad][bytes]`);
+/** The AEAD names' framing, `[npub 12][key 32][adLen u32][ad][body]`. */
+function aeadArgs(a: Uint8Array, op: string): { npub: Uint8Array; key: Uint8Array; ad: Uint8Array; body: Uint8Array } {
+  if (a.length < 48) throw new Error(`guest-seam: aes256gcm/${op} wants [npub 12][key 32][adLen u32][ad][bytes]`);
   const adLen = readU32BE(a, 44);
-  if (adLen > a.length - 48) throw new Error(`guest-seam: chacha20poly1305-ietf/${op} associated data runs past the call`);
+  if (adLen > a.length - 48) throw new Error(`guest-seam: aes256gcm/${op} associated data runs past the call`);
   return {
     npub: a.subarray(0, 12),
     key: a.subarray(12, 44),
-    ad: adLen === 0 ? null : a.subarray(48, 48 + adLen),
+    ad: a.subarray(48, 48 + adLen),
     body: a.subarray(48 + adLen),
   };
 }

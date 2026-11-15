@@ -104,10 +104,34 @@ export function randomBytes(n: number): Uint8Array {
   return out;
 }
 
+/** AES-256-GCM by WebCrypto, which answers only asynchronously. A page has no SHA-256 of its
+ *  own, so the host hashes with libsodium (abi.ts). */
+const subtle = (): SubtleCrypto => {
+  const s = globalThis.crypto?.subtle;
+  if (!s) throw new Error("platform: no WebCrypto (globalThis.crypto.subtle) available");
+  return s;
+};
+const gcmKey = (key: Uint8Array, use: KeyUsage) =>
+  subtle().importKey("raw", key as BufferSource, "AES-GCM", false, [use]);
+/** Every argument is read before these return, as the seam's borrowed views require: WebCrypto
+ *  copies what it is called with, and what waits behind the key import is copied first. */
+export const webSymmetric: Pick<HostBridge, "aesGcmSeal" | "aesGcmOpen"> = {
+  aesGcmSeal: (key, nonce, ad, pt) => {
+    const params = { name: "AES-GCM", iv: nonce.slice(), additionalData: ad.slice() };
+    const msg = pt.slice();
+    return gcmKey(key, "encrypt").then((k) => subtle().encrypt(params, k, msg));
+  },
+  aesGcmOpen: (key, nonce, ad, ct) => {
+    const params = { name: "AES-GCM", iv: nonce.slice(), additionalData: ad.slice() };
+    const msg = ct.slice();
+    return gcmKey(key, "decrypt").then((k) => subtle().decrypt(params, k, msg)).catch(() => null);
+  },
+};
+
 // ── the platform ─────────────────────────────────────────────────────────────
 
 /** The bridge members the Node and browser platforms share. */
-export type WebBridge = Pick<HostBridge, "random"> & WholeEngine;
+export type WebBridge = Pick<HostBridge, "random" | "aesGcmSeal" | "aesGcmOpen"> & WholeEngine;
 
 /** Entropy, private modules in workers and the engine over WebAssembly, and the release of
  *  every module they hold. */
@@ -117,6 +141,7 @@ export function webBridge(): { bridge: WebBridge; teardown(): void } {
   return {
     bridge: {
       random: randomBytes,
+      ...webSymmetric,
       // Each module in a worker of its own (module-table.ts), the only way V8 stops a call.
       modules: {
         async build(mods) {

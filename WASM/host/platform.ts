@@ -184,8 +184,6 @@ function tableEngine(t: EngineTable): SyncEngine {
   };
 }
 
-/** Zeros for wiping a scratch window, grown to the largest wipe. */
-let zeros = new Uint8Array(0);
 /** One private module on bounded engine instances, under the shared ABI: bound at
  *  install, and again on the call after a deadline closed its instance (§4.3). */
 function engineModule(t: EngineTable, wasm: Uint8Array) {
@@ -206,10 +204,7 @@ function engineModule(t: EngineTable, wasm: Uint8Array) {
         memoryBytes: () => t.engineGrow(id, 0) * WASM_PAGE_BYTES,
         read: (ptr, len) => u8(t.engineRead(id, ptr, len)),
         write: (ptr, bytes) => { t.engineWrite(id, ptr, bytes); },
-        wipe: (ptr, len) => {
-          if (zeros.length < len) zeros = new Uint8Array(len);
-          t.engineWrite(id, ptr, zeros.subarray(0, len));
-        },
+        wipe: (ptr, len) => { t.engineFill(id, ptr, len); },
       }, DEFAULT_SCRATCH_SIZE);
     } catch (err) {
       t.engineDispose(id);
@@ -258,7 +253,7 @@ export function platformHost({ bridge, fs: files, net, udp }: Platform): Platfor
    *  default transport. */
   const hostEnv = u8(bridge.hostBlob());
   const hostParts = readHostBlob(hostEnv);
-  const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)));
+  const sodium = engineSodium(engine, hostParts.sodium, hostParts.mldsa, (n) => u8(bridge.random(n)), bridge);
 
   const tcp = net && tcpChannels(net);
   const channels = () => {

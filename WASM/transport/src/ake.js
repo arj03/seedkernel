@@ -18,9 +18,9 @@ const N_LINK_STATUS = "link/status";
 
 const N_TIMER_ARM = "timer/arm";
 
-const P_HASH = "crypto/blake2b";
-const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
-const P_OPEN = "crypto/chacha20poly1305-ietf/open";
+const P_HASH = "crypto/sha256";
+const P_SEAL = "crypto/aes256gcm/seal";
+const P_OPEN = "crypto/aes256gcm/open";
 const P_DH = "crypto/x25519/dh";
 
 // The X25519 base point: `dh(sk, BASEPOINT)` derives the public key.
@@ -39,15 +39,16 @@ const ROUTINE_REASONS = new Set([REASON_NONE, REASON_CLEAN, REASON_LOCAL]);
 
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
 
-const SUITE_CHANNEL_CONCEALED = 0x03;
-const SUITE_LEN = 1, PK_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
+const SUITE_CHANNEL_CONCEALED = 0x04;
+const SUITE_LEN = 1, PK_LEN = 32, EPH_LEN = 32, SIG_LEN = 64, INCARNATION_LEN = 8;
 const NPUB_LEN = 12, TAG_LEN = 16;
 const KEM_PK_LEN = 1184, KEM_SK_LEN = 2400, KEM_CT_LEN = 1088, KEM_SS_LEN = 32;
-// msg1's seal carries nothing: its tag is the contact-secret proof. msg2 carries only the
-// receiver's signature, since every dial already holds the key it is checked against.
-const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + TAG_LEN; // 1233
-const M2_LEN = EPH_LEN + KEM_CT_LEN + SIG_LEN + TAG_LEN;   // 1200
-const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                 // 112
+// msg1's seal carries nothing: its tag is the contact-secret proof. msg2 carries the
+// receiver's signature but not its key, since every dial already holds the key it is
+// checked against. msg2 and msg3 each end with the sender's incarnation (`incarnation`).
+const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + TAG_LEN;                 // 1233
+const M2_LEN = EPH_LEN + KEM_CT_LEN + SIG_LEN + INCARNATION_LEN + TAG_LEN; // 1208
+const M3_LEN = PK_LEN + SIG_LEN + INCARNATION_LEN + TAG_LEN;               // 120
 
 // The one suite this transport speaks, not negotiated (§12.6, §14.1).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
@@ -75,10 +76,9 @@ const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-o
 // A call's arguments go to `host.call` as their parts, which the realm lays back to back,
 // so none of these concatenates them.
 
-/** BLAKE2b-256 over the concatenation; `crypto/blake2b` takes `[outLen][keyLen][key][msg]`. */
-const HASH_256 = new Uint8Array([32, 0]);
+/** SHA-256 over the concatenation. */
 function hash(...parts) {
-  return host.call(P_HASH, [HASH_256, ...parts]);
+  return host.call(P_HASH, parts);
 }
 async function verify(pk, sig, msg) {
   const r = await host.call(N_VERIFY, [pk, sig, msg]);
@@ -182,6 +182,18 @@ function keySecret() {
   }
   return ownKeySecret;
 }
+/** This node's incarnation: random bytes drawn once per transport realm, so a peer tells a
+ *  restarted node's links from the ones its earlier run left without a goodbye (core.js
+ *  `supersede`). Drawn on first use, since a host call at load is refused, and drawn again
+ *  after a failure. */
+let ownIncarnation = null;
+function incarnation() {
+  if (ownIncarnation === null) {
+    ownIncarnation = randomBytes(INCARNATION_LEN);
+    ownIncarnation.catch(() => { ownIncarnation = null; });
+  }
+  return ownIncarnation;
+}
 /** The channel's identity-signature payload; the host prefixes its scope. */
 function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
@@ -276,6 +288,7 @@ class Link {
 
     this.peerPubkey = null;
     this.peerId = "";
+    this.peerIncarnation = ""; // hex, from the peer's msg2 or msg3
     this.authed = false;
     this.peerSaidGoodbye = false;
     this.myEph = null;
@@ -643,7 +656,7 @@ class Link {
     }
   }
 
-  // ── the concealed-identity handshake (suite 0x03, §12.6) ────────────────────
+  // ── the concealed-identity handshake (suite 0x04, §12.6) ────────────────────
 
   /** Every handshake key comes through here, so every one mixes in the contact secret. */
   kdf(ikm, ctx, label) {
@@ -684,6 +697,7 @@ class Link {
     }
   }
 
+  /** msg3's `[id][sig][incarnation]`: the verified id, keeping the incarnation. */
   async openIdentity(key, ct, th) {
     const r = await this.openZero(key, ct);
     if (!r.ok) return null;
@@ -692,6 +706,7 @@ class Link {
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
     if (!(await verify(id, sig, channelIdentityMessage(this.root, th, id)))) return null;
     if (bytesCompare(id, ownPk) === 0) return null; // our own traffic reflected
+    this.peerIncarnation = toHex(plain.subarray(PK_LEN + SIG_LEN));
     return id;
   }
 
@@ -745,8 +760,8 @@ class Link {
     const hs = await hash(h1, head);
     const sig = await this.signTranscript(hs);
     if (!sig) return;
-    const w2 = concatBytes([head,
-      await this.sealZero(await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), sig)]);
+    const w2 = concatBytes([head, await this.sealZero(
+      await this.kdf([this.ee, this.kemSecret], hs, LABEL_M2), concatBytes([sig, await incarnation()]))]);
     this.th = await hash(h1, w2);
     if (this.plain) await this.channelHandshakeKeys(this.th);
     await this.wire(w2);
@@ -773,15 +788,16 @@ class Link {
     // so a failure closes instead of stalling.
     const idR = fromHex(this.dialedPeerId);
     if (bytesCompare(idR, ownPk) === 0) { this.abort(); return; }
-    if (!(await verify(idR, r.pt, channelIdentityMessage(this.root, hs, idR)))) { this.abort(true); return; }
+    if (!(await verify(idR, r.pt.subarray(0, SIG_LEN), channelIdentityMessage(this.root, hs, idR)))) { this.abort(true); return; }
     if (this.lint && !admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = this.dialedPeerId;
+    this.peerIncarnation = toHex(r.pt.subarray(SIG_LEN));
 
     const h2 = await hash(this.th, w2);
     if (this.plain) await this.channelHandshakeKeys(h2);
     const sig = await this.signTranscript(h2);
     if (!sig) return;
-    const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([ownPk, sig]));
+    const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([ownPk, sig, await incarnation()]));
     this.th = await hash(h2, w3);
     try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
     await this.wire(w3);

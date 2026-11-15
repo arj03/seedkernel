@@ -86,7 +86,7 @@ The rule is that anything a bundle can observe is shared code. A guarantee that 
 
 **The label is the namespace; the author is trust and lineage.** The `app` label, each `protocols` claim and each `services` claim are literal manifest strings with one active owner on a node. A candidate contesting one is refused; a replacement of the slot holding it takes over the slot, its label and its claims, whoever authored it (§12.10). The label names the fs and signing scopes, so they belong to the label rather than to an author: a fork under the same label signs and verifies in the same scope, an author who rotates its key keeps its records, and whatever holds the label next inherits its data. The author is what admission and revocation decide on (§12.5), and it keys the freshness mark, so versions are an author's own count (§12.4).
 
-**One hash.** Content hashes, author ids and binary pins use BLAKE2b-256 (`genesisHash`). The same primitive is `crypto/blake2b` for guests and the shipped transport's KDF and transcript hash.
+**One hash.** SHA-256 is the system's only hash, the platform's own where it has one and libsodium's on a page. Content hashes, author ids and binary pins use it (`genesisHash`), guests reach it as `crypto/sha256`, the shipped transport's KDF and transcript hash are built on it, and so are the QUIC connection's derivations.
 
 **Relayed-message apps layer their own authenticity.** The channel authenticates one hop (§12.6). An app whose messages pass through intermediaries (a feed, a forum, store-and-forward gossip) cannot let the channel speak for the original author, so it adds a per-message signature naming the author, plus backlinks (a hash chain, as [SSB](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` or [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s lipmaa links) to order the history and make equivocation detectable. Signed bundles already do the author half for relayed code; such an app does the same one layer up. §14 says why lineage stays out of the install path.
 
@@ -234,8 +234,8 @@ The values a second implementation of a bundle signer, a guest or a peer must ma
 | `DOMAIN_link_scope` | `"seedkernel-link-scope-v1\0"` | `node/sign` and `node/verify` for the link occupant (§12.2) |
 | `DOMAIN_subkey` | `"seedkernel-subkey-v1\0"` | deriving the node keypair seed from the master seed (§12.6.2b) |
 | Manifest suite | `0x02` | byte 0 of a bundle or host blob envelope (§12.4) |
-| Author id | 32 bytes, `BLAKE2b-256(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` | admission, revocation, freshness (§12.4, §12.5) |
-| `AUTHOR_MLDSA_SEED_LABEL` | `"seedkernel-author-mldsa-v1"`, no trailing NUL | an author's ML-DSA-65 seed is `BLAKE2b-256(ed25519_seed ‖ label)` (§12.4) |
+| Author id | 32 bytes, `SHA-256(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` | admission, revocation, freshness (§12.4, §12.5) |
+| `AUTHOR_MLDSA_SEED_LABEL` | `"seedkernel-author-mldsa-v1"`, no trailing NUL | an author's ML-DSA-65 seed is `SHA-256(ed25519_seed ‖ label)` (§12.4) |
 | Master seed | 32 bytes | the node's only stored secret; derives the identity under the label `channel` (§12.6.2b) |
 
 Domain strings end in a NUL and are prepended before signing or hashing, never stored or transmitted. The fs key charset is §12.2.

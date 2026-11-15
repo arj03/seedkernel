@@ -82,35 +82,24 @@ async function testGuestSeam() {
     // algorithm, and the seam knows nothing about cipher suites.
     const prim = (name, argBytes) => seam(`crypto/${name}`, argBytes);
     const msg = U(1, 2, 3, 4, 5);
-    // crypto/blake2b takes RFC 7693's whole interface ([outLen][keyLen][key][msg]) and the
-    // AEAD names take associated data (RFC 8439), so a standard protocol can be built on
-    // them without a host release (tests/noise-vectors.js runs one).
-    assert(bytesEqual(await prim("blake2b", concatBytes([U(32, 0), msg])), sodium.crypto_generichash(32, msg, null)), "crypto/blake2b, by name");
+    // The AEAD names take associated data (SP 800-38D), so a standard protocol can be
+    // built on them without a host release (tests/noise-vectors.js runs one).
     const hex = (b) => Buffer.from(b).toString("hex");
-    assertEqual(hex(await prim("blake2b", concatBytes([U(64, 0), new TextEncoder().encode("abc")]))),
-      "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
-      "crypto/blake2b: RFC 7693 Appendix A, 64-byte output");
-    assertEqual(hex(await prim("blake2b", concatBytes([U(64, 64), Uint8Array.from({ length: 64 }, (_, i) => i)]))),
-      "10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568",
-      "crypto/blake2b: BLAKE2's keyed KAT, first entry");
-    for (const bad of [U(), U(0, 0), U(65, 0), U(32, 65), U(32, 8, 1, 2)]) {
-      let refused = false;
-      try { await prim("blake2b", bad); } catch { refused = true; }
-      assert(refused, `crypto/blake2b refuses the mis-framed call [${[...bad]}]`);
-    }
+    assertEqual(hex(await prim("sha256", new TextEncoder().encode("abc"))),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "crypto/sha256: FIPS 180-4 \"abc\", by name");
     const npub = new Uint8Array(12).fill(7), aeadKey = new Uint8Array(32).fill(9), ad = U(1, 2, 3);
     const aead = (adBytes, body) => {
       const len = new Uint8Array(4); new DataView(len.buffer).setUint32(0, adBytes.length);
       return concatBytes([npub, aeadKey, len, adBytes, body]);
     };
-    const sealed = await prim("chacha20poly1305-ietf/seal", aead(ad, msg));
-    assert(bytesEqual(sealed, sodium.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, aeadKey)),
-      "chacha20poly1305-ietf/seal binds its associated data exactly as libsodium does");
-    assert(bytesEqual((await prim("chacha20poly1305-ietf/open", aead(ad, sealed))).subarray(1), msg), "…and open takes it back");
-    assertEqual((await prim("chacha20poly1305-ietf/open", aead(U(1, 2, 4), sealed)))[0], 0,
+    const sealed = await prim("aes256gcm/seal", aead(ad, msg));
+    assert(bytesEqual(sealed, sodium.aesGcmSeal(aeadKey, npub, ad, msg)),
+      "aes256gcm/seal binds its associated data exactly as the platform's AES-256-GCM does");
+    assert(bytesEqual((await prim("aes256gcm/open", aead(ad, sealed))).subarray(1), msg), "…and open takes it back");
+    assertEqual((await prim("aes256gcm/open", aead(U(1, 2, 4), sealed)))[0], 0,
       "a different associated data does not open");
     let shortAead = false;
-    try { await prim("chacha20poly1305-ietf/open", concatBytes([npub, aeadKey, U(0, 0, 0, 9), msg])); } catch { shortAead = true; }
+    try { await prim("aes256gcm/open", concatBytes([npub, aeadKey, U(0, 0, 0, 9), msg])); } catch { shortAead = true; }
     assert(shortAead, "associated data longer than the call is mis-framed, not a failed open");
     // node/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
     // node/verify applies the same scope on the host, so a guest checks a signature by
@@ -160,7 +149,7 @@ async function testGuestSeam() {
     // The host half hands back an answer it already has, and a Promise of one it has to
     // wait for. The guest reads a Promise for every name alike, so a forgotten `await`
     // never reads bytes (testPreviousAbiRefused, through a realm).
-    assert(prim("blake2b", concatBytes([U(32, 0), msg])) instanceof Uint8Array, "a catalog primitive has its answer at once");
+    assert(prim("sha256", msg) instanceof Uint8Array, "a catalog primitive has its answer at once");
     assert(seam("fs/size", fk) instanceof Uint8Array, "fs/size has its answer at once, as the store is synchronous");
     assert(prim("random", U(0, 0, 0, 1)) instanceof Uint8Array, "crypto/random has its answer at once");
 
@@ -357,7 +346,7 @@ async function testGuestAbi() {
     assert(verifyTestBundle(sodium, mk({ requires: ["fs", "_backup"] })) !== null,
       "a host service and a local service id sit in the one requires list");
     let crypto = "";
-    try { verifyTestBundle(sodium, mk({ requires: ["crypto/blake2b"] })); }
+    try { verifyTestBundle(sodium, mk({ requires: ["crypto/sha256"] })); }
     catch (e) { crypto = e.message; }
     assert(crypto.includes("host method"),
       `a local id in the ungated crypto/ namespace is refused, so it cannot shadow a host transform (got: ${crypto})`);
@@ -664,8 +653,8 @@ async function testSeamGating() {
   // Host crypto transforms need no declaration: `crypto/` reaches nothing, so there is
   // nothing to gate. A seam for a bundle declaring no names still hashes.
   const timerOnly = mk(["timer"]);
-  assertEqual((await timerOnly("crypto/blake2b", U(32, 0, 1, 2))).length, 32,
-    "crypto/blake2b resolves for a bundle declaring no crypto name — a pure transform is not a grant");
+  assertEqual((await timerOnly("crypto/sha256", U(1, 2))).length, 32,
+    "crypto/sha256 resolves for a bundle declaring no crypto name — a pure transform is not a grant");
   threw = false;
   try { await timerOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
@@ -779,6 +768,22 @@ async function testCallModuleGuards() {
     "the JS module worker erases copied responses before the next call");
   scrubber.dispose();
 
+  console.log("  OK\n");
+}
+
+// ─── Test: the platform's crypto is a capability of the platform (§4.2) ───────────
+// quic.wasm imports `host_crypto`. A page's table, which cannot serve it, refuses the
+// module by that import, read from its bytes; Node's module workers serve it.
+async function testHostCryptoCapability() {
+  console.log("Test: a module importing host_crypto loads where the platform serves it");
+  const wasm = readFileSync(join(root, "transport/quic/quic.wasm"));
+  const { readModuleLimits } = await imp("build/host/wasm-limits.js");
+  assert(/^host_crypto\.\w+$/.test(readModuleLimits(wasm).hostCrypto ?? ""),
+    "the import a page refuses the module by is read from its bytes");
+  const before = workersStarted;
+  const served = await new JsModuleLoader().build([{ name: "quic", wasm }]);
+  assertEqual(workersStarted, before + 1, "a Node table serves it and loads the module");
+  served.dispose();
   console.log("  OK\n");
 }
 
@@ -962,9 +967,9 @@ async function testModuleCallChargedToGuestBudget() {
 async function testPreviousAbiRefused() {
   console.log("Test: every host.call answers a Promise — no name sits on a sync line");
 
-  const NAMES = ["crypto/blake2b", "crypto/random"];
+  const NAMES = ["crypto/sha256", "crypto/random"];
   // A well-formed argument per name, so each probe settles by resolving.
-  const ARGS = [[32, 0, 0, 0], [0, 0, 0, 4]];
+  const ARGS = [[1, 2, 3], [0, 0, 0, 4]];
   // One byte per probed name: 1 when the un-awaited call handed back a thenable.
   const source = `
     const names = ${JSON.stringify(NAMES)}, args = ${JSON.stringify(ARGS)};
@@ -1237,6 +1242,7 @@ await testSafeJs();
 await testRealmSerialization();
 await testSeamGating();
 await testCallModuleGuards();
+await testHostCryptoCapability();
 await testModuleCallBound();
 await testModuleCallChargedToGuestBudget();
 await testPreviousAbiRefused();

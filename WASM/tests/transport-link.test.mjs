@@ -14,6 +14,12 @@ import { testkit } from "./testkit.mjs";
 import { bytesEqual, joined } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
 import { HOST_CALLER_ID } from "../build/host/util.js";
+import { engineSodium } from "../build/host/sodium-engine.js";
+import { randomBytes, syncWebEngine, webSymmetric } from "../build/host/platform-web.js";
+import { packageHostBlob } from "../build/host/crypto-node.js";
+import { readHostBlob } from "../build/host/host-blob.js";
+
+const hostParts = readHostBlob(packageHostBlob());
 
 /** Read a link event as the bound realm does. The driver passes the occupant the whole
  *  realm argument, `[caller 32][opLen u8][op][args ...]`, with the host's caller id in front
@@ -206,6 +212,44 @@ await test("baseline: two ends authenticate and exchange frames", async (keep) =
   assert(await bUp(st), "the acceptor must attribute the link to the caller");
 });
 
+await test("a page's crypto (WebCrypto's AES, which answers later, and libsodium's SHA-256) links with OpenSSL's", async (keep) => {
+  // A page's host on one end: the same blob crypto, beside the browser bridge's AES. Every
+  // seal and open answers on a later turn, from arguments lent out of the realm's memory.
+  const page = engineSodium(syncWebEngine, hostParts.sodium, hostParts.mldsa, randomBytes, webSymmetric);
+  const st = keep(await upPair(undefined, { sodium: page }));
+  const small = await st.A.request(st.B.peerId, PROTO, Uint8Array.from([1, 2, 3]));
+  assert(bytesEqual(small, Uint8Array.from([1, 2, 3])), "a frame crosses both ways");
+  // Many records each way, so a borrowed view overwritten before its seal ran would show.
+  const n = 1024 * 1024;
+  const up = await st.A.request(st.B.peerId, PROTO, generatorRequest(n, 3));
+  const down = await st.B.request(st.A.peerId, PROTO, generatorRequest(n, 5));
+  for (const [got, mul, dir] of [[up, 3, "OpenSSL to page"], [down, 5, "page to OpenSSL"]]) {
+    assert(got.length === n && got.every((b, i) => b === ((i * mul) & 255)), `a megabyte arrives intact, ${dir}`);
+  }
+});
+
+await test("a peer back after leaving without a goodbye is answered on its new link", async (keep) => {
+  // A dials with the smaller key, so its link would win a double connect. Then B goes
+  // silently, as a process does that leaves a UDP path behind: A still holds the link.
+  let [ia, ib] = [generateKeyPair(), generateKeyPair()];
+  if (Buffer.compare(Buffer.from(ia.publicKey), Buffer.from(ib.publicKey)) > 0) [ia, ib] = [ib, ia];
+  const st = keep(await upPair(undefined, { identity: ia }, { identity: ib }));
+  await settle(50);
+  st.chans[1].dead = true;
+  st.B.shell.close();
+  assert(await aUp(st), "A still holds the link B left");
+  // B again, under the same key, dialing A afresh at once: the old link is to an earlier
+  // incarnation, not this one's double connect, so A routes the new one.
+  const factory = new InjectedChannels();
+  const again = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT, identity: ib, connsPerPeer: 64 }));
+  const chans = wirePair();
+  st.A.factory.give(chans[1]);
+  await factory.dial(again, st.A.peerId, chans[0], CONTACT);
+  await until(() => linkedTo(again, st.A.peerId), 4000, "the new link");
+  const resp = await again.request(st.A.peerId, PROTO, Uint8Array.from([4, 5, 6]), 3000);
+  assert(bytesEqual(resp, Uint8Array.from([4, 5, 6])), "the answer comes back on the new link, not the dead one");
+});
+
 await test("a request's deadline is the CALLER's, not a node-wide clock", async (keep) => {
   // Two requests to the same peer on one live link, with different deadlines: the short
   // one must settle on its own schedule. A node-wide silence clock would reset on any frame
@@ -238,7 +282,7 @@ await test("OUT OF TIME: an app past its deadline loses its own request, never t
   let slowSeal = false;
   const st = keep(await upPair(undefined, {
     onHostAnswer: (name, answer) => {
-      if (!slowSeal || name !== "crypto/chacha20poly1305-ietf/seal") return answer;
+      if (!slowSeal || name !== "crypto/aes256gcm/seal") return answer;
       slowSeal = false;
       return new Promise((r) => setTimeout(() => r(answer), 100));
     },
@@ -394,7 +438,7 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
   // Trailing bytes would sit outside the transcript hash, and so outside what both
   // signatures cover. Every handshake message must have the exact width, not a minimum.
   // A's two handshake messages, by the width each is accepted at: msg1 and msg3.
-  for (const len of [1233, 112]) {
+  for (const len of [1233, 120]) {
     const chans = wirePair({
       tamper: (b, from) => (from === "A" && b.length === len ? Buffer.concat([Buffer.from(b), Buffer.from([0])]) : b),
     });
@@ -601,7 +645,7 @@ await test("a silent connection buys no hash: the session root is computed once"
   const factory = new InjectedChannels();
   const B = await makeTransportHost({
     channels: factory,
-    onHostCall: (name) => { if (name === "crypto/blake2b") hashes++; },
+    onHostCall: (name) => { if (name === "crypto/sha256") hashes++; },
   });
   keep({ close() { try { B.shell.close(); } catch { /* already down */ } } });
   for (let i = 0; i < 5; i++) factory.give(wirePair()[1]);
@@ -842,9 +886,9 @@ await test("OUTBOUND QUEUE: authenticated encryption work is bounded", async (ke
   let stallSeals = false;
   let releaseSeal = null;
   const slowSodium = Object.create(sodium);
-  Object.defineProperty(slowSodium, "crypto_aead_chacha20poly1305_ietf_encrypt", {
+  Object.defineProperty(slowSodium, "aesGcmSeal", {
     value: (...args) => {
-      const seal = () => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(...args);
+      const seal = () => sodium.aesGcmSeal(...args);
       if (!stallSeals) return seal();
       return new Promise((resolve) => { releaseSeal = () => resolve(seal()); });
     },

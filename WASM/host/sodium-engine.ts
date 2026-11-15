@@ -11,6 +11,7 @@
 import type { EngineExport, EngineInstance, EngineImports } from "./engine-realm.js";
 import type { Keypair } from "./subkeys.js";
 import type { ShellSodium } from "./shell-core.js";
+import type { Symmetric } from "./abi.js";
 import { createMlDsa65, type MlDsa65Signer } from "./pq.js";
 import { WASM_PAGE_BYTES } from "./wasm-limits.js";
 
@@ -24,26 +25,25 @@ export interface HostSodium extends ShellSodium, MlDsa65Signer {
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }
 
-// libsodium.wasm's minified export names, for the pinned build (the libsodium npm dist's
-// glue maps them; tests/crypto.test.mjs checks this table against it). Re-derive them, and the
-// two EM_JS entropy addresses, if libsodium.wasm is rebuilt.
+// libsodium.wasm's minified export names, for the pinned build (the libsodium-sumo npm
+// dist's glue maps them; tests/crypto.test.mjs checks this table against it). Re-derive
+// them, and the two EM_JS entropy addresses, if libsodium.wasm is rebuilt.
 const EXPORTS = {
-  malloc: "Ee", free: "Fe", sodium_init: "xe",
-  crypto_generichash: "Ja",
-  crypto_sign_detached: "wd", crypto_sign_verify_detached: "xd",
-  crypto_sign_keypair: "td", crypto_sign_seed_keypair: "sd",
-  crypto_scalarmult: "Jc",
-  crypto_aead_chacha20poly1305_ietf_encrypt: "D", crypto_aead_chacha20poly1305_ietf_decrypt: "H",
+  malloc: "lm", free: "mm", sodium_init: "Uj",
+  crypto_sign_detached: "Nh", crypto_sign_verify_detached: "Oh",
+  crypto_sign_keypair: "Kh", crypto_sign_seed_keypair: "Jh",
+  crypto_scalarmult: "Dg", crypto_hash_sha256: "Nc",
 } as const;
 export const SODIUM_EXPORTS: Readonly<Record<keyof typeof EXPORTS, string>> = EXPORTS;
 /** The EM_JS snippets randombytes reaches through import `a.b`: one random word, and the
  *  RNG's lazy init. */
-const RAND_U32 = 40216, RAND_INIT = 40252;
-const AEAD_TAG = 16, AEAD_NPUB = 12, AEAD_KEY = 32;
+const RAND_U32 = 40712, RAND_INIT = 40748;
 
-/** libsodium plus ML-DSA-65 over `engine`. `random` is the platform CSPRNG. */
+/** libsodium plus ML-DSA-65 over `engine`, beside the platform's own `symmetric` primitives,
+ *  whose SHA-256, where the platform has one, stands in for libsodium's. `random` is the
+ *  platform CSPRNG. */
 export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWasm: Uint8Array,
-  random: (n: number) => Uint8Array): HostSodium {
+  random: (n: number) => Uint8Array, symmetric: Symmetric): HostSodium {
   // ── libsodium ──
   let lib!: EngineInstance;
   lib = engine(sodiumWasm, {
@@ -85,12 +85,6 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
   const put = (ptr: number, bytes: Uint8Array): void => {
     if (bytes.length > 0) lib.write(ptr, bytes);
   };
-  /** The AEAD's nonce and key cross without lengths, so check them before writing. */
-  const aeadWidths = (op: string, npub: Uint8Array, key: Uint8Array): void => {
-    if (npub.length !== AEAD_NPUB || key.length !== AEAD_KEY) {
-      throw new Error(`${op}: nonce must be ${AEAD_NPUB} bytes and key ${AEAD_KEY}`);
-    }
-  };
   // [pk 32][sk 64][seed 32]
   const keypair = (seed: Uint8Array | null): Keypair => {
     const at = scratch(128);
@@ -102,18 +96,16 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
   };
 
   return {
+    aesGcmSeal: symmetric.aesGcmSeal,
+    aesGcmOpen: symmetric.aesGcmOpen,
     ...createMlDsa65(engine(mldsaWasm, {}), random),
-    // [out len][key][message]
-    crypto_generichash(len, message, key) {
-      const keyLen = key ? key.length : 0;
-      const out = scratch(len + keyLen + message.length), m = out + len + keyLen;
-      if (key) put(out + len, key);
-      put(m, message);
-      if (fn.crypto_generichash(out, len, m, message.length, 0, keyLen > 0 ? out + len : 0, keyLen) !== 0) {
-        throw new Error("crypto_generichash: invalid output or key length");
-      }
-      return lib.read(out, len);
-    },
+    // [out 32][message]
+    sha256: symmetric.sha256 ?? ((message) => {
+      const at = scratch(32 + message.length);
+      put(at + 32, message);
+      fn.crypto_hash_sha256(at, at + 32, message.length, 0);
+      return lib.read(at, 32);
+    }),
     // [sk 64][sig 64][message]
     crypto_sign_detached(message, sk) {
       if (sk.length !== 64) throw new Error("crypto_sign_detached: secret key must be 64 bytes");
@@ -150,37 +142,6 @@ export function engineSodium(engine: SyncEngine, sodiumWasm: Uint8Array, mldsaWa
         throw new Error("crypto_scalarmult: unexpected result of the multiplication");
       }
       return lib.read(at + 64, 32);
-    },
-    // [key 32][npub 16][ad][message][out]
-    crypto_aead_chacha20poly1305_ietf_encrypt(message, ad, _nsec, npub, key) {
-      aeadWidths("crypto_aead_chacha20poly1305_ietf_encrypt", npub, key);
-      const adLen = ad ? ad.length : 0, n = message.length;
-      const at = scratch(48 + adLen + 2 * n + AEAD_TAG), m = at + 48 + adLen, out = m + n;
-      lib.write(at, key);
-      lib.write(at + 32, npub);
-      if (ad) put(at + 48, ad);
-      put(m, message);
-      if (fn.crypto_aead_chacha20poly1305_ietf_encrypt(out, 0, m, n, 0,
-        adLen > 0 ? at + 48 : 0, adLen, 0, 0, at + 32, at) !== 0) {
-        throw new Error("crypto_aead_chacha20poly1305_ietf_encrypt failed");
-      }
-      return lib.read(out, n + AEAD_TAG);
-    },
-    // [key 32][npub 16][ad][ciphertext][out]
-    crypto_aead_chacha20poly1305_ietf_decrypt(_nsec, ciphertext, ad, npub, key) {
-      aeadWidths("crypto_aead_chacha20poly1305_ietf_decrypt", npub, key);
-      if (ciphertext.length < AEAD_TAG) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
-      const adLen = ad ? ad.length : 0, n = ciphertext.length - AEAD_TAG;
-      const at = scratch(48 + adLen + ciphertext.length + n), c = at + 48 + adLen, out = c + ciphertext.length;
-      lib.write(at, key);
-      lib.write(at + 32, npub);
-      if (ad) put(at + 48, ad);
-      lib.write(c, ciphertext);
-      if (fn.crypto_aead_chacha20poly1305_ietf_decrypt(out, 0, 0, c, ciphertext.length, 0,
-        adLen > 0 ? at + 48 : 0, adLen, 0, at + 32, at) !== 0) {
-        throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
-      }
-      return lib.read(out, n);
     },
     randombytes_buf: random,
   };

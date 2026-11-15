@@ -50,10 +50,15 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
         heard = [];
         deliver(batch);
       };
+      // The last sender's address and its bytes: a socket hears mostly one.
+      let lastFrom = "", ip: Uint8Array = new Uint8Array(0);
       s.on("message", (msg, from) => {
-        // IPv4 as itself, though a dual-stack socket hears it IPv4-mapped.
-        const a = from.address.startsWith(MAPPED) ? from.address.slice(MAPPED.length) : from.address;
-        const ip = a.includes(":") ? ipv6Bytes(a) : Uint8Array.from(a.split("."), Number);
+        if (from.address !== lastFrom) {
+          lastFrom = from.address;
+          // IPv4 as itself, though a dual-stack socket hears it IPv4-mapped.
+          const a = lastFrom.startsWith(MAPPED) ? lastFrom.slice(MAPPED.length) : lastFrom;
+          ip = a.includes(":") ? ipv6Bytes(a) : Uint8Array.from(a.split("."), Number);
+        }
         const batch = new Uint8Array(5 + ip.length + msg.length);
         batch[0] = ip.length;
         batch.set(ip, 1);
@@ -75,12 +80,17 @@ export function nodeRawDatagrams(): RawDatagrams & { closeAll(): void } {
         // as the contract says, not an exception out of the socket callback.
         try { s.send(bytes, port, host, sent); } catch { sent(); }
       };
+      // The address the last host was sent to, "" for a name: a socket sends mostly to one.
+      let lastHost: string | null = null, lastDest = "";
       const id = ++seq;
       sockets.set(id, {
         send(bytes, port, host) {
           if (closing) return;
-          if (!six || host.includes(":")) to(bytes, port, host);
-          else if (isIPv4(host)) to(bytes, port, MAPPED + host);
+          if (host !== lastHost) {
+            lastHost = host;
+            lastDest = !six || host.includes(":") ? host : isIPv4(host) ? MAPPED + host : "";
+          }
+          if (lastDest !== "") to(bytes, port, lastDest);
           else {
             // A name, as a STUN server's: its IPv4 address, as on an IPv4 socket.
             sending++;

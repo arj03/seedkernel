@@ -1,8 +1,8 @@
 // Builds transport/quic/quic.wasm, the QUIC connection of the transport's UDP paths
-// (transport/quic/quic.c over ngtcp2), as an import-free pure module (§4) shipped in the
-// transport bundle. The artifact is committed, as browser/mlkem768.wasm is, so a build
-// needs no C toolchain; this rebuilds it after quic.c, scratch.wat or a pin in build.sh
-// changes.
+// (transport/quic/quic.c over ngtcp2), as a pure module (§4) that imports only the host's
+// AES and SHA-256, shipped in the transport bundle. The artifact is committed, as
+// browser/mlkem768.wasm is, so a build needs no C toolchain; this rebuilds it after quic.c,
+// scratch.wat or a pin in build.sh changes.
 //
 // Requires wasi-sdk, binaryen (wasm-as, wasm-merge, wasm-opt), cmake and git. On Windows it
 // runs in WSL, as build-pq-wasm.mjs does.

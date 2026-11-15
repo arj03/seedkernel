@@ -1,5 +1,5 @@
 // The engine table (the platform ABI's engine calls): instantiate a wasm module from bytes,
-// call its exports with numbers, and read and write its memory. It knows nothing of what
+// call its exports with numbers, and read, write and zero its memory. It knows nothing of what
 // runs inside; the shared realm driver (host/engine-realm.ts) builds guest realms on it
 // from qjs.wasm. An import outside WASI calls the JS function the instantiation names for
 // it, as WebAssembly's importObject does. WASI is answered only for an unbounded instance,
@@ -123,6 +123,14 @@ func installEngineBridge(qc *qjs.Context, b qjs.Value) {
 		}
 		return qjs.Value{}, nil
 	})
+	on("engineFill", func(e *engineInstance, args []qjs.Value) (qjs.Value, error) {
+		view, ok := e.mem.Read(uint32(args[0].Int64()), uint32(args[1].Int64()))
+		if !ok {
+			return qjs.Value{}, errors.New("engine: fill out of bounds")
+		}
+		clear(view)
+		return qjs.Value{}, nil
+	})
 	on("engineGlobal", func(e *engineInstance, args []qjs.Value) (qjs.Value, error) {
 		g := e.mod.ExportedGlobal(args[0].String())
 		if g == nil {
@@ -175,9 +183,27 @@ func newEngineInstance(qc *qjs.Context, bytes []byte, importObject qjs.Value, bo
 		}
 	}
 	builders := map[string]wazero.HostModuleBuilder{}
+	var crypto map[string]api.GoModuleFunc
 	for _, def := range imports {
 		module, name, _ := def.Import()
 		if module == "wasi_snapshot_preview1" && !bounded {
+			continue
+		}
+		// A module's host crypto is answered here, not by the host realm.
+		if module == hostCryptoModule && bounded {
+			if crypto == nil {
+				crypto = moduleCrypto()
+			}
+			f := crypto[name]
+			if f == nil {
+				return nil, fmt.Errorf("engine: no host crypto %s", name)
+			}
+			b := builders[module]
+			if b == nil {
+				b = e.rt.NewHostModuleBuilder(module)
+				builders[module] = b
+			}
+			b.NewFunctionBuilder().WithGoModuleFunction(f, def.ParamTypes(), def.ResultTypes()).Export(name)
 			continue
 		}
 		ns := importObject.GetPropertyStr(module)

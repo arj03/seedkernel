@@ -115,6 +115,7 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "assemblyscript": "0.28.14",
+    "libsodium-sumo": "0.8.4",
     "libsodium-wrappers": "0.8.4",
     "typescript": "^5.4.0"
   }

@@ -399,7 +399,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 // checks the realm has no authority: the host services are not reachable as globals.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
-// put hashes the data (crypto/blake2b, by name) and stores it under that id
+// put hashes the data (crypto/sha256, by name) and stores it under that id
 // (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals. One
 // entrypoint, and the ops are the guest's own framing after the caller id.
 const storeGuestSource = `
@@ -421,8 +421,7 @@ function handle(arg) {
   if (op === "put") {
     // A primitive is reached by name under crypto/, not by op number, and answers a
     // Promise like every name.
-    const hashArg = new Uint8Array(2 + data.length); hashArg[0] = 32; hashArg.set(data, 2);
-    return host.call("crypto/blake2b", hashArg).then((id) =>
+    return host.call("crypto/sha256", data).then((id) =>
       host.call("fs/put", fsPutArg(hex(id), data)).then(() => id));
   }
   if (op === "get") {

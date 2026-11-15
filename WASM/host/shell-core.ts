@@ -32,6 +32,8 @@ interface AppSlot {
   links: boolean;
   pureModules: PureModules;
   fsScope?: Fs;
+  /** The label's genesis hash, the 32-byte sender a local call from this slot carries. */
+  appId: Uint8Array;
   /** The fs prefix this slot's view is scoped under (`appScopeFor`). */
   appScope: string;
   realm: Realm | null;
@@ -208,8 +210,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   const table = createSlotTable<AppSlot>();
   /** A slot for `loaded`, without its realm yet. The wake reads `slot.realm` when it
    *  fires, so it enters whichever realm is there then. */
-  const newSlot = (loaded: LoadedBundle, pureModules: PureModules, load: InstallOptions,
-    deadlineMs: number): AppSlot => {
+  const newSlot = (loaded: LoadedBundle, appId: Uint8Array, pureModules: PureModules,
+    load: InstallOptions, deadlineMs: number): AppSlot => {
     let slot: AppSlot;
     const timers = createRealmTimers(
       // A host event under the host's caller id. There is no caller to reject to, so an
@@ -220,9 +222,10 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       }),
       deadlineMs,
     );
-    const appScope = appScopeFor(sodium, loaded.manifest.app);
+    const appScope = appScopeFor(appId);
     slot = {
       verifiedBundle: loaded,
+      appId,
       links: reachesLink(loaded.manifest),
       pureModules,
       fsScope: fs ? scopedFs(fs, appScope) : undefined,
@@ -340,7 +343,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       },
       // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
       // zeros is the host.
-      callLocal: sendsOwn(app, b.manifest.protocols ?? [], callLocal(genesisHash(sodium, enc.encode(app)))),
+      callLocal: sendsOwn(app, b.manifest.protocols ?? [], callLocal(slot.appId)),
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
         call: slot.pureModules.call,
@@ -401,8 +404,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // Refuse a conflict before the candidate's code runs; checked again at commit, since
     // another install may take a free claim in the meantime.
     checkInstallation();
+    const appId = genesisHash(sodium, enc.encode(v.manifest.app));
     const pureModules = await loadBundleModules(moduleLoader, v);
-    const slot = newSlot(loaded, pureModules, load, bounds.deadlineMs);
+    const slot = newSlot(loaded, appId, pureModules, load, bounds.deadlineMs);
     // A guest that cannot compile fails the install, not the first frame.
     try {
       await standRealm(slot, localConfig, bounds);

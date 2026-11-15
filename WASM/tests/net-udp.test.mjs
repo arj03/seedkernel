@@ -9,7 +9,7 @@
 
 import vm from "node:vm";
 import { createSocket } from "node:dgram";
-import { randomBytes } from "node:crypto";
+import * as nodeCrypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -28,6 +28,10 @@ const { forEachDatagram, ipv6Bytes } = await imp("build/services/datagrams.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
 const { RTC_TAG } = await imp("build/services/net-rtc.js");
 const { combineChannels } = await imp("build/services/socket-seam.js");
+const { hostCryptoImports } = await imp("build/host/pure-module.js");
+const { callerOf, readOp } = await imp("build/host/op-frame.js");
+const { MAX_LINK_READ_BYTES } = await imp("build/services/net-limits.js");
+const { randomBytes } = nodeCrypto;
 
 const { test, assert, summary } = testkit();
 const enc = new TextEncoder();
@@ -69,7 +73,9 @@ globalThis.__stop = () => { clearTimeout(wakeTimer); for (const n of [...udp.liv
  *  a slot holds one: `call(bytes)` as `host.call("quic", bytes)` answers. */
 const QUIC = new WebAssembly.Module(readFileSync(join(root, "transport", "quic", "quic.wasm")));
 function quicModule() {
-  const { exports: m } = new WebAssembly.Instance(QUIC, {});
+  let memory = null;
+  const { exports: m } = new WebAssembly.Instance(QUIC, hostCryptoImports(nodeCrypto, () => memory));
+  memory = m.memory;
   const at = m.scratch.value;
   return (input) => {
     new Uint8Array(m.memory.buffer).set(input, at);
@@ -971,6 +977,45 @@ await test("a Node socket is dual-stack: it hears IPv4 and IPv6, and names each 
   assert(heard.sort().join(",") === "127.0.0.1 true 4,::1 true 6", `heard ${heard}`);
 });
 
+await test("a platform batch past one event's size reaches the occupant cut between datagrams", async () => {
+  // Native's reader holds what arrives while the loop is busy as one batch, which can run
+  // past what one event carries; quic.js reads an event whole into its module's scratch.
+  let deliver;
+  const raw = { bind: (d) => { deliver = d; return { id: 7, port: 9 }; }, send() {}, close() {}, addresses: () => "" };
+  const driver = new TransportHost({ datagrams: raw, suppressLinkLog: true });
+  const events = [];
+  driver.activate((input) => {
+    const { op, args } = readOp(callerOf(joined(input)).body);
+    if (op === "datagrams") events.push(args.slice());
+    return Promise.resolve(new Uint8Array(0));
+  });
+  const s = await driver.rawNet().udpBind();
+  // 3 MiB of 1400-byte datagrams from 127.0.0.1:9, each numbered in its first 4 bytes.
+  const count = 2250, one = 9 + 1400, batch = new Uint8Array(count * one);
+  for (let i = 0; i < count; i++) {
+    const at = i * one;
+    batch.set([4, 127, 0, 0, 1, 0, 9, 1400 >> 8, 1400 & 255], at);
+    new DataView(batch.buffer).setUint32(at + 9, i);
+  }
+  deliver(batch);
+  await until(() => events.reduce((n, e) => n + e.length, 0) >= batch.length, 2000, "every datagram");
+  const seen = [];
+  for (const e of events) {
+    const v = new DataView(e.buffer, e.byteOffset);
+    let bytes = 0;
+    for (let at = 0; at < e.length;) {
+      assert(v.getUint32(at) === s.id, "the batch is the socket's");
+      const len = v.getUint32(at + 4);
+      for (let d = at + 8; d < at + 8 + len; d += one) seen.push(v.getUint32(d + 9));
+      bytes += len;
+      at += 8 + len;
+    }
+    assert(bytes <= MAX_LINK_READ_BYTES, `an event carries ${bytes} bytes of datagrams, past ${MAX_LINK_READ_BYTES}`);
+  }
+  assert(events.length >= 2, `cut into ${events.length} event(s)`);
+  assert(seen.length === count && seen.every((n, i) => n === i), "every datagram whole and in order");
+});
+
 // ── the transport, over real UDP ─────────────────────────────────────────────
 
 const joinRelay = (node, url) => transportOp(node, new OpArgs("relay").text(url));
@@ -1073,6 +1118,31 @@ await test("a peer back over TCP while its dead UDP path is still held gets ever
   assert((await routes(B)).get(A.peerId) === true, "while B still holds the dead path");
 });
 
+await test("a peer back through the relay while its dead UDP path is still held is offered a new one", async (keep) => {
+  // B offers, and still holds a direct link to the peer that crashed, so it would offer
+  // nothing: the new link is from another incarnation of A, which ends the old one.
+  const relay = new FakeRelay("relay:8080");
+  const net = fabric();
+  const [small, large] = sortedIdentities(2);
+  const B = keep(await makeTransportHost({ identity: small, channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.2", true)) }));
+  const A = await makeTransportHost({ identity: large, channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.1", false)) });
+  await relayLink(A, B, relayUrl("relay:8080"));
+  await until(async () => (await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true,
+    5000, "both to move to the path");
+  await settle();
+  net.cut();
+  A.shell.close();
+  await settle(100);
+  net.dead = false;
+  const A2 = keep(await makeTransportHost({ identity: large, channels: relay.factory(), datagrams: rawOver(net.machine("10.0.0.1", false)) }));
+  await joinRelay(A2, relayUrl("relay:8080"));
+  await transportOp(A2, new OpArgs("addr").blob(Buffer.from(B.peerId, "hex")).blob(new Uint8Array(32)).text("relay+" + relayUrl("relay:8080")));
+  await A2.request(B.peerId, PROTO, Uint8Array.of(0));
+  await until(async () => (await routes(A2)).get(B.peerId) === true, 5000, "the peer to be on a path again");
+  const resp = await B.request(A2.peerId, PROTO, Uint8Array.of(7, 8, 9));
+  assert(resp.length === 3 && resp[2] === 9, "B's request crosses the new path, not the dead one");
+});
+
 await test("a peer with no UDP path declines it, and the offering side offers WebRTC next", async (keep) => {
   const relay = new FakeRelay();
   const [small, large] = sortedIdentities(2);
@@ -1108,6 +1178,27 @@ await test("a node dials another at quic://ip:port, with no relay, and the link 
   const big = await B.request(A.peerId, PROTO, generatorRequest(1024 * 1024, 5));
   assert(big.length === 1024 * 1024 && big.every((x, i) => x === ((i * 5) & 255)), "and a large one back, intact");
   assert((await routes(A)).get(B.peerId) === true && (await routes(B)).get(A.peerId) === true, "a direct link at both ends");
+});
+
+await test("a node back at quic:// while its dead connection is still held is the only one routed to", async (keep) => {
+  // A crashed dialer sends no CLOSE, so B holds its connection beside the new process's,
+  // until the new link, from another incarnation, ends it.
+  const { node: B, port } = await quicListener();
+  keep(B);
+  const identity = generateKeyPair();
+  const raw = nodeRawDatagrams();
+  const A = await makeTransportHost({ identity, datagrams: raw });
+  await A.addr(B.peerId, `quic://127.0.0.1:${port}`);
+  await A.request(B.peerId, PROTO, Uint8Array.of(0));
+  raw.closeAll();
+  A.shell.close();
+  const A2 = keep(await makeTransportHost({ identity, datagrams: nodeRawDatagrams() }));
+  await A2.addr(B.peerId, `quic://127.0.0.1:${port}`);
+  await A2.request(B.peerId, PROTO, Uint8Array.of(0));
+  await settle();
+  const asks = Array.from({ length: 16 }, (_, i) => B.request(A2.peerId, PROTO, Uint8Array.of(i)));
+  const answered = await Promise.race([Promise.all(asks), settle(3000).then(() => null)]);
+  assert(answered !== null && answered.every((r, i) => r[0] === i), "every request of B's is answered, none lost to the dead connection");
 });
 
 await test("one listening socket takes many nodes at once, each on its own connection", async (keep) => {

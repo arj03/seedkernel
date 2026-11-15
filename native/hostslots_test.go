@@ -51,7 +51,7 @@ func hostAuthor(t *testing.T) authorKeys {
 		t.Fatal(err)
 	}
 	edPriv := ed25519.NewKeyFromSeed(seed)
-	mlPk, mlSk := testSigner(t).keypair(t, blake2b256(append(seed, "seedkernel-author-mldsa-v1"...)))
+	mlPk, mlSk := testSigner(t).keypair(t, sha256Sum(append(seed, "seedkernel-author-mldsa-v1"...)))
 	a := authorKeys{edPriv: edPriv, edPub: edPriv.Public().(ed25519.PublicKey), mlPk: mlPk, mlSk: mlSk}
 	if !bytes.Equal(a.edPub, genesisHost[offEdPk:offMlPk]) || !bytes.Equal(a.mlPk, genesisHost[offMlPk:offEdSig]) {
 		t.Fatal("host-author.key is not the genesis blob's author: rebuild (cd WASM && npm run build:native)")

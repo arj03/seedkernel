@@ -54,7 +54,7 @@ func hostEnvelope(t testing.TB, a authorKeys, version, abi int, script string) [
 		body = append(body, part...)
 	}
 	pre := append(hexBytes(realmString(`toHex(DOMAIN_HOST)`)), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), blake2b256(body)...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), sha256Sum(body)...)
 	env := append([]byte{manifestSuite()}, a.edPub...)
 	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)

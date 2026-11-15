@@ -37,17 +37,46 @@ export function datagramEnd(batch: Uint8Array, at: number): number {
   return p + 4 > batch.length ? Infinity : p + 4 + ((batch[p + 2] << 8) | batch[p + 3]);
 }
 
+/** Where the read batch's datagrams from `at` end, taking as many whole ones as fit in
+ *  `max` bytes and at least one. A read datagram is `[n u8][ip n][port u16][len u16][bytes]`. */
+export function readsWithin(batch: Uint8Array, at: number, max: number): number {
+  let end = at;
+  while (end < batch.length) {
+    const n = batch[end] + 5;
+    const next = end + n + ((batch[end + n - 2] << 8) | batch[end + n - 1]);
+    if (next > batch.length) return batch.length;
+    if (end > at && next - at > max) break;
+    end = next;
+  }
+  return end;
+}
+
 /** Each datagram of a send batch, in order, its host as text; the host has already checked
  *  its bounds. */
 export function forEachDatagram(batch: Uint8Array, fn: (id: number, host: string, port: number, bytes: Uint8Array) => void): void {
+  // A batch is mostly one path's, so a host spelled as the one before is that one's text.
+  let last = -1, host = "";
   for (let at = 0; at < batch.length;) {
     const p = hostEnd(batch, at), end = datagramEnd(batch, at), n = batch[at + 4];
-    const host = n === 4 ? batch.subarray(at + 5, p).join(".")
-      : n === 16 ? Array.from({ length: 8 }, (_, i) => ((batch[at + 5 + 2 * i] << 8) | batch[at + 6 + 2 * i]).toString(16)).join(":")
-        : dec.decode(batch.subarray(at + 6, p));
+    if (last < 0 || !sameSpan(batch, last, at + 4, p - at - 4)) {
+      host = n === 4 ? batch.subarray(at + 5, p).join(".")
+        : n === 16 ? Array.from({ length: 8 }, (_, i) => ((batch[at + 5 + 2 * i] << 8) | batch[at + 6 + 2 * i]).toString(16)).join(":")
+          : dec.decode(batch.subarray(at + 6, p));
+    }
+    last = at + 4;
     fn(readU32BE(batch, at), host, (batch[p] << 8) | batch[p + 1], batch.subarray(p + 4, end));
     at = end;
   }
+}
+
+/** Whether the `len` bytes at `b` spell what the host field at `a` does, its length byte
+ *  first. */
+function sameSpan(batch: Uint8Array, a: number, b: number, len: number): boolean {
+  if (hostEnd(batch, a - 4) - a !== len) return false;
+  for (let i = 0; i < len; i++) {
+    if (batch[a + i] !== batch[b + i]) return false;
+  }
+  return true;
 }
 
 /** The 16 bytes of an IPv6 address's text, as an OS spells one: any zone dropped. */

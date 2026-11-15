@@ -28,7 +28,8 @@ class Router {
   /** The origin of the relay a peer's relayed link runs through, "" for none. */
   relayOf(peerId) { return this.pools.get(peerId)?.links.find((l) => l.relay)?.relay ?? ""; }
 
-  /** Round-robin over the direct links, or over the relayed ones when there is none. */
+  /** Round-robin over the direct links, or over the relayed ones when there is none,
+   *  answering the link that took the frame or false. */
   send(to, frame) {
     const pool = this.pools.get(to);
     // Empty only inside `promote`, while a tie-break loser passes its queue on.
@@ -36,7 +37,7 @@ class Router {
     const i = pool.next % (pool.direct || pool.links.length);
     pool.next = i + 1;
     pool.links[i].send(frame);
-    return true;
+    return pool.links[i];
   }
 
   /** Send on `link` while `send` could pick it, else as `send` does. An answer goes back
@@ -60,12 +61,14 @@ class Router {
   }
 
   /** Add a newly authenticated link, after the double-connect tie-break, which compares
-   *  it only with links of its own kind: a relayed link and a direct one are two paths,
-   *  not a double connect. A peer's first link marks it up. False when the link lost the
-   *  tie-break, and so does not route. */
+   *  it only with links of its own kind and the peer's same incarnation: a relayed link and
+   *  a direct one are two paths, and a link to an earlier run of the peer is one it left
+   *  (core.js `supersede`), not a double connect. A peer's first link marks it up. False
+   *  when the link lost the tie-break, and so does not route. */
   promote(peerId, link) {
     let pool = this.pools.get(peerId);
-    const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed && l.relayed === link.relayed);
+    const rival = pool && pool.links.find((l) => l.weDialed !== link.weDialed && l.relayed === link.relayed
+      && l.peerIncarnation === link.peerIncarnation);
     if (rival) {
       if (!this.canonicalKeep(link)) { this.retire(pool, link); return false; }
       Router.unlist(pool, rival);
@@ -200,7 +203,7 @@ class ReqRes {
     if (this.nextCorr > 0xffffffff) this.nextCorr = 1;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (noReply) { this.put(0, to, frame); return; }
-    const p = { to, d, due: requestTimeoutMs > 0 ? dueIn(requestTimeoutMs) : Infinity, relayedBytes: 0, held: null };
+    const p = { to, d, due: requestTimeoutMs > 0 ? dueIn(requestTimeoutMs) : Infinity, relayedBytes: 0, held: null, link: null };
     this.pending.set(corr, p);
     if (!router.relayedOnly(to)) { this.put(corr, to, frame); return; }
     // A relay may meter its splices, and whatever is handed to one waits there, past
@@ -242,9 +245,27 @@ class ReqRes {
   /** Hand a request frame to a link; one no link takes fails its request at once. */
   put(corr, to, frame) {
     // A routed peer takes it now, without the dial path's promise.
-    if (to !== ownId && core.place(to, frame)) return;
+    const placed = to !== ownId && core.place(to, frame);
+    if (placed) { this.sentOn(frame, placed); return; }
     const unanswerable = () => this.finish(corr, null);
-    core.sendFrame(to, frame).then((placed) => { if (!placed) unanswerable(); }, unanswerable);
+    core.sendFrame(to, frame).then((link) => {
+      if (link) this.sentOn(frame, link);
+      else unanswerable();
+    }, unanswerable);
+  }
+
+  /** The link a request frame went out on, for `linkDown`. */
+  sentOn(frame, link) {
+    if (!link || frame[0] !== KIND_REQ) return;
+    const p = this.pending.get(readU32BE(frame, 1));
+    if (p) p.link = link;
+  }
+
+  /** A link left routing: its requests still waiting get no answer. */
+  linkDown(link) {
+    for (const [corr, p] of this.pending) {
+      if (p.link === link) this.finish(corr, null);
+    }
   }
 
   buildReq(corr, noReply, proto, payload) {

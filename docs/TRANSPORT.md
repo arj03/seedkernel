@@ -12,7 +12,7 @@
 
 ## Overview
 
-A node is known by its Ed25519 public key, its **peer id**, and reached at an address such as `pk.secret@host:port`. A link between two nodes is any ordered byte pipe: TCP, WebSocket, a WebRTC data channel, a QUIC stream, or a splice through a relay. On every one of them the same three-message handshake runs, authenticates both ends and derives session keys, and every frame after it is a ChaCha20-Poly1305 record. Inside the records, a node sends requests named by a protocol id and gets responses back.
+A node is known by its Ed25519 public key, its **peer id**, and reached at an address such as `pk.secret@host:port`. A link between two nodes is any ordered byte pipe: TCP, WebSocket, a WebRTC data channel, a QUIC stream, or a splice through a relay. On every one of them the same three-message handshake runs, authenticates both ends and derives session keys, and every frame after it is an AES-256-GCM record. Inside the records, a node sends requests named by a protocol id and gets responses back.
 
 The handshake is built so that **an observer who can open sockets to a node and watch traffic cannot tell which identities are present on the network, nor which pairs are talking**. It denies three attacks:
 
@@ -45,13 +45,13 @@ Three messages, then records. A message is a bare body with no type byte, accept
 
 ```
 msg1  i→r   [suite 1][eph_i 32][kem_pk_i 1184][seal(k_probe; ∅) 16]       1,233 B  contact proof, no identity
-msg2  r→i   [eph_r 32][kem_ct 1088][seal(k2; sig_r 64) 80]                1,200 B  hybrid reply, signed, no identity
-msg3  i→r   [seal(k3; id_i 32 ‖ sig_i 64) 112]                              112 B  the caller names itself
+msg2  r→i   [eph_r 32][kem_ct 1088][seal(k2; sig_r 64 ‖ inc_r 8) 88]      1,208 B  hybrid reply, signed, no identity
+msg3  i→r   [seal(k3; id_i 32 ‖ sig_i 64 ‖ inc_i 8) 120]                    120 B  the caller names itself
 then        [AEAD record ..]
 ```
 
 ```
-H(x)    = BLAKE2b-256(x), unkeyed; ‖ is concatenation
+H(x)    = SHA-256(x); ‖ is concatenation
 KDF(ikm, ctx, label) = H(ikm ‖ ctx ‖ label)
 root    = H(DOMAIN_channel ‖ network_key)
 k_probe = KDF(contact, H(root ‖ suite ‖ eph_i ‖ kem_pk_i), LABEL_probe)
@@ -69,17 +69,18 @@ k_i2r   = KDF(ee ‖ pq ‖ contact, h3, LABEL_i2r)
 k_r2i   = KDF(ee ‖ pq ‖ contact, h3, LABEL_r2i)
 
 Sign(m) = Ed25519(DOMAIN_link_scope ‖ m)
-seal    = ChaCha20-Poly1305-IETF, nonce zero, no associated data; each key seals one message
+seal    = AES-256-GCM, nonce zero, no associated data; each key seals one message
 ```
 
 The labels, `DOMAIN_channel` and `DOMAIN_link_scope` are in Constants. `contact` is the receiver's contact secret, or 32 zero bytes for an open node (§12.6.3).
 
 - **Keys.** `eph` is a fresh X25519 key per connection on each side, and `kem_pk_i` a fresh ML-KEM-768 key; the responder encapsulates, the initiator decapsulates. No long-term Diffie-Hellman or KEM key exists. An all-zero X25519 result (a low-order point) or a KEM input the implementation refuses is a refusal like a seal that does not open.
-- **Suite `0x03`** is the only suite: Ed25519 identity, ephemeral X25519 and ML-KEM-768, contact secret, ChaCha20-Poly1305 records. There is no list, fallback or negotiation, and an unknown id draws silence. The suite byte is folded into `h1`, so both signatures cover it.
+- **Suite `0x04`** is the only suite: Ed25519 identity, ephemeral X25519 and ML-KEM-768, contact secret, SHA-256, AES-256-GCM records. There is no list, fallback or negotiation, and an unknown id draws silence. The suite byte is folded into `h1`, so both signatures cover it.
 - **A dial pins its peer, and the receiver's key never travels.** The initiator checks `sig_r` against the key it dialed; `id_r` is in the signed message but not on the wire. A signature under any other key, the initiator's own included, closes the link before the initiator names itself.
 - **Ordering.** A responder sends nothing until a msg1 opens under its contact secret or one of its other secrets (§12.6.3). The responder proves itself at msg2; the initiator names itself at msg3, only to a responder it has verified. The initiator authenticates the responder at 1 RTT and may send records right behind msg3; the responder authenticates the initiator at 1.5 RTT.
 - **Refusals.** A responder refuses a wrong contact secret, wrong network, malformed message or bad msg3 by doing nothing until its deadline. An initiator the responder's peer list declines at msg3 is closed at once. An initiator closes on a bad msg2 (wrong signature, its own key, a peer it declines).
-- **Double connect.** When two nodes dial each other, both keep the link the smaller peer id dialed. Only the loser's dialer closes it: a dialer may already have sent records behind msg3, so the accepting end stops routing to the losing link but reads it until the dialer's end-of-stream record.
+- **Incarnation.** `inc` is 8 random bytes a node's transport draws once when it starts, so it names one run of the node. It is sealed under a key only the sender of the signed message can hold, and the transcript binds it. When a link authenticates, the node aborts its other links to that peer from a different incarnation: an earlier run stopped without a goodbye, which a UDP path does not report until its idle timeout. Two live runs under one key therefore displace each other's links; one key is one running node.
+- **Double connect.** When two nodes dial each other, both keep the link the smaller peer id dialed. Only links from the same incarnation count as a double connect. Only the loser's dialer closes it: a dialer may already have sent records behind msg3, so the accepting end stops routing to the losing link but reads it until the dialer's end-of-stream record.
 - **Cost.** Each end makes one Ed25519 signature, one verification and one X25519 exchange; the initiator also generates an ML-KEM-768 keypair and decapsulates, and the responder encapsulates.
 
 ### Identities travel under the hybrid ephemeral secrets
@@ -112,7 +113,7 @@ msg1 is 1,233 bytes before either end has authenticated, so the KEM raises what 
 
 ## 12.6.1 Records and link teardown
 
-- **Every frame after the handshake is a record**: ChaCha20-Poly1305-IETF with no associated data. The initiator seals with `k_i2r` and opens with `k_r2i`; the responder mirrors.
+- **Every frame after the handshake is a record**: AES-256-GCM with no associated data. The initiator seals with `k_i2r` and opens with `k_r2i`; the responder mirrors.
 - **The nonce is implicit**, per direction, never sent: `epoch u32 ‖ 0x00000000 ‖ counter u32`, both starting at 0. The receiving counter advances only on a record that opens; a bad tag or an out-of-order record tears the link down.
 - **Rekey.** After `rekeyAfterFrames` records a direction ratchets, `k ← H(k ‖ LABEL_rekey)`, advances the epoch and restarts the counter. Both ends must use the same value, since the nonce is implicit. Reaching `REJECT_AFTER_EPOCHS` retires the link rather than repeat a nonce.
 - **End of stream** is a record with an empty plaintext, its 16-byte tag alone, sent only by a deliberate close and behind everything sent before it. An application frame is never empty, so the two cannot be confused. Every failure closes silently.
@@ -249,13 +250,13 @@ A UDP path is QUIC version 1 (RFC 9000) with the channel handshake in TLS's plac
 **Keys.** Each encryption level has one 32-byte secret per direction. From a secret `s`:
 
 ```
-K(s, label)  = BLAKE2b-256 keyed with s, over the ASCII label (no NUL)
+K(s, label)  = HMAC-SHA256 keyed with s, over the ASCII label (no NUL)
 packet key   = K(s, "seedkernel-quic-key-v1")
 iv           = first 12 bytes of K(s, "seedkernel-quic-iv-v1")
 hp key       = K(s, "seedkernel-quic-hp-v1")
 ```
 
-Packets are protected as RFC 9001 §5.3 and §5.4.4 describe for `TLS_CHACHA20_POLY1305_SHA256`: ChaCha20-Poly1305 with the nonce `iv XOR packet number`, and ChaCha20 header protection whose counter is the sample's first four bytes, little-endian, and whose nonce is the other twelve. The secrets per level:
+Packets are protected as RFC 9001 §5.3 and §5.4.3 describe for `TLS_AES_256_GCM_SHA384`: AES-256-GCM with the nonce `iv XOR packet number`, and AES-256 header protection whose mask is the first five bytes of the sample's AES-256 encryption under the hp key. A 1-RTT key seals at most 2²³ packets before ngtcp2 updates it, AES-GCM's confidentiality limit (RFC 9001 §6.6). The sealing is the host's AES and the derivations the host's SHA-256, which quic.wasm imports (BUNDLE.md §4.2). The secrets per level:
 
 | Level | Client → server secret | Server → client secret |
 | --- | --- | --- |
@@ -285,7 +286,7 @@ The client's parameters cross at Initial too, as a TLS ClientHello carries them,
 A node can be dialed over QUIC directly at `quic://ip:port`, with no relay and no punch, as a TCP listener is dialed. The destination is an IP address, since a client takes its connection only from the address it dials. Past the first packets the connection is a UDP path's.
 
 - **Retry.** An Initial addressed to no connection and carrying no token is answered with a stateless Retry. Only an Initial that echoes the Retry's token, from the address the Retry went to, opens a connection. So a spoofed source costs the listener one answer smaller than what it sent and no state, and every connection's address is validated from its first packet. A forged Retry fails the handshake, since the server's transport parameters name the Retry's source connection ID under the Handshake keys. The cost is one round trip per dial.
-- **Retry integrity.** The Retry integrity tag is RFC 9001 §5.8's, over the same pseudo-packet with the same version 1 nonce, but sealed with ChaCha20-Poly1305 under the fixed key `K(0³², "seedkernel-quic-retry-v1")`. Like RFC 9001's fixed key, it proves only that the Retry was not damaged. The token's contents and the Retry's source connection ID are the listener's own; a client only echoes them, as RFC 9000 §8.1 has it. The shipped listener makes the token `[odcid len u8][odcid][issued f64]`, good for 10 s, and the source connection ID a 16-byte keyed hash of the token and the client's address under a key drawn at start, so the ID is the token's MAC and the listener keeps no state.
+- **Retry integrity.** The Retry integrity tag is RFC 9001 §5.8's, over the same pseudo-packet with the same version 1 nonce, but sealed with AES-256-GCM under the fixed key `K(0³², "seedkernel-quic-retry-v1")`. Like RFC 9001's fixed key, it proves only that the Retry was not damaged. The token's contents and the Retry's source connection ID are the listener's own; a client only echoes them, as RFC 9000 §8.1 has it. The shipped listener makes the token `[odcid len u8][odcid][issued f64]`, good for 10 s, and the source connection ID the first 16 bytes of HMAC-SHA256 over the client's address and the token under a key drawn at start, so the ID is the token's MAC and the listener keeps no state.
 - **Accepting.** A connection's link is an accept like a TCP one: open to whoever holds the contact secret, since msg1 crosses in the first Initial, and counted against the half-open budgets and the per-source cap.
 
 ---
@@ -297,8 +298,8 @@ The values a peer must match.
 | Constant | Value | Notes |
 | --- | --- | --- |
 | `DOMAIN_link_scope` | `"seedkernel-link-scope-v1\0"` | prefixes every handshake signature; the host's, repeated here from ARCHITECTURE §16.1 |
-| Channel suite | `0x03` | byte 0 of msg1; the only one accepted |
-| Message widths | msg1 1,233 B, msg2 1,200 B, msg3 112 B | each accepted only at its exact width |
+| Channel suite | `0x04` | byte 0 of msg1; the only one accepted |
+| Message widths | msg1 1,233 B, msg2 1,208 B, msg3 120 B | each accepted only at its exact width |
 | `DOMAIN_channel` | `"seedkernel-channel-id-v1\0"` | seeds `root` and prefixes both signatures' messages; a format tag inside `DOMAIN_link_scope`, never transmitted |
 | `LABEL_probe` | `"seedkernel-c-probe-v1\0"` | |
 | `LABEL_msg2` | `"seedkernel-c-msg2-v1\0"` | |
@@ -308,7 +309,7 @@ The values a peer must match.
 | `LABEL_rekey` | `"seedkernel-session-rekey-v1\0"` | |
 | `LABEL_hs_i2r` | `"seedkernel-channel-handshake-i->r-v1\0"` | QUIC Handshake secret, client to server |
 | `LABEL_hs_r2i` | `"seedkernel-channel-handshake-r->i-v1\0"` | QUIC Handshake secret, server to client |
-| QUIC labels | `seedkernel-quic-{key,iv,hp,update,retry}-v1`, `seedkernel-quic-initial-{client,server}-v1` | ASCII, no NUL, keyed-BLAKE2b labels (The QUIC connection) |
+| QUIC labels | `seedkernel-quic-{key,iv,hp,update,retry}-v1`, `seedkernel-quic-initial-{client,server}-v1` | ASCII, no NUL, HMAC-SHA256 labels (The QUIC connection) |
 | QUIC version | `0x00000001` | connection IDs are 16 bytes |
 | Contact secret | 32 bytes | never on the wire; 32 zero bytes means open |
 | Network key | 32 bytes | public; 32 zero bytes is the public network |
@@ -338,7 +339,7 @@ A room's secret is derived from its name, so a room with a guessable name is ope
 
 **A recorded msg1 can be replayed once.** A replay draws a msg2 nobody can open without the ephemeral private key, but it shows that the holder of that contact secret is at the address replayed to, so a recording tracks a node across address changes. The spent set makes a recording worth one answer rather than one per copy, but it is bounded and does not survive a restart. Closing this needs freshness in msg1 (a challenge costing a round trip, a clock like WireGuard's timestamp, or a seen-set that survives restarts), and none is taken: this is the replay linkability Noise grades `XK` down for.
 
-**The protocol is fingerprintable.** A cleartext `0x03` at offset 0 says "seedkernel": the protocol, not the peer. A first message indistinguishable from random belongs in a suite of its own.
+**The protocol is fingerprintable.** A cleartext `0x04` at offset 0 says "seedkernel": the protocol, not the peer. A first message indistinguishable from random belongs in a suite of its own.
 
 **WebSocket and QUIC listeners answer as one.** A WebSocket listener writes the HTTP upgrade before any msg1, and a QUIC listener answers any Initial with a Retry, so a prober learns that such a server is there, though not whose. The channel's own silence starts behind that.
 

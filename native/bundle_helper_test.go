@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/tetratelabs/wazero"
-	"golang.org/x/crypto/blake2b"
 )
 
 // forwarderWasm is a minimal pure-transform module (WASM/tests/fixtures/forwarder: exports
@@ -87,12 +87,12 @@ type authorKeys struct {
 func (a authorKeys) id() []byte {
 	pre := append(domainManifestAuthor(), manifestSuite())
 	pre = append(append(pre, a.edPub...), a.mlPk...)
-	return blake2b256(pre)
+	return sha256Sum(pre)
 }
 
-// blake2b256 is the one system hash (§5), as the host's libsodium computes it.
-func blake2b256(b []byte) []byte {
-	h := blake2b.Sum256(b)
+// sha256Sum is the one system hash (§5).
+func sha256Sum(b []byte) []byte {
+	h := sha256.Sum256(b)
 	return h[:]
 }
 
@@ -181,7 +181,7 @@ func signBundleJSON(t testing.TB, a authorKeys, app string, mjson []byte, guestS
 }
 
 // bundleEnvelope independently frames and signs the whole bundle, for the shared JS reader.
-// Both keys sign DOMAIN_manifest || suite || keys || BLAKE2b-256(body).
+// Both keys sign DOMAIN_manifest || suite || keys || SHA-256(body).
 func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, modules ...[]byte) []byte {
 	t.Helper()
 	var body []byte
@@ -191,7 +191,7 @@ func bundleEnvelope(t testing.TB, a authorKeys, mjson []byte, guestSrc string, m
 		body = append(body, part...)
 	}
 	pre := append(domainManifest(), manifestSuite())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), blake2b256(body)...)
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), sha256Sum(body)...)
 	env := append([]byte{manifestSuite()}, a.edPub...)
 	env = append(append(env, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(env, testSigner(t).signDetached(t, pre, a.mlSk)...), body...)

@@ -22,7 +22,7 @@ const kem = await new ModuleTable().build([{ name: "mlkem", wasm: readFileSync(j
 const utf8 = (s) => new TextEncoder().encode(s);
 const cat = (...parts) => Buffer.concat(parts.map((p) => Buffer.from(p)));
 const hex = (b) => Buffer.from(b).toString("hex");
-const H = (...parts) => sodium.crypto_generichash(32, cat(...parts), null);
+const H = (...parts) => new Uint8Array(sodium.sha256(cat(...parts)));
 const ZERO32 = new Uint8Array(32), NONCE0 = new Uint8Array(12);
 const X25519_BASE = Uint8Array.of(9, ...new Uint8Array(31));
 
@@ -32,15 +32,15 @@ const LABEL = {
   i2r: utf8("seedkernel-session-i->r-v1\0"), r2i: utf8("seedkernel-session-r->i-v1\0"),
   rekey: utf8("seedkernel-session-rekey-v1\0"),
 };
-const SUITE = 0x03, M1_LEN = 1233, M3_LEN = 112, KEM_PK_LEN = 1184;
+const SUITE = 0x04, M1_LEN = 1233, M3_LEN = 120, KEM_PK_LEN = 1184;
 /** The public network's root: every relay link is on it, whatever the node's network. */
 const ROOT = H(DOMAIN_CHANNEL, ZERO32);
 const R_REGISTERED = 0x01, R_CALL = 0x05, R_UNREACHABLE = 0x06, R_TELL = 0x08;
 
-const seal = (key, nonce, pt) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(pt, null, null, nonce, key);
+const seal = (key, nonce, pt) => new Uint8Array(sodium.aesGcmSeal(key, nonce, new Uint8Array(0), pt));
 function open(key, nonce, ct) {
-  try { return sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, null, nonce, key); }
-  catch { return null; }
+  const pt = sodium.aesGcmOpen(key, nonce, new Uint8Array(0), ct);
+  return pt === null ? null : new Uint8Array(pt);
 }
 function recordNonce(epoch, ctr) {
   const n = new Uint8Array(12);
@@ -203,7 +203,9 @@ export class FakeRelay {
     const h1 = H(ROOT, w1);
     const hs = H(h1, head);
     const sig = sodium.crypto_sign_detached(cat(DOMAIN_LINK_SCOPE, DOMAIN_CHANNEL, ROOT, hs, this.identity.publicKey), this.identity.privateKey);
-    const w2 = cat(head, seal(H(ee, pq, this.secret, hs, LABEL.m2), NONCE0, sig));
+    // The relay's incarnation follows its signature: one per fake, a run of the relay.
+    this.incarnation ??= sodium.randombytes_buf(8);
+    const w2 = cat(head, seal(H(ee, pq, this.secret, hs, LABEL.m2), NONCE0, cat(sig, this.incarnation)));
     c.hs = { ee, pq, th: H(h1, w2) };
     this.put(c, w2);
   }

@@ -135,6 +135,7 @@ func exposeBridge(qc *qjs.Context) {
 		el.stopped = el.stopped || now
 		return qjs.Value{}, err
 	}))
+	installSymmetric(qc, b)
 	b.SetPropertyStr("random", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		out := make([]byte, args[0].Int32())
 		crand.Read(out)

@@ -195,7 +195,8 @@ class Pieces {
   }
 
   /** The next `n` bytes, of the `bytes` there are: a view of the piece they sit in, or a
-   *  copy across pieces. A piece is never written once pushed, so a view stays good. */
+   *  copy across pieces, and empty for none. A piece is never written once pushed, so a
+   *  view stays good. */
   take(n) {
     this.bytes -= n;
     let out;
@@ -207,7 +208,7 @@ class Pieces {
       this.at += k;
       if (this.at === piece.length) this.shift();
     }
-    return out;
+    return out ?? EMPTY;
   }
 
   /** The first `n` bytes, of the `bytes` there are, pushed onto `parts` as views of their

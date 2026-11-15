@@ -4,7 +4,7 @@ import "testing"
 
 // The native node's identity is the key the shared code derives from the master seed
 // (deriveNodeKey, host/subkeys.ts, §12.6.2b), computed with this target's crypto, whose
-// BLAKE2b is native Go. The expected peer id is the JS target's answer for the same seed,
+// SHA-256 is native Go. The expected peer id is the JS target's answer for the same seed,
 // so a native derivation that differed would give the node a different identity.
 func TestNodeDerivesSharedIdentity(t *testing.T) {
 	bootRealm(t)
@@ -13,8 +13,8 @@ func TestNodeDerivesSharedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal("startNode:", err)
 	}
-	// deriveNodeKey over libsodium-wrappers (the Node target) for the seed above.
-	const want = "7167b875c908982c267a60468df52921a01a13c184f5b98368c0f5bdd1587b03"
+	// deriveNodeKey on the Node target for the seed above.
+	const want = "c5536ae5e33f89e175c07b178fe48604bed6effcd4d881e4e6c71effcc4798ff"
 	if st.PeerID != want {
 		t.Fatalf("peer id = %s, want the shared derivation %s", st.PeerID, want)
 	}

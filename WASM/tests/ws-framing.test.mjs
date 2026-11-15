@@ -217,6 +217,24 @@ async function run() {
   }
 
   {
+    // The client end of a link a server keeps alive, as a relay does with empty pings. A
+    // client reads unmasked frames straight off its buffer, where an empty payload is the
+    // edge: a pong that failed to build lost every relay link at its first heartbeat.
+    const { framer, outbox } = makeFramer(true, "relay:1");
+    await framer.prepared;
+    outbox.length = 0;
+    framer.open = true;
+    framer.opened.resolve();
+    for (const body of [new Uint8Array(0), payload(3, 7)]) {
+      const r = await framer.push(Uint8Array.of(0x80 | WS.WS_OP_PING, body.length, ...body), () => {});
+      await framer.writes;
+      const pong = outbox.length === 1 ? decodeFrame(outbox.pop(), true) : null;
+      ok(r === true && pong?.opcode === WS.WS_OP_PONG && bytesEq(pong.payload, body),
+        `a client answers a server's ${body.length}-byte ping with a masked pong and stays open`);
+    }
+  }
+
+  {
     const { framer, delivered } = await serverAfterUpgrade();
     const orphan = await client.frame(WS.WS_OP_CONT, payload(10));
     const r = await framer.push(orphan, (p) => delivered.push(p));
@@ -297,8 +315,8 @@ async function run() {
     {
       const framer = new WS.LengthFramer(() => {});
       const lengthFrame = (body) => concat([Uint8Array.of(0, 0, 0, 0), body]);
-      const msg3 = lengthFrame(payload(112)), record = lengthFrame(payload(big));
-      new DataView(msg3.buffer).setUint32(0, 112);
+      const msg3 = lengthFrame(payload(120)), record = lengthFrame(payload(big));
+      new DataView(msg3.buffer).setUint32(0, 120);
       new DataView(record.buffer).setUint32(0, big);
       const delivered = [];
       const r = await framer.push(concat([msg3, record]), raisingStep(framer, delivered));
@@ -307,7 +325,7 @@ async function run() {
     }
     {
       const { framer, delivered } = await serverAfterUpgrade();
-      const msg3 = await client.frame(WS.WS_OP_BINARY, payload(112));
+      const msg3 = await client.frame(WS.WS_OP_BINARY, payload(120));
       const record = await client.frame(WS.WS_OP_BINARY, payload(big));
       const r = await framer.push(concat([msg3, record]), raisingStep(framer, delivered));
       ok(r === true && delivered.length === 2 && delivered[1].length === big,

@@ -85,7 +85,7 @@ The host is one signed blob, and the loader that runs it is the only code fixed 
 
 ## The transport is a bundle
 
-The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then seals every frame under forward-secret ChaCha20-Poly1305 keys, with the same protocol over TCP, WebSocket, WebRTC and UDP (QUIC) ([TRANSPORT](docs/TRANSPORT.md)). The node's signing key stays in the host.
+The handshake, framing, record encryption and link routing run in a signed bundle, admitted by the same install path as any other app. The shipped transport opens each link with a mutually-authenticated hybrid X25519 + ML-KEM-768 handshake that conceals both identities, then seals every frame under forward-secret AES-256-GCM keys, with the same protocol over TCP, WebSocket, WebRTC and UDP (QUIC) ([TRANSPORT](docs/TRANSPORT.md)). The node's signing key stays in the host.
 
 This makes the **protocol replaceable without a fork**: a deployment changes its handshake, framing or dial policy by selecting a new transport bundle, and a running node can replace its transport atomically, even across authors. An upgrade is a **reconnect**: listeners stay, while links, session state and the address book go with the old transport (§12.10). The first transport ships inside the host artifact; later versions arrive over the one already running. A node with no transport still runs apps, just without peers.
 
@@ -94,7 +94,7 @@ The transport holds sockets, session keys and plaintext, so it must be trusted w
 ## What runs today
 
 - **Three targets, one implementation.** Seedkernel runs in the browser, on Node or as a single native binary, with the same admission and confinement on each. Every target runs the same host blob and runs guests on the same QuickJS build, so nothing about the protocol is written twice ([one implementation, three targets](#one-implementation-three-targets)).
-- **The native node is one 5.2 MiB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The wasm engine and the Go runtime are four fifths of it; the host blob, transport included, is 0.6 MiB gzipped (§10.2, [ARCHITECTURE §12.9](docs/ARCHITECTURE.md#129-loaders-and-the-host-blob)).
+- **The native node is one 5.3 MiB file.** A cgo-free, cross-compiled Go binary: a loader with a wasm engine, carrying the host blob it starts with. The wasm engine and the Go runtime are four fifths of it; the host blob, transport included, is 0.6 MiB gzipped (§10.2, [ARCHITECTURE §12.9](docs/ARCHITECTURE.md#129-loaders-and-the-host-blob)).
 - **The host updates itself, when the operator allows it.** An app can hand the host a newer host blob from the host author, fetched over the node's own network. The running host checks it as it checks an app bundle and hands it to the loader, which tries it once and commits it after a health window; one that fails first is dropped for the host it replaced (§12.9).
 - **The engine is fast enough for real storage.** In seedstore's tested network configurations, transfer rate and latency dominated, not the engine ([seedstore's performance notes](https://github.com/arj03/seedstore/blob/main/docs/PERFORMANCE.md)).
 - **Code really does arrive only as a bundle.** [seedshell](https://github.com/arj03/seedshell)'s chat app installs its whole UI and logic at runtime, and [seedstore](https://github.com/arj03/seedstore)'s storage node is the host plus a signed bundle.
@@ -105,7 +105,7 @@ Each cryptographic role is protected according to when a quantum attacker could 
 
 ## 10. Performance
 
-The message path does no asymmetric cryptography: routing a frame is one AEAD open, one claim lookup and one guest invocation (§13). Public-key cryptography runs per link, in the handshake, and per bundle load, where one BLAKE2b-256 hash and both manifest signatures are checked (§12.4). The host's libsodium and ML-DSA-65 ship in the host blob and run on the platform's wasm engine on every target (§12.9); ML-KEM-768 and QUIC are the transport bundle's own modules.
+The message path does no asymmetric cryptography: routing a frame is one AEAD open, one claim lookup and one guest invocation (§13). Public-key cryptography runs per link, in the handshake, and per bundle load, where one SHA-256 hash and both manifest signatures are checked (§12.4). The host's libsodium and ML-DSA-65 ship in the host blob and run on the platform's wasm engine on every target (§12.9); AES-256-GCM is the platform's own on every target, and SHA-256 wherever the platform has one; ML-KEM-768 and QUIC are the transport bundle's own modules.
 
 Application throughput is the apps' to measure: seedstore keeps its figures in [its performance notes](https://github.com/arj03/seedstore/blob/main/docs/PERFORMANCE.md). The native target's `*_bench_test.go` benchmarks cover the host's hot paths.
 
@@ -115,21 +115,21 @@ Native and Node:
 
 | Component | Size |
 |---|---|
-| **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.43 MiB |
-| of which the host script (`build/host.js`) | 222 KiB |
+| **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.48 MiB |
+| of which the host script (`build/host.js`) | 225 KiB |
 | of which `qjs.wasm`, the realm engine, built for size | 624 KiB |
-| of which `libsodium.wasm` | 217 KiB |
+| of which `libsodium.wasm` | 278 KiB |
 | of which `mldsa65.wasm` | 16 KiB |
-| of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (247 KiB) | 378 KiB |
-| **Native binary** per `GOOS`/`GOARCH`, built with `-tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`: wazero with its compiler backend (~2.9 MiB), the Go runtime (~1.3 MiB), the host blob above, gzipped (~0.6 MiB), and the loader itself (~0.4 MiB) | ~5.2 MiB |
+| of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (235 KiB) | 369 KiB |
+| **Native binary** per `GOOS`/`GOARCH`, built with `-tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`: wazero with its compiler backend (~2.9 MiB), the Go runtime (~1.3 MiB), the host blob above, gzipped (~0.6 MiB), and the loader itself (~0.4 MiB) | ~5.3 MiB |
 
 Browser:
 
 | Component | Size |
 |---|---|
-| **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 132 KiB transport without `quic.wasm` | 994 KiB |
-| Host modules a page imports beside it, minified (`build-min`) | ~142 KiB |
-| **Total browser deployment** | **~1.11 MiB (~470 KiB gzipped)** |
+| **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 134 KiB transport without `quic.wasm` | 1.03 MiB |
+| Host modules a page imports beside it, minified (`build-min`) | ~144 KiB |
+| **Total browser deployment** | **~1.18 MiB (~495 KiB gzipped)** |
 
 ## One implementation, three targets
 
@@ -137,11 +137,11 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 | Code | What | LOC |
 | --- | --- | --- |
-| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 3,943 TS |
-| **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,058 TS |
-| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,508 Go |
+| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 3,995 TS |
+| **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,120 TS |
+| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,820 Go |
 
-The transport bundle sits outside these totals: 3,015 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
+The transport bundle sits outside these totals: 3,057 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
 
 ## Build this repo
 

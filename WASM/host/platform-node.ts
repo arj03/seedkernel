@@ -10,7 +10,7 @@ import { nodeRawFiles } from "../services/fs-node.js";
 import { nodeRawDatagrams } from "../services/datagrams-node.js";
 import { EMPTY, errMessage } from "./util.js";
 import { webBridge } from "./platform-web.js";
-import { packageHostBlob } from "./crypto-node.js";
+import { nodeSymmetric, packageHostBlob } from "./crypto-node.js";
 import type { Platform } from "./platform.js";
 import { PLATFORM_ABI, type NetDispatchers, type PlatformBridge, type PlatformNet } from "./abi.js";
 
@@ -82,6 +82,8 @@ export function nodePlatform(o: NodePlatformOptions = {}): Required<Platform> & 
       try { return new Uint8Array(readFileSync(0)); } catch { return EMPTY; }
     },
     ...web.bridge,
+    // OpenSSL, synchronously, rather than WebCrypto's promise per record.
+    ...nodeSymmetric,
     hostBlob: o.hostBlob ?? packageHostBlob,
     stageHost: o.stageHost ?? (() => { throw new Error("host: a library node runs its package's host and takes no updates"); }),
   };

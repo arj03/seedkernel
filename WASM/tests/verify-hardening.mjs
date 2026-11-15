@@ -31,7 +31,7 @@ const { MAX_OUTBOUND_QUEUE_BYTES, MAX_OUTBOUND_QUEUE_SLICES,
   MAX_NODE_OUTBOUND_QUEUE_BYTES, MAX_INBOUND_HOLD_BYTES }
   = await imp("build/services/net-limits.js");
 const { MemoryFs } = await imp("build/services/fs-memory.js");
-const { appScopeFor, loadBundleModules, FreshnessMarks }
+const { appScopeFor, genesisHash, loadBundleModules, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
 /** A manifest author: both halves of the key set, plus the 32-byte id derived from them,
@@ -163,9 +163,10 @@ console.log("\n§4.3 — declared memory and tables are bounded before instantia
 
 console.log("\n§12.2 — fs is scoped per app label");
 {
+  const scopeOf = (app) => appScopeFor(genesisHash(sodium, new TextEncoder().encode(app)));
   const disk = new MemoryFs();
-  const chat = scopedFs(disk, appScopeFor(sodium, "chat"));
-  const notes = scopedFs(disk, appScopeFor(sodium, "notes"));
+  const chat = scopedFs(disk, scopeOf("chat"));
+  const notes = scopedFs(disk, scopeOf("notes"));
   // Every method is awaited: the seam is async so a browser backend can implement it
   // (services/fs.ts), and MemoryFs answers in a microtask like any other.
   chat.put("secret", new Uint8Array([1, 2, 3]));
@@ -178,15 +179,15 @@ console.log("\n§12.2 — fs is scoped per app label");
   ok(disk.list("").length === 1, "the backend holds both under distinct physical keys");
 
   // Colons in an app name cannot make two scopes overlap, and cannot reach the backend.
-  const amb1 = scopedFs(disk, appScopeFor(sodium, "x:y"));
-  const amb2 = scopedFs(disk, appScopeFor(sodium, "x"));
+  const amb1 = scopedFs(disk, scopeOf("x:y"));
+  const amb2 = scopedFs(disk, scopeOf("x"));
   amb1.put("z", new Uint8Array([1]));
   ok(amb2.get("y:z") === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
-  ok(/^[A-Za-z0-9._-]+$/.test(appScopeFor(sodium, "x:y")), "the derived scope is inside the backend key charset");
+  ok(/^[A-Za-z0-9._-]+$/.test(scopeOf("x:y")), "the derived scope is inside the backend key charset");
   // Keys are filenames, and a case-folding filesystem would merge two labels differing
   // only in case if the label were the prefix. The hash is lowercase hex.
-  const upper = appScopeFor(sodium, "Chat");
-  ok(upper !== appScopeFor(sodium, "chat") && upper === upper.toLowerCase(),
+  const upper = scopeOf("Chat");
+  ok(upper !== scopeOf("chat") && upper === upper.toLowerCase(),
     "labels differing only in case get distinct lowercase prefixes");
   // The real backends reject anything outside that charset, so an unsafe scope must fail
   // at construction, not on the first write.

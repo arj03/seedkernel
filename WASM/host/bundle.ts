@@ -1,5 +1,5 @@
 // App bundle format (§12.4): one signed body, manifest + guest + modules in manifest order.
-import { concatBytes, toHex, isHex64, isRecord, enc, dec, errMessage, readU32BE, type JsonValue, type JsonObject } from "./util.js";
+import { concatBytes, toHex, isHex64, isRecord, enc, dec, errMessage, readU32BE, u8, type Bytes, type JsonValue, type JsonObject } from "./util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_HYBRID_PQ, HOST_SERVICES, isService, isHostNamespace } from "./domains.js";
 import { checkModuleLimits, moduleFootprintBytes, DEFAULT_MAX_BUNDLE_MODULES, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "./wasm-limits.js";
 export type { JsonValue, JsonObject };
@@ -39,8 +39,9 @@ export interface BundleManifest {
 /** The libsodium subset verifying a manifest needs; install is handed no way to sign. */
 export interface ManifestVerifier {
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
-  /** The genesis hash: content integrity, and the author id (`hybridAuthorId`). */
-  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+  /** SHA-256, the platform's own: the genesis hash under the signatures, and the author id
+   *  (`hybridAuthorId`). */
+  sha256(msg: Uint8Array): Bytes;
   /** ML-DSA-65 verify (FIPS 204), the PQ half of the hybrid suite (§14.1). Required:
    *  there is no Ed25519-only fallback. */
   ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
@@ -104,9 +105,9 @@ export interface VerifiedBundle {
 /** Verified metadata and guest source, without the module bytes. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
-/** The genesis hash (BLAKE2b-256), the one system hash. */
-export function genesisHash(sodium: ManifestVerifier, data: Uint8Array): Uint8Array {
-  return sodium.crypto_generichash(32, data, null);
+/** The genesis hash (SHA-256), the one system hash. */
+export function genesisHash(sodium: Pick<ManifestVerifier, "sha256">, data: Uint8Array): Uint8Array {
+  return u8(sodium.sha256(data));
 }
 
 /** Whether the signed manifest requires the node's exclusive raw-link service. */
@@ -114,11 +115,11 @@ export function reachesLink(manifest: BundleManifest): boolean {
   return manifest.guest.requires.includes("link");
 }
 
-/** The fs prefix for one app label (§12.2): 128 bits of lowercase hex, so it is a safe
- *  filename on case-folding filesystems and no prefix extends another. Separates
- *  namespaces; does not authenticate them. */
-export function appScopeFor(crypto: ManifestVerifier, app: string): string {
-  return toHex(genesisHash(crypto, enc.encode(app))).slice(0, 32) + "-";
+/** The fs prefix for one app label (§12.2), from `appId`, the label's genesis hash: 128
+ *  bits of lowercase hex, so it is a safe filename on case-folding filesystems and no
+ *  prefix extends another. Separates namespaces; does not authenticate them. */
+export function appScopeFor(appId: Uint8Array): string {
+  return toHex(appId).slice(0, 32) + "-";
 }
 
 const SUITE_LEN = 1;
@@ -144,16 +145,17 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  *  convention (`_net`), not a reservation. */
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 
-/** Both keys sign `domain ‖ suite ‖ keys ‖ BLAKE2b-256(body)`: `DOMAIN_manifest` for an
- *  app bundle, `DOMAIN_host` for a host blob. */
-export function envelopeSigningInput(sodium: ManifestVerifier, domain: Uint8Array, edPk: Uint8Array,
-  mlDsaPk: Uint8Array, body: Uint8Array): Uint8Array {
+/** Both keys sign `domain ‖ suite ‖ keys ‖ SHA-256(body)`: `DOMAIN_manifest` for an app
+ *  bundle, `DOMAIN_host` for a host blob. */
+export function envelopeSigningInput(sodium: Pick<ManifestVerifier, "sha256">, domain: Uint8Array,
+  edPk: Uint8Array, mlDsaPk: Uint8Array, body: Uint8Array): Uint8Array {
   return concatBytes([domain, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, genesisHash(sodium, body)]);
 }
 
 /** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. */
-export function hybridAuthorId(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array): Uint8Array {
-  return sodium.crypto_generichash(32, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]), null);
+export function hybridAuthorId(sodium: Pick<ManifestVerifier, "sha256">, edPk: Uint8Array,
+  mlDsaPk: Uint8Array): Uint8Array {
+  return genesisHash(sodium, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]));
 }
 
 /** Control, line-separator, bidi and zero-width characters. */

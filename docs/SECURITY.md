@@ -34,7 +34,7 @@ A chat message arriving at a node, traced through every boundary. Nodes **A** an
 2. **The host resolves the protocol.** The transport hands the host the claim `chat`, A's key and the payload through `link/deliver`, and the host looks the claim up among B's installed claims (§12.10). An unclaimed protocol reaches no guest and is answered empty. A named only the protocol; which code runs is B's choice alone.
 3. **The guest receives the attribution and the payload**: `[A's key 32][payload]`. The key comes from the link, never from the frame body, so a peer cannot claim to be someone else: the bytes it chooses do not include the attribution. The host does not check the attribution itself; the transport is trusted with it (§14).
 4. **The guest runs** under its deadline and heap cap (§12.3), and calls its module by bare name. The name resolves only among that slot's own modules (§12.2).
-5. **The module transforms bytes.** The host copies the input to the module's scratch region, calls `handle`, and copies the answer back (§4.1). The module imports nothing and can ask nobody who sent the message; everything it knows is in its input (§4.2).
+5. **The module transforms bytes.** The host copies the input to the module's scratch region, calls `handle`, and copies the answer back (§4.1). The module's only imports are inert shims and the platform's AES on its own memory, so it can ask nobody who sent the message; everything it knows is in its input (§4.2).
 6. **The answer goes back** through the guest, the host and the transport, sealed for A.
 
 Public-key cryptography runs only per link and per install. A bundle a peer offers re-runs the whole install check on B, which is why a bundle authenticates against its author across any number of relays while a chat message authenticates only its one hop (§5).
@@ -64,7 +64,7 @@ Public-key cryptography runs only per link and per install. A bundle a peer offe
 
 **The channel conceals both identities**, forward-secretly, and the identity key is signing-only. The construction, and what it does not hide (traffic metadata, a stable `host:port`, the cleartext suite byte), are [TRANSPORT](TRANSPORT.md), Handshake and Limits.
 
-**The cryptographic root is the host, not a bundle.** Ed25519, BLAKE2b-256 and ML-DSA-65 are the manifest trust root, shipped in the host blob, and a host's successor is checked by the host it replaces (§12.9). The trust anchors are the loader and its genesis blob, the host author, and the operator's policy.
+**The cryptographic root is the host, not a bundle.** Ed25519 and ML-DSA-65 are the manifest trust root, shipped in the host blob, over SHA-256, the loader's where it has one and otherwise the blob's, and a host's successor is checked by the host it replaces (§12.9). The trust anchors are the loader and its genesis blob, the host author, and the operator's policy.
 
 **The host author is a node's root of code.** With updates on, whoever holds the host author's key decides what every updating node runs, including the code that holds the master seed: a stolen host key is the whole node. That is why updates are off unless the operator turns them on, and why the key belongs offline. It cannot move a node below the version floor or reach a node with updates off (§12.9). A page is outside this: it keeps no slots, its origin is its trust root, and bundles and peer input run only inside QuickJS in wasm, so it needs no `'unsafe-eval'`.
 
@@ -76,7 +76,7 @@ Public-key cryptography runs only per link and per install. A bundle a peer offe
 2. it cannot be delivered as a module at the endpoints, as the manifest verifier cannot;
 3. it is a migration the host itself must call.
 
-A pure function of bytes the guest already holds is computation, not a grant, and belongs in a module. The same test is why the residual `crypto/*` table does not shrink further. `blake2b` passes the first condition outright: the host hashes bundles and derives ids with it. `chacha20poly1305-ietf` is the per-record cipher, where a module would add a scratch copy per record against a library the host already links. `x25519/dh` fails the test on its merits, but removing it would mean vendoring a second, unreviewed, handshake-critical X25519, since none exists in the vendored post-quantum code. And a module cannot borrow the host's copy: reaching libsodium would mean exporting the memory that holds the node key.
+A pure function of bytes the guest already holds is computation, not a grant, and belongs in a module. What remains in the `crypto/*` table is what a module cannot do as well. `sha256` and `aes256gcm` are the platform's own where it has them, run by the CPU's SHA and AES instructions, which no module compiled to wasm can reach. `x25519/dh` is already in the host: libsodium is there for Ed25519 and X25519 comes with it, the same reviewed code on every target. Exposing it costs one table entry, where a module would put a second X25519 in the bundle for every handshake to depend on.
 
 **Freshness is not revocation.** `version` refuses downgrades (§12.4); it cannot say a key is still its author's. An attacker holding an admitted author's keys signs `version + 1` and lands as an ordinary upgrade. The remedy is revocation (§12.5). The residual is the window between compromise and the operator noticing, which no host mechanism shortens.
 
@@ -116,7 +116,7 @@ Channel confidentiality, live authentication and long-lived app signatures are e
 
 **Peer authentication stays classical for now.** That is where deployed protocols stand: TLS, Signal (PQXDH) and OpenSSH run hybrid post-quantum key exchange by default and keep classical authentication, because harvested traffic is the threat that exists today. Post-quantum authentication would add about 5.1 KiB to each of msg2 and msg3, against messages of about 1.2 KiB. Bundles are the other way round, long-lived and verified once per install, so they are signed post-quantum now. Moving peer authentication later is a transport and host update, and changes every peer id, since an id binding both keys is a hash over them, as the author id is.
 
-**The hash is already fine.** BLAKE2b-256 is the one system hash (§5). Grover gives at most a quadratic speedup on preimage search, and at 256 bits collision resistance for author ids and content addresses is unchanged.
+**The hash is already fine.** SHA-256 is the one system hash (§5). Grover gives at most a quadratic speedup on preimage search, and at 256 bits collision resistance for author ids and content addresses is unchanged.
 
 **Suite bytes keep the path open.** Both places that use public-key cryptography carry a suite byte, by one discipline: it is the first field of the structure it governs, and it is covered by that structure's signature.
 
@@ -143,10 +143,11 @@ Each role is protected according to when a quantum attacker could use it:
 | Use | Primitive | Suite byte | Status |
 | --- | --- | --- | --- |
 | Channel session keys | ephemeral X25519 + ML-KEM-768 | yes | closed |
+| Records and QUIC packets | AES-256-GCM | yes | 256-bit keys: Grover leaves 128 bits |
 | Channel authentication | Ed25519 | yes | classical by design: verified live (§14.1) |
 | Manifest signatures | Ed25519 + ML-DSA-65 | yes | closed |
 | App signatures (`node/sign`) | Ed25519 | no, deliberately | the app's to close, inside its own records |
-| Author ids and content hashes | BLAKE2b-256 | n/a | no change needed |
+| Author ids and content hashes | SHA-256 | n/a | no change needed |
 
 **App signatures can outlive their algorithm.** The argument that a signature need only be unforgeable when verified holds for manifests and handshakes. It does not hold for signatures an app keeps in a replicated log: every future replica verifies them, so their deadline is the record's lifetime. Once Ed25519 falls, an attacker can mint history that verifies. An app needing long-horizon non-repudiation adds a post-quantum signature or an external anchor (timestamping, a witnessed checkpoint) inside its own records.
 

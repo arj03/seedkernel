@@ -5,6 +5,9 @@ import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE } from "../host/domains.js";
 import type { SeamCrypto, ServiceHandlers } from "../host/guest-seam.js";
 import type { Keypair } from "../host/subkeys.js";
 
+/** The two libsodium calls a scoped signer makes. */
+type SignCrypto = Pick<SeamCrypto, "crypto_sign_detached" | "crypto_sign_verify_detached">;
+
 /** What a scoped SIGN/VERIFY signs under (§12.2): `domain ‖ scope ‖ msg`, `msg` never
  *  parsed. */
 export interface SignScope {
@@ -34,7 +37,7 @@ export function slotSignScope(node: { identity: Keypair }, app: string, links: b
 
 /** Sign and verify under one scope, over `domain ‖ scope ‖ msg`: `node/sign` and
  *  `node/verify`, and their host-side twin `appSigner`. */
-function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
+function scopedSigner(sodium: SignCrypto, scope: SignScope): {
   sign(msg: Uint8Array): Uint8Array;
   /** False on a bad signature, and on a `sig` or `pk` of the wrong shape. */
   verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
@@ -55,12 +58,12 @@ function scopedSigner(sodium: SeamCrypto, scope: SignScope): {
 }
 
 /** Host-side twin of a slot's scoped SIGN/VERIFY (§12.2). */
-export function appSigner(sodium: SeamCrypto, key: Keypair, app: string): ReturnType<typeof scopedSigner> {
+export function appSigner(sodium: SignCrypto, key: Keypair, app: string): ReturnType<typeof scopedSigner> {
   return scopedSigner(sodium, appSignScope(key, app));
 }
 
 /** The `node` handlers for one slot, signing under its scope. */
-export function nodeService(sodium: SeamCrypto, scope: SignScope): ServiceHandlers<"node"> {
+export function nodeService(sodium: SignCrypto, scope: SignScope): ServiceHandlers<"node"> {
   const signer = scopedSigner(sodium, scope);
   return {
     "node/sign": (payload) => signer.sign(payload),

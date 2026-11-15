@@ -7,6 +7,7 @@
 // unsupported envelope byte, so none uses `authorBundle` except the hybrid suite's
 // end-to-end case (case 6 below).
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { testkit } from "./testkit.mjs";
@@ -23,7 +24,7 @@ const assert = ok;
 // ─── Test: manifest suite byte, signed so it cannot be edited in flight ────────
 //
 // The suite byte starts the §12.4 envelope and is part of the signed preimage
-// `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ BLAKE2b-256(body)`. That makes it safe to
+// `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ SHA-256(body)`. That makes it safe to
 // read the byte before verifying: a verifier needs it to know the field widths, and the
 // signature it then checks covers the same byte, so rewriting it only breaks the
 // manifest. Algorithm confusion with a later suite is impossible (§14.1).
@@ -250,7 +251,7 @@ async function testHybridManifestSuite() {
   assertEqual(new TextDecoder().decode(env.slice(OFF_BODY + 4, OFF_BODY + 4 + new DataView(env.buffer).getUint32(OFF_BODY, false))), JSON.stringify(manifest),
     "the manifest JSON is carried verbatim as the first body field");
 
-  const bodyHash = sodium.crypto_generichash(32, env.subarray(OFF_BODY));
+  const bodyHash = createHash("sha256").update(env.subarray(OFF_BODY)).digest();
   const signedInput = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"),
     Uint8Array.of(0x02), ed.publicKey, pq.publicKey, bodyHash]);
   assert(sodium.crypto_sign_verify_detached(env.subarray(OFF_ED_SIG, OFF_ML_SIG), signedInput, ed.publicKey),
@@ -291,7 +292,7 @@ async function testHybridManifestSuite() {
     const body = env.slice(OFF_BODY);
     const pre = concatBytes([
       new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x02),
-      attacker.publicKey, pq.publicKey, sodium.crypto_generichash(32, body),
+      attacker.publicKey, pq.publicKey, createHash("sha256").update(body).digest(),
     ]);
     const spliced = concatBytes([
       Uint8Array.of(0x02), attacker.publicKey, pq.publicKey,
@@ -308,7 +309,7 @@ async function testHybridManifestSuite() {
   {
     const classicalOnly = {
       crypto_sign_verify_detached: (...a) => sodium.crypto_sign_verify_detached(...a),
-      crypto_generichash: (...a) => sodium.crypto_generichash(...a),
+      sha256: (m) => sodium.sha256(m),
     };
     let msg = "";
     try { verifyTestBundle(classicalOnly, env); } catch (e) { msg = String(e.message); }
@@ -370,22 +371,28 @@ async function testHostSodium() {
   console.log("Test: the host's crypto on the engine table agrees with libsodium-wrappers");
   const { engineSodium, SODIUM_EXPORTS } = await imp("build/host/sodium-engine.js");
   const { syncWebEngine } = await imp("build/host/platform-web.js");
+  const { nodeSymmetric } = await imp("build/host/crypto-node.js");
   // The oracle is the upstream glue, not the package's root entry, which is the engine.
   const { default: oracle } = await import("libsodium-wrappers");
   await oracle.ready;
   // The glue libsodium.wasm is extracted from (scripts/build-libsodium.mjs).
-  const glue = readFileSync(join(root, "node_modules/libsodium/dist/modules-esm/libsodium.mjs"), "utf8");
+  const glue = readFileSync(join(root, "node_modules/libsodium-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs"), "utf8");
   for (const [name, min] of Object.entries(SODIUM_EXPORTS)) {
     assert(glue.includes(`._${name}=A.${min},`) || glue.includes(`._${name}=A.${min};`),
       `${name} is export ${min} in the glue`);
   }
+  // No platform SHA-256, as on a page, so the host hashes with libsodium's.
+  const { aesGcmSeal, aesGcmOpen } = nodeSymmetric;
   const host = engineSodium(syncWebEngine, readFileSync(join(root, "browser/libsodium.wasm")),
-    readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n));
+    readFileSync(join(root, "browser/mldsa65.wasm")), (n) => sodium.randombytes_buf(n), { aesGcmSeal, aesGcmOpen });
+  assertEqual(toHex(host.sha256(new TextEncoder().encode("abc"))),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "libsodium SHA-256(\"abc\") (FIPS 180-4)");
+  assertEqual(toHex(host.sha256(new Uint8Array(0))),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "libsodium SHA-256 of nothing");
   const msg = new Uint8Array(70000).map((_, i) => i * 7);
-  const key = new Uint8Array(32).fill(5), npub = new Uint8Array(12).fill(6), ad = Uint8Array.of(1, 2, 3);
-  assertEqual(toHex(host.crypto_generichash(32, msg, null)), toHex(oracle.crypto_generichash(32, msg, null)), "BLAKE2b-256");
-  assertEqual(toHex(host.crypto_generichash(64, msg, key)), toHex(oracle.crypto_generichash(64, msg, key)), "keyed BLAKE2b-512");
+  const key = new Uint8Array(32).fill(5);
   const seed = new Uint8Array(32).fill(9);
+  assertEqual(toHex(host.sha256(msg)), createHash("sha256").update(msg).digest("hex"), "libsodium SHA-256 over many blocks");
   const kp = host.crypto_sign_seed_keypair(seed);
   assertEqual(toHex(kp.privateKey), toHex(oracle.crypto_sign_seed_keypair(seed).privateKey), "Ed25519 keypair from a seed");
   const sig = host.crypto_sign_detached(msg, kp.privateKey);
@@ -393,20 +400,6 @@ async function testHostSodium() {
   assert(host.crypto_sign_verify_detached(sig, msg, kp.publicKey), "Ed25519 verify accepts");
   assert(!host.crypto_sign_verify_detached(sig, msg.subarray(1), kp.publicKey), "Ed25519 verify refuses another message");
   assertEqual(toHex(host.crypto_scalarmult(key, kp.publicKey)), toHex(oracle.crypto_scalarmult(key, kp.publicKey)), "X25519");
-  const ct = host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key);
-  assertEqual(toHex(ct), toHex(oracle.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key)), "ChaCha20-Poly1305 seal");
-  assertEqual(toHex(host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key)), toHex(msg), "ChaCha20-Poly1305 open");
-  ct[5] ^= 1;
-  let refused = false;
-  try { host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub, key); } catch { refused = true; }
-  assert(refused, "a tampered record does not open");
-  // The scratch arena holds the last operation's bytes (here the signing key), which a
-  // short key or nonce would otherwise be padded out with.
-  const throws = (fn) => { try { fn(); return false; } catch { return true; } };
-  assert(throws(() => host.crypto_aead_chacha20poly1305_ietf_encrypt(msg, ad, null, npub, key.subarray(0, 16))),
-    "a short AEAD key is refused");
-  assert(throws(() => host.crypto_aead_chacha20poly1305_ietf_decrypt(null, ct, ad, npub.subarray(0, 8), key)),
-    "a short AEAD nonce is refused");
   const author = testAuthor();
   const signed = signTestBundle(sodium, author, { app: "host-crypto", version: 1, modules: [{ name: "fwd" }], guest: { requires: [] } });
   assert(verifyBundle(host, signed).manifest.app === "host-crypto", "a hybrid bundle verifies on the host's crypto");
@@ -421,5 +414,44 @@ await testMlKemAcvpVectors();
 await testHybridManifestSuite();
 await testRandomBytesInBlocks();
 await testHostSodium();
+await testPlatformSymmetric();
+
+/** The platform's AES-256-GCM (abi.ts `Symmetric`) by OpenSSL and by WebCrypto, the Node and
+ *  browser bridges, and OpenSSL's SHA-256 (a page has none), against FIPS 180-4's "abc" and
+ *  the GCM specification's AES-256 test cases 13 and 14 (zero key and nonce). Native runs
+ *  the same vectors in Go (native/guestseam_test.go). */
+async function testPlatformSymmetric() {
+  console.log("Test: the platform's AES-256-GCM and SHA-256 on OpenSSL and WebCrypto");
+  const { nodeSymmetric } = await imp("build/host/crypto-node.js");
+  const { webSymmetric } = await imp("build/host/platform-web.js");
+  const z = (n) => new Uint8Array(n);
+  const hex = async (b) => toHex(new Uint8Array(await b));
+  assertEqual(toHex(nodeSymmetric.sha256(new TextEncoder().encode("abc"))),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "OpenSSL SHA-256(\"abc\")");
+  for (const [name, s] of [["OpenSSL", nodeSymmetric], ["WebCrypto", webSymmetric]]) {
+    assertEqual(await hex(s.aesGcmSeal(z(32), z(12), z(0), z(0))), "530f8afbc74536b9a963b4f1c4cb738b",
+      `${name} AES-256-GCM, empty message`);
+    const ct = new Uint8Array(await s.aesGcmSeal(z(32), z(12), z(0), z(16)));
+    assertEqual(toHex(ct), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919",
+      `${name} AES-256-GCM, one zero block`);
+    assertEqual(await hex(s.aesGcmOpen(z(32), z(12), z(0), ct)), toHex(z(16)), `${name} opens it`);
+    const ad = Uint8Array.of(1, 2, 3);
+    const bound = new Uint8Array(await s.aesGcmSeal(z(32), z(12), ad, z(5)));
+    assert(await s.aesGcmOpen(z(32), z(12), z(0), bound) === null, `${name} binds the associated data`);
+    ct[0] ^= 1;
+    assert(await s.aesGcmOpen(z(32), z(12), z(0), ct) === null, `${name} refuses a flipped bit`);
+    ct[0] ^= 1;
+    // The seam lends views of a realm's memory that its next entry overwrites, so every
+    // argument must be read before the call returns, though the answer comes later.
+    const key = z(32), nonce = z(12), msg = z(16);
+    const sealing = s.aesGcmSeal(key, nonce, z(0), msg);
+    key.fill(9); nonce.fill(9); msg.fill(9);
+    assertEqual(await hex(sealing), toHex(ct), `${name} seal reads its arguments before it returns`);
+    const sealed = ct.slice();
+    const opening = s.aesGcmOpen(z(32), z(12), z(0), sealed);
+    sealed.fill(0);
+    assertEqual(await hex(opening), toHex(z(16)), `${name} open reads its arguments before it returns`);
+  }
+}
 
 summary("Results");

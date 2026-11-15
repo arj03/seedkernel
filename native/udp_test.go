@@ -62,19 +62,19 @@ const udpPairHarness = `
 	  // The relay's side of a relay link: the channel handshake as its responder, on the
 	  // public network's root, then the relay wire in records (fake-relay.mjs has the same).
 	  const enc = (s) => new TextEncoder().encode(s);
-	  const H = (...parts) => sodium.crypto_generichash(32, cat(...parts), null);
+	  const H = (...parts) => new Uint8Array(sodium.sha256(cat(...parts)));
 	  const DOMAIN_LINK_SCOPE = enc("seedkernel-link-scope-v1\0"), DOMAIN_CHANNEL = enc("seedkernel-channel-id-v1\0");
 	  const L = (s) => enc("seedkernel-" + s + "-v1\0");
 	  const ROOT = H(DOMAIN_CHANNEL, new Uint8Array(32)), NONCE0 = new Uint8Array(12), SECRET = new Uint8Array(32);
-	  const relayId = sodium.crypto_sign_keypair();
+	  const relayId = sodium.crypto_sign_keypair(), relayIncarnation = sodium.randombytes_buf(8);
 	  const kem = platformModules.build([{ name: "mlkem", wasm: fromHex(%q) }]);
 	  const aead = {
-	    seal: (k, n, m) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(m, null, null, n, k),
-	    open: (k, n, c) => { try { return sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, c, null, n, k); } catch { return null; } },
+	    seal: (k, n, m) => new Uint8Array(sodium.aesGcmSeal(k, n, new Uint8Array(0), m)),
+	    open: (k, n, c) => { const p = sodium.aesGcmOpen(k, n, new Uint8Array(0), c); return p === null ? null : new Uint8Array(p); },
 	  };
 	  const nonce = (ctr) => { const n = new Uint8Array(12); n[8] = ctr >>> 24; n[9] = (ctr >>> 16) & 255; n[10] = (ctr >>> 8) & 255; n[11] = ctr & 255; return n; };
 	  const onMsg1 = async (c, w1) => {
-	    if (w1.length !== 1233 || w1[0] !== 3) return;
+	    if (w1.length !== 1233 || w1[0] !== 4) return;
 	    const eph = w1.subarray(1, 33), kemPk = w1.subarray(33, 1217);
 	    if (!aead.open(H(SECRET, H(ROOT, w1.subarray(0, 1), eph, kemPk), L("c-probe")), NONCE0, w1.subarray(1217))) return;
 	    const sk = sodium.randombytes_buf(32);
@@ -83,13 +83,13 @@ const udpPairHarness = `
 	    const head = cat(sodium.crypto_scalarmult(sk, Uint8Array.of(9, ...new Uint8Array(31))), r.subarray(1, 1089));
 	    const h1 = H(ROOT, w1), hs = H(h1, head);
 	    const sig = sodium.crypto_sign_detached(cat(DOMAIN_LINK_SCOPE, DOMAIN_CHANNEL, ROOT, hs, relayId.publicKey), relayId.privateKey);
-	    const w2 = cat(head, aead.seal(H(ee, pq, SECRET, hs, L("c-msg2")), NONCE0, sig));
+	    const w2 = cat(head, aead.seal(H(ee, pq, SECRET, hs, L("c-msg2")), NONCE0, cat(sig, relayIncarnation)));
 	    c.hs = { ee, pq, th: H(h1, w2) };
 	    c.end.deliver(w2);
 	  };
 	  const onMsg3 = (c, w3) => {
 	    const { ee, pq, th } = c.hs;
-	    const plain = w3.length === 112 ? aead.open(H(ee, pq, SECRET, th, L("c-msg3")), NONCE0, w3) : null;
+	    const plain = w3.length === 120 ? aead.open(H(ee, pq, SECRET, th, L("c-msg3")), NONCE0, w3) : null;
 	    if (!plain) return;
 	    const h3 = H(th, w3);
 	    c.recv = { key: H(ee, pq, SECRET, h3, L("session-i->r")), ctr: 0 };
