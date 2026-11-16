@@ -117,9 +117,9 @@ Native and Node:
 
 | Component | Size |
 |---|---|
-| **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.48 MiB |
+| **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.49 MiB |
 | of which the host script (`build/host.js`) | 225 KiB |
-| of which `qjs.wasm`, the realm engine, built for size | 624 KiB |
+| of which `qjs.wasm`, the realm engine, built for size | 630 KiB |
 | of which `libsodium.wasm` | 278 KiB |
 | of which `mldsa65.wasm` | 16 KiB |
 | of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (234 KiB) | 368 KiB |
@@ -129,7 +129,7 @@ Browser:
 
 | Component | Size |
 |---|---|
-| **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 134 KiB transport without `quic.wasm` | 1.03 MiB |
+| **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 134 KiB transport without `quic.wasm` | 1.04 MiB |
 | Host modules a page imports beside it, minified (`build-min`) | ~144 KiB |
 | **Total browser deployment** | **~1.18 MiB (~495 KiB gzipped)** |
 
