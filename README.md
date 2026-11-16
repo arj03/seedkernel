@@ -109,6 +109,8 @@ The message path does no asymmetric cryptography: routing a frame is one AEAD op
 
 Application throughput is the apps' to measure: seedstore keeps its figures in [its performance notes](https://github.com/arj03/seedstore/blob/main/docs/PERFORMANCE.md). The native target's `*_bench_test.go` benchmarks cover the host's hot paths.
 
+Two of them track the bulk path a seedstore PUT takes, where seedstore's own figures are now bounded by seedstore's work rather than the host's: `BenchmarkNetUpload1M` sends 1 MiB over TCP and `BenchmarkUdpUpload1M` over QUIC, each answered by a 1-byte ack. Both nodes run in one process, so the time covers the sender's encryption and writes as well as the receiver's reads, decryption, reassembly and dispatch to the guest. On an AMD Ryzen 7 PRO 7840U on mains power (`go test -run '^$' -bench Upload1M` in `native/`), they take 6.1 ms (171 MB/s) and 11.7 ms (90 MB/s) per op.
+
 ### 10.2 Distribution Size
 
 Native and Node:
