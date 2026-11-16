@@ -120,7 +120,7 @@ Native and Node:
 | of which `qjs.wasm`, the realm engine, built for size | 624 KiB |
 | of which `libsodium.wasm` | 278 KiB |
 | of which `mldsa65.wasm` | 16 KiB |
-| of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (235 KiB) | 369 KiB |
+| of which the transport bundle (`build/transport.skb`): its guest, `ws.wasm`, `mlkem768.wasm` (12 KiB) and `quic.wasm` (234 KiB) | 368 KiB |
 | **Native binary** per `GOOS`/`GOARCH`, built with `-tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w"`: wazero with its compiler backend (~2.9 MiB), the Go runtime (~1.3 MiB), the host blob above, gzipped (~0.6 MiB), and the loader itself (~0.4 MiB) | ~5.3 MiB |
 
 Browser:
@@ -137,11 +137,11 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 | Code | What | LOC |
 | --- | --- | --- |
-| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,003 TS |
+| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,010 TS |
 | **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,120 TS |
-| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,820 Go |
+| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,839 Go |
 
-The transport bundle sits outside these totals: 3,057 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
+The transport bundle sits outside these totals: 3,066 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
 
 ## Build this repo
 

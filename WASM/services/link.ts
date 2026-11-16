@@ -17,7 +17,7 @@ import {
   UDP_SOCKET_BUFFER_BYTES,
 } from "./net-limits.js";
 import { type LinkEvent } from "../host/domains.js";
-import { datagramEnd, readsWithin, type RawDatagrams } from "./datagrams.js";
+import { groupEnd, readsWithin, type RawDatagrams } from "./datagrams.js";
 import { type Arrival, type ChannelFactory, type ListenAddress, type RawLink } from "./socket-seam.js";
 import type { ServiceHandlers } from "../host/guest-seam.js";
 import { REALM_DISPOSED, type CausalClock } from "../host/realm-queue.js";
@@ -38,9 +38,9 @@ export interface RawNet {
   /** A datagram socket on `port`, or on one the OS picks for 0, for the occupant's UDP paths
    *  (§12.7); its reads arrive as `datagrams` events. */
   udpBind(port: number): Promise<DatagramSocket>;
-  /** A turn's datagrams, each `[socket u32][host][port u16][len u16][bytes]`, the host an
-   *  address as the reads spell it or a name (datagrams.ts `datagramEnd`); one that fails is
-   *  lost. */
+  /** A turn's datagrams, by socket: `([socket u32][len u32]([host][port u16][len u16]
+   *  [bytes])*)*`, the host an address as the reads spell it or a name (datagrams.ts
+   *  `forEachDatagram`); one that fails is lost. */
   udpSend(batch: Uint8Array): void;
   udpClose(id: number): void;
 }
@@ -442,12 +442,13 @@ export class TransportHost {
       udpSend: (batch) => {
         const raw = this.opts.datagrams;
         if (!bound() || !raw) return;
-        // The platform takes the batch whole, so it is checked here: every datagram inside
-        // it, and from a socket this occupant holds. One that is not is left out.
+        // The platform takes the batch whole, so its socket groups are checked here: each
+        // within it, and from a socket this occupant holds; one that is not is left out. The
+        // platform checks the datagrams inside a group.
         let kept: Uint8Array[] | null = null;
         for (let at = 0; at < batch.length;) {
-          const end = datagramEnd(batch, at);
-          if (end > batch.length) throw new Error("link/udpSend: a datagram runs past the batch");
+          const end = groupEnd(batch, at);
+          if (end > batch.length) throw new Error("link/udpSend: a socket's group runs past the batch");
           if (this.sockets.has(readU32BE(batch, at))) kept?.push(batch.subarray(at, end));
           else kept ??= [batch.subarray(0, at)];
           at = end;

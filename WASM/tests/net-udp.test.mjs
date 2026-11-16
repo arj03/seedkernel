@@ -225,14 +225,17 @@ function batchOf(host, port, bytes) {
   return out;
 }
 
-/** One datagram as a send batch carries it: `[socket u32][n u8][ip n][port u16][len u16][bytes]`. */
+/** One datagram as a send batch carries it, alone in its socket's group:
+ *  `[socket u32][len u32][n u8][ip n][port u16][len u16][bytes]`. */
 function sendOf(id, host, port, bytes) {
   const ip = host.includes(":") ? ipv6Bytes(host) : Uint8Array.from(host.split("."), Number);
-  const out = new Uint8Array(9 + ip.length + bytes.length);
+  const out = new Uint8Array(13 + ip.length + bytes.length);
   out[0] = id >>> 24; out[1] = (id >>> 16) & 255; out[2] = (id >>> 8) & 255; out[3] = id & 255;
-  out[4] = ip.length;
-  out.set(ip, 5);
-  const at = 5 + ip.length;
+  const len = out.length - 8;
+  out[6] = len >> 8; out[7] = len & 255;
+  out[8] = ip.length;
+  out.set(ip, 9);
+  const at = 9 + ip.length;
   out[at] = port >> 8; out[at + 1] = port & 255;
   out[at + 2] = bytes.length >> 8; out[at + 3] = bytes.length & 255;
   out.set(bytes, at + 4);
@@ -557,13 +560,18 @@ function quicTurn(call, id, { msgs = [], write = new Uint8Array(0), batch = null
   return { accepted: r.readUInt32BE(1), up, sends: r.subarray(22 + readLen + hsLen + 4 * r[21]) };
 }
 
-/** Datagrams to send as the peer reads them, a batch from `from`. */
+/** Datagrams to send, `([socket u32][len u32]([host][port u16][len u16][bytes])*)*`, as the
+ *  peer reads them, a batch from `from`. */
 function asBatch(sends, from) {
   const out = [];
   for (let at = 0; at < sends.length;) {
-    const p = at + 5 + sends[at + 4], len = sends.readUInt16BE(p + 2);
-    out.push(from, sends.subarray(p + 2, p + 4 + len));
-    at = p + 4 + len;
+    const end = at + 8 + sends.readUInt32BE(at + 4);
+    for (let d = at + 8; d < end;) {
+      const p = d + 1 + sends[d], len = sends.readUInt16BE(p + 2);
+      out.push(from, sends.subarray(p + 2, p + 4 + len));
+      d = p + 4 + len;
+    }
+    at = end;
   }
   return Buffer.concat(out);
 }
@@ -1285,9 +1293,13 @@ await test("a stranger's first Initial is answered with a Retry, and only one th
     const v = new DataView(a.buffer);
     let at = 22 + v.getUint32(13) + v.getUint32(17) + 4 * a[21];
     while (at < a.length) {
-      const n = a[at + 4], len = v.getUint16(at + 5 + n + 2);
-      sock.send(a.subarray(at + 5 + n + 4, at + 5 + n + 4 + len), port, "127.0.0.1");
-      at += 5 + n + 4 + len;
+      const end = at + 8 + v.getUint32(at + 4);
+      for (let d = at + 8; d < end;) {
+        const n = a[d], len = v.getUint16(d + 1 + n + 2);
+        sock.send(a.subarray(d + 1 + n + 4, d + 1 + n + 4 + len), port, "127.0.0.1");
+        d += 1 + n + 4 + len;
+      }
+      at = end;
     }
   };
   turn();

@@ -215,8 +215,14 @@ func (c *sockChannel) writeMsgs(batch [][]byte) int {
 	return total
 }
 
+// A read's buffer grows from readMin up to readMax while reads fill it: the socket is not
+// read while a delivery's realm turn runs, so a streaming peer's bytes queue in the kernel,
+// and one turn then takes them all where a fixed 64 KiB read took one turn per 64 KiB.
+// A read that fills under a quarter of it halves it again.
+const readMin, readMax = 64 << 10, 1 << 20
+
 func (c *sockChannel) readLoop() {
-	chunk := make([]byte, 64<<10)
+	chunk := make([]byte, readMin)
 	conn := c.conn
 	for {
 		if !c.waitReadable() {
@@ -225,6 +231,11 @@ func (c *sockChannel) readLoop() {
 		n, err := conn.Read(chunk)
 		if n > 0 {
 			c.onMsg(chunk[:n])
+			if n == len(chunk) && n < readMax {
+				chunk = make([]byte, 2*n)
+			} else if n < len(chunk)/4 && len(chunk) > readMin {
+				chunk = make([]byte, len(chunk)/2)
+			}
 		} else if err == nil {
 			// No delivery, so no realm turn returns the token.
 			c.resume()

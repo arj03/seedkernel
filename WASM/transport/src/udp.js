@@ -224,6 +224,9 @@ class Udp {
     /** What goes out this turn, as `link/udpSend` takes it. */
     this.out = new Uint8Array(SEND_BATCH);
     this.outLen = 0;
+    /** Where the socket group the last datagram went in starts, and whose it is. */
+    this.groupAt = -1;
+    this.groupId = 0;
     this.flushDue = false;
     this.flushNow = () => { this.flushDue = false; this.flush(); };
     /** Birthday sockets this node may still open, shared across every negotiation. */
@@ -268,17 +271,24 @@ class Udp {
 
   /** Send `p` from socket `id` to `to`, at `port` if given, with the turn's others. */
   sendto(id, to, p, port = to.port) {
-    const need = 8 + to.b.length + p.length;
+    const need = 12 + to.b.length + p.length;
     if (this.outLen + need > this.out.length) this.flush();
     const o = this.out;
     let at = this.outLen;
-    writeU32BE(o, at, id);
-    o.set(to.b, at + 4);
-    at += 4 + to.b.length;
+    // In the last datagram's socket group, `[socket u32][len u32]`, when it is this socket's.
+    if (this.groupAt < 0 || this.groupId !== id) {
+      this.groupAt = at;
+      this.groupId = id;
+      writeU32BE(o, at, id);
+      at += 8;
+    }
+    o.set(to.b, at);
+    at += to.b.length;
     writeU16BE(o, at, port);
     writeU16BE(o, at + 2, p.length);
     o.set(p, at + 4);
     this.outLen = at + 4 + p.length;
+    writeU32BE(o, this.groupAt + 4, this.outLen - this.groupAt - 8);
     if (!this.flushDue) {
       this.flushDue = true;
       void Promise.resolve().then(this.flushNow);
@@ -297,6 +307,7 @@ class Udp {
     if (this.outLen === 0) return;
     const batch = this.out.slice(0, this.outLen);
     this.outLen = 0;
+    this.groupAt = -1;
     try { void host.call(N_UDP_SEND, batch).catch(() => {}); } catch { /* lost */ }
   }
 

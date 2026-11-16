@@ -67,26 +67,37 @@ const (
 	groBuf   = 1 << 16
 )
 
-// datagramAt reads the datagram of a send batch at `at` (`[socket u32][host][port u16][len
-// u16][bytes]`), answering where the next begins. The host is as the batch spells it.
-func datagramAt(b []byte, at int) (id int64, host []byte, port uint16, data []byte, end int) {
-	n := int(b[at+4])
-	p := at + 5 + n
-	if n == 0 {
-		p = at + 6 + int(b[at+5])
+// datagramAt reads the datagram of a socket's group at `at` (`[host][port u16][len u16]
+// [bytes]`), answering where the next begins; not ok when it names no host or runs past the
+// group. The host is as the batch spells it.
+func datagramAt(b []byte, at int) (host []byte, port uint16, data []byte, end int, ok bool) {
+	p := at + 1 + int(b[at])
+	if b[at] == 0 {
+		if at+1 >= len(b) {
+			return
+		}
+		p = at + 2 + int(b[at+1])
+	} else if b[at] != 4 && b[at] != 16 {
+		return
+	}
+	if p+4 > len(b) {
+		return
 	}
 	port, end = binary.BigEndian.Uint16(b[p:]), p+4+int(binary.BigEndian.Uint16(b[p+2:]))
-	return int64(binary.BigEndian.Uint32(b[at:])), b[at+4 : p], port, b[p+4 : end], end
+	if end > len(b) {
+		return
+	}
+	return b[at:p], port, b[p+4 : end], end, true
 }
 
-// sendRun sends `first`, to `to`, with what follows it from `at` that can go in one buffer:
-// the same socket, host and port, none longer than first, a shorter one last. It answers
-// where the run ended.
-func (s *udpSock) sendRun(b []byte, at int, id int64, host []byte, port uint16, first []byte, to netip.AddrPort) int {
+// sendRun sends `first`, to `to`, with what follows it from `at` in the socket's group that
+// can go in one buffer: the same host and port, none longer than first, a shorter one last.
+// It answers where the run ended.
+func (s *udpSock) sendRun(b []byte, at int, host []byte, port uint16, first []byte, to netip.AddrPort) int {
 	run := append(s.run[:0], first...)
 	for segs := 1; segs < gsoMaxSegs && at < len(b) && len(run)+len(first) <= gsoMaxBytes; segs++ {
-		nid, nhost, nport, next, end := datagramAt(b, at)
-		if nid != id || nport != port || len(next) == 0 || len(next) > len(first) || !bytes.Equal(nhost, host) {
+		nhost, nport, next, end, ok := datagramAt(b, at)
+		if !ok || nport != port || len(next) == 0 || len(next) > len(first) || !bytes.Equal(nhost, host) {
 			break
 		}
 		run = append(run, next...)
@@ -143,44 +154,48 @@ func exposeUdp(qc *qjs.Context, el *eventLoop) *udpHost {
 		r.SetPropertyStr("port", qc.NewInt32(int32(conn.LocalAddr().(*net.UDPAddr).Port)))
 		return r, nil
 	}))
-	// A turn's datagrams, `([socket u32][host][port u16][len u16][bytes])*`, which the host
-	// has checked: the host `[4][ip 4]` or `[16][ip 16]`, or a name as `[0][len u8][name]`
-	// (services/datagrams.ts `datagramEnd`). A send that fails is a lost datagram, IPv6 from
-	// an IPv4 socket among them. An address is sent to at once, from a view of the batch,
-	// and a run of datagrams to it in one syscall where the kernel cuts them (sendRun); a
-	// name is resolved to IPv4 off the loop goroutine, from a copy. A batch is mostly one
-	// path's, so a socket is looked up once a run.
+	// A turn's datagrams, `([socket u32][len u32]([host][port u16][len u16][bytes])*)*`: each
+	// socket's group, whose bounds the host has checked, of datagrams this checks: the host
+	// `[4][ip 4]` or `[16][ip 16]`, or a name as `[0][len u8][name]`. One that names no host
+	// or runs past its group rejects the call, the batch's later ones unsent. A send that
+	// fails is a lost datagram, IPv6 from an IPv4 socket among them. An address is sent to at
+	// once, from a view of the batch, and a run of datagrams to it in one syscall where the
+	// kernel cuts them (sendRun); a name is resolved to IPv4 off the loop goroutine, from a
+	// copy.
 	o.SetPropertyStr("send", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		b, err := args[0].View()
 		if err != nil {
 			return qjs.Value{}, err
 		}
-		var s *udpSock
-		sid := int64(-1)
 		for at := 0; at < len(b); {
-			id, host, port, data, end := datagramAt(b, at)
-			if id != sid {
-				s, sid = u.get(id), id
-			}
+			s, end := u.get(int64(binary.BigEndian.Uint32(b[at:]))), at+8+int(binary.BigEndian.Uint32(b[at+4:]))
+			g := b[at+8 : end]
 			at = end
 			if s == nil {
 				continue
 			}
-			if ip, ok := netip.AddrFromSlice(host[1:]); ok && host[0] != 0 {
-				to := netip.AddrPortFrom(ip, port)
-				if s.gso && len(data) > 0 {
-					at = s.sendRun(b, at, id, host, port, data, to)
-				} else {
-					s.conn.WriteToUDPAddrPort(data, to)
+			for d := 0; d < len(g); {
+				host, port, data, next, ok := datagramAt(g, d)
+				if !ok {
+					return qjs.Value{}, errors.New("udp: a malformed datagram")
 				}
-				continue
+				d = next
+				if ip, ok := netip.AddrFromSlice(host[1:]); ok && host[0] != 0 {
+					to := netip.AddrPortFrom(ip, port)
+					if s.gso && len(data) > 0 {
+						d = s.sendRun(g, d, host, port, data, to)
+					} else {
+						s.conn.WriteToUDPAddrPort(data, to)
+					}
+					continue
+				}
+				conn, name, copied := s.conn, string(host[2:]), append([]byte(nil), data...)
+				go func() {
+					if to, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(name, strconv.Itoa(int(port)))); err == nil {
+						conn.WriteToUDP(copied, to)
+					}
+				}()
 			}
-			conn, name, copied := s.conn, string(host[2:]), append([]byte(nil), data...)
-			go func() {
-				if to, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(name, strconv.Itoa(int(port)))); err == nil {
-					conn.WriteToUDP(copied, to)
-				}
-			}()
 		}
 		return qjs.Value{}, nil
 	}))

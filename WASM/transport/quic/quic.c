@@ -133,8 +133,14 @@ static ngtcp2_socklen addr_len(const ngtcp2_sockaddr_union *a) {
   return a->sa.sa_family == NGTCP2_AF_INET ? sizeof a->in : sizeof a->in6;
 }
 
-/** One datagram as `link/udpSend` takes it, `[socket u32][n u8][ip n][port u16][len u16]
- *  [bytes]`, an IPv4-mapped address as IPv4. */
+/** Where the socket group the last datagram went in starts and ends, and whose it is; each
+ *  answer opens its own (`handle`). */
+static size_t group_at, group_end = SIZE_MAX;
+static uint32_t group_socket;
+
+/** One datagram as `link/udpSend` takes it, `[n u8][ip n][port u16][len u16][bytes]`, an
+ *  IPv4-mapped address as IPv4, in its socket's group `[socket u32][len u32]`: the last
+ *  one's, unless that was another socket's or something was put since. */
 static void put_send(uint32_t socket, const ngtcp2_sockaddr_union *to, const uint8_t *bytes, size_t len) {
   static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
   const uint8_t *ip = (const uint8_t *)&to->in.sin_addr;
@@ -146,12 +152,18 @@ static void put_send(uint32_t socket, const ngtcp2_sockaddr_union *to, const uin
     if (memcmp(ip, mapped, 12)) n = 16;
     else ip += 12;
   }
-  put_u32(socket);
+  if (group_end != out_at || group_socket != socket) {
+    group_at = out_at, group_socket = socket;
+    put_u32(socket);
+    put_u32(0);
+  }
   put(&n, 1);
   put(ip, n);
   put_u16(port);
   put_u16((uint32_t)len);
   put(bytes, len);
+  group_end = out_at;
+  put_u32_at(group_at + 4, (uint32_t)(group_end - group_at - 8));
 }
 
 // ── time ─────────────────────────────────────────────────────────────────────
@@ -1157,6 +1169,7 @@ static int op_turn(reader *r) {
 __attribute__((export_name("handle"))) int32_t handle(int32_t len) {
   reader r = {scratch, len < 0 ? 0 : (size_t)len > SCRATCH_BYTES ? SCRATCH_BYTES : (size_t)len, 0, 0};
   int n;
+  group_end = SIZE_MAX;
   switch (u8(&r)) {
   case OP_OPEN:
     n = op_open(&r);

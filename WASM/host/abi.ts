@@ -18,7 +18,7 @@ import type { RawDatagrams } from "../services/datagrams.js";
 import type { Bytes, Maybe } from "./util.js";
 
 /** The ABI version a loader implements and the host script requires. */
-export const PLATFORM_ABI = 2;
+export const PLATFORM_ABI = 3;
 
 /** Where a node's store lives when `--dir` is omitted, on every target: the host's (cli.ts)
  *  and its loader's host slots beside it (slots.ts). */
