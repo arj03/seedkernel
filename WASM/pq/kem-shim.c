@@ -52,7 +52,7 @@ void *memset(void *s, int c, size_t n)
 /* KeyGen_Internal (FIPS 203 Algorithm 16). `coins` is 2*32 bytes: (d ‖ z). */
 EXPORT int mlkem768_keypair(uint8_t *pk, uint8_t *sk, const uint8_t *coins)
 {
-  return crypto_kem_keypair_derand(pk, sk, coins) == 0;
+  return mlk768_keypair_derand(pk, sk, coins) == 0;
 }
 
 /* Encaps_Internal (FIPS 203 Algorithm 17). `coins` is 32 bytes (m). Returns 0 when
@@ -61,7 +61,7 @@ EXPORT int mlkem768_keypair(uint8_t *pk, uint8_t *sk, const uint8_t *coins)
 EXPORT int mlkem768_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk,
                            const uint8_t *coins)
 {
-  return crypto_kem_enc_derand(ct, ss, pk, coins) == 0;
+  return mlk768_enc_derand(ct, ss, pk, coins) == 0;
 }
 
 /* Decaps (FIPS 203 Algorithm 21). Returns 0 only when the secret key fails the hash
@@ -71,7 +71,7 @@ EXPORT int mlkem768_encaps(uint8_t *ct, uint8_t *ss, const uint8_t *pk,
  * would create the oracle implicit rejection is there to prevent. */
 EXPORT int mlkem768_decaps(uint8_t *ss, const uint8_t *ct, const uint8_t *sk)
 {
-  return crypto_kem_dec(ss, ct, sk) == 0;
+  return mlk768_dec(ss, ct, sk) == 0;
 }
 
 /* Field widths, exported so callers can check them at load: a build against the
