@@ -1,7 +1,8 @@
 // Cuts a native release whose host blob is signed here, with the local host-author.key,
 // and compiled by .github/workflows/release.yml. Tags HEAD as v<package.json version>,
-// builds and signs the host blob, opens a draft release carrying host.skb.gz and loader.js,
-// and starts the workflow, which attaches the binaries to that draft for review and publish.
+// builds and signs the host blobs, opens a draft release carrying host.skb.gz, loader.js and
+// the browser's host-web.skb, and starts the workflow, which attaches the binaries to that
+// draft for review and publish.
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -22,6 +23,6 @@ if (published && published !== read("git rev-parse HEAD")) throw new Error(`${ta
 run("npm run build:native", root);
 run(`git tag -f ${tag}`);
 run(`git push origin ${tag}`);
-run(`gh release create ${tag} --draft --verify-tag --title ${tag} --generate-notes native/host.skb.gz native/loader.js`);
+run(`gh release create ${tag} --draft --verify-tag --title ${tag} --generate-notes native/host.skb.gz native/loader.js WASM/build/host-web.skb`);
 run(`gh workflow run release.yml -f tag=${tag}`);
 console.log(`\n${tag}: draft release created, binaries building (gh run watch)`);

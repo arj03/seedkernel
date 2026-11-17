@@ -145,6 +145,24 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 The transport bundle sits outside these totals: 3,066 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
 
+## Download
+
+Each [release](https://github.com/arj03/seedkernel/releases/latest) carries the native binary for Linux, macOS and Windows on amd64 and arm64, one self-contained file per target, with `SHA256SUMS` beside them. Each binary embeds the release's signed host blob (`host.skb.gz`, also attached), so it accepts host updates only from that release's host author (§12.9). Releases are signed by this host author:
+
+```
+4879eea43bdb3c5d934bf474ecbe2eaa03349bdc6f988410192e4fe1035dc3da
+```
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+chmod +x seedkernel-v0.1.0-linux-amd64
+./seedkernel-v0.1.0-linux-amd64 --policy ./allowed-keys.json --bundle ./app.skb
+```
+
+The binary is the native target only. Apps are signed bundles it runs unchanged: [seedstore](https://github.com/arj03/seedstore)'s `seedstore.skb` with `--bundle`, [seedrelay](https://github.com/arj03/seedrelay)'s `relay.skb` as the transport with `--transport`. For the browser, use the release's `host-web.skb`: it is signed by the seedkernel host author above, so pages that vendor it run the published host. Build your own from a checkout ([below](#build-this-repo)) only when developing locally or running under your own host author, since a checkout signs `build/host-web.skb` with its own key. [seedshell](https://github.com/arj03/seedshell) and the other repos depend on `seedkernel-wasm` from such a checkout.
+
+The macOS and Windows binaries are not code-signed: on macOS clear the quarantine flag (`xattr -d com.apple.quarantine <file>`), and on Windows accept the SmartScreen prompt. The flags are in [the CLI section of CLIENT](docs/CLIENT.md#the-cli).
+
 ## Build this repo
 
 ```sh
