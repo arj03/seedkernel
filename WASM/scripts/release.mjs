@@ -15,10 +15,12 @@ const read = (cmd) => execSync(cmd, { cwd: repo, encoding: "utf8" }).trim();
 
 // The binaries are compiled from the tagged commit, so it must be exactly what is built here.
 if (read("git status --porcelain --untracked-files=no")) throw new Error("working tree is not clean; commit first");
-if (read(`git tag -l ${tag}`)) throw new Error(`${tag} already exists`);
+// A tag at HEAD is a rerun after a failed push or upload; one elsewhere is a real conflict.
+const tagged = read(`git tag -l ${tag}`);
+if (tagged && read(`git rev-parse ${tag}^{commit}`) !== read("git rev-parse HEAD")) throw new Error(`${tag} exists on another commit`);
 
 run("npm run build:native", root);
-run(`git tag ${tag}`);
+if (!tagged) run(`git tag ${tag}`);
 run(`git push origin ${tag}`);
 run(`gh release create ${tag} --draft --verify-tag --title ${tag} --generate-notes native/host.skb.gz native/loader.js`);
 run(`gh workflow run release.yml -f tag=${tag}`);
