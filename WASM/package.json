@@ -1,6 +1,6 @@
 {
   "name": "seedkernel-wasm",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "hostVersion": 1,
   "private": true,
   "type": "module",
@@ -110,7 +110,8 @@
     "build:host-script": "node scripts/bundle-host.mjs build/host.js \"runMain,loadedLine,standUp,createRealm,guestPreamble,createGuestSeam,appSignScope,nodeService,fsService,toHex,fromHex,freshnessPathFor,FilesFs,sodium,deriveNodeKey,verifyBundle,readHostBlob,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,DOMAIN_HOST,SUITE_MANIFEST_HYBRID_PQ,platformChannels,platformModules,moduleShims,combineChannels\" build/host/utf8.js build/host/native-polyfills.js build/host/util.js build/host/op-frame.js build/host/domains.js build/host/wasm-limits.js build/services/net-limits.js build/host/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/services/fs.js build/services/fs-files.js build/host/realm-queue.js build/host/slot-table.js build/services/node.js build/services/timer.js build/services/socket-seam.js build/services/datagrams.js build/services/link.js build/services/host.js build/host/shell-core.js build/services/peer-addr.js build/host/control.js build/host/cli.js build/host/engine-realm.js build/host/pq.js build/host/sodium-engine.js build/host/abi.js build/host/host-blob.js build/host/pure-module.js build/host/platform.js build/host/host-main.js",
     "build:loader-script": "node scripts/bundle-host.mjs build/loader.js \"Loader,loaderFlags,withoutOp,PLATFORM_ABI\" build/host/utf8.js build/host/native-polyfills.js build/host/util.js build/host/domains.js build/host/wasm-limits.js build/host/bundle.js build/host/host-blob.js build/host/abi.js build/host/slots.js",
     "build:native-host": "npm run build:host-script && npm run build:loader-script && npm run build:host-blob && node -e \"const f=require('fs'); f.writeFileSync('../native/host.skb.gz', require('zlib').gzipSync(f.readFileSync('build/host.skb'), {level: 9})); f.copyFileSync('build/loader.js', '../native/loader.js')\"",
-    "build:host-blob": "node scripts/build-host-blob.mjs"
+    "build:host-blob": "node scripts/build-host-blob.mjs",
+    "release": "node scripts/release.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

@@ -1,0 +1,62 @@
+# Builds the native loader binaries for a release whose host blob was signed locally.
+#
+# The host-author key never leaves the maintainer's machine, so the signed blob comes in
+# through the draft release itself:
+#
+#   cd WASM && npm run build:native
+#   git tag v0.1.0 && git push origin v0.1.0
+#   gh release create v0.1.0 --draft --verify-tag native/host.skb.gz native/loader.js
+#   gh workflow run release.yml -f tag=v0.1.0
+#
+# The job cross-compiles every target from the tagged source around those two files,
+# attaches the binaries and SHA256SUMS to the draft, and leaves it for review and publish.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of an existing draft release carrying host.skb.gz and loader.js"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Fetch the signed host blob and loader script
+        run: gh release download "$TAG" -p host.skb.gz -p loader.js -D native
+
+      - name: Build
+        working-directory: native
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            ext=""
+            [ "$os" = windows ] && ext=".exe"
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -tags wazero_nointerp,wazero_nodwarf -ldflags="-s -w" \
+              -o "../dist/seedkernel-$TAG-$os-$arch$ext" .
+          done
+          cd ../dist && sha256sum * > SHA256SUMS
+
+      - name: Attach to the draft release
+        run: gh release upload "$TAG" dist/* --clobber
