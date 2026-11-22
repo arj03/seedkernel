@@ -69,7 +69,9 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 | `node/sign` | message bytes | 64-byte Ed25519 signature under the node identity over `domain ‖ scope ‖ msg` (Signing scope) |
 | `node/verify` | `[pk 32][sig 64][msg ..]` | `[ok u8]`: 1 iff `sig` verifies over `domain ‖ scope ‖ msg` under `pk`. A payload shorter than 96 bytes throws. |
 | `fs/get` | key (UTF-8) | `[0]` absent, or `[1][bytes ..]` |
+| `fs/read` | `[offset u32][length u32][key ..]` | `[0]` absent, or `[1][bytes ..]`: up to `length` bytes from `offset`, fewer at the value's end and none past it. Only those bytes are read. |
 | `fs/put` | `[klen u32][key][bytes ..]` | (empty) |
+| `fs/append` | `[klen u32][key][bytes ..]` | (empty). Adds the bytes to the end of the value, creating it when absent. Not atomic: a crash can leave part of the new bytes, never a change to the bytes already there. Rejects a value that would pass 16 MiB. |
 | `fs/list` | prefix (UTF-8, may be empty) | `[count u32] {[klen u32][key]}` |
 | `fs/delete` | key (UTF-8) | (empty) |
 | `fs/stat` | (empty) | `[used u64][available u64]` |

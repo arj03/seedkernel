@@ -379,9 +379,12 @@ async function testFs() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  // Both backends must satisfy the same contract.
+  // Every backend must satisfy the same contract. The third is a platform's files without a raw
+  // append or ranged read, as an embedder may supply them: the store then reads the whole value.
+  const { memoryRawFiles } = await imp("build/services/fs-memory.js");
   const backends = [
     { name: "MemoryFs", make: () => ({ fs: new MemoryFs(), cleanup: () => {} }) },
+    { name: "FilesFs without append", make: () => ({ fs: new FilesFs({ ...memoryRawFiles(), append: undefined, readRange: undefined }, "plain"), cleanup: () => {} }) },
     {
       name: "NodeFs",
       make: () => {
@@ -420,6 +423,22 @@ async function testFs() {
       assert(fs.delete("a.blk"), `${name}: delete reports removal`);
       assert(fs.size("a.blk") < 0, `${name}: absent after delete`);
       assert(!fs.delete("a.blk"), `${name}: second delete is false`);
+
+      // append: creates the value when absent, then adds to its end, writing only the new
+      // bytes where the platform can.
+      fs.append("log", new Uint8Array([1, 2]));
+      fs.append("log", new Uint8Array([3]));
+      assert(bytesEqual(fs.get("log"), new Uint8Array([1, 2, 3])), `${name}: append adds to the end`);
+      // read: a range of a value, cut short at its end; null only when the value is absent.
+      assert(bytesEqual(fs.read("log", 1, 1), new Uint8Array([2])), `${name}: read returns the range`);
+      assert(bytesEqual(fs.read("log", 1, 100), new Uint8Array([2, 3])), `${name}: read stops at the end`);
+      assertEqual(fs.read("log", 5, 2)?.length, 0, `${name}: read past the end is empty`);
+      assertEqual(fs.read("nope", 0, 1), null, `${name}: read of an absent key is null`);
+      assertEqual(fs.stat().used, 1 + 2 + 3, `${name}: append counts only the new bytes`);
+      let tooBig = false;
+      try { fs.append("log", new Uint8Array((16 << 20) - 2)); } catch { tooBig = true; }
+      assert(tooBig, `${name}: append refuses a value past 16 MiB`);
+      assertEqual(fs.size("log"), 3, `${name}: a refused append leaves the value alone`);
     } finally {
       cleanup();
     }
@@ -530,6 +549,8 @@ async function testFsKeyRule() {
   fs.put("ok.blk", new Uint8Array([1]));
   for (const [what, call] of [
     ["put", () => fs.put("a/b", new Uint8Array([1]))],
+    ["append", () => fs.append("a/b", new Uint8Array([1]))],
+    ["read", () => fs.read("a/b", 0, 1)],
     ["get", () => fs.get("a/b")],
     ["size", () => fs.size("CON")],
     ["delete", () => fs.delete("")],

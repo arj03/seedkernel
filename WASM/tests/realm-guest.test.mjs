@@ -141,6 +141,13 @@ async function testGuestSeam() {
     const got = await seam("fs/get", fk);
     assert(got[0] === 1 && bytesEqual(got.slice(1), fv), "fs/put + fs/get round-trips under an opaque key");
     assertEqual((await seam("fs/get", new TextEncoder().encode("missing")))[0], 0, "fs/get of an absent key → [0]");
+    await seam("fs/append", concatBytes([U(0, 0, 0, fk.length), fk, U(8)]));
+    const appended = await seam("fs/get", fk);
+    assert(bytesEqual(appended.slice(1), U(7, 7, 7, 8)), "fs/append adds to the end of the value");
+    const ranged = await seam("fs/read", concatBytes([U(0, 0, 0, 2), U(0, 0, 0, 9), fk]));
+    assert(ranged[0] === 1 && bytesEqual(ranged.slice(1), U(7, 8)), "fs/read returns a range, cut short at the end");
+    assertEqual((await seam("fs/read", concatBytes([U(0, 0, 0, 0), U(0, 0, 0, 1), new TextEncoder().encode("missing")])))[0], 0, "fs/read of an absent key → [0]");
+    await seam("fs/put", concatBytes([U(0, 0, 0, fk.length), fk, fv]));
     const szPresent = await seam("fs/size", fk);
     assertEqual(new DataView(szPresent.buffer, szPresent.byteOffset).getUint32(0, false), fv.length, "fs/size returns the value's byte length");
     const szAbsent = await seam("fs/size", new TextEncoder().encode("missing"));

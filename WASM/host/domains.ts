@@ -45,7 +45,7 @@ export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
  *  Only what a confined realm cannot do itself; time and entropy need no declaration. */
 export const HOST_SERVICES = {
   node: { calls: ["sign", "verify"] },
-  fs: { calls: ["get", "put", "list", "delete", "size", "stat"] },
+  fs: { calls: ["get", "read", "put", "append", "list", "delete", "size", "stat"] },
   timer: { calls: ["arm", "clear"] },
   // Raw links, and the raw datagram sockets the occupant runs its UDP paths over (§12.7).
   link: {

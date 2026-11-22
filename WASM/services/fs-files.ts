@@ -4,7 +4,7 @@
 
 import type { Fs, FsStat } from "./fs.js";
 import { FS_AVAILABLE_UNKNOWN } from "./fs.js";
-import { u8, type Bytes } from "../host/util.js";
+import { concatBytes, u8, type Bytes } from "../host/util.js";
 
 /** Whole files by path, as a platform offers them (host/abi.ts `PlatformFs`). Synchronous:
  *  the freshness marks are written inside install's commit window, which cannot await. */
@@ -14,6 +14,9 @@ export interface RawFiles {
   /** A whole file, or `null` when it is absent. One larger than `maxBytes`, or one that
    *  cannot be read, throws. */
   read(path: string, maxBytes: number): Bytes | null;
+  /** Up to `length` bytes of a file from `offset`, or `null` when it is absent. Only those
+   *  bytes are read. Optional: without it the store reads the whole file and slices it. */
+  readRange?(path: string, offset: number, length: number): Bytes | null;
   /** Write a whole file atomically and readable by this user alone, through a sibling temp
    *  file whose name starts with `~`; a crash can leave that file behind. `durable` also
    *  flushes the file to disk before the rename and then, as best it can, the directory,
@@ -22,6 +25,10 @@ export interface RawFiles {
    *  loader's slots), where a lost write is a lost revocation or identity. The store's
    *  blocks skip it, since a lost block is fetched again. */
   write(path: string, bytes: Uint8Array, durable?: boolean): void;
+  /** Add bytes to the end of a file, creating it readable by this user alone when absent.
+   *  Only the new bytes are written, so a crash can leave part of them, but never changes
+   *  what was there. Optional: without it the store reads the file and writes it whole. */
+  append?(path: string, bytes: Uint8Array): void;
   /** false when there was nothing to remove. */
   remove(path: string): boolean;
   /** A regular file's size, or -1 when there is none. */
@@ -84,6 +91,18 @@ export class FilesFs implements Fs {
       return b === null ? null : u8(b);
     } catch { return null; }
   }
+  /** As `get`, a read that fails answers null. `length` is capped at what one call carries. */
+  read(key: string, offset: number, length: number): Uint8Array | null {
+    try {
+      const path = this.path(key), n = Math.min(length, MAX_VALUE_BYTES);
+      if (this.files.readRange) {
+        const b = this.files.readRange(path, offset, n);
+        return b === null ? null : u8(b);
+      }
+      const b = this.files.read(path, MAX_VALUE_BYTES);
+      return b === null ? null : u8(b).slice(offset, offset + n);
+    } catch { return null; }
+  }
   put(key: string, bytes: Uint8Array): void {
     const path = this.path(key);
     this.scan();
@@ -91,6 +110,20 @@ export class FilesFs implements Fs {
     // Atomic but not fsynced: a lost block is re-fetched, a torn one would be served.
     this.files.write(path, bytes);
     this.used += bytes.byteLength - old;
+  }
+  /** A value grown past what get reads would be lost, so that append is refused. */
+  append(key: string, bytes: Uint8Array): void {
+    const path = this.path(key);
+    this.scan();
+    const old = Math.max(0, this.files.size(path));
+    if (old + bytes.byteLength > MAX_VALUE_BYTES) throw new Error(`fs: ${key} would pass ${MAX_VALUE_BYTES} bytes`);
+    if (this.files.append) {
+      this.files.append(path, bytes);
+    } else {
+      const previous = this.files.read(path, MAX_VALUE_BYTES);
+      this.files.write(path, previous ? concatBytes([u8(previous), bytes]) : bytes);
+    }
+    this.used += bytes.byteLength;
   }
   size(key: string): number {
     try { return this.files.size(this.path(key)); } catch { return -1; }

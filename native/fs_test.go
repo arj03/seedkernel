@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -112,5 +113,30 @@ func TestFsDurableWrite(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 		t.Fatalf("the durable write left %d entries, want the file alone", len(entries))
+	}
+}
+
+// TestFsAppendAndReadRange: append adds to the end of a file, creating it 0600 when absent,
+// and readRange reads only the range, cut short at the end (RawFiles.append/readRange).
+func TestFsAppendAndReadRange(t *testing.T) {
+	bootRealm(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "log")
+	got := awaitOK(t, "append and readRange", `(() => {
+		const p = `+jsonString(p)+`, dec = (b) => b === null ? "null" : Array.from(new Uint8Array(b)).join(".");
+		__fs.append(p, new Uint8Array([1, 2]));
+		__fs.append(p, new Uint8Array([3]));
+		return new TextEncoder().encode([
+			dec(__fs.readRange(p, 0, 100)), dec(__fs.readRange(p, 1, 1)),
+			dec(__fs.readRange(p, 5, 2)), dec(__fs.readRange(p + "-nope", 0, 1)),
+		].join("|"));
+	})()`, 5*time.Second)
+	if want := "1.2.3|2||null"; string(got) != want {
+		t.Fatalf("append/readRange: got %q, want %q", got, want)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("an appended file is not 0600: %v %v", fi.Mode(), err)
+		}
 	}
 }

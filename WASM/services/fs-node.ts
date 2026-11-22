@@ -3,7 +3,7 @@
 // target: the Node platform's files, the operator's and the loader's slots included.
 
 import { randomBytes } from "node:crypto";
-import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { FilesFs, type RawFiles } from "./fs-files.js";
@@ -36,6 +36,19 @@ export const nodeRawFiles: RawFiles = {
       closeSync(fd);
     }
   },
+  readRange(path, offset, length) {
+    let fd: number;
+    try { fd = openSync(path, "r"); } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw e;
+    }
+    try {
+      const out = new Uint8Array(Math.max(0, Math.min(length, fstatSync(fd).size - offset)));
+      return out.subarray(0, readSync(fd, out, 0, out.length, offset));
+    } finally {
+      closeSync(fd);
+    }
+  },
   write(path, bytes, durable = false) {
     const tmp = tempBeside(path);
     try {
@@ -51,6 +64,9 @@ export const nodeRawFiles: RawFiles = {
     if (durable && process.platform !== "win32") {
       try { flush(dirname(path), "r"); } catch { /* the file stands */ }
     }
+  },
+  append(path, bytes) {
+    appendFileSync(path, bytes, { mode: 0o600 });
   },
   remove(path) {
     try { unlinkSync(path); return true; } catch { return false; }

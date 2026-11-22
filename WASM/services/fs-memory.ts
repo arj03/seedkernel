@@ -26,6 +26,7 @@ export function memoryRawFiles(maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES, maxEntrie
       if (f && f.length > max) throw new Error(`memory-fs: ${path} is larger than ${max} bytes`);
       return f ? f.slice() : null;
     },
+    readRange: (path, offset, length) => files.get(path)?.slice(offset, offset + length) ?? null,
     write(path, bytes) {
       const previous = files.get(path);
       if (!previous && files.size >= maxEntries) throw new Error(`memory-fs: entry quota exceeded (cap ${maxEntries})`);
@@ -34,6 +35,18 @@ export function memoryRawFiles(maxBytes = DEFAULT_MEMORY_FS_MAX_BYTES, maxEntrie
       // `new Uint8Array`, because a Node Buffer's slice() aliases the caller's storage.
       files.set(path, new Uint8Array(bytes));
       used = next;
+    },
+    // One copy of the value per append. Without it the store reads the value (a copy), joins
+    // the new bytes (a second) and writes the result (a third).
+    append(path, bytes) {
+      if (!files.has(path) && files.size >= maxEntries) throw new Error(`memory-fs: entry quota exceeded (cap ${maxEntries})`);
+      const previous = files.get(path) ?? new Uint8Array(0);
+      if (used + bytes.length > maxBytes) throw new Error(`memory-fs: byte quota exceeded (cap ${maxBytes})`);
+      const next = new Uint8Array(previous.length + bytes.length);
+      next.set(previous);
+      next.set(bytes, previous.length);
+      files.set(path, next);
+      used += bytes.length;
     },
     remove(path) {
       used -= files.get(path)?.length ?? 0;

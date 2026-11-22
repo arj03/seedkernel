@@ -118,7 +118,7 @@ Native and Node:
 | Component | Size |
 |---|---|
 | **Host blob** (`build/host.skb`), which the native and Node loaders run | 1.49 MiB |
-| of which the host script (`build/host.js`) | 225 KiB |
+| of which the host script (`build/host.js`) | 229 KiB |
 | of which `qjs.wasm`, the realm engine, built for size | 630 KiB |
 | of which `libsodium.wasm` | 278 KiB |
 | of which `mldsa65.wasm` | 16 KiB |
@@ -130,8 +130,8 @@ Browser:
 | Component | Size |
 |---|---|
 | **Web host blob** (`build/host-web.skb`): no script, since a page imports the host, and a 134 KiB transport without `quic.wasm` | 1.04 MiB |
-| Host modules a page imports beside it, minified (`build-min`) | ~144 KiB |
-| **Total browser deployment** | **~1.18 MiB (~495 KiB gzipped)** |
+| Host modules a page imports beside it, minified (`build-min`) | ~147 KiB |
+| **Total browser deployment** | **~1.18 MiB (~496 KiB gzipped)** |
 
 ## One implementation, three targets
 
@@ -139,9 +139,9 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 | Code | What | LOC |
 | --- | --- | --- |
-| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,010 TS |
-| **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,120 TS |
-| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,839 Go |
+| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,047 TS |
+| **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,147 TS |
+| **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,878 Go |
 
 The transport bundle sits outside these totals: 3,066 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
 

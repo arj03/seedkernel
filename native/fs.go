@@ -81,6 +81,30 @@ func exposeFs(qc *qjs.Context) {
 		}
 		return qc.NewArrayBuffer(b), nil
 	}))
+	o.SetPropertyStr("readRange", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
+		// Up to length bytes from offset; only those are read (RawFiles.readRange).
+		path, offset, length := args[0].String(), args[1].Int64(), args[2].Int64()
+		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return qc.NewNull(), nil
+		} else if err != nil {
+			return qjs.Value{}, err
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			return qjs.Value{}, err
+		}
+		n := min(length, fi.Size()-offset)
+		if n < 0 {
+			n = 0
+		}
+		b := make([]byte, n)
+		if _, err := f.ReadAt(b, offset); err != nil && !errors.Is(err, io.EOF) {
+			return qjs.Value{}, err
+		}
+		return qc.NewArrayBuffer(b), nil
+	}))
 	o.SetPropertyStr("write", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		// Bytes borrowed last (qjs.Value.View).
 		path := args[0].String()
@@ -90,6 +114,24 @@ func exposeFs(qc *qjs.Context) {
 			return qjs.Value{}, err
 		}
 		return qjs.Value{}, writeFileAtomic(path, b, durable)
+	}))
+	o.SetPropertyStr("append", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
+		// Only the new bytes are written: a crash can leave part of them, never change what
+		// was there (RawFiles.append). Bytes borrowed last (qjs.Value.View).
+		path := args[0].String()
+		b, err := args[1].View()
+		if err != nil {
+			return qjs.Value{}, err
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+		if err != nil {
+			return qjs.Value{}, err
+		}
+		_, err = f.Write(b)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		return qjs.Value{}, err
 	}))
 	o.SetPropertyStr("remove", qc.Function(func(qc *qjs.Context, args []qjs.Value) (qjs.Value, error) {
 		return qc.NewBool(os.Remove(args[0].String()) == nil), nil

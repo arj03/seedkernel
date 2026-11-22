@@ -19,7 +19,13 @@ export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
  *  throws. */
 export interface Fs {
   get(key: string): Uint8Array | null;
+  /** Up to `length` bytes of a value from `offset`: fewer at its end, none past it. Null
+   *  if absent. */
+  read(key: string, offset: number, length: number): Uint8Array | null;
   put(key: string, bytes: Uint8Array): void;
+  /** Add bytes to the end of a value, creating it when absent. Not atomic: a crash can
+   *  leave part of the new bytes at the end, but never changes the bytes already there. */
+  append(key: string, bytes: Uint8Array): void;
   /** Byte length, or -1 if absent. Use `size >= 0` to test existence. */
   size(key: string): number;
   list(prefix?: string): string[];
@@ -74,7 +80,9 @@ export function validatedFs(inner: Fs): Fs {
   };
   return {
     get: (key) => inner.get(check(key)),
+    read: (key, offset, length) => inner.read(check(key), offset, length),
     put: (key, bytes) => inner.put(check(key), bytes),
+    append: (key, bytes) => inner.append(check(key), bytes),
     size: (key) => inner.size(check(key)),
     list: (prefix) => inner.list(prefix),
     delete: (key) => inner.delete(check(key)),
@@ -92,7 +100,9 @@ export function scopedFs(inner: Fs, scope: string): Fs {
   const outward = (key: string): string => scope + key;
   return {
     get: (key) => inner.get(outward(key)),
+    read: (key, offset, length) => inner.read(outward(key), offset, length),
     put: (key, bytes) => inner.put(outward(key), bytes),
+    append: (key, bytes) => inner.append(outward(key), bytes),
     size: (key) => inner.size(outward(key)),
     // No prefix means everything in this scope. Keys come back with the scope stripped,
     // so the guest only sees names it chose.
@@ -113,13 +123,20 @@ function u64be(value: number): Uint8Array {
  *  answers inline. Views, not copies: the payload already belongs to this call, and
  *  backends copy (or write) before returning. */
 export function fsService(fs: Fs): ServiceHandlers<"fs"> {
+  // [klen u32][key][bytes ..], as fs/put and fs/append take it.
+  const keyAndBytes = (payload: Uint8Array): [string, Uint8Array] => {
+    const klen = readU32BE(payload, 0);
+    return [dec.decode(payload.subarray(4, 4 + klen)), payload.subarray(4 + klen)];
+  };
   return {
     "fs/get": (payload) => { const v = fs.get(dec.decode(payload)); return v ? [ONE, v] : ZERO; },
-    "fs/put": (payload) => {
-      const klen = readU32BE(payload, 0);
-      fs.put(dec.decode(payload.subarray(4, 4 + klen)), payload.subarray(4 + klen));
-      return EMPTY;
+    // [offset u32][length u32][key ..] -> as fs/get
+    "fs/read": (payload) => {
+      const v = fs.read(dec.decode(payload.subarray(8)), readU32BE(payload, 0), readU32BE(payload, 4));
+      return v ? [ONE, v] : ZERO;
     },
+    "fs/put": (payload) => { fs.put(...keyAndBytes(payload)); return EMPTY; },
+    "fs/append": (payload) => { fs.append(...keyAndBytes(payload)); return EMPTY; },
     // -> [count u32]([len u32][key utf8])*
     "fs/list": (payload) => {
       const keys = fs.list(payload.length ? dec.decode(payload) : undefined);
