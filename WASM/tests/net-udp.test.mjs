@@ -61,7 +61,7 @@ function callRetried(name, bytes) { void host.call(name, bytes).catch(() => {});
 function randomBytes(n) { return host.call("crypto/random", argU32(n)); }
 const udp = new Udp();
 globalThis.__handle = (input) => {
-  const { op, args } = readOp(callerOf(input).body);
+  const { op, args } = readOp(input.subarray(33)); // after the host's [kind][caller 32]
   if (op === "datagrams") udp.onDatagrams(new Reader(args));
   return Promise.resolve(EMPTY);
 };
@@ -1254,7 +1254,7 @@ await test("a udp listener is bound afresh, on its port, for each occupant that 
   probe.close();
   const driver = new TransportHost({ datagrams: nodeRawDatagrams(), suppressLinkLog: true, listen: [{ label: "quic", host: "0.0.0.0", port, udp: true }] });
   const heard = [[], []];
-  const occupant = (i) => (parts) => { const input = joined(parts); heard[i].push(new TextDecoder().decode(input.subarray(33, 33 + input[32]))); return Promise.resolve(new Uint8Array()); };
+  const occupant = (i) => (parts) => { const input = joined(parts); heard[i].push(new TextDecoder().decode(input.subarray(34, 34 + input[33]))); return Promise.resolve(new Uint8Array()); };
   try {
     driver.activate(occupant(0));
     await driver.start();

@@ -10,7 +10,7 @@ import { engineSodium, type HostSodium } from "../host/sodium-engine.js";
 import { randomBytes, syncWebEngine } from "../host/platform-web.js";
 import { nodeSymmetric } from "../host/crypto-node.js";
 import { AUTHOR_MLDSA_SEED_LABEL, DOMAIN_HOST, DOMAIN_MANIFEST, SUITE_MANIFEST_HYBRID_PQ } from "../host/domains.js";
-import { callerOf, readOp, writeOp, OpArgs } from "../host/op-frame.js";
+import { readOp, writeOp, OpArgs } from "../host/op-frame.js";
 import { utf8Encode, utf8Decode } from "../host/utf8.js";
 import type { Keypair } from "../host/subkeys.js";
 import { HOST_PART_NAMES, type HostManifest, type HostParts } from "../host/host-blob.js";
@@ -217,7 +217,7 @@ export function stripComments(source: string): string {
  *  Newlines are forced to LF because callers sign the result, and the compiled line
  *  endings depend on the machine that built this file. */
 export function guestOpFraming(): string {
-  const src = [callerOf, readOp, writeOp, utf8Encode, utf8Decode, Fifo].map((fn) => fn.toString()).join("\n");
+  const src = [readOp, writeOp, utf8Encode, utf8Decode, Fifo].map((fn) => fn.toString()).join("\n");
   return `
 // op-frame: the host's raw-link event ABI; optional framing for application bodies; UTF-8,
 // which a realm has no TextEncoder for; the host's queue.

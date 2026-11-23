@@ -89,12 +89,11 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
 		  return out;
 		}
-		// handle reads [caller 32][this app's op framing]: the local "ask" op (the mock
-		// realm builds it around the test payload) builds the transport's send op and
-		// awaits the response.
-		function handle(arg) {
-		  const n = arg[32];
-		  const msg = arg.subarray(33 + n);
+		// onHost reads this app's op framing: the local "ask" op (the mock realm builds it
+		// around the test payload) builds the transport's send op and awaits the response.
+		function onHost(body) {
+		  const n = body[0];
+		  const msg = body.subarray(1 + n);
 		  const peer = fromHex(APP.peer);                       // A's 32-byte public key
 		  const proto = Uint8Array.from("probe", (c) => c.charCodeAt(0)); // the app A claims
 		  // [opLen u8]["send"] then the op's args:

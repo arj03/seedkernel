@@ -136,13 +136,14 @@ func TestHostUpdatesNative(t *testing.T) {
 	work := t.TempDir()
 	app := testAuthor(t)
 	updater, _ := writeBundle(t, app, "updater", 1, `
-		async function handle(arg) {
-		  const n = arg[32];
+		async function onHost(arg) {
+		  const n = arg[0];
 		  let op = "";
-		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
-		  if (op === "stage") await host.call("host/stage", arg.subarray(33 + n));
+		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[1 + i]);
+		  if (op === "stage") await host.call("host/stage", arg.subarray(1 + n));
 		  return new Uint8Array([1]);
-		}`, []string{"host"})
+		}
+		function onPeer() { return new Uint8Array(0); }`, []string{"host"})
 	policy := filepath.Join(work, "policy.json")
 	if err := os.WriteFile(policy, []byte(`{"authors":["`+hex.EncodeToString(app.id())+`"]}`), 0o600); err != nil {
 		t.Fatal(err)

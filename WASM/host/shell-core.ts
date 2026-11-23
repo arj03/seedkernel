@@ -3,10 +3,10 @@
 // members; signed bundles are the only way to fill a slot (§12.4).
 import { denyAll, checkHostGates, type Admit } from "./policy.js";
 import { appScopeFor, FreshnessMarks, genesisHash, reachesLink, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, type SeamCrypto, type HostCall, type LocalCall } from "./guest-seam.js";
+import { createGuestSeam, GUEST_ENTRYPOINTS, KIND_ENTRYPOINTS, type SeamCrypto, type HostCall, type LocalCall } from "./guest-seam.js";
 import { createSlotTable } from "./slot-table.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES } from "./wasm-limits.js";
-import { enc, fromHex, toHex, isHex64, isRecord, errMessage, EMPTY, HOST_CALLER_ID } from "./util.js";
+import { concatBytes, enc, fromHex, toHex, isHex64, isRecord, errMessage, EMPTY, CALLER_APP, CALLER_PEER, HOST_CALLER } from "./util.js";
 import { sendProtocol } from "./op-frame.js";
 import { type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "./subkeys.js";
@@ -23,6 +23,9 @@ export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
 
 /** Observe a slot's own answer to a peer-inbound frame, after it resolves. */
 export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array) => void;
+
+/** The envelope's first byte for a peer's request; the occupant's attribution follows. */
+const PEER_KIND = Uint8Array.of(CALLER_PEER);
 
 /** One installed app. `realm` is null only while the install is still building it; a
  *  slot enters the table with its realm in place. */
@@ -279,13 +282,33 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       ownTurns: slot.links,
     });
   };
-  /** Enter a committed slot as `caller` with `body`. Host events the host frames itself
-   *  (a wake, a link event, a peer request) enter through `realm.call` directly. */
+  /** Refuse a guest whose entrypoints cannot serve what its manifest claims (§12.3): a
+   *  peer reaches it only at `onPeer`, the host's events and the embedder only at `onHost`,
+   *  and a service is answered at `onApp` (another app) or `onHost` (the embedder's
+   *  `Shell.call`). The preamble answers which are defined, without running guest code. */
+  const checkEntrypoints = async (slot: AppSlot): Promise<void> => {
+    const mask = (await slot.realm!.call(Uint8Array.of(KIND_ENTRYPOINTS)))[0] ?? 0;
+    const has = (name: (typeof GUEST_ENTRYPOINTS)[number]) => (mask & (1 << GUEST_ENTRYPOINTS.indexOf(name))) !== 0;
+    const m = slot.verifiedBundle.manifest;
+    const missing: string[] = [];
+    if (mask === 0) missing.push("entrypoint at all (onHost, onPeer or onApp)");
+    if ((m.protocols ?? []).length > 0 && !has("onPeer")) missing.push("onPeer, which peers reach its protocols at");
+    if ((m.services ?? []).length > 0 && !has("onApp") && !has("onHost")) {
+      missing.push("onApp or onHost, which its services are answered at");
+    }
+    if (m.guest.requires.some((r) => r === "link" || r === "timer") && !has("onHost")) {
+      missing.push("onHost, which the host's events arrive at");
+    }
+    if (missing.length > 0) throw new Error(`bundle: ${m.app}'s guest defines no ${missing.join(", and no ")}`);
+  };
+  /** Enter a committed slot as `caller`, the envelope's `[kind u8][caller 32]`, with
+   *  `body`. Host events the host frames itself (a wake, a link event) and a peer request
+   *  enter through `realm.call` directly. */
   const enter = (slot: AppSlot, caller: Uint8Array, body: Uint8Array,
     deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array> =>
     slot.realm!.call([caller, body], deadlineMs, causalClock);
-  /** A local service id's claimant, entered as `caller`, resolved at call time so a
-   *  service installed or replaced later is found. */
+  /** A local service id's claimant, entered as `caller` (`HOST_CALLER`, or an app's kind
+   *  and id), resolved at call time so a service installed or replaced later is found. */
   const callLocal = (caller: Uint8Array): LocalCall => (id, payload, deadlineMs, causalClock) => {
     const slot = table.localClaimant(id);
     return slot ? enter(slot, caller, payload, deadlineMs, causalClock) : null;
@@ -309,10 +332,12 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     deliver: (claim, framed, deadlineMs, causalClock) => {
       const slot = table.peerClaimant(claim);
       if (!slot) return Promise.resolve(EMPTY);
-      const answer = slot.realm!.call(framed, deadlineMs, causalClock);
+      // Kind 1: the host says this came through a `protocols` claim, from the peer the
+      // occupant attributed.
+      const answer = slot.realm!.call([PEER_KIND, framed], deadlineMs, causalClock);
       const onInbound = slot.onInbound;
       if (onInbound) {
-        const attribution = framed.subarray(0, HOST_CALLER_ID.length);
+        const attribution = framed.subarray(0, 32);
         // Two-arg `.then`, so a refused frame leaves no unhandled rejection on this branch.
         answer.then((bytes) => {
           try { onInbound(claim, attribution, bytes); }
@@ -347,9 +372,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         link: linkHandlers,
         host: hostHandlers,
       },
-      // The label, hashed, so it has the same 32-byte shape as a peer's sender key. All
-      // zeros is the host.
-      callLocal: sendsOwn(app, b.manifest.protocols ?? [], callLocal(slot.appId)),
+      // An app's calls arrive as kind 2 and its id, the label hashed, so the callee knows
+      // they came from this node through its `services` claim, and from which app.
+      callLocal: sendsOwn(app, b.manifest.protocols ?? [], callLocal(concatBytes([Uint8Array.of(CALLER_APP), slot.appId]))),
       modules: {
         names: new Set(b.manifest.modules.map((m) => m.name)),
         call: slot.pureModules.call,
@@ -413,9 +438,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const appId = genesisHash(sodium, enc.encode(v.manifest.app));
     const pureModules = await loadBundleModules(moduleLoader, v);
     const slot = newSlot(loaded, appId, pureModules, load, bounds.deadlineMs);
-    // A guest that cannot compile fails the install, not the first frame.
+    // A guest that cannot compile, or does not define the entrypoints its claims are
+    // reached through, fails the install, not the first frame.
     try {
       await standRealm(slot, localConfig, bounds);
+      await checkEntrypoints(slot);
       // Synchronous from here to the end, so gates, conflict check, mark and claim handover
       // cannot interleave with another install or an uninstall. The gates are checked again
       // because a newer version or a `revoke` may have arrived; admission is not re-asked.
@@ -445,7 +472,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       fs: slot.fsScope,
       appScope: slot.appScope,
       invoke: (payload, deadlineMs) => slot.active
-        ? enter(slot, HOST_CALLER_ID, payload, deadlineMs)
+        ? enter(slot, HOST_CALLER, payload, deadlineMs)
         : Promise.reject(new Error(`shell: app '${loaded.manifest.app}' slot is no longer loaded`)),
     };
     return handle;
@@ -457,7 +484,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       return slot ? table.labelOf(slot) : null;
     },
     routes: table.routes,
-    call: callLocal(HOST_CALLER_ID),
+    call: callLocal(HOST_CALLER),
     fs,
     sodium,
     install: (blob, load) => installBundle(blob, load),

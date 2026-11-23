@@ -26,8 +26,8 @@ const author = testAuthor();
 writeFileSync(join(work, "updater.skb"), authorBundle(sodium, author, {
   app: "updater", version: 1, modules: [], guestRequires: ["host"],
   guestSource: `${guestOpFraming()}
-    async function handle(arg) {
-      const { op, args } = readOp(arg.subarray(32));
+    async function onHost(body) {
+      const { op, args } = readOp(body);
       if (op === "stage") await host.call("host/stage", args);
       return new Uint8Array([1]);
     }`,

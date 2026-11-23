@@ -144,10 +144,22 @@ function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
   };
 }
 
-/** Guest preamble: `host.call` and the entrypoint, `handle`, which receives
- *  `[caller 32][body ...]`. Every realm factory installs `__host_call`, `__callDone` and
- *  `__callFail`, which the preamble moves into its closure, calls `handle` through
- *  `__start`, and settles a parked call through `__settleHostCall`. */
+/** The guest's entrypoints by caller kind (§12.3): the host's own calls, a peer's request
+ *  through a `protocols` claim, and another app's call through a `services` claim. */
+export const GUEST_ENTRYPOINTS = ["onHost", "onPeer", "onApp"] as const;
+
+/** The envelope kind the host sends only to ask the preamble which entrypoints the guest
+ *  defines; it never reaches guest code. Answered `[mask u8]`, bit i set when
+ *  `GUEST_ENTRYPOINTS[i]` is a function. */
+export const KIND_ENTRYPOINTS = 255;
+
+/** Guest preamble: `host.call`, and the dispatch of each invocation, `[kind u8][caller 32]
+ *  [body ...]`, to the guest's entrypoint for that kind of caller: `onHost(body)`,
+ *  `onPeer(peer, body)` or `onApp(app, body)`. A kind the guest defines no entrypoint for is
+ *  refused, so a guest takes only the callers it wrote code for, and never has to tell them
+ *  apart itself. Every realm factory installs `__host_call`, `__callDone` and `__callFail`,
+ *  which the preamble moves into its closure, dispatches through `__start`, and settles a
+ *  parked call through `__settleHostCall`. */
 export function guestPreamble(): string {
   return GUEST_PREAMBLE;
 }
@@ -189,14 +201,28 @@ globalThis.host = {
 // queue frees the realm at the end of the synchronous part (realm-queue.ts).
 globalThis.__deferred = false;
 const fail = (id, e) => callFail(id, String(e && e.message || e));
-// Run handle for one invocation and report its answer as bytes, so no guest promise
-// reaches the host. Returns 1 when the invocation deferred.
+const ENTRY = ${JSON.stringify(GUEST_ENTRYPOINTS)};
+// Run the entrypoint for the caller's kind for one invocation and report its answer as
+// bytes, so no guest promise reaches the host. Returns 1 when the invocation deferred.
 globalThis.__start = (id, argBuf) => {
   // Cleared here, so a guest cannot leave it set for the next invocation.
   globalThis.__deferred = false;
   try {
-    if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
-    const out = globalThis.handle(new Uint8Array(argBuf));
+    const arg = new Uint8Array(argBuf);
+    const kind = arg[0];
+    if (kind === ${KIND_ENTRYPOINTS}) {
+      let mask = 0;
+      for (let i = 0; i < ENTRY.length; i++) if (typeof globalThis[ENTRY[i]] === "function") mask |= 1 << i;
+      callDone(id, Uint8Array.of(mask));
+      return 0;
+    }
+    const name = ENTRY[kind];
+    const fn = name === undefined ? undefined : globalThis[name];
+    if (typeof fn !== "function") {
+      throw new Error(name === undefined ? "guest: no caller kind " + kind : "guest: takes no call here: no entrypoint '" + name + "'");
+    }
+    const body = arg.subarray(33);
+    const out = kind === 0 ? fn(body) : fn(arg.subarray(1, 33), body);
     if (out && typeof out.then === "function") {
       out.then((v) => { try { callDone(id, v); } catch (e) { fail(id, e); } },
         (e) => fail(id, e));

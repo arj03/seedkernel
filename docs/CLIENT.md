@@ -12,7 +12,7 @@
 
 ## Overview
 
-An app is a plain JavaScript function, `handle(bytes)`, running in a confined guest, plus optional WASM modules for computation the guest delegates. A build script signs the guest and its modules into a bundle. A **client** is the program that boots a node, installs bundles into it, and connects it to a UI, a CLI or peers.
+An app is plain JavaScript, an entrypoint per kind of caller it takes (`onHost`, `onPeer`, `onApp`), running in a confined guest, plus optional WASM modules for computation the guest delegates. A build script signs the guest and its modules into a bundle. A **client** is the program that boots a node, installs bundles into it, and connects it to a UI, a CLI or peers.
 
 | You write | Seedkernel supplies |
 | --- | --- |
@@ -62,8 +62,8 @@ import { authorAllowlist, bootShell } from "seedkernel-wasm/shell-core";
 
 const guestSource = `
 let count = 0;
-function handle(input) {
-  if (input.length !== 32) throw new Error("counter takes no payload");
+function onHost(body) {
+  if (body.length !== 0) throw new Error("counter takes no payload");
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, count = (count + 1) >>> 0);
   return out;
@@ -96,7 +96,7 @@ try {
 }
 ```
 
-Every invocation receives `[caller 32][payload]`; `app.invoke` supplies the host's all-zero caller, so an empty payload arrives as 32 bytes (§12.3). The counter keeps its state only in the guest heap, so reinstalling resets it, and it claims no protocol or service, so only the returned handle can invoke it. The demo makes fresh author and node keys each run and keeps everything in memory.
+`app.invoke` calls the guest as the host, so it arrives at `onHost` with the payload as given (§12.3). The counter keeps its state only in the guest heap, so reinstalling resets it, and it claims no protocol or service, so only the returned handle can invoke it. The demo makes fresh author and node keys each run and keeps everything in memory.
 
 ### Turn the demo into a release
 
@@ -105,7 +105,7 @@ Keep a private 32-byte author seed across releases and pass it to `hybridAuthorK
 ### Add only the interfaces your app needs
 
 - **A private WASM transform**: add `{ name: "codec", wasm }` to `modules` and call `await host.call("codec", bytes)`. The module ABI is §4.
-- **Receive peer requests**: add `protocols: ["counter"]`. A networked node routes requests for that protocol to `handle`; your guest decides what the caller may do.
+- **Receive peer requests**: add `protocols: ["counter"]`. A networked node routes requests for that protocol to `onPeer(peer, body)`, which your guest defines; it decides what the peer may do.
 - **Provide a local service**: add `services: ["counter-local"]`. The embedder reaches it with `shell.call`, and another guest by declaring it in its own `guestRequires`.
 - **Send through the transport**: add `"_net"` to `guestRequires` and call it with the transport's `send` op (TRANSPORT, Local interface). A send may name only a protocol in your own `protocols`, so an app that only sends claims it too (§12.10).
 - **App-scoped storage**: add `"fs"` to `guestRequires` and use the `fs/*` names (§12.2). Durable storage needs a node with a disk backend.
@@ -179,7 +179,7 @@ await shell.install(blob, { replaces: installed.has(label) ? label : undefined }
 
 A transport replacement keeps the node identity and listeners and discards links, session keys and the address book, so supply its configuration again (§12.10).
 
-**`shell.call(serviceId, payload)`** calls the app claiming a local service id, with the host's zero caller id, and returns `null` when nothing claims it. That is the door to the node's network:
+**`shell.call(serviceId, payload)`** calls the app claiming a local service id as the host, kind 0 and the zero caller id, and returns `null` when nothing claims it. That is the door to the node's network:
 
 ```js
 import { OpArgs } from "seedkernel-wasm/op-frame";
@@ -228,7 +228,7 @@ seedkernel --policy ./allowed-keys.json --dir ./data --key ./node.key \
 - **`--transport`** boots a transport bundle from disk instead of the built-in one; a relay node runs seedrelay's this way. **`--transport-config`** is a JSON object that becomes the transport's `LOCAL`.
 - **`--peers`**, **`--contact-secret`**, **`--relay`**, **`--relay-secret`** go to the transport unread, so a replacement transport can spell addresses and secrets its own way; the shell refuses only a `wss://` destination, which no console socket reaches. Secrets are given as file names, never on the command line, because an argument is visible in `ps` and shell history. With `--peers`, the CLI waits for the cohort; with `--relay`, it registers there and reports whether that took.
 - **`--revoke`** writes off authors and uninstalls what they installed; **`--uninstall`** removes apps alone (§12.5).
-- **`--op name`** invokes the `--bundle` just loaded: stdin is the argument, stdout the response, logs go to stderr. One flag with stdin and stdout, because an op travels inside `handle`'s bytes and a flag per operation would have to know each app's argument shape.
+- **`--op name`** invokes the `--bundle` just loaded: stdin is the argument, stdout the response, logs go to stderr. One flag with stdin and stdout, because an op travels inside the bytes `onHost` receives and a flag per operation would have to know each app's argument shape.
 - **`--guest-timeout`** (`0` means no deadline) and **`--guest-memory`** set the node's guest limits.
 - **`--host`** boots a specific host blob, unchecked, by the operator's explicit choice; **`--host-updates`** (`off` by default, `next`, `now`) allows the running host to stage its successor (§12.9). Both are the loader's; the host never sees them.
 
@@ -252,7 +252,7 @@ Apps import only `seedkernel-wasm` and `seedkernel-wasm/*`, as [`WASM/package.js
 - `./shell-core`: `bootShell`, `AppHandle`, `scopedFs`, and the admission constructors `denyAll`, `admitAll`, `authorAllowlist`, `policyFromJson`.
 - `./shell-node`: `bootNodeShell`, `nodeChannels` (TCP), `nodeDatagrams` (UDP), `nodeLocalChannels`.
 - `./transport-bundle`: `transportBundleBytes()`, the shipped transport, and `TRANSPORT_SERVICE` (`"_net"`).
-- `./op-frame`: the `[opLen u8][op][args]` codec, `writeOp`, `readOp`, `callerOf`, `OpArgs`.
+- `./op-frame`: the `[opLen u8][op][args]` codec, `writeOp`, `readOp`, `OpArgs`, and `callerOf`, which splits a realm argument for a stand-in realm.
 - `./control`: `controlInvoke`, `controlServes`, `serveControl`.
 - `./node`: `appSigner`, a host-side mirror of one app's scoped sign and verify.
 - `./subkeys`: `deriveNodeKey`, the node keypair from a master seed (§12.6.2b).

@@ -501,11 +501,12 @@ const udp = new Udp();
 const relays = new Relays();
 for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
 
-// ── the one entrypoint ────────────────────────────────────────────────────────
+// ── the entrypoints ───────────────────────────────────────────────────────────
 //
-// `handle([caller 32][body ...])`, where body is an op envelope `[opLen u8][op][args]`
-// (`readOp`). The caller is the host (32 zero bytes: platform events and operator ops) or
-// an app (its id), which may only name APP_OPS. Ops whose answer comes in a later
+// Two callers, each at its own entrypoint (§12.3): the host, `onHost(body)`, with platform
+// events and operator ops, and an app on this node, `onApp(app, body)`, which may only name
+// APP_OPS. No peer reaches the transport this way: it claims no protocol. Each body is an
+// op envelope `[opLen u8][op][args]` (`readOp`). Ops whose answer comes in a later
 // invocation use `defer()`, so they do not hold the realm's queue (realm-queue.ts).
 
 // Answer on a later turn; `__deferred` tells the host the realm is free.
@@ -520,16 +521,23 @@ function entry(name, fn) { ops[name] = fn; }
 /** The ops an app may name; null-prototype, so `toString` is not one. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-function handle(argBytes) {
-  const { fromHost, caller, body } = callerOf(argBytes);
+/** Run one op of `body` for `caller`, the host's zero id or an app's. */
+function runOp(body, caller) {
   if (owedAt < Infinity) wakeBy(owedAt);
   const { op, args } = readOp(body);
-  const r = new Reader(args);
   const fn = ops[op];
   if (!fn) throw new Error("transport: no op '" + op + "'");
-  // The caller id is written by the host, so this is a real boundary.
-  if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
-  return fn(r, caller) || EMPTY;
+  return fn(new Reader(args), caller) || EMPTY;
+}
+
+const HOST_ID = new Uint8Array(32);
+function onHost(body) { return runOp(body, HOST_ID); }
+
+function onApp(app, body) {
+  // Only the host reaches onHost, so this is a real boundary.
+  const { op } = readOp(body);
+  if (!APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
+  return runOp(body, app);
 }
 
 /** The realm's wake (§12.3): walk the deadlines (`onWake`). */

@@ -145,15 +145,14 @@ func realmString(expr string) string {
 
 // The stub guest for test bundles that do not exercise the guest: every app is a guest
 // (§12.4), so a bundle ships one even when the test is about something else (policy,
-// freshness, suite admission). It reads the payload after the host's 32-byte caller with
-// its own framing (the op header the harness builds in invokeApp) and forwards the
-// arguments to its one module.
-const stubGuestSrc = `function handle(arg) {
-	const n = arg.length > 32 ? arg[32] : -1;
-	let op = "";
-	for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
-	return host.call("fwd", arg.subarray(33 + n));
-}`
+// freshness, suite admission). It reads the host's call with its own framing (the op header the harness
+// builds in invokeApp) and forwards the arguments to its one module; a peer's request,
+// under the protocol every fixture claims, goes to the module whole.
+const stubGuestSrc = `function onHost(body) {
+	const n = body.length > 0 ? body[0] : -1;
+	return host.call("fwd", body.subarray(1 + n));
+}
+function onPeer(peer, body) { return host.call("fwd", body); }`
 
 // writeTestBundle writes a minimal signed bundle file (§12.4) in a fresh temp dir: one
 // forwarder module and a stub guest with no requires, under an author-signed manifest at
@@ -303,7 +302,7 @@ func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int
 // an app uses the path a deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given, and for a local loopback
-// the `send` op sends one request. The framing after the host's 32-byte caller is the
+// the `send` op sends one request. The framing after the host's kind and 32-byte caller is the
 // probe's own, as in a real app; the host never reads it.
 const probeGuestSource = `
   function readOp(b) {
@@ -320,17 +319,12 @@ const probeGuestSource = `
     out.set(args, 1 + op.length);
     return out;
   }
-  function handle(arg) {
-    let fromHost = true;
-    for (let i = 0; i < 32; i++) { if (arg[i] !== 0) { fromHost = false; break; } }
-    const body = arg.subarray(32);
-    if (fromHost) {
-      const { op, args } = readOp(body);
-      if (op === "send") return host.call("_net", writeOp("send", args));
-      return new Uint8Array(0);
-    }
-    return body;
+  function onHost(body) {
+    const { op, args } = readOp(body);
+    if (op === "send") return host.call("_net", writeOp("send", args));
+    return new Uint8Array(0);
   }
+  function onPeer(peer, body) { return body; }
 `
 
 // probeSendArgs encodes the `send` op's arguments:

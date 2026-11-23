@@ -10,14 +10,16 @@ const realm = await createWebRealm({
   source: `
     for (const name of ["__start", "__settleHostCall"])
       Object.defineProperty(globalThis, name, { get() { for (;;) {} } });
-    async function handle(arg) {
-      try { return await host.call(arg[0] === 1 ? "fail" : "park", new Uint8Array()); }
+    async function onHost(body) {
+      try { return await host.call(body[0] === 1 ? "fail" : "park", new Uint8Array()); }
       catch { return new Uint8Array([8]); }
     }`,
   hostCall: (name) => name === "fail" ? Promise.reject(new Error("refused")) : Promise.resolve(new Uint8Array([7])),
   deadlineMs: 300,
 });
-const answers = [(await realm.call(new Uint8Array([0])))[0], (await realm.call(new Uint8Array([1])))[0]];
+// [kind 0][zero caller 32][x]: entered as the host, as a shell enters its own calls.
+const asHost = (x) => { const a = new Uint8Array(34); a[33] = x; return a; };
+const answers = [(await realm.call(asHost(0)))[0], (await realm.call(asHost(1)))[0]];
 realm.dispose();
 if (answers[0] !== 7 || answers[1] !== 8) {
   console.error(`parked calls settled wrongly: ${answers}`);

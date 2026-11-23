@@ -1,21 +1,26 @@
 // Named-op envelope for the host's raw-link event ABI, and optional application framing.
 // Event names live in host/domains.ts; their byte layouts are in §12.2.
-// bundle-author.ts's `guestOpFraming` serializes the three functions below into import-free
+// bundle-author.ts's `guestOpFraming` serializes `readOp` and `writeOp` into import-free
 // guests, and the transport build injects that source before signing, so they must
 // reference nothing outside themselves, not even this file's imports. The type system
 // cannot check that; `testGeneratedOpFrame` (tests/bundle-install.test.mjs) runs the
 // emitted source to catch a free variable, so a new code path here needs a case there.
 import { writeU32BE, readU32BE, enc, EMPTY } from "./util.js";
 
-/** Split a `handle` argument: `[caller 32][body ...]`. The host id is all zeros, checked
- *  over all 32 bytes, since a caller id can be ground to match any short prefix. */
-export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Array; body: Uint8Array } {
-  const caller = arg.subarray(0, 32);
-  let fromHost = true;
-  for (let i = 0; i < 32; i++) {
-    if (caller[i] !== 0) fromHost = false;
-  }
-  return { fromHost, caller, body: arg.subarray(32) };
+/** Split a realm argument as the host frames it: `[kind u8][caller 32][body ...]` (§12.3).
+ *  `kind` is 0 for the host itself (its id is 32 zero bytes), 1 for a peer through a
+ *  `protocols` claim (its id is the key the occupant attributed), 2 for an app on this node
+ *  through a `services` claim (its id is the app's). For host-side readers of a realm's
+ *  input, such as a stand-in realm in a test. A guest never sees the envelope: the preamble
+ *  hands each kind to its own entrypoint (guest-seam.ts). */
+export function callerOf(arg: Uint8Array): {
+  kind: number; fromHost: boolean; fromPeer: boolean; fromApp: boolean; caller: Uint8Array; body: Uint8Array;
+} {
+  const kind = arg[0];
+  return {
+    kind, fromHost: kind === 0, fromPeer: kind === 1, fromApp: kind === 2,
+    caller: arg.subarray(1, 33), body: arg.subarray(33),
+  };
 }
 
 /** Read `[opLen u8][op ascii][args ...]`: required for link events, optional for apps. */
@@ -91,7 +96,7 @@ export class OpArgs {
     this.len += b.length;
     return this;
   }
-  /** The whole thing as one buffer. `prefix` (the host's 32-byte caller id) is written in
+  /** The whole thing as one buffer. `prefix` (the host's caller, `[kind u8][id 32]`) is written in
    *  front of the envelope, so a socket read is copied once here instead of again when a
    *  prefix is added later. */
   build(prefix?: Uint8Array): Uint8Array {

@@ -20,21 +20,20 @@ import (
 // is an ordinary async entrypoint like an initiator, and the realm serializes the two
 // instead of running one while the other waits.
 const holderGuestSource = `
-	async function handle(arg) {
-	  const sender = arg.slice(0, 32);
-	  const type = arg[32];
-	  const payload = arg.slice(33);
+	async function onPeer(sender, arg) {
+	  const type = arg[0];
+	  const payload = arg.slice(1);
 	  if (type === 1) { await host.call("fs/put", payload); return new Uint8Array([1]); }
 	  if (type === 2) { return await host.call("fs/get", payload); }
 	  return new Uint8Array(0);
 	}
 `
 
-// The echo guest: forwards its input to the bundle's own "fwd" module by its bare name,
-// over the same host.call as everything else (§12.2). Every app has this shape (§12.4):
-// inbound delivery reaches the guest, and the guest calls its modules.
+// The echo guest: forwards a peer's key and payload to the bundle's own "fwd" module by its
+// bare name, over the same host.call as everything else (§12.2). Every app has this shape
+// (§12.4): inbound delivery reaches the guest, and the guest calls its modules.
 const echoGuestSource = `
-	function handle(arg) { return host.call("fwd", arg); }
+	function onPeer(peer, body) { return host.call("fwd", [peer, body]); }
 `
 
 // requesterJS boots a second node in the same realm, just a network and the transport, so

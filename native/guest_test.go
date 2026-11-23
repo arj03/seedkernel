@@ -97,7 +97,7 @@ func TestGuestRealmEntryGettersNeverRun(t *testing.T) {
 		newTestRealmBudget(t, "{}", `
 			for (const name of ["__start", "__settleHostCall"])
 			  Object.defineProperty(globalThis, name, { get() { for (;;) {} } });
-			async function handle(arg) {
+			async function onHost(arg) {
 			  try { return await host.call(arg[arg.length - 1] === 1 ? "fail" : "park", new Uint8Array()); }
 			  catch { return new Uint8Array([8]); }
 			}
@@ -151,7 +151,7 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle() {
+		function onHost() {
 		  for (let i = 0; i < 10000; i++) host.call("hold", new Uint8Array([i & 255]));
 		  return new Uint8Array();
 		}
@@ -174,7 +174,7 @@ func TestGuestRealmOutstandingHostCallBytesCapped(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle() {
+		function onHost() {
 		  const payload = new Uint8Array(2 * 1024 * 1024);
 		  for (let i = 0; i < 9; i++) host.call("link/deliver", payload);
 		  return new Uint8Array();
@@ -201,7 +201,7 @@ func TestGuestRealmHostCallBytesAreNameBlind(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle() {
+		function onHost() {
 		  const payload = new Uint8Array(2 * 1024 * 1024);
 		  for (let i = 0; i < 9; i++) host.call("send", payload);
 		  return new Uint8Array();
@@ -257,7 +257,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle() { return host.call("probe", new Uint8Array()); }
+		function onHost() { return host.call("probe", new Uint8Array()); }
 	`, 250)
 	defer func() { _, _ = qc.Eval("dispose.js", `__realm.dispose()`) }()
 	if got, err := realmCall("probe", nil); err != nil || !bytes.Equal(got, []byte{9}) {
@@ -282,7 +282,7 @@ func TestGuestRealmReportsCausalExecutionNotWait(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		async function handle() {
+		async function onHost() {
 		  await host.call("pause", new Uint8Array());
 		  return new Uint8Array([7]);
 		}
@@ -337,8 +337,10 @@ const rawRealm = `
 	  const raw = { parked: -1, call };
 	  if (call("R_Init", 64 * 1024 * 1024, 4, 1024) !== 0) throw new Error("R_Init");
 	  if (call("R_Eval", stage(guestPreamble()), 1, 0) !== 0) throw new Error("preamble");
-	  if (call("R_Eval", stage('let got = 0; function handle(b) { if (b.length) return new Uint8Array([got]); host.call("hold", new Uint8Array([1])).then(() => { got++; }); return new Uint8Array(); }'), 0, 0) !== 0) throw new Error("guest");
-	  raw.got = () => { call("R_Invoke", 99, stage("?"), 0); return raw.answer[0]; };
+	  if (call("R_Eval", stage('let got = 0; function onHost(b) { if (b.length) return new Uint8Array([got]); host.call("hold", new Uint8Array([1])).then(() => { got++; }); return new Uint8Array(); }'), 0, 0) !== 0) throw new Error("guest");
+	  raw.got = () => { call("R_Invoke", 99, stage("\0".repeat(33) + "?"), 0); return raw.answer[0]; };
+	  // [kind 0][zero caller 32] and no body: the host's call, as the shell frames one.
+	  raw.hostEmpty = () => stage("\0".repeat(33));
 	  return raw;
 	})();
 `
@@ -347,7 +349,7 @@ const rawRealm = `
 // the parked call still settles once.
 func TestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	bootRealm(t)
-	evalString(t, rawRealm+`; __raw.call("R_Invoke", 1, 0, 0); String(__raw.parked)`)
+	evalString(t, rawRealm+`; __raw.call("R_Invoke", 1, __raw.hostEmpty(), 0); String(__raw.parked)`)
 	steps := evalString(t, `[
 	  __raw.call("R_Settle", __raw.parked + 1000, 1, 0, 0), __raw.got(),
 	  __raw.call("R_Settle", __raw.parked, 1, 0, 0), __raw.got(),
@@ -371,7 +373,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 	// The host's own crypto engines stand throughout; the realm adds one.
 	standing := len(engines)
 	newTestRealm(t, "{}", `
-		function handle() {
+		function onHost() {
 		  host.call("hold", new Uint8Array([1, 2, 3]));
 		  return new Uint8Array();
 		}
@@ -401,7 +403,7 @@ func TestGuestRealmCloseReleasesParkedCalls(t *testing.T) {
 // A minimal content-addressed store guest, the essence of seedstore's local path:
 // put hashes the data (crypto/sha256, by name) and stores it under that id
 // (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals. One
-// entrypoint, and the ops are the guest's own framing after the caller id.
+// entrypoint, and the ops are the guest's own framing, as the host hands it to onHost.
 const storeGuestSource = `
 function hex(u8) { let s = ""; for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0"); return s; }
 function ascii(s) { const out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; }
@@ -413,11 +415,11 @@ function fsPutArg(key, bytes) {
   out.set(k, 4); out.set(bytes, 4 + k.length);
   return out;
 }
-function handle(arg) {
-  const n = arg[32];
+function onHost(arg) {
+  const n = arg[0];
   let op = "";
-  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
-  const data = arg.subarray(33 + n);
+  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[1 + i]);
+  const data = arg.subarray(1 + n);
   if (op === "put") {
     // A primitive is reached by name under crypto/, not by op number, and answers a
     // Promise like every name.
@@ -499,10 +501,10 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	// Twice the shared 64 MiB default (host/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
 	// passed by the shim); Go has no constant of its own.
 	src := fmt.Sprintf(`
-		function handle(arg) {
-		  const n = arg[32];
+		function onHost(arg) {
+		  const n = arg[0];
 		  let op = "";
-		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[1 + i]);
 		  if (op === "ok") return new Uint8Array(1 << 20);   // well under the cap
 		  return new Uint8Array(%d);                        // twice the cap
 		}
@@ -538,10 +540,10 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle(arg) {
-		  const n = arg[32];
+		function onHost(arg) {
+		  const n = arg[0];
 		  let op = "";
-		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[1 + i]);
 		  if (op === "ok") return new Uint8Array([7]);
 		  for (;;) {}
 		}
@@ -588,7 +590,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	}
 
 	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
-		async function handle() {
+		async function onHost() {
 		  // the mock builds this guest's op framing; the local op is "park"
 		  await host.call("_net", new Uint8Array(0));
 		  for (;;) {}                 // burn the budget in the continuation
@@ -621,7 +623,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		async function handle() {
+		async function onHost() {
 		  await Promise.resolve();   // resumes via the realm pump, not settleHostCall
 			for (;;) {}
 		}
@@ -660,7 +662,7 @@ func TestGuestRealmDeferredKeepsItsDeadline(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		async function handle(tag) {
+		async function onHost(tag) {
 		  globalThis.__deferred = true;
 		  try { await host.call("park", tag); } catch {}
 		  await host.call("remaining", tag);
@@ -714,7 +716,7 @@ func TestGuestRealmDetachedAnswerIsANewTurn(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		function handle(tag) {
+		function onHost(tag) {
 		  host.call("deliver", tag).then(() => {}, () => {})
 		    .then(() => host.call("remaining", tag)).catch(() => {});
 		  return tag;
@@ -750,7 +752,7 @@ func TestGuestRealmOwnTurns(t *testing.T) {
 		  }
 		  return new Promise((resolve) => { globalThis.__release = resolve; });
 		};
-		globalThis.__src = "async function handle(tag) {" +
+		globalThis.__src = "async function onHost(tag) {" +
 		  "  try { await host.call('wait', tag); await host.call('remaining', tag); } catch {}" +
 		  "  return tag;" +
 		  "}";
@@ -758,8 +760,8 @@ func TestGuestRealmOwnTurns(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	if _, err := callRealm(`(async () => {
-		globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
-		  deadlineMs: 5000, ownTurns: true });
+		globalThis.__realm = __hostRealm(await createRealm({ source: __src, hostCall: __guestSeam,
+		  deadlineMs: 5000, ownTurns: true }));
 		return new Uint8Array();
 	})`, 10*time.Second); err != nil {
 		t.Fatal("createRealm:", err)
@@ -803,7 +805,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
 		  return out;
 		}
-		async function handle() {
+		async function onHost() {
 		  const peer = fromHex(APP.peer);
 		  const proto = [0x74, 0x65, 0x73, 0x74];
 		  const req = new Uint8Array(32 + 1 + proto.length);
@@ -845,8 +847,8 @@ func TestGuestRealmAnswersAtOnceWhenTheHostAlreadyHasIt(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealm(t, "{}", `
-		async function handle(arg) {
-		  if (arg[33] === 109) { // "many"
+		async function onHost(arg) {
+		  if (arg[1] === 109) { // "many"
 		    const calls = [];
 		    for (let i = 0; i < 300; i++) calls.push(host.call("now", new Uint8Array([i & 255])));
 		    const answers = await Promise.all(calls);

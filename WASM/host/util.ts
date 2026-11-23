@@ -21,9 +21,18 @@ export const EMPTY = new Uint8Array(0);
 export const ONE = new Uint8Array([1]);
 export const ZERO = new Uint8Array([0]);
 
-/** The host's own caller id: 32 zero bytes, which no app label derives. Every other id is
- *  a peer or a co-resident app. */
-export const HOST_CALLER_ID = new Uint8Array(32);
+/** Who a realm's `handle` is entered for: the envelope's first byte, `[kind u8][caller 32]`,
+ *  which only the host writes (§12.2). */
+export const CALLER_HOST = 0;
+/** A peer, through the slot's `protocols` claim; the caller is the key the occupant
+ *  attributed. */
+export const CALLER_PEER = 1;
+/** An app on this node, through the slot's `services` claim; the caller is its app id. */
+export const CALLER_APP = 2;
+
+/** The host's own caller, as the envelope starts: kind 0, then 32 zero bytes, which no app
+ *  label derives. */
+export const HOST_CALLER = new Uint8Array(33);
 
 /** Bytes as one buffer, or as parts that go back to back: a realm copies parts in one by
  *  one (engine-realm.ts `stage`), so whoever frames bytes need not concatenate them. */

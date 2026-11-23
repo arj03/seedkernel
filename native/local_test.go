@@ -43,7 +43,7 @@ func TestControlEndpointNative(t *testing.T) {
 	bootRealm(t)
 	work := t.TempDir()
 	app := testAuthor(t)
-	bundle, _ := writeBundle(t, app, "echo", 1, `function handle(arg) { return arg.subarray(33 + arg[32]); }`, nil)
+	bundle, _ := writeBundle(t, app, "echo", 1, `function onHost(arg) { return arg.subarray(1 + arg[0]); } function onPeer() { return new Uint8Array(0); }`, nil)
 	policy := filepath.Join(work, "policy.json")
 	if err := os.WriteFile(policy, []byte(`{"authors":["`+hex.EncodeToString(app.id())+`"]}`), 0o600); err != nil {
 		t.Fatal(err)

@@ -150,7 +150,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     } },
     createRealm: async (o) => {
       source = o.source;
-      return { call: async () => new Uint8Array(), dispose() {} };
+      return { call: async (p) => p[0] === 255 ? Uint8Array.of(7) : new Uint8Array(), dispose() {} };
     },
     admit: policyFromJson(JSON.stringify({
       authors: [],

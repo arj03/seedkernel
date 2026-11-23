@@ -77,7 +77,7 @@ export const PROTO = "harness/v1";
  *    send: one request out; returns `[ok u8][response]` straight from `_net`.
  *    op:   an already-framed `[opLen u8][op][args]` passed to `_net` verbatim, for the
  *          tests about which ops an app may name.
- *    seen/from: everything `handle` received inbound, and who it was attributed to.
+ *    seen/from: everything `onPeer` received, and who it was attributed to.
  *  The echo/hang mode is chosen at install through the manifest's `config`. */
 const HARNESS_GUEST = `
 // This app's own copy of the op format it shares with what it calls (after the host's
@@ -102,14 +102,10 @@ const seen = [];
 // authenticated sender in front of the payload. Recorded separately so attribution tests
 // can read it without changing the payload tests.
 const from = [];
-function handle(arg) {
-  const c = arg.subarray(0, 32);
-  let fromHost = true;
-  for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
-  const p = arg.subarray(32);
-  // A local call from the host (caller = 32 zero bytes): the op name picks the local op,
-  // as in the transport's own handle.
-  if (fromHost) {
+// A local call from the host: the op name picks the local op, as in the transport's own
+// onHost.
+function onHost(p) {
+  {
     const { op, args } = readOp(p);
     if (op === "send") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, writeOp("send", args));
     if (op === "op") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, args);
@@ -132,8 +128,10 @@ function handle(arg) {
     }
     return new Uint8Array(0);
   }
-  // A remote peer's frame: record it and who it came from, then echo it (or hang, or
-  // generate).
+}
+// A remote peer's frame: record it and who it came from, then echo it (or hang, or
+// generate).
+function onPeer(c, p) {
   seen.push(p);
   from.push(c.slice());
   if (APP.mode === "hang") return new Promise(() => {});

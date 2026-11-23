@@ -13,7 +13,7 @@ import {
 import { testkit } from "./testkit.mjs";
 import { bytesEqual, joined } from "./bytes.mjs";
 import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/services/net-limits.js";
-import { HOST_CALLER_ID } from "../build/host/util.js";
+import { HOST_CALLER } from "../build/host/util.js";
 import { engineSodium } from "../build/host/sodium-engine.js";
 import { randomBytes, syncWebEngine, webSymmetric } from "../build/host/platform-web.js";
 import { packageHostBlob } from "../build/host/crypto-node.js";
@@ -22,11 +22,11 @@ import { readHostBlob } from "../build/host/host-blob.js";
 const hostParts = readHostBlob(packageHostBlob());
 
 /** Read a link event as the bound realm does. The driver passes the occupant the whole
- *  realm argument, `[caller 32][opLen u8][op][args ...]`, with the host's caller id in front
+ *  realm argument, `[kind u8][caller 32][opLen u8][op][args ...]`, with the host's caller in front
  *  (services/link.ts `TransportCall`), so a test standing in for an occupant reads it at
  *  the same seam the signed one does. */
 function opOf(input) {
-  const body = joined(input).subarray(HOST_CALLER_ID.length);
+  const body = joined(input).subarray(HOST_CALLER.length);
   const n = body[0];
   return { op: new TextDecoder().decode(body.subarray(1, 1 + n)), args: body.subarray(1 + n) };
 }
@@ -1500,12 +1500,13 @@ await test("a peer-inbound answer reaches the installer through onInbound", asyn
   // A second, tiny app on B: it claims its own protocol and answers by flipping every
   // byte, so the response is trivially distinct from the request that produced it.
   const guestSource = `
-    function handle(arg) {
-      const payload = arg.subarray(32);
+    function onPeer(peer, payload) {
       const out = new Uint8Array(payload.length);
       for (let i = 0; i < payload.length; i++) out[i] = payload[i] ^ 0xff;
       return out;
     }
+    // The host loopback below reaches it here, apart from the peer path.
+    function onHost() { return new Uint8Array(0); }
   `;
   const { blob } = authorBundle(sodium, st.B.appAuthor, {
     app: "watcher", version: 1, protocols: ["watch/v1"],

@@ -33,9 +33,9 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 			for (let j = 0; j < s.length; j++) b[j] = s.charCodeAt(j);
 			return b;
 		}
-		async function handle(arg) {
+		async function onHost(arg) {
 			// The mock composes this guest's local "chain" op; the payload is one byte.
-			const n = arg[33 + arg[32]];
+			const n = arg[1 + arg[0]];
 			let seen = 0;
 			for (let i = 0; i < n; i++) {
 				const k = keyBytes(i);

@@ -20,7 +20,7 @@ const { test, assert, summary } = testkit();
 await test("host and confined transport hex preserve unsigned words, padding, tails and views", async () => {
   const source = readFileSync(new URL("../transport/src/util.js", import.meta.url), "utf8").replace("/* @seedkernel-op-frame */", guestOpFraming());
   const realm = await createWebRealm({
-    source: source + '\nfunction handle(b) { return Uint8Array.from(toHex(b), c => c.charCodeAt(0)); }',
+    source: source + '\nfunction onHost(b) { return Uint8Array.from(toHex(b), c => c.charCodeAt(0)); }',
     hostCall: async () => new Uint8Array(),
   });
   try {
@@ -30,7 +30,7 @@ await test("host and confined transport hex preserve unsigned words, padding, ta
     for (const bytes of cases) {
       const expected = Buffer.from(bytes).toString("hex");
       assert(toHex(bytes) === expected, `host hex (${bytes.length} bytes, offset ${bytes.byteOffset})`);
-      const actual = new TextDecoder().decode(await realm.call(bytes));
+      const actual = new TextDecoder().decode(await realm.call([new Uint8Array(33), bytes]));
       assert(actual === expected, `guest hex (${bytes.length} bytes, offset ${bytes.byteOffset})`);
     }
   } finally { realm.dispose(); }

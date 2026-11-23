@@ -387,6 +387,12 @@ globalThis.__buildGuestSeam = function (names, callLocal, scope) {
   });
   return __guestSeam;
 };
+// A realm entered as the host, as the shell enters its own calls: kind 0 and the zero
+// caller in front of every call, so the guest's onHost takes each test's bytes as given.
+globalThis.__hostRealm = (realm) => ({
+  call: (payload, deadlineMs, causalClock) => realm.call([new Uint8Array(33), ...[payload].flat()], deadlineMs, causalClock),
+  dispose: () => realm.dispose(),
+});
 // With the budget a realm would pass: an unbounded segment, no causal root, no spend.
 const __testBudget = { remainingMs: Infinity, causalClock: undefined, charge() {}, detach() {} };
 // An answer in parts comes back joined, as the guest reads it (engine-realm.ts stage).
@@ -431,20 +437,17 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {
-			globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
-				deadlineMs: __deadlineMs || undefined });
-			// The test driver's version of the shell's enter: the host's 32 zero-byte
-			// caller id in front of the guest's own op framing (built here, since the host
-			// never knows a guest's op names).
+			globalThis.__realm = __hostRealm(await createRealm({ source: __src, hostCall: __guestSeam,
+				deadlineMs: __deadlineMs || undefined }));
+			// The test driver's version of the shell's enter: the guest's own op framing
+			// (built here, since the host never knows a guest's op names), entered as the host.
 			globalThis.__realmCall = (op, arg, causalClock) => {
 			  const body = new Uint8Array(arg);
 			  const framed = new Uint8Array(1 + op.length + body.length);
 			  framed[0] = op.length;
 			  for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
 			  framed.set(body, 1 + op.length);
-			  const input = new Uint8Array(32 + framed.length);
-			  input.set(framed, 32);
-			  return __realm.call(input, undefined, causalClock);
+			  return __realm.call(framed, undefined, causalClock);
 			};
 			return new Uint8Array(0);
 		})`,
@@ -455,8 +458,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 }
 
 // realmCall invokes the realm newTestRealm stored, as the initiator, the same way the
-// shell does (the 32 zero-byte caller id plus the guest's own op framing, built by
-// __realmCall), driving the loop until it settles; the guest may await the network on the
+// shell does (the guest's own op framing, built by __realmCall, entered as the host), driving the loop until it settles; the guest may await the network on the
 // way. Go passes the payload as an ArrayBuffer, so the Uint8Array Realm.call takes is
 // made in the expression instead of loosening the shared signature.
 func realmCall(entry string, payload []byte) ([]byte, error) {

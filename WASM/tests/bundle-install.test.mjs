@@ -314,9 +314,16 @@ async function testManifestClaimIsTheRouting() {
       const node = await bootTestShell({
         identity,
         services: { transport: { bundle: (await imp("build/host/transport-bundle.js")).transportBundleBytes() } },
+        // Each realm answers the envelope's kind byte, then the payload after the caller id.
         createRealm: async (o) => {
           seams.push(o.hostCall);
-          return { call: async (input) => input.slice(32), dispose() {} };
+          return {
+            call: async (input) => {
+              const arg = concatBytes([input].flat());
+              return concatBytes([arg.subarray(0, 1), arg.subarray(33)]);
+            },
+            dispose() {},
+          };
         },
         admit: admitAll,
       });
@@ -326,15 +333,23 @@ async function testManifestClaimIsTheRouting() {
           modules: [], guestSource: GUEST_TEXT, guestRequires: [],
         }).blob);
         // The boot transport was created first. Its `link/deliver` body is
-        // `[claimLen u8][claim]` followed by the realm argument
-        // `[attribution 32][payload ...]`.
+        // `[claimLen u8][claim]` followed by `[attribution 32][payload ...]`, and the host
+        // puts the kind in front.
         const deliver = withTestBudget(seams[0]);
         const framed = concatBytes([new Uint8Array(32).fill(0x11), new Uint8Array([1, 2, 3])]);
         const to = (claim) => concatBytes([Uint8Array.of(claim.length), enc.encode(claim), framed]);
-        assertEqual([...await deliver("link/deliver", to(pub))], [1, 2, 3],
-          "a name in `protocols` is reachable by a peer");
+        assertEqual([...await deliver("link/deliver", to(pub))], [1, 1, 2, 3],
+          "a name in `protocols` is reachable by a peer, and is entered as kind 1, a peer");
         assertEqual((await deliver("link/deliver", to(priv))).length, 0,
           "the same bundle's `services` name is unreachable by a peer, however it is spelled");
+        // The same claim reached from this node: by the embedder as the host, kind 0, and
+        // by an app that requires it as kind 2, whatever its id looks like.
+        assertEqual([...await node.call(priv, Uint8Array.of(4))], [0, 4], "the embedder's call is entered as kind 0, the host");
+        await node.install(authorBundle(sodium, author, {
+          app: "asker", version: 1, modules: [], guestSource: GUEST_TEXT, guestRequires: [priv],
+        }).blob);
+        assertEqual([...await withTestBudget(seams[2])(priv, Uint8Array.of(5))], [2, 5],
+          "an app's call through its `services` claim is entered as kind 2, an app");
       } finally { node.close(); }
     }
   } finally { shell.close(); }
@@ -683,7 +698,7 @@ async function testBundle() {
     // manifest has no filenames, and module bytes follow the guest in manifest order.
     const { host: h } = await makeHost();
     const testKey = "test";
-    const guestText = "function handle() { return new Uint8Array([1]); }";
+    const guestText = "function onHost() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
       modules: [{ name: "codec" }],
@@ -717,7 +732,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.installFile(bundlePath);
-    assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
+    assert(loaded.guestSource.includes("function onHost"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): the version is a monotonic high-water mark per (author, app), set
     // to 1 by the install above. Installing this label again needs `replaces`, since an
@@ -825,7 +840,7 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const guestText = "function handle() { return new Uint8Array([1]); }";
+    const guestText = "function onHost() { return new Uint8Array([1]); }";
     const manifest = (version) => ({
       app: "rollback", version,
       modules: [{ name: "codec" }],
@@ -1400,20 +1415,15 @@ function testGeneratedOpFrame() {
   // Every caller inlines this fragment into a guest it then signs, so the bytes must not
   // depend on the machine that compiled op-frame.ts, which line endings otherwise would.
   assert(!guestOpFraming().includes("\r"), "the emitted op-frame source is LF-only, so a signed guest is the same bytes anywhere");
-  const host = { callerOf, readOp, writeOp, utf8Encode, utf8Decode };
+  const host = { readOp, writeOp, utf8Encode, utf8Decode };
   const guest = new Function(`"use strict";${guestOpFraming()}
-    return { callerOf, readOp, writeOp, utf8Encode, utf8Decode };`)();
+    return { readOp, writeOp, utf8Encode, utf8Decode };`)();
   // Outcome, not message: the emitted source and module execute in different contexts, so
   // what must agree is accept-vs-reject and the bytes on accept.
   const out = (impl, fn, args) => { try { return JSON.stringify(impl[fn](...args)); } catch { return "threw"; } };
   const agree = (label, fn, ...args) =>
     assert(out(guest, fn, args) === out(host, fn, args), `${label}: generated source and host disagree`);
 
-  // A caller id differing from the host's all-zero one only in its last byte: a prefix
-  // test would call this the host.
-  const peer = new Uint8Array(32); peer[31] = 1;
-  agree("a host loopback", "callerOf", concatBytes([new Uint8Array(32), enc.encode("hi")]));
-  agree("a caller differing only in its last byte", "callerOf", concatBytes([peer, new Uint8Array(0)]));
   agree("a well-formed op", "readOp", Uint8Array.from([2, 0x68, 0x69, 9]));
   // Declared length one past the bytes that follow it, which separates `len < 1 + n`
   // from `len < n`.
@@ -1531,6 +1541,41 @@ async function testCommitRevalidatesHostGates() {
   console.log("  OK\n");
 }
 
+// ─── The guest's entrypoints serve what its manifest claims (§12.3) ─────
+// Each kind of caller reaches only its own entrypoint, so a guest that claims a protocol
+// but defines no onPeer would install and answer every peer with a refusal. The install
+// asks the preamble which entrypoints the guest defined and refuses such a bundle.
+async function testInstallChecksEntrypoints() {
+  console.log("Test: an install is refused when the guest cannot serve what its manifest claims (§12.3)");
+  const { admitAll } = await imp("build/host/policy.js");
+  const author = testAuthor();
+  const shell = await bootTestShell({ admit: admitAll });
+  let n = 0;
+  const install = async (guestSource, claims) => {
+    try {
+      await shell.install(authorBundle(sodium, author, {
+        app: `entry${++n}`, version: 1, modules: [], guestRequires: [], guestSource, ...claims,
+      }).blob);
+      return "";
+    } catch (err) { return err.message; }
+  };
+  const fn = (name) => `function ${name}() { return new Uint8Array(); }`;
+  try {
+    assert(/defines no entrypoint at all/.test(await install("const x = 1;", {})), "a guest with no entrypoint is refused");
+    assert(/no onPeer/.test(await install(fn("onHost"), { protocols: ["p/one"] })),
+      "a guest claiming a protocol with no onPeer is refused");
+    assert(await install(fn("onPeer"), { protocols: ["p/two"] }) === "", "…and installs once it defines onPeer");
+    assert(/no onApp or onHost/.test(await install(fn("onPeer"), { services: ["s-one"] })),
+      "a guest claiming a service with neither onApp nor onHost is refused");
+    assert(await install(fn("onApp"), { services: ["s-two"] }) === "", "a service answered at onApp installs");
+    assert(await install(fn("onHost"), { services: ["s-three"] }) === "",
+      "…and one answered at onHost, for the embedder's Shell.call, installs too");
+    assert(/no onHost/.test(await install(fn("onApp"), { guestRequires: ["timer"] })),
+      "a guest requiring the timer with no onHost, where its wakes arrive, is refused");
+    assert(await install(fn("onHost"), {}) === "", "a guest only the embedder invokes needs only onHost");
+  } finally { shell.close(); }
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1557,5 +1602,6 @@ await testCandidateRealmCannotActBeforeCommit();
 await testFailedRevokePersistRollsBack();
 await testInPlaceUpgradeReleasesTheOldSlot();
 await testCommitRevalidatesHostGates();
+await testInstallChecksEntrypoints();
 
 summary("Results");

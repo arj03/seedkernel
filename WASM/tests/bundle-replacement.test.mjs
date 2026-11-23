@@ -2,13 +2,13 @@
 import assert from "node:assert/strict";
 import {
   sodium, generateKeyPair, authorBundle, testAuthor, bootShell, MemoryFs,
-  FreshnessMarks, toHex, concatBytes, imp, withTestBudget,
+  FreshnessMarks, toHex, concatBytes, imp, withTestBudget, probed,
 } from "./fixtures.mjs";
 
 const { DEFAULT_MAX_APP_SLOTS } = await imp("build/host/wasm-limits.js");
 const alice = testAuthor(), bob = testAuthor(), carol = testAuthor();
 const bundle = (author, app, version = 1, extra = {}) => authorBundle(sodium, author, {
-  app, version, modules: [], guestSource: "function handle() { return new Uint8Array(); }",
+  app, version, modules: [], guestSource: "function onHost() { return new Uint8Array(); } function onPeer() { return new Uint8Array(); } function onApp() { return new Uint8Array(); }",
   guestRequires: [], guestConfig: { tag: version }, ...extra,
 }).blob;
 const linkBundle = (author, version = 1, extra = {}) => bundle(author, "transport", version, {
@@ -21,7 +21,7 @@ async function node({ transport, store = new FreshnessMarks(), admit = () => tru
   const result = await bootShell({
     sodium, identity, freshnessStore: store,
     services: { fs: new MemoryFs(), transport }, admit,
-    createRealm: async (o) => {
+    createRealm: probed(async (o) => {
       // Compile the fixture without executing guest top-level code.
       new Function(o.source);
       const app = Function(o.source.split("\n").slice(0, 3).join("\n") + "\nreturn APP;")();
@@ -30,7 +30,7 @@ async function node({ transport, store = new FreshnessMarks(), admit = () => tru
       records.push(r);
       if (control.hook) await control.hook(r);
       return r;
-    },
+    }),
   });
   return { ...result, identity, store, records, control };
 }

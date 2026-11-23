@@ -53,16 +53,12 @@ const netBenchGuestSource = `
     return out;
   }
   const block64k = new Uint8Array(65536); block64k.fill(0x5a);
-  function handle(arg) {
-    const c = arg.subarray(0, 32);
-    let fromHost = true;
-    for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
-    const p = arg.subarray(32);
-    if (fromHost) {
-      const { op, args } = readOp(p);
-      if (op === "send") return host.call("_net", writeOp("send", args));
-      return args;
-    }
+  function onHost(p) {
+    const { op, args } = readOp(p);
+    if (op === "send") return host.call("_net", writeOp("send", args));
+    return args;
+  }
+  function onPeer(c, p) {
     if (p.length > 0 && p[0] === 7) return block64k;
     if (p.length > 0 && p[0] === 9) return new Uint8Array([(p.slice(1).length ^ p[p.length - 1]) & 255]);
     return p;

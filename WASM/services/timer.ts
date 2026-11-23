@@ -2,7 +2,7 @@
 // Every node offers it. Deadline tables belong in the guest heap.
 import { OpArgs } from "../host/op-frame.js";
 import { DEFAULT_GUEST_DEADLINE_MS, SELF_INITIATED_CLOCK_DIVISOR } from "../host/wasm-limits.js";
-import { EMPTY, HOST_CALLER_ID, readU32BE } from "../host/util.js";
+import { EMPTY, HOST_CALLER, readU32BE } from "../host/util.js";
 import type { ServiceHandlers } from "../host/guest-seam.js";
 import { monotonicMs, type CausalClock } from "../host/realm-queue.js";
 
@@ -18,9 +18,9 @@ export interface RealmTimers extends HostTimers {
   clearAll(): void;
 }
 
-/** Every wake is the `wake` event from the host's caller id, with no args. Built fresh
+/** Every wake is the `wake` event from the host's caller, with no args. Built fresh
  *  per fire, since the realm owns what it is handed. */
-const wakeBody = (): Uint8Array => new OpArgs("wake").build(HOST_CALLER_ID);
+const wakeBody = (): Uint8Array => new OpArgs("wake").build(HOST_CALLER);
 
 /** At most one armed wake and one in flight. A due wake waits for the previous
  *  invocation to settle, which bounds what the host holds even when the guest defers its

@@ -11,10 +11,11 @@ func TestEngineRealmRoundTrip(t *testing.T) {
 	bootRealm(t)
 	evalString(t, `globalThis.__engineProbe = (async () => {
 	  const realm = await createRealm({
-	    source: "async function handle(b) { const r = await host.call('echo', b); const p = await host.call('later', r); return p; }",
+	    source: "async function onHost(b) { const r = await host.call('echo', b); const p = await host.call('later', r); return p; }",
 	    hostCall: (name, payload) => name === 'echo' ? payload : Promise.resolve(new Uint8Array([payload.length])),
 	  });
-	  const out = await realm.call(new Uint8Array([1, 2, 3]));
+	  // Entered as the host: kind 0 and the zero caller, then the body.
+	  const out = await realm.call([new Uint8Array(33), new Uint8Array([1, 2, 3])]);
 	  realm.dispose();
 	  return out;
 	})(); 0`)

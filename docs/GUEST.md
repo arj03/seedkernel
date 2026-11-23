@@ -12,13 +12,13 @@
 
 ## Overview
 
-A guest is a JS program that defines one function, `handle`. It runs in its own QuickJS realm with the language's built-ins and nothing else: no files, sockets, `fetch` or `process`. The host calls `handle` with `[caller 32][body]` and sends back whatever bytes it returns. Everything the guest does beyond computing goes through one function, `await host.call(name, bytes)`, and the names it may use are exactly what its signed manifest declared: the host services in `guest.requires`, other apps' service ids, its own modules, and the `crypto/*` transforms.
+A guest is a JS program that defines an entrypoint for each kind of caller it takes: `onHost(body)`, `onPeer(peer, body)` and `onApp(app, body)`. It runs in its own QuickJS realm with the language's built-ins and nothing else: no files, sockets, `fetch` or `process`. The host calls the entrypoint for whoever is calling and sends back whatever bytes it returns. Everything the guest does beyond computing goes through one function, `await host.call(name, bytes)`, and the names it may use are exactly what its signed manifest declared: the host services in `guest.requires`, other apps' service ids, its own modules, and the `crypto/*` transforms.
 
 ```js
 // manifest: "guest": { "requires": ["fs"] }
 const key = new TextEncoder().encode("count");
 
-async function handle(input) {                 // [caller 32][body]
+async function onHost(body) {                  // the host's call, invoke or Shell.call
   const got = await host.call("fs/get", key);  // [0] absent, or [1][value]
   const count = got[0] === 1 ? (got[1] + 1) & 255 : 1;
   const put = new Uint8Array(4 + key.length + 1);
@@ -30,7 +30,7 @@ async function handle(input) {                 // [caller 32][body]
 }
 ```
 
-The same `handle` receives a peer's request (caller = the peer's key), a co-resident app's call (caller = that app's id), and the host's own events (caller = 32 zero bytes): a timer `wake`, and, for the transport only, socket events. Invocations run one at a time per realm, each under a deadline, a heap cap and a cap on outstanding host calls. A guest that wants to do work on its own schedule arms its one wake.
+`onHost` receives the host's own calls: a timer `wake`, for the transport only socket events, and an embedder's `invoke` or `Shell.call`. `onPeer` receives a peer's request under a protocol the bundle claims, with the peer's key, and `onApp` a co-resident app's call under a service it claims, with that app's id. A guest defines only the ones it serves, and a caller it defines none for is refused. Invocations run one at a time per realm, each under a deadline, a heap cap and a cap on outstanding host calls. A guest that wants to do work on its own schedule arms its one wake.
 
 A transport is a guest like any other, with one more service: `link`, which lends it the node's sockets and lets it hand decrypted requests to the apps that claim them.
 
@@ -43,7 +43,7 @@ This file has two parts:
 
 ## 12.2 The guest seam: the guest name ABI
 
-A guest reaches the world through one call, `host.call(name, bytes)`, which answers a Promise. `bytes` is a `Uint8Array` or `ArrayBuffer`, or an array of them, which the call sends back to back: a guest hands over an argument's parts without concatenating them. It is entered through one function, `handle(bytes)` (§12.3). Multi-byte integers are big-endian.
+A guest reaches the world through one call, `host.call(name, bytes)`, which answers a Promise. `bytes` is a `Uint8Array` or `ArrayBuffer`, or an array of them, which the call sends back to back: a guest hands over an argument's parts without concatenating them. It is entered through its entrypoints, one per kind of caller (§12.3). Multi-byte integers are big-endian.
 
 ### Names
 
@@ -83,7 +83,7 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 | `timer/clear` | (empty) | (empty). Cancels the armed wake; a `wake` already handed to the realm is not retracted. |
 | `host/stage` | a host blob | (empty), or rejects. Hands the loader a host blob to run next (§12.9). |
 | *bare module name* | request bytes, unwrapped | the module's response. A trap, an overrun length or a deadline kill rejects (§4.3). |
-| *declared local service id* | opaque bytes; the host prepends the **caller's** 32-byte id | what the claimant's `handle` returned. Refused by name when nothing claims it (§12.10). |
+| *declared local service id* | opaque bytes, which the claimant's `onApp` receives with the **caller's** 32-byte id | what the claimant's `onApp` returned. Refused by name when nothing claims it, and refused when the claimant defines no `onApp` (§12.10). |
 | **`link/*`** | | **The link occupant only (§12.5).** Raw bytes over opaque link ids and datagram sockets; the transport above them is the occupant's (§12.6). |
 | `link/open` | `[dest utf8 ..]`: an opaque destination the host resolves against the sockets it can open. The shipped sockets read `scheme://host:port[/path]`. | `[linkId u32][stream u8]`. Link 0 means no route, an unparseable or unroutable destination included. |
 | `link/send` | `[linkId u32][bytes ..]`; no bytes sends nothing and only asks | `[backlog u32]`: what the link still holds for the wire, this write included, 0 for a link that is gone. An occupant forwarding between links reads it to stop reading the other side. |
@@ -119,7 +119,7 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 **`fs/*`, `crypto/*` and `identity/*` answer within the asking turn**: the guest's `await` continues with no host turn in between. The exceptions are `crypto/aes256gcm/seal` and `crypto/aes256gcm/open`, which answer when the platform's AES does: in the turn on native and Node, on a later turn on a page. Module calls, local service ids, `link/deliver`, `link/udpBind` and `host/stage` answer on a later turn. The file primitive under every fs backend is synchronous on every target, so a guest cannot work on one backend and fail on another by accident. A durable browser backend therefore has to be synchronous too (OPFS sync access handles in a Worker, or a store loaded from IndexedDB and persisted behind it).
 
-**`__deferred`.** A guest that will answer on a later turn sets `globalThis.__deferred = true` during the synchronous part of `handle`. The realm's queue is freed at the end of that segment though nothing has settled; the invocation's deadline stays attached to the answer and settles one that never arrives. This is the one ABI bit beyond `handle` returning bytes. Serializing invocations is right when the answer comes from outside, since a guest parked on a module call is suspended mid-update and must hold the queue. It is wrong when the answer arrives *through* the realm: the transport answers an app's send by reading bytes off a link, and that read is another invocation of the same realm, so awaiting inside the frame would hold the queue against the only event that could settle it. The flag hands over queue occupancy, never time, which is why the deadline stays.
+**`__deferred`.** A guest that will answer on a later turn sets `globalThis.__deferred = true` during the synchronous part of its entrypoint. The realm's queue is freed at the end of that segment though nothing has settled; the invocation's deadline stays attached to the answer and settles one that never arrives. This is the one ABI bit beyond an entrypoint returning bytes. Serializing invocations is right when the answer comes from outside, since a guest parked on a module call is suspended mid-update and must hold the queue. It is wrong when the answer arrives *through* the realm: the transport answers an app's send by reading bytes off a link, and that read is another invocation of the same realm, so awaiting inside the frame would hold the queue against the only event that could settle it. The flag hands over queue occupancy, never time, which is why the deadline stays.
 
 ### Signing scope
 
@@ -129,10 +129,10 @@ Every node running an app under the same label derives the same scope, whoever a
 
 ### Host events
 
-The host enters a realm with its own events. A realm that armed a wake receives `wake`; the link occupant, and only it, receives the link events. Each arrives at `handle` as:
+The host enters a realm with its own events. A realm that armed a wake receives `wake`; the link occupant, and only it, receives the link events. Each arrives at `onHost` as:
 
 ```
-[32 zero bytes][opLen u8][op ASCII][args ..]
+[opLen u8][op ASCII][args ..]
 ```
 
 No padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLength u32][bytes]`, `text` is a blob of UTF-8, and a boolean is one byte, 0 or 1.
@@ -151,7 +151,7 @@ No padding or terminator. A `u32` is unsigned big-endian, a `blob` is `[byteLeng
 - **A `datagrams` event's batches are at most `MAX_LINK_READ_BYTES` together**, cut between datagrams when the platform held more, so an occupant can take one event whole.
 - **`listening`** hands the occupant a `udp` listener the operator configured, as one of its own datagram sockets. It is bound each time an occupant takes `link`, so it goes with the occupant as its other sockets do.
 
-There is one envelope because host events and peer requests arrive at the same `handle`, and the zero caller id is one no peer or realm can hold, so no host input is told apart by its length or position. A wake carries no payload because the guest keeps its own deadline table and reads its own clock (§12.3).
+Host events and an embedder's own ops arrive at the same `onHost`, and the op name tells them apart. A wake carries no payload because the guest keeps its own deadline table and reads its own clock (§12.3).
 
 Listeners are labelled, not typed, because which codec a listener speaks is the transport's choice, not a property of the socket. A host that typed listeners would carry one transport's vocabulary, and a replacement speaking a third codec would need a host release to be listened for. A label is a string the host hands over unread, so the operator's flag and the transport agree without the host between them.
 
@@ -163,11 +163,23 @@ A guest runs as confined JS in a QuickJS realm. The realm holds the ECMAScript i
 
 A realm starts with no authority and receives only names, so the list in `guest.requires` is the guest's whole reach (§12.1). Time is not authority: every ECMAScript program already has a clock.
 
-### One entrypoint
+### One entrypoint per kind of caller
 
-The host invokes the guest's `handle` with `[caller 32][body ..]` and nothing else. The caller id is the host's to write: the peer key for a peer request, the calling realm's id for a local call, and 32 zero bytes for the host and its events. The body format is the callee's. `handle` may return bytes or a Promise of bytes, as `host.call` takes them: an array of parts is answered back to back.
+The host knows who is calling from the way it entered the realm, and the preamble calls the guest's entrypoint for that kind of caller:
 
-Which role an invocation serves, requester or responder, is read from the guest's own body format, never selected by the host. A synchronous second entry is not possible to offer, since a responder may need a module or another realm, and neither is bound to answer in the same turn. So both roles are ordinary async invocations of one function.
+| Entrypoint | Called for | With |
+| --- | --- | --- |
+| `onHost(body)` | the host: its events, and an embedder's `invoke` or `Shell.call` | the body |
+| `onPeer(peer, body)` | a peer, through the slot's `protocols` claim (`link/deliver`, §12.10) | the key the occupant attributed, and the body |
+| `onApp(app, body)` | an app on this node, through the slot's `services` claim (§12.10) | the calling app's id, its label hashed, and the body |
+
+Each is a top-level function of the guest. A kind of caller the guest defines no entrypoint for is refused: a peer is answered empty, and a calling app's `host.call` rejects. So a guest takes only the callers it wrote code for, and never tells them apart itself: no caller id could, since a peer key and an app id are 32 bytes their owners choose, and the guest is never handed one to read wrong. What an entrypoint lets its caller do is the guest's to decide, from the body. The body format is the callee's. An entrypoint may return bytes or a Promise of bytes, as `host.call` takes them: an array of parts is answered back to back.
+
+**An install checks the entrypoints against the claims.** A bundle claiming `protocols` must define `onPeer`; one claiming `services`, `onApp` or `onHost` (a service only the embedder calls is answered at `onHost`); and one requiring `timer` or `link` must define `onHost`, where those events arrive. A guest with no entrypoint at all is refused too. The preamble answers which entrypoints exist after the guest's top level ran, so a claim nobody serves fails the install, not the first frame.
+
+Under the entrypoints the host still frames each invocation as `[kind u8][caller 32][body ..]`: kind 0 for the host with 32 zero bytes, 1 for a peer, 2 for an app. Only the host and the preamble read it; a stand-in realm in a test sees it, and `callerOf` in op-frame splits it.
+
+Which role an invocation serves, requester or responder, is read from the guest's own body format, never selected by the host. A synchronous second entry is not possible to offer, since a responder may need a module or another realm, and neither is bound to answer in the same turn. So both roles are ordinary async invocations. Who the caller is, by contrast, is a fact only the host has, so the host selects the entrypoint for it.
 
 ### Invocations are serialized
 

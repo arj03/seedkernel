@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { testkit, makeAuthor, importBuilt } from "./testkit.mjs";
 import { readGuestSource } from "../scripts/guest-source.mjs";
+import { bytesEqual } from "./bytes.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = importBuilt(root);
@@ -42,7 +43,7 @@ const { createRealmTimers, timerService } = await imp("build/services/timer.js")
 const { identityService } = await imp("build/services/identity.js");
 const { fsService } = await imp("build/services/fs.js");
 const { linkService, TransportHost } = await imp("build/services/link.js");
-const { toHex, HOST_CALLER_ID } = await imp("build/host/util.js");
+const { toHex, HOST_CALLER } = await imp("build/host/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, CallBudget } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["identity", "fs", "timer", "link"];
@@ -50,8 +51,17 @@ const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALL_LOCAL = () => null;
 const TEST_LINK = { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) };
 const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
-const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
+const isWake = (arg) => arg.length > 33 && callerOf(arg).fromHost && readOp(callerOf(arg).body).op === "wake";
 const { createWebRealm } = await imp("build/host/engine-web.js");
+/** A realm entered as the host, as the shell enters one for its own calls, so the guest's
+ *  `onHost` takes each test's bytes as given (fixtures.mjs has the same). */
+const hostRealm = async (opts) => {
+  const realm = await createWebRealm(opts);
+  return {
+    call: (payload, ...rest) => realm.call([HOST_CALLER, ...[payload].flat()], ...rest),
+    dispose: () => realm.dispose(),
+  };
+};
 const { createDeadlineQueue, serializeCalls } = await imp("build/host/realm-queue.js");
 
 const { ok, throws, summary, sleep } = testkit();
@@ -284,8 +294,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     `a guest that swaps the preamble's entry points for getters never runs them (${getterProbe.error?.message ?? getterProbe.stderr.trim()})`);
 
   // A guest that loops forever is interrupted instead of wedging the host thread.
-  const spinner = await createWebRealm({
-    source: 'function handle() { for(;;){} }',
+  const spinner = await hostRealm({
+    source: 'function onHost() { for(;;){} }',
     hostCall: noop, deadlineMs: 300,
   });
   const t0 = Date.now();
@@ -301,8 +311,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const slowSeam = (name) => name === "slow"
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
-  const waiter = await createWebRealm({
-    source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); }',
+  const waiter = await hostRealm({
+    source: 'async function onHost() { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); }',
     hostCall: slowSeam, deadlineMs: 200,
   });
   await rejects(waiter.call(new Uint8Array()),
@@ -313,8 +323,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // waiting waits for it instead of interleaving, and then runs on its own budget, not on
   // what the first left (§12.3).
   const order = [];
-  const both = await createWebRealm({
-    source: 'async function handle(a) { if (a[0] === 1) { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); } return new Uint8Array([2]); }',
+  const both = await hostRealm({
+    source: 'async function onHost(a) { if (a[0] === 1) { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); } return new Uint8Array([2]); }',
     hostCall: slowSeam, deadlineMs: 1000,
   });
   const parked = both.call(new Uint8Array([1])).then((r) => { order.push("initiator"); return r; });
@@ -327,8 +337,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // The queue does not strand callers on dispose: one still queued fails instead of
   // entering a torn-down realm, which would abort the whole wasm module.
-  const closing = await createWebRealm({
-    source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); }',
+  const closing = await hostRealm({
+    source: 'async function onHost() { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); }',
     hostCall: slowSeam, deadlineMs: 5000,
   });
   const first = closing.call(new Uint8Array()).catch(() => "failed");
@@ -339,7 +349,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // The default is a real number, so omitting the field bounds the guest instead of
   // leaving it unbounded, like the seam gates above.
-  const defaulted = await createWebRealm({ source: 'function handle() { for(;;){} }', hostCall: noop });
+  const defaulted = await hostRealm({ source: 'function onHost() { for(;;){} }', hostCall: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
   try { await defaulted.call(new Uint8Array()); } catch { defaultInterrupted = true; }
@@ -352,8 +362,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // the retained calls returns the allowance to the realm.
   const held = [];
   let hold = true;
-  const boundedCalls = await createWebRealm({
-    source: `function handle(a) {
+  const boundedCalls = await hostRealm({
+    source: `function onHost(a) {
       if (a[0]) {
         for (let i = 0; i <= ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS}; i++)
           host.call("hold", new Uint8Array([i & 255]));
@@ -377,8 +387,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // An answer the host already has comes back in the frame that asked for it and holds
   // nothing meanwhile: more unawaited calls than the cap all answer.
   const asked = DEFAULT_MAX_OUTSTANDING_HOST_CALLS + 44;
-  const answeredAtOnce = await createWebRealm({
-    source: `async function handle() {
+  const answeredAtOnce = await hostRealm({
+    source: `async function onHost() {
       const calls = [];
       for (let i = 0; i < ${asked}; i++) calls.push(host.call("now", new Uint8Array([i & 255])));
       const answers = await Promise.all(calls);
@@ -394,8 +404,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // Such an answer still has to fit the byte allowance beside what the realm already
   // holds. One that does not is a failed round trip: a rejection, as for a late answer.
-  const overAllowance = await createWebRealm({
-    source: `async function handle() {
+  const overAllowance = await hostRealm({
+    source: `async function onHost() {
       host.call("hold", new Uint8Array(${DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES} - 8));
       let thrown = 0, rejected = 0;
       try { await host.call("now", new Uint8Array(4)).catch(() => { rejected = 1; }); } catch { thrown = 1; }
@@ -409,8 +419,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     "an immediate answer past the byte allowance rejects at the await, not at the call site");
   overAllowance.dispose();
 
-  const hidden = await createWebRealm({
-    source: `function handle() {
+  const hidden = await hostRealm({
+    source: `function onHost() {
       return Uint8Array.of(["__host_call", "__callDone", "__callFail"].some((n) => n in globalThis) ? 1 : 0);
     }`,
     hostCall: noop,
@@ -424,8 +434,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const callsAtByteCap = DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES / hostCallChunk;
   const byteHeld = [];
   let holdBytes = true;
-  const byteBoundedCalls = await createWebRealm({
-    source: `function handle(a) {
+  const byteBoundedCalls = await hostRealm({
+    source: `function onHost(a) {
       if (a[0]) {
         const payload = new Uint8Array(${hostCallChunk});
         for (let i = 0; i <= ${callsAtByteCap}; i++) host.call("link/deliver", payload);
@@ -449,8 +459,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // Changing only the operation name does not escape the accounting.
   const ordinaryHeld = [];
-  const ordinaryCalls = await createWebRealm({
-    source: `function handle() {
+  const ordinaryCalls = await hostRealm({
+    source: `function onHost() {
       const payload = new Uint8Array(${hostCallChunk});
       for (let i = 0; i < ${callsAtByteCap + 1}; i++) host.call("send", payload);
       return new Uint8Array();
@@ -475,7 +485,7 @@ console.log("\n§12.3 — a bounded realm count is what makes the node total a c
   // host memory must add its term here, not just declare its own constant.
   const perRealm = DEFAULT_REALM_MEMORY_BYTES  // §12.3: one confined guest heap
     + DEFAULT_MAX_OUTSTANDING_HOST_CALL_BYTES  // copied host-call inputs and their answers
-    + 2 * (HOST_CALLER_ID.length + 4)           // one armed and one in-flight wake
+    + 2 * (HOST_CALLER.length + 5)              // one armed and one in-flight wake
     + DEFAULT_MAX_MODULE_MEMORY_BYTES;         // §4.3: one bundle's total module memory
   const nodeMemoryCeiling = DEFAULT_MAX_APP_SLOTS * perRealm
     + MAX_NODE_OUTBOUND_QUEUE_BYTES // §12.6: outbound socket queues, over every link
@@ -510,14 +520,14 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
   const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const timersBeforeFailedConstruction = liveTimers();
   let settleOrphan;
-  await rejects(createWebRealm({
+  await rejects(hostRealm({
     source: 'host.call("hold", Uint8Array.of(1)); throw new Error("init failed");',
     hostCall: () => new Promise((resolve) => { settleOrphan = resolve; }),
   }), "failed realm construction reports its source error");
   ok(liveTimers() === timersBeforeFailedConstruction,
     "failed realm construction disarms host-call deadlines it can no longer own");
-  const afterFailure = await createWebRealm({
-    source: 'async function handle() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
+  const afterFailure = await hostRealm({
+    source: 'async function onHost() { await host.call("ok", Uint8Array.of(1)); return Uint8Array.of(7); }',
     hostCall: () => new Uint8Array(),
   });
   ok((await afterFailure.call(new Uint8Array()))[0] === 7,
@@ -528,8 +538,8 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
     "an orphaned backend settling later is a no-op, not a second release");
 
   let settleAtDispose;
-  const disposedWithParked = await createWebRealm({
-    source: 'async function handle() { await host.call("park", Uint8Array.of(1)); return Uint8Array.of(1); }',
+  const disposedWithParked = await hostRealm({
+    source: 'async function onHost() { await host.call("park", Uint8Array.of(1)); return Uint8Array.of(1); }',
     hostCall: () => new Promise((resolve) => { settleAtDispose = resolve; }),
   });
   // dispose() rejects this invocation; the caller holds the error, so consume it here.
@@ -621,12 +631,12 @@ console.log("\n§12.3 — active-call and realm-entry owners have complete lifec
 
   // A deferred result keeps no fresh clock of its own: it retains the handoff deadline
   // admitted with the call, including across another realm's host.call.
-  const deferring = await createWebRealm({
-    source: 'function handle() { globalThis.__deferred = true; return new Promise(() => {}); }',
+  const deferring = await hostRealm({
+    source: 'function onHost() { globalThis.__deferred = true; return new Promise(() => {}); }',
     hostCall: () => new Uint8Array(),
   });
-  const waiting = await createWebRealm({
-    source: 'function handle() { return host.call("ask", new Uint8Array()); }',
+  const waiting = await hostRealm({
+    source: 'function onHost() { return host.call("ask", new Uint8Array()); }',
     hostCall: () => deferring.call(new Uint8Array(1), 75),
     deadlineMs: 500,
   });
@@ -758,8 +768,8 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     });
     // [0] calls identity/verify on the rest, [1] fs/get.
-    const realm = await createWebRealm({
-      source: `async function handle(arg) {
+    const realm = await hostRealm({
+      source: `async function onHost(arg) {
         return await host.call(arg[0] === 0 ? "identity/verify" : "fs/get", arg.subarray(1));
       }`,
       hostCall: seam,
@@ -786,8 +796,8 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
   // callee start module-like work without awaiting that either. The late charge must still
   // reach the wake's clock after both entrypoints have answered.
   let moduleCharged;
-  const callee = await createWebRealm({
-    source: 'function handle() { void host.call("work", new Uint8Array()); return new Uint8Array(); }',
+  const callee = await hostRealm({
+    source: 'function onHost() { void host.call("work", new Uint8Array()); return new Uint8Array(); }',
     hostCall: (_name, _payload, budget) => new Promise((resolve) => {
       setTimeout(() => {
         budget.charge(2 * budgetMs);
@@ -796,8 +806,8 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       }, 10);
     }),
   });
-  const caller = await createWebRealm({
-    source: `async function handle() {
+  const caller = await hostRealm({
+    source: `async function onHost() {
       await host.call("pause", new Uint8Array());
       void host.call("callee", new Uint8Array());
       return new Uint8Array();
@@ -831,7 +841,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // still not be passed through, so this boots a node on a stub realm factory and checks
   // the numbers arrive. No transport, so nothing here may require `link`.
   const kp = testAuthor();
-  const guestSrc = 'function handle() { return new Uint8Array([1]); }';
+  const guestSrc = 'function onHost() { return new Uint8Array([1]); }';
   const guestBytes = new TextEncoder().encode(guestSrc);
   const signedConfig = JSON.parse('{"mode":"signed","nested":[true,null,{"n":3}],"__proto__":{"kept":"data"}}');
   const manifest = {
@@ -849,7 +859,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     freshnessStore: new FreshnessMarks(),
     createRealm: async (o) => {
       seen.push(o);
-      return { call: async () => new Uint8Array(), dispose() {} };
+      return { call: async (p) => p[0] === 255 ? Uint8Array.of(7) : new Uint8Array(), dispose() {} };
     },
     admit: admitAll,
     guestDeadlineMs: 1234,
@@ -951,7 +961,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     freshnessStore: new FreshnessMarks(),
     createRealm: async (o) => {
       seen2 = o;
-      return { call: async () => new Uint8Array(), dispose() {} };
+      return { call: async (p) => p[0] === 255 ? Uint8Array.of(7) : new Uint8Array(), dispose() {} };
     },
     admit: admitAll,
   });
@@ -1178,10 +1188,9 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const guestSrc = `
     let fired = [], armedId = null;
 ${guestOpFraming()}
-    function handle(arg) {
-      const { fromHost, body } = callerOf(arg);
+    function onHost(body) {
       const { op, args: p } = readOp(body);
-      if (fromHost && op === "wake") {
+      if (op === "wake") {
         if (armedId !== null) fired.push(armedId);
         armedId = null;
         return new Uint8Array(0);
@@ -1254,6 +1263,7 @@ ${guestOpFraming()}
       armed = o.hostCall;
       return {
         call: async (p) => {
+          if (p[0] === 255) return Uint8Array.of(7);
           entries.push(isWake(p) ? "timer" : "invoke");
           return new Uint8Array();
         },
@@ -1273,33 +1283,30 @@ ${guestOpFraming()}
   stub.close();
 }
 
-// ── §12.2: the host's caller id is matched whole, never by prefix ──────────
-// There is one host caller id, 32 zero bytes, matched over all 32 bytes. Every other
-// caller id is a hashed app label or a peer key, which their owners choose, so any byte
-// can be ground (~256 tries per byte). A reader checking only a prefix would let anyone
-// pass as the host, so the match covers all 32 bytes.
-console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not by its prefix");
+// ── §12.3: each kind of caller reaches only its own entrypoint ──────────────
+// A caller id is a peer key or a hashed app label, which their owners choose, so no id
+// can say who is calling. The envelope's first byte does, which only the host writes, and
+// the preamble hands each kind to its own entrypoint: a guest never reads the kind, so it
+// cannot read it wrong, and a kind it defines no entrypoint for is refused.
+console.log("\n§12.3 — each kind of caller reaches only the entrypoint the guest defined for it");
 {
-  const body = new Uint8Array([9, 9, 9, 9]);
-  const withCaller = (caller) => { const a = new Uint8Array(36); a.set(caller, 0); a.set(body, 32); return a; };
-
-  // This test app's reader; the host contributes only the 32-byte attribution prefix.
-  ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
-  // A near-miss on the host id is not the host: one bit in the last byte is enough.
-  const nearHost = new Uint8Array(32); nearHost[31] = 1;
-  ok(!callerOf(withCaller(nearHost)).fromHost, "a caller id that is zero but for its last byte is not the host");
-  const leadingZero = new Uint8Array(32); leadingZero[31] = 0xff; // zero everywhere but the LAST byte
-  ok(!callerOf(withCaller(leadingZero)).fromHost,
-    "a caller id that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
-
-  // The transport build injects the generated reader into its signed source. Evaluate that
-  // assembled source instead of copying the reader into this test.
-  const transportSrc = readGuestSource(guestOpFraming());
-  const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(transportSrc);
-  ok(m !== null, "the transport assembler injected the canonical callerOf");
-  const transportCallerOf = new Function(`${m[0]}; return callerOf;`)();
-  ok(transportCallerOf(withCaller(new Uint8Array(32))).fromHost, "the transport reads 32 zero bytes as the host proper");
-  ok(!transportCallerOf(withCaller(nearHost)).fromHost, "…and refuses a near-miss as the host proper");
+  const realm = await createWebRealm({
+    source: `function onHost(body) { return Uint8Array.of(0, ...body); }
+      function onPeer(peer, body) { return Uint8Array.of(1, peer[31], ...body); }`,
+    hostCall: async () => new Uint8Array(),
+  });
+  const zero = new Uint8Array(32), one = new Uint8Array(32);
+  one[31] = 1;
+  const enter = (kind, caller, ...body) => realm.call(Uint8Array.of(kind, ...caller, ...body));
+  const refused = async (p) => { try { await p; return false; } catch { return true; } };
+  ok(bytesEqual(await enter(0, zero, 9), Uint8Array.of(0, 9)), "kind 0 reaches onHost, with the body alone");
+  ok(bytesEqual(await enter(1, one, 9), Uint8Array.of(1, 1, 9)), "kind 1 reaches onPeer, with the peer's key and the body");
+  ok(bytesEqual(await enter(1, zero, 9), Uint8Array.of(1, 0, 9)), "a peer whose key is all zeros is still a peer, never the host");
+  ok(await refused(enter(2, one, 9)), "kind 2 is refused when the guest defines no onApp");
+  ok(await refused(enter(3, zero, 9)), "a kind the host never writes is refused");
+  ok(bytesEqual(await realm.call(Uint8Array.of(255)), Uint8Array.of(0b011)),
+    "the host's entrypoint probe answers which entrypoints the guest defines, without running it");
+  realm.dispose();
 }
 
 summary("hardening checks");

@@ -44,7 +44,7 @@ export const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js")
 export const { utf8Encode, utf8Decode } = await imp("build/host/utf8.js");
 /** Is this realm argument the host's wake event (§12.3)? */
 export { joined };
-export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
+export const isWake = (arg) => arg.length > 33 && callerOf(arg).fromHost && readOp(callerOf(arg).body).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
 export const { identityService } = await imp("build/services/identity.js");
 export const { fsService } = await imp("build/services/fs.js");
@@ -66,7 +66,17 @@ export const enc = new TextEncoder();
 export const { NodeFs, nodeRawFiles } = await imp("build/services/fs-node.js");
 export const { FilesFs } = await imp("build/services/fs-files.js");
 export const { createWebRealm } = await imp("build/host/engine-web.js");
-export const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/host/util.js");
+export const { toHex, fromHex, concatBytes, writeU32BE, HOST_CALLER } = await imp("build/host/util.js");
+/** A realm entered as the host, as the shell enters one for its own calls: every call gets
+ *  kind 0 and the zero caller in front, so the guest's `onHost` takes the test's bytes as
+ *  given. For tests of the realm itself; a shell frames its own calls. */
+export const hostRealm = async (opts) => {
+  const realm = await createWebRealm(opts);
+  return {
+    call: (payload, ...rest) => realm.call([HOST_CALLER, ...[payload].flat()], ...rest),
+    dispose: () => realm.dispose(),
+  };
+};
 export { bytesEqual } from "./bytes.mjs";
 
 // Install's admission step (§12.4): tests use the same code path an install does.
@@ -77,8 +87,9 @@ export const { policyFromJson, authorAllowlist, checkHostGates } = await imp("bu
 export const { ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 
 // Every app is a guest (§12.4), so every test bundle declares one. Tests that do not
-// exercise the guest use this minimal program.
-export const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
+// exercise the guest use this minimal program, which takes every kind of caller, so it
+// serves whatever a test's manifest claims.
+export const GUEST_TEXT = "function onHost() { return new Uint8Array([1]); } function onPeer() { return new Uint8Array([1]); } function onApp() { return new Uint8Array([1]); }";
 export const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 export const GUEST = (extra = {}) => ({ requires: [], ...extra });
 
@@ -100,7 +111,7 @@ export const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
  *  `transportAuthor` boots a small signed link occupant for explicit replacement tests. */
 export async function bootTestShell({ transportAuthor, services, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
-  const fixtureSource = "const FIXTURE_TRANSPORT = true; function handle() { return new Uint8Array(); }";
+  const fixtureSource = "const FIXTURE_TRANSPORT = true; function onHost() { return new Uint8Array(); } function onApp() { return new Uint8Array(); }";
   const transport = transportAuthor ? {
     transport: { bundle: authorBundle(sodium, transportAuthor, {
       app: "fixture-transport", version: 1, modules: [], services: ["_fixture-transport"],
@@ -114,13 +125,26 @@ export async function bootTestShell({ transportAuthor, services, ...opts } = {})
     ...opts,
     services: { ...transport, ...services },
     identity,
-    ...(transportAuthor && opts.createRealm ? { createRealm: async (o) =>
+    ...(opts.createRealm ? { createRealm: probed(transportAuthor ? async (o) =>
       o.source.endsWith(fixtureSource)
         ? { call: async () => new Uint8Array(), dispose() {} }
-        : opts.createRealm(o) } : {}),
+        : opts.createRealm(o) : opts.createRealm) } : {}),
   });
   return shell;
 }
+
+/** Whether a realm argument is the install's entrypoint probe (§12.3), kind 255. */
+const isProbe = (input) => (Array.isArray(input) ? input[0]?.[0] : input?.[0]) === 255;
+
+/** A stand-in realm factory whose realms answer the install's entrypoint probe as a guest
+ *  defining all three entrypoints would, so a stub that answers nothing still installs.
+ *  Every other call reaches the stub as it came. */
+export const probed = (createRealm) => async (o) => {
+  const realm = await createRealm(o);
+  const call = realm.call.bind(realm);
+  realm.call = (input, ...rest) => isProbe(input) ? Promise.resolve(Uint8Array.of(0b111)) : call(input, ...rest);
+  return realm;
+};
 
 /** `verifyBundle`, then `admit`, then module loading (§12.4), for the policy and
  *  integrity tests that use their own module host without a shell. `admit` is awaited:

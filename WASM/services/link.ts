@@ -2,7 +2,7 @@
 // state stay in the signed guest, and the handlers the link occupant reaches it through.
 // Destinations are opaque, and events go to the current occupant (§12.10).
 
-import { concatBytes, dec, enc, EMPTY, errMessage, Fifo, HOST_CALLER_ID, readU32BE, u8, writeU32BE, type Parts } from "../host/util.js";
+import { concatBytes, dec, enc, EMPTY, errMessage, Fifo, HOST_CALLER, readU32BE, u8, writeU32BE, type Parts } from "../host/util.js";
 import {
   DEFAULT_MAX_RAW_LINKS,
   MAX_LINK_READ_BYTES,
@@ -126,7 +126,7 @@ const ev = (name: LinkEvent) => new OpArgs(name);
 export { DEFAULT_MAX_RAW_LINKS } from "./net-limits.js";
 
 /** Active transport entrypoint, called with the whole realm argument
- *  `[caller 32][body ...]`; `null` means no occupant is bound. */
+ *  `[kind u8][caller 32][body ...]`; `null` means no occupant is bound. */
 export type TransportCall = (input: Parts) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
@@ -385,7 +385,7 @@ export class TransportHost {
    *  order. */
   private toTransport(event: OpArgs | Parts): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
-    return this.call(event instanceof OpArgs ? event.split(HOST_CALLER_ID) : event);
+    return this.call(event instanceof OpArgs ? event.split(HOST_CALLER) : event);
   }
 
   /** Log a rejected op, except a realm disposed by this driver's own teardown. */
@@ -556,9 +556,9 @@ export class TransportHost {
     // The occupant paused the link: no read reaches it until it resumes.
     let paused = false;
     const held = new Fifo<Uint8Array>();
-    // A `linkBytes` event up to its read, `[caller][op][link u32][len u32]`, framed once:
+    // A `linkBytes` event up to its read, `[kind][caller][op][link u32][len u32]`, framed once:
     // only the length changes, and one read per link is in the realm at a time.
-    const readHead = ev("linkBytes").u32(linkId).u32(0).build(HOST_CALLER_ID);
+    const readHead = ev("linkBytes").u32(linkId).u32(0).build(HOST_CALLER);
 
     const dropHeld = () => {
       for (let i = 0; i < held.size; i++) this.releaseInboundRead(held.at(i).length);

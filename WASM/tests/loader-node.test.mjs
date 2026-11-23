@@ -19,11 +19,9 @@ const app = authorBundle(sodium, author, {
   modules: [{ name: "fwd", wasm: forwarderBytes }],
   guestRequires: ["_net"],
   guestSource: `${guestOpFraming()}
-    function handle(arg) {
-      const caller = callerOf(arg);
-      const p = arg.subarray(32);
-      if (!caller.fromHost) return host.call("fwd", p);
-      const { op, args } = readOp(p);
+    function onPeer(peer, body) { return host.call("fwd", body); }
+    function onHost(body) {
+      const { op, args } = readOp(body);
       if (op === "send") return host.call("_net", writeOp("send", args));
       return host.call("fwd", args);
     }`,

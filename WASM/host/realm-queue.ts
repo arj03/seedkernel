@@ -55,7 +55,7 @@ export interface RealmOptions {
 
 /** One confined guest realm, independent of the target that implements it. */
 export interface Realm {
-  /** Invoke `handle` with `[caller 32][body ...]`, serialized per realm. An omitted
+  /** Invoke `handle` with `[kind u8][caller 32][body ...]`, serialized per realm. An omitted
    *  deadline means a host-initiated call on this realm's own ceiling. */
   call(payload: Parts, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
   dispose(): void;

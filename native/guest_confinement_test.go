@@ -60,7 +60,7 @@ func TestConfinedRealmCannotImportLibcModules(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		async function handle() {
+		async function onHost() {
 		  const report = [
 		    typeof os, typeof std, typeof bjson, typeof print, typeof console,
 		    typeof navigator, typeof gc, typeof setTimeout, typeof TextEncoder, typeof TextDecoder,

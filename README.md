@@ -46,7 +46,7 @@ There has been no external audit, and no cryptographer has reviewed the design (
 | **Host** | The runtime outside installed bundles: one signed host blob that a small fixed loader runs, natively or on Node, or that a page imports (§12.9). It verifies and admits bundles, builds their slots, confines execution, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
 | ↳ **Host services** | What a confined app cannot obtain for itself, the `HOST_SERVICES` set (§12.1): `identity` (signing with the node's identity, Ed25519 or hybrid with ML-DSA-65), `fs` (storage), `timer` (the realm's wake), `link` (sockets) and `host` (staging a new host blob). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
 | **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. |
-| ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
+| ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and, in, an entrypoint per kind of caller: `onHost`, `onPeer` and `onApp`. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
 | ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have **no host imports** and no I/O, and their names are private to the slot (§3). |
 
 The operator chooses which authors may install code and which host services they may receive; the host enforces those grants at admission and at the guest seam. Application-level authorization and behaviour live in the bundles.
@@ -55,19 +55,19 @@ There is one app shape, one install path (§12.4) and one guest seam (§12.2). T
 
 ## What a guest looks like
 
-A guest is plain JavaScript that defines `handle`. This one counts its invocations:
+A guest is plain JavaScript that defines an entrypoint for each kind of caller it takes. This one counts the host's invocations:
 
 ```js
 let count = 0;
-function handle(input) {
-  if (input.length !== 32) throw new Error("counter takes no payload");
+function onHost(body) {
+  if (body.length !== 0) throw new Error("counter takes no payload");
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, count = (count + 1) >>> 0);
   return out;
 }
 ```
 
-Every invocation receives `[caller 32][payload]` and answers with the bytes it returns. The caller is the peer's key for a peer request, the calling app's id for a local call, and zeros for the host. Everything else goes through `await host.call(name, bytes)`: a method of a host service the manifest declares (`fs/get` under `fs`), another app's service id it declares, one of the bundle's own modules by bare name, or a `crypto/*` transform. A build step signs the guest into a bundle, and a host installs and invokes it; [CLIENT](docs/CLIENT.md#build-and-run-a-bundle) is the whole runnable program.
+Each answers with the bytes it returns. `onHost(body)` takes the host's calls, `onPeer(peer, body)` a peer's request under a protocol the bundle claims, and `onApp(app, body)` another app's call under a service it claims. A caller with no entrypoint is refused, so a guest never has to tell its callers apart. Everything else goes through `await host.call(name, bytes)`: a method of a host service the manifest declares (`fs/get` under `fs`), another app's service id it declares, one of the bundle's own modules by bare name, or a `crypto/*` transform. A build step signs the guest into a bundle, and a host installs and invokes it; [CLIENT](docs/CLIENT.md#build-and-run-a-bundle) is the whole runnable program.
 
 ## The shape of it
 
@@ -139,11 +139,11 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 | Code | What | LOC |
 | --- | --- | --- |
-| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`identity`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,119 TS |
+| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`identity`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,159 TS |
 | **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,147 TS |
 | **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,878 Go |
 
-The transport bundle sits outside these totals: 3,066 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
+The transport bundle sits outside these totals: 3,070 lines of `transport/src/*.js` plus its private modules `ws.wasm`, `mlkem768.wasm` and `quic.wasm` (ngtcp2).
 
 ## Download
 

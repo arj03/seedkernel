@@ -39,13 +39,14 @@ var (
 	rsSetupErr  error // non-nil: SEEDSTORE_CODEC was set but unusable, so fail, don't skip
 )
 
-// invokeApp prefixes the host caller identity and its test op-frame. The guest removes
-// both before handing the codec its private payload. Returning the Promise is the async
+// invokeApp hands onHost its test op-frame. The guest removes it before handing the codec
+// its private payload. Returning the Promise is the async
 // guest ABI.
-const rsBenchGuestSource = `async function handle(arg) {
-	const opLen = arg.length > 32 ? arg[32] : -1;
-	return await host.call("codec", arg.subarray(33 + opLen));
-}`
+const rsBenchGuestSource = `async function onHost(arg) {
+	const opLen = arg.length > 0 ? arg[0] : -1;
+	return await host.call("codec", arg.subarray(1 + opLen));
+}
+function onPeer() { return new Uint8Array(0); }`
 
 // setupRS loads a benchmark app containing codec.wasm and stages a fixed encode request
 // plus a one-data-block-lost decode request. Both are validated once before timing.

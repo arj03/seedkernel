@@ -19,7 +19,7 @@ A node is three layers, and only the bottom one is fixed when it is deployed:
 | Bundles, one slot each: an app, or the transport                 |
 |   guest (confined JS realm)  +  private WASM modules             |
 +------------------------------------------------------------------+
-            host.call(name, bytes) ↓       ↑ handle([caller][body])
+            host.call(name, bytes) ↓       ↑ onHost / onPeer / onApp
 +------------------------------------------------------------------+
 | Host script (signed host blob)                                   |
 |   admission, slots, routing, host services, resource bounds      |
@@ -32,10 +32,10 @@ A node is three layers, and only the bottom one is fixed when it is deployed:
 
 - **The loader** gives the host raw primitives and keeps the one thing a host cannot keep for itself: the ability to roll back a host that crashes.
 - **The host** is a signed script the loader runs. It verifies bundles against the operator's policy, gives each one a slot, routes messages to slots, and lends each slot the host services its manifest declares. It never interprets what an app's bytes mean.
-- **A bundle** is a signed app: a JS guest that runs with no ambient authority, plus private WASM modules only that guest can call. The guest reaches the world only by name through `host.call`, and is entered only through `handle`.
+- **A bundle** is a signed app: a JS guest that runs with no ambient authority, plus private WASM modules only that guest can call. The guest reaches the world only by name through `host.call`, and is entered only through its entrypoints, one per kind of caller: `onHost`, `onPeer` and `onApp`.
 - **The transport is a bundle too.** It holds the node's sockets, runs the handshake and encrypts every frame. Other apps reach the network through it, and peers reach apps through it.
 
-A request from a peer crosses all of it. The host reads bytes off a socket and hands them to the transport's guest, which authenticates and decrypts them and names the protocol they are for. The host looks that protocol up among the installed claims and invokes the claiming app's `handle` with the sender's key in front. The app answers, perhaps after calling its modules or its own host services, and the answer goes back through the transport to the socket.
+A request from a peer crosses all of it. The host reads bytes off a socket and hands them to the transport's guest, which authenticates and decrypts them and names the protocol they are for. The host looks that protocol up among the installed claims and invokes the claiming app's `onPeer` with the sender's key. The app answers, perhaps after calling its modules or its own host services, and the answer goes back through the transport to the socket.
 
 Two ideas shape every section below. **Authority is declared, signed and admitted**: a bundle reaches only what its author declared in a signed manifest and the operator's policy allowed, and anything undeclared is absent rather than refused. **Anything with structure lives in a bundle**: the host moves raw bytes and enforces bounds, so protocols, storage formats and even the handshake change by signed update without a host release.
 
@@ -50,7 +50,7 @@ The file follows that order:
 
 ## 2. The message model
 
-A message at the runtime boundary is `(protocol id, input bytes)`. The transport has already decrypted it and put the peer key it attributes it to in front (§12.6). The host resolves the protocol claim to a bundle slot and invokes that slot's guest `handle` with those bytes (§12.10). Nothing on the inbound path dispatches to a module: a module is reached only by its own guest, by bare name (§4).
+A message at the runtime boundary is `(protocol id, input bytes)`. The transport has already decrypted it and put the peer key it attributes it to in front (§12.6). The host resolves the protocol claim to a bundle slot and invokes that slot's guest `onPeer` with those bytes (§12.10). Nothing on the inbound path dispatches to a module: a module is reached only by its own guest, by bare name (§4).
 
 The host has no wire format, so it has no message cap of its own. Bounds live where bytes are framed: the transport caps a frame and a module caps its I/O at its scratch size (§4.1). The host bounds only what it holds, such as one socket read (§12.6).
 
@@ -215,7 +215,7 @@ Each slot claims names from its signed manifest, and the host keeps three books,
 
 **The raw-link binding is a claim.** The driver has one event sink, so a second holder would take the node's sockets off the first while leaving its claims and realm in place: installed, routed, and silently off the network. Claiming it under the same rule as a name makes that a refusal. The occupant is also the one that attributes: holding the sockets is the authority to say which peer a request came from, because nothing else ever held the bytes. A claim grants no authority, but it does select which admitted app receives decrypted input (§14).
 
-**Peer delivery.** The occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in the `peer` book alone and invokes that slot's `handle` with `attribution ‖ payload`. An unclaimed protocol, or a `services`-only name, is answered empty, so "nobody here serves that" stays distinct from an unreachable peer.
+**Peer delivery.** The occupant decodes a request and calls `link/deliver(claim, attribution, payload)`; the host looks the claim up in the `peer` book alone and invokes that slot's `onPeer(attribution, payload)`. A local call through the `local` book reaches `onApp(app id, payload)`, so a slot claiming both lists serves each book at its own entrypoint and never tells them apart itself (§12.3). An unclaimed protocol, or a `services`-only name, is answered empty, so "nobody here serves that" stays distinct from an unreachable peer.
 
 **A claim is also the right to send.** The far end knows a frame by its protocol id and this node's key; nothing says which local app wrote it, so an app free to name any id would speak as the node in every other app's protocol. An app may send only under ids in its own `protocols`. The host checks this on every call from an app to the occupant, reading the leading fields of a `send`: `[op "send"][noReply u8][to blob][proto blob]` (blobs as in §12.2). These fields are the one part of the occupant's vocabulary the host reads; the check sits in the host because the claim book does, where asking the transport would cost a round trip on every send.
 

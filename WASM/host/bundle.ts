@@ -110,6 +110,14 @@ export function genesisHash(sodium: Pick<ManifestVerifier, "sha256">, data: Uint
   return u8(sodium.sha256(data));
 }
 
+/** Whether a name in a manifest's `guest.requires` is one of this host's services, and so
+ *  the host's to back, rather than a local service id another slot claims (§12.2, §12.10).
+ *  An embedder that grants apps only some host services asks this, so a service the host
+ *  gains later is never mistaken for another app's. */
+export function isHostService(name: string): boolean {
+  return isService(name);
+}
+
 /** Whether the signed manifest requires the node's exclusive raw-link service. */
 export function reachesLink(manifest: BundleManifest): boolean {
   return manifest.guest.requires.includes("link");

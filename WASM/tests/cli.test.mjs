@@ -159,7 +159,7 @@ for (const flags of [[], ["--listen", "127.0.0.1:0"], ["--listen", "ws=127.0.0.1
   try {
     const app = await node.shell.install(authorBundle(sodium, testAuthor(), {
       app: "page-probe", version: 1, modules: [], guestRequires: [],
-      guestSource: "function handle() { return host.call('crypto/sha256', new Uint8Array([1, 2, 3])); }",
+      guestSource: "function onHost() { return host.call('crypto/sha256', new Uint8Array([1, 2, 3])); }",
     }).blob);
     ok(asked.includes("page-probe"), "a page's node admits through the page's own gate");
     ok(toHex(await app.invoke(new Uint8Array())) === toHex(host.sodium.sha256(new Uint8Array([1, 2, 3]))),
