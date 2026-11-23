@@ -12,15 +12,15 @@ import type { EngineExport, EngineInstance, EngineImports } from "./engine-realm
 import type { Keypair } from "./subkeys.js";
 import type { ShellSodium } from "./shell-core.js";
 import type { Symmetric } from "./abi.js";
-import { createMlDsa65, type MlDsa65Signer } from "./pq.js";
+import { createMlDsa65 } from "./pq.js";
 import { WASM_PAGE_BYTES } from "./wasm-limits.js";
 
 /** An engine table that instantiates synchronously, as every loader's does. */
 export type SyncEngine = (wasm: Uint8Array, imports: EngineImports) => EngineInstance;
 
-/** `ShellSodium` plus the keypair producers a node's identity comes from, and the ML-DSA-65
- *  signing half a bundle author needs (§12.4). */
-export interface HostSodium extends ShellSodium, MlDsa65Signer {
+/** `ShellSodium` plus the keypair producers a node's identity comes from. Its ML-DSA-65
+ *  signing half serves both a bundle author (§12.4) and `identity/sign-hybrid` (§12.2). */
+export interface HostSodium extends ShellSodium {
   crypto_sign_keypair(): Keypair;
   crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
 }

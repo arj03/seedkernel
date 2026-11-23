@@ -12,7 +12,7 @@ const bundle = (author, app, version = 1, extra = {}) => authorBundle(sodium, au
   guestRequires: [], guestConfig: { tag: version }, ...extra,
 }).blob;
 const linkBundle = (author, version = 1, extra = {}) => bundle(author, "transport", version, {
-  guestRequires: ["node", "link"], services: ["_net"], ...extra,
+  guestRequires: ["identity", "link"], services: ["_net"], ...extra,
 });
 
 async function node({ transport, store = new FreshnessMarks(), admit = () => true } = {}) {
@@ -41,11 +41,11 @@ await test("another author replaces a chat owner under a new label atomically, w
   const n = await node();
   try {
     const old = await n.shell.install(bundle(alice, "chat", 50, {
-      protocols: ["chat", "old-only"], services: ["chat-local"], guestRequires: ["fs", "node"],
+      protocols: ["chat", "old-only"], services: ["chat-local"], guestRequires: ["fs", "identity"],
     }));
     old.fs.put("private", Uint8Array.of(42));
     const next = await n.shell.install(bundle(bob, "other-chat", 1, {
-      protocols: ["chat"], services: ["chat-local", "new-only"], guestRequires: ["fs", "node"],
+      protocols: ["chat"], services: ["chat-local", "new-only"], guestRequires: ["fs", "identity"],
     }), { replaces: "chat" });
     assert.equal(n.shell.resolve("chat"), "other-chat");
     assert.equal(n.shell.resolve("chat-local"), "other-chat");
@@ -65,18 +65,18 @@ await test("another author replaces a chat owner under a new label atomically, w
 
 await test("another author keeping the label takes its data and signing scope, but not its history", async () => {
   const n = await node();
-  const reach = { guestRequires: ["fs", "node"] };
+  const reach = { guestRequires: ["fs", "identity"] };
   try {
     const old = await n.shell.install(bundle(alice, "chat", 50, reach));
     old.fs.put("history", Uint8Array.of(42));
     const msg = Uint8Array.of(7, 7);
-    const sig = await n.records[0].seam("node/sign", msg);
+    const sig = await n.records[0].seam("identity/sign", msg);
     // One slot per label: a second author's `chat` installs only by replacing the current one.
     await assert.rejects(n.shell.install(bundle(bob, "chat", 1, reach)), /'chat' is already installed/);
     const next = await n.shell.install(bundle(bob, "chat", 1, reach), { replaces: "chat" });
     assert.equal(next.appScope, old.appScope);
     assert.deepEqual(next.fs.get("history"), Uint8Array.of(42));
-    const verdict = await n.records[1].seam("node/verify", concatBytes([n.identity.publicKey, sig, msg]));
+    const verdict = await n.records[1].seam("identity/verify", concatBytes([n.identity.publicKey, sig, msg]));
     assert.equal(verdict[0], 1, "the new author's slot verifies what the old one signed");
     assert.equal(n.store.get(alice.id, "chat"), 50);
     assert.equal(n.store.get(bob.id, "chat"), 1);

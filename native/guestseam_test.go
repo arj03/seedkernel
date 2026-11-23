@@ -19,27 +19,30 @@ import (
 
 // The guest-seam.ts names used below, defined once so a rename is one edit.
 const (
-	nameSign     = "node/sign"
-	nameVerify   = "node/verify"
-	nameRandom   = "crypto/random"
-	nameFsGet    = "fs/get"
-	nameFsPut    = "fs/put"
-	nameLinkSend = "link/send"
+	nameSign         = "identity/sign"
+	nameVerify       = "identity/verify"
+	nameSignHybrid   = "identity/sign-hybrid"
+	nameVerifyHybrid = "identity/verify-hybrid"
+	nameHybridKey    = "identity/hybrid-key"
+	nameRandom       = "crypto/random"
+	nameFsGet        = "fs/get"
+	nameFsPut        = "fs/put"
+	nameLinkSend     = "link/send"
 )
 
 func TestGuestSeamOps(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Declare `node` and `fs` (not link), plus an identity from sodium. The signing scope
-	// ties node/sign and node/verify to an app namespace (§12.2); a real node derives it
+	// Declare `identity` and `fs` (not link), plus an identity from sodium. The signing scope
+	// ties identity/sign and identity/verify to an app namespace (§12.2); a real node derives it
 	// from the manifest's `app` label, here it is a throwaway one.
 	if _, err := qc.Eval("build.js", `
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__other = sodium.crypto_sign_keypair();
-		// node/sign signs under a slot-derived scope: domain, scope bytes and the signing
+		// identity/sign signs under a slot-derived scope: domain, scope bytes and the signing
 		// key.
 		globalThis.__scope = appSignScope(__id, "testapp");
-		__buildGuestSeam(["node", "fs"], null, __scope);
+		__buildGuestSeam(["identity", "fs"], null, __scope);
 	`); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -94,38 +97,60 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatalf("crypto/aes256gcm/open of a flipped bit = %x, want [0]", got)
 	}
 
-	// node/sign and node/verify are scoped (§12.2): the host applies DOMAIN_guest ‖ scope
+	// identity/sign and identity/verify are scoped (§12.2): the host applies DOMAIN_guest ‖ scope
 	// to the message on both sides, so the guest checks a signature by naming the key,
 	// never by rebuilding the host's prefix bytes.
 	msg := []byte("a message to sign")
 	sig := callBytes(nameSign, msg)
 	if len(sig) != 64 {
-		t.Fatalf("node/sign len = %d, want 64", len(sig))
+		t.Fatalf("identity/sign len = %d, want 64", len(sig))
 	}
-	// node/verify, [pk 32][sig 64][msg]; the host adds the scope.
+	// identity/verify, [pk 32][sig 64][msg]; the host adds the scope.
 	verifyScoped := append(append(append([]byte{}, pk...), sig...), msg...)
 	if v := callBytes(nameVerify, verifyScoped); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("node/verify(scoped msg) = %v, want [1]", v)
+		t.Fatalf("identity/verify(scoped msg) = %v, want [1]", v)
 	}
 	// The same signature must not verify under a different key: the caller names the key,
 	// not the scope, so this checks this app's namespace, not just any key.
 	otherPk := jsBytes(t, qc, `__other.publicKey`)
 	verifyOther := append(append(append([]byte{}, otherPk...), sig...), msg...)
 	if v := callBytes(nameVerify, verifyOther); len(v) != 1 || v[0] != 0 {
-		t.Fatalf("node/verify(another key) = %v, want [0]", v)
+		t.Fatalf("identity/verify(another key) = %v, want [0]", v)
 	}
 	// A mis-framed call is not a failed verification: a payload too short for
 	// [pk 32][sig 64] errors, since [0] would be a verdict on bytes nothing checked. The
 	// bound is exactly that prefix, so an empty message still gets an answer.
 	if err := refused(nameVerify, verifyScoped[:95]); err == nil {
-		t.Fatal("node/verify(short payload) returned a verdict, want an error (mis-framed is not invalid)")
+		t.Fatal("identity/verify(short payload) returned a verdict, want an error (mis-framed is not invalid)")
 	}
 	emptySig := callBytes(nameSign, nil)
 	verifyEmpty := append(append([]byte{}, pk...), emptySig...)
 	if v := callBytes(nameVerify, verifyEmpty); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("node/verify(empty msg) = %v, want [1]", v)
+		t.Fatalf("identity/verify(empty msg) = %v, want [1]", v)
 	}
-	// Raw Ed25519 verification is host-internal. Guests get only node/verify, whose
+	// The hybrid names run the same ML-DSA-65 module under wazero: the key is the identity
+	// plus its derived ML-DSA half, and a hybrid signature verifies only whole.
+	hk := callBytes(nameHybridKey, nil)
+	if len(hk) != 32+1952 || !bytes.Equal(hk[:32], pk) {
+		t.Fatalf("identity/hybrid-key = %d bytes, want [ed pk 32 = the identity][ml pk 1952]", len(hk))
+	}
+	hsig := callBytes(nameSignHybrid, msg)
+	if len(hsig) != 64+3309 {
+		t.Fatalf("identity/sign-hybrid len = %d, want 64+3309", len(hsig))
+	}
+	verifyHybrid := func(sig []byte) []byte {
+		t.Helper()
+		return callBytes(nameVerifyHybrid, append(append(append([]byte{}, hk...), sig...), msg...))
+	}
+	if v := verifyHybrid(hsig); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("identity/verify-hybrid = %v, want [1]", v)
+	}
+	broken := append([]byte{}, hsig...)
+	broken[64] ^= 1
+	if v := verifyHybrid(broken); len(v) != 1 || v[0] != 0 {
+		t.Fatalf("identity/verify-hybrid(broken ML-DSA half) = %v, want [0]", v)
+	}
+	// Raw Ed25519 verification is host-internal. Guests get only identity/verify, whose
 	// scope is supplied by the host rather than reconstructed in guest bytes.
 	if err := refused("crypto/ed25519/verify", nil); err == nil {
 		t.Fatal("crypto/ed25519/verify was exposed, want unknown host transform")
@@ -166,16 +191,16 @@ func TestGuestSeamOps(t *testing.T) {
 	}
 
 	// The gate itself, on a service this harness has a real backend for, so only the gate
-	// can refuse it: the same seam narrowed to `node` answers no fs name. The refusal (a
+	// can refuse it: the same seam narrowed to `identity` answers no fs name. The refusal (a
 	// throw at the call site, guest-seam.ts) reaches the test as callRealm's error.
-	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["node"], null, __scope);`); err != nil {
+	if _, err := qc.Eval("narrow.js", `__buildGuestSeam(["identity"], null, __scope);`); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
 	if err := refused(nameFsPut, make([]byte, 8)); err == nil {
 		t.Fatal("fs/put resolved on a seam declaring no fs service")
 	}
 	if sig := callBytes(nameSign, []byte{1}); len(sig) != 64 {
-		t.Fatalf("node/sign = %d bytes on the narrowed seam, want the one service it declares", len(sig))
+		t.Fatalf("identity/sign = %d bytes on the narrowed seam, want the one service it declares", len(sig))
 	}
 	if r := callBytes(nameRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
 		t.Fatalf("crypto/random = %d bytes on the narrowed seam, want 4 — it is not a grant", len(r))

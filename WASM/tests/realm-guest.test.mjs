@@ -1,4 +1,4 @@
-// The guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy parsing, node/sign
+// The guest seam and realm lifecycle (§12.2, §12.3, §4.3): policy parsing, identity/sign
 // scoping, realm confinement, realm serialization, seam gating, and module-call
 // budgeting. bundle-install.test.mjs covers the verify, admit and install lifecycle;
 // crypto.test.mjs the manifest suite and ACVP vectors.
@@ -59,14 +59,14 @@ async function testGuestSeam() {
   const testKey = "testapp";
   await installMod(host, testKey, "echo", forwarderBytes);
 
-  // A host-derived signing scope binds the guest's node/sign name to a bundle namespace
+  // A host-derived signing scope binds the guest's identity/sign name to a bundle namespace
   // (§12.2); a real node derives it from the manifest's `app` label.
   const signScope = appSignScope(id, "testapp");
   const scopeBytes = guestSignScope("testapp");
   const seam = withTestBudget(createGuestSeam({
     sodium,
     requires: names,
-    services: testServices({ node: signScope, fs }),
+    services: testServices({ identity: signScope, fs }),
     callLocal,
     // Scoped to one app, as the shell does: a bare name is a module in this app's map
     // and cannot reach outside it.
@@ -101,28 +101,70 @@ async function testGuestSeam() {
     let shortAead = false;
     try { await prim("aes256gcm/open", concatBytes([npub, aeadKey, U(0, 0, 0, 9), msg])); } catch { shortAead = true; }
     assert(shortAead, "associated data longer than the call is mis-framed, not a failed open");
-    // node/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
-    // node/verify applies the same scope on the host, so a guest checks a signature by
+    // identity/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
+    // identity/verify applies the same scope on the host, so a guest checks a signature by
     // naming the key, never by rebuilding the host's prefix.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
-    const sig = await seam("node/sign", msg);
+    const sig = await seam("identity/sign", msg);
     const preimage = concatBytes([DOMAIN_GUEST, scopeBytes, msg]);
-    assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "node/sign signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
-    assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "node/sign never signs the raw message (scoped, not raw)");
-    assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "node/verify accepts what node/sign signed — the same scope, host-applied");
-    assertEqual((await seam("node/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "node/verify rejects the signature under a different key");
-    assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "node/verify rejects a forged message");
+    assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "identity/sign signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
+    assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "identity/sign never signs the raw message (scoped, not raw)");
+    assertEqual((await seam("identity/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "identity/verify accepts what identity/sign signed — the same scope, host-applied");
+    assertEqual((await seam("identity/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "identity/verify rejects the signature under a different key");
+    assertEqual((await seam("identity/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "identity/verify rejects a forged message");
     // A mis-framed call is not a failed verification: too few bytes for [pk][sig] throws,
     // since 0 would be a verdict on bytes nothing checked. The bound is exactly the fixed
     // prefix; an empty message is valid.
-    const emptySig = await seam("node/sign", new Uint8Array(0));
-    assertEqual((await seam("node/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "node/verify takes an empty message — 96 bytes is a whole call");
+    const emptySig = await seam("identity/sign", new Uint8Array(0));
+    assertEqual((await seam("identity/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "identity/verify takes an empty message — 96 bytes is a whole call");
     let verifyThrew = false;
-    try { await seam("node/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
-    assert(verifyThrew, "node/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
+    try { await seam("identity/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
+    assert(verifyThrew, "identity/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
+
+    // identity/sign-hybrid: the same identity plus its ML-DSA-65 half, for records that
+    // outlive Ed25519. Both halves sign DOMAIN_hybrid ‖ DOMAIN_guest ‖ scope ‖ ed_pk ‖
+    // ml_pk ‖ msg.
+    const DOMAIN_HYBRID = new TextEncoder().encode("seedkernel-hybrid-sig-v1\0");
+    const hk = await seam("identity/hybrid-key", new Uint8Array(0));
+    assertEqual(hk.length, 32 + 1952, "identity/hybrid-key answers [ed pk 32][ml pk 1952]");
+    assert(bytesEqual(hk.subarray(0, 32), id.publicKey), "…whose Ed25519 half is the node identity");
+    assert(bytesEqual(await seam("identity/hybrid-key", new Uint8Array(0)), hk), "…and is the same key on every call");
+    const hsig = await seam("identity/sign-hybrid", msg);
+    assertEqual(hsig.length, 64 + 3309, "identity/sign-hybrid answers [ed sig 64][ml sig 3309]");
+    const hpre = concatBytes([DOMAIN_HYBRID, DOMAIN_GUEST, scopeBytes, hk, msg]);
+    assert(sodium.crypto_sign_verify_detached(hsig.subarray(0, 64), hpre, id.publicKey),
+      "the Ed25519 half signs DOMAIN_hybrid ‖ DOMAIN_guest ‖ scope ‖ both keys ‖ msg");
+    assert(sodium.ml_dsa65_verify_detached(hsig.subarray(64), hpre, hk.subarray(32)),
+      "the ML-DSA-65 half signs the same preimage under the derived key");
+    const vh = async (pk, s, m) => (await seam("identity/verify-hybrid", concatBytes([pk, s, m])))[0];
+    assertEqual(await vh(hk, hsig, msg), 1, "identity/verify-hybrid accepts what identity/sign-hybrid signed");
+    assertEqual(await vh(hk, hsig, U(9, 9)), 0, "identity/verify-hybrid rejects a forged message");
+    const flip = (b, i) => { const c = new Uint8Array(b); c[i] ^= 1; return c; };
+    assertEqual(await vh(hk, flip(hsig, 0), msg), 0, "…a broken Ed25519 half, with the ML-DSA half intact");
+    assertEqual(await vh(hk, flip(hsig, 64), msg), 0, "…a broken ML-DSA half, with the Ed25519 half intact");
+    assertEqual(await vh(concatBytes([otherKey.publicKey, hk.subarray(32)]), hsig, msg), 0,
+      "…the ML-DSA half paired with another Ed25519 key");
+    // Neither half passes as a plain scoped signature, and a plain one is no half.
+    assertEqual((await seam("identity/verify", concatBytes([id.publicKey, hsig.subarray(0, 64), msg])))[0], 0,
+      "the Ed25519 half of a hybrid signature is not an identity/sign signature");
+    assertEqual(await vh(hk, concatBytes([sig, hsig.subarray(64)]), msg), 0,
+      "an identity/sign signature is not the Ed25519 half of a hybrid one");
+    const hEmpty = await seam("identity/sign-hybrid", new Uint8Array(0));
+    assertEqual(await vh(hk, hEmpty, new Uint8Array(0)), 1, "identity/verify-hybrid takes an empty message");
+    let hybridShort = false;
+    try { await seam("identity/verify-hybrid", concatBytes([hk, hsig.subarray(0, 100)])); } catch { hybridShort = true; }
+    assert(hybridShort, "identity/verify-hybrid refuses a short payload rather than answering 0");
+    // Another app's scope: the same node, the same keys, a different label.
+    const otherScope = withTestBudget(createGuestSeam({
+      sodium, requires: ["identity"], callLocal: TEST_CALL_LOCAL, modules: { names: new Set(), call: () => null },
+      services: testServices({ identity: appSignScope(id, "otherapp") }),
+    }));
+    assertEqual((await otherScope("identity/verify-hybrid", concatBytes([hk, hsig, msg])))[0], 0,
+      "a hybrid signature verifies only under the scope that made it");
+
     let rawVerifyRefused = false;
     try { await prim("ed25519/verify", new Uint8Array(0)); } catch { rawVerifyRefused = true; }
-    assert(rawVerifyRefused, "crypto/ed25519/verify is host-internal — guests use scoped node/verify");
+    assert(rawVerifyRefused, "crypto/ed25519/verify is host-internal — guests use scoped identity/verify");
     for (const removed of ["xchacha20/xor", "ml-kem-768/keypair", "ml-kem-768/encaps", "ml-kem-768/decaps"]) {
       let refused = false;
       try { await prim(removed, new Uint8Array(0)); } catch { refused = true; }
@@ -235,7 +277,7 @@ async function testPolicy() {
   console.log("  OK\n");
 }
 
-// ─── Test: node/sign's scope is the slot's: the app scope for an app slot, the ──────
+// ─── Test: identity/sign's scope is the slot's: the app scope for an app slot, the ──────
 // ─── link scope for the link slot, on every install path ─────────────────────────────
 // `slotSignScope` depends only on admitted facts (the node's identity, the manifest, and
 // whether it requires link), so it cannot drift. Tested through a real shell because the
@@ -244,7 +286,7 @@ async function testPolicy() {
 // running while every handshake with a non-upgraded peer failed as an unexplained
 // authentication error.
 async function testSigningScopeFollowsSlot() {
-  console.log("Test: node/sign is the slot's scope — app scope for an app, link scope for the link slot, on every load path");
+  console.log("Test: identity/sign is the slot's scope — app scope for an app, link scope for the link slot, on every load path");
   const { admitAll } = await imp("build/host/policy.js");
 
   const linkAuthor = testAuthor(), appAuthor = testAuthor();
@@ -275,34 +317,34 @@ async function testSigningScopeFollowsSlot() {
   try {
     // The link slot's scope is the link scope: channel authentication comes from the slot,
     // not from a second sign name.
-    await shell.install(blob(linkAuthor, "linkprobe", 1, ["node", "link"]), {
+    await shell.install(blob(linkAuthor, "linkprobe", 1, ["identity", "link"]), {
       replaces: shell.resolve("_fixture-transport"),
       localConfig: { networkKey: "7a".repeat(32) },
     });
-    const v1 = await seam("node/sign", msg);
+    const v1 = await seam("identity/sign", msg);
     assert(signs(v1, DOMAIN_LINK, linkScope, msg),
-      "the link slot's node/sign signs under DOMAIN_link_scope");
+      "the link slot's identity/sign signs under DOMAIN_link_scope");
     assert(!signs(v1, DOMAIN_GUEST, linkApp, msg),
       "…and never under the transport author's app scope — the slot's scope is what the name means");
-    assertEqual((await seam("node/verify", concatBytes([identity.publicKey, v1, msg])))[0], 1,
-      "node/verify on the link slot checks under the same link scope");
+    assertEqual((await seam("identity/verify", concatBytes([identity.publicKey, v1, msg])))[0], 1,
+      "identity/verify on the link slot checks under the same link scope");
 
     // In-place update: the installed slot is replaced.
-    await shell.install(blob(linkAuthor, "linkprobe", 2, ["node", "link"]), {
+    await shell.install(blob(linkAuthor, "linkprobe", 2, ["identity", "link"]), {
       replaces: "linkprobe",
       localConfig: { networkKey: "7b".repeat(32) },
     });
-    const v2 = await seam("node/sign", msg);
+    const v2 = await seam("identity/sign", msg);
     assert(signs(v2, DOMAIN_LINK, linkScope, msg),
       "an in-place update of the link slot keeps the SAME link scope — an upgrade cannot re-scope a node");
     assert(bytesEqual(v1, v2), "changing transport config does not change the host's signing scope");
 
     // The other case, on a shell that already has a link occupant: an ordinary app signs
     // under its own scope, with the same sign names.
-    await shell.install(blob(appAuthor, "plainapp", 1, ["node"]));
-    const app = await seam("node/sign", msg);
+    await shell.install(blob(appAuthor, "plainapp", 1, ["identity"]));
+    const app = await seam("identity/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope("plainapp"), msg),
-      "an ordinary app's node/sign signs under DOMAIN_guest ‖ app");
+      "an ordinary app's identity/sign signs under DOMAIN_guest ‖ app");
     assert(!signs(app, DOMAIN_LINK, linkScope, msg),
       "…and cannot reach the link slot's link scope");
     let refused = false;
@@ -650,7 +692,7 @@ async function testSeamGating() {
   const mk = (names) => withTestBudget(createGuestSeam({
     sodium,
     requires: names,
-    services: testServices({ node: appSignScope(id, "probe") }),
+    services: testServices({ identity: appSignScope(id, "probe") }),
     callLocal: TEST_CALL_LOCAL,
     modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   }));
@@ -674,7 +716,7 @@ async function testSeamGating() {
   // Access is by service, not method: declaring `timer` resolves `timer/clear`, and an
   // undeclared service is still refused beside it.
   threw = false;
-  try { await timerOnly("node/sign", U(1)); } catch { threw = true; }
+  try { await timerOnly("identity/sign", U(1)); } catch { threw = true; }
   assert(threw, "an undeclared service (node) is refused by the seam");
   threw = false;
   try { await timerOnly("fs/delete", U(120)); } catch { threw = true; }
@@ -683,29 +725,29 @@ async function testSeamGating() {
   try { await timerOnly("timer/clear", U()); } catch { threw = true; }
   assert(!threw, "timer/clear resolves under the declared service");
 
-  // A manifest declares whole services: declaring `node` wires every `node/*` method,
-  // `node/verify` as well as `node/sign` (§12.2).
-  const nodeOnly = mk(["node"]);
-  assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign resolves under the declared service");
-  const nodeSig = await nodeOnly("node/sign", U(3));
-  assertEqual((await nodeOnly("node/verify", concatBytes([id.publicKey, nodeSig, U(3)])))[0], 1, "…and so does node/verify, the SAME declared service");
+  // A manifest declares whole services: declaring `identity` wires every `identity/*` method,
+  // `identity/verify` as well as `identity/sign` (§12.2).
+  const identityOnly = mk(["identity"]);
+  assertEqual((await identityOnly("identity/sign", U(1, 2))).length, 64, "identity/sign resolves under the declared service");
+  const identitySig = await identityOnly("identity/sign", U(3));
+  assertEqual((await identityOnly("identity/verify", concatBytes([id.publicKey, identitySig, U(3)])))[0], 1, "…and so does identity/verify, the SAME declared service");
   threw = false;
-  try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
+  try { await identityOnly("fs/get", U(120)); } catch { threw = true; }
   assert(threw, "a different, undeclared service (fs) is still refused beside the declared one");
 
-  // Declaring a method's name is not declaring its service: `node/sign` is not a service,
-  // so it is read as a local service id nothing claims and no `node` handler is wired
+  // Declaring a method's name is not declaring its service: `identity/sign` is not a service,
+  // so it is read as a local service id nothing claims and no `identity` handler is wired
   // (install would also refuse the manifest).
-  const methodNameOnly = mk(["node/sign"]);
+  const methodNameOnly = mk(["identity/sign"]);
   threw = false;
-  try { await methodNameOnly("node/sign", U(1, 2)); } catch { threw = true; }
+  try { await methodNameOnly("identity/sign", U(1, 2)); } catch { threw = true; }
   assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
   // Guest-controlled allocation caps. Tests that use every host service declare them all
   // explicitly; omitting requires entirely grants none (§12.2).
   const open = mk(ALL_HOST_SERVICES);
   let omitted = false;
-  try { await mk(undefined)("node/sign", U(1, 2)); } catch { omitted = true; }
+  try { await mk(undefined)("identity/sign", U(1, 2)); } catch { omitted = true; }
   assert(omitted, "omitting requires grants no service rather than every name");
   // A declared service this node cannot provide fails the seam, so the install fails.
   let unbacked = "";

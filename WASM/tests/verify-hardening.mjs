@@ -39,13 +39,13 @@ const { guestOpFraming } = await imp("build/scripts/bundle-author.js");
 const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { createRealmTimers, timerService } = await imp("build/services/timer.js");
-const { nodeService } = await imp("build/services/node.js");
+const { identityService } = await imp("build/services/identity.js");
 const { fsService } = await imp("build/services/fs.js");
 const { linkService, TransportHost } = await imp("build/services/link.js");
 const { toHex, HOST_CALLER_ID } = await imp("build/host/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, CallBudget } = await imp("build/host/guest-seam.js");
-const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
+const ALL_HOST_SERVICES = ["identity", "fs", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALL_LOCAL = () => null;
 const TEST_LINK = { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) };
@@ -236,7 +236,7 @@ console.log("\n§12.2 — the service gates cannot be reached by omission");
   const base = {
     sodium,
     services: {
-      node: nodeService(sodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: sodium.crypto_sign_keypair() }),
+      identity: identityService(sodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: sodium.crypto_sign_keypair() }),
       fs: fsService(new MemoryFs()), timer: timerService(TEST_TIMERS), link: linkService(TEST_LINK),
     },
     callLocal: TEST_CALL_LOCAL,
@@ -751,16 +751,16 @@ console.log("\n§12.3 — a realm's self-initiated work is paced by its share of
       sodium: burningSodium,
       requires: ALL_HOST_SERVICES,
       services: {
-        node: nodeService(burningSodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity }),
+        identity: identityService(burningSodium, { domain: new Uint8Array(1), scope: new Uint8Array(1), key: identity }),
         fs: fsService(new MemoryFs()), timer: timerService(TEST_TIMERS), link: linkService(TEST_LINK),
       },
       callLocal: TEST_CALL_LOCAL,
       modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     });
-    // [0] calls node/verify on the rest, [1] fs/get.
+    // [0] calls identity/verify on the rest, [1] fs/get.
     const realm = await createWebRealm({
       source: `async function handle(arg) {
-        return await host.call(arg[0] === 0 ? "node/verify" : "fs/get", arg.subarray(1));
+        return await host.call(arg[0] === 0 ? "identity/verify" : "fs/get", arg.subarray(1));
       }`,
       hostCall: seam,
     });
@@ -968,10 +968,10 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     && advertised.maxOutstandingHostCalls === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
   "the realm's host-call budget is advertised to the guest, not only enforced against it");
   ok(advertised.deadlineMs === 5000, "so is its invocation deadline, so a guest can settle a wait before it");
-  // So is the node's public key, as hex: the key `node/sign` signs with, so what a guest
+  // So is the node's public key, as hex: the key `identity/sign` signs with, so what a guest
   // publishes as its node and what its signatures verify under cannot disagree.
   ok(advertised.identity === toHex(kp.ed.publicKey),
-    "HOST.identity is the node's public key, the one node/sign signs with");
+    "HOST.identity is the node's public key, the one identity/sign signs with");
   bare.close();
 }
 

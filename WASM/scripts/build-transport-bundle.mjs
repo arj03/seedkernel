@@ -35,7 +35,7 @@ async function main() {
     modules,
     guestSource: guest,
     // `link` goes only to the boot-selected transport or an explicit replacement (§12.5).
-    guestRequires: ["node", "link", "timer"],
+    guestRequires: ["identity", "link", "timer"],
     // Signed defaults; an installation overrides any of them through LOCAL.
     guestConfig: TRANSPORT_APP_CONFIG,
   });

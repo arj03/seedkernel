@@ -18,6 +18,10 @@ export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
 /** Guest-seam signing for the slot holding `link` (§12.2, §12.6): that slot's signatures
  *  stay in the link domain, never in an app's namespace. */
 export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
+/** Hybrid guest-seam signing (§12.2): put in front of the slot's own prefix and scope, so
+ *  neither half of a hybrid signature verifies as a plain `identity/sign`, and no plain
+ *  signature passes as a half of a hybrid one. */
+export const DOMAIN_HYBRID = domain("seedkernel-hybrid-sig-v1\0");
 /** Subkey derivation (§12.6.2b): its own domain so a derived seed never equals any other
  *  hash this system computes. */
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
@@ -44,7 +48,7 @@ export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
 /** Host-service ABI (§12.2): `calls` go to the host; `events` go to the service occupant.
  *  Only what a confined realm cannot do itself; time and entropy need no declaration. */
 export const HOST_SERVICES = {
-  node: { calls: ["sign", "verify"] },
+  identity: { calls: ["sign", "verify", "sign-hybrid", "verify-hybrid", "hybrid-key"] },
   fs: { calls: ["get", "read", "put", "append", "list", "delete", "size", "stat"] },
   timer: { calls: ["arm", "clear"] },
   // Raw links, and the raw datagram sockets the occupant runs its UDP paths over (§12.7).

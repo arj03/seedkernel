@@ -1,8 +1,8 @@
 // Transport bundle guest: the host-call helpers and the link, with its handshake and
 // record layer (§12.6).
 
-const N_SIGN = "node/sign";
-const N_VERIFY = "node/verify";
+const N_SIGN = "identity/sign";
+const N_VERIFY = "identity/verify";
 const N_RANDOM = "crypto/random";
 // Bundle modules: a bare name without `/` is a module, not a host name (§12.2).
 const N_WS = "ws";

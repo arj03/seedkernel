@@ -66,8 +66,11 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 | `crypto/aes256gcm/open` | `[npub 12][key 32][adLen u32][ad][ciphertext ‖ tag ..]` | `[1][plaintext ..]`, or `[0]` when the tag does not verify |
 | `crypto/x25519/dh` | `[sk 32][pk 32]` | `[1][shared 32]`, or `[0]` for a low-order point. Against the base point it derives a public key. |
 | `crypto/random` | `[n u32]` | `n` bytes of host entropy |
-| `node/sign` | message bytes | 64-byte Ed25519 signature under the node identity over `domain ‖ scope ‖ msg` (Signing scope) |
-| `node/verify` | `[pk 32][sig 64][msg ..]` | `[ok u8]`: 1 iff `sig` verifies over `domain ‖ scope ‖ msg` under `pk`. A payload shorter than 96 bytes throws. |
+| `identity/sign` | message bytes | 64-byte Ed25519 signature under the node identity over `domain ‖ scope ‖ msg` (Signing scope) |
+| `identity/verify` | `[pk 32][sig 64][msg ..]` | `[ok u8]`: 1 iff `sig` verifies over `domain ‖ scope ‖ msg` under `pk`. A payload shorter than 96 bytes throws. |
+| `identity/sign-hybrid` | message bytes | `[ed sig 64][ml sig 3309]`: Ed25519 under the node identity and ML-DSA-65 under its derived PQ key, both over `DOMAIN_hybrid ‖ domain ‖ scope ‖ ed_pk ‖ ml_pk ‖ msg` (Signing scope) |
+| `identity/verify-hybrid` | `[ed pk 32][ml pk 1952][ed sig 64][ml sig 3309][msg ..]` | `[ok u8]`: 1 iff both halves verify over that preimage under the named keys. A payload shorter than 5,357 bytes throws. |
+| `identity/hybrid-key` | (empty) | `[ed pk 32][ml pk 1952]`: the key `identity/sign-hybrid` signs with, the identity first |
 | `fs/get` | key (UTF-8) | `[0]` absent, or `[1][bytes ..]` |
 | `fs/read` | `[offset u32][length u32][key ..]` | `[0]` absent, or `[1][bytes ..]`: up to `length` bytes from `offset`, fewer at the value's end and none past it. Only those bytes are read. |
 | `fs/put` | `[klen u32][key][bytes ..]` | (empty) |
@@ -98,7 +101,7 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 **A host transform takes its algorithm's whole standard interface** (the AEAD's associated data and nonce), never the subset one bundle uses. The table takes no new algorithms; new computation ships as a module of the bundle that needs it. SHA-256 and AES-256-GCM are in it because the platform has them natively (the CPU's AES and SHA instructions, through Go, OpenSSL or WebCrypto; a page hashes with the host's libsodium), which a module compiled to wasm cannot match; the rest because the host already carries the code (§14). A name trimmed to one bundle's use makes the next bundle re-ship that code, or wait for a host release to adopt a standard protocol such as Noise. Published Noise XX vectors (`25519_AESGCM_SHA256`) run through these names on every target and hold the interfaces there (`tests/noise-vectors.js`).
 
-**`node/verify` is a grant, not a transform**, because its prefix is the host-derived scope, and "does this verify under *my* scope?" is a fact the guest cannot state for itself.
+**`identity/verify` and `identity/verify-hybrid` are grants, not transforms**, because its prefix is the host-derived scope, and "does this verify under *my* scope?" is a fact the guest cannot state for itself.
 
 ### Links
 
@@ -114,13 +117,13 @@ Dispatch builds one map at load of every name the realm can reach, so it never r
 
 **No name re-enters the calling realm.** A socket write does not deliver during the write, an armed timer fires on a later turn, and a call into another realm (a local service id, `link/deliver`) runs its callee on a later turn. A guest answering such a call fires it and returns rather than awaiting it inside its own frame, because invocations are serialized per realm (§12.3) and a re-entrant answer would deadlock on the frame that asked for it.
 
-**`fs/*`, `crypto/*` and `node/*` answer within the asking turn**: the guest's `await` continues with no host turn in between. The exceptions are `crypto/aes256gcm/seal` and `crypto/aes256gcm/open`, which answer when the platform's AES does: in the turn on native and Node, on a later turn on a page. Module calls, local service ids, `link/deliver`, `link/udpBind` and `host/stage` answer on a later turn. The file primitive under every fs backend is synchronous on every target, so a guest cannot work on one backend and fail on another by accident. A durable browser backend therefore has to be synchronous too (OPFS sync access handles in a Worker, or a store loaded from IndexedDB and persisted behind it).
+**`fs/*`, `crypto/*` and `identity/*` answer within the asking turn**: the guest's `await` continues with no host turn in between. The exceptions are `crypto/aes256gcm/seal` and `crypto/aes256gcm/open`, which answer when the platform's AES does: in the turn on native and Node, on a later turn on a page. Module calls, local service ids, `link/deliver`, `link/udpBind` and `host/stage` answer on a later turn. The file primitive under every fs backend is synchronous on every target, so a guest cannot work on one backend and fail on another by accident. A durable browser backend therefore has to be synchronous too (OPFS sync access handles in a Worker, or a store loaded from IndexedDB and persisted behind it).
 
 **`__deferred`.** A guest that will answer on a later turn sets `globalThis.__deferred = true` during the synchronous part of `handle`. The realm's queue is freed at the end of that segment though nothing has settled; the invocation's deadline stays attached to the answer and settles one that never arrives. This is the one ABI bit beyond `handle` returning bytes. Serializing invocations is right when the answer comes from outside, since a guest parked on a module call is suspended mid-update and must hold the queue. It is wrong when the answer arrives *through* the realm: the transport answers an app's send by reading bytes off a link, and that read is another invocation of the same realm, so awaiting inside the frame would hold the queue against the only event that could settle it. The flag hands over queue occupancy, never time, which is why the deadline stays.
 
 ### Signing scope
 
-Each slot has **one** signing scope, derived at load from admitted facts, identical on every load path: `DOMAIN_guest ‖ app_len u8 ‖ app` for an ordinary app, from the manifest's `app` label and never the author, and bare `DOMAIN_link_scope` for the link occupant. `node/sign` signs `domain ‖ scope ‖ msg`; `node/verify` checks a caller-named key's signature under the same prefix. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. The prefixes are the `DOMAIN_*` family (§16.1). The format inside a scope, the transport's `DOMAIN_channel` tag included, is bundle content.
+Each slot has **one** signing scope, derived at load from admitted facts, identical on every load path: `DOMAIN_guest ‖ app_len u8 ‖ app` for an ordinary app, from the manifest's `app` label and never the author, and bare `DOMAIN_link_scope` for the link occupant. `identity/sign` signs `domain ‖ scope ‖ msg`; `identity/verify` checks a caller-named key's signature under the same prefix. The hybrid names sign and check `DOMAIN_hybrid ‖ domain ‖ scope ‖ ed_pk ‖ ml_pk ‖ msg` with both halves: the leading prefix keeps either half from passing as a plain signature, and naming both keys binds the halves to each other. The guest never supplies or reads the prefix, no name signs raw bytes, and the key never enters a realm. The prefixes are the `DOMAIN_*` family (§16.1). The format inside a scope, the transport's `DOMAIN_channel` tag included, is bundle content.
 
 Every node running an app under the same label derives the same scope, whoever authored it, for the reason §5 gives. Deriving it from admitted facts rather than accepting it from the guest is what makes it the same on boot, on an explicit install and on an in-place update, so an upgrade cannot silently re-scope a node. §12.6.2b says why both purposes share one key.
 
@@ -176,7 +179,7 @@ Serializing them avoids two frames resuming into each other at every await, in a
 
 Three constants reach the guest before its top level runs. Each is an object and always defined; absent means `{}`.
 
-- **`HOST`**, from the host and fixed for the realm's life: `identity` (the node's public key as 64 lowercase hex, the key `node/sign` signs with, §12.6.2b), `maxOutstandingHostCalls`, `maxOutstandingHostCallBytes`, and `deadlineMs` (each invocation's deadline, a deferred answer included; `null` when unbounded).
+- **`HOST`**, from the host and fixed for the realm's life: `identity` (the node's public key as 64 lowercase hex, the key `identity/sign` signs with, §12.6.2b), `maxOutstandingHostCalls`, `maxOutstandingHostCallBytes`, and `deadlineMs` (each invocation's deadline, a deferred answer included; `null` when unbounded).
 - **`APP`**, from the author: exactly the manifest's signed `guest.config`. The host never merges into it.
 - **`LOCAL`**, from the installation: exactly the JSON object the installer passed for this install. Not retained, invisible to other bundles.
 

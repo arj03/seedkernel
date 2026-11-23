@@ -24,7 +24,7 @@ export interface Keypair {
 
 /** Deterministic, so a node rebuilds its key at boot from the one secret it stores. The
  *  public half is the peer id and `HOST.identity`; the key signs the link slot's statements
- *  and an app's scoped `node/sign`. */
+ *  and an app's scoped `identity/sign`. */
 export function deriveNodeKey(sodium: SubkeyCrypto, master: Uint8Array): Keypair {
   if (master.length !== 32) throw new Error(`subkey: master seed must be 32 bytes (got ${master.length})`);
   const seed = new Uint8Array(sodium.sha256(concatBytes([
@@ -33,6 +33,30 @@ export function deriveNodeKey(sodium: SubkeyCrypto, master: Uint8Array): Keypair
     master,
   ])));
   const kp = sodium.crypto_sign_seed_keypair(seed);
+  seed.fill(0);
+  return kp;
+}
+
+/** What deriving the identity's ML-DSA-65 half takes. */
+export interface HybridSubkeyCrypto {
+  sha256(msg: Uint8Array): Bytes;
+  ml_dsa65_keypair_from_seed(seed: Uint8Array): Keypair;
+}
+
+/** The ML-DSA-65 half of the node's identity, for `identity/sign-hybrid` (§12.2): derived
+ *  from the identity key's own seed (the first 32 bytes of a libsodium Ed25519 secret key)
+ *  under its own label, so the node still stores one secret and the PQ key exists only in
+ *  the host. Deterministic, so it is the same key on every boot and every target. */
+export function deriveHybridKey(sodium: HybridSubkeyCrypto, identity: Keypair): Keypair {
+  if (identity.privateKey.length !== 64) {
+    throw new Error(`subkey: identity secret key must be 64 bytes (got ${identity.privateKey.length})`);
+  }
+  const seed = new Uint8Array(sodium.sha256(concatBytes([
+    DOMAIN_SUBKEY,
+    enc.encode("seedkernel-subkey-mldsa-v1\0"),
+    identity.privateKey.subarray(0, 32),
+  ])));
+  const kp = sodium.ml_dsa65_keypair_from_seed(seed);
   seed.fill(0);
   return kp;
 }

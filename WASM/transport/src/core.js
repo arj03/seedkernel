@@ -3,7 +3,7 @@
 
 // ── per-host state, read from the preamble ───────────────────────────────────
 // Built during load, so invalid config fails the load (§12.4). The identity comes from
-// `HOST`: the key `node/sign` signs with (§12.2).
+// `HOST`: the key `identity/sign` signs with (§12.2).
 
 const ownId = HOST.identity;            // the node channel public key, hex
 const ownPk = fromHex(ownId);           // the same, 32 bytes

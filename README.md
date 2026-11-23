@@ -44,7 +44,7 @@ There has been no external audit, and no cryptographer has reviewed the design (
 | Component | Role |
 | --- | --- |
 | **Host** | The runtime outside installed bundles: one signed host blob that a small fixed loader runs, natively or on Node, or that a page imports (§12.9). It verifies and admits bundles, builds their slots, confines execution, and routes calls. A bundle cannot verify its own admission or enforce its own confinement, so this is the host's job. |
-| ↳ **Host services** | What a confined app cannot obtain for itself, the `HOST_SERVICES` set (§12.1): `node` (signing with the node's private key), `fs` (storage), `timer` (the realm's wake), `link` (sockets) and `host` (staging a new host blob). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
+| ↳ **Host services** | What a confined app cannot obtain for itself, the `HOST_SERVICES` set (§12.1): `identity` (signing with the node's identity, Ed25519 or hybrid with ML-DSA-65), `fs` (storage), `timer` (the realm's wake), `link` (sockets) and `host` (staging a new host blob). They move raw bytes under opaque link ids and storage keys, protect the key, and enforce limits on the resources they hold. A guest reaches only the services its signed manifest declares. |
 | **Bundle** | The unit of installation (§12.4) and the app itself: a manifest, a guest JS program, optional WASM modules, and hybrid author signatures over the whole set. The host checks policy (§12.5), builds a private slot, and atomically replaces its claims. |
 | ↳ **Guest** | The app's state and logic in a JS realm with no ambient authority (§12.2). Its interface is `host.call(name, …)` out and `handle(bytes)` in. Invocations are serialized per realm and bounded in heap, execution, and handoff time (§12.3). |
 | ↳ **Modules** | The app's private library of restartable WASM transforms (§4), called by bare name through its guest. They have **no host imports** and no I/O, and their names are private to the slot (§3). |
@@ -101,7 +101,7 @@ The transport holds sockets, session keys and plaintext, so it must be trusted w
 
 ## Post-quantum by role
 
-Each cryptographic role is protected according to when a quantum attacker could use it. What a recording could later break is hybrid: session keys are X25519 + ML-KEM-768, which also conceals both identities, and bundle signatures are Ed25519 + ML-DSA-65, with both halves required. What is verified live stays classical: peer authentication and `node/sign` are Ed25519, as in TLS, Signal (PQXDH) and OpenSSH, since post-quantum signatures cost kilobytes per handshake. An app that keeps signed records for years adds its own post-quantum signature. The table and the reasoning are [SECURITY §14.1 and §14.2](docs/SECURITY.md#141-cryptographic-suites-and-update-boundaries).
+Each cryptographic role is protected according to when a quantum attacker could use it. What a recording could later break is hybrid: session keys are X25519 + ML-KEM-768, which also conceals both identities, and bundle signatures are Ed25519 + ML-DSA-65, with both halves required. What is verified live stays classical: peer authentication and `identity/sign` are Ed25519, as in TLS, Signal (PQXDH) and OpenSSH, since post-quantum signatures cost kilobytes per handshake. An app that keeps signed records for years signs them with `identity/sign-hybrid`, Ed25519 + ML-DSA-65 under the same identity. The table and the reasoning are [SECURITY §14.1 and §14.2](docs/SECURITY.md#141-cryptographic-suites-and-update-boundaries).
 
 ## 10. Performance
 
@@ -139,7 +139,7 @@ All three targets share bundle admission, policy and routing, and a networked no
 
 | Code | What | LOC |
 | --- | --- | --- |
-| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`node`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,047 TS |
+| **Shared** (all three targets) | bundle format and admission, resource limits, the module ABI, the host blob and its slots, the guest seam and realm queue, node assembly and claim routing, guest realms, the host's crypto, the host's side of the platform ABI, the host services (`identity`, `timer`, `fs`, `link`, `host`), the CLI and its control endpoint (Node and native) | 4,119 TS |
 | **JS** (browser + Node) | the Node platform and loader, the browser platform, the WebAssembly engine table, sockets, the `fs` backend, worker-backed modules, entry points | 1,147 TS |
 | **Native** (Go) | the loader: QuickJS embedding, the event loop, the engine table over wazero, raw net, fs and UDP | 1,878 Go |
 
@@ -197,7 +197,7 @@ To read the spec as one document: `cat README.md docs/{ARCHITECTURE,BUNDLE,GUEST
 - **Slot**: an installed bundle's private code, state and storage, keyed by its app label (§3).
 - **Guest**: a bundle's JS program, confined in its own realm (§12.3).
 - **Module**: a bundle's private WASM transform, with no imports (§4).
-- **Host service**: what a guest can reach only through the host: `node`, `fs`, `timer`, `link`, `host` (§12.1).
+- **Host service**: what a guest can reach only through the host: `identity`, `fs`, `timer`, `link`, `host` (§12.1).
 - **Claim**: a protocol id or service id a manifest says its app answers (§12.10).
 - **Transport**: the bundle holding `link`, the node's sockets; it runs the channel (§12.6).
 - **Link occupant**: the slot holding `link`, normally the transport.

@@ -239,7 +239,7 @@ export function createGuestSeam({ sodium, requires, services, callLocal, modules
   };
   addHost(hostTransforms(sodium));
   for (const id of new Set(requires)) {
-    // A service comes whole: declaring `node` wires `node/sign` and `node/verify`.
+    // A service comes whole: declaring `identity` wires every `identity/` name.
     if (isService(id)) {
       const handlers = services[id];
       if (handlers === undefined) throw new Error(`guest-seam: the bundle requires "${id}", which this node does not provide`);
@@ -275,7 +275,8 @@ export function createGuestSeam({ sodium, requires, services, callLocal, modules
     if (!route) throw new Error("guest-seam: no such name " + name + " (not crypto, a module, or declared in guest.requires)");
     return route(payload, budget);
   };
-  // The crypto transforms, `node` and `fs` answer inline and keep nothing of their payload.
-  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("node/") || name.startsWith("fs/");
+  // The crypto transforms, `identity` and `fs` answer inline and keep nothing of their
+  // payload.
+  seam.borrows = (name) => name.startsWith("crypto/") || name.startsWith("identity/") || name.startsWith("fs/");
   return seam;
 }

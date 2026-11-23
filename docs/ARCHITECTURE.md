@@ -114,7 +114,7 @@ Three consequences shape every owner:
 
 The host provides five host services (`HOST_SERVICES`, `host/domains.ts`) and two ungated name families. Their exact names and byte layouts are §12.2.
 
-- **`node`**: signing and verification with the node key, under the slot's scope. The key never enters a realm.
+- **`identity`**: signing and verification with the node's identity, under the slot's scope: Ed25519 alone, or hybrid with the ML-DSA-65 key derived from it. No key ever enters a realm.
 - **`fs`**: raw bytes under an opaque, flat key, scoped to the app label.
 - **`timer`**: the realm's one wake.
 - **`link`**: raw links over opaque ids, attributed inbound delivery, and datagram sockets. The link occupant only (§12.5).
@@ -122,7 +122,7 @@ The host provides five host services (`HOST_SERVICES`, `host/domains.ts`) and tw
 - **`crypto/*`**, ungated: a frozen table of transforms the host already carries, plus host entropy.
 - **bare names**, ungated: the bundle's own modules.
 
-Every node offers `node` and `timer`; `fs`, `link` and `host` only where the embedder enables them (§12.8). A declared service the node cannot back refuses the install, since a node's services are fixed for its life and the install already knows what the first call would answer.
+Every node offers `identity` and `timer`; `fs`, `link` and `host` only where the embedder enables them (§12.8). A declared service the node cannot back refuses the install, since a node's services are fixed for its life and the install already knows what the first call would answer.
 
 **Only reach is declared.** A transform is computation, not authority: a bundle's modules are verified and installed with its guest, so calling one reaches nothing the guest does not already hold. Time is not authority either, since every realm has ECMAScript's clocks. So `guest.requires` carries exactly what a guest could not otherwise touch (the node key, disk, its wake, sockets, the loader's host slots and other realms), and the list an operator reads is the bundle's whole reach. A grant is a whole service, never a method: there is no finer grant the seam could enforce.
 
@@ -142,7 +142,7 @@ The link occupant, a transport bundle, owns the channel: handshake, record layer
 
 **Confinement is why the transport is a bundle.** It parses everything a stranger sends: frames before any handshake, the handshake itself, relay messages. That is the node's largest attack surface, so it runs where a parsing bug owns one realm, its sessions and plaintext, and never the host's state, the node key or another slot. That any admitted author can write one, and that a running node can replace it, follow from the same placement.
 
-**The protocol is content.** The handshake, records and routing change in a bundle update without a host release. That holds only while nothing beneath the bundle assumes this handshake: the host sees no handshake width, the shell passes the transport's flags through unread, and each `crypto/*` name takes its algorithm's whole interface (§12.2), so an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's is the identity key's algorithm (Ed25519, through `node/sign`), the socket kinds a destination can name, and the link events.
+**The protocol is content.** The handshake, records and routing change in a bundle update without a host release. That holds only while nothing beneath the bundle assumes this handshake: the host sees no handshake width, the shell passes the transport's flags through unread, and each `crypto/*` name takes its algorithm's whole interface (§12.2), so an algorithm the host lacks ships as a module, as ML-KEM does. What stays the host's is the identity's algorithms (Ed25519 through `identity/sign`, Ed25519 + ML-DSA-65 through `identity/sign-hybrid`), the socket kinds a destination can name, and the link events.
 
 **The first transport ships inside the host blob.** A node has no network until it has a transport, and fetching one over raw sockets from a peer it does not yet trust would open a metadata window before any channel exists to close it. So the first one ships in the artifact, and what travels is the next one.
 
@@ -157,6 +157,8 @@ The link occupant, a transport bundle, owns the channel: handshake, record layer
 A node stores one secret, a 32-byte **master seed**. Its signing keypair derives from it (`host/subkeys.ts`) under the closed label `channel` (`DOMAIN_subkey`, §16.1); that public key **is** the node's identity: its peer id, the key peers authenticate and `HOST.identity`. The master seed signs nothing. The one key signs for both purposes, the link and the apps, separated by signing scope (§12.2). Nothing revokes it: a leaked seed is a lost identity, and recovery is a new seed and so a new peer id (§14).
 
 There is one key rather than one per purpose because a peer knows a record's author only as a peer id, the key the handshake authenticated. A record signed by a sibling key would name an author in no peer's roster, and binding the two would need a new gossiped protocol element per peer. Both keys would derive from one seed in one process, so a compromise reaching either reaches both; a split buys resistance to one class of code bug (a lost prefix), not identity separation. So the purposes are kept apart as every other pair is: the host chooses domain and scope from the asking slot, and no name signs raw bytes. The stored secret is still not the signing key, so the key file format stays independent of the key algorithm.
+
+The identity's ML-DSA-65 half, which `identity/sign-hybrid` signs with beside the Ed25519 key, is not a sibling key in that sense. It derives from the identity key's seed (`DOMAIN_subkey` under its own label, §16.1), on first use, and never stands alone: every hybrid signature is made by both halves over a preimage naming both public keys, and a peer still knows the node by its Ed25519 key. Which ML-DSA key belongs to a peer id is not something the kernel gossips. An app that keeps hybrid records learns it from the peer over a live, authenticated channel (`identity/hybrid-key` answers it) and names both keys in what it keeps, for example by an author id hashed over both. Once Ed25519 falls, an attacker can bind a new ML-DSA key to a peer id, but cannot sign under the one a record already names.
 
 ### 12.7 Relays, WebRTC and UDP paths
 
@@ -230,16 +232,18 @@ The values a second implementation of a bundle signer, a guest or a peer must ma
 | `DOMAIN_manifest` | `"seedkernel-manifest-sig-v1\0"` | bundle signatures (§12.4) |
 | `DOMAIN_manifest_author` | `"seedkernel-manifest-author-v1\0"` | author id derivation (§12.4); prefixes a hash, not a signature |
 | `DOMAIN_host` | `"seedkernel-host-sig-v1\0"` | host blob signatures (§12.9) |
-| `DOMAIN_guest` | `"seedkernel-guest-sig-v1\0"` | `node/sign` and `node/verify` for an ordinary app, followed by `app_len u8 ‖ app` (§12.2) |
-| `DOMAIN_link_scope` | `"seedkernel-link-scope-v1\0"` | `node/sign` and `node/verify` for the link occupant (§12.2) |
-| `DOMAIN_subkey` | `"seedkernel-subkey-v1\0"` | deriving the node keypair seed from the master seed (§12.6.2b) |
+| `DOMAIN_guest` | `"seedkernel-guest-sig-v1\0"` | `identity/sign` and `identity/verify` for an ordinary app, followed by `app_len u8 ‖ app` (§12.2) |
+| `DOMAIN_link_scope` | `"seedkernel-link-scope-v1\0"` | `identity/sign` and `identity/verify` for the link occupant (§12.2) |
+| `DOMAIN_hybrid` | `"seedkernel-hybrid-sig-v1\0"` | `identity/sign-hybrid` and `identity/verify-hybrid`, in front of the slot's own prefix and scope, then `ed_pk ‖ ml_pk` (§12.2) |
+| `DOMAIN_subkey` | `"seedkernel-subkey-v1\0"` | deriving the node keypair seed from the master seed, and the identity's ML-DSA-65 seed from that keypair's seed (§12.6.2b) |
 | Manifest suite | `0x02` | byte 0 of a bundle or host blob envelope (§12.4) |
 | Author id | 32 bytes, `SHA-256(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` | admission, revocation, freshness (§12.4, §12.5) |
 | `AUTHOR_MLDSA_SEED_LABEL` | `"seedkernel-author-mldsa-v1"`, no trailing NUL | an author's ML-DSA-65 seed is `SHA-256(ed25519_seed ‖ label)` (§12.4) |
 | Master seed | 32 bytes | the node's only stored secret; derives the identity under the label `channel` (§12.6.2b) |
+| Identity ML-DSA-65 seed | `SHA-256(DOMAIN_subkey ‖ "seedkernel-subkey-mldsa-v1\0" ‖ ed25519_seed)` | the hybrid half of `identity` (§12.6.2b) |
 
 Domain strings end in a NUL and are prepended before signing or hashing, never stored or transmitted. The fs key charset is §12.2.
 
-**The `DOMAIN_*` family is declared in one file.** The prefixes exist for one property: no signature made under one may verify under another, over any bytes, and no derived id or seed may collide with a signed preimage. That is a property of the whole set rather than any member, so the set lives together in `host/domains.ts`, where adding a member means reading the others on the same screen, and every place a prefix is applied imports it from there. A guest never sees one: it asks through `node/sign`, and the host chooses the prefix from the asking slot, so a prefix cannot be restated in content. The transport's `DOMAIN_channel` is not a member: it is a format tag inside the transport's own content, under `DOMAIN_link_scope`.
+**The `DOMAIN_*` family is declared in one file.** The prefixes exist for one property: no signature made under one may verify under another, over any bytes, and no derived id or seed may collide with a signed preimage. That is a property of the whole set rather than any member, so the set lives together in `host/domains.ts`, where adding a member means reading the others on the same screen, and every place a prefix is applied imports it from there. A guest never sees one: it asks through `identity/sign` or `identity/sign-hybrid`, and the host chooses the prefix from the asking slot, so a prefix cannot be restated in content. The transport's `DOMAIN_channel` is not a member: it is a format tag inside the transport's own content, under `DOMAIN_link_scope`.
 
 **The seed label is frozen.** Changing it re-identifies every author whose keys were built from a seed.

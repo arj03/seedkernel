@@ -10,8 +10,9 @@ import { enc, fromHex, toHex, isHex64, isRecord, errMessage, EMPTY, HOST_CALLER_
 import { sendProtocol } from "./op-frame.js";
 import { type CausalClock, type Realm, type RealmFactory } from "./realm-queue.js";
 import type { Keypair } from "./subkeys.js";
-// The host services: `node` and `timer` on every node, the others where offered.
-import { nodeService, slotSignScope } from "../services/node.js";
+// The host services: `identity` and `timer` on every node, the others where offered.
+import { identityService, lazyHybridKey, slotSignScope } from "../services/identity.js";
+import type { MlDsa65Signer } from "./pq.js";
 import { createRealmTimers, timerService, type RealmTimers } from "../services/timer.js";
 import { fsService, scopedFs, validatedFs, type Fs } from "../services/fs.js";
 import { linkService, TransportHost, type LinkBackend, type TransportHostOptions } from "../services/link.js";
@@ -46,8 +47,10 @@ interface AppSlot {
   onInbound?: InboundObserver;
 }
 
-/** Manifest verification plus the guest crypto ops; core libsodium satisfies both. */
-export type ShellSodium = ManifestVerifier & SeamCrypto;
+/** Manifest verification, the guest crypto ops, and ML-DSA-65 signing for the hybrid
+ *  half of `identity` (services/identity.ts). The host's crypto (sodium-engine.ts) is all
+ *  three. */
+export type ShellSodium = ManifestVerifier & SeamCrypto & MlDsa65Signer;
 
 /** This installation's settings for one install: the operator's, never the author's.
  *  The guest reads `localConfig` as `LOCAL`. */
@@ -114,7 +117,7 @@ export interface AppHandle extends LoadedBundle {
 export { denyAll, admitAll, authorAllowlist, policyFromJson, type Admit } from "./policy.js";
 export { scopedFs } from "../services/fs.js";
 
-/** The host services this node offers beyond `node` and `timer`, which every node has
+/** The host services this node offers beyond `identity` and `timer`, which every node has
  *  (§12.2). One left out is not offered: a bundle requiring it does not install. A relay
  *  is `{ transport }`, a node with no network `{ fs }`. */
 export interface NodeServices {
@@ -146,7 +149,8 @@ export interface BootShellOptions {
   /** Core libsodium with the ML-DSA-65 verifier mixed in. */
   sodium: ShellSodium;
   /** The node's keypair: its public half is the peer id every realm reads as
-   *  `HOST.identity`; the handshake and `node/sign` both sign with it. */
+   *  `HOST.identity`; the handshake and `identity/sign` both sign with it, and the
+   *  ML-DSA-65 half of `identity/sign-hybrid` derives from it. */
   identity: Keypair;
   /** Admission for ordinary apps; deny-all when absent. `link` is authorized only by boot
    *  selection or by replacing its holder. Host gates apply to every bundle. */
@@ -257,7 +261,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     bounds: { deadlineMs: number; memoryBytes: number }): Promise<void> => {
     const b = slot.verifiedBundle;
     const appConfig = b.manifest.guest.config ?? {};
-    // The host's facts (§12.3): the key `node/sign` signs with, and the budgets the realm
+    // The host's facts (§12.3): the key `identity/sign` signs with, and the budgets the realm
     // is held to, so a guest can pace its fan-out and settle a wait before its deadline.
     const hostFacts: JsonObject = {
       identity: toHex(opts.identity.publicKey),
@@ -324,6 +328,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
   } : undefined;
   // Node-wide services share one handler set; the rest are scoped per slot.
   const linkHandlers = link && linkService(link);
+  // One ML-DSA-65 key per node, derived on the first hybrid call from any slot.
+  const hybridKey = lazyHybridKey(sodium, opts.identity);
   const hostHandlers = offered.host && hostService(offered.host);
   /** Wire the `host.call` seam for one slot (guest-seam.ts): only the services its bundle
    *  declares. */
@@ -335,7 +341,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
       // The signed list, unmodified: host services and local service ids.
       requires: b.manifest.guest.requires,
       services: {
-        node: nodeService(sodium, slotSignScope(opts, app, slot.links)),
+        identity: identityService(sodium, slotSignScope(opts, app, slot.links), hybridKey),
         timer: timerService(slot.timers),
         fs: slot.fsScope && fsService(slot.fsScope),
         link: linkHandlers,

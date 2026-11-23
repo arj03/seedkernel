@@ -125,7 +125,7 @@ function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_A
     // (scripts/build-transport-bundle.mjs). The installer grants `link` only by boot
     // selection or owner replacement (§12.5); it includes inbound delivery (`link/deliver`),
     // since services are declared whole, never by method.
-    guestRequires: ["node", "link", "timer"],
+    guestRequires: ["identity", "link", "timer"],
     guestConfig: guestConfig ?? undefined,
   });
   return blob;

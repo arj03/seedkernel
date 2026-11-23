@@ -124,7 +124,7 @@ A guest is a plain script with the engine's built-ins and the globals `host`, `H
 
 Every field but `sodium` and `identity` has a default, so you state only what you own. An absent `admit` refuses every ordinary app (§12.5).
 
-`services` names what the node offers beyond `node` and `timer`, which every node has. A service left out is not offered, and a bundle requiring it does not install:
+`services` names what the node offers beyond `identity` and `timer`, which every node has. A service left out is not offered, and a bundle requiring it does not install:
 
 - **`fs: backend`**: storage, each app scoped to its label over the backend (`MemoryFs`, `NodeFs`, or any `Fs`).
 - **`transport: { … }`**: the network. `bootShell` installs the transport bundle at boot, with revocation and freshness enforced, passes `transport.config` as its `LOCAL`, and starts listeners. The options carry the socket adapter (`channels`), listeners, the `bundle` (a platform's `standUp` defaults to its blob's, and `transportBundleBytes()` gives it on Node), the `config`, and optionally `datagrams` for UDP paths. Without it, `BootResult.transport` is `null` and the node has no network.

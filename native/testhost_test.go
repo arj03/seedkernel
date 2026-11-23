@@ -377,7 +377,7 @@ globalThis.__buildGuestSeam = function (names, callLocal, scope) {
     // of these, and every other name here is a local service id (§12.10).
     requires: names,
     // What this node offers; only the declared ones are wired.
-    services: { node: scope ? nodeService(sodium, scope) : undefined, fs: fsService(fs) },
+    services: { identity: scope ? identityService(sodium, scope) : undefined, fs: fsService(fs) },
     // Local service id routing, done by the shell in production. Absent here means
     // nothing claims any id, which the seam reports by name instead of leaving the caller
     // waiting.

@@ -26,7 +26,7 @@ export const sodium = await loadCrypto();
 // by every other.
 export const TEST_CONTACT = new Uint8Array(32).fill(3);
 export const { createGuestSeam, CallBudget } = await imp("build/host/guest-seam.js");
-export const { appSignScope, slotSignScope } = await imp("build/services/node.js");
+export const { appSignScope, slotSignScope } = await imp("build/services/identity.js");
 /** The bytes an app's scope adds after `DOMAIN_guest`: `app_len u8 ‖ app`. */
 export const guestSignScope = (app) => appSignScope(null, app).scope;
 /** A seam called straight from a test, with the budget a realm would pass: an unbounded
@@ -36,7 +36,7 @@ export const withTestBudget = (seam) => (name, payload) => {
   const r = seam(name, payload, new CallBudget(Infinity, undefined, { consumedMs: 0 }));
   return r instanceof Promise ? r : joined(r);
 };
-export const ALL_HOST_SERVICES = ["node", "fs", "timer", "link"];
+export const ALL_HOST_SERVICES = ["identity", "fs", "timer", "link"];
 export const TEST_TIMERS = { arm() {}, clear() {} };
 /** Local service routing under which nothing claims any id. */
 export const TEST_CALL_LOCAL = () => null;
@@ -46,7 +46,7 @@ export const { utf8Encode, utf8Decode } = await imp("build/host/utf8.js");
 export { joined };
 export const isWake = (arg) => arg.length > 32 && callerOf(arg).fromHost && readOp(arg.subarray(32)).op === "wake";
 export const { MemoryFs } = await imp("build/services/fs-memory.js");
-export const { nodeService } = await imp("build/services/node.js");
+export const { identityService } = await imp("build/services/identity.js");
 export const { fsService } = await imp("build/services/fs.js");
 export const { timerService } = await imp("build/services/timer.js");
 export const { linkService } = await imp("build/services/link.js");
@@ -54,13 +54,13 @@ export const { linkService } = await imp("build/services/link.js");
  *  of them. `backends` replaces a stand-in. */
 export const testServices = (backends = {}) => {
   const b = {
-    node: appSignScope(sodium.crypto_sign_keypair(), "test"),
+    identity: appSignScope(sodium.crypto_sign_keypair(), "test"),
     fs: new MemoryFs(),
     timer: TEST_TIMERS,
     link: { open: () => ({ linkId: 0, stream: false }), send() {}, close() {}, deliver: async () => new Uint8Array(0) },
     ...backends,
   };
-  return { node: nodeService(sodium, b.node), fs: fsService(b.fs), timer: timerService(b.timer), link: linkService(b.link) };
+  return { identity: identityService(sodium, b.identity), fs: fsService(b.fs), timer: timerService(b.timer), link: linkService(b.link) };
 };
 export const enc = new TextEncoder();
 export const { NodeFs, nodeRawFiles } = await imp("build/services/fs-node.js");
