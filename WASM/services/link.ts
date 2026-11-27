@@ -56,7 +56,7 @@ export interface LinkBackend extends RawNet {
    *  with `[attribution 32][payload ...]` (§12.10). An unreachable claim and a failed
    *  handler both answer empty. It enters another realm, so the caller must not wait on it
    *  in the same turn; the answer resumes the caller as a new turn (`CallBudget.detach`). */
-  deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock): Promise<Uint8Array>;
+  deliver(claim: string, framed: Uint8Array, deadlineMs?: number, causalClock?: CausalClock, noReply?: boolean): Promise<Uint8Array>;
   /** The occupant's word on its own standing, in its own format, told each time it
    *  changes; the host passes it to the embedder unread. */
   status(status: Uint8Array): void;
@@ -86,14 +86,15 @@ export function linkService(net: LinkBackend): ServiceHandlers<"link"> {
       net.close(readU32BE(payload, 0), payload[4] === 1);
       return EMPTY;
     },
-    // [claimLen u8][claim][attribution 32][payload ...] (§12.10). Detached: the reply is
-    // new work on a shared link and must not inherit a read's spent budget, since a record
-    // cut halfway breaks the stream (§12.3). Everything after the claim is already the
-    // realm argument, so it is passed on as a view.
+    // [claimLen u8, high bit set when the sender wants no reply][claim][attribution 32]
+    // [payload ...] (§12.10). Detached: the reply is new work on a shared link and must not
+    // inherit a read's spent budget, since a record cut halfway breaks the stream (§12.3).
+    // Everything after the claim is already the realm argument, so it is passed on as a view.
     "link/deliver": (payload, budget) => {
       budget.detach();
-      const attrAt = 1 + payload[0];
-      return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock);
+      const attrAt = 1 + (payload[0] & 0x7f);
+      return net.deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt), budget.remainingMs, budget.causalClock,
+        (payload[0] & 0x80) !== 0);
     },
     // The occupant's standing, in its own format, for the embedder.
     "link/status": (payload) => {

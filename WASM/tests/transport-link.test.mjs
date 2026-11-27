@@ -1514,7 +1514,7 @@ await test("a peer-inbound answer reaches the installer through onInbound", asyn
   });
   const seen = [];
   const watcher = await st.B.shell.install(blob, {
-    onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
+    onInbound: (claim, from, answer, oneWay) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer, oneWay }),
   });
 
   const resp = await st.A.requestAsHost(st.B.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
@@ -1525,11 +1525,17 @@ await test("a peer-inbound answer reaches the installer through onInbound", asyn
   assert(seen[0].from === st.A.peerId,
     "…and the AUTHENTICATED sender, exactly as dispatch attributes it");
   assert(bytesEqual(seen[0].answer, resp), "…carrying exactly the bytes the caller received");
+  assert(seen[0].oneWay === false, "…and saying the sender asked for a reply");
+
+  // A one-way frame's answer reaches nobody but the installer, and says so.
+  await st.A.sendNoReplyAsHost(st.B.peerId, "watch/v1", Uint8Array.from([4]));
+  await until(() => seen.length === 2, 3000, "the one-way frame's answer to be observed");
+  assert(seen[1].oneWay === true && seen[1].answer[0] === 0xfb, "a one-way frame's answer is observed as one-way");
 
   // The host loopback path already has its return value, and onInbound is only wired for
   // the peer path, so invoking the same slot as the host must not fire it.
   await watcher.invoke(Uint8Array.from([9, 9]));
-  assert(seen.length === 1, "a host loopback invoke of the same slot must not fire onInbound");
+  assert(seen.length === 2, "a host loopback invoke of the same slot must not fire onInbound");
 });
 
 // A peer names the id the transport itself claims. The transport passes on what it

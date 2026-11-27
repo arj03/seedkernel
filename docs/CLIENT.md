@@ -162,7 +162,7 @@ A transport requires `link` and bypasses the predicate (§12.5), so pinning `_ne
 - `replaces`: the app label of the slot this install retires (§12.5). Without it, the label must be free.
 - `localConfig`: the guest's `LOCAL`, unsigned and passed unchanged.
 - `realmMemoryBytes`, `guestDeadlineMs`: this install's heap and deadline, overriding the node's.
-- `onInbound(claim, sender, answer)`: called once a peer request to this slot is answered, for observation only. It exists because the transport consumes the answer, so an embedder that must paint what its app just answered (seedshell relaying render bytes to an app's view) has no other path to it.
+- `onInbound(claim, sender, answer, oneWay)`: called once a peer request to this slot is answered, for observation only. `oneWay` says the sender wanted no reply, so the answer reaches nobody else. It exists because the transport consumes the answer, so an embedder that must paint what its app just answered (seedshell relaying render bytes to an app's view, for one-way frames) has no other path to it.
 
 ```js
 // Upgrade an app: name the slot it retires.

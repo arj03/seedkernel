@@ -21,8 +21,9 @@ import { hostService, type HostStaging } from "../services/host.js";
 /** Neutral realm contracts exposed through the shell facade clients configure. */
 export type { Realm, RealmOptions, RealmFactory } from "./realm-queue.js";
 
-/** Observe a slot's own answer to a peer-inbound frame, after it resolves. */
-export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array) => void;
+/** Observe a slot's own answer to a peer-inbound frame, after it resolves. `oneWay`: the
+ *  sender wanted no reply, so the answer reaches nobody but the observer. */
+export type InboundObserver = (claim: string, from: Uint8Array, answer: Uint8Array, oneWay: boolean) => void;
 
 /** The envelope's first byte for a peer's request; the occupant's attribution follows. */
 const PEER_KIND = Uint8Array.of(CALLER_PEER);
@@ -71,9 +72,10 @@ export interface InstallOptions {
   /** Guest execution budget per invocation for this install, in ms. Falls back to the
    *  shell's `guestDeadlineMs`, then `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
   guestDeadlineMs?: number;
-  /** Observe this slot's answer to a peer-inbound frame, so an embedder can show what its
-   *  app answered. Observation only: not called for a loopback `invoke` or a cross-realm
-   *  call, and anything it throws is logged and ignored. */
+  /** Observe this slot's answer to a peer-inbound frame, and whether the sender wanted no
+   *  reply, so an embedder can show what its app answered. Observation only:
+   *  not called for a loopback `invoke` or a cross-realm call, and anything it throws is
+   *  logged and ignored. */
   onInbound?: InboundObserver;
 }
 
@@ -329,7 +331,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
    *  claim and a failed handler both answer empty. */
   const link: LinkBackend | undefined = netHost ? {
     ...netHost.rawNet(),
-    deliver: (claim, framed, deadlineMs, causalClock) => {
+    deliver: (claim, framed, deadlineMs, causalClock, noReply = false) => {
       const slot = table.peerClaimant(claim);
       if (!slot) return Promise.resolve(EMPTY);
       // Kind 1: the host says this came through a `protocols` claim, from the peer the
@@ -340,7 +342,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         const attribution = framed.subarray(0, 32);
         // Two-arg `.then`, so a refused frame leaves no unhandled rejection on this branch.
         answer.then((bytes) => {
-          try { onInbound(claim, attribution, bytes); }
+          try { onInbound(claim, attribution, bytes, noReply); }
           catch (err) { console.error(`[shell] the installer's onInbound threw: ${errMessage(err)}`); }
         }, () => {});
       }

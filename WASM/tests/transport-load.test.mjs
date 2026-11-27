@@ -315,11 +315,12 @@ await test("one peer's pipeline cannot spend the host calls every other link nee
   let answering = false;
   // `link/deliver` is `[claimLen u8][claim]` followed by the whole realm argument,
   // `[attribution 32][payload ...]`, so this stand-in claimant reads the sender and the
-  // request from it as a claimant's realm would.
+  // request from it as a claimant's realm would. The length byte's high bit says the
+  // sender wants no reply.
   const ATTR = 32;
   const standIn = (name, answer, payload) => {
     if (name !== "link/deliver") return answer;
-    const framed = payload.subarray(1 + payload[0]);
+    const framed = payload.subarray(1 + (payload[0] & 0x7f));
     return answering
       ? Promise.resolve(framed.slice(ATTR))
       : new Promise((resolve) => {

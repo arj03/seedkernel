@@ -224,11 +224,12 @@ function netLinkClose(linkId, graceful) {
   callRetried(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0]));
 }
 /** Hand one decoded request to the host's claim routing:
- *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
- *  (empty for an unreachable claim or a failed handler). Do not wait on it in the same
- *  turn: the answer comes in another turn of this realm. */
-function netLinkDeliver(claim, attribution, payload) {
-  return host.call(N_LINK_DELIVER, [Uint8Array.of(claim.length), claim, attribution, payload]);
+ *  `[claimLen u8, high bit set when the sender wants no reply][claim][attribution 32]
+ *  [payload]`, answered with the claimant's bytes (empty for an unreachable claim or a
+ *  failed handler). Do not wait on it in the same turn: the answer comes in another turn
+ *  of this realm. */
+function netLinkDeliver(claim, attribution, payload, noReply) {
+  return host.call(N_LINK_DELIVER, [Uint8Array.of(claim.length | (noReply ? 0x80 : 0)), claim, attribution, payload]);
 }
 
 // Proved msg1s, by the initiator's ephemeral key, so a replayed recording is refused (a

@@ -294,6 +294,8 @@ class ReqRes {
     if (frame.length < REQ_HEAD_LEN) return; // no room for the protocol-id length byte
     const idLen = frame[REQ_PROTO_LEN_AT];
     if (frame.length < REQ_HEAD_LEN + idLen) return;
+    // A claim is at most 64 bytes (bundle.ts CLAIM_RE): a longer id reaches nobody.
+    if (idLen > 64) { this.respond(corr, noReply, from, link, EMPTY); return; }
     const proto = frame.subarray(REQ_HEAD_LEN, REQ_HEAD_LEN + idLen);
     const payload = frame.subarray(REQ_HEAD_LEN + idLen);
     // Deliver to the host's claim routing, attributed to the authenticated sender. Not
@@ -301,7 +303,7 @@ class ReqRes {
     // Past the window, answer empty as for an unclaimed request.
     const weight = 1 + idLen + PK_LEN + payload.length + callWeight;
     if (!this.admits(from, weight)) { this.respond(corr, noReply, from, link, EMPTY); return; }
-    const answer = netLinkDeliver(proto, fromPubkey, payload);
+    const answer = netLinkDeliver(proto, fromPubkey, payload, noReply);
     this.hold(from, weight);
     // A seam rejection (deadline, budget) is no answer either: reply empty.
     const done = (bytes) => { this.hold(from, -weight); this.respond(corr, noReply, from, link, bytes); };

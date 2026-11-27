@@ -333,6 +333,9 @@ export async function makeTransportHost(opts = {}) {
     if (r[0] !== 1) throw new Error("net: request failed");
     return r.slice(1);
   };
+  /** A one-way frame through the host's own door: the sender wants no reply. */
+  node.sendNoReplyAsHost = (to, proto, payload) => shell.call(TRANSPORT_SERVICE, new OpArgs("send").u8(1)
+    .blob(Buffer.from(to, "hex")).blob(enc.encode(proto)).blob(payload).build());
   node.app = app;
   /** Name an arbitrary transport op from the app, for the tests about the caller boundary
    *  (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the name. */
